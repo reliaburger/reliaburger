@@ -1,0 +1,30 @@
+project:
+  type: book
+  output-dir: ../_book
+
+book:
+  output-file: building-reliaburger
+  title: "Building Reliaburger"
+  subtitle: "A Rust Guide to Container Orchestration"
+  author: "Miko Pawlikowski"
+  date: "March 2026"
+  chapters:
+    - index.md
+    - book/00-preface.md
+    - book/01-hello-container.md
+    - book/02-finding-friends.md
+    - book/03-talking-to-each-other.md
+    - book/04-trust-no-one.md
+    - book/05-where-the-images-live.md
+    - book/06-watching-everything.md
+    - book/07-ship-it.md
+    - book/08-breaking-things-on-purpose.md
+    - book/09-ready-for-production.md
+
+format:
+  pdf:
+    documentclass: book
+    classoption:
+      - twoside
+      - openright
+    toc-depth: 2

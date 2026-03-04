@@ -1,0 +1,17 @@
+project:
+  type: default
+  output-dir: ../_book
+  render:
+    - design-index.md
+
+metadata:
+  title: "Reliaburger - Design Docs"
+  subtitle: "The Batteries-Included Container Orchestrator"
+  author: "Miko Pawlikowski"
+  date: "March 2026"
+
+format:
+  pdf:
+    documentclass: report
+    toc-depth: 2
+    output-file: reliaburger-design-docs.pdf
