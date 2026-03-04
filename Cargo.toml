@@ -1,0 +1,30 @@
+[package]
+name = "reliaburger"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A batteries-included container orchestrator"
+
+[lib]
+name = "reliaburger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bun"
+path = "src/bin/bun.rs"
+
+[[bin]]
+name = "relish"
+path = "src/bin/relish.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+proptest = "1"
