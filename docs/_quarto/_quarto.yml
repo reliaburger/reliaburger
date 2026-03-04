@@ -1,0 +1,26 @@
+format:
+  pdf:
+    fontsize: 10pt
+    papersize: a4
+    geometry:
+      - top=2cm
+      - bottom=2cm
+      - left=2.5cm
+      - right=2.5cm
+    toc: true
+    number-sections: false
+    colorlinks: true
+    linkcolor: black
+    urlcolor: blue
+    include-in-header:
+      - text: |
+          \usepackage{booktabs}
+          \usepackage{longtable}
+          \usepackage[hyphens]{url}
+          \usepackage{fancyhdr}
+          \pagestyle{fancy}
+          \fancyhead[LE]{\leftmark}
+          \fancyhead[RO]{\rightmark}
+          \fancyhead[RE,LO]{}
+          \fancyfoot[C]{\thepage}
+          \usepackage{microtype}

@@ -1,0 +1,50 @@
+name: Build PDF
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+        with:
+          tinytex: true
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y librsvg2-bin
+
+      - name: Build PDFs
+        run: make pdf
+
+      - name: Upload PDF artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliaburger-pdfs
+          path: docs/_book/*.pdf
+
+  release-pdf:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-pdf
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download PDF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: reliaburger-pdfs
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.pdf"
+          generate_release_notes: true

@@ -1,0 +1,17 @@
+project:
+  type: default
+  output-dir: ../_book
+  render:
+    - roadmap.md
+
+metadata:
+  title: "Reliaburger - Roadmap"
+  subtitle: "The Batteries-Included Container Orchestrator"
+  author: "Miko Pawlikowski"
+  date: "March 2026"
+
+format:
+  pdf:
+    documentclass: report
+    toc-depth: 3
+    output-file: reliaburger-roadmap.pdf
