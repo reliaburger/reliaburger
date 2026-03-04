@@ -122,17 +122,17 @@ Let's walk through the choices.
 
 **Dependencies — why these six?**
 
-- **tokio** — the async runtime. Reliaburger is fundamentally an async system: it manages network connections, health check timers, container events, and cluster gossip, all concurrently. Tokio is the standard choice here. The `"full"` feature enables everything — we'll need most of it eventually, and cherry-picking features buys us nothing at this stage.
-- **serde** — serialisation and deserialisation. Every config file, every API payload, every state snapshot flows through serde. The `"derive"` feature lets us annotate structs with `#[derive(Serialize, Deserialize)]` instead of writing conversion code by hand.
-- **toml** — Reliaburger uses TOML for all configuration. It's more readable than YAML for the kind of structured config we need, and it doesn't have YAML's footguns (the Norway problem, the boolean problem, the indentation-is-semantic problem).
-- **clap** — argument parsing for the CLI. The `"derive"` feature lets us define CLI structure as Rust types, which the compiler then validates. We'll see this in action in a moment.
-- **thiserror** — for defining error types in library code. It generates `Display` and `Error` implementations from an enum, with format strings that include context. No boilerplate.
-- **anyhow** — for error handling in binaries. Where `thiserror` is about *defining* precise error types, `anyhow` is about *propagating* errors with context. The split is deliberate: library code uses `thiserror` (callers need to match on specific errors), binary code uses `anyhow` (errors just need to be reported clearly).
+- **[tokio](https://tokio.rs/)** — the async runtime. Reliaburger is fundamentally an async system: it manages network connections, health check timers, container events, and cluster gossip, all concurrently. Tokio is the standard choice here. The `"full"` feature enables everything — we'll need most of it eventually, and cherry-picking features buys us nothing at this stage.
+- **[serde](https://serde.rs/)** — serialisation and deserialisation. Every config file, every API payload, every state snapshot flows through serde. The `"derive"` feature lets us annotate structs with `#[derive(Serialize, Deserialize)]` instead of writing conversion code by hand.
+- **[toml](https://docs.rs/toml)** — Reliaburger uses TOML for all configuration. It's more readable than YAML for the kind of structured config we need, and it doesn't have YAML's footguns (the Norway problem, the boolean problem, the indentation-is-semantic problem).
+- **[clap](https://docs.rs/clap)** — argument parsing for the CLI. The `"derive"` feature lets us define CLI structure as Rust types, which the compiler then validates. We'll see this in action in a moment.
+- **[thiserror](https://docs.rs/thiserror)** — for defining error types in library code. It generates `Display` and `Error` implementations from an enum, with format strings that include context. No boilerplate.
+- **[anyhow](https://docs.rs/anyhow)** — for error handling in binaries. Where `thiserror` is about *defining* precise error types, `anyhow` is about *propagating* errors with context. The split is deliberate: library code uses `thiserror` (callers need to match on specific errors), binary code uses `anyhow` (errors just need to be reported clearly).
 
 **Dev-dependencies — testing tools:**
 
-- **insta** — snapshot testing. We'll use it to verify CLI output, serialised configs, and TUI rendering. You write a test that produces output, `insta` captures it in a file, and future runs compare against the snapshot.
-- **proptest** — property-based testing. Instead of writing specific test cases, you describe the *properties* your code should satisfy, and proptest generates thousands of random inputs to find violations. We'll use it for the scheduler, port allocator, and other algorithmic code.
+- **[insta](https://insta.rs/)** — snapshot testing. We'll use it to verify CLI output, serialised configs, and TUI rendering. You write a test that produces output, `insta` captures it in a file, and future runs compare against the snapshot.
+- **[proptest](https://docs.rs/proptest)** — property-based testing. Instead of writing specific test cases, you describe the *properties* your code should satisfy, and proptest generates thousands of random inputs to find violations. We'll use it for the scheduler, port allocator, and other algorithmic code.
 
 ### The binaries
 
