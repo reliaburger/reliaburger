@@ -253,11 +253,20 @@ pub struct ResourceRange {
 #[derive(Debug, Clone)]
 pub struct HealthSpec {
     pub path: String,                         // HTTP path, e.g. "/healthz"
+    pub port: Option<u16>,                    // default: app's declared port
+    pub protocol: HealthProtocol,             // default: Http
     pub interval: Duration,                   // default: 10s
     pub timeout: Duration,                    // default: 5s
-    pub unhealthy_threshold: u32,             // default: 3
-    pub healthy_threshold: u32,               // default: 1
+    pub threshold_unhealthy: u32,             // default: 3
+    pub threshold_healthy: u32,               // default: 1
     pub initial_delay: Duration,              // default: 0s
+}
+
+/// Protocol for health check probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthProtocol {
+    Http,
+    Https,
 }
 
 /// Result of a single health check probe.
@@ -400,7 +409,7 @@ pub enum ContainerState {
     /// Onion service map and receives traffic.
     Running,
 
-    /// The health check has failed `unhealthy_threshold` consecutive
+    /// The health check has failed `threshold_unhealthy` consecutive
     /// times. The workload is removed from the Onion service map
     /// (no new traffic). Existing connections drain.
     Unhealthy,
@@ -792,9 +801,9 @@ pub struct UpgradeConfig {
 9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem. Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container via containerd sharing the main container's network namespace and volumes. Wait for exit code 0. If any fails, transition to `Failed` and emit event.
 11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
-12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `healthy_threshold` consecutive successes.
+12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
 13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event to the reporting tree.
-14. **Ongoing health checking:** HealthChecker continues probing at `interval`. If `unhealthy_threshold` consecutive failures: transition to `Unhealthy`, remove from Onion service map, emit event. If the workload recovers (`healthy_threshold` consecutive passes), transition back to `Running` and re-add to service map.
+14. **Ongoing health checking:** HealthChecker continues probing at `interval`. If `threshold_unhealthy` consecutive failures: transition to `Unhealthy`, remove from Onion service map, emit event. If the workload recovers (`threshold_healthy` consecutive passes), transition back to `Running` and re-add to service map.
 15. **Restart on persistent unhealthiness:** If the workload remains `Unhealthy` and the restart policy permits, transition to `Stopping`, send SIGTERM, wait `drain_timeout`, send SIGKILL if still alive, then loop back to step 2 with incremented `restart_count` and exponential backoff.
 
 **Stop a container workload:**
@@ -889,19 +898,19 @@ loop {
 
     // Evaluate state transitions
     if instance.state == HealthWait
-       && instance.consecutive_healthy >= spec.healthy_threshold {
+       && instance.consecutive_healthy >= spec.threshold_healthy {
         transition(instance, Running)
         onion_service_map.add(instance)
     }
 
     if instance.state == Running
-       && instance.consecutive_unhealthy >= spec.unhealthy_threshold {
+       && instance.consecutive_unhealthy >= spec.threshold_unhealthy {
         transition(instance, Unhealthy)
         onion_service_map.remove(instance)
     }
 
     if instance.state == Unhealthy
-       && instance.consecutive_healthy >= spec.healthy_threshold {
+       && instance.consecutive_healthy >= spec.threshold_healthy {
         transition(instance, Running)
         onion_service_map.add(instance)
     }
@@ -1193,11 +1202,11 @@ join = ["10.0.1.5:9443"]
 
 **What happens:** The workload's health check endpoint does not respond, returns errors, or times out.
 
-**Detection:** HealthChecker's `unhealthy_threshold` consecutive failure counter.
+**Detection:** HealthChecker's `threshold_unhealthy` consecutive failure counter.
 
-**Impact:** After `unhealthy_threshold` failures (default 3), the workload is marked `Unhealthy` and removed from the Onion service map. It stops receiving new traffic. If the restart policy permits, Bun restarts the workload.
+**Impact:** After `threshold_unhealthy` failures (default 3), the workload is marked `Unhealthy` and removed from the Onion service map. It stops receiving new traffic. If the restart policy permits, Bun restarts the workload.
 
-**Recovery:** Automatic. If the workload recovers (returns healthy responses), it is re-added to the service map after `healthy_threshold` consecutive passes (default 1).
+**Recovery:** Automatic. If the workload recovers (returns healthy responses), it is re-added to the service map after `threshold_healthy` consecutive passes (default 1).
 
 ### 7.6 Self-Upgrade Failure
 

@@ -195,9 +195,11 @@ An App is a long-running process with replicas, replacing the seven Kubernetes r
 image = "myapp:v1.4.2"
 replicas = 3
 port = 8080
-health = "/healthz"
 memory = "128Mi-512Mi"
 cpu = "100m-500m"
+
+[app.web.health]
+path = "/healthz"
 
 [app.web.ingress]
 host = "myapp.com"

@@ -426,9 +426,9 @@ pub struct HealthProbeConfig {
     /// Timeout for each probe.
     pub timeout: Duration,
     /// Number of consecutive failures before marking unhealthy.
-    pub unhealthy_threshold: u32,
+    pub threshold_unhealthy: u32,
     /// Number of consecutive successes before marking healthy again.
-    pub healthy_threshold: u32,
+    pub threshold_healthy: u32,
     /// HTTP path to probe (default: "/").
     pub path: String,
     /// Expected HTTP status codes (default: 200-399).
@@ -748,10 +748,10 @@ health_probe_interval = "5s"
 health_probe_timeout = "2s"
 
 # Consecutive probe failures before marking backend unhealthy. Default: 3.
-health_unhealthy_threshold = 3
+health_threshold_unhealthy = 3
 
 # Consecutive probe successes before marking backend healthy. Default: 2.
-health_healthy_threshold = 2
+health_threshold_healthy = 2
 ```
 
 ### 6.2 App-Level Configuration (app spec TOML)
@@ -801,7 +801,7 @@ Wrapper validates ingress configuration at deploy time:
 | **Council unreachable (cluster TLS)** | CSR request to council member times out | New `tls = "cluster"` certificates cannot be issued. Renewals fail. Existing certificates continue serving until they expire (90-day lifetime). | Council recovery. Wrapper retries CSR requests every 5 minutes. Alert fires when any certificate is within 30 days of expiry and renewal is failing. |
 | **Port 80/443 already in use** | `bind()` returns `EADDRINUSE` | Wrapper cannot start. Bun logs the error and retries every 30 seconds. | Operator must free the ports or reconfigure Wrapper to use alternative ports. |
 | **rustls handshake failure** | Client sends unsupported TLS version or cipher suite | Connection dropped during handshake | Client-side fix (upgrade TLS version). Wrapper logs the failure at debug level to avoid log flooding. |
-| **Upstream connection refused** | Backend process crashed between health probe and request routing | Individual request fails with 502. Wrapper marks backend as locally unhealthy after `unhealthy_threshold` consecutive failures. | Automatic: backend removed from pool. Next request goes to a healthy backend. Bun's container supervision restarts the crashed process. |
+| **Upstream connection refused** | Backend process crashed between health probe and request routing | Individual request fails with 502. Wrapper marks backend as locally unhealthy after `threshold_unhealthy` consecutive failures. | Automatic: backend removed from pool. Next request goes to a healthy backend. Bun's container supervision restarts the crashed process. |
 
 ---
 
