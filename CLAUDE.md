@@ -9,7 +9,7 @@ This project produces two things simultaneously:
 1. **A working implementation** — complete, testable, simple, bug-free.
 2. **A book** — "Building Reliaburger" — that walks through how we built all of it, teaching Rust and distributed systems design at the same time.
 
-IMPORTANT: Remember that we're also writing the book in docs/book/*.md, where we're going to explain everything that we're doing, why we're doing it like that, and what else we decided not to do. Incorporate that when planning any change.
+IMPORTANT: Remember that we're also writing the book in docs/book/*.md, where we're going to explain everything that we're doing, why we're doing it like that, and what else we decided not to do. Incorporate that when planning any change. The target audience are programmers familiar wth other languages (e.g. C, Python, Go), but not Rust. Focus on how Rust differs from other languages.
 
 ## Project Structure
 

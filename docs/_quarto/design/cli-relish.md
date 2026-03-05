@@ -1197,7 +1197,7 @@ Each correlated group becomes one `[app.*]` block. Uncorrelated resources are co
 | `spec.template.spec.containers[0].ports[0].containerPort` | `port` |
 | `resources.requests.cpu` / `resources.limits.cpu` | `cpu = "request-limit"` |
 | `resources.requests.memory` / `resources.limits.memory` | `memory = "request-limit"` |
-| `readinessProbe.httpGet.path` | `health = "/path"` |
+| `readinessProbe.httpGet.path` | `[app.*.health] path` |
 | `env[]` and `envFrom[]` | `[app.*.env]` |
 | `nodeSelector` | `[app.*.placement] required` |
 | `tolerations` | **Warning** (no equivalent) |

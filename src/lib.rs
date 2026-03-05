@@ -5,3 +5,5 @@
 //! gossip protocol (Mustard), and everything else.
 //!
 //! Modules are added incrementally as each roadmap phase is implemented.
+
+pub mod config;
