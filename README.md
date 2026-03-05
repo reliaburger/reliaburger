@@ -16,6 +16,12 @@ The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
 ## Repo layout
 
 ```
+src/
+  lib.rs               # Core library
+  bin/bun.rs           # Node agent entry point
+  bin/relish.rs        # CLI entry point
+  config/              # TOML configuration parsing (7 resource types)
+  grill/               # Container runtime interface (state machine, ports, cgroups, OCI)
 docs/
   whitepaper.md        # Full architectural vision (the "what and why")
   roadmap.md           # 9 implementation phases, tests-first ordering
@@ -25,15 +31,20 @@ docs/
   _quarto/             # PDF build configuration
 assets/
   images/              # Logo and project media
-Makefile               # PDF build targets (via Quarto)
+Makefile               # Build, test, lint, format targets
 CLAUDE.md              # Project guide, conventions, writing style
 ```
 
-No `src/` directory yet. We haven't written a single line of Rust. That's next.
-
 ## Current status
 
-Design-complete, implementation not started. Ready to begin Phase 1 (single-node container lifecycle). See [progress.md](docs/progress.md) for the full checklist.
+Phase 1 in progress (single-node container lifecycle). Completed so far:
+
+- Cargo workspace with two binaries (`bun` agent, `relish` CLI) and core library
+- TOML config parsing for all 7 resource types with custom serde deserialisers
+- Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
+- 135 passing tests
+
+See [progress.md](docs/progress.md) for the full checklist.
 
 ## Licence
 
