@@ -661,3 +661,343 @@ test result: ok. 66 passed; 0 failed; 0 ignored
 ```
 
 66 passing tests. No containers yet, no networking, no gossip protocol. Just a solid configuration layer that we can trust completely. Everything we build from here — the container runtime, the health checker, the scheduler — will parse its config through these types. And we know they work.
+
+## The container runtime interface
+
+Now we need something that actually runs containers. That something is Grill.
+
+The name follows the burger theme (Reliaburger, Bun, Relish, Patty, Mustard...), but the architecture is practical. When you run a container on Linux, three layers are involved:
+
+1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
+
+2. **containerd** manages runc. It pulls images, stores them, keeps track of which containers are running, and provides a gRPC API for other programs to talk to. When a container's process dies, containerd knows about it. When the machine reboots, containerd can tell you what was running before.
+
+3. **Grill** manages containerd. It translates our `AppSpec` configuration into the OCI runtime specification that containerd expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
+
+Why not talk to runc directly? Because containerd handles image management, process supervision, and state persistence. Without it, we'd need to reimplement all of that ourselves. And why not use containerd's higher-level CRI (Container Runtime Interface)? Because CRI is designed for Kubernetes, and carries assumptions about pods, sandboxes, and other concepts we don't need. We use containerd's lower-level API and keep full control.
+
+For Phase 1, we're building the parts of Grill that don't need a running containerd daemon: the state machine, port allocation, cgroup computation, and OCI spec generation. These are pure logic, testable on any platform. The actual containerd integration comes later.
+
+## State machines in Rust
+
+Every container goes through a lifecycle. It starts as a request, gets prepared, starts running, might become unhealthy, gets stopped, and might restart. We need to track this precisely, because the wrong state transition — marking a container as "running" when it hasn't passed its health check yet — means sending traffic to a process that isn't ready.
+
+Here's the state machine:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContainerState {
+    Pending,
+    Preparing,
+    Initialising,
+    Starting,
+    HealthWait,
+    Running,
+    Unhealthy,
+    Stopping,
+    Stopped,
+    Failed,
+}
+```
+
+Ten states. Each one means something specific:
+
+- **Pending** — we've received the spec but haven't started work.
+- **Preparing** — pulling the container image.
+- **Initialising** — running init containers (setup tasks that must complete before the main process).
+- **Starting** — the main process is launching.
+- **HealthWait** — it's running, but we haven't confirmed it's healthy yet. No traffic.
+- **Running** — healthy and receiving traffic.
+- **Unhealthy** — health checks are failing. Removed from the service map, no new traffic.
+- **Stopping** — graceful shutdown in progress, draining existing connections.
+- **Stopped** — process has exited, resources cleaned up.
+- **Failed** — permanent failure. Exceeded restart limits, or an init container crashed.
+
+The key insight is that not all transitions are valid. You can't go from `Pending` directly to `Running` — you have to prepare first, start, and pass health checks. You can't go from `Failed` to `Running` — you have to start over from `Pending`. The state machine enforces this:
+
+```rust
+impl ContainerState {
+    pub fn can_transition_to(self, next: ContainerState) -> bool {
+        matches!(
+            (self, next),
+            (Pending, Preparing)
+                | (Preparing, Initialising)
+                | (Preparing, Starting)
+                | (Preparing, Failed)
+                | (Initialising, Starting)
+                | (Initialising, Failed)
+                | (Starting, HealthWait)
+                | (Starting, Failed)
+                | (HealthWait, Running)
+                | (HealthWait, Failed)
+                | (Running, Unhealthy)
+                | (Running, Stopping)
+                | (Unhealthy, Running)
+                | (Unhealthy, Stopping)
+                | (Stopping, Stopped)
+                | (Stopped, Pending)
+        )
+    }
+}
+```
+
+This uses `match`, which is Rust's pattern matching. If you're coming from C, think of `switch`, but the compiler guarantees you handle every case. If you add a new variant to `ContainerState` and forget to add its transitions here, the code won't compile. In C, the `switch` would silently fall through to `default`. In Go, the compiler wouldn't complain either. Rust catches it at build time.
+
+The `matches!()` macro is shorthand for "does this value match any of these patterns?" It returns a `bool`. The `(self, next)` creates a tuple, and each `(Pending, Preparing)` is a pattern that matches when `self` is `Pending` and `next` is `Preparing`. The `|` between patterns means "or" — match any of these.
+
+The `_` wildcard pattern (which you'll see in other `match` expressions) means "I don't care what this value is." It's the catch-all case. But notice we don't use `_` here. We list every valid transition explicitly. If we'd used a catch-all `_ => false`, adding a new state wouldn't trigger a compilation error, and we'd silently miss transitions. By listing them exhaustively, the compiler works for us.
+
+Now look at how we implement `Display` for `ContainerState`:
+
+```rust
+impl fmt::Display for ContainerState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContainerState::Pending => write!(f, "pending"),
+            ContainerState::Preparing => write!(f, "preparing"),
+            ContainerState::Initialising => write!(f, "initialising"),
+            // ... and so on for each variant
+        }
+    }
+}
+```
+
+This is the first time we're implementing a trait by hand rather than deriving it. When we wrote `#[derive(Debug)]`, the compiler generated the `Debug` trait implementation automatically. But `Display` can't be derived — the compiler doesn't know how you want your type displayed to users (should it say "Pending" or "pending" or "PENDING"?). So we write the `impl` block ourselves.
+
+An `impl Trait for Type` block is like implementing an interface in Go or Java, but explicit. In Go, a type satisfies an interface just by having the right methods — you don't declare it. In Rust, you say `impl Display for ContainerState` and the compiler checks that you've provided all the required methods. The `write!()` macro inside `fmt` works like `format!()` but writes to the formatter instead of creating a new string.
+
+## Port allocation: randomness and concurrency
+
+Every container that exposes a port needs a host port mapped to it. When traffic arrives at the host on port 34217, Grill routes it to the container's internal port (say, 8080). We need to hand out these host ports without collisions, and release them when containers stop.
+
+```rust
+#[derive(Debug, Clone)]
+pub struct PortAllocator {
+    range_start: u16,
+    range_end: u16,
+    allocated: Arc<Mutex<HashSet<u16>>>,
+}
+```
+
+Three new concepts packed into one struct.
+
+**`Arc`** stands for "Atomically Reference Counted." In Rust, every value has exactly one owner. When the owner goes out of scope, the value is dropped (freed). This is how Rust avoids garbage collection — the compiler knows at compile time when to free memory. But sometimes multiple parts of your program need to share a value. `Arc` solves this: it wraps a value and keeps a count of how many references exist. When the count reaches zero, the value is dropped. If you're coming from Python or Java, this is roughly what the garbage collector does, but deterministic — you know exactly when it happens, and there are no GC pauses.
+
+**`Mutex`** provides mutual exclusion. Rust normally prevents you from mutating shared data — if two tasks could modify the `HashSet` simultaneously, you'd get a data race, and Rust's ownership rules are designed to make data races a compile-time error. `Mutex` is the escape hatch: it lets you mutate shared data, but only after acquiring a lock. The key word here is `tokio::sync::Mutex`, not `std::sync::Mutex`. The standard library's mutex blocks the OS thread when waiting for the lock. In an async programme, that's catastrophic — it blocks the entire Tokio worker thread, starving every other task on that thread. Tokio's mutex suspends the async task instead, letting the worker thread run other tasks while waiting. In Go, goroutines are preemptively scheduled, so a blocked goroutine doesn't starve others. In Rust, you have to make the right choice yourself.
+
+**`Arc<Mutex<HashSet<u16>>>`** is the idiomatic Rust way to share mutable data across async tasks. `Arc` handles the sharing, `Mutex` handles the mutation, `HashSet` is the actual data. In Go, you'd write a `struct` with a `sync.Mutex` and a `map`. The difference is that in Rust, the compiler won't let you access the `HashSet` without going through the `Mutex` — there's no way to accidentally forget the lock.
+
+Here's how allocation works:
+
+```rust
+pub async fn allocate(&self) -> Result<u16, PortError> {
+    let mut allocated = self.allocated.lock().await;
+    if allocated.len() >= self.total_ports() {
+        return Err(PortError::Exhausted { ... });
+    }
+
+    let mut rng = rand::thread_rng();
+    loop {
+        let port = rng.gen_range(self.range_start..self.range_end);
+        if allocated.insert(port) {
+            return Ok(port);
+        }
+    }
+}
+```
+
+`async fn` and `.await` — this is the first async code in the project. Rust's async model is fundamentally different from Go's goroutines. In Go, every goroutine is independently scheduled by the runtime — you call a function, it might be suspended at any point, and you don't explicitly mark where. In Rust, `async fn` returns a *future* — a value that represents work that hasn't happened yet. Nothing executes until you `.await` it. Each `.await` is an explicit point where the runtime can suspend your task and run another. This is more verbose than Go (you have to write `.await` everywhere), but it makes suspension points visible in the code. You always know where your task might be paused.
+
+`self.allocated.lock().await` acquires the mutex lock. The `.await` is crucial: it means "if the lock is held by another task, suspend me and let other tasks run." Without `.await`, this would be `std::sync::Mutex::lock()`, which blocks the thread.
+
+Why random port selection instead of sequential? Two reasons. Sequential assignment is predictable, which is a minor security concern (an attacker who knows your allocation pattern can guess which ports are in use). And sequential assignment creates hot-spots when containers are frequently created and destroyed — you'd keep reusing the same low ports while the rest of the range sits idle.
+
+`rand::thread_rng()` creates a thread-local random number generator. `rng.gen_range(start..end)` picks a random number in the half-open range `[start, end)`. These come from the `rand` crate, which we added to our dependencies. `allocated.insert(port)` tries to add the port to the set. If it's already there (collision), `insert` returns `false` and we try again. If it succeeds, `insert` returns `true` and we return the port.
+
+## Speaking cgroup v2
+
+Cgroups (control groups) are a Linux kernel feature that limits how much CPU, memory, and other resources a process can use. Every container orchestrator uses them. Kubernetes uses them. Docker uses them. We use them.
+
+cgroup v2 organises limits as a filesystem hierarchy under `/sys/fs/cgroup`. To limit a container's CPU, you write a value to a file. No system calls, no APIs — just write a string to a file. The kernel reads it and enforces the limit.
+
+Reliaburger creates its cgroup hierarchy under `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}`:
+
+```rust
+pub fn cgroup_path(namespace: &str, app_name: &str, instance: u32) -> PathBuf {
+    PathBuf::from(format!("{CGROUP_ROOT}/{namespace}/{app_name}/{instance}"))
+}
+```
+
+`format!()` is Rust's string interpolation macro, similar to Python's f-strings or Go's `fmt.Sprintf`. But unlike `Sprintf`, the compiler checks the format string at compile time. If you reference a variable that doesn't exist, or use the wrong format specifier, you get a compilation error, not a runtime panic.
+
+CPU limits use two parameters. `cpu.max` is a hard limit: "this container can use at most X microseconds of CPU time per Y-microsecond period." `cpu.weight` is proportional sharing: "when the CPU is contended, give this container this share relative to others."
+
+The conversion from millicores (what users write in config) to microseconds (what the kernel expects) is straightforward:
+
+```rust
+pub fn cpu_max_from_millicores(millicores: u64) -> String {
+    let quota_us = millicores * CGROUP_PERIOD_US / 1000;
+    format!("{quota_us} {CGROUP_PERIOD_US}")
+}
+```
+
+500 millicores means "half a CPU." With a 100ms (100,000 microsecond) period, that's 50,000 microseconds of quota: `"50000 100000"`. 1000 millicores is a full CPU: `"100000 100000"`. 2000 millicores is two CPUs: `"200000 100000"` — the kernel allows quota larger than the period.
+
+For `cpu.weight`, we convert millicores to the kernel's 1-10000 range using `.clamp()`:
+
+```rust
+pub fn cpu_weight_from_millicores(millicores: u64) -> u32 {
+    let weight = millicores / 10;
+    (weight as u32).clamp(1, 10000)
+}
+```
+
+`.clamp(min, max)` is a standard library method on numeric types that bounds a value: if it's below `min`, return `min`; if it's above `max`, return `max`; otherwise return it unchanged.
+
+Memory limits are simpler. `memory.max` is the hard limit in bytes — exceed it and the kernel OOM-kills your process. `memory.high` is a soft limit — exceed it and the kernel starts reclaiming memory aggressively, slowing your process down but not killing it. We set `memory.max` to the configured limit and `memory.high` to the request. This gives containers breathing room between "the kernel starts pushing back" and "the kernel kills you."
+
+Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform — your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
+
+## Generating OCI specs
+
+The Open Container Initiative (OCI) runtime specification is a JSON document that tells runc exactly how to create a container: what filesystem to use, what processes to run, what namespaces to create, what resource limits to apply. Containerd passes this spec to runc, and runc does the rest.
+
+We define our own Rust types for the spec rather than importing an external crate:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciSpec {
+    pub root: OciRoot,
+    pub process: OciProcess,
+    pub mounts: Vec<OciMount>,
+    pub linux: OciLinux,
+}
+```
+
+Why not use an existing OCI spec crate? We only need a subset of the full spec. Defining our own types means we control exactly which derives they have, what methods are available, and how they serialise. An external crate might not derive `PartialEq` (needed for tests), or might pull in dependencies we don't want.
+
+The `OciMount` type shows a serde trick we haven't seen:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciMount {
+    pub destination: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PathBuf>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub mount_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+```
+
+`#[serde(rename = "type")]` maps the Rust field name `mount_type` to `"type"` in JSON. We can't name the field `type` because it's a reserved keyword in Rust — you'd use it to define a type alias or trait object. So we pick a Rust-friendly name and tell serde to use the JSON-friendly name on the wire. Every language with JSON serialisation has the same problem. In Go, you'd use a struct tag:
+
+```go
+type OciMount struct {
+    Destination string  `json:"destination"`
+    Source      *string `json:"source,omitempty"`
+    MountType   *string `json:"type,omitempty"`
+    Options     []string `json:"options,omitempty"`
+}
+```
+
+In Python with Pydantic or dataclasses, you'd use `Field(alias="type")`:
+
+```python
+from pydantic import BaseModel, Field
+
+class OciMount(BaseModel):
+    destination: str
+    source: str | None = None
+    mount_type: str | None = Field(None, alias="type")
+    options: list[str] = []
+```
+
+The Rust version is more verbose than Go's struct tags, but more flexible. `skip_serializing_if` lets you control exactly when a field is omitted, rather than relying on Go's all-or-nothing `omitempty` (which, by the way, treats `0` and `false` as empty too — a footgun if you actually want to serialise a zero value).
+
+`#[serde(skip_serializing_if = "Option::is_none")]` omits the field from JSON output when it's `None`. Without it, you'd get `"source": null` in the JSON. The OCI spec doesn't expect null fields — it expects them to be absent entirely. `skip_serializing_if` takes a function name (as a string) that returns `bool`. For `Vec`, we use `"Vec::is_empty"` to skip empty arrays. You can pass any function here — including your own custom ones — which is something neither Go's `omitempty` nor Python's `exclude_none` can do without extra work.
+
+The `generate_oci_spec` function builds the spec from our `AppSpec`:
+
+```rust
+pub fn generate_oci_spec(
+    app_name: &str,
+    namespace: &str,
+    spec: &AppSpec,
+    host_port: Option<u16>,
+    cgroup_path: &str,
+) -> OciSpec { ... }
+```
+
+It iterates the environment variables, building `"KEY=VALUE"` strings:
+
+```rust
+for (key, value) in &spec.env {
+    match value {
+        EnvValue::Plain(v) => env.push(format!("{key}={v}")),
+        EnvValue::Encrypted(v) => env.push(format!("{key}={v}")),
+    }
+}
+```
+
+`for (key, value) in &spec.env` iterates over the `BTreeMap` by reference. The `&` is important: without it, Rust would try to *move* the map out of `spec`, taking ownership. Since we're borrowing `spec` (the function takes `&AppSpec`, not `AppSpec`), we can only borrow its contents. In Go, `range` over a map copies the key and value — there's no distinction. In Rust, you choose between borrowing (`&`), mutable borrowing (`&mut`), and consuming (no `&`). Most of the time you want borrowing.
+
+You might notice that encrypted values are passed through as the literal `ENC[AGE:...]` string. That's intentional. The decryption infrastructure (Sesame PKI) doesn't exist yet — that's Phase 4. Rather than stubbing it out or adding a no-op decrypt function, we pass the encrypted blob through and leave a `// TODO(Phase 4)` comment. The container will see the encrypted string as its environment variable. That's not useful, but it's honest — and it compiles, tests, and ships.
+
+## Designing for what doesn't exist yet
+
+Grill depends on systems we haven't built. The image registry (Pickle, Phase 5) stores and distributes container images. The eBPF service discovery (Onion, Phase 3) routes traffic to healthy containers. The PKI system (Sesame, Phase 4) decrypts secrets and issues workload identity certificates. None of these exist.
+
+We handle this with traits. A trait in Rust is like an interface in Go, but with one important difference: you implement it explicitly.
+
+```rust
+pub trait Grill: Send + Sync {
+    fn create(
+        &self,
+        instance: &InstanceId,
+        spec: &OciSpec,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send;
+
+    fn start(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send;
+
+    // ... stop, kill, state
+}
+```
+
+In Go, any type with the right methods automatically satisfies an interface. In Rust, you write `impl Grill for ContainerdGrill { ... }` and the compiler verifies that you've implemented every method. This is more verbose, but it means you can't accidentally satisfy a trait — it's always intentional.
+
+The trait methods return `impl Future<Output = Result<(), GrillError>> + Send`. Let's break that down. `impl Future<Output = ...>` is Rust 2024's way of writing async methods in traits — earlier editions needed a separate `async-trait` crate to do this. `Result<(), GrillError>` means the method either succeeds (returning nothing, `()`) or fails with a `GrillError`. And `+ Send` means the future can be moved between threads. Tokio is a multi-threaded runtime — it might start running your future on one thread and resume it on another. `Send` is a *marker trait* that tells the compiler "this is safe to send to another thread." If your future holds a reference to something that isn't thread-safe (like an `Rc`, which is a non-atomic reference count), the compiler would reject the `+ Send` bound at compile time.
+
+`InstanceId` is a newtype:
+
+```rust
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct InstanceId(pub String);
+```
+
+This is a tuple struct with one field — it's just a `String` at runtime, with zero overhead. But the compiler treats `InstanceId` and `String` as different types. If you write a function that takes an `InstanceId` and accidentally pass it a `String`, the compiler rejects it. This is Rust's answer to "stringly-typed" APIs. In Go or Python, you'd pass `string` everywhere and rely on variable names and documentation to keep track of what's what. In Rust, the type system does it for you.
+
+The `GrillError` enum shows another thiserror pattern:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum GrillError {
+    #[error("invalid state transition: {0}")]
+    InvalidTransition(#[from] state::InvalidTransition),
+
+    #[error("port allocation failed: {0}")]
+    Port(#[from] PortError),
+
+    // ...
+}
+```
+
+`#[from]` on a variant generates a `From<InvalidTransition> for GrillError` implementation. This means anywhere you have a `Result<_, InvalidTransition>`, you can use `?` to automatically convert it to `Result<_, GrillError>`. No manual error wrapping, no `map_err` calls. The `?` operator does three things: if the result is `Ok`, unwrap the value and continue; if it's `Err`, convert the error using `From` and return early. It's the Rust equivalent of Go's `if err != nil { return err }`, but in three characters instead of three lines.
+
+With the trait defined, Phase 1's implementation focuses on the parts that don't need containerd: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
+
+When we implement the actual containerd integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
