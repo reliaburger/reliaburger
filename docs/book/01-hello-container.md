@@ -1001,3 +1001,442 @@ pub enum GrillError {
 With the trait defined, Phase 1's implementation focuses on the parts that don't need containerd: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
 
 When we implement the actual containerd integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
+
+## The process supervisor
+
+The Grill trait tells us *how* to create and stop containers. But who decides *when* to create them, how many to create, and what to do when one dies? That's the job of Bun, the per-node agent. Its central piece is the `WorkloadSupervisor`, which manages the lifecycle of every workload instance running on a single node.
+
+### WorkloadInstance: what the supervisor tracks
+
+Each container (or, eventually, process) running on the node is represented by a `WorkloadInstance`:
+
+```rust
+pub struct WorkloadInstance {
+    pub id: InstanceId,
+    pub app_name: String,
+    pub namespace: String,
+    pub state: ContainerState,
+    pub health_counters: HealthCounters,
+    pub restart_count: u32,
+    pub last_restart: Option<Instant>,
+    pub host_port: Option<u16>,
+    pub created_at: Instant,
+    pub restart_policy: RestartPolicy,
+    pub health_config: Option<HealthCheckConfig>,
+}
+```
+
+Every field and the struct itself are marked `pub`, which means they're visible outside the module. In Rust, everything is private by default. If you just wrote `struct WorkloadInstance { state: ContainerState, ... }`, the struct and all its fields would only be accessible within `supervisor.rs`. Other modules in the same crate couldn't even name the type, let alone read its fields. `pub` opens things up one level at a time: `pub` on the struct makes the type visible, but each field is still independently private unless it also has `pub`. You can have a public struct with a mix of public and private fields, which is how you expose some data while keeping internal bookkeeping hidden. In C, everything in a header file is public. In Go, capitalisation controls visibility (exported vs unexported). Rust's approach is more granular: you decide per-item, and the compiler enforces it.
+
+For `WorkloadInstance`, we make everything `pub` because the supervisor's callers (the Bun agent's main loop, tests, and eventually the API layer) need to read and sometimes modify instance state directly. If we wanted to protect certain fields, we'd drop the `pub` and add getter methods instead.
+
+The interesting design choice here is storing `health_config` directly on the instance rather than looking it up from the `HealthChecker`. We'll come back to why in a moment.
+
+### Generic structs with trait bounds
+
+The supervisor needs a container runtime to do its work, but we don't want to hardcode which runtime. Here's how Rust handles that:
+
+```rust
+pub struct WorkloadSupervisor<G: Grill> {
+    grill: G,
+    port_allocator: PortAllocator,
+    instances: HashMap<InstanceId, WorkloadInstance>,
+    health_checker: HealthChecker,
+    app_instances: HashMap<(String, String), Vec<InstanceId>>,
+}
+```
+
+The `<G: Grill>` syntax means "this struct is generic over any type `G` that implements the `Grill` trait." If you've used Go, you've seen this with interfaces: a struct holds an `interface` field, and at runtime Go uses a fat pointer (interface value = data pointer + vtable pointer) to dispatch method calls. C++ templates work similarly to Rust generics, but without the trait bound: the compiler checks whether the type has the right methods only when you try to use them, leading to notoriously terrible error messages.
+
+Rust takes a different approach. When you write `WorkloadSupervisor<MockGrill>`, the compiler generates a completely separate copy of `WorkloadSupervisor` with `MockGrill` in place of `G`. Every method call on `self.grill` is a direct, statically-dispatched call. No vtable, no pointer indirection, no runtime cost. This process is called *monomorphisation*, and it's why Rust generics have zero overhead compared to writing the code by hand for each concrete type.
+
+The trade-off is compile time: more concrete types means more code to generate. For our use case (one real implementation plus one mock), that's negligible.
+
+### The secondary index pattern
+
+Look at the `app_instances` field: `HashMap<(String, String), Vec<InstanceId>>`. This maps `(app_name, namespace)` tuples to the list of instance IDs belonging to that app. Why maintain this separately from `instances`?
+
+Because `instances` is keyed by `InstanceId`. If you want to stop all instances of an app called "web" in namespace "prod", you'd have to iterate every instance in the map and check whether its `app_name` and `namespace` match. That's O(n) in the total number of instances on the node.
+
+With the secondary index, it's O(1) to find the right instance IDs, then O(k) to look up each one, where k is the number of replicas for that specific app. At 500 apps with 3 replicas each, that's the difference between scanning 1,500 entries and looking up 3.
+
+In Go you'd probably reach for the same pattern, but the compiler wouldn't force you to think about it. Rust's ownership model makes you explicitly decide how to structure your data, because you can't just iterate a map while mutating entries you find along the way. The borrow checker catches that: you can't hold an immutable iterator over `instances` and simultaneously get a mutable reference to modify an instance. The secondary index is the clean solution.
+
+### Deploying an app
+
+Here's the core of `deploy_app`, showing how the supervisor creates instances:
+
+```rust
+pub async fn deploy_app(
+    &mut self,
+    app_name: &str,
+    namespace: &str,
+    spec: &AppSpec,
+    now: Instant,
+) -> Result<Vec<InstanceId>, BunError> {
+    let replica_count = match spec.replicas {
+        Replicas::Fixed(n) => n,
+        Replicas::DaemonSet => 1,
+    };
+
+    let mut instance_ids = Vec::with_capacity(replica_count as usize);
+
+    for i in 0..replica_count {
+        let instance_id = InstanceId(format!("{app_name}-{i}"));
+
+        let host_port = if spec.port.is_some() {
+            Some(self.port_allocator.allocate().await?)
+        } else {
+            None
+        };
+
+        // ... create WorkloadInstance, register health checks ...
+
+        self.instances.insert(instance_id.clone(), instance);
+        instance_ids.push(instance_id);
+    }
+
+    self.app_instances.insert(
+        (app_name.to_string(), namespace.to_string()),
+        instance_ids.clone(),
+    );
+
+    Ok(instance_ids)
+}
+```
+
+Look at the first parameter: `&mut self`. In Rust, methods receive `self` in one of three ways, and the choice tells the compiler (and anyone reading the code) what the method is allowed to do:
+
+- `&self` borrows the struct immutably. You can read fields but not change them. Multiple `&self` borrows can exist at the same time, because read-only access is always safe to share. This is the default for "getter" methods.
+- `&mut self` borrows the struct mutably. You can read *and* write fields, but the compiler guarantees you're the only one with access. No other reference to the struct can exist while you hold a `&mut`. This is what `deploy_app` needs, because it modifies `self.instances` and `self.app_instances`.
+- `self` (no `&`) takes ownership of the struct entirely. The caller gives up the value and can't use it afterwards. This is rare for methods on long-lived types. You'd use it for a `into_parts()` method that dismantles a struct and returns its pieces.
+
+In C, there's no distinction: you get a pointer, and it's up to you not to mess things up. In Go, methods on pointer receivers (`*T`) can mutate freely, and the compiler won't stop two goroutines from doing it simultaneously. Rust's borrow checker enforces the rule at compile time: if `deploy_app` holds `&mut self`, nothing else can read or write the supervisor until `deploy_app` returns. Data races are structurally impossible.
+
+The other parameters show the read-only side: `app_name: &str` and `spec: &AppSpec` are immutable borrows. The function reads them but doesn't need to own or modify them.
+
+A few more things to notice. The `?` operator after `self.port_allocator.allocate().await?` does double duty: it awaits the future (`.await`), then propagates the error if the allocation failed (`?`). If the port range is exhausted, `allocate()` returns a `PortError`, and the `?` converts it to a `BunError::Port` automatically (via the `#[from]` attribute on the error enum) and returns early.
+
+`Vec::with_capacity(replica_count as usize)` pre-allocates the right amount of memory. Without it, the `Vec` would start empty and double its allocation each time it runs out of space. For small replica counts this doesn't matter. It's a habit worth building: if you know the final size, tell the allocator.
+
+And notice the last line of the function: `Ok(instance_ids)` with no `return` keyword and no semicolon. In Rust, every block (function body, `if` branch, `match` arm) is an expression that evaluates to its last line, as long as that line doesn't end with a semicolon. Adding a semicolon turns an expression into a statement, which evaluates to `()` (Rust's unit type, roughly equivalent to `void`). So `Ok(instance_ids)` is the function's return value, and `Ok(instance_ids);` would be a type error because the function promises to return `Result<Vec<InstanceId>, BunError>`, not `()`.
+
+You can use `return Ok(instance_ids);` explicitly, and you'll see that in early-return situations (the `?` operator is actually shorthand for an early `return Err(...)`). But idiomatic Rust reserves `return` for early exits and uses the implicit expression form for the "happy path" at the end of a function. It takes a day to get used to. After that, explicit `return` at the end of a function starts looking like a code smell.
+
+The same rule applies to `if`/`else`. Look at the `host_port` assignment:
+
+```rust
+let host_port = if spec.port.is_some() {
+    Some(self.port_allocator.allocate().await?)
+} else {
+    None
+};
+```
+
+This isn't special syntax. `if`/`else` is an expression, and each branch evaluates to its last line. The whole thing works like a ternary operator (`condition ? a : b` in C), but it scales to multiple lines without getting unreadable. The semicolon after the closing `};` is there because we're using the `if` expression as a statement (assigning its result to `host_port`).
+
+### Testing with MockGrill
+
+Because `WorkloadSupervisor` is generic over `G: Grill`, testing doesn't require a mocking framework. We define a `MockGrill` in the test module:
+
+```rust
+#[derive(Debug, Clone, Default)]
+struct MockGrill {
+    calls: Arc<Mutex<Vec<(String, InstanceId)>>>,
+}
+
+impl Grill for MockGrill {
+    async fn create(&self, instance: &InstanceId, _spec: &OciSpec)
+        -> Result<(), GrillError>
+    {
+        self.calls.lock().unwrap()
+            .push(("create".to_string(), instance.clone()));
+        Ok(())
+    }
+    // ... same for start, stop, kill, state
+}
+```
+
+This records every call so tests can assert that the right methods were called with the right arguments. The `Arc<Mutex<Vec<...>>>` is a common test pattern in Rust: `Arc` (atomic reference count) lets multiple references exist, `Mutex` makes it safe to mutate from any of them. We use `std::sync::Mutex` here, not `tokio::sync::Mutex`, because in tests we're calling `.unwrap()` anyway and the lock is never held across an `.await` point.
+
+Then in tests:
+
+```rust
+fn test_supervisor() -> WorkloadSupervisor<MockGrill> {
+    let grill = MockGrill::new();
+    let port_allocator = PortAllocator::new(30000, 31000);
+    WorkloadSupervisor::new(grill, port_allocator)
+}
+```
+
+The compiler generates a `WorkloadSupervisor<MockGrill>` that calls `MockGrill` methods directly. In production, we'll create a `WorkloadSupervisor<ContainerdGrill>` that calls the real runtime. Same code, different concrete type, zero runtime overhead.
+
+## Health checking: priority queues and state transitions
+
+A health check answers a simple question: is this container still working? The answer drives the state machine: if a container in `HealthWait` passes enough consecutive checks, it transitions to `Running`. If a `Running` container fails enough consecutive checks, it goes to `Unhealthy`. And if an `Unhealthy` container starts passing again, it recovers back to `Running`.
+
+The tricky part isn't the logic. It's the scheduling.
+
+### Separating scheduling from probing
+
+You could run a health check loop for each container: `loop { sleep(interval); probe(); }`. With 500 containers, that's 500 concurrent loops. It works, but it's wasteful. Most of the time they're just sleeping.
+
+Instead, we use a priority queue. Every health check is an entry with a deadline. The supervisor asks the queue: "what's the next check I need to run, and when?" Then it sleeps until that deadline, runs the check, and schedules the next one. One loop, one sleep, handles all containers.
+
+This separation also makes testing much cleaner. The scheduling logic (when to check) is pure data structure manipulation. The probing logic (HTTP requests) involves network I/O. We can test the first exhaustively without touching a network socket.
+
+### The priority queue
+
+Rust's standard library provides `BinaryHeap`, a max-heap. We want a min-heap (earliest deadline first), so we wrap entries in `Reverse`:
+
+```rust
+pub struct HealthChecker {
+    heap: BinaryHeap<Reverse<HealthCheckEntry>>,
+    configs: HashMap<InstanceId, HealthCheckConfig>,
+}
+```
+
+The `HealthCheckEntry` carries a deadline and an instance ID:
+
+```rust
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct HealthCheckEntry {
+    deadline: Instant,
+    instance_id: InstanceId,
+}
+```
+
+To put something in a `BinaryHeap`, it needs to implement `Ord`. And `Ord` requires `PartialOrd`. This is where Rust differs from most languages.
+
+In Python, you can compare anything to anything. In Go, comparison operators work on comparable types, and if they don't, you pass a `less` function. In Rust, comparison is split into two traits:
+
+- `PartialOrd` means "these values can *sometimes* be compared." Not every pair of values has a defined ordering. The classic example is `f64`: `NaN` is not less than, equal to, or greater than any other value, including itself.
+- `Ord` means "these values have a *total* ordering." Every pair can be compared, and the result is always `Less`, `Equal`, or `Greater`.
+
+`BinaryHeap` requires `Ord` because it needs total ordering to maintain the heap invariant. If two entries couldn't be compared, the heap would break. We implement `Ord` on `HealthCheckEntry` by comparing deadlines:
+
+```rust
+impl Ord for HealthCheckEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deadline.cmp(&other.deadline)
+    }
+}
+
+impl PartialOrd for HealthCheckEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+```
+
+The `PartialOrd` implementation just delegates to `Ord` and wraps the result in `Some`. This is the standard boilerplate when you have a total ordering. It looks redundant, but it exists because Rust won't let you accidentally claim total ordering for a type that doesn't have it (like one containing `f64` fields).
+
+Then `Reverse<HealthCheckEntry>` flips the ordering, turning the max-heap into a min-heap. `Reverse` is just a wrapper in `std::cmp` that reverses the `Ord` implementation. No custom comparator functions, no separate `MinHeap` type.
+
+### Lazy deletion
+
+When an instance is unregistered (say, because it was stopped), we don't scan the heap to remove its entry. That would be O(n). Instead, `unregister` only removes the instance from the `configs` HashMap:
+
+```rust
+pub fn unregister(&mut self, instance_id: &InstanceId) {
+    self.configs.remove(instance_id);
+}
+```
+
+When `pop_due` encounters a stale entry (one whose `instance_id` isn't in `configs`), it skips it:
+
+```rust
+pub fn pop_due(&mut self, now: Instant) -> Option<(InstanceId, HealthCheckConfig)> {
+    while let Some(Reverse(entry)) = self.heap.peek() {
+        if entry.deadline > now {
+            return None;
+        }
+        let Reverse(entry) = self.heap.pop().unwrap();
+        if let Some(config) = self.configs.get(&entry.instance_id) {
+            return Some((entry.instance_id, config.clone()));
+        }
+    }
+    None
+}
+```
+
+This is called lazy deletion. The stale entries sit in the heap until they naturally rise to the top, at which point they're discarded. It's a well-known trick in priority queue implementations. The trade-off is memory: stale entries take up space until they're popped. For our scale (hundreds of containers, not millions), this is fine.
+
+### Explicit time injection
+
+Every method on `HealthChecker` that deals with time takes a `now: Instant` parameter instead of calling `Instant::now()` internally:
+
+```rust
+pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, now: Instant) {
+    let deadline = now + config.initial_delay;
+    // ...
+}
+```
+
+This makes tests completely deterministic. You create an `Instant`, advance it by known amounts, and assert on the results. No flaky tests from timing races. No need for time-mocking libraries. Just pass the time you want.
+
+This is a general pattern worth adopting for any code that depends on the clock: make time a parameter, not a hidden dependency.
+
+### evaluate_result: a pure function
+
+The function that decides state transitions is deliberately stateless:
+
+```rust
+pub fn evaluate_result(
+    status: HealthStatus,
+    counters: &HealthCounters,
+    current_state: ContainerState,
+    config: &HealthCheckConfig,
+) -> Option<ContainerState> {
+    match (current_state, status.is_healthy()) {
+        (ContainerState::HealthWait, true)
+            if counters.consecutive_healthy >= config.threshold_healthy =>
+        {
+            Some(ContainerState::Running)
+        }
+        (ContainerState::Running, false)
+            if counters.consecutive_unhealthy >= config.threshold_unhealthy =>
+        {
+            Some(ContainerState::Unhealthy)
+        }
+        (ContainerState::Unhealthy, true)
+            if counters.consecutive_healthy >= config.threshold_healthy =>
+        {
+            Some(ContainerState::Running)
+        }
+        _ => None,
+    }
+}
+```
+
+It takes all its inputs as parameters, does a `match`, and returns `Option<ContainerState>`. `Some(new_state)` means "transition to this state." `None` means "no change." The caller decides what to do with the result.
+
+The `match` uses Rust's pattern matching with guards (the `if` clauses). The tuple pattern `(current_state, status.is_healthy())` lets us branch on both values simultaneously. The `_` arm catches everything else: states where health check results don't drive transitions (`Pending`, `Preparing`, `Stopping`, etc.).
+
+Making this a free function rather than a method on `HealthChecker` or `WorkloadInstance` is a deliberate choice. It has no hidden state, no side effects, and it's trivially testable. You can write a dozen test cases for it without setting up a supervisor, a mock runtime, or an instance. Just call the function with different inputs and check the output.
+
+## Restart backoff
+
+When a container fails, you want to restart it. But you don't want to restart it immediately, because if it's crashing due to a configuration error or a missing dependency, it'll just crash again. And again. And again. Each failed start consumes CPU, writes logs, and might even make things worse (imagine a container that corrupts a database on startup before crashing).
+
+Exponential backoff solves this: wait 1 second before the first restart, 2 seconds before the second, 4 before the third, 8 before the fourth, and so on. If the failure is transient (a network hiccup, a briefly unavailable dependency), the container recovers quickly. If it's permanent, the restarts space out so you're not burning resources.
+
+### The RestartPolicy struct
+
+```rust
+#[derive(Debug, Clone)]
+pub struct RestartPolicy {
+    pub max_restarts: Option<u32>,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+    pub backoff_multiplier: f64,
+}
+```
+
+`max_restarts` is `Option<u32>`, not `u32`. This is Rust's answer to the sentinel value problem. In Go, you might use `0` to mean "unlimited restarts" and then write a comment explaining it. But what if someone actually wants zero restarts? They can't, because `0` is already taken. The documentation becomes a critical part of the API, and the compiler can't help you if you forget to check it.
+
+With `Option<u32>`, the meaning is unambiguous: `None` means no limit, `Some(5)` means at most 5 restarts. And `match` forces you to handle both cases:
+
+```rust
+pub fn should_restart(&self, restart_count: u32) -> bool {
+    match self.max_restarts {
+        None => true,
+        Some(max) => restart_count < max,
+    }
+}
+```
+
+If you forget to handle one of the variants, the code won't compile. The compiler literally will not let you ignore the `None` case.
+
+### Computing backoff without overflow
+
+The backoff formula is `initial_backoff * multiplier^restart_count`. With a 2x multiplier, after 31 restarts that's 2^31 seconds, which overflows a 32-bit integer. After 63 restarts, it overflows a 64-bit integer. Rust catches integer overflow in debug mode (it panics) but wraps silently in release mode. Neither is what we want.
+
+The solution is to do the arithmetic in floating point:
+
+```rust
+pub fn compute_backoff(&self, restart_count: u32) -> Duration {
+    let base = self.initial_backoff.as_secs_f64();
+    let multiplier = self.backoff_multiplier.powi(restart_count as i32);
+    let uncapped = base * multiplier;
+    let capped = uncapped.min(self.max_backoff.as_secs_f64());
+    Duration::from_secs_f64(capped)
+}
+```
+
+`f64` handles large exponents gracefully. At extreme values, `powi` returns infinity, and `infinity.min(300.0)` is `300.0` (the max backoff). No overflow, no panic, no wrapping. The `.min()` method on floats is exactly the cap we need.
+
+`powi` is "power, integer exponent." It's faster than `powf` (which takes a float exponent) because integer exponentiation can use repeated squaring. The `i` suffix is Rust's naming convention for integer-argument variants.
+
+### The struct update syntax
+
+The `for_job` constructor uses `..Self::default()` to fill in fields it doesn't explicitly set:
+
+```rust
+pub fn for_job(max_restarts: u32) -> Self {
+    Self {
+        max_restarts: Some(max_restarts),
+        ..Self::default()
+    }
+}
+```
+
+`..Self::default()` means "for any field I didn't mention above, take the value from `Self::default()`." It's similar to JavaScript's `{ ...defaults, ...overrides }` spread syntax, but checked at compile time. If `RestartPolicy` gains a new field later, `for_job` will automatically pick up its default. If the new field doesn't have a default (because `Default` isn't derived or implemented for the new type), the compiler will flag it.
+
+## GPU detection: traits for optional dependencies
+
+Some nodes have GPUs. Most don't. We need to know which GPUs are available so the scheduler can place GPU workloads on the right nodes. But GPU detection requires vendor-specific libraries (NVIDIA's NVML, for instance), and we don't want to pull those in as hard dependencies.
+
+### The trait approach
+
+We define a trait:
+
+```rust
+pub trait GpuDetector {
+    fn detect(&self) -> Vec<GpuInfo>;
+}
+```
+
+And a stub that always reports no GPUs:
+
+```rust
+pub struct StubGpuDetector;
+
+impl GpuDetector for StubGpuDetector {
+    fn detect(&self) -> Vec<GpuInfo> {
+        Vec::new()
+    }
+}
+```
+
+The alternative would be conditional compilation:
+
+```rust
+#[cfg(feature = "nvml")]
+fn detect_gpus() -> Vec<GpuInfo> { /* real NVML calls */ }
+
+#[cfg(not(feature = "nvml"))]
+fn detect_gpus() -> Vec<GpuInfo> { Vec::new() }
+```
+
+Both work, but they have different testing properties. With `#[cfg(feature)]`, your CI either compiles with the `nvml` feature (and tests the real GPU path, which requires actual GPU hardware) or without it (and tests nothing interesting). You can't test GPU-aware scheduling on a macOS laptop because the code literally doesn't exist in the binary.
+
+With a trait, you can write a `FakeGpuDetector` that reports synthetic GPUs:
+
+```rust
+struct FakeGpuDetector {
+    gpus: Vec<GpuInfo>,
+}
+
+impl GpuDetector for FakeGpuDetector {
+    fn detect(&self) -> Vec<GpuInfo> {
+        self.gpus.clone()
+    }
+}
+```
+
+Now you can test that the scheduler correctly places a workload requiring 2 GPUs on a node that reports 4, or rejects it when the node only has 1. All without GPU hardware, all on any platform, all in unit tests that run in milliseconds.
+
+The trait boundary is a seam for testing, not just for polymorphism. Define the trait now, use the stub, swap in the real implementation later without changing any callers. This is dependency inversion in Rust: the same principle as in Go or Java, but with zero runtime cost because the compiler monomorphises generic code.
+
+With the Bun agent core in place, we've added 62 tests (bringing the total to 197) covering the supervisor, health checking, restart backoff, and GPU detection. Every state transition is tested. Every edge case in backoff computation is covered. The priority queue correctly orders, lazily deletes, and reschedules. And the mock-based testing pattern we've established here will scale to every subsystem we build next.
