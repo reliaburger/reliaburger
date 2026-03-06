@@ -1119,6 +1119,22 @@ A few more things to notice. The `?` operator after `self.port_allocator.allocat
 
 `Vec::with_capacity(replica_count as usize)` pre-allocates the right amount of memory. Without it, the `Vec` would start empty and double its allocation each time it runs out of space. For small replica counts this doesn't matter. It's a habit worth building: if you know the final size, tell the allocator.
 
+And notice the last line of the function: `Ok(instance_ids)` with no `return` keyword and no semicolon. In Rust, every block (function body, `if` branch, `match` arm) is an expression that evaluates to its last line, as long as that line doesn't end with a semicolon. Adding a semicolon turns an expression into a statement, which evaluates to `()` (Rust's unit type, roughly equivalent to `void`). So `Ok(instance_ids)` is the function's return value, and `Ok(instance_ids);` would be a type error because the function promises to return `Result<Vec<InstanceId>, BunError>`, not `()`.
+
+You can use `return Ok(instance_ids);` explicitly, and you'll see that in early-return situations (the `?` operator is actually shorthand for an early `return Err(...)`). But idiomatic Rust reserves `return` for early exits and uses the implicit expression form for the "happy path" at the end of a function. It takes a day to get used to. After that, explicit `return` at the end of a function starts looking like a code smell.
+
+The same rule applies to `if`/`else`. Look at the `host_port` assignment:
+
+```rust
+let host_port = if spec.port.is_some() {
+    Some(self.port_allocator.allocate().await?)
+} else {
+    None
+};
+```
+
+This isn't special syntax. `if`/`else` is an expression, and each branch evaluates to its last line. The whole thing works like a ternary operator (`condition ? a : b` in C), but it scales to multiple lines without getting unreadable. The semicolon after the closing `};` is there because we're using the `if` expression as a statement (assigning its result to `host_port`).
+
 ### Testing with MockGrill
 
 Because `WorkloadSupervisor` is generic over `G: Grill`, testing doesn't require a mocking framework. We define a `MockGrill` in the test module:
