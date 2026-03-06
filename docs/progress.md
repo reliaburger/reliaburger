@@ -9,7 +9,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Cargo workspace setup (binary `bun`, library `reliaburger`, test fixtures)
 - [x] TOML config parsing (App, Job, Secret, ConfigFile, Volume, Permission, Namespace)
 - [x] Grill container runtime interface (containerd/runc, OCI extraction, ports, cgroups)
-- [ ] Bun agent core (process supervisor, health checks, restart logic, GPU detection)
+- [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection)
 - [ ] Relish CLI skeleton (`apply`, `status`, `logs`, `exec`, `inspect`)
 - [ ] All Phase 1 tests green
 
