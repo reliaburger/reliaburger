@@ -4,12 +4,19 @@
 //! Launches a TUI when invoked with no arguments.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use reliaburger::relish::OutputFormat;
+use reliaburger::relish::commands;
 
 #[derive(Parser)]
 #[command(name = "relish", version, about = "Reliaburger CLI")]
 struct Cli {
+    /// Output format: human, json, or yaml.
+    #[arg(long, default_value = "human", global = true)]
+    output: OutputFormat,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -43,14 +50,85 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    match cli.command {
-        Command::Apply { path: _ } => todo!("Phase 1"),
-        Command::Status => todo!("Phase 1"),
-        Command::Logs { name: _ } => todo!("Phase 1"),
-        Command::Exec { app: _, command: _ } => todo!("Phase 1"),
-        Command::Inspect { name: _ } => todo!("Phase 1"),
+    let result = match cli.command {
+        Command::Apply { ref path } => commands::apply(path, cli.output),
+        Command::Status => commands::status(),
+        Command::Logs { ref name } => commands::logs(name),
+        Command::Exec {
+            ref app,
+            ref command,
+        } => commands::exec(app, command),
+        Command::Inspect { ref name } => commands::inspect(name),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn parse_apply_command() {
+        let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Apply { ref path } if path.to_str() == Some("config.toml"))
+        );
+    }
+
+    #[test]
+    fn parse_status_command() {
+        let cli = parse(&["relish", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn parse_exec_with_trailing_args() {
+        let cli = parse(&["relish", "exec", "web", "sh", "-c", "ls"]).unwrap();
+        match cli.command {
+            Command::Exec { app, command } => {
+                assert_eq!(app, "web");
+                assert_eq!(command, vec!["sh", "-c", "ls"]);
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn output_flag_json() {
+        let cli = parse(&["relish", "--output", "json", "status"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Json);
+    }
+
+    #[test]
+    fn output_flag_yaml() {
+        let cli = parse(&["relish", "--output", "yaml", "status"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn default_output_is_human() {
+        let cli = parse(&["relish", "status"]).unwrap();
+        assert_eq!(cli.output, OutputFormat::Human);
+    }
+
+    #[test]
+    fn invalid_output_format_rejected() {
+        let result = parse(&["relish", "--output", "csv", "status"]);
+        assert!(result.is_err());
     }
 }

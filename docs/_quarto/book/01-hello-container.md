@@ -1440,3 +1440,308 @@ Now you can test that the scheduler correctly places a workload requiring 2 GPUs
 The trait boundary is a seam for testing, not just for polymorphism. Define the trait now, use the stub, swap in the real implementation later without changing any callers. This is dependency inversion in Rust: the same principle as in Go or Java, but with zero runtime cost because the compiler monomorphises generic code.
 
 With the Bun agent core in place, we've added 62 tests (bringing the total to 197) covering the supervisor, health checking, restart backoff, and GPU detection. Every state transition is tested. Every edge case in backoff computation is covered. The priority queue correctly orders, lazily deletes, and reschedules. And the mock-based testing pattern we've established here will scale to every subsystem we build next.
+
+## The Relish CLI
+
+We've got a config parser, a container runtime, and a node agent. But so far, the only way to interact with Reliaburger is by writing Rust code. That's fine for tests, not so fine for humans. Time to build the CLI.
+
+Relish is the command-line tool that operators use to interact with a Reliaburger cluster. Think `kubectl`, but with a lot less YAML and a lot more opinion. In Phase 1 we don't have a cluster yet, so Relish can't actually deploy anything. But it can do something genuinely useful: parse a config file, validate it, and show you exactly what *would* happen. A dry-run planner.
+
+### clap and derive macros
+
+Rust has several CLI parsing libraries. We're using [clap](https://docs.rs/clap/latest/clap/), the most widely used one, with its derive API. If you've used Go's `cobra` or Python's `click`, the idea is similar: you define your CLI structure as data types, and the library generates the parser.
+
+Here's what the binary entry point looks like:
+
+```rust
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "relish", version, about = "Reliaburger CLI")]
+struct Cli {
+    #[arg(long, default_value = "human", global = true)]
+    output: OutputFormat,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Apply { path: PathBuf },
+    Status,
+    Logs { name: String },
+    Exec {
+        app: String,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    Inspect { name: String },
+}
+```
+
+Two attributes do the heavy lifting here.
+
+`#[derive(Parser)]` generates the argument parsing code at compile time. It reads the field names and types from your struct, figures out what flags and positional arguments to expect, and writes the parser for you. No runtime reflection, no code generation step — the Rust compiler does it during the normal build. If you add a field with the wrong type, you get a compile error, not a runtime crash.
+
+`#[derive(Subcommand)]` does the same for the command enum. Each variant becomes a subcommand. The variant's fields become that subcommand's arguments. `Apply { path: PathBuf }` means `relish apply <path>` — clap figures out that `path` is a positional argument because it doesn't have `#[arg(long)]` or `#[arg(short)]`.
+
+Compare this to Go's standard `flag` package, where you manually define each flag, parse them, then check which subcommand was used with `os.Args`:
+
+```go
+// Go: manual, repetitive, easy to forget a flag
+applyCmd := flag.NewFlagSet("apply", flag.ExitOnError)
+outputFlag := applyCmd.String("output", "human", "output format")
+switch os.Args[1] {
+case "apply":
+    applyCmd.Parse(os.Args[2:])
+    // ...
+}
+```
+
+Or Python's `argparse`, where the parser is built at runtime:
+
+```python
+# Python: runtime construction, easy to get wrong
+parser = argparse.ArgumentParser()
+subparsers = parser.add_subparsers()
+apply_parser = subparsers.add_parser("apply")
+apply_parser.add_argument("path")
+apply_parser.add_argument("--output", default="human")
+```
+
+With clap's derive API, you get the same result by writing a struct. The compiler catches typos. Adding a new subcommand means adding an enum variant. If you forget to handle it in your `match`, the compiler tells you.
+
+### ValueEnum for flag types
+
+The `--output` flag isn't a `String`. It's an `OutputFormat`:
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Human,
+    Json,
+    Yaml,
+}
+```
+
+`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code.
+
+The `#[default]` attribute on `Human` means you don't even need to specify `--output` — it defaults to human-readable text. This is a Rust enum feature that works with the `Default` trait. In Go you'd check for an empty string; in Python you'd pass `default=` to `argparse`. Here the default is part of the type definition itself.
+
+Why does this matter? Because we use `OutputFormat` in a `match` expression later:
+
+```rust
+pub fn format_output<T: Serialize + fmt::Display>(
+    value: &T,
+    format: OutputFormat,
+) -> Result<String, RelishError> {
+    match format {
+        OutputFormat::Human => Ok(value.to_string()),
+        OutputFormat::Json => serde_json::to_string_pretty(value)
+            .map_err(RelishError::SerialiseJson),
+        OutputFormat::Yaml => serde_yaml::to_string(value)
+            .map_err(RelishError::SerialiseYaml),
+    }
+}
+```
+
+If we ever add a fourth format (say, `Table`), the compiler will refuse to build until we handle it in every `match`. A `String` flag can't do that.
+
+### The plan pattern
+
+The core of Phase 1's CLI value lives in `generate_plan`. It takes a parsed `Config` and produces a structured plan showing what would be deployed:
+
+```rust
+pub fn generate_plan(config: &Config) -> ApplyPlan {
+    let mut entries = Vec::new();
+
+    for (name, app) in &config.app {
+        let mut summary = Vec::new();
+        if let Some(ref image) = app.image {
+            summary.push(("image".to_string(), image.clone()));
+        }
+        summary.push(("replicas".to_string(), app.replicas.to_string()));
+        // ... port, health, memory, cpu, namespace
+        entries.push(PlanEntry {
+            resource: format!("app.{name}"),
+            action: PlanAction::Create,
+            summary,
+        });
+    }
+    // ... jobs, namespaces, permissions
+
+    ApplyPlan {
+        to_create: entries.len(),
+        entries,
+        to_update: 0,
+        to_destroy: 0,
+        unchanged: 0,
+    }
+}
+```
+
+Notice `if let Some(ref image) = app.image`. This is pattern matching with a reference — `ref` borrows the inner `String` instead of moving it out of the `Option`. In Rust, `match` and `if let` can destructure values, and `ref` says "I want to look at this, not take ownership of it." Without `ref`, the compiler would complain that you're trying to move `image` out of a borrowed `app`.
+
+The function iterates `config.app`, which is a `BTreeMap<String, AppSpec>`. We chose `BTreeMap` over `HashMap` back in the config chapter for deterministic ordering — and here's the payoff. The plan entries come out in alphabetical order. Tests can assert on ordering without fragility. The YAML and JSON output is stable across runs. Small decision, compound benefit.
+
+In Phase 1 every resource gets `PlanAction::Create` because there's no cluster state to compare against. In Phase 2, when we have a running cluster, this function will diff the desired state (config file) against the actual state (cluster) and produce `Update`, `Destroy`, and `Unchanged` entries too. The structure is ready for that — we just haven't implemented it yet.
+
+### One data structure, three output formats
+
+`ApplyPlan` implements both `Display` (for human output) and `Serialize` (for JSON and YAML). One struct, three views:
+
+```
+$ relish apply cluster.toml
+
+Relish apply plan:
+
+  + app.web
+      image     myapp:v1.4.2
+      replicas  3
+      port      8080
+      health    /healthz
+
+  + job.db-migrate
+      image     myapp:v1.4.2
+      command   npm run migrate
+
+Plan: 2 to create, 0 to update, 0 to destroy.
+```
+
+```
+$ relish --output json apply cluster.toml
+{
+  "entries": [
+    {
+      "resource": "app.web",
+      "action": "create",
+      "summary": [["image", "myapp:v1.4.2"], ...]
+    }
+  ],
+  "to_create": 2,
+  ...
+}
+```
+
+YAML output is there for Kubernetes refugees who want the comfort of familiar syntax. `serde_yaml` makes it trivial — same `#[derive(Serialize)]`, different serialiser.
+
+The `Display` implementation for `ApplyPlan` uses `write!` and `writeln!` macros, which work like `format!` but write directly to a formatter instead of allocating a new string. The `+` prefix on each entry is the `Display` implementation for `PlanAction`:
+
+```rust
+impl fmt::Display for PlanAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PlanAction::Create => write!(f, "+"),
+        }
+    }
+}
+```
+
+If you've used Terraform, this will look familiar. Green `+` for create, yellow `~` for update (Phase 2), red `-` for destroy (Phase 2). Same idea, applied to container workloads instead of cloud infrastructure.
+
+### Error handling: library vs binary
+
+The Relish module has its own error type:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum RelishError {
+    #[error("{0}")]
+    Config(#[from] ConfigError),
+
+    #[error("failed to serialise JSON: {0}")]
+    SerialiseJson(serde_json::Error),
+
+    #[error("failed to serialise YAML: {0}")]
+    SerialiseYaml(serde_yaml::Error),
+
+    #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
+    AgentRequired { command: String },
+}
+```
+
+Two things worth pointing out. First, `#[from] ConfigError` generates a `From<ConfigError> for RelishError` implementation, which lets the `?` operator automatically convert config errors. When `Config::from_file(path)?` fails inside `apply()`, the `ConfigError` gets wrapped into `RelishError::Config` without any manual conversion.
+
+Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don't use `#[from]`. They can't, because `#[from]` generates `From<E>` implementations, and both `serde_json::Error` and `serde_yaml::Error` would conflict — Rust's orphan rules don't allow two blanket `From` impls that could overlap. Instead, we use `.map_err(RelishError::SerialiseJson)` at the call site. A small bit of ceremony, but it makes the error's origin unambiguous.
+
+The binary's `main()` function doesn't use `anyhow::Result` anymore. Instead, it returns `ExitCode`:
+
+```rust
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Apply { ref path } => commands::apply(path, cli.output),
+        Command::Status => commands::status(),
+        // ...
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+```
+
+`ExitCode` is from Rust's standard library (`std::process::ExitCode`). It lets you return a proper exit code to the shell without going through `anyhow`'s default error printing, which includes a `Error:` prefix and the Debug representation. We want clean, lowercase error messages on stderr, so we format them ourselves with `eprintln!`.
+
+The split is: `thiserror` in the library for structured, matchable errors. Manual `ExitCode` in the binary for clean user-facing output. The library defines *what* went wrong; the binary decides *how* to tell the user.
+
+### Graceful stubs
+
+The previous version of the binary had `todo!("Phase 1")` in every match arm. That compiles, but it panics at runtime with a stack trace. Not a great user experience.
+
+Now, the stub commands return structured errors:
+
+```rust
+pub fn status() -> Result<(), RelishError> {
+    Err(RelishError::AgentRequired {
+        command: "status".to_string(),
+    })
+}
+```
+
+Running `relish status` prints:
+
+```
+error: status requires a running Bun agent (not available in single-node mode yet)
+```
+
+No stack trace, no panic, proper exit code. The error message tells you *what's* wrong and *why*. When Phase 2 adds the agent, we'll replace the error return with real logic, and the function signature won't change.
+
+### Testing CLI argument parsing
+
+You might wonder: how do you test a `main()` function? You don't. You test the argument parsing separately:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn parse_apply_command() {
+        let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
+        assert!(matches!(cli.command,
+            Command::Apply { ref path } if path.to_str() == Some("config.toml")));
+    }
+
+    #[test]
+    fn invalid_output_format_rejected() {
+        assert!(parse(&["relish", "--output", "csv", "status"]).is_err());
+    }
+}
+```
+
+`Cli::try_parse_from` parses from a string slice instead of reading `std::env::args()`. Same parsing logic, no process spawning needed. The test for invalid output proves that clap rejects unknown formats at parse time — our `ValueEnum` derive handles it.
+
+The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. The stub commands get one test each, proving they return the right `AgentRequired` error variant.
+
+With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). The CLI parses five subcommands with a global `--output` flag. `apply` does real work — it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats — human, JSON, YAML — work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
