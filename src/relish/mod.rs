@@ -1,0 +1,33 @@
+/// Relish CLI library.
+///
+/// Separates CLI logic from the binary so it can be tested as a library.
+/// The binary (`src/bin/relish.rs`) handles argument parsing and exit codes;
+/// this module handles everything else.
+pub mod commands;
+pub mod output;
+pub mod plan;
+
+pub use output::OutputFormat;
+pub use plan::{ApplyPlan, PlanAction, PlanEntry};
+
+use crate::config::ConfigError;
+
+/// Errors from Relish CLI operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RelishError {
+    /// Configuration parse or validation failure.
+    #[error("{0}")]
+    Config(#[from] ConfigError),
+
+    /// JSON serialisation failure.
+    #[error("failed to serialise JSON: {0}")]
+    SerialiseJson(serde_json::Error),
+
+    /// YAML serialisation failure.
+    #[error("failed to serialise YAML: {0}")]
+    SerialiseYaml(serde_yaml::Error),
+
+    /// Command requires a running Bun agent.
+    #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
+    AgentRequired { command: String },
+}
