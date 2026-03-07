@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
-use crate::grill::oci::generate_oci_spec;
+use crate::config::job::JobSpec;
+use crate::grill::oci::{generate_job_oci_spec, generate_oci_spec};
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
@@ -111,6 +112,8 @@ impl<G: Grill> BunAgent<G> {
                 }
                 _ = health_interval.tick() => {
                     self.run_health_checks().await;
+                    self.check_jobs().await;
+                    self.drive_pending_restarts().await;
                 }
             }
         }
@@ -146,7 +149,7 @@ impl<G: Grill> BunAgent<G> {
         }
     }
 
-    /// Deploy all apps from a config.
+    /// Deploy all apps and jobs from a config.
     async fn deploy(&mut self, config: Config) -> Result<ApplyResult, BunError> {
         let now = Instant::now();
         let mut all_ids = Vec::new();
@@ -161,6 +164,21 @@ impl<G: Grill> BunAgent<G> {
             // Drive each instance through Pending → Preparing → Starting → HealthWait
             for id in &ids {
                 self.drive_instance_startup(id, app_name, namespace, spec)
+                    .await?;
+            }
+
+            all_ids.extend(ids.iter().map(|id| id.0.clone()));
+        }
+
+        for (job_name, spec) in &config.job {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            let ids = self
+                .supervisor
+                .deploy_job(job_name, namespace, spec, now)
+                .await?;
+
+            for id in &ids {
+                self.drive_job_startup(id, job_name, namespace, spec)
                     .await?;
             }
 
@@ -214,7 +232,59 @@ impl<G: Grill> BunAgent<G> {
             .create(instance_id, &oci_spec)
             .await?;
 
-        // Preparing → Starting
+        // Store OCI spec for restart re-drive
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.oci_spec = Some(oci_spec);
+        }
+
+        // Run init containers if any
+        if !spec.init.is_empty() {
+            // Preparing → Initialising
+            {
+                let instance = self
+                    .supervisor
+                    .get_instance_mut(instance_id)
+                    .ok_or_else(|| BunError::InstanceNotFound {
+                        instance_id: instance_id.clone(),
+                    })?;
+                instance.state = instance.state.transition_to(ContainerState::Initialising)?;
+            }
+
+            for (i, init_spec) in spec.init.iter().enumerate() {
+                let init_id = InstanceId(format!("{}-init-{i}", instance_id.0));
+                let init_oci = crate::grill::oci::generate_init_oci_spec(
+                    &init_spec.command,
+                    namespace,
+                    app_name,
+                    &cgroup_str,
+                );
+
+                self.supervisor.grill().create(&init_id, &init_oci).await?;
+                self.supervisor.grill().start(&init_id).await?;
+
+                // Wait for init container to complete
+                let failed = loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let state = self.supervisor.grill().state(&init_id).await?;
+                    if state == ContainerState::Stopped {
+                        let exit_code = self.supervisor.grill().exit_code(&init_id).await;
+                        break exit_code != Some(0);
+                    }
+                };
+
+                if failed {
+                    if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+                        instance.state = instance.state.transition_to(ContainerState::Failed)?;
+                    }
+                    return Err(BunError::InitContainerFailed {
+                        instance_id: instance_id.clone(),
+                        init_index: i,
+                    });
+                }
+            }
+        }
+
+        // Preparing/Initialising → Starting
         {
             let instance = self
                 .supervisor
@@ -240,6 +310,75 @@ impl<G: Grill> BunAgent<G> {
             if instance.health_config.is_none() {
                 instance.state = instance.state.transition_to(ContainerState::Running)?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Drive a job instance through startup: Pending → Preparing → Starting → Running.
+    ///
+    /// Jobs skip health checks and go straight to Running.
+    async fn drive_job_startup(
+        &mut self,
+        instance_id: &InstanceId,
+        job_name: &str,
+        namespace: &str,
+        spec: &JobSpec,
+    ) -> Result<(), BunError> {
+        // Pending → Preparing
+        {
+            let instance = self
+                .supervisor
+                .get_instance_mut(instance_id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                })?;
+            instance.state = instance.state.transition_to(ContainerState::Preparing)?;
+        }
+
+        let instance_index: u32 = instance_id
+            .0
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, job_name, instance_index);
+        let cgroup_str = cgroup_path.to_string_lossy();
+        let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str);
+
+        self.supervisor
+            .grill()
+            .create(instance_id, &oci_spec)
+            .await?;
+
+        // Store OCI spec for restart re-drive
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.oci_spec = Some(oci_spec);
+        }
+
+        // Preparing → Starting
+        {
+            let instance = self
+                .supervisor
+                .get_instance_mut(instance_id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                })?;
+            instance.state = instance.state.transition_to(ContainerState::Starting)?;
+        }
+
+        self.supervisor.grill().start(instance_id).await?;
+
+        // Starting → HealthWait → Running (no health checks for jobs)
+        {
+            let instance = self
+                .supervisor
+                .get_instance_mut(instance_id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: instance_id.clone(),
+                })?;
+            instance.state = instance.state.transition_to(ContainerState::HealthWait)?;
+            instance.state = instance.state.transition_to(ContainerState::Running)?;
         }
 
         Ok(())
@@ -281,6 +420,155 @@ impl<G: Grill> BunAgent<G> {
             self.supervisor
                 .health_checker_mut()
                 .schedule_next(instance_id, now);
+        }
+    }
+
+    /// Monitor running job instances for process exit.
+    ///
+    /// For each running job, polls the runtime to see if the process has
+    /// exited. On success (exit code 0), transitions to Stopped. On
+    /// failure, attempts a restart or marks as Failed if the retry limit
+    /// is exhausted.
+    async fn check_jobs(&mut self) {
+        let now = Instant::now();
+
+        // Check running job instances for process exit
+        let running_jobs: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| i.is_job && i.state == ContainerState::Running)
+            .map(|i| i.id.clone())
+            .collect();
+
+        for id in running_jobs {
+            let grill_state = match self.supervisor.grill().state(&id).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            if grill_state == ContainerState::Stopped {
+                let exit_code = self.supervisor.grill().exit_code(&id).await;
+
+                // Transition Running → Stopping → Stopped
+                if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
+                        instance.state = s;
+                    }
+                    if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
+                        instance.state = s;
+                    }
+                }
+
+                if exit_code == Some(0) {
+                    // Job completed successfully — stays in Stopped
+                    continue;
+                }
+
+                // Job failed — attempt restart
+                match self.supervisor.maybe_restart(&id, now).await {
+                    Ok(true) => {
+                        // Now in Pending — drive_pending_restarts will handle it
+                    }
+                    Ok(false) => {
+                        // Backoff not elapsed — will retry on next tick
+                    }
+                    Err(_) => {
+                        // Exceeded restart limit — mark as Failed
+                        if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                            && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
+                        {
+                            instance.state = s;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Retry stopped failed jobs waiting for backoff
+        let stopped_jobs: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| i.is_job && i.state == ContainerState::Stopped && i.restart_count > 0)
+            .map(|i| i.id.clone())
+            .collect();
+
+        for id in stopped_jobs {
+            match self.supervisor.maybe_restart(&id, now).await {
+                Ok(true) => {
+                    // Now in Pending — drive_pending_restarts will handle it
+                }
+                Ok(false) => {
+                    // Still in backoff
+                }
+                Err(_) => {
+                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                        && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
+                    {
+                        instance.state = s;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-drive instances that are in Pending state after a restart.
+    ///
+    /// When `maybe_restart` transitions an instance back to Pending,
+    /// this method picks it up and drives it through the startup
+    /// sequence again using the stored OCI spec.
+    async fn drive_pending_restarts(&mut self) {
+        let pending_restarts: Vec<(InstanceId, crate::grill::oci::OciSpec)> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
+            .filter_map(|i| i.oci_spec.as_ref().map(|spec| (i.id.clone(), spec.clone())))
+            .collect();
+
+        for (id, oci_spec) in pending_restarts {
+            // Pending → Preparing
+            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                match instance.state.transition_to(ContainerState::Preparing) {
+                    Ok(s) => instance.state = s,
+                    Err(_) => continue,
+                }
+            }
+
+            if self
+                .supervisor
+                .grill()
+                .create(&id, &oci_spec)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            // Preparing → Starting
+            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                match instance.state.transition_to(ContainerState::Starting) {
+                    Ok(s) => instance.state = s,
+                    Err(_) => continue,
+                }
+            }
+
+            if self.supervisor.grill().start(&id).await.is_err() {
+                continue;
+            }
+
+            // Starting → HealthWait, then Running if no health checks
+            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                if let Ok(s) = instance.state.transition_to(ContainerState::HealthWait) {
+                    instance.state = s;
+                }
+                if instance.health_config.is_none()
+                    && let Ok(s) = instance.state.transition_to(ContainerState::Running)
+                {
+                    instance.state = s;
+                }
+            }
         }
     }
 
@@ -394,12 +682,23 @@ mod tests {
         mpsc::Sender<AgentCommand>,
         CancellationToken,
     ) {
+        let (agent, tx, shutdown, _grill) = test_agent_with_grill();
+        (agent, tx, shutdown)
+    }
+
+    fn test_agent_with_grill() -> (
+        BunAgent<MockGrill>,
+        mpsc::Sender<AgentCommand>,
+        CancellationToken,
+        MockGrill,
+    ) {
         let (tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
+        let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
         let agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
-        (agent, tx, shutdown)
+        (agent, tx, shutdown, grill_handle)
     }
 
     fn basic_config() -> Config {
@@ -643,6 +942,190 @@ mod tests {
         })
         .await
         .unwrap();
+        let result = resp_rx.await.unwrap();
+        assert!(result.is_err());
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    fn job_config() -> Config {
+        let toml_str = r#"
+            [job.migrate]
+            image = "myapp:v1"
+            command = ["echo", "done"]
+        "#;
+        Config::parse(toml_str).unwrap()
+    }
+
+    fn mixed_config() -> Config {
+        let toml_str = r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+
+            [job.migrate]
+            image = "myapp:v1"
+            command = ["echo", "done"]
+        "#;
+        Config::parse(toml_str).unwrap()
+    }
+
+    #[tokio::test]
+    async fn deploy_job_creates_instance() {
+        let (mut agent, tx, shutdown) = test_agent();
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Deploy {
+            config: job_config(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+
+        let result = resp_rx.await.unwrap().unwrap();
+        assert_eq!(result.created, 1);
+        assert_eq!(result.instances, vec!["migrate-0"]);
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_job_starts_in_running() {
+        let (mut agent, tx, shutdown) = test_agent();
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Deploy {
+            config: job_config(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+        resp_rx.await.unwrap().unwrap();
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+
+        let statuses = resp_rx.await.unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].app_name, "migrate");
+        assert_eq!(statuses[0].state, "running");
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_mixed_apps_and_jobs() {
+        let (mut agent, tx, shutdown) = test_agent();
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Deploy {
+            config: mixed_config(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+
+        let result = resp_rx.await.unwrap().unwrap();
+        assert_eq!(result.created, 2);
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+
+        let statuses = resp_rx.await.unwrap();
+        assert_eq!(statuses.len(), 2);
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    fn config_with_init_container() -> Config {
+        let toml_str = r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+
+            [[app.web.init]]
+            command = ["echo", "init"]
+        "#;
+        Config::parse(toml_str).unwrap()
+    }
+
+    #[tokio::test]
+    async fn deploy_with_init_container_succeeds() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+
+        // Pre-configure: init container exits successfully
+        let init_id = InstanceId("web-0-init-0".to_string());
+        grill.set_state(&init_id, ContainerState::Stopped);
+        grill.set_exit_code(&init_id, Some(0));
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Deploy {
+            config: config_with_init_container(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+
+        let result = resp_rx.await.unwrap().unwrap();
+        assert_eq!(result.created, 1);
+
+        // App should reach running after successful init
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let statuses = resp_rx.await.unwrap();
+        assert_eq!(statuses[0].state, "running");
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_with_failing_init_container_fails() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+
+        // Pre-configure: init container exits with failure
+        let init_id = InstanceId("web-0-init-0".to_string());
+        grill.set_state(&init_id, ContainerState::Stopped);
+        grill.set_exit_code(&init_id, Some(1));
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Deploy {
+            config: config_with_init_container(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+
         let result = resp_rx.await.unwrap();
         assert!(result.is_err());
 

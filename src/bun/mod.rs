@@ -57,4 +57,11 @@ pub enum BunError {
         restart_count: u32,
         max_restarts: u32,
     },
+
+    /// An init container failed during startup.
+    #[error("init container {init_index} failed for instance {instance_id}")]
+    InitContainerFailed {
+        instance_id: InstanceId,
+        init_index: usize,
+    },
 }

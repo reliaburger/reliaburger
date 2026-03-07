@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.as_array().unwrap().len() >= 1);
+        assert!(!json.as_array().unwrap().is_empty());
 
         shutdown.cancel();
     }
