@@ -1,0 +1,21 @@
+# Minimal app configuration for Phase 1.
+#
+# Deploy with:
+#   cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
+#
+# Without a running agent, this shows a dry-run plan.
+# With a running agent (cargo run --bin bun), it deploys for real.
+
+[app.web]
+image = "myapp:v1"
+port = 8080
+
+[app.web.health]
+path = "/healthz"
+interval = 10
+timeout = 5
+threshold_unhealthy = 3
+threshold_healthy = 1
+
+[app.worker]
+image = "worker:v1"

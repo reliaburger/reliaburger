@@ -197,11 +197,11 @@ Global flags:
 Examples:
 
 ```sh
-# Deploy an app (agent must be running)
-cargo run --bin relish -- apply app.toml
+# Deploy the example app (agent must be running)
+cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
 
 # Deploy without agent (shows dry-run plan)
-cargo run --bin relish -- apply app.toml
+cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
 
 # List running workloads
 cargo run --bin relish -- status
@@ -225,7 +225,7 @@ app "web" (myapp:v1)
 
 ## Configuration
 
-Workloads are defined in TOML. A minimal example:
+Workloads are defined in TOML. See [`examples/phase-1-minimal-app.toml`](../examples/phase-1-minimal-app.toml) for a ready-to-apply config, or write your own:
 
 ```toml
 [app.web]

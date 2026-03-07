@@ -22,8 +22,8 @@ cargo build
 # Run the node agent
 cargo run --bin bun
 
-# In another terminal — deploy an app
-cargo run --bin relish -- apply app.toml
+# In another terminal — deploy the example app
+cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
 
 # Check what's running
 cargo run --bin relish -- status
@@ -60,6 +60,8 @@ docs/
   design/              # Detailed design docs per component (14 files)
   book/                # "Building Reliaburger" chapter drafts
   _quarto/             # PDF build configuration
+examples/
+  phase-1-minimal-app.toml  # Ready-to-apply example config
 assets/
   images/              # Logo and project media
 Makefile               # Build, test, lint, format targets
