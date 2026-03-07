@@ -263,3 +263,135 @@ async fn deploy_multiple_apps() {
     let statuses = harness.client.status().await.unwrap();
     assert_eq!(statuses.len(), 2);
 }
+
+#[tokio::test]
+async fn job_runs_to_completion() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [job.migrate]
+        image = "test:v1"
+        command = ["echo", "migration complete"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for the job process to exit (echo is near-instant)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].app_name, "migrate");
+    assert_eq!(
+        statuses[0].state, "stopped",
+        "expected stopped after successful job, got {}",
+        statuses[0].state
+    );
+}
+
+#[tokio::test]
+async fn job_failed_retries_then_fails() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [job.broken]
+        image = "test:v1"
+        command = ["false"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for retries to exhaust (3 retries with exponential backoff)
+    // Backoff: 1s, 2s, 4s — total ~7s plus detection time
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].app_name, "broken");
+    assert_eq!(
+        statuses[0].state, "failed",
+        "expected failed after exhausting retries, got {}",
+        statuses[0].state
+    );
+    assert!(
+        statuses[0].restart_count > 0,
+        "expected restart_count > 0, got {}",
+        statuses[0].restart_count
+    );
+}
+
+#[tokio::test]
+async fn init_container_success_allows_app_start() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.web]
+        image = "test:v1"
+        command = ["sleep", "60"]
+
+        [[app.web.init]]
+        command = ["echo", "init done"]
+    "#,
+    )
+    .unwrap();
+
+    let result = harness.client.apply(&config).await.unwrap();
+    assert_eq!(result.created, 1);
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(statuses[0].state, "running");
+}
+
+#[tokio::test]
+async fn init_container_failure_prevents_start() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.web]
+        image = "test:v1"
+        command = ["sleep", "60"]
+
+        [[app.web.init]]
+        command = ["false"]
+    "#,
+    )
+    .unwrap();
+
+    let result = harness.client.apply(&config).await;
+    assert!(
+        result.is_err(),
+        "expected deploy to fail when init container fails"
+    );
+}
+
+#[tokio::test]
+async fn health_check_triggers_restart() {
+    // App goes unhealthy after 3 healthy responses, then stays unhealthy
+    let test_app = TestApp::start(TestAppMode::UnhealthyAfter(3)).await;
+    let harness = TestHarness::start().await;
+
+    let config = TestHarness::config_for_test_app(test_app.port());
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for: health checks to pass (go running), then fail, then restart
+    // Health interval is 1s, threshold_unhealthy is 2
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let statuses = harness.client.status().await.unwrap();
+    assert!(
+        statuses[0].restart_count > 0,
+        "expected restart_count > 0, got {} (state: {})",
+        statuses[0].restart_count,
+        statuses[0].state
+    );
+
+    test_app.shutdown();
+}
