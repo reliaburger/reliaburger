@@ -62,28 +62,40 @@ impl TestApp {
                                 tokio::spawn(async move {
                                     // Read the request (must consume it before responding)
                                     let mut buf = vec![0u8; 4096];
-                                    let _ = socket.read(&mut buf).await;
+                                    let n = socket.read(&mut buf).await.unwrap_or(0);
+
+                                    // Extract method and path from the request line
+                                    let request_line = std::str::from_utf8(&buf[..n])
+                                        .unwrap_or("")
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("?");
 
                                     let response = match &mode {
                                         TestAppMode::Healthy => {
+                                            println!("{request_line} -> 200");
                                             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
                                                 .to_string()
                                         }
                                         TestAppMode::UnhealthyAfter(n) => {
                                             if count < *n {
+                                                println!("{request_line} -> 200 ({}/{})", count + 1, n);
                                                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
                                                     .to_string()
                                             } else {
+                                                println!("{request_line} -> 500");
                                                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nerror"
                                                     .to_string()
                                             }
                                         }
                                         TestAppMode::Hang => {
+                                            println!("{request_line} -> (hang)");
                                             // Never respond
                                             tokio::time::sleep(Duration::from_secs(3600)).await;
                                             return;
                                         }
                                         TestAppMode::ExitAfter(n) => {
+                                            println!("{request_line} -> 200 ({}/{})", count + 1, n);
                                             if count >= *n {
                                                 token.cancel();
                                             }
@@ -91,6 +103,7 @@ impl TestApp {
                                                 .to_string()
                                         }
                                         TestAppMode::Slow(delay) => {
+                                            println!("{request_line} -> 200 (after {}ms)", delay.as_millis());
                                             tokio::time::sleep(*delay).await;
                                             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
                                                 .to_string()
