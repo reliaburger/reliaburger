@@ -206,6 +206,7 @@ impl Drop for RuncGrill {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grill::Grill;
 
     fn runc_tests_enabled() -> bool {
         std::env::var("RELIABURGER_RUNC_TESTS").is_ok()
