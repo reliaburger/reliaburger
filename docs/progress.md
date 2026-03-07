@@ -11,7 +11,15 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Grill container runtime interface (containerd/runc, OCI extraction, ports, cgroups)
 - [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection)
 - [x] Relish CLI skeleton (`apply`, `status`, `logs`, `exec`, `inspect`)
-- [ ] All Phase 1 tests green
+- [x] ProcessGrill (cross-platform process-based runtime)
+- [x] RuncGrill (Linux-only, calls runc CLI)
+- [x] AppleContainerGrill (macOS-only, calls Apple container CLI)
+- [x] HTTP health probing (reqwest-based probe with timeout)
+- [x] Bun agent event loop (tokio::select, command channels, lifecycle driver)
+- [x] Bun local HTTP API (axum on localhost:9117)
+- [x] Relish HTTP client (live agent calls with dry-run fallback)
+- [x] Integration tests (lifecycle, health checks, restart, CLI)
+- [x] All Phase 1 tests green (268 tests)
 
 ## Phase 2: Cluster Formation
 

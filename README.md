@@ -11,18 +11,49 @@ This repo produces two things simultaneously:
 1. **A working implementation** — complete, testable, simple, bug-free.
 2. **A book** — *Building Reliaburger* — that walks through how we built all of it, teaching Rust and distributed systems along the way.
 
-The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
+The full architectural vision lives in the [whitepaper](docs/whitepaper.md). For installation and usage instructions, see the [documentation](docs/README.md).
+
+## Quick start
+
+```sh
+# Build
+cargo build
+
+# Run the node agent
+cargo run --bin bun
+
+# In another terminal — deploy an app
+cargo run --bin relish -- apply app.toml
+
+# Check what's running
+cargo run --bin relish -- status
+```
+
+See [docs/README.md](docs/README.md) for prerequisites, container runtime setup, and full CLI reference.
 
 ## Repo layout
 
 ```
 src/
   lib.rs               # Core library
-  bin/bun.rs           # Node agent entry point
+  bin/bun.rs           # Node agent (daemon)
   bin/relish.rs        # CLI entry point
   config/              # TOML configuration parsing (7 resource types)
   grill/               # Container runtime interface (state machine, ports, cgroups, OCI)
+    process.rs         # Cross-platform process-based runtime
+    runc.rs            # Linux runc runtime
+    apple.rs           # macOS Apple Container runtime
+  bun/                 # Node agent internals
+    agent.rs           # Event loop (tokio::select, command channels)
+    api.rs             # Local HTTP API (axum, port 9117)
+    probe.rs           # HTTP health probing
+    supervisor.rs      # Workload lifecycle management
+    health.rs          # Health check state machine
+  relish/              # CLI internals
+    client.rs          # HTTP client for bun agent
+    commands.rs        # Subcommand implementations
 docs/
+  README.md            # User documentation (install, build, run)
   whitepaper.md        # Full architectural vision (the "what and why")
   roadmap.md           # 9 implementation phases, tests-first ordering
   progress.md          # What's done, what's next
@@ -37,12 +68,16 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-Phase 1 in progress (single-node container lifecycle). Completed so far:
+**Phase 1 complete** (single-node container lifecycle). 268 passing tests.
 
-- Cargo workspace with two binaries (`bun` agent, `relish` CLI) and core library
 - TOML config parsing for all 7 resource types with custom serde deserialisers
 - Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
-- 135 passing tests
+- Three container runtimes: ProcessGrill (cross-platform), RuncGrill (Linux), AppleContainerGrill (macOS) with auto-detection
+- Bun node agent: event loop with health check timer, command channels, graceful shutdown
+- Local HTTP API (axum on port 9117): deploy, status, stop, logs, health endpoints
+- Relish CLI: `apply` (with dry-run fallback), `status`, `logs`, `inspect`, three output formats
+- HTTP health probing with configurable intervals, timeouts, and thresholds
+- 9 integration tests exercising the full stack end to end
 
 See [progress.md](docs/progress.md) for the full checklist.
 
