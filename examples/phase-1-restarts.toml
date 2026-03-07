@@ -1,0 +1,21 @@
+# App that goes unhealthy and gets restarted.
+#
+# The testapp in "unhealthy-after" mode returns 200 for the first N
+# requests, then 500. Once the health checker accumulates enough
+# failures, it marks the app unhealthy and the agent restarts it.
+# Watch restart_count increment with: relish status
+#
+# Build first:  cargo build
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1-restarts.toml
+
+[app.flaky]
+image = "flaky:v1"
+command = ["target/debug/testapp", "--mode", "unhealthy-after", "--count", "5", "--port", "8080"]
+port = 8080
+
+[app.flaky.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+threshold_healthy = 1

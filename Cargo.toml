@@ -17,6 +17,10 @@ path = "src/bin/bun.rs"
 name = "relish"
 path = "src/bin/relish.rs"
 
+[[bin]]
+name = "testapp"
+path = "src/bin/testapp.rs"
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"

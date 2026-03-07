@@ -1,0 +1,10 @@
+# Job that runs to completion.
+#
+# Jobs are run-to-completion tasks. This one prints a message and exits.
+# Check status with: relish status
+#
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1-job-success.toml
+
+[job.migrate]
+image = "migrate:v1"
+command = ["echo", "migration complete"]

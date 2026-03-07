@@ -33,9 +33,16 @@ pub struct TestApp {
 }
 
 impl TestApp {
-    /// Start the test app in the given mode. Returns immediately.
+    /// Start the test app on an ephemeral port. Returns immediately.
     pub async fn start(mode: TestAppMode) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on_port(mode, 0).await
+    }
+
+    /// Start the test app on a specific port (0 = ephemeral). Returns immediately.
+    pub async fn start_on_port(mode: TestAppMode, port: u16) -> Self {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
