@@ -18,7 +18,7 @@ pub mod state;
 use std::fmt;
 
 pub use cgroup::{CgroupParams, cgroup_path, compute_cgroup_params, cpu_max_from_millicores};
-pub use oci::{OciSpec, generate_oci_spec};
+pub use oci::{OciSpec, generate_job_oci_spec, generate_oci_spec};
 pub use port::{PortAllocator, PortError};
 pub use process::ProcessGrill;
 pub use state::ContainerState;
@@ -99,6 +99,18 @@ pub trait Grill: Send + Sync {
         let _ = instance;
         std::future::ready(None)
     }
+
+    /// Get the exit code of a stopped instance.
+    ///
+    /// Returns `None` if the instance hasn't exited, doesn't exist,
+    /// or the runtime doesn't track exit codes.
+    fn exit_code(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Option<i32>> + Send {
+        let _ = instance;
+        std::future::ready(None)
+    }
 }
 
 /// Runtime-selected Grill implementation.
@@ -175,6 +187,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.pid(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.pid(instance).await,
+        }
+    }
+
+    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        match self {
+            AnyGrill::Process(g) => g.exit_code(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.exit_code(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.exit_code(instance).await,
         }
     }
 }

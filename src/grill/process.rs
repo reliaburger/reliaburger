@@ -22,6 +22,7 @@ struct ProcessEntry {
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
+    exit_code: Option<i32>,
 }
 
 /// Process-based Grill implementation.
@@ -70,7 +71,10 @@ impl Default for ProcessGrill {
 impl super::Grill for ProcessGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         let mut procs = self.processes.lock().await;
-        if procs.contains_key(instance) {
+        // Allow re-creation of stopped instances (needed for restart)
+        if let Some(existing) = procs.get(instance)
+            && existing.state != ContainerState::Stopped
+        {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "instance already exists".to_string(),
@@ -84,6 +88,7 @@ impl super::Grill for ProcessGrill {
                 state: ContainerState::Pending,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
+                exit_code: None,
             },
         );
         Ok(())
@@ -223,14 +228,16 @@ impl super::Grill for ProcessGrill {
         // Check if the process has exited
         if let Some(ref mut child) = entry.child {
             match child.try_wait() {
-                Ok(Some(_status)) => {
+                Ok(Some(status)) => {
                     entry.state = ContainerState::Stopped;
+                    entry.exit_code = status.code();
                 }
                 Ok(None) => {
                     // Still running — keep current state
                 }
                 Err(_) => {
                     entry.state = ContainerState::Stopped;
+                    entry.exit_code = None;
                 }
             }
         }
@@ -242,6 +249,12 @@ impl super::Grill for ProcessGrill {
         let procs = self.processes.lock().await;
         let entry = procs.get(instance)?;
         entry.child.as_ref().and_then(|c| c.id())
+    }
+
+    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        let procs = self.processes.lock().await;
+        let entry = procs.get(instance)?;
+        entry.exit_code
     }
 }
 
