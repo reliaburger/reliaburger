@@ -19,7 +19,14 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Bun local HTTP API (axum on localhost:9117)
 - [x] Relish HTTP client (live agent calls with dry-run fallback)
 - [x] Integration tests (lifecycle, health checks, restart, CLI)
-- [x] All Phase 1 tests green (268 tests)
+- [x] `command` field on AppSpec (run custom processes via ProcessGrill)
+- [x] TestApp standalone binary (`cargo run --bin testapp`)
+- [x] Job execution (deploy, run-to-completion, retry with backoff, failure)
+- [x] Init container execution (sequential run, failure prevents main start)
+- [x] Restart re-drive (health check and job restarts re-start instances)
+- [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill)
+- [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container)
+- [x] All Phase 1 tests green (285 tests)
 
 ## Phase 2: Cluster Formation
 

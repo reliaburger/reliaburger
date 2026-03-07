@@ -223,13 +223,37 @@ app "web" (myapp:v1)
 (dry run — bun agent not reachable, showing plan only)
 ```
 
+### TestApp utility
+
+A built-in test HTTP server with configurable behaviour:
+
+```sh
+cargo run --bin testapp -- --mode healthy --port 8080
+cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
+cargo run --bin testapp -- --mode hang --port 8080
+cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
+```
+
+Used in the example configs to demonstrate health checks, restarts, and lifecycle transitions with ProcessGrill.
+
 ## Configuration
 
-Workloads are defined in TOML. See [`examples/phase-1-minimal-app.toml`](../examples/phase-1-minimal-app.toml) for a ready-to-apply config, or write your own:
+Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-apply configs:
+
+| Example | Demonstrates |
+|---------|-------------|
+| [`phase-1-minimal-app.toml`](../examples/phase-1-minimal-app.toml) | App with health check + worker without |
+| [`phase-1-restarts.toml`](../examples/phase-1-restarts.toml) | App that goes unhealthy and gets restarted |
+| [`phase-1-job-success.toml`](../examples/phase-1-job-success.toml) | Job that runs to completion |
+| [`phase-1-job-failure.toml`](../examples/phase-1-job-failure.toml) | Job that fails and gets retried |
+| [`phase-1-init-container.toml`](../examples/phase-1-init-container.toml) | App with init container |
+
+### Apps
 
 ```toml
 [app.web]
 image = "myapp:v1"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
 port = 8080
 
 [app.web.health]
@@ -238,7 +262,32 @@ interval = 10
 timeout = 5
 ```
 
-For the full configuration reference (resource limits, replicas, environment variables, volumes, jobs, secrets, namespaces), see the book chapter [Hello, Container](book/01-hello-container.md).
+The `image` field is required for real runtimes (runc, Apple Container) but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
+
+### Jobs
+
+Jobs are run-to-completion tasks. They retry up to 3 times with exponential backoff on failure.
+
+```toml
+[job.migrate]
+image = "myapp:v1"
+command = ["echo", "migration complete"]
+```
+
+### Init containers
+
+Init containers run sequentially before the main app starts. If any init container fails, the app transitions to Failed.
+
+```toml
+[app.web]
+image = "myapp:v1"
+command = ["sleep", "60"]
+
+[[app.web.init]]
+command = ["echo", "initialising database"]
+```
+
+For the full configuration reference (resource limits, replicas, environment variables, volumes, secrets, namespaces), see the book chapter [Hello, Container](book/01-hello-container.md).
 
 ## Runtime auto-detection
 

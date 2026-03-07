@@ -38,6 +38,7 @@ src/
   lib.rs               # Core library
   bin/bun.rs           # Node agent (daemon)
   bin/relish.rs        # CLI entry point
+  bin/testapp.rs       # Configurable test HTTP server
   config/              # TOML configuration parsing (7 resource types)
   grill/               # Container runtime interface (state machine, ports, cgroups, OCI)
     process.rs         # Cross-platform process-based runtime
@@ -61,7 +62,11 @@ docs/
   book/                # "Building Reliaburger" chapter drafts
   _quarto/             # PDF build configuration
 examples/
-  phase-1-minimal-app.toml  # Ready-to-apply example config
+  phase-1-minimal-app.toml  # App with health check + worker
+  phase-1-restarts.toml     # App that goes unhealthy and restarts
+  phase-1-job-success.toml  # Job that runs to completion
+  phase-1-job-failure.toml  # Job that fails and gets retried
+  phase-1-init-container.toml # App with init container
 assets/
   images/              # Logo and project media
 Makefile               # Build, test, lint, format targets
@@ -70,16 +75,20 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete** (single-node container lifecycle). 268 passing tests.
+**Phase 1 complete** (single-node container lifecycle). 285 passing tests.
 
 - TOML config parsing for all 7 resource types with custom serde deserialisers
 - Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
 - Three container runtimes: ProcessGrill (cross-platform), RuncGrill (Linux), AppleContainerGrill (macOS) with auto-detection
 - Bun node agent: event loop with health check timer, command channels, graceful shutdown
+- Job execution: run-to-completion tasks with exit code tracking, retry with exponential backoff
+- Init containers: sequential pre-start execution, failure prevents main app start
+- Restart re-drive: instances automatically restart through full lifecycle after health check or job failure
 - Local HTTP API (axum on port 9117): deploy, status, stop, logs, health endpoints
 - Relish CLI: `apply` (with dry-run fallback), `status`, `logs`, `inspect`, three output formats
 - HTTP health probing with configurable intervals, timeouts, and thresholds
-- 9 integration tests exercising the full stack end to end
+- TestApp standalone binary for demos and integration tests
+- 14 integration tests exercising the full stack end to end
 
 See [progress.md](docs/progress.md) for the full checklist.
 

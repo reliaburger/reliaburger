@@ -1023,8 +1023,14 @@ pub struct WorkloadInstance {
     pub created_at: Instant,
     pub restart_policy: RestartPolicy,
     pub health_config: Option<HealthCheckConfig>,
+    pub is_job: bool,
+    pub oci_spec: Option<OciSpec>,
 }
 ```
+
+Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have.
+
+`oci_spec` stores the OCI spec that was used to create this instance. Why keep it around? Because when an instance fails and gets restarted, the agent needs to call `grill.create()` again with the same spec. Without storing it, we'd need to regenerate it from the original `AppSpec` or `JobSpec`, which means the agent would need to keep the config around and know which spec belongs to which instance. Storing the OCI spec directly is simpler and self-contained.
 
 Every field and the struct itself are marked `pub`, which means they're visible outside the module. In Rust, everything is private by default. If you just wrote `struct WorkloadInstance { state: ContainerState, ... }`, the struct and all its fields would only be accessible within `supervisor.rs`. Other modules in the same crate couldn't even name the type, let alone read its fields. `pub` opens things up one level at a time: `pub` on the struct makes the type visible, but each field is still independently private unless it also has `pub`. You can have a public struct with a mix of public and private fields, which is how you expose some data while keeping internal bookkeeping hidden. In C, everything in a header file is public. In Go, capitalisation controls visibility (exported vs unexported). Rust's approach is more granular: you decide per-item, and the compiler enforces it.
 
@@ -1170,6 +1176,75 @@ fn test_supervisor() -> WorkloadSupervisor<MockGrill> {
 ```
 
 The compiler generates a `WorkloadSupervisor<MockGrill>` that calls `MockGrill` methods directly. In production, we'll create a `WorkloadSupervisor<ContainerdGrill>` that calls the real runtime. Same code, different concrete type, zero runtime overhead.
+
+### Deploying a job
+
+Apps run forever (or until someone stops them). Jobs run to completion. A database migration, a batch data export, a cleanup script. You start it, it does its thing, it exits. If it fails, you retry a few times. If it keeps failing, you give up.
+
+The supervisor handles both, but the differences show up in the deploy method:
+
+```rust
+pub async fn deploy_job(
+    &mut self,
+    job_name: &str,
+    namespace: &str,
+    _spec: &JobSpec,
+    now: Instant,
+) -> Result<Vec<InstanceId>, BunError> {
+    let instance_id = InstanceId(format!("{job_name}-0"));
+
+    let instance = WorkloadInstance {
+        id: instance_id.clone(),
+        app_name: job_name.to_string(),
+        namespace: namespace.to_string(),
+        state: ContainerState::Pending,
+        health_counters: HealthCounters::new(),
+        restart_count: 0,
+        last_restart: None,
+        host_port: None,
+        created_at: now,
+        restart_policy: RestartPolicy::for_job(3),
+        health_config: None,
+        is_job: true,
+        oci_spec: None,
+    };
+
+    self.instances.insert(instance_id.clone(), instance);
+    // ...
+    Ok(vec![instance_id])
+}
+```
+
+Compare this to `deploy_app`. Three things are different. First, no port allocation. Jobs don't listen for connections, so `host_port` is always `None`. Second, no health check config. There's nothing to probe because the process will exit on its own. Third, the restart policy uses `RestartPolicy::for_job(3)` instead of the app's infinite-restart default. A job gets 3 retry attempts. After that, it's marked Failed and stays there. Nobody wants a broken migration retrying forever.
+
+The `_spec` parameter has a leading underscore. That's Rust telling you the parameter is intentionally unused. Without the underscore, the compiler warns about unused variables. The underscore prefix suppresses the warning while keeping the parameter in the signature for forward compatibility. We'll use the spec in later phases when jobs need environment variables, resource limits, and secrets.
+
+### The `command` field
+
+Both apps and jobs have an optional `command` field in their TOML config:
+
+```toml
+[app.web]
+image = "myapp:v1"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+port = 8080
+```
+
+The `image` field is required by real container runtimes (runc, Apple Container) to know which rootfs to use. But ProcessGrill doesn't pull images. It spawns OS processes. So for ProcessGrill, `command` is what actually matters. If neither `command` nor `image` produces something to run, ProcessGrill falls back to `sleep 86400` as a placeholder.
+
+This split is honest about the difference between development and production. During development, you'll run with ProcessGrill and use `command` to point at local binaries. In production, the OCI image provides the command, and `command` becomes an override (like Kubernetes's `command` field overriding the image's `ENTRYPOINT`).
+
+### The TestApp binary
+
+To make examples and demos meaningful, we ship a configurable test HTTP server:
+
+```sh
+cargo run --bin testapp -- --mode healthy --port 8080
+cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
+cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
+```
+
+It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1-minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
 
 ## Health checking: priority queues and state transitions
 
@@ -2093,6 +2168,8 @@ pub async fn run(&mut self) {
             }
             _ = health_interval.tick() => {
                 self.run_health_checks().await;
+                self.check_jobs().await;
+                self.drive_pending_restarts().await;
             }
         }
     }
@@ -2143,6 +2220,181 @@ async fn drive_instance_startup(
 Each `transition_to` call validates the transition against the state machine. Try to go from Pending to Running directly? The state machine rejects it. This isn't defensive programming — it's the compiler and the state machine working together to ensure the lifecycle always follows the expected sequence.
 
 Health checks happen on the timer tick. For each instance in `HealthWait` or `Running`, the agent probes the health endpoint and feeds the result to the health checker. If the health checker says the instance is now healthy (enough consecutive successful probes), the agent transitions it to `Running`. If it's unhealthy, the agent stops and restarts it, applying backoff between retries.
+
+The health tick also does two more things:
+
+```rust
+_ = health_interval.tick() => {
+    self.run_health_checks().await;
+    self.check_jobs().await;
+    self.drive_pending_restarts().await;
+}
+```
+
+`check_jobs` monitors running jobs for process exit and handles retry logic. `drive_pending_restarts` picks up instances that have been reset to Pending after a failure and drives them through startup again. We'll look at both of these next.
+
+## Jobs, init containers, and restarts
+
+### Monitoring jobs
+
+Apps run forever. Jobs exit. The agent needs to notice when a job process has stopped and decide what to do about it. That's `check_jobs`:
+
+```rust
+async fn check_jobs(&mut self) {
+    let running_jobs: Vec<InstanceId> = self
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|i| i.is_job && i.state == ContainerState::Running)
+        .map(|i| i.id.clone())
+        .collect();
+
+    for id in running_jobs {
+        let grill_state = match self.supervisor.grill().state(&id).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if grill_state == ContainerState::Stopped {
+            let exit_code = self.supervisor.grill().exit_code(&id).await;
+
+            // Transition Running → Stopping → Stopped
+            // ...
+
+            if exit_code == Some(0) {
+                continue;  // success — stays Stopped
+            }
+
+            // Failed — attempt restart
+            match self.supervisor.maybe_restart(&id, now).await {
+                Ok(true) => { /* now Pending */ }
+                Ok(false) => { /* backoff not elapsed */ }
+                Err(_) => { /* exceeded limit — mark Failed */ }
+            }
+        }
+    }
+}
+```
+
+The pattern is: collect, iterate, check. We collect all running job IDs into a `Vec` first, then iterate. Why not iterate directly over `list_instances()`? Because inside the loop we call `self.supervisor.grill().state()`, which borrows the supervisor. If we were iterating over a reference to the supervisor's internal data, the borrow checker would reject the second borrow. Collecting into a `Vec` gives us owned data that doesn't conflict with later borrows. This is a common pattern in Rust when you need to read a collection and then mutate based on what you found.
+
+For each running job, we ask the grill what the process is actually doing. If it's still running, we move on. If it's stopped, we check the exit code. Exit code 0 means success. Anything else means failure, and we try to restart.
+
+### Exit code tracking
+
+How does the grill know the exit code? ProcessGrill stores it when the process exits:
+
+```rust
+async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+    let mut procs = self.processes.lock().await;
+    let entry = procs.get_mut(instance).ok_or(/* ... */)?;
+
+    if entry.state == ContainerState::Running {
+        if let Some(ref mut child) = entry.child {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    entry.state = ContainerState::Stopped;
+                    entry.exit_code = status.code();
+                }
+                // ...
+            }
+        }
+    }
+
+    Ok(entry.state)
+}
+```
+
+`try_wait()` is a non-blocking check. If the child process has exited, it returns `Ok(Some(status))`. If it's still running, `Ok(None)`. We call this on every state check rather than spawning a background waiter, because the health tick already gives us a regular polling interval. `status.code()` returns `Option<i32>`: `Some(0)` for success, `Some(n)` for failure with exit code n, and `None` if the process was killed by a signal (on Unix).
+
+The `exit_code()` method on the `Grill` trait has a default implementation that returns `None`:
+
+```rust
+fn exit_code(
+    &self,
+    instance: &InstanceId,
+) -> impl std::future::Future<Output = Option<i32>> + Send {
+    let _ = instance;
+    std::future::ready(None)
+}
+```
+
+This is a trait method with a default body. Types that implement `Grill` can override it (ProcessGrill does), or accept the default (MockGrill can configure it per test). The `let _ = instance` suppresses the unused-variable warning while keeping the parameter in the signature. `std::future::ready(None)` creates a future that immediately resolves to `None`, which is the async equivalent of `return None` for a synchronous function.
+
+### Init containers
+
+Some apps need setup work before they can start. A database migration, a config file download, a certificate generation. Kubernetes calls these "init containers": processes that run to completion before the main container starts. If any init container fails, the main container never starts.
+
+The agent handles init containers during the startup sequence, between Preparing and Starting:
+
+```rust
+if !spec.init.is_empty() {
+    instance.state = instance.state.transition_to(ContainerState::Initialising)?;
+
+    for (i, init_spec) in spec.init.iter().enumerate() {
+        let init_id = InstanceId(format!("{}-init-{i}", instance_id.0));
+        let init_oci = generate_init_oci_spec(
+            &init_spec.command, namespace, app_name, &cgroup_str,
+        );
+
+        self.supervisor.grill().create(&init_id, &init_oci).await?;
+        self.supervisor.grill().start(&init_id).await?;
+
+        // Wait for init container to complete
+        let failed = loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let state = self.supervisor.grill().state(&init_id).await?;
+            if state == ContainerState::Stopped {
+                let exit_code = self.supervisor.grill().exit_code(&init_id).await;
+                break exit_code != Some(0);
+            }
+        };
+
+        if failed {
+            instance.state = instance.state.transition_to(ContainerState::Failed)?;
+            return Err(BunError::InitContainerFailed {
+                instance_id: instance_id.clone(),
+                init_index: i,
+            });
+        }
+    }
+}
+```
+
+Each init container gets its own `InstanceId` (e.g., `web-0-init-0`, `web-0-init-1`) and a minimal OCI spec. They run sequentially. `.enumerate()` gives us both the index and the value from the iterator, so we can report which init container failed.
+
+The `loop { ... break ... }` pattern is how you write a polling loop in Rust. The `break` expression evaluates to a value (the boolean `failed`), which becomes the value of the `let failed = loop { ... }` expression. This is another case of "everything is an expression": `loop` produces a value via `break`, just like `if`/`else` produces a value via its branches. In C you'd declare `bool failed` before the loop and assign it inside, which is more fragile because the compiler can't verify that the variable is always assigned before the loop exits.
+
+The state transition path for apps with init containers is: Pending → Preparing → Initialising → Starting → HealthWait → Running. Without init containers, it's: Pending → Preparing → Starting → HealthWait → Running. The state machine validates both paths because we added Preparing → Initialising and Initialising → Starting as valid transitions.
+
+### Restart re-drive
+
+When a health check fails or a job exits with a non-zero code, the agent calls `maybe_restart()`. If the restart policy allows it, `maybe_restart` transitions the instance back to Pending, increments the restart counter, and applies exponential backoff. But that leaves the instance sitting in Pending. Something needs to drive it through startup again.
+
+That's `drive_pending_restarts`:
+
+```rust
+async fn drive_pending_restarts(&mut self) {
+    let pending_restarts: Vec<(InstanceId, OciSpec)> = self
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
+        .filter_map(|i| i.oci_spec.as_ref().map(|spec| (i.id.clone(), spec.clone())))
+        .collect();
+
+    for (id, oci_spec) in pending_restarts {
+        // Pending → Preparing → Starting → HealthWait → Running
+        // (same sequence as initial startup, using stored OCI spec)
+    }
+}
+```
+
+The filter logic is specific: only instances that are Pending *and* have been restarted at least once. Fresh deploys are driven by `deploy()` directly. Restarted instances are driven by this method on the next health tick.
+
+`.filter_map()` combines filtering and transforming. For each instance that passes the filter, it tries to extract the OCI spec. `i.oci_spec.as_ref()` converts `Option<OciSpec>` to `Option<&OciSpec>` (borrowing the inner value without moving it), then `.map(|spec| ...)` transforms the `Some` case while leaving `None` unchanged. `filter_map` drops the `None`s and unwraps the `Some`s. In Go, you'd write an `if` inside a `for` loop. The Rust version chains iterators, which avoids the intermediate `Vec` until `.collect()` materialises the results at the end.
+
+This is called the "collect-then-process" pattern. We gather everything we need to act on (releasing the borrow on the supervisor), then iterate and mutate. The alternative would be indexing into the instances map by position, which is both less readable and fragile if the map changes size during iteration.
 
 ## A local API
 
@@ -2320,6 +2572,20 @@ Here's what the integration tests cover:
 
 **`status_empty_when_nothing_deployed`** — verify that a fresh agent reports no instances.
 
+**`logs_for_deployed_app`** — deploy an app, fetch logs, verify they contain the app name.
+
+**`relish_status_returns_expected_output`** — deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
+
+**`job_runs_to_completion`** — deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
+
+**`job_failed_retries_then_fails`** — deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
+
+**`init_container_success_allows_app_start`** — deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
+
+**`init_container_failure_prevents_start`** — deploy an app with an init container that runs `false`. Verify the deploy returns an error. The app should never start.
+
+**`health_check_triggers_restart`** — deploy an app with a health check pointing at a TestApp in `UnhealthyAfter(3)` mode. The app passes 3 health checks (reaching Running), then starts failing. Wait long enough for the failure threshold to trip and the restart to happen. Verify `restart_count > 0`. This is the full lifecycle test: healthy, unhealthy, restart.
+
 Each test is end-to-end: real HTTP, real process spawning, real state machine transitions. The only thing that's fake is the container runtime (ProcessGrill instead of runc). That's exactly the line we want: test the orchestration logic with real I/O, but don't require root privileges or a container runtime to be installed.
 
 ## The bun binary
@@ -2354,8 +2620,12 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle. 
 - `cargo run --bin relish -- status` shows what's running
 - `cargo run --bin relish -- logs web` shows captured output
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
+- `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
+- Jobs run to completion with exit code tracking and retry on failure
+- Init containers run sequentially before the main app, with failure halting the deploy
+- Unhealthy apps get restarted automatically with exponential backoff
 
-268 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, the agent event loop, the API server, the CLI, and 9 integration tests that exercise the full stack end to end.
+285 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, the agent event loop, the API server, the CLI, and 14 integration tests that exercise the full stack end to end.
 
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), image pulling (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 
