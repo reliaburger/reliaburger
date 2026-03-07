@@ -3,6 +3,7 @@
 /// Separates CLI logic from the binary so it can be tested as a library.
 /// The binary (`src/bin/relish.rs`) handles argument parsing and exit codes;
 /// this module handles everything else.
+pub mod client;
 pub mod commands;
 pub mod output;
 pub mod plan;
@@ -30,4 +31,12 @@ pub enum RelishError {
     /// Command requires a running Bun agent.
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
+
+    /// The Bun agent is not reachable.
+    #[error("bun agent not reachable at localhost:9117 (is it running?)")]
+    AgentUnreachable,
+
+    /// The API returned an error.
+    #[error("API error (status {status}): {body}")]
+    ApiError { status: u16, body: String },
 }

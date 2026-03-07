@@ -14,7 +14,13 @@ use super::types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSpec {
     /// OCI image reference. Required for container workloads.
+    /// Ignored by ProcessGrill (which runs `command` as an OS process).
     pub image: Option<String>,
+    /// Command and arguments to run inside the container.
+    /// For ProcessGrill, this is the process that gets spawned.
+    /// For runc/Apple Container, this overrides the image entrypoint.
+    #[serde(default)]
+    pub command: Vec<String>,
     /// Host binary path (Phase 8: process workloads).
     pub exec: Option<PathBuf>,
     /// Inline script content (Phase 8: process workloads).

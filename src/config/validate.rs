@@ -24,8 +24,8 @@ impl Config {
 }
 
 fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
-    // Phase 1: image is required (exec/script deferred to Phase 8)
-    if app.image.is_none() && app.exec.is_none() && app.script.is_none() {
+    // An app needs at least one of: image, command, exec, or script
+    if app.image.is_none() && app.command.is_empty() && app.exec.is_none() && app.script.is_none() {
         return Err(ConfigError::MissingImage {
             name: name.to_string(),
         });

@@ -51,6 +51,7 @@ impl ContainerState {
                 | (ContainerState::Unhealthy, ContainerState::Stopping)
                 | (ContainerState::Stopping, ContainerState::Stopped)
                 | (ContainerState::Stopped, ContainerState::Pending)
+                | (ContainerState::Stopped, ContainerState::Failed)
         )
     }
 
@@ -280,6 +281,24 @@ mod tests {
         let mut state = ContainerState::Pending;
         state = state.transition_to(ContainerState::Preparing).unwrap();
         state = state.transition_to(ContainerState::Initialising).unwrap();
+        state = state.transition_to(ContainerState::Failed).unwrap();
+        assert_eq!(state, ContainerState::Failed);
+    }
+
+    #[test]
+    fn stopped_to_failed_for_exhausted_retries() {
+        assert!(ContainerState::Stopped.can_transition_to(ContainerState::Failed));
+    }
+
+    #[test]
+    fn job_failure_path() {
+        let mut state = ContainerState::Pending;
+        state = state.transition_to(ContainerState::Preparing).unwrap();
+        state = state.transition_to(ContainerState::Starting).unwrap();
+        state = state.transition_to(ContainerState::HealthWait).unwrap();
+        state = state.transition_to(ContainerState::Running).unwrap();
+        state = state.transition_to(ContainerState::Stopping).unwrap();
+        state = state.transition_to(ContainerState::Stopped).unwrap();
         state = state.transition_to(ContainerState::Failed).unwrap();
         assert_eq!(state, ContainerState::Failed);
     }

@@ -1,0 +1,11 @@
+# Job that fails and gets retried.
+#
+# The "false" command always exits with code 1. The agent retries
+# failed jobs up to the restart limit, then marks them as Failed.
+# Check status with: relish status
+#
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1-job-failure.toml
+
+[job.broken]
+image = "broken:v1"
+command = ["false"]
