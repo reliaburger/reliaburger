@@ -90,6 +90,15 @@ pub trait Grill: Send + Sync {
         &self,
         instance: &InstanceId,
     ) -> impl std::future::Future<Output = Result<ContainerState, GrillError>> + Send;
+
+    /// Get the OS process ID for an instance, if available.
+    ///
+    /// Returns `None` for runtimes where the PID isn't directly visible
+    /// (e.g. containers running inside VMs).
+    fn pid(&self, instance: &InstanceId) -> impl std::future::Future<Output = Option<u32>> + Send {
+        let _ = instance;
+        std::future::ready(None)
+    }
 }
 
 /// Runtime-selected Grill implementation.
@@ -156,6 +165,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.state(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.state(instance).await,
+        }
+    }
+
+    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        match self {
+            AnyGrill::Process(g) => g.pid(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.pid(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.pid(instance).await,
         }
     }
 }

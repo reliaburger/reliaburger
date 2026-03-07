@@ -70,6 +70,8 @@ pub struct InstanceStatus {
     pub restart_count: u32,
     /// Allocated host port, if any.
     pub host_port: Option<u16>,
+    /// OS process ID, if available.
+    pub pid: Option<u32>,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
@@ -130,7 +132,7 @@ impl<G: Grill> BunAgent<G> {
                 let _ = response.send(result);
             }
             AgentCommand::Status { response } => {
-                let statuses = self.get_status();
+                let statuses = self.get_status().await;
                 let _ = response.send(statuses);
             }
             AgentCommand::Logs {
@@ -326,19 +328,21 @@ impl<G: Grill> BunAgent<G> {
     }
 
     /// Get status of all instances.
-    fn get_status(&self) -> Vec<InstanceStatus> {
-        self.supervisor
-            .list_instances()
-            .iter()
-            .map(|instance| InstanceStatus {
+    async fn get_status(&self) -> Vec<InstanceStatus> {
+        let mut statuses = Vec::new();
+        for instance in self.supervisor.list_instances() {
+            let pid = self.supervisor.grill().pid(&instance.id).await;
+            statuses.push(InstanceStatus {
                 id: instance.id.0.clone(),
                 app_name: instance.app_name.clone(),
                 namespace: instance.namespace.clone(),
                 state: instance.state.to_string(),
                 restart_count: instance.restart_count,
                 host_port: instance.host_port,
-            })
-            .collect()
+                pid,
+            });
+        }
+        statuses
     }
 
     /// Get logs (placeholder — returns empty for MockGrill, captured output for ProcessGrill).

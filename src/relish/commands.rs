@@ -53,13 +53,17 @@ pub async fn status() -> Result<(), RelishError> {
         println!("no workloads running");
     } else {
         println!(
-            "{:<20} {:<15} {:<12} {:<10} {:<6}",
-            "INSTANCE", "APP", "NAMESPACE", "STATE", "RESTARTS"
+            "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+            "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
         );
         for s in &statuses {
+            let pid = s
+                .pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<20} {:<15} {:<12} {:<10} {:<6}",
-                s.id, s.app_name, s.namespace, s.state, s.restart_count
+                "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
             );
         }
     }
@@ -97,6 +101,9 @@ pub async fn inspect(name: &str) -> Result<(), RelishError> {
             println!("  Namespace: {}", s.namespace);
             println!("  State:     {}", s.state);
             println!("  Restarts:  {}", s.restart_count);
+            if let Some(pid) = s.pid {
+                println!("  PID:       {pid}");
+            }
             if let Some(port) = s.host_port {
                 println!("  Port:      {port}");
             }

@@ -237,6 +237,12 @@ impl super::Grill for ProcessGrill {
 
         Ok(entry.state)
     }
+
+    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        let procs = self.processes.lock().await;
+        let entry = procs.get(instance)?;
+        entry.child.as_ref().and_then(|c| c.id())
+    }
 }
 
 #[cfg(test)]
