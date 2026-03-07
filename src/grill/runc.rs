@@ -16,6 +16,7 @@ use super::{GrillError, InstanceId};
 
 /// Entry for a runc-managed container.
 struct RuncEntry {
+    #[allow(dead_code)]
     bundle_dir: PathBuf,
     #[allow(dead_code)]
     spec: OciSpec,
