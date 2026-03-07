@@ -256,6 +256,7 @@ impl<G: Grill> BunAgent<G> {
                     &init_spec.command,
                     namespace,
                     app_name,
+                    spec.image.as_deref(),
                     &cgroup_str,
                 );
 

@@ -122,8 +122,11 @@ pub fn generate_oci_spec(
 
     OciSpec {
         root: OciRoot {
-            // TODO(Phase 5): resolve via Pickle image cache
-            path: format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs"),
+            // Use the image reference directly (Apple Container needs this).
+            // For runc, Phase 5 (Pickle) will resolve the image to a local rootfs.
+            path: spec.image.clone().unwrap_or_else(|| {
+                format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
+            }),
             readonly: false,
         },
         process: OciProcess {
@@ -314,7 +317,9 @@ pub fn generate_job_oci_spec(
 
     OciSpec {
         root: OciRoot {
-            path: format!("/var/lib/reliaburger/images/{namespace}/{job_name}/rootfs"),
+            path: spec.image.clone().unwrap_or_else(|| {
+                format!("/var/lib/reliaburger/images/{namespace}/{job_name}/rootfs")
+            }),
             readonly: false,
         },
         process: OciProcess {
@@ -338,16 +343,20 @@ pub fn generate_job_oci_spec(
 /// Generate a minimal OCI spec for an init container.
 ///
 /// Init containers run a single command to completion before the main
-/// app starts. No ports, no health checks, no volumes.
+/// app starts. No ports, no health checks, no volumes. The `image`
+/// parameter is typically inherited from the parent app's image.
 pub fn generate_init_oci_spec(
     command: &[String],
     namespace: &str,
     app_name: &str,
+    image: Option<&str>,
     cgroup_path: &str,
 ) -> OciSpec {
     OciSpec {
         root: OciRoot {
-            path: format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs"),
+            path: image.map(String::from).unwrap_or_else(|| {
+                format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
+            }),
             readonly: false,
         },
         process: OciProcess {
@@ -382,13 +391,21 @@ mod tests {
         let spec = minimal_app();
         let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
 
+        assert_eq!(oci.root.path, "test:v1");
+        assert_eq!(oci.process.cwd, "/");
+        assert_eq!(oci.process.user.uid, 65534);
+        assert!(oci.process.env.is_empty());
+    }
+
+    #[test]
+    fn generate_without_image_uses_filesystem_path() {
+        let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+
         assert_eq!(
             oci.root.path,
             "/var/lib/reliaburger/images/default/web/rootfs"
         );
-        assert_eq!(oci.process.cwd, "/");
-        assert_eq!(oci.process.user.uid, 65534);
-        assert!(oci.process.env.is_empty());
     }
 
     #[test]
@@ -581,10 +598,7 @@ mod tests {
         let spec = minimal_job();
         let oci = generate_job_oci_spec("migrate", "default", &spec, "/cgroup/path");
 
-        assert_eq!(
-            oci.root.path,
-            "/var/lib/reliaburger/images/default/migrate/rootfs"
-        );
+        assert_eq!(oci.root.path, "myapp:v1");
         assert_eq!(
             oci.process.args,
             vec!["echo".to_string(), "done".to_string()]
