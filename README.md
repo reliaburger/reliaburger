@@ -23,7 +23,7 @@ cargo build
 cargo run --bin bun
 
 # In another terminal — deploy the example app
-cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
+cargo run --bin relish -- apply examples/phase-1/minimal-app.toml
 
 # Check what's running
 cargo run --bin relish -- status
@@ -62,11 +62,14 @@ docs/
   book/                # "Building Reliaburger" chapter drafts
   _quarto/             # PDF build configuration
 examples/
-  phase-1-minimal-app.toml  # App with health check + worker
-  phase-1-restarts.toml     # App that goes unhealthy and restarts
-  phase-1-job-success.toml  # Job that runs to completion
-  phase-1-job-failure.toml  # Job that fails and gets retried
-  phase-1-init-container.toml # App with init container
+  phase-1/
+    minimal-app.toml           # App with health check + worker
+    restarts.toml              # App that goes unhealthy and restarts
+    job-success.toml           # Job that runs to completion
+    job-failure.toml           # Job that fails and gets retried
+    init-container.toml        # App with init container
+    apple-container-hello.toml # Real container: Alpine hello world
+    apple-container-nginx.toml # Real container: nginx with health check
 assets/
   images/              # Logo and project media
 Makefile               # Build, test, lint, format targets

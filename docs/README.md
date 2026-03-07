@@ -198,10 +198,10 @@ Examples:
 
 ```sh
 # Deploy the example app (agent must be running)
-cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
+cargo run --bin relish -- apply examples/phase-1/minimal-app.toml
 
 # Deploy without agent (shows dry-run plan)
-cargo run --bin relish -- apply examples/phase-1-minimal-app.toml
+cargo run --bin relish -- apply examples/phase-1/minimal-app.toml
 
 # List running workloads
 cargo run --bin relish -- status
@@ -238,15 +238,41 @@ Used in the example configs to demonstrate health checks, restarts, and lifecycl
 
 ## Configuration
 
+### Running real containers (Apple Container)
+
+If you have Apple Container installed, you can run real Docker Hub images:
+
+```sh
+# Terminal 1 — start the agent with Apple Container runtime
+cargo run --bin bun -- --runtime apple
+
+# Terminal 2 — deploy nginx with health checks
+cargo run --bin relish -- apply examples/phase-1/apple-container-nginx.toml
+
+# Check status (nginx should reach Running after health checks pass)
+cargo run --bin relish -- status
+
+# Or run a quick Alpine hello world job
+cargo run --bin relish -- apply examples/phase-1/apple-container-hello.toml
+```
+
+The first deploy will pull the image from Docker Hub, which takes a few seconds. Subsequent deploys reuse the cached image.
+
+The ProcessGrill examples (minimal-app, restarts, etc.) use `command` to run local binaries and work without any container runtime. The apple-container examples use `image` to pull and run real OCI containers.
+
+## Configuration
+
 Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-apply configs:
 
 | Example | Demonstrates |
 |---------|-------------|
-| [`phase-1-minimal-app.toml`](../examples/phase-1-minimal-app.toml) | App with health check + worker without |
-| [`phase-1-restarts.toml`](../examples/phase-1-restarts.toml) | App that goes unhealthy and gets restarted |
-| [`phase-1-job-success.toml`](../examples/phase-1-job-success.toml) | Job that runs to completion |
-| [`phase-1-job-failure.toml`](../examples/phase-1-job-failure.toml) | Job that fails and gets retried |
-| [`phase-1-init-container.toml`](../examples/phase-1-init-container.toml) | App with init container |
+| [`minimal-app.toml`](../examples/phase-1/minimal-app.toml) | App with health check + worker without |
+| [`restarts.toml`](../examples/phase-1/restarts.toml) | App that goes unhealthy and gets restarted |
+| [`job-success.toml`](../examples/phase-1/job-success.toml) | Job that runs to completion |
+| [`job-failure.toml`](../examples/phase-1/job-failure.toml) | Job that fails and gets retried |
+| [`init-container.toml`](../examples/phase-1/init-container.toml) | App with init container |
+| [`apple-container-hello.toml`](../examples/phase-1/apple-container-hello.toml) | Real container: Alpine hello world |
+| [`apple-container-nginx.toml`](../examples/phase-1/apple-container-nginx.toml) | Real container: nginx with health check |
 
 ### Apps
 

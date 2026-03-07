@@ -1,0 +1,20 @@
+# Real container: nginx with health check
+#
+# Pulls nginx:latest from Docker Hub and runs it with health monitoring.
+# Requires Apple Container: brew install container && container system start
+#
+# Usage:
+#   cargo run --bin bun -- --runtime apple
+#   cargo run --bin relish -- apply examples/phase-1/apple-container-nginx.toml
+#   cargo run --bin relish -- status
+
+[app.nginx]
+image = "nginx:latest"
+port = 80
+
+[app.nginx.health]
+path = "/"
+interval = 5
+timeout = 3
+threshold_unhealthy = 3
+threshold_healthy = 1
