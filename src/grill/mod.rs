@@ -1,12 +1,18 @@
 /// Container runtime interface.
 ///
-/// Grill abstracts the container runtime (containerd/runc), providing
-/// container state management, port allocation, cgroup configuration,
-/// and OCI spec generation. The actual containerd gRPC integration
-/// is deferred to the integration test phase.
+/// Grill abstracts the container runtime (runc, Apple Container, or
+/// a simple process fallback), providing container state management,
+/// port allocation, cgroup configuration, and OCI spec generation.
+#[cfg(target_os = "macos")]
+pub mod apple;
 pub mod cgroup;
+#[cfg(test)]
+pub mod mock;
 pub mod oci;
 pub mod port;
+pub mod process;
+#[cfg(target_os = "linux")]
+pub mod runc;
 pub mod state;
 
 use std::fmt;
@@ -14,6 +20,7 @@ use std::fmt;
 pub use cgroup::{CgroupParams, cgroup_path, compute_cgroup_params, cpu_max_from_millicores};
 pub use oci::{OciSpec, generate_oci_spec};
 pub use port::{PortAllocator, PortError};
+pub use process::ProcessGrill;
 pub use state::ContainerState;
 
 /// Unique identifier for a workload instance on this node.
@@ -45,13 +52,13 @@ pub enum GrillError {
 
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
-    // TODO(Phase 1): add containerd client errors when integration is implemented
 }
 
 /// The container runtime interface.
 ///
-/// Abstracts the underlying container runtime (containerd/runc).
-/// The real implementation talks to containerd over gRPC.
+/// Abstracts the underlying container runtime. Implementations exist
+/// for `runc` (Linux), Apple Container (macOS), and plain OS processes
+/// (cross-platform fallback).
 pub trait Grill: Send + Sync {
     /// Create a container from an OCI spec. Does not start it.
     fn create(
@@ -83,4 +90,105 @@ pub trait Grill: Send + Sync {
         &self,
         instance: &InstanceId,
     ) -> impl std::future::Future<Output = Result<ContainerState, GrillError>> + Send;
+}
+
+/// Runtime-selected Grill implementation.
+///
+/// Since `Grill` uses `impl Future` return types (not `dyn`-safe),
+/// we can't use trait objects. This enum dispatches to the concrete
+/// implementation selected at startup.
+pub enum AnyGrill {
+    /// Cross-platform process-based runtime.
+    Process(ProcessGrill),
+    /// Linux runc-based container runtime.
+    #[cfg(target_os = "linux")]
+    Runc(runc::RuncGrill),
+    /// macOS Apple Container runtime.
+    #[cfg(target_os = "macos")]
+    Apple(apple::AppleContainerGrill),
+}
+
+impl Grill for AnyGrill {
+    async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.create(instance, spec).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.create(instance, spec).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.create(instance, spec).await,
+        }
+    }
+
+    async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.start(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.start(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.start(instance).await,
+        }
+    }
+
+    async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.stop(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.stop(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.stop(instance).await,
+        }
+    }
+
+    async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.kill(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.kill(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.kill(instance).await,
+        }
+    }
+
+    async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.state(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.state(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.state(instance).await,
+        }
+    }
+}
+
+/// Auto-detect the best available runtime.
+///
+/// Checks for platform-specific runtimes first, falls back to ProcessGrill.
+pub async fn detect_runtime() -> AnyGrill {
+    #[cfg(target_os = "macos")]
+    {
+        if which_exists("container").await {
+            return AnyGrill::Apple(apple::AppleContainerGrill::new());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if which_exists("runc").await {
+            return AnyGrill::Runc(runc::RuncGrill::new(std::path::PathBuf::from(
+                "/var/lib/reliaburger/bundles",
+            )));
+        }
+    }
+
+    AnyGrill::Process(ProcessGrill::new())
+}
+
+/// Check if a binary exists in PATH.
+async fn which_exists(name: &str) -> bool {
+    tokio::process::Command::new("which")
+        .arg(name)
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }

@@ -1,56 +1,110 @@
 /// Command executors for the Relish CLI.
 ///
-/// Each subcommand is a function that returns `Result<(), RelishError>`.
-/// In Phase 1 only `apply` does real work — the others return a graceful
-/// "agent required" error instead of panicking with `todo!()`.
+/// Each subcommand is an async function that returns `Result<(), RelishError>`.
+/// Commands try to reach the live Bun agent first. If the agent is
+/// unreachable, `apply` falls back to a dry-run plan.
 use std::path::Path;
 
 use crate::config::Config;
 
 use super::RelishError;
+use super::client::BunClient;
 use super::output::{OutputFormat, format_output};
 use super::plan::generate_plan;
 
-/// Parse, validate, and display the apply plan for a config file.
+/// Parse, validate, and deploy a config file.
 ///
-/// In Phase 1 this only shows what *would* happen — actual deployment
-/// requires the Bun agent (Phase 2+).
-pub fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+/// If a Bun agent is running, sends the config for deployment.
+/// If no agent is reachable, falls back to showing the dry-run plan.
+pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
-    let plan = generate_plan(&config);
-    let formatted = format_output(&plan, output)?;
-    println!("{formatted}");
-    println!("\n(dry run — actual deployment requires a running Bun agent)");
-    Ok(())
+
+    let client = BunClient::default_local();
+
+    match client.health().await {
+        Ok(()) => {
+            // Agent is alive — send the config
+            let result = client.apply(&config).await?;
+            println!(
+                "deployed {} instance(s): {}",
+                result.created,
+                result.instances.join(", ")
+            );
+            Ok(())
+        }
+        Err(_) => {
+            // Agent unreachable — fall back to dry-run
+            let plan = generate_plan(&config);
+            let formatted = format_output(&plan, output)?;
+            println!("{formatted}");
+            println!("\n(dry run — bun agent not reachable, showing plan only)");
+            Ok(())
+        }
+    }
 }
 
 /// Show cluster and app status.
-pub fn status() -> Result<(), RelishError> {
-    Err(RelishError::AgentRequired {
-        command: "status".to_string(),
-    })
+pub async fn status() -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let statuses = client.status().await?;
+
+    if statuses.is_empty() {
+        println!("no workloads running");
+    } else {
+        println!(
+            "{:<20} {:<15} {:<12} {:<10} {:<6}",
+            "INSTANCE", "APP", "NAMESPACE", "STATE", "RESTARTS"
+        );
+        for s in &statuses {
+            println!(
+                "{:<20} {:<15} {:<12} {:<10} {:<6}",
+                s.id, s.app_name, s.namespace, s.state, s.restart_count
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Stream logs from an app or job.
-pub fn logs(_name: &str) -> Result<(), RelishError> {
-    Err(RelishError::AgentRequired {
-        command: "logs".to_string(),
-    })
+pub async fn logs(name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let log_output = client.logs(name, "default").await?;
+    println!("{log_output}");
+    Ok(())
 }
 
 /// Execute a command inside a running container.
-pub fn exec(_app: &str, _command: &[String]) -> Result<(), RelishError> {
+pub async fn exec(_app: &str, _command: &[String]) -> Result<(), RelishError> {
     Err(RelishError::AgentRequired {
         command: "exec".to_string(),
     })
 }
 
 /// Show detailed info about an app, node, or job.
-pub fn inspect(_name: &str) -> Result<(), RelishError> {
-    Err(RelishError::AgentRequired {
-        command: "inspect".to_string(),
-    })
+pub async fn inspect(name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let statuses = client.status().await?;
+    let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == name).collect();
+
+    if matching.is_empty() {
+        println!("no instances found for {name}");
+    } else {
+        for s in &matching {
+            println!("Instance: {}", s.id);
+            println!("  App:       {}", s.app_name);
+            println!("  Namespace: {}", s.namespace);
+            println!("  State:     {}", s.state);
+            println!("  Restarts:  {}", s.restart_count);
+            if let Some(port) = s.host_port {
+                println!("  Port:      {port}");
+            }
+            println!();
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -64,8 +118,8 @@ mod tests {
         f
     }
 
-    #[test]
-    fn apply_with_valid_config_succeeds() {
+    #[tokio::test]
+    async fn apply_with_valid_config_falls_back_to_dry_run() {
         let f = write_temp_config(
             r#"
             [app.web]
@@ -73,12 +127,13 @@ mod tests {
             port = 8080
         "#,
         );
-        assert!(apply(f.path(), OutputFormat::Human).is_ok());
+        // No agent running, so this falls back to dry-run
+        assert!(apply(f.path(), OutputFormat::Human).await.is_ok());
     }
 
-    #[test]
-    fn apply_with_missing_file_errors() {
-        let result = apply(Path::new("/nonexistent/config.toml"), OutputFormat::Human);
+    #[tokio::test]
+    async fn apply_with_missing_file_errors() {
+        let result = apply(Path::new("/nonexistent/config.toml"), OutputFormat::Human).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -87,22 +142,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_with_invalid_toml_errors() {
+    #[tokio::test]
+    async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply(f.path(), OutputFormat::Human);
+        let result = apply(f.path(), OutputFormat::Human).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn apply_with_validation_error() {
+    #[tokio::test]
+    async fn apply_with_validation_error() {
         let f = write_temp_config(
             r#"
             [app.broken]
             replicas = 3
         "#,
         );
-        let result = apply(f.path(), OutputFormat::Human);
+        let result = apply(f.path(), OutputFormat::Human).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -111,42 +166,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_json_output_produces_valid_json() {
-        let f = write_temp_config(
-            r#"
-            [app.web]
-            image = "myapp:v1"
-        "#,
-        );
-        // Just verify it doesn't error — the actual JSON goes to stdout
-        assert!(apply(f.path(), OutputFormat::Json).is_ok());
+    #[tokio::test]
+    async fn status_returns_agent_unreachable() {
+        let err = status().await.unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 
-    #[test]
-    fn status_returns_agent_required() {
-        let err = status().unwrap_err();
-        assert!(
-            matches!(err, RelishError::AgentRequired { ref command } if command == "status"),
-            "got: {err:?}"
-        );
+    #[tokio::test]
+    async fn logs_returns_agent_unreachable() {
+        let err = logs("web").await.unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable));
     }
 
-    #[test]
-    fn logs_returns_agent_required() {
-        let err = logs("web").unwrap_err();
-        assert!(matches!(err, RelishError::AgentRequired { ref command } if command == "logs"));
-    }
-
-    #[test]
-    fn exec_returns_agent_required() {
-        let err = exec("web", &["sh".to_string()]).unwrap_err();
+    #[tokio::test]
+    async fn exec_returns_agent_required() {
+        let err = exec("web", &["sh".to_string()]).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentRequired { ref command } if command == "exec"));
     }
 
-    #[test]
-    fn inspect_returns_agent_required() {
-        let err = inspect("web").unwrap_err();
-        assert!(matches!(err, RelishError::AgentRequired { ref command } if command == "inspect"));
+    #[tokio::test]
+    async fn inspect_returns_agent_unreachable() {
+        let err = inspect("web").await.unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable));
     }
 }

@@ -2,15 +2,15 @@
 ///
 /// Manages workload instances on a single node: deploying containers,
 /// supervising their lifecycle, running health checks, computing restart
-/// backoff, and detecting GPU hardware.
-///
-/// In Phase 1 this module contains the pure logic foundations. The actual
-/// containerd integration and HTTP health probing come in the integration
-/// test phase.
+/// backoff, detecting GPU hardware, and serving a local HTTP API.
+pub mod agent;
+pub mod api;
 pub mod gpu;
 pub mod health;
+pub mod probe;
 pub mod restart;
 pub mod supervisor;
+pub mod testapp;
 
 pub use gpu::{GpuDetector, GpuInfo, StubGpuDetector};
 pub use health::{HealthCheckConfig, HealthChecker, HealthCounters, HealthStatus, evaluate_result};

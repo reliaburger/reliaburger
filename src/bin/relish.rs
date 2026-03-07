@@ -50,18 +50,19 @@ enum Command {
     },
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Apply { ref path } => commands::apply(path, cli.output),
-        Command::Status => commands::status(),
-        Command::Logs { ref name } => commands::logs(name),
+        Command::Apply { ref path } => commands::apply(path, cli.output).await,
+        Command::Status => commands::status().await,
+        Command::Logs { ref name } => commands::logs(name).await,
         Command::Exec {
             ref app,
             ref command,
-        } => commands::exec(app, command),
-        Command::Inspect { ref name } => commands::inspect(name),
+        } => commands::exec(app, command).await,
+        Command::Inspect { ref name } => commands::inspect(name).await,
     };
 
     match result {

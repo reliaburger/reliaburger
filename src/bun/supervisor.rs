@@ -295,8 +295,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         &self.health_checker
     }
 
+    /// Mutable access to the health checker (e.g. to pop due checks).
+    pub fn health_checker_mut(&mut self) -> &mut HealthChecker {
+        &mut self.health_checker
+    }
+
     /// Access the underlying runtime.
-    #[allow(dead_code)]
     pub fn grill(&self) -> &G {
         &self.grill
     }
@@ -306,77 +310,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
 mod tests {
     use super::*;
     use crate::config::app::{HealthProtocol, HealthSpec};
-    use crate::grill::oci::OciSpec;
-    use std::sync::{Arc, Mutex};
+    use crate::grill::mock::MockGrill;
     use std::time::Duration;
-
-    // -- MockGrill ------------------------------------------------------------
-
-    /// Records all calls to the Grill trait for test assertions.
-    #[derive(Debug, Clone, Default)]
-    struct MockGrill {
-        calls: Arc<Mutex<Vec<(String, InstanceId)>>>,
-    }
-
-    impl MockGrill {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        #[allow(dead_code)]
-        fn calls(&self) -> Vec<(String, InstanceId)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl Grill for MockGrill {
-        async fn create(
-            &self,
-            instance: &InstanceId,
-            _spec: &OciSpec,
-        ) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("create".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn start(&self, instance: &InstanceId) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("start".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn stop(&self, instance: &InstanceId) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("stop".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn kill(&self, instance: &InstanceId) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("kill".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn state(
-            &self,
-            instance: &InstanceId,
-        ) -> Result<ContainerState, crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("state".to_string(), instance.clone()));
-            Ok(ContainerState::Running)
-        }
-    }
 
     // -- Helpers --------------------------------------------------------------
 
