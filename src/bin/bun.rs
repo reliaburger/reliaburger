@@ -140,7 +140,10 @@ async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
             };
 
             Ok(AnyGrill::Runc(reliaburger::grill::runc::RuncGrill::new(
-                bundle_base, image_store, is_rootless, state_dir,
+                bundle_base,
+                image_store,
+                is_rootless,
+                state_dir,
             )))
         }
         #[cfg(target_os = "macos")]
