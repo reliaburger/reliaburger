@@ -17,6 +17,7 @@ Each section must explain any Rust syntax appearing for the first time. The targ
 
 ```
 docs/
+  README.md            # User documentation (install, build, run)
   whitepaper.md        # Full architectural vision (the "what and why")
   roadmap.md           # Implementation phases with tests-first ordering (the "when")
   progress.md          # Implementation checklist (what's done, what's next)
@@ -310,6 +311,7 @@ Implementation progress lives in `docs/progress.md` — a checklist per roadmap 
 - In code, use `todo!("Phase N")` for stubs that exist structurally but aren't implemented yet.
 - Use `// TODO(Phase N):` for deferred work belonging to a later phase.
 - Before starting work, check `docs/progress.md` to see what's done and what's next.
+- When a phase is completed or significant progress is made, update both `docs/README.md` and the top-level `README.md` to reflect the current state (test counts, completed features, new CLI commands, new runtimes, etc.).
 
 # Writing Style Guide
 

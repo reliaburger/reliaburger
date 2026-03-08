@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::config::app::AppSpec;
+use crate::config::job::JobSpec;
 use crate::config::types::Replicas;
+use crate::grill::oci::OciSpec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
@@ -44,6 +46,10 @@ pub struct WorkloadInstance {
     /// Health check config, if any. Stored here to avoid borrow conflicts
     /// when the supervisor needs both the instance and the health checker.
     pub health_config: Option<HealthCheckConfig>,
+    /// Whether this instance is a job (run-to-completion) rather than an app.
+    pub is_job: bool,
+    /// Stored OCI spec for restart re-drive. Set during initial startup.
+    pub oci_spec: Option<OciSpec>,
 }
 
 /// Manages all workload instances on this node.
@@ -127,6 +133,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 created_at: now,
                 restart_policy: RestartPolicy::default(),
                 health_config,
+                is_job: false,
+                oci_spec: None,
             };
 
             self.instances.insert(instance_id.clone(), instance);
@@ -139,6 +147,44 @@ impl<G: Grill> WorkloadSupervisor<G> {
         );
 
         Ok(instance_ids)
+    }
+
+    /// Deploy a job, creating a single workload instance in Pending state.
+    ///
+    /// Jobs are run-to-completion tasks: no port allocation, no health
+    /// checks, and a finite restart budget (3 retries by default).
+    pub async fn deploy_job(
+        &mut self,
+        job_name: &str,
+        namespace: &str,
+        _spec: &JobSpec,
+        now: Instant,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        let instance_id = InstanceId(format!("{job_name}-0"));
+
+        let instance = WorkloadInstance {
+            id: instance_id.clone(),
+            app_name: job_name.to_string(),
+            namespace: namespace.to_string(),
+            state: ContainerState::Pending,
+            health_counters: HealthCounters::new(),
+            restart_count: 0,
+            last_restart: None,
+            host_port: None,
+            created_at: now,
+            restart_policy: RestartPolicy::for_job(3),
+            health_config: None,
+            is_job: true,
+            oci_spec: None,
+        };
+
+        self.instances.insert(instance_id.clone(), instance);
+        self.app_instances.insert(
+            (job_name.to_string(), namespace.to_string()),
+            vec![instance_id.clone()],
+        );
+
+        Ok(vec![instance_id])
     }
 
     /// Stop all instances of an app by transitioning Running/Unhealthy → Stopping.
@@ -295,8 +341,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         &self.health_checker
     }
 
+    /// Mutable access to the health checker (e.g. to pop due checks).
+    pub fn health_checker_mut(&mut self) -> &mut HealthChecker {
+        &mut self.health_checker
+    }
+
     /// Access the underlying runtime.
-    #[allow(dead_code)]
     pub fn grill(&self) -> &G {
         &self.grill
     }
@@ -306,77 +356,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
 mod tests {
     use super::*;
     use crate::config::app::{HealthProtocol, HealthSpec};
-    use crate::grill::oci::OciSpec;
-    use std::sync::{Arc, Mutex};
+    use crate::grill::mock::MockGrill;
     use std::time::Duration;
-
-    // -- MockGrill ------------------------------------------------------------
-
-    /// Records all calls to the Grill trait for test assertions.
-    #[derive(Debug, Clone, Default)]
-    struct MockGrill {
-        calls: Arc<Mutex<Vec<(String, InstanceId)>>>,
-    }
-
-    impl MockGrill {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        #[allow(dead_code)]
-        fn calls(&self) -> Vec<(String, InstanceId)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl Grill for MockGrill {
-        async fn create(
-            &self,
-            instance: &InstanceId,
-            _spec: &OciSpec,
-        ) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("create".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn start(&self, instance: &InstanceId) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("start".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn stop(&self, instance: &InstanceId) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("stop".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn kill(&self, instance: &InstanceId) -> Result<(), crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("kill".to_string(), instance.clone()));
-            Ok(())
-        }
-
-        async fn state(
-            &self,
-            instance: &InstanceId,
-        ) -> Result<ContainerState, crate::grill::GrillError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(("state".to_string(), instance.clone()));
-            Ok(ContainerState::Running)
-        }
-    }
 
     // -- Helpers --------------------------------------------------------------
 
@@ -389,6 +370,7 @@ mod tests {
     fn basic_app_spec(port: Option<u16>) -> AppSpec {
         AppSpec {
             image: Some("nginx:latest".to_string()),
+            command: Vec::new(),
             exec: None,
             script: None,
             replicas: Replicas::Fixed(1),
@@ -750,5 +732,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids.len(), 1);
+    }
+
+    // -- deploy_job -----------------------------------------------------------
+
+    fn basic_job_spec() -> crate::config::job::JobSpec {
+        toml::from_str(
+            r#"
+            image = "myapp:v1"
+            command = ["echo", "done"]
+        "#,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deploy_job_creates_pending_instance() {
+        let mut sup = test_supervisor();
+        let now = Instant::now();
+        let spec = basic_job_spec();
+
+        let ids = sup
+            .deploy_job("migrate", "default", &spec, now)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], InstanceId("migrate-0".to_string()));
+
+        let instance = sup.get_instance(&ids[0]).unwrap();
+        assert_eq!(instance.state, ContainerState::Pending);
+        assert!(instance.is_job);
+        assert!(instance.host_port.is_none());
+        assert!(instance.health_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn deploy_job_has_finite_restart_policy() {
+        let mut sup = test_supervisor();
+        let now = Instant::now();
+        let spec = basic_job_spec();
+
+        let ids = sup
+            .deploy_job("migrate", "default", &spec, now)
+            .await
+            .unwrap();
+
+        let instance = sup.get_instance(&ids[0]).unwrap();
+        assert_eq!(instance.restart_policy.max_restarts, Some(3));
     }
 }

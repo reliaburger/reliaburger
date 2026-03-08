@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf help
+.PHONY: build test check fmt lint clean pdf loc help
 
 CARGO = cargo
 
@@ -36,6 +36,14 @@ pdf: ## Build all PDFs
 	$(QUARTO) --profile design
 	$(QUARTO) --profile whitepaper
 	$(QUARTO) --profile roadmap
+
+# --- Stats ---
+
+loc: ## Count lines of .rs, .md, and .toml files
+	@echo "  .rs:   $$(find . -name '*.rs'   | xargs cat 2>/dev/null | wc -l)"
+	@echo "  .md:   $$(find . -name '*.md'   | xargs cat 2>/dev/null | wc -l)"
+	@echo "  .toml: $$(find . -name '*.toml' | xargs cat 2>/dev/null | wc -l)"
+	@echo "  total: $$(find . -name '*.rs' -o -name '*.md' -o -name '*.toml' | xargs cat 2>/dev/null | wc -l)"
 
 # --- Housekeeping ---
 

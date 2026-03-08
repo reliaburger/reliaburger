@@ -1,0 +1,23 @@
+# App with an init container.
+#
+# Init containers run sequentially before the main app starts.
+# If any init container fails, the app transitions to Failed.
+# Here, the init runs "echo" (succeeds), then the main app starts.
+#
+# Build first:  cargo build
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1-init-container.toml
+
+[app.web]
+image = "myapp:v1"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+port = 8080
+
+[[app.web.init]]
+command = ["echo", "initialising database"]
+
+[app.web.health]
+path = "/healthz"
+interval = 5
+timeout = 2
+threshold_unhealthy = 3
+threshold_healthy = 1
