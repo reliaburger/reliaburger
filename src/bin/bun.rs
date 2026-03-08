@@ -117,9 +117,30 @@ async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
         }
         #[cfg(target_os = "linux")]
         "runc" => {
-            println!("bun: using runc runtime");
+            let is_rootless = reliaburger::grill::rootless::is_rootless();
+            let mode = if is_rootless { "rootless" } else { "root" };
+            println!("bun: using runc runtime ({mode})");
+
+            let (bundle_base, image_store, state_dir) = if is_rootless {
+                let base = dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reliaburger"))
+                    .join("reliaburger");
+                (
+                    base.join("bundles"),
+                    reliaburger::grill::ImageStore::new(base.join("images")),
+                    reliaburger::grill::rootless::rootless_state_dir(),
+                )
+            } else {
+                let base = std::path::PathBuf::from("/var/lib/reliaburger");
+                (
+                    base.join("bundles"),
+                    reliaburger::grill::ImageStore::new(base.join("images")),
+                    std::path::PathBuf::from("/run/reliaburger/runc"),
+                )
+            };
+
             Ok(AnyGrill::Runc(reliaburger::grill::runc::RuncGrill::new(
-                std::path::PathBuf::from("/var/lib/reliaburger/bundles"),
+                bundle_base, image_store, is_rootless, state_dir,
             )))
         }
         #[cfg(target_os = "macos")]
