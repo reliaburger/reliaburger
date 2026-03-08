@@ -844,7 +844,15 @@ mod tests {
             .await
             .unwrap();
         let statuses = resp_rx.await.unwrap();
-        assert_eq!(statuses[0].state, "health-wait");
+        // The instance should be in health-wait (awaiting first health check)
+        // or running (if the mock health check resolved before we queried status).
+        // Both are correct — it's a race between the status query and the
+        // health check timer.
+        let state = &statuses[0].state;
+        assert!(
+            state == "health-wait" || state == "running",
+            "expected health-wait or running, got {state}"
+        );
 
         shutdown.cancel();
         agent_handle.await.unwrap();
