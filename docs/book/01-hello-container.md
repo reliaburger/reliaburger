@@ -46,6 +46,15 @@ On Fedora:
 sudo dnf groupinstall "Development Tools"
 ```
 
+For rootless containers (running without sudo), you need kernel 5.11 or later. That's where unprivileged user namespaces became stable enough for general use. Ubuntu 22.04+, Fedora 31+, and Debian 11+ all ship kernels that qualify. Check yours with `uname -r`. If you're on an older kernel, runc still works — you'll just need root.
+
+You also need `runc` installed. Your package manager probably has it (`sudo apt install runc` on Debian/Ubuntu), or grab a binary from the [GitHub releases](https://github.com/opencontainers/runc/releases). Rootless mode requires cgroups v2 with systemd delegation, which is the default on any modern systemd-based distro. You can verify with:
+
+```sh
+# Should print "cgroup2fs" — if it says "tmpfs", you're on cgroups v1
+stat -f -c %T /sys/fs/cgroup
+```
+
 **macOS** needs the Xcode command line tools:
 
 ```sh
@@ -2611,9 +2620,133 @@ Startup is sequential: load config, create port allocator, detect runtime, creat
 
 The `--runtime` flag controls which `Grill` implementation to use. `auto` checks what's available on the platform. `process` forces ProcessGrill. `runc` and `apple` select the platform-specific runtimes and error out if they're not available.
 
+## Pulling real images
+
+Up to this point, runc could only create containers with an empty rootfs directory. That's fine for testing the OCI spec generation pipeline, but it means `runc create` fails the moment the container process tries to do anything useful. The `container` CLI on macOS handles image pulling internally, so Apple Container works out of the box. On Linux, we need to do this ourselves.
+
+### How OCI image distribution works
+
+Container images aren't monolithic files. They're a stack of layers, each one a gzipped tarball containing filesystem changes. When you `docker pull alpine:latest`, here's what actually happens:
+
+1. The client contacts the registry (e.g. `registry-1.docker.io`) and requests the *manifest* for `library/alpine:latest`.
+2. The manifest lists the image's layers by their SHA-256 digest, plus a config blob containing the default command, environment variables, and other metadata.
+3. The client downloads each layer blob and verifies its digest.
+4. The layers are unpacked bottom-up into a directory, with each layer's files overlaying the previous one.
+
+The manifest can also be a *manifest index* (sometimes called a "fat manifest") that lists platform-specific manifests for linux/amd64, linux/arm64, and so on. The client picks the one matching its host architecture.
+
+### Parsing image references
+
+Docker Hub has convenient shorthand. You type `alpine`, but the actual reference is `docker.io/library/alpine:latest`. The `ImageReference` type normalises this:
+
+```rust
+pub struct ImageReference {
+    pub registry: String,
+    pub repository: String,
+    pub tag: String,
+}
+```
+
+The parser handles bare names (`alpine`), names with tags (`alpine:3.19`), user repos (`myuser/myimage:v1`), and custom registries (`ghcr.io/org/image:sha`). It distinguishes registries from user names by checking for a `.` or `:` in the first path component.
+
+### The `oci-distribution` crate
+
+We use the `oci-distribution` crate for the registry protocol. It handles HTTP authentication (we only need anonymous pulls for now), manifest parsing, and blob downloads. The key call is:
+
+```rust
+let (manifest, digest, config) = client
+    .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
+    .await?;
+```
+
+This returns an `OciImageManifest` with the layer descriptors. If the registry returns a manifest index (multi-platform), the client's built-in platform resolver automatically selects the right architecture.
+
+### Layer unpacking and whiteouts
+
+Each layer is a gzipped tarball. We extract them base-first (the first layer in the manifest is the bottom of the filesystem). The `flate2` crate handles gzip decompression, and `tar` handles extraction. We run the unpacking inside `tokio::task::spawn_blocking` since tar extraction is CPU-bound and would block the async runtime.
+
+OCI images use a convention called *whiteout files* to handle deletions between layers. Think of each layer as a transparent sheet. You can add new files, but you can't erase what's underneath. Whiteout markers solve this:
+
+- `.wh.filename` means "delete `filename` from whatever layer created it"
+- `.wh..wh..opq` means "this entire directory is opaque — ignore everything from lower layers"
+
+The unpacker watches for these markers and removes the corresponding files before continuing with the rest of the layer.
+
+### Content-addressed caching
+
+Every blob is stored by its SHA-256 digest under `{store_root}/blobs/sha256/{hash}`. If the file already exists, we skip the download entirely. Tags always re-fetch the manifest (since `latest` might point to a new digest tomorrow), but if all the layers are already cached, the second pull only costs one HTTP request for the manifest.
+
+### Going rootless
+
+On Linux, runc normally requires root to create namespaces and set up cgroups. Rootless mode uses user namespaces instead: the kernel maps your unprivileged UID to UID 0 *inside* the container, giving the container process the illusion of being root without any actual privileges on the host.
+
+The `rootless::make_rootless` function adjusts an OCI spec for this:
+
+```rust
+pub fn make_rootless(spec: &mut OciSpec, instance_name: &str) {
+    // Add user namespace
+    spec.linux.namespaces.push(OciNamespace {
+        ns_type: "user".to_string(),
+        path: None,
+    });
+
+    // Remove network namespace (share host network for Phase 1)
+    spec.linux.namespaces.retain(|ns| ns.ns_type != "network");
+
+    // Map current user to container root
+    let uid = nix::unistd::getuid().as_raw();
+    spec.linux.uid_mappings = Some(vec![OciIdMapping {
+        container_id: 0, host_id: uid, size: 1,
+    }]);
+    // ... gid_mappings, /sys adjustments, cgroup path
+}
+```
+
+Three things change from the root spec:
+
+1. **User namespace added.** This is what makes rootless work. The kernel creates a new user namespace where UID 0 maps to your real UID.
+2. **Network namespace removed.** Creating a network namespace rootlessly requires tools like `slirp4netns` or `pasta`. We'll handle container networking properly in Phase 3. For now, containers share the host network.
+3. **`/sys` becomes a bind mount.** Mounting `sysfs` requires `CAP_SYS_ADMIN`, which we don't have outside the user namespace. A read-only bind mount of the host's `/sys` works instead.
+
+The `OciIdMapping` type is new in our OCI spec:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciIdMapping {
+    #[serde(rename = "containerID")]
+    pub container_id: u32,
+    #[serde(rename = "hostID")]
+    pub host_id: u32,
+    pub size: u32,
+}
+```
+
+The `serde(rename)` attributes match the OCI runtime spec's JSON field names. Without them, Rust's snake_case field names would produce `container_id` instead of `containerID`, and runc would reject the spec.
+
+### Wiring it together
+
+`RuncGrill` now has an `ImageStore` and a `rootless` flag. When `create()` is called, it checks whether the spec's `root.path` looks like an image reference (doesn't start with `/` or `.`). If it does, it pulls and unpacks the image, then symlinks the resulting rootfs into the bundle directory:
+
+```rust
+if looks_like_image_ref(&spec.root.path) {
+    let rootfs = self.image_store
+        .pull_and_unpack(&spec.root.path).await?;
+    tokio::fs::symlink(&rootfs, bundle_dir.join("rootfs")).await?;
+    spec.root.path = "rootfs".to_string();
+}
+```
+
+The `detect_runtime()` function now auto-detects rootless mode and configures paths accordingly. Non-root users get `~/.local/share/reliaburger/` for images and bundles; root uses `/var/lib/reliaburger/`.
+
+### Testing image pulling
+
+The unit tests for `ImageReference::parse` and layer unpacking run unconditionally. They create synthetic gzipped tarballs in temp directories and verify that whiteouts, symlinks, and multi-layer ordering work correctly.
+
+The integration tests for actual image pulling are gated behind `RELIABURGER_IMAGE_PULL_TESTS=1` since they require network access. They pull `alpine:latest` from Docker Hub and verify that `/bin/sh` exists in the unpacked rootfs.
+
 ## What we built
 
-Phase 1 started with parsing TOML and ended with a working container lifecycle. We can now:
+Phase 1 started with parsing TOML and ended with a working container lifecycle that can pull real OCI images from Docker Hub and run them rootlessly on Linux. We can now:
 
 - `cargo run --bin bun` starts a node agent that auto-detects the runtime, spawns containers (or processes), and runs health checks on a timer
 - `cargo run --bin relish -- apply app.toml` deploys workloads to the running agent
@@ -2621,12 +2754,14 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle. 
 - `cargo run --bin relish -- logs web` shows captured output
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
 - `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
+- RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
+- Rootless runc runs containers without sudo using user namespaces and UID/GID mapping
 - Jobs run to completion with exit code tracking and retry on failure
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-285 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, the agent event loop, the API server, the CLI, and 14 integration tests that exercise the full stack end to end.
+306 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI, and 14 integration tests that exercise the full stack end to end.
 
-What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), image pulling (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
+What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 
 The foundation is solid. The trait boundaries (`Grill`, the state machine, the health checker) were designed so that adding real implementations doesn't change the orchestration logic. When we add runc support, the agent doesn't know the difference. When we add a scheduler in Phase 2, it sends the same `AgentCommand::Deploy` that the API sends today. That's the payoff of getting the abstractions right early: each phase adds new capabilities without rewriting what came before.

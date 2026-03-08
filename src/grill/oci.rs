@@ -67,6 +67,23 @@ pub struct OciLinux {
     pub resources: Option<OciResources>,
     #[serde(rename = "cgroupsPath", skip_serializing_if = "Option::is_none")]
     pub cgroups_path: Option<String>,
+    #[serde(rename = "uidMappings", skip_serializing_if = "Option::is_none")]
+    pub uid_mappings: Option<Vec<OciIdMapping>>,
+    #[serde(rename = "gidMappings", skip_serializing_if = "Option::is_none")]
+    pub gid_mappings: Option<Vec<OciIdMapping>>,
+}
+
+/// UID/GID mapping for user namespaces.
+///
+/// Maps a range of IDs inside the container to a range on the host.
+/// Used by rootless runc to map the current user to container root.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciIdMapping {
+    #[serde(rename = "containerID")]
+    pub container_id: u32,
+    #[serde(rename = "hostID")]
+    pub host_id: u32,
+    pub size: u32,
 }
 
 /// A Linux namespace to create for the container.
@@ -144,6 +161,8 @@ pub fn generate_oci_spec(
             namespaces,
             resources,
             cgroups_path: Some(cgroup_path.to_string()),
+            uid_mappings: None,
+            gid_mappings: None,
         },
     }
 }
@@ -201,7 +220,7 @@ fn build_mounts(spec: &AppSpec, _host_port: Option<u16>) -> Vec<OciMount> {
 }
 
 /// Standard Linux namespaces for container isolation.
-fn standard_namespaces() -> Vec<OciNamespace> {
+pub fn standard_namespaces() -> Vec<OciNamespace> {
     vec![
         OciNamespace {
             ns_type: "pid".to_string(),
@@ -227,7 +246,7 @@ fn standard_namespaces() -> Vec<OciNamespace> {
 }
 
 /// Standard base mounts (/proc, /dev, /sys) for OCI containers.
-fn standard_mounts() -> Vec<OciMount> {
+pub fn standard_mounts() -> Vec<OciMount> {
     vec![
         OciMount {
             destination: PathBuf::from("/proc"),
@@ -336,6 +355,8 @@ pub fn generate_job_oci_spec(
             namespaces: standard_namespaces(),
             resources,
             cgroups_path: Some(cgroup_path.to_string()),
+            uid_mappings: None,
+            gid_mappings: None,
         },
     }
 }
@@ -373,6 +394,8 @@ pub fn generate_init_oci_spec(
             namespaces: standard_namespaces(),
             resources: None,
             cgroups_path: Some(cgroup_path.to_string()),
+            uid_mappings: None,
+            gid_mappings: None,
         },
     }
 }
@@ -628,5 +651,30 @@ mod tests {
         let oci = generate_job_oci_spec("cleanup", "default", &spec, "/cgroup/path");
 
         assert!(oci.process.args.is_empty());
+    }
+
+    // -- OciIdMapping ----------------------------------------------------------
+
+    #[test]
+    fn oci_id_mapping_serialises_correctly() {
+        let mapping = OciIdMapping {
+            container_id: 0,
+            host_id: 1000,
+            size: 1,
+        };
+        let json = serde_json::to_value(&mapping).unwrap();
+        assert_eq!(json["containerID"], 0);
+        assert_eq!(json["hostID"], 1000);
+        assert_eq!(json["size"], 1);
+    }
+
+    #[test]
+    fn uid_gid_mappings_omitted_when_none() {
+        let spec = minimal_app();
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+
+        let json = serde_json::to_string(&oci).unwrap();
+        assert!(!json.contains("uidMappings"));
+        assert!(!json.contains("gidMappings"));
     }
 }

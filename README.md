@@ -42,8 +42,10 @@ src/
   config/              # TOML configuration parsing (7 resource types)
   grill/               # Container runtime interface (state machine, ports, cgroups, OCI)
     process.rs         # Cross-platform process-based runtime
-    runc.rs            # Linux runc runtime
+    runc.rs            # Linux runc runtime (image pulling, rootless support)
     apple.rs           # macOS Apple Container runtime
+    image.rs           # OCI image pulling and layer unpacking
+    rootless.rs        # Rootless runc spec modifications (Linux only)
   bun/                 # Node agent internals
     agent.rs           # Event loop (tokio::select, command channels)
     api.rs             # Local HTTP API (axum, port 9117)
@@ -78,11 +80,13 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete** (single-node container lifecycle). 285 passing tests.
+**Phase 1 complete** (single-node container lifecycle). 306 passing tests.
 
 - TOML config parsing for all 7 resource types with custom serde deserialisers
 - Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
 - Three container runtimes: ProcessGrill (cross-platform), RuncGrill (Linux), AppleContainerGrill (macOS) with auto-detection
+- OCI image pulling: pull real images from Docker Hub, content-addressed blob caching, layer unpacking with whiteout support
+- Rootless runc: user namespace UID/GID mapping, rootless cgroups v2, no-sudo container execution
 - Bun node agent: event loop with health check timer, command channels, graceful shutdown
 - Job execution: run-to-completion tasks with exit code tracking, retry with exponential backoff
 - Init containers: sequential pre-start execution, failure prevents main app start

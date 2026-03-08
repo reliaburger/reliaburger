@@ -70,9 +70,11 @@ sudo apt install runc
 Download the latest binary from [github.com/opencontainers/runc/releases](https://github.com/opencontainers/runc/releases) and place it in your `PATH`.
 
 Notes:
-- Requires root privileges for container operations
-- Bun stores OCI bundles in `/var/lib/reliaburger/bundles/`
+- **Rootless mode** is supported — runs containers without sudo using user namespaces
+- Rootless stores bundles/images in `~/.local/share/reliaburger/`; root mode uses `/var/lib/reliaburger/`
+- OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
 - To run runc-specific tests: `RELIABURGER_RUNC_TESTS=1 cargo test`
+- To run image pull tests (requires network): `RELIABURGER_IMAGE_PULL_TESTS=1 cargo test`
 
 ### Apple Container (macOS)
 

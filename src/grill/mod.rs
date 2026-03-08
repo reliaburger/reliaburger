@@ -6,11 +6,14 @@
 #[cfg(target_os = "macos")]
 pub mod apple;
 pub mod cgroup;
+pub mod image;
 #[cfg(test)]
 pub mod mock;
 pub mod oci;
 pub mod port;
 pub mod process;
+#[cfg(target_os = "linux")]
+pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
 pub mod state;
@@ -18,6 +21,7 @@ pub mod state;
 use std::fmt;
 
 pub use cgroup::{CgroupParams, cgroup_path, compute_cgroup_params, cpu_max_from_millicores};
+pub use image::ImageStore;
 pub use oci::{OciSpec, generate_job_oci_spec, generate_oci_spec};
 pub use port::{PortAllocator, PortError};
 pub use process::ProcessGrill;
@@ -52,6 +56,9 @@ pub enum GrillError {
 
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
+
+    #[error("image pull failed: {0}")]
+    ImagePull(#[from] image::ImageError),
 }
 
 /// The container runtime interface.
@@ -204,6 +211,7 @@ impl Grill for AnyGrill {
 /// Auto-detect the best available runtime.
 ///
 /// Checks for platform-specific runtimes first, falls back to ProcessGrill.
+/// On Linux, detects rootless mode and configures paths accordingly.
 pub async fn detect_runtime() -> AnyGrill {
     #[cfg(target_os = "macos")]
     {
@@ -215,9 +223,32 @@ pub async fn detect_runtime() -> AnyGrill {
     #[cfg(target_os = "linux")]
     {
         if which_exists("runc").await {
-            return AnyGrill::Runc(runc::RuncGrill::new(std::path::PathBuf::from(
-                "/var/lib/reliaburger/bundles",
-            )));
+            let is_rootless = rootless::is_rootless();
+
+            let (bundle_base, image_store, state_dir) = if is_rootless {
+                let base = dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reliaburger"))
+                    .join("reliaburger");
+                (
+                    base.join("bundles"),
+                    ImageStore::new(base.join("images")),
+                    rootless::rootless_state_dir(),
+                )
+            } else {
+                let base = std::path::PathBuf::from("/var/lib/reliaburger");
+                (
+                    base.join("bundles"),
+                    ImageStore::new(base.join("images")),
+                    std::path::PathBuf::from("/run/reliaburger/runc"),
+                )
+            };
+
+            return AnyGrill::Runc(runc::RuncGrill::new(
+                bundle_base,
+                image_store,
+                is_rootless,
+                state_dir,
+            ));
         }
     }
 

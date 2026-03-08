@@ -42,7 +42,9 @@ Integration tests:
 3. **Grill container runtime interface.** containerd/runc integration, OCI image extraction, port mapping, cgroup management.
 4. **Bun agent core.** Process supervisor loop, health checks, restart logic, GPU detection via NVML.
 5. **Relish CLI skeleton.** `apply`, `status`, `logs`, `exec`, `inspect` (clap derive API, single-node mode).
-6. **Run all tests green.**
+6. **OCI image pulling.** Pull real images from Docker Hub via `oci-distribution`, unpack layers into rootfs with whiteout support, content-addressed blob caching.
+7. **Rootless runc.** User namespace mapping, rootless cgroups v2, `--root` state directory, no-sudo container execution.
+8. **Run all tests green.**
 
 Design docs: [agent-bun.md](design/agent-bun.md), [cli-relish.md](design/cli-relish.md)
 

@@ -26,7 +26,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Restart re-drive (health check and job restarts re-start instances)
 - [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill)
 - [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container)
-- [x] All Phase 1 tests green (285 tests)
+- [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts)
+- [x] Rootless runc (user namespaces, UID/GID mapping, rootless cgroups v2, no-sudo containers)
+- [x] All Phase 1 tests green (306 tests)
 
 ## Phase 2: Cluster Formation
 

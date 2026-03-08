@@ -237,6 +237,8 @@ mod tests {
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
             },
         };
 
