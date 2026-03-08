@@ -46,6 +46,15 @@ On Fedora:
 sudo dnf groupinstall "Development Tools"
 ```
 
+For rootless containers (running without sudo), you need kernel 5.11 or later. That's where unprivileged user namespaces became stable enough for general use. Ubuntu 22.04+, Fedora 31+, and Debian 11+ all ship kernels that qualify. Check yours with `uname -r`. If you're on an older kernel, runc still works — you'll just need root.
+
+You also need `runc` installed. Your package manager probably has it (`sudo apt install runc` on Debian/Ubuntu), or grab a binary from the [GitHub releases](https://github.com/opencontainers/runc/releases). Rootless mode requires cgroups v2 with systemd delegation, which is the default on any modern systemd-based distro. You can verify with:
+
+```sh
+# Should print "cgroup2fs" — if it says "tmpfs", you're on cgroups v1
+stat -f -c %T /sys/fs/cgroup
+```
+
 **macOS** needs the Xcode command line tools:
 
 ```sh
@@ -666,17 +675,15 @@ test result: ok. 66 passed; 0 failed; 0 ignored
 
 Now we need something that actually runs containers. That something is Grill.
 
-The name follows the burger theme (Reliaburger, Bun, Relish, Patty, Mustard...), but the architecture is practical. When you run a container on Linux, three layers are involved:
+The name follows the burger theme (Reliaburger, Bun, Relish, Patty, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
 
 1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
 
-2. **containerd** manages runc. It pulls images, stores them, keeps track of which containers are running, and provides a gRPC API for other programs to talk to. When a container's process dies, containerd knows about it. When the machine reboots, containerd can tell you what was running before.
+2. **Grill** manages runc. It translates our `AppSpec` configuration into the OCI runtime specification that runc expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
 
-3. **Grill** manages containerd. It translates our `AppSpec` configuration into the OCI runtime specification that containerd expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
+In the Docker and Kubernetes world, there's usually a third layer in between: **containerd**, a daemon that manages runc, pulls images, persists state across reboots, and exposes a gRPC API. We skip it. containerd adds protobuf serialisation, a socket connection, and a daemon that needs to be running. We talk to runc directly, and handle image pulling ourselves. This gives us fewer moving parts, no daemon dependency, and full control over the lifecycle. If we need containerd later, we'll add another `Grill` implementation. The trait boundary makes that a local change.
 
-Why not talk to runc directly? Because containerd handles image management, process supervision, and state persistence. Without it, we'd need to reimplement all of that ourselves. And why not use containerd's higher-level CRI (Container Runtime Interface)? Because CRI is designed for Kubernetes, and carries assumptions about pods, sandboxes, and other concepts we don't need. We use containerd's lower-level API and keep full control.
-
-For Phase 1, we're building the parts of Grill that don't need a running containerd daemon: the state machine, port allocation, cgroup computation, and OCI spec generation. These are pure logic, testable on any platform. The actual containerd integration comes later.
+For Phase 1, we're building the parts of Grill that work without real containers: the state machine, port allocation, cgroup computation, and OCI spec generation. These are pure logic, testable on any platform. The runc integration and image pulling come later in this chapter.
 
 ## State machines in Rust
 
@@ -736,6 +743,7 @@ impl ContainerState {
                 | (Unhealthy, Stopping)
                 | (Stopping, Stopped)
                 | (Stopped, Pending)
+                | (Stopped, Failed)
         )
     }
 }
@@ -998,9 +1006,9 @@ pub enum GrillError {
 
 `#[from]` on a variant generates a `From<InvalidTransition> for GrillError` implementation. This means anywhere you have a `Result<_, InvalidTransition>`, you can use `?` to automatically convert it to `Result<_, GrillError>`. No manual error wrapping, no `map_err` calls. The `?` operator does three things: if the result is `Ok`, unwrap the value and continue; if it's `Err`, convert the error using `From` and return early. It's the Rust equivalent of Go's `if err != nil { return err }`, but in three characters instead of three lines.
 
-With the trait defined, Phase 1's implementation focuses on the parts that don't need containerd: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
+With the trait defined, Phase 1's implementation focuses on the parts that don't need a real container runtime: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
 
-When we implement the actual containerd integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
+When we implement the runc integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
 
 ## The process supervisor
 
@@ -1023,8 +1031,14 @@ pub struct WorkloadInstance {
     pub created_at: Instant,
     pub restart_policy: RestartPolicy,
     pub health_config: Option<HealthCheckConfig>,
+    pub is_job: bool,
+    pub oci_spec: Option<OciSpec>,
 }
 ```
+
+Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have.
+
+`oci_spec` stores the OCI spec that was used to create this instance. Why keep it around? Because when an instance fails and gets restarted, the agent needs to call `grill.create()` again with the same spec. Without storing it, we'd need to regenerate it from the original `AppSpec` or `JobSpec`, which means the agent would need to keep the config around and know which spec belongs to which instance. Storing the OCI spec directly is simpler and self-contained.
 
 Every field and the struct itself are marked `pub`, which means they're visible outside the module. In Rust, everything is private by default. If you just wrote `struct WorkloadInstance { state: ContainerState, ... }`, the struct and all its fields would only be accessible within `supervisor.rs`. Other modules in the same crate couldn't even name the type, let alone read its fields. `pub` opens things up one level at a time: `pub` on the struct makes the type visible, but each field is still independently private unless it also has `pub`. You can have a public struct with a mix of public and private fields, which is how you expose some data while keeping internal bookkeeping hidden. In C, everything in a header file is public. In Go, capitalisation controls visibility (exported vs unexported). Rust's approach is more granular: you decide per-item, and the compiler enforces it.
 
@@ -1170,6 +1184,75 @@ fn test_supervisor() -> WorkloadSupervisor<MockGrill> {
 ```
 
 The compiler generates a `WorkloadSupervisor<MockGrill>` that calls `MockGrill` methods directly. In production, we'll create a `WorkloadSupervisor<ContainerdGrill>` that calls the real runtime. Same code, different concrete type, zero runtime overhead.
+
+### Deploying a job
+
+Apps run forever (or until someone stops them). Jobs run to completion. A database migration, a batch data export, a cleanup script. You start it, it does its thing, it exits. If it fails, you retry a few times. If it keeps failing, you give up.
+
+The supervisor handles both, but the differences show up in the deploy method:
+
+```rust
+pub async fn deploy_job(
+    &mut self,
+    job_name: &str,
+    namespace: &str,
+    _spec: &JobSpec,
+    now: Instant,
+) -> Result<Vec<InstanceId>, BunError> {
+    let instance_id = InstanceId(format!("{job_name}-0"));
+
+    let instance = WorkloadInstance {
+        id: instance_id.clone(),
+        app_name: job_name.to_string(),
+        namespace: namespace.to_string(),
+        state: ContainerState::Pending,
+        health_counters: HealthCounters::new(),
+        restart_count: 0,
+        last_restart: None,
+        host_port: None,
+        created_at: now,
+        restart_policy: RestartPolicy::for_job(3),
+        health_config: None,
+        is_job: true,
+        oci_spec: None,
+    };
+
+    self.instances.insert(instance_id.clone(), instance);
+    // ...
+    Ok(vec![instance_id])
+}
+```
+
+Compare this to `deploy_app`. Three things are different. First, no port allocation. Jobs don't listen for connections, so `host_port` is always `None`. Second, no health check config. There's nothing to probe because the process will exit on its own. Third, the restart policy uses `RestartPolicy::for_job(3)` instead of the app's infinite-restart default. A job gets 3 retry attempts. After that, it's marked Failed and stays there. Nobody wants a broken migration retrying forever.
+
+The `_spec` parameter has a leading underscore. That's Rust telling you the parameter is intentionally unused. Without the underscore, the compiler warns about unused variables. The underscore prefix suppresses the warning while keeping the parameter in the signature for forward compatibility. We'll use the spec in later phases when jobs need environment variables, resource limits, and secrets.
+
+### The `command` field
+
+Both apps and jobs have an optional `command` field in their TOML config:
+
+```toml
+[app.web]
+image = "myapp:v1"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+port = 8080
+```
+
+The `image` field is required by real container runtimes (runc, Apple Container) to know which rootfs to use. But ProcessGrill doesn't pull images. It spawns OS processes. So for ProcessGrill, `command` is what actually matters. If neither `command` nor `image` produces something to run, ProcessGrill falls back to `sleep 86400` as a placeholder.
+
+This split is honest about the difference between development and production. During development, you'll run with ProcessGrill and use `command` to point at local binaries. In production, the OCI image provides the command, and `command` becomes an override (like Kubernetes's `command` field overriding the image's `ENTRYPOINT`).
+
+### The TestApp binary
+
+To make examples and demos meaningful, we ship a configurable test HTTP server:
+
+```sh
+cargo run --bin testapp -- --mode healthy --port 8080
+cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
+cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
+```
+
+It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
 
 ## Health checking: priority queues and state transitions
 
@@ -1659,6 +1742,12 @@ pub enum RelishError {
 
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
+
+    #[error("bun agent not reachable at localhost:9117 (is it running?)")]
+    AgentUnreachable,
+
+    #[error("API error (status {status}): {body}")]
+    ApiError { status: u16, body: String },
 }
 ```
 
@@ -1669,11 +1758,12 @@ Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don
 The binary's `main()` function doesn't use `anyhow::Result` anymore. Instead, it returns `ExitCode`:
 
 ```rust
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Apply { ref path } => commands::apply(path, cli.output),
-        Command::Status => commands::status(),
+        Command::Apply { ref path } => commands::apply(path, cli.output).await,
+        Command::Status => commands::status().await,
         // ...
     };
     match result {
@@ -1686,7 +1776,7 @@ fn main() -> ExitCode {
 }
 ```
 
-`ExitCode` is from Rust's standard library (`std::process::ExitCode`). It lets you return a proper exit code to the shell without going through `anyhow`'s default error printing, which includes a `Error:` prefix and the Debug representation. We want clean, lowercase error messages on stderr, so we format them ourselves with `eprintln!`.
+`ExitCode` is from Rust's standard library (`std::process::ExitCode`). The `#[tokio::main]` macro sets up the async runtime, same as in `bun`. We need async here because the command functions talk to the bun agent over HTTP. `ExitCode` lets you return a proper exit code to the shell without going through `anyhow`'s default error printing, which includes a `Error:` prefix and the Debug representation. We want clean, lowercase error messages on stderr, so we format them ourselves with `eprintln!`.
 
 The split is: `thiserror` in the library for structured, matchable errors. Manual `ExitCode` in the binary for clean user-facing output. The library defines *what* went wrong; the binary decides *how* to tell the user.
 
@@ -1750,7 +1840,7 @@ With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). 
 
 We have a `Grill` trait that knows how to create, start, stop, and query containers. We have an OCI spec generator that produces the right cgroup limits and port mappings. We have a state machine that tracks what's Pending, Running, or Stopped. But none of it does anything yet. Time to give Grill a body.
 
-The obvious choice would be to jump straight to `runc` or `containerd`. But those only work on Linux, and half the development is happening on macOS. We need something that works everywhere so the test suite runs on every developer's machine.
+The obvious choice would be to jump straight to `runc`. But runc only works on Linux, and half the development is happening on macOS. We need something that works everywhere so the test suite runs on every developer's machine.
 
 The answer is `ProcessGrill`: a `Grill` implementation that spawns child processes instead of containers. Each "container" is just an OS process. No namespaces, no cgroups, no rootfs. But it implements the same trait, so the agent doesn't know the difference.
 
@@ -1765,6 +1855,7 @@ struct ProcessEntry {
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
+    exit_code: Option<i32>,
 }
 ```
 
@@ -1905,7 +1996,7 @@ match status {
 }
 ```
 
-Why call `runc` directly instead of going through `containerd` with gRPC? Because `containerd` adds a layer of protobuf serialisation, a socket connection, and a daemon that needs to be running. For Phase 1 we don't need any of that. `runc` is simpler: one binary, no daemon, no protobuf. If we need containerd later, we'll add another `Grill` implementation. The trait makes that a local change.
+As we discussed earlier, we call runc directly rather than going through containerd. One binary, no daemon, no protobuf.
 
 `RuncGrill` is Linux-only, gated behind `#[cfg(target_os = "linux")]`. Its tests require root privileges and `runc` installed, so they're further gated behind an environment variable: `RELIABURGER_RUNC_TESTS=1`.
 
@@ -2093,6 +2184,8 @@ pub async fn run(&mut self) {
             }
             _ = health_interval.tick() => {
                 self.run_health_checks().await;
+                self.check_jobs().await;
+                self.drive_pending_restarts().await;
             }
         }
     }
@@ -2121,7 +2214,7 @@ async fn drive_instance_startup(
     instance.state = instance.state.transition_to(ContainerState::Preparing)?;
 
     // Generate OCI spec and create the container
-    let oci_spec = generate_oci_spec(app_name, spec, host_port, idx)?;
+    let oci_spec = generate_oci_spec(app_name, namespace, spec, host_port, &cgroup_str);
     self.supervisor.grill().create(instance_id, &oci_spec).await?;
 
     // Preparing → Starting
@@ -2143,6 +2236,182 @@ async fn drive_instance_startup(
 Each `transition_to` call validates the transition against the state machine. Try to go from Pending to Running directly? The state machine rejects it. This isn't defensive programming — it's the compiler and the state machine working together to ensure the lifecycle always follows the expected sequence.
 
 Health checks happen on the timer tick. For each instance in `HealthWait` or `Running`, the agent probes the health endpoint and feeds the result to the health checker. If the health checker says the instance is now healthy (enough consecutive successful probes), the agent transitions it to `Running`. If it's unhealthy, the agent stops and restarts it, applying backoff between retries.
+
+The health tick also does two more things:
+
+```rust
+_ = health_interval.tick() => {
+    self.run_health_checks().await;
+    self.check_jobs().await;
+    self.drive_pending_restarts().await;
+}
+```
+
+`check_jobs` monitors running jobs for process exit and handles retry logic. `drive_pending_restarts` picks up instances that have been reset to Pending after a failure and drives them through startup again. We'll look at both of these next.
+
+## Jobs, init containers, and restarts
+
+### Monitoring jobs
+
+Apps run forever. Jobs exit. The agent needs to notice when a job process has stopped and decide what to do about it. That's `check_jobs`:
+
+```rust
+async fn check_jobs(&mut self) {
+    let running_jobs: Vec<InstanceId> = self
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|i| i.is_job && i.state == ContainerState::Running)
+        .map(|i| i.id.clone())
+        .collect();
+
+    for id in running_jobs {
+        let grill_state = match self.supervisor.grill().state(&id).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if grill_state == ContainerState::Stopped {
+            let exit_code = self.supervisor.grill().exit_code(&id).await;
+
+            // Transition Running → Stopping → Stopped
+            // ...
+
+            if exit_code == Some(0) {
+                continue;  // success — stays Stopped
+            }
+
+            // Failed — attempt restart
+            match self.supervisor.maybe_restart(&id, now).await {
+                Ok(true) => { /* now Pending */ }
+                Ok(false) => { /* backoff not elapsed */ }
+                Err(_) => { /* exceeded limit — mark Failed */ }
+            }
+        }
+    }
+}
+```
+
+The pattern is: collect, iterate, check. We collect all running job IDs into a `Vec` first, then iterate. Why not iterate directly over `list_instances()`? Because inside the loop we call `self.supervisor.grill().state()`, which borrows the supervisor. If we were iterating over a reference to the supervisor's internal data, the borrow checker would reject the second borrow. Collecting into a `Vec` gives us owned data that doesn't conflict with later borrows. This is a common pattern in Rust when you need to read a collection and then mutate based on what you found.
+
+For each running job, we ask the grill what the process is actually doing. If it's still running, we move on. If it's stopped, we check the exit code. Exit code 0 means success. Anything else means failure, and we try to restart.
+
+### Exit code tracking
+
+How does the grill know the exit code? ProcessGrill stores it when the process exits:
+
+```rust
+async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+    let mut procs = self.processes.lock().await;
+    let entry = procs.get_mut(instance).ok_or(/* ... */)?;
+
+    if entry.state == ContainerState::Running {
+        if let Some(ref mut child) = entry.child {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    entry.state = ContainerState::Stopped;
+                    entry.exit_code = status.code();
+                }
+                // ...
+            }
+        }
+    }
+
+    Ok(entry.state)
+}
+```
+
+`try_wait()` is a non-blocking check. If the child process has exited, it returns `Ok(Some(status))`. If it's still running, `Ok(None)`. We call this on every state check rather than spawning a background waiter, because the health tick already gives us a regular polling interval. `status.code()` returns `Option<i32>`: `Some(0)` for success, `Some(n)` for failure with exit code n, and `None` if the process was killed by a signal (on Unix).
+
+The `exit_code()` method on the `Grill` trait has a default implementation that returns `None`:
+
+```rust
+fn exit_code(
+    &self,
+    instance: &InstanceId,
+) -> impl std::future::Future<Output = Option<i32>> + Send {
+    let _ = instance;
+    std::future::ready(None)
+}
+```
+
+This is a trait method with a default body. Types that implement `Grill` can override it (ProcessGrill does), or accept the default (MockGrill can configure it per test). The `let _ = instance` suppresses the unused-variable warning while keeping the parameter in the signature. `std::future::ready(None)` creates a future that immediately resolves to `None`, which is the async equivalent of `return None` for a synchronous function.
+
+### Init containers
+
+Some apps need setup work before they can start. A database migration, a config file download, a certificate generation. Kubernetes calls these "init containers": processes that run to completion before the main container starts. If any init container fails, the main container never starts.
+
+The agent handles init containers during the startup sequence, between Preparing and Starting:
+
+```rust
+if !spec.init.is_empty() {
+    instance.state = instance.state.transition_to(ContainerState::Initialising)?;
+
+    for (i, init_spec) in spec.init.iter().enumerate() {
+        let init_id = InstanceId(format!("{}-init-{i}", instance_id.0));
+        let init_oci = generate_init_oci_spec(
+            &init_spec.command, namespace, app_name,
+            spec.image.as_deref(), &cgroup_str,
+        );
+
+        self.supervisor.grill().create(&init_id, &init_oci).await?;
+        self.supervisor.grill().start(&init_id).await?;
+
+        // Wait for init container to complete
+        let failed = loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let state = self.supervisor.grill().state(&init_id).await?;
+            if state == ContainerState::Stopped {
+                let exit_code = self.supervisor.grill().exit_code(&init_id).await;
+                break exit_code != Some(0);
+            }
+        };
+
+        if failed {
+            instance.state = instance.state.transition_to(ContainerState::Failed)?;
+            return Err(BunError::InitContainerFailed {
+                instance_id: instance_id.clone(),
+                init_index: i,
+            });
+        }
+    }
+}
+```
+
+Each init container gets its own `InstanceId` (e.g., `web-0-init-0`, `web-0-init-1`) and a minimal OCI spec. They run sequentially. `.enumerate()` gives us both the index and the value from the iterator, so we can report which init container failed.
+
+The `loop { ... break ... }` pattern is how you write a polling loop in Rust. The `break` expression evaluates to a value (the boolean `failed`), which becomes the value of the `let failed = loop { ... }` expression. This is another case of "everything is an expression": `loop` produces a value via `break`, just like `if`/`else` produces a value via its branches. In C you'd declare `bool failed` before the loop and assign it inside, which is more fragile because the compiler can't verify that the variable is always assigned before the loop exits.
+
+The state transition path for apps with init containers is: Pending → Preparing → Initialising → Starting → HealthWait → Running. Without init containers, it's: Pending → Preparing → Starting → HealthWait → Running. The state machine validates both paths because we added Preparing → Initialising and Initialising → Starting as valid transitions.
+
+### Restart re-drive
+
+When a health check fails or a job exits with a non-zero code, the agent calls `maybe_restart()`. If the restart policy allows it, `maybe_restart` transitions the instance back to Pending, increments the restart counter, and applies exponential backoff. But that leaves the instance sitting in Pending. Something needs to drive it through startup again.
+
+That's `drive_pending_restarts`:
+
+```rust
+async fn drive_pending_restarts(&mut self) {
+    let pending_restarts: Vec<(InstanceId, OciSpec)> = self
+        .supervisor
+        .list_instances()
+        .iter()
+        .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
+        .filter_map(|i| i.oci_spec.as_ref().map(|spec| (i.id.clone(), spec.clone())))
+        .collect();
+
+    for (id, oci_spec) in pending_restarts {
+        // Pending → Preparing → Starting → HealthWait → Running
+        // (same sequence as initial startup, using stored OCI spec)
+    }
+}
+```
+
+The filter logic is specific: only instances that are Pending *and* have been restarted at least once. Fresh deploys are driven by `deploy()` directly. Restarted instances are driven by this method on the next health tick.
+
+`.filter_map()` combines filtering and transforming. For each instance that passes the filter, it tries to extract the OCI spec. `i.oci_spec.as_ref()` converts `Option<OciSpec>` to `Option<&OciSpec>` (borrowing the inner value without moving it), then `.map(|spec| ...)` transforms the `Some` case while leaving `None` unchanged. `filter_map` drops the `None`s and unwraps the `Some`s. In Go, you'd write an `if` inside a `for` loop. The Rust version chains iterators, which avoids the intermediate `Vec` until `.collect()` materialises the results at the end.
+
+This is called the "collect-then-process" pattern. We gather everything we need to act on (releasing the borrow on the supervisor), then iterate and mutate. The alternative would be indexing into the instances map by position, which is both less readable and fragile if the map changes size during iteration.
 
 ## A local API
 
@@ -2252,9 +2521,7 @@ pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError>
 }
 ```
 
-Two new `RelishError` variants handle the failure modes: `AgentUnreachable` (can't connect at all) and `ApiError { status, body }` (connected but got an error response). The error enum grows with each phase, but every variant carries enough context to display a useful error message.
-
-Making `main()` async was a one-line change: `fn main()` became `#[tokio::main] async fn main()`. All the command functions were already returning `Result` — we just added `.await` to the calls.
+The two new `RelishError` variants we saw earlier handle the failure modes: `AgentUnreachable` (can't connect at all) and `ApiError { status, body }` (connected but got an error response). The error enum grows with each phase, but every variant carries enough context to display a useful error message.
 
 ## Integration tests: the full lifecycle
 
@@ -2320,6 +2587,20 @@ Here's what the integration tests cover:
 
 **`status_empty_when_nothing_deployed`** — verify that a fresh agent reports no instances.
 
+**`logs_for_deployed_app`** — deploy an app, fetch logs, verify they contain the app name.
+
+**`relish_status_returns_expected_output`** — deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
+
+**`job_runs_to_completion`** — deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
+
+**`job_failed_retries_then_fails`** — deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
+
+**`init_container_success_allows_app_start`** — deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
+
+**`init_container_failure_prevents_start`** — deploy an app with an init container that runs `false`. Verify the deploy returns an error. The app should never start.
+
+**`health_check_triggers_restart`** — deploy an app with a health check pointing at a TestApp in `UnhealthyAfter(3)` mode. The app passes 3 health checks (reaching Running), then starts failing. Wait long enough for the failure threshold to trip and the restart to happen. Verify `restart_count > 0`. This is the full lifecycle test: healthy, unhealthy, restart.
+
 Each test is end-to-end: real HTTP, real process spawning, real state machine transitions. The only thing that's fake is the container runtime (ProcessGrill instead of runc). That's exactly the line we want: test the orchestration logic with real I/O, but don't require root privileges or a container runtime to be installed.
 
 ## The bun binary
@@ -2345,18 +2626,148 @@ Startup is sequential: load config, create port allocator, detect runtime, creat
 
 The `--runtime` flag controls which `Grill` implementation to use. `auto` checks what's available on the platform. `process` forces ProcessGrill. `runc` and `apple` select the platform-specific runtimes and error out if they're not available.
 
+## Pulling real images
+
+Up to this point, runc could only create containers with an empty rootfs directory. That's fine for testing the OCI spec generation pipeline, but it means `runc create` fails the moment the container process tries to do anything useful. The `container` CLI on macOS handles image pulling internally, so Apple Container works out of the box. On Linux, we need to do this ourselves.
+
+### How OCI image distribution works
+
+Container images aren't monolithic files. They're a stack of layers, each one a gzipped tarball containing filesystem changes. When you `docker pull alpine:latest`, here's what actually happens:
+
+1. The client contacts the registry (e.g. `registry-1.docker.io`) and requests the *manifest* for `library/alpine:latest`.
+2. The manifest lists the image's layers by their SHA-256 digest, plus a config blob containing the default command, environment variables, and other metadata.
+3. The client downloads each layer blob and verifies its digest.
+4. The layers are unpacked bottom-up into a directory, with each layer's files overlaying the previous one.
+
+The manifest can also be a *manifest index* (sometimes called a "fat manifest") that lists platform-specific manifests for linux/amd64, linux/arm64, and so on. The client picks the one matching its host architecture.
+
+### Parsing image references
+
+Docker Hub has convenient shorthand. You type `alpine`, but the actual reference is `docker.io/library/alpine:latest`. The `ImageReference` type normalises this:
+
+```rust
+pub struct ImageReference {
+    pub registry: String,
+    pub repository: String,
+    pub tag: String,
+}
+```
+
+The parser handles bare names (`alpine`), names with tags (`alpine:3.19`), user repos (`myuser/myimage:v1`), and custom registries (`ghcr.io/org/image:sha`). It distinguishes registries from user names by checking for a `.` or `:` in the first path component.
+
+### The `oci-distribution` crate
+
+We use the `oci-distribution` crate for the registry protocol. It handles HTTP authentication (we only need anonymous pulls for now), manifest parsing, and blob downloads. The key call is:
+
+```rust
+let (manifest, digest, config) = client
+    .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
+    .await?;
+```
+
+This returns an `OciImageManifest` with the layer descriptors. If the registry returns a manifest index (multi-platform), the client's built-in platform resolver automatically selects the right architecture.
+
+### Layer unpacking and whiteouts
+
+Each layer is a gzipped tarball. We extract them base-first (the first layer in the manifest is the bottom of the filesystem). The `flate2` crate handles gzip decompression, and `tar` handles extraction. We run the unpacking inside `tokio::task::spawn_blocking` since tar extraction is CPU-bound and would block the async runtime.
+
+OCI images use a convention called *whiteout files* to handle deletions between layers. Think of each layer as a transparent sheet. You can add new files, but you can't erase what's underneath. Whiteout markers solve this:
+
+- `.wh.filename` means "delete `filename` from whatever layer created it"
+- `.wh..wh..opq` means "this entire directory is opaque — ignore everything from lower layers"
+
+The unpacker watches for these markers and removes the corresponding files before continuing with the rest of the layer.
+
+### Content-addressed caching
+
+Every blob is stored by its SHA-256 digest under `{store_root}/blobs/sha256/{hash}`. If the file already exists, we skip the download entirely. Tags always re-fetch the manifest (since `latest` might point to a new digest tomorrow), but if all the layers are already cached, the second pull only costs one HTTP request for the manifest.
+
+### Going rootless
+
+On Linux, runc normally requires root to create namespaces and set up cgroups. Rootless mode uses user namespaces instead: the kernel maps your unprivileged UID to UID 0 *inside* the container, giving the container process the illusion of being root without any actual privileges on the host.
+
+The `rootless::make_rootless` function adjusts an OCI spec for this:
+
+```rust
+pub fn make_rootless(spec: &mut OciSpec, instance_name: &str) {
+    // Add user namespace
+    spec.linux.namespaces.push(OciNamespace {
+        ns_type: "user".to_string(),
+        path: None,
+    });
+
+    // Remove network namespace (share host network for Phase 1)
+    spec.linux.namespaces.retain(|ns| ns.ns_type != "network");
+
+    // Map current user to container root
+    let uid = nix::unistd::getuid().as_raw();
+    spec.linux.uid_mappings = Some(vec![OciIdMapping {
+        container_id: 0, host_id: uid, size: 1,
+    }]);
+    // ... gid_mappings, /sys adjustments, cgroup path
+}
+```
+
+Three things change from the root spec:
+
+1. **User namespace added.** This is what makes rootless work. The kernel creates a new user namespace where UID 0 maps to your real UID.
+2. **Network namespace removed.** Creating a network namespace rootlessly requires tools like `slirp4netns` or `pasta`. We'll handle container networking properly in Phase 3. For now, containers share the host network.
+3. **`/sys` becomes a bind mount.** Mounting `sysfs` requires `CAP_SYS_ADMIN`, which we don't have outside the user namespace. A read-only bind mount of the host's `/sys` works instead.
+
+The `OciIdMapping` type is new in our OCI spec:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OciIdMapping {
+    #[serde(rename = "containerID")]
+    pub container_id: u32,
+    #[serde(rename = "hostID")]
+    pub host_id: u32,
+    pub size: u32,
+}
+```
+
+The `serde(rename)` attributes match the OCI runtime spec's JSON field names. Without them, Rust's snake_case field names would produce `container_id` instead of `containerID`, and runc would reject the spec.
+
+### Wiring it together
+
+`RuncGrill` now has an `ImageStore` and a `rootless` flag. When `create()` is called, it checks whether the spec's `root.path` looks like an image reference (doesn't start with `/` or `.`). If it does, it pulls and unpacks the image, then symlinks the resulting rootfs into the bundle directory:
+
+```rust
+if looks_like_image_ref(&spec.root.path) {
+    let rootfs = self.image_store
+        .pull_and_unpack(&spec.root.path).await?;
+    tokio::fs::symlink(&rootfs, bundle_dir.join("rootfs")).await?;
+    spec.root.path = "rootfs".to_string();
+}
+```
+
+The `detect_runtime()` function now auto-detects rootless mode and configures paths accordingly. Non-root users get `~/.local/share/reliaburger/` for images and bundles; root uses `/var/lib/reliaburger/`.
+
+### Testing image pulling
+
+The unit tests for `ImageReference::parse` and layer unpacking run unconditionally. They create synthetic gzipped tarballs in temp directories and verify that whiteouts, symlinks, and multi-layer ordering work correctly.
+
+The integration tests for actual image pulling are gated behind `RELIABURGER_IMAGE_PULL_TESTS=1` since they require network access. They pull `alpine:latest` from Docker Hub and verify that `/bin/sh` exists in the unpacked rootfs.
+
 ## What we built
 
-Phase 1 started with parsing TOML and ended with a working container lifecycle. We can now:
+Phase 1 started with parsing TOML and ended with a working container lifecycle that can pull real OCI images from Docker Hub and run them rootlessly on Linux. We can now:
 
 - `cargo run --bin bun` starts a node agent that auto-detects the runtime, spawns containers (or processes), and runs health checks on a timer
 - `cargo run --bin relish -- apply app.toml` deploys workloads to the running agent
 - `cargo run --bin relish -- status` shows what's running
 - `cargo run --bin relish -- logs web` shows captured output
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
+- `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
+- RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
+- Rootless runc runs containers without sudo using user namespaces and UID/GID mapping
+- Jobs run to completion with exit code tracking and retry on failure
+- Init containers run sequentially before the main app, with failure halting the deploy
+- Unhealthy apps get restarted automatically with exponential backoff
 
-268 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, the agent event loop, the API server, the CLI, and 9 integration tests that exercise the full stack end to end.
+306 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI, and 14 integration tests that exercise the full stack end to end.
 
-What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), image pulling (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
+What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 
 The foundation is solid. The trait boundaries (`Grill`, the state machine, the health checker) were designed so that adding real implementations doesn't change the orchestration logic. When we add runc support, the agent doesn't know the difference. When we add a scheduler in Phase 2, it sends the same `AgentCommand::Deploy` that the API sends today. That's the payoff of getting the abstractions right early: each phase adds new capabilities without rewriting what came before.
