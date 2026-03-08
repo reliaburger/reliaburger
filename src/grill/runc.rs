@@ -105,7 +105,7 @@ impl super::Grill for RuncGrill {
                 .image_store
                 .pull_and_unpack(&spec.root.path)
                 .await
-                .map_err(|e| GrillError::ImagePull(e))?;
+                .map_err(GrillError::ImagePull)?;
 
             // Symlink the unpacked rootfs into the bundle directory
             let bundle_rootfs = bundle_dir.join("rootfs");

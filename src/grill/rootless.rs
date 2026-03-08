@@ -5,7 +5,7 @@
 /// (sharing the host network for Phase 1), adjusts /sys to a
 /// bind mount, and sets up cgroup paths for systemd delegation.
 use super::oci::{OciIdMapping, OciMount, OciNamespace, OciSpec};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Modify an OCI spec for rootless runc execution.
 ///
@@ -53,7 +53,7 @@ pub fn make_rootless(spec: &mut OciSpec, instance_name: &str) {
     // Adjust /sys mount: sysfs requires CAP_SYS_ADMIN outside the user
     // namespace, so bind-mount the host's /sys read-only instead
     for mount in &mut spec.mounts {
-        if mount.destination == PathBuf::from("/sys") {
+        if mount.destination == Path::new("/sys") {
             mount.source = Some(PathBuf::from("/sys"));
             mount.mount_type = Some("none".to_string());
             mount.options = vec![
@@ -70,7 +70,7 @@ pub fn make_rootless(spec: &mut OciSpec, instance_name: &str) {
     let has_devpts = spec
         .mounts
         .iter()
-        .any(|m| m.destination == PathBuf::from("/dev/pts"));
+        .any(|m| m.destination == Path::new("/dev/pts"));
     if !has_devpts {
         spec.mounts.push(OciMount {
             destination: PathBuf::from("/dev/pts"),
