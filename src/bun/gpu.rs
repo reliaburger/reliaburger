@@ -29,7 +29,7 @@ pub trait GpuDetector {
 ///
 /// Used on nodes without GPU hardware, and as a placeholder until
 /// NVML integration is implemented.
-// TODO(Phase 1): replace with NvmlGpuDetector when GPU support is added
+// TODO(Phase 2): replace with NvmlGpuDetector when GPU scheduling is added
 pub struct StubGpuDetector;
 
 impl GpuDetector for StubGpuDetector {
