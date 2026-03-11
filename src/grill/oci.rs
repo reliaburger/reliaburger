@@ -222,9 +222,9 @@ fn build_mounts(
             let base = volumes_dir
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"));
-            base.join(namespace).join(app_name).join(
-                vol.path.strip_prefix("/").unwrap_or(&vol.path),
-            )
+            base.join(namespace)
+                .join(app_name)
+                .join(vol.path.strip_prefix("/").unwrap_or(&vol.path))
         };
 
         mounts.push(OciMount {
@@ -639,7 +639,9 @@ mod tests {
             .expect("volume mount not found");
         assert_eq!(
             vol_mount.source,
-            Some(PathBuf::from("/var/lib/reliaburger/volumes/prod/redis/data"))
+            Some(PathBuf::from(
+                "/var/lib/reliaburger/volumes/prod/redis/data"
+            ))
         );
         assert!(vol_mount.options.contains(&"rw".to_string()));
     }

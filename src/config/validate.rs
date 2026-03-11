@@ -58,10 +58,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         if !vol.path.is_absolute() {
             return Err(ConfigError::InvalidVolume {
                 name: name.to_string(),
-                reason: format!(
-                    "mount path {:?} must be absolute",
-                    vol.path.display()
-                ),
+                reason: format!("mount path {:?} must be absolute", vol.path.display()),
             });
         }
         if let Some(ref source) = vol.source
@@ -69,10 +66,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         {
             return Err(ConfigError::InvalidVolume {
                 name: name.to_string(),
-                reason: format!(
-                    "source path {:?} must be absolute",
-                    source.display()
-                ),
+                reason: format!("source path {:?} must be absolute", source.display()),
             });
         }
     }
