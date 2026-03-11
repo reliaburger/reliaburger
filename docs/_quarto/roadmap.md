@@ -46,7 +46,7 @@ Integration tests:
 
 Design docs: [agent-bun.md](design/agent-bun.md), [cli-relish.md](design/cli-relish.md)
 
-**Milestone:** `relish init && relish apply -f app.toml` runs a container on one node with health checks, logs, and resource limits. All Phase 1 tests pass.
+**Milestone:** `relish init && relish apply app.toml` runs a container on one node with health checks, logs, and resource limits. All Phase 1 tests pass.
 
 ---
 

@@ -385,7 +385,9 @@ host = "myapp.com"
 [app.redis]
 image = "redis:7-alpine"
 port = 6379
-volume = { path = "/data", size = "10Gi" }
+[[app.redis.volumes]]
+path = "/data"
+size = "10Gi"
 
 [job.db-migrate]
 image = "myapp:v1.4.2"
@@ -2766,7 +2768,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-306 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI, and 14 integration tests that exercise the full stack end to end.
+321 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, and 16 integration tests that exercise the full stack end to end.
 
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 

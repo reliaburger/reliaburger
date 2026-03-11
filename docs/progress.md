@@ -25,10 +25,13 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Init container execution (sequential run, failure prevents main start)
 - [x] Restart re-drive (health check and job restarts re-start instances)
 - [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill)
-- [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container)
+- [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container, volumes, multi-app, full-featured)
 - [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts)
 - [x] Rootless runc (user namespaces, UID/GID mapping, rootless cgroups v2, no-sudo containers)
-- [x] All Phase 1 tests green (306 tests)
+- [x] Streaming apply progress via SSE (real-time deploy feedback instead of blocking response)
+- [x] HostPath-style volumes (dual-mode: explicit source for hostPath, managed for auto-provisioned storage)
+- [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
+- [x] All Phase 1 tests green (321 tests)
 
 ## Phase 2: Cluster Formation
 
