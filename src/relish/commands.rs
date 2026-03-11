@@ -3,6 +3,7 @@
 /// Each subcommand is an async function that returns `Result<(), RelishError>`.
 /// Commands try to reach the live Bun agent first. If the agent is
 /// unreachable, `apply` falls back to a dry-run plan.
+use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
@@ -130,6 +131,53 @@ async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), Relis
     Ok(())
 }
 
+/// Initialise a new project with starter config files.
+///
+/// Creates `reliaburger.toml` (node config) and `app.toml` (sample app)
+/// in the given directory. Refuses to overwrite existing files.
+pub fn init(dir: &Path) -> Result<(), RelishError> {
+    let node_path = dir.join("reliaburger.toml");
+    let app_path = dir.join("app.toml");
+
+    if node_path.exists() {
+        return Err(RelishError::FileExists {
+            path: node_path.display().to_string(),
+        });
+    }
+    if app_path.exists() {
+        return Err(RelishError::FileExists {
+            path: app_path.display().to_string(),
+        });
+    }
+
+    let node_config = crate::config::node::NodeConfig::default();
+    let node_toml = format!(
+        "# Reliaburger node configuration.\n\
+         # See docs/README.md for full reference.\n\n{}",
+        toml::to_string_pretty(&node_config).expect("failed to serialise default node config")
+    );
+
+    let app_toml = "\
+# Sample Reliaburger app configuration.
+# Deploy with: relish apply app.toml
+
+[app.web]
+image = \"nginx:latest\"
+port = 8080
+
+[app.web.health]
+path = \"/\"
+";
+
+    fs::write(&node_path, node_toml)?;
+    fs::write(&app_path, app_toml)?;
+
+    println!("created {}", node_path.display());
+    println!("created {}", app_path.display());
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +267,35 @@ mod tests {
     async fn exec_returns_agent_required() {
         let err = exec("web", &["sh".to_string()]).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentRequired { ref command } if command == "exec"));
+    }
+
+    #[test]
+    fn init_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        assert!(dir.path().join("reliaburger.toml").exists());
+        assert!(dir.path().join("app.toml").exists());
+    }
+
+    #[test]
+    fn init_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        let err = init(dir.path()).unwrap_err();
+        assert!(matches!(err, RelishError::FileExists { .. }));
+    }
+
+    #[test]
+    fn init_generated_config_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+
+        let node_content = std::fs::read_to_string(dir.path().join("reliaburger.toml")).unwrap();
+        let _: crate::config::node::NodeConfig = toml::from_str(&node_content).unwrap();
+
+        let app_content = std::fs::read_to_string(dir.path().join("app.toml")).unwrap();
+        let config = Config::parse(&app_content).unwrap();
+        config.validate().unwrap();
     }
 
     #[tokio::test]

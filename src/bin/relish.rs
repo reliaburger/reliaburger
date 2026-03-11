@@ -48,6 +48,12 @@ enum Command {
         /// Resource name.
         name: String,
     },
+    /// Initialise a new project with starter config files.
+    Init {
+        /// Directory to create config files in.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -63,6 +69,7 @@ async fn main() -> ExitCode {
             ref command,
         } => commands::exec(app, command).await,
         Command::Inspect { ref name } => commands::inspect(name).await,
+        Command::Init { ref dir } => commands::init(dir),
     };
 
     match result {
@@ -125,6 +132,20 @@ mod tests {
     fn default_output_is_human() {
         let cli = parse(&["relish", "status"]).unwrap();
         assert_eq!(cli.output, OutputFormat::Human);
+    }
+
+    #[test]
+    fn parse_init_command() {
+        let cli = parse(&["relish", "init"]).unwrap();
+        assert!(matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some(".")));
+    }
+
+    #[test]
+    fn parse_init_with_dir() {
+        let cli = parse(&["relish", "init", "/tmp/myproject"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some("/tmp/myproject"))
+        );
     }
 
     #[test]

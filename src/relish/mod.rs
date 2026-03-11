@@ -43,4 +43,12 @@ pub enum RelishError {
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },
+
+    /// File already exists (init refuses to overwrite).
+    #[error("{path} already exists (refusing to overwrite)")]
+    FileExists { path: String },
+
+    /// IO error.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 }
