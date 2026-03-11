@@ -4,7 +4,7 @@
 /// We define our own types rather than importing the full OCI spec
 /// crate, because we only need a subset and want control over the
 /// serialisation and derives.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -128,10 +128,11 @@ pub fn generate_oci_spec(
     spec: &AppSpec,
     host_port: Option<u16>,
     cgroup_path: &str,
+    volumes_dir: Option<&Path>,
 ) -> OciSpec {
     let env = build_env(spec);
     let args = build_args(app_name, spec);
-    let mounts = build_mounts(spec, host_port);
+    let mounts = build_mounts(spec, host_port, app_name, namespace, volumes_dir);
 
     let namespaces = standard_namespaces();
 
@@ -191,26 +192,44 @@ fn build_args(app_name: &str, spec: &AppSpec) -> Vec<String> {
     spec.command.clone()
 }
 
-fn build_mounts(spec: &AppSpec, _host_port: Option<u16>) -> Vec<OciMount> {
+fn build_mounts(
+    spec: &AppSpec,
+    _host_port: Option<u16>,
+    app_name: &str,
+    namespace: &str,
+    volumes_dir: Option<&Path>,
+) -> Vec<OciMount> {
     let mut mounts = standard_mounts();
 
     // Config files: read-only bind mounts
     for cf in &spec.config_file {
         mounts.push(OciMount {
             destination: cf.path.clone(),
-            // TODO(Phase 1): resolve source content to a temp file path
+            // TODO(Phase 5): resolve inline content to a temp file path
             source: cf.source.as_ref().map(PathBuf::from),
             mount_type: Some("bind".to_string()),
             options: vec!["bind".to_string(), "ro".to_string()],
         });
     }
 
-    // Volume: read-write bind mount
-    if let Some(vol) = &spec.volume {
+    // Volumes: read-write bind mounts
+    for vol in &spec.volumes {
+        let host_path = if let Some(source) = &vol.source {
+            // HostPath mode: use the explicit host path
+            source.clone()
+        } else {
+            // Managed mode: resolve to a subdirectory under volumes_dir
+            let base = volumes_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"));
+            base.join(namespace).join(app_name).join(
+                vol.path.strip_prefix("/").unwrap_or(&vol.path),
+            )
+        };
+
         mounts.push(OciMount {
             destination: vol.path.clone(),
-            // TODO(Phase 1): resolve to actual host path under storage.volumes
-            source: Some(vol.path.clone()),
+            source: Some(host_path),
             mount_type: Some("bind".to_string()),
             options: vec!["bind".to_string(), "rw".to_string()],
         });
@@ -412,7 +431,7 @@ mod tests {
     #[test]
     fn generate_minimal_app() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         assert_eq!(oci.root.path, "test:v1");
         assert_eq!(oci.process.cwd, "/");
@@ -423,7 +442,7 @@ mod tests {
     #[test]
     fn generate_without_image_uses_filesystem_path() {
         let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         assert_eq!(
             oci.root.path,
@@ -442,7 +461,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         assert!(oci.process.env.contains(&"FOO=bar".to_string()));
         assert!(oci.process.env.contains(&"BAZ=qux".to_string()));
@@ -458,7 +477,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         assert!(
             oci.process
@@ -476,7 +495,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let resources = oci.linux.resources.unwrap();
         let cpu = resources.cpu.unwrap();
@@ -493,7 +512,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let resources = oci.linux.resources.unwrap();
         let memory = resources.memory.unwrap();
@@ -503,14 +522,14 @@ mod tests {
     #[test]
     fn generate_without_resources_has_no_resources_block() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
         assert!(oci.linux.resources.is_none());
     }
 
     #[test]
     fn generate_has_all_namespaces() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let ns_types: Vec<&str> = oci
             .linux
@@ -534,6 +553,7 @@ mod tests {
             &spec,
             None,
             "/sys/fs/cgroup/reliaburger/default/web/0",
+            None,
         );
 
         assert_eq!(
@@ -545,7 +565,7 @@ mod tests {
     #[test]
     fn generate_has_standard_mounts() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let mount_paths: Vec<&str> = oci
             .mounts
@@ -565,7 +585,7 @@ mod tests {
             content: Some("key = value".to_string()),
             source: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let cf_mount = oci
             .mounts
@@ -576,26 +596,85 @@ mod tests {
     }
 
     #[test]
-    fn generate_with_volume() {
+    fn generate_with_volume_hostpath() {
         let mut spec = minimal_app();
-        spec.volume = Some(VolumeSpec {
+        spec.volumes.push(VolumeSpec {
             path: PathBuf::from("/data"),
-            size: "10Gi".to_string(),
+            source: Some(PathBuf::from("/host/data")),
+            size: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let vol_mount = oci
             .mounts
             .iter()
+            .find(|m| m.destination == std::path::Path::new("/data"))
+            .expect("volume mount not found");
+        assert_eq!(vol_mount.source, Some(PathBuf::from("/host/data")));
+        assert!(vol_mount.options.contains(&"rw".to_string()));
+    }
+
+    #[test]
+    fn generate_with_volume_managed() {
+        let mut spec = minimal_app();
+        spec.volumes.push(VolumeSpec {
+            path: PathBuf::from("/data"),
+            source: None,
+            size: Some("10Gi".to_string()),
+        });
+        let volumes_dir = PathBuf::from("/var/lib/reliaburger/volumes");
+        let oci = generate_oci_spec(
+            "redis",
+            "prod",
+            &spec,
+            None,
+            "/cgroup/path",
+            Some(&volumes_dir),
+        );
+
+        let vol_mount = oci
+            .mounts
+            .iter()
+            .find(|m| m.destination == std::path::Path::new("/data"))
+            .expect("volume mount not found");
+        assert_eq!(
+            vol_mount.source,
+            Some(PathBuf::from("/var/lib/reliaburger/volumes/prod/redis/data"))
+        );
+        assert!(vol_mount.options.contains(&"rw".to_string()));
+    }
+
+    #[test]
+    fn generate_with_multiple_volumes() {
+        let mut spec = minimal_app();
+        spec.volumes.push(VolumeSpec {
+            path: PathBuf::from("/data"),
+            source: Some(PathBuf::from("/host/data")),
+            size: None,
+        });
+        spec.volumes.push(VolumeSpec {
+            path: PathBuf::from("/logs"),
+            source: None,
+            size: None,
+        });
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+
+        let data_mount = oci
+            .mounts
+            .iter()
             .find(|m| m.destination == std::path::Path::new("/data"));
-        assert!(vol_mount.is_some());
-        assert!(vol_mount.unwrap().options.contains(&"rw".to_string()));
+        let logs_mount = oci
+            .mounts
+            .iter()
+            .find(|m| m.destination == std::path::Path::new("/logs"));
+        assert!(data_mount.is_some());
+        assert!(logs_mount.is_some());
     }
 
     #[test]
     fn generate_serialises_to_json() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let json = serde_json::to_string_pretty(&oci).unwrap();
         assert!(json.contains("\"root\""));
@@ -671,7 +750,7 @@ mod tests {
     #[test]
     fn uid_gid_mappings_omitted_when_none() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path");
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
 
         let json = serde_json::to_string(&oci).unwrap();
         assert!(!json.contains("uidMappings"));

@@ -284,12 +284,21 @@ pub struct ConfigFileSpec {
 /// Local persistent storage attached to an App.
 ///
 /// Volumes survive container restarts but are tied to the physical node.
+/// Two modes:
+///
+/// - **HostPath:** set `source` to an absolute path on the host. The
+///   directory is bind-mounted directly (like Kubernetes `hostPath`).
+/// - **Managed:** omit `source`. Reliaburger creates a directory under
+///   `storage.volumes/{namespace}/{app}` and bind-mounts it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeSpec {
     /// Mount path inside the container.
     pub path: PathBuf,
-    /// Size limit, e.g. "10Gi". Validated via `parse_resource_value`.
-    pub size: String,
+    /// Host path to bind mount from. If omitted, Reliaburger manages
+    /// the storage directory automatically.
+    pub source: Option<PathBuf>,
+    /// Size limit, e.g. "10Gi". Optional — enforced in Phase 5.
+    pub size: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

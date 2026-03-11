@@ -44,8 +44,9 @@ pub struct AppSpec {
     /// Configuration files injected into the container.
     #[serde(default)]
     pub config_file: Vec<ConfigFileSpec>,
-    /// Local persistent volume.
-    pub volume: Option<VolumeSpec>,
+    /// Persistent volumes mounted into the container.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
     /// Init containers run before the main container starts.
     #[serde(default)]
     pub init: Vec<InitContainerSpec>,
@@ -275,7 +276,7 @@ mod tests {
             path = "/etc/app/config.yaml"
             content = "key: value"
 
-            [volume]
+            [[volumes]]
             path = "/data"
             size = "10Gi"
 
@@ -339,8 +340,9 @@ mod tests {
         assert_eq!(app.config_file.len(), 1);
         assert_eq!(app.config_file[0].content.as_deref(), Some("key: value"));
 
-        // Volume
-        assert_eq!(app.volume.as_ref().unwrap().size, "10Gi");
+        // Volumes
+        assert_eq!(app.volumes.len(), 1);
+        assert_eq!(app.volumes[0].size.as_deref(), Some("10Gi"));
 
         // Init containers
         assert_eq!(app.init.len(), 1);
@@ -588,16 +590,58 @@ mod tests {
     }
 
     #[test]
-    fn parse_app_with_volume_inline_table() {
+    fn parse_app_with_volume_hostpath() {
         let app = parse_app(
             r#"
             image = "redis:7-alpine"
             port = 6379
-            volume = { path = "/data", size = "10Gi" }
+
+            [[volumes]]
+            source = "/host/data"
+            path = "/data"
         "#,
         );
-        let v = app.volume.unwrap();
-        assert_eq!(v.path, PathBuf::from("/data"));
-        assert_eq!(v.size, "10Gi");
+        assert_eq!(app.volumes.len(), 1);
+        assert_eq!(app.volumes[0].path, PathBuf::from("/data"));
+        assert_eq!(app.volumes[0].source, Some(PathBuf::from("/host/data")));
+        assert!(app.volumes[0].size.is_none());
+    }
+
+    #[test]
+    fn parse_app_with_volume_managed() {
+        let app = parse_app(
+            r#"
+            image = "redis:7-alpine"
+            port = 6379
+
+            [[volumes]]
+            path = "/data"
+            size = "10Gi"
+        "#,
+        );
+        assert_eq!(app.volumes.len(), 1);
+        assert_eq!(app.volumes[0].path, PathBuf::from("/data"));
+        assert!(app.volumes[0].source.is_none());
+        assert_eq!(app.volumes[0].size.as_deref(), Some("10Gi"));
+    }
+
+    #[test]
+    fn parse_app_with_multiple_volumes() {
+        let app = parse_app(
+            r#"
+            image = "myapp:v1"
+
+            [[volumes]]
+            source = "/host/logs"
+            path = "/var/log/app"
+
+            [[volumes]]
+            path = "/data"
+            size = "5Gi"
+        "#,
+        );
+        assert_eq!(app.volumes.len(), 2);
+        assert_eq!(app.volumes[0].source, Some(PathBuf::from("/host/logs")));
+        assert_eq!(app.volumes[1].path, PathBuf::from("/data"));
     }
 }

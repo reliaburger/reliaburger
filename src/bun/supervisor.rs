@@ -381,7 +381,7 @@ mod tests {
             gpu: None,
             env: Default::default(),
             config_file: Vec::new(),
-            volume: None,
+            volumes: Vec::new(),
             init: Vec::new(),
             ingress: None,
             placement: None,
