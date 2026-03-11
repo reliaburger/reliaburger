@@ -256,6 +256,11 @@ impl super::Grill for ProcessGrill {
         let entry = procs.get(instance)?;
         entry.exit_code
     }
+
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        let stdout = self.stdout(instance).await?;
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    }
 }
 
 #[cfg(test)]

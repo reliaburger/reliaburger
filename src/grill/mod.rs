@@ -118,6 +118,18 @@ pub trait Grill: Send + Sync {
         let _ = instance;
         std::future::ready(None)
     }
+
+    /// Get captured logs for an instance.
+    ///
+    /// Returns whatever output the runtime has captured. The default
+    /// returns an empty string for runtimes that don't capture logs.
+    fn logs(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<String, GrillError>> + Send {
+        let _ = instance;
+        std::future::ready(Ok(String::new()))
+    }
 }
 
 /// Runtime-selected Grill implementation.
@@ -204,6 +216,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.exit_code(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.exit_code(instance).await,
+        }
+    }
+
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.logs(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.logs(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.logs(instance).await,
         }
     }
 }

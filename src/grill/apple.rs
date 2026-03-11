@@ -163,6 +163,11 @@ impl super::Grill for AppleContainerGrill {
         Ok(())
     }
 
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        let output = Self::container_command(&["logs", &instance.0], instance).await?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
         let output = Self::container_command(&["inspect", &instance.0], instance).await?;
 

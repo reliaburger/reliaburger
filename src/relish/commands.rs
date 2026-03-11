@@ -17,10 +17,16 @@ use super::plan::generate_plan;
 /// If a Bun agent is running, sends the config for deployment.
 /// If no agent is reachable, falls back to showing the dry-run plan.
 pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+    apply_with_client(path, output, &BunClient::default_local()).await
+}
+
+async fn apply_with_client(
+    path: &Path,
+    output: OutputFormat,
+    client: &BunClient,
+) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
-
-    let client = BunClient::default_local();
 
     match client.health().await {
         Ok(()) => {
@@ -46,7 +52,10 @@ pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError>
 
 /// Show cluster and app status.
 pub async fn status() -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+    status_with_client(&BunClient::default_local()).await
+}
+
+async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
     let statuses = client.status().await?;
 
     if statuses.is_empty() {
@@ -73,7 +82,10 @@ pub async fn status() -> Result<(), RelishError> {
 
 /// Stream logs from an app or job.
 pub async fn logs(name: &str) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+    logs_with_client(name, &BunClient::default_local()).await
+}
+
+async fn logs_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
     let log_output = client.logs(name, "default").await?;
     println!("{log_output}");
     Ok(())
@@ -88,7 +100,10 @@ pub async fn exec(_app: &str, _command: &[String]) -> Result<(), RelishError> {
 
 /// Show detailed info about an app, node, or job.
 pub async fn inspect(name: &str) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+    inspect_with_client(name, &BunClient::default_local()).await
+}
+
+async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
     let statuses = client.status().await?;
     let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == name).collect();
 
@@ -119,6 +134,12 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    /// Port 1 on localhost — nothing listens there, so connections
+    /// are refused immediately without waiting for a timeout.
+    fn bogus_client() -> BunClient {
+        BunClient::new("http://127.0.0.1:1")
+    }
+
     fn write_temp_config(content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -134,13 +155,17 @@ mod tests {
             port = 8080
         "#,
         );
-        // No agent running, so this falls back to dry-run
-        assert!(apply(f.path(), OutputFormat::Human).await.is_ok());
+        assert!(
+            apply_with_client(f.path(), OutputFormat::Human, &bogus_client())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn apply_with_missing_file_errors() {
-        let result = apply(Path::new("/nonexistent/config.toml"), OutputFormat::Human).await;
+        let result =
+            apply_with_client(Path::new("/nonexistent/config.toml"), OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -152,7 +177,7 @@ mod tests {
     #[tokio::test]
     async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply(f.path(), OutputFormat::Human).await;
+        let result = apply_with_client(f.path(), OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err());
     }
 
@@ -164,7 +189,7 @@ mod tests {
             replicas = 3
         "#,
         );
-        let result = apply(f.path(), OutputFormat::Human).await;
+        let result = apply_with_client(f.path(), OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -175,13 +200,13 @@ mod tests {
 
     #[tokio::test]
     async fn status_returns_agent_unreachable() {
-        let err = status().await.unwrap_err();
+        let err = status_with_client(&bogus_client()).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
-        let err = logs("web").await.unwrap_err();
+        let err = logs_with_client("web", &bogus_client()).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 
@@ -193,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_returns_agent_unreachable() {
-        let err = inspect("web").await.unwrap_err();
+        let err = inspect_with_client("web", &bogus_client()).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 }

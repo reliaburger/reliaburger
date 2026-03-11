@@ -634,28 +634,37 @@ impl<G: Grill> BunAgent<G> {
         statuses
     }
 
-    /// Get logs (placeholder — returns empty for MockGrill, captured output for ProcessGrill).
+    /// Get logs for all instances of an app in a namespace.
     async fn get_logs(&self, app_name: &str, namespace: &str) -> Result<String, BunError> {
-        let instances: Vec<&super::supervisor::WorkloadInstance> = self
+        let instance_ids: Vec<InstanceId> = self
             .supervisor
             .list_instances()
             .into_iter()
             .filter(|i| i.app_name == app_name && i.namespace == namespace)
+            .map(|i| i.id.clone())
             .collect();
 
-        if instances.is_empty() {
+        if instance_ids.is_empty() {
             return Err(BunError::AppNotFound {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
             });
         }
 
-        // For now return a placeholder. ProcessGrill captures stdout/stderr
-        // but accessing it requires downcasting, which we'll handle in Phase 2.
-        Ok(format!(
-            "[logs for {app_name} in {namespace}: {} instance(s)]",
-            instances.len()
-        ))
+        let mut all_logs = String::new();
+        for id in &instance_ids {
+            let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
+            if !logs.is_empty() {
+                if instance_ids.len() > 1 {
+                    all_logs.push_str(&format!("==> {id} <==\n"));
+                }
+                all_logs.push_str(&logs);
+                if !logs.ends_with('\n') {
+                    all_logs.push('\n');
+                }
+            }
+        }
+        Ok(all_logs)
     }
 
     /// Gracefully stop all instances.
@@ -905,8 +914,9 @@ mod tests {
         })
         .await
         .unwrap();
-        let logs = resp_rx.await.unwrap().unwrap();
-        assert!(logs.contains("web"));
+        let result = resp_rx.await.unwrap();
+        // MockGrill returns empty logs, but the call should succeed
+        assert!(result.is_ok());
 
         shutdown.cancel();
         agent_handle.await.unwrap();
