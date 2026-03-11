@@ -375,6 +375,48 @@ async fn init_container_failure_prevents_start() {
 }
 
 #[tokio::test]
+async fn health_check_hang_stays_in_health_wait() {
+    let test_app = TestApp::start(TestAppMode::Hang).await;
+    let harness = TestHarness::start().await;
+
+    let config = TestHarness::config_for_test_app(test_app.port());
+    harness.client.apply(&config).await.unwrap();
+
+    // Health check timeout is 1s, interval is 1s — after 5s the probes
+    // should have timed out but the app should never reach "running"
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(
+        statuses[0].state, "health-wait",
+        "expected health-wait when probes hang, got {}",
+        statuses[0].state
+    );
+
+    test_app.shutdown();
+}
+
+#[tokio::test]
+async fn inspect_returns_expected_output() {
+    let harness = TestHarness::start().await;
+
+    harness
+        .client
+        .apply(&TestHarness::config_no_health())
+        .await
+        .unwrap();
+
+    let statuses = harness.client.status().await.unwrap();
+    let matching: Vec<_> = statuses
+        .iter()
+        .filter(|s| s.app_name == "worker")
+        .collect();
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0].namespace, "default");
+    assert!(matching[0].pid.is_some());
+}
+
+#[tokio::test]
 async fn health_check_triggers_restart() {
     // App goes unhealthy after 3 healthy responses, then stays unhealthy
     let test_app = TestApp::start(TestAppMode::UnhealthyAfter(3)).await;
