@@ -126,7 +126,7 @@ The book chapters live in `docs/book/` and are written in Markdown. Chapter mapp
 - **Web framework**: axum
 - **TUI framework**: ratatui + crossterm
 - **Testing**: cargo test for unit/integration, proptest for property-based, insta for snapshots
-- **Formatting**: rustfmt defaults, enforced in CI
+- **Formatting**: rustfmt defaults, enforced in CI. Always run `cargo fmt` before committing.
 - **Linting**: clippy with default lints, warnings are errors in CI
 
 ## Rust Best Practices

@@ -177,7 +177,13 @@ enum Command {
     /// Show cluster and app status.
     Status,
     /// Stream logs from an app or job.
-    Logs { name: String },
+    Logs {
+        name: String,
+        #[arg(long)]
+        tail: Option<usize>,
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     /// Execute a command inside a running container.
     Exec {
         app: String,
@@ -190,6 +196,8 @@ enum Command {
 ```
 
 This is clap's derive API. The `Cli` struct *is* the argument parser. Each variant of the `Command` enum is a subcommand. The `///` doc comments become the help text automatically. If someone passes invalid arguments, clap generates the error message. If someone runs `relish --help`, clap generates the help output. We get all of that for free — no manual parsing, no string matching.
+
+Look at `Logs` for a moment. The `name` field is a positional argument (no `#[arg]` annotation), so `relish logs web` captures "web" as the app name. The `--tail` flag takes an optional number (`Option<usize>` means it's not required), and `--follow` is a boolean flag with a `-f` short alias. So `relish logs web --tail 10` shows the last 10 lines, `relish logs web -f` streams new output as it's produced, and `relish logs web --follow --tail 5` shows the last 5 lines then keeps streaming. All of that falls out of the type definitions — clap figures out the argument parsing from the struct fields.
 
 Can you see what we're doing here? We're letting the type system do the work. The compiler guarantees that every subcommand is handled in the `match` statement. Add a new variant to `Command` and forget to handle it? Compilation error. That's the kind of guarantee we'll lean on throughout this book.
 
@@ -2472,6 +2480,8 @@ async fn apply_handler(State(state): State<ApiState>, body: String) -> Response 
 }
 ```
 
+The logs endpoint supports two query parameters: `?tail=N` returns only the last N lines, and `?follow=true` switches from a JSON response to an SSE stream. When following, the API sends each new log line as a Server-Sent Event, reusing the same streaming pattern we built for `apply`. The client reads the stream and prints each line to stdout. When the process exits or the user hits Ctrl-C, the stream ends cleanly. This gives us `tail -f` behaviour without polling.
+
 The API listens on `127.0.0.1:9117` — localhost only. In Phase 1, there's no cluster, no mTLS, no authentication. Opening it to the network would be a security hole. We'll add proper auth in Phase 4 and bind to all interfaces when the cluster needs it.
 
 ## Relish talks to Bun
@@ -2589,7 +2599,9 @@ Here's what the integration tests cover:
 
 **`status_empty_when_nothing_deployed`** — verify that a fresh agent reports no instances.
 
-**`logs_for_deployed_app`** — deploy an app, fetch logs, verify they contain the app name.
+**`logs_for_deployed_app`** — deploy an app, fetch logs, verify the call succeeds.
+
+**`logs_with_tail_returns_limited_lines`** — deploy an app that echoes three lines ("line1", "line2", "line3"), then fetch logs with `tail=1`. Verify we get exactly one line back, and it's "line3". This exercises the full `--tail` pipeline: query param parsing in the API, tail truncation in the agent, and the client passing the parameter through.
 
 **`relish_status_returns_expected_output`** — deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
 
@@ -2759,7 +2771,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - `cargo run --bin bun` starts a node agent that auto-detects the runtime, spawns containers (or processes), and runs health checks on a timer
 - `cargo run --bin relish -- apply app.toml` deploys workloads to the running agent
 - `cargo run --bin relish -- status` shows what's running
-- `cargo run --bin relish -- logs web` shows captured output
+- `cargo run --bin relish -- logs web` shows captured output, with `--tail N` for the last N lines and `--follow` to stream new output
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
 - `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
 - RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
@@ -2768,7 +2780,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-321 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, and 16 integration tests that exercise the full stack end to end.
+332 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, and 17 integration tests that exercise the full stack end to end.
 
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 

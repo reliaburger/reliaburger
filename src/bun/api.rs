@@ -240,9 +240,8 @@ async fn logs_handler(
                 .into_response();
         }
 
-        let stream = ReceiverStream::new(lines_rx).map(|line| {
-            Ok::<_, std::convert::Infallible>(Event::default().data(line))
-        });
+        let stream = ReceiverStream::new(lines_rx)
+            .map(|line| Ok::<_, std::convert::Infallible>(Event::default().data(line)));
         return Sse::new(stream).into_response();
     }
 

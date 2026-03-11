@@ -83,11 +83,7 @@ async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
 }
 
 /// Stream logs from an app or job.
-pub async fn logs(
-    name: &str,
-    tail: Option<usize>,
-    follow: bool,
-) -> Result<(), RelishError> {
+pub async fn logs(name: &str, tail: Option<usize>, follow: bool) -> Result<(), RelishError> {
     logs_with_client(name, tail, follow, &BunClient::default_local()).await
 }
 

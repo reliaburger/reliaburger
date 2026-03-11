@@ -34,6 +34,8 @@ Integration tests:
 - Job: runs to completion and reports success
 - Job: failed job retries up to limit
 - Relish CLI: `status`, `logs`, `exec`, `inspect` return expected output
+- Relish CLI: `logs --tail N` returns only last N lines
+- Relish CLI: `logs --follow` streams new output via SSE
 
 ### Implementation
 
@@ -41,14 +43,14 @@ Integration tests:
 2. **TOML config parsing.** Define all 7 resource types (App, Job, Secret, ConfigFile, Volume, Permission, Namespace) with serde, including `[[app.*.init]]` blocks.
 3. **Grill container runtime interface.** containerd/runc integration, OCI image extraction, port mapping, cgroup management.
 4. **Bun agent core.** Process supervisor loop, health checks, restart logic, GPU detection via NVML.
-5. **Relish CLI skeleton.** `apply`, `status`, `logs`, `exec`, `inspect` (clap derive API, single-node mode).
+5. **Relish CLI skeleton.** `apply`, `status`, `logs` (with `--tail` and `--follow`), `exec`, `inspect` (clap derive API, single-node mode).
 6. **OCI image pulling.** Pull real images from Docker Hub via `oci-distribution`, unpack layers into rootfs with whiteout support, content-addressed blob caching.
 7. **Rootless runc.** User namespace mapping, rootless cgroups v2, `--root` state directory, no-sudo container execution.
 8. **Run all tests green.**
 
 Design docs: [agent-bun.md](design/agent-bun.md), [cli-relish.md](design/cli-relish.md)
 
-**Milestone:** `relish init && relish apply app.toml` runs a container on one node with health checks, logs, and resource limits. All Phase 1 tests pass.
+**Milestone:** `relish init && relish apply app.toml` runs a container on one node with health checks, logs (including `--tail` and `--follow`), and resource limits. All Phase 1 tests pass.
 
 ---
 
