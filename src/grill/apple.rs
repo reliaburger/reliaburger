@@ -168,6 +168,34 @@ impl super::Grill for AppleContainerGrill {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    async fn follow_logs(
+        &self,
+        instance: &InstanceId,
+        lines_tx: tokio::sync::mpsc::Sender<String>,
+    ) {
+        let mut child = match tokio::process::Command::new("container")
+            .args(["logs", "--follow", &instance.0])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = tokio::io::BufReader::new(stdout);
+            let mut lines = tokio::io::AsyncBufReadExt::lines(reader);
+            while let Ok(Some(line)) = lines.next_line().await {
+                if lines_tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = child.kill().await;
+    }
+
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
         let output = Self::container_command(&["inspect", &instance.0], instance).await?;
 

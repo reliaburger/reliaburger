@@ -230,8 +230,8 @@ async fn logs_for_deployed_app() {
         .await
         .unwrap();
 
-    // MockGrill returns empty logs, but the call should succeed
-    let result = harness.client.logs("worker", "default").await;
+    // ProcessGrill returns empty logs for sleep, but the call should succeed
+    let result = harness.client.logs("worker", "default", None, false).await;
     assert!(result.is_ok());
 }
 
@@ -407,10 +407,7 @@ async fn inspect_returns_expected_output() {
         .unwrap();
 
     let statuses = harness.client.status().await.unwrap();
-    let matching: Vec<_> = statuses
-        .iter()
-        .filter(|s| s.app_name == "worker")
-        .collect();
+    let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == "worker").collect();
     assert_eq!(matching.len(), 1);
     assert_eq!(matching[0].namespace, "default");
     assert!(matching[0].pid.is_some());
@@ -438,4 +435,34 @@ async fn health_check_triggers_restart() {
     );
 
     test_app.shutdown();
+}
+
+#[tokio::test]
+async fn logs_with_tail_returns_limited_lines() {
+    let harness = TestHarness::start().await;
+
+    // Deploy an app that echoes multiple lines
+    let config = Config::parse(
+        r#"
+        [app.echoer]
+        image = "test:v1"
+        command = ["sh", "-c", "echo line1; echo line2; echo line3"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for the echo to finish and output to be captured
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = harness
+        .client
+        .logs("echoer", "default", Some(1), false)
+        .await
+        .unwrap();
+
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 1, "expected 1 line, got: {result:?}");
+    assert_eq!(lines[0], "line3");
 }

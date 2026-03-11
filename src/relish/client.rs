@@ -113,10 +113,7 @@ impl BunClient {
                         ApplyEvent::InstanceCreated { id, app } => {
                             eprintln!("  created {id} ({app})");
                         }
-                        ApplyEvent::Complete {
-                            created,
-                            instances,
-                        } => {
+                        ApplyEvent::Complete { created, instances } => {
                             result = Some(ApplyResult {
                                 created: *created,
                                 instances: instances.clone(),
@@ -134,20 +131,12 @@ impl BunClient {
         }
 
         // Check for any remaining data in the buffer
-        if let Some(data) = buffer
-            .lines()
-            .find_map(|line| line.strip_prefix("data:"))
+        if let Some(data) = buffer.lines().find_map(|line| line.strip_prefix("data:"))
             && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
         {
             match event {
-                ApplyEvent::Complete {
-                    created,
-                    instances,
-                } => {
-                    result = Some(ApplyResult {
-                        created,
-                        instances,
-                    });
+                ApplyEvent::Complete { created, instances } => {
+                    result = Some(ApplyResult { created, instances });
                 }
                 ApplyEvent::Error { message } => {
                     return Err(RelishError::ApiError {
@@ -168,12 +157,7 @@ impl BunClient {
     /// Get status of all instances.
     pub async fn status(&self) -> Result<Vec<InstanceStatus>, RelishError> {
         let url = format!("{}/v1/status", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -210,14 +194,33 @@ impl BunClient {
     }
 
     /// Get logs for an app.
-    pub async fn logs(&self, app: &str, namespace: &str) -> Result<String, RelishError> {
-        let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+    ///
+    /// When `follow` is false, returns the (optionally tailed) log output
+    /// as a string. When `follow` is true, streams log lines to stdout
+    /// via SSE and returns `Ok(String::new())` when the stream ends.
+    pub async fn logs(
+        &self,
+        app: &str,
+        namespace: &str,
+        tail: Option<usize>,
+        follow: bool,
+    ) -> Result<String, RelishError> {
+        let mut url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+
+        // Build query string
+        let mut params = Vec::new();
+        if let Some(n) = tail {
+            params.push(format!("tail={n}"));
+        }
+        if follow {
+            params.push("follow=true".to_string());
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -225,11 +228,43 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
+        if follow {
+            // Read SSE stream, printing each data: line to stdout
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
 
-        Ok(json["logs"].as_str().unwrap_or("").to_string())
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.map_err(classify_error)?;
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                while let Some(event_end) = buffer.find("\n\n") {
+                    let event_text = buffer[..event_end].to_string();
+                    buffer = buffer[event_end + 2..].to_string();
+
+                    for line in event_text.lines() {
+                        if let Some(data) = line.strip_prefix("data:") {
+                            println!("{}", data.trim());
+                        }
+                    }
+                }
+            }
+
+            // Flush remaining buffer
+            for line in buffer.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    println!("{}", data.trim());
+                }
+            }
+
+            Ok(String::new())
+        } else {
+            let json: serde_json::Value =
+                response.json().await.map_err(|e| RelishError::ApiError {
+                    status: 0,
+                    body: format!("failed to parse response: {e}"),
+                })?;
+
+            Ok(json["logs"].as_str().unwrap_or("").to_string())
+        }
     }
 }

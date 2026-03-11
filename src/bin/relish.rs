@@ -34,6 +34,12 @@ enum Command {
     Logs {
         /// App or job name.
         name: String,
+        /// Show only the last N lines.
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Follow log output (stream new lines as they appear).
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Execute a command inside a running container.
     Exec {
@@ -63,7 +69,11 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Apply { ref path } => commands::apply(path, cli.output).await,
         Command::Status => commands::status().await,
-        Command::Logs { ref name } => commands::logs(name).await,
+        Command::Logs {
+            ref name,
+            tail,
+            follow,
+        } => commands::logs(name, tail, follow).await,
         Command::Exec {
             ref app,
             ref command,
@@ -152,5 +162,44 @@ mod tests {
     fn invalid_output_format_rejected() {
         let result = parse(&["relish", "--output", "csv", "status"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_logs_with_tail() {
+        let cli = parse(&["relish", "logs", "web", "--tail", "10"]).unwrap();
+        match cli.command {
+            Command::Logs { name, tail, follow } => {
+                assert_eq!(name, "web");
+                assert_eq!(tail, Some(10));
+                assert!(!follow);
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_follow_short() {
+        let cli = parse(&["relish", "logs", "web", "-f"]).unwrap();
+        match cli.command {
+            Command::Logs { name, tail, follow } => {
+                assert_eq!(name, "web");
+                assert_eq!(tail, None);
+                assert!(follow);
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_follow_and_tail() {
+        let cli = parse(&["relish", "logs", "web", "--follow", "--tail", "5"]).unwrap();
+        match cli.command {
+            Command::Logs { name, tail, follow } => {
+                assert_eq!(name, "web");
+                assert_eq!(tail, Some(5));
+                assert!(follow);
+            }
+            _ => panic!("expected Logs command"),
+        }
     }
 }

@@ -83,13 +83,24 @@ async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
 }
 
 /// Stream logs from an app or job.
-pub async fn logs(name: &str) -> Result<(), RelishError> {
-    logs_with_client(name, &BunClient::default_local()).await
+pub async fn logs(
+    name: &str,
+    tail: Option<usize>,
+    follow: bool,
+) -> Result<(), RelishError> {
+    logs_with_client(name, tail, follow, &BunClient::default_local()).await
 }
 
-async fn logs_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
-    let log_output = client.logs(name, "default").await?;
-    println!("{log_output}");
+async fn logs_with_client(
+    name: &str,
+    tail: Option<usize>,
+    follow: bool,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let log_output = client.logs(name, "default", tail, follow).await?;
+    if !log_output.is_empty() {
+        println!("{log_output}");
+    }
     Ok(())
 }
 
@@ -259,7 +270,9 @@ mod tests {
 
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
-        let err = logs_with_client("web", &bogus_client()).await.unwrap_err();
+        let err = logs_with_client("web", None, false, &bogus_client())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 

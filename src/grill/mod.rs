@@ -20,6 +20,8 @@ pub mod state;
 
 use std::fmt;
 
+use tokio::sync::mpsc;
+
 pub use cgroup::{CgroupParams, cgroup_path, compute_cgroup_params, cpu_max_from_millicores};
 pub use image::ImageStore;
 pub use oci::{OciSpec, generate_job_oci_spec, generate_oci_spec};
@@ -130,6 +132,20 @@ pub trait Grill: Send + Sync {
         let _ = instance;
         std::future::ready(Ok(String::new()))
     }
+
+    /// Stream logs for an instance.
+    ///
+    /// Sends new log lines over the channel as they are produced.
+    /// The default does nothing (stream closes immediately). Runtimes
+    /// that support streaming override this.
+    fn follow_logs(
+        &self,
+        instance: &InstanceId,
+        lines_tx: mpsc::Sender<String>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        let _ = (instance, lines_tx);
+        std::future::ready(())
+    }
 }
 
 /// Runtime-selected Grill implementation.
@@ -226,6 +242,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.logs(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.logs(instance).await,
+        }
+    }
+
+    async fn follow_logs(&self, instance: &InstanceId, lines_tx: mpsc::Sender<String>) {
+        match self {
+            AnyGrill::Process(g) => g.follow_logs(instance, lines_tx).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx).await,
         }
     }
 }

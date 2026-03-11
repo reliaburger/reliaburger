@@ -6,12 +6,13 @@
 /// `oneshot` response. The `apply` endpoint streams progress events
 /// via Server-Sent Events (SSE).
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -201,17 +202,57 @@ async fn stop_handler(
     }
 }
 
+/// Query parameters for the logs endpoint.
+#[derive(Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+    follow: Option<bool>,
+}
+
 /// Get logs for an app.
+///
+/// Supports `?tail=N` to return only the last N lines, and
+/// `?follow=true` to stream new lines as an SSE stream.
 async fn logs_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<LogsQuery>,
 ) -> Response {
+    let follow = query.follow.unwrap_or(false);
+
+    if follow {
+        let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
+        if state
+            .cmd_tx
+            .send(AgentCommand::FollowLogs {
+                app_name: app,
+                namespace,
+                tail: query.tail,
+                lines: lines_tx,
+            })
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "agent unavailable" })),
+            )
+                .into_response();
+        }
+
+        let stream = ReceiverStream::new(lines_rx).map(|line| {
+            Ok::<_, std::convert::Infallible>(Event::default().data(line))
+        });
+        return Sse::new(stream).into_response();
+    }
+
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::Logs {
             app_name: app,
             namespace,
+            tail: query.tail,
             response: resp_tx,
         })
         .await
