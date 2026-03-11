@@ -1,0 +1,24 @@
+# Volume mounts example.
+#
+# Two modes:
+#   - HostPath: specify `source` to bind-mount a host directory directly.
+#   - Managed:  omit `source` and Reliaburger picks a directory under
+#               storage.volumes/{namespace}/{app}/{path}.
+
+[app.redis]
+image = "redis:7-alpine"
+port = 6379
+
+# Managed volume — Reliaburger creates the host directory automatically.
+[[app.redis.volumes]]
+path = "/data"
+size = "10Gi"
+
+[app.nginx]
+image = "nginx:latest"
+port = 8080
+
+# HostPath volume — bind-mount a specific host directory.
+[[app.nginx.volumes]]
+source = "/var/www/html"
+path = "/usr/share/nginx/html"
