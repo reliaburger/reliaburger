@@ -13,7 +13,7 @@ use reliaburger::config::Config;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
 use reliaburger::relish::client::BunClient;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Test harness: starts a real agent with ProcessGrill on an ephemeral port.
@@ -173,16 +173,17 @@ async fn relish_status_returns_expected_output() {
     let harness = TestHarness::start().await;
 
     // Deploy via channel
-    let (resp_tx, resp_rx) = oneshot::channel();
+    let (event_tx, mut event_rx) = mpsc::channel(64);
     harness
         .cmd_tx
         .send(AgentCommand::Deploy {
             config: TestHarness::config_no_health(),
-            response: resp_tx,
+            events: event_tx,
         })
         .await
         .unwrap();
-    resp_rx.await.unwrap().unwrap();
+    // Drain events until the channel closes
+    while event_rx.recv().await.is_some() {}
 
     let statuses = harness.client.status().await.unwrap();
     assert!(!statuses.is_empty());

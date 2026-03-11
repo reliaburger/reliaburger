@@ -36,6 +36,10 @@ pub enum RelishError {
     #[error("bun agent not reachable at localhost:9117 (is it running?)")]
     AgentUnreachable,
 
+    /// A request to the agent timed out. The operation may still be running.
+    #[error("request timed out (the operation may still be running on the agent)")]
+    RequestTimeout,
+
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },

@@ -15,6 +15,7 @@ use super::plan::generate_plan;
 /// Parse, validate, and deploy a config file.
 ///
 /// If a Bun agent is running, sends the config for deployment.
+/// Progress events are streamed to stderr in real time.
 /// If no agent is reachable, falls back to showing the dry-run plan.
 pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
     apply_with_client(path, output, &BunClient::default_local()).await
@@ -30,7 +31,7 @@ async fn apply_with_client(
 
     match client.health().await {
         Ok(()) => {
-            // Agent is alive — send the config
+            // Agent is alive — send the config (progress streams to stderr)
             let result = client.apply(&config).await?;
             println!(
                 "deployed {} instance(s): {}",

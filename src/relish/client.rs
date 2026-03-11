@@ -2,7 +2,13 @@
 ///
 /// Sends requests to the Bun local API at `http://127.0.0.1:9117`.
 /// Used by Relish CLI commands when a live agent is available.
-use crate::bun::agent::{ApplyResult, InstanceStatus};
+///
+/// The `apply` endpoint returns Server-Sent Events, which the client
+/// reads incrementally — printing progress to stderr and collecting
+/// the final result.
+use futures_util::StreamExt;
+
+use crate::bun::agent::{ApplyEvent, ApplyResult, InstanceStatus};
 use crate::config::Config;
 
 use super::RelishError;
@@ -13,13 +19,22 @@ pub struct BunClient {
     client: reqwest::Client,
 }
 
+/// Classify a reqwest send error as either a timeout or a connection failure.
+fn classify_error(e: reqwest::Error) -> RelishError {
+    if e.is_timeout() {
+        RelishError::RequestTimeout
+    } else {
+        RelishError::AgentUnreachable
+    }
+}
+
 impl BunClient {
     /// Create a client pointing at the given base URL.
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to create HTTP client"),
         }
@@ -31,17 +46,26 @@ impl BunClient {
     }
 
     /// Check if the agent is reachable.
+    ///
+    /// Uses a short timeout (5 seconds) — if the health endpoint
+    /// doesn't respond quickly, the agent is effectively unreachable.
     pub async fn health(&self) -> Result<(), RelishError> {
         let url = format!("{}/v1/health", self.base_url);
         self.client
             .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
             .map_err(|_| RelishError::AgentUnreachable)?;
         Ok(())
     }
 
-    /// Deploy workloads from a config.
+    /// Deploy workloads from a config, streaming progress to stderr.
+    ///
+    /// The agent returns Server-Sent Events. Each `data:` line
+    /// contains a JSON `ApplyEvent`. Progress events are printed to
+    /// stderr as they arrive; the final `Complete` event is returned
+    /// as an `ApplyResult`.
     pub async fn apply(&self, config: &Config) -> Result<ApplyResult, RelishError> {
         let url = format!("{}/v1/apply", self.base_url);
         let toml_str = toml::to_string_pretty(config).map_err(|e| RelishError::ApiError {
@@ -55,7 +79,7 @@ impl BunClient {
             .body(toml_str)
             .send()
             .await
-            .map_err(|_| RelishError::AgentUnreachable)?;
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -63,12 +87,82 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let result: ApplyResult = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
+        // Read the SSE stream
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut result = None;
 
-        Ok(result)
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(classify_error)?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            // Process complete SSE events (separated by double newline)
+            while let Some(event_end) = buffer.find("\n\n") {
+                let event_text = buffer[..event_end].to_string();
+                buffer = buffer[event_end + 2..].to_string();
+
+                if let Some(data) = event_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:"))
+                    && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
+                {
+                    match &event {
+                        ApplyEvent::Progress { message } => {
+                            eprintln!("  {message}");
+                        }
+                        ApplyEvent::InstanceCreated { id, app } => {
+                            eprintln!("  created {id} ({app})");
+                        }
+                        ApplyEvent::Complete {
+                            created,
+                            instances,
+                        } => {
+                            result = Some(ApplyResult {
+                                created: *created,
+                                instances: instances.clone(),
+                            });
+                        }
+                        ApplyEvent::Error { message } => {
+                            return Err(RelishError::ApiError {
+                                status: 500,
+                                body: message.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for any remaining data in the buffer
+        if let Some(data) = buffer
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
+        {
+            match event {
+                ApplyEvent::Complete {
+                    created,
+                    instances,
+                } => {
+                    result = Some(ApplyResult {
+                        created,
+                        instances,
+                    });
+                }
+                ApplyEvent::Error { message } => {
+                    return Err(RelishError::ApiError {
+                        status: 500,
+                        body: message,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        result.ok_or_else(|| RelishError::ApiError {
+            status: 0,
+            body: "stream ended without a Complete event".to_string(),
+        })
     }
 
     /// Get status of all instances.
@@ -79,7 +173,7 @@ impl BunClient {
             .get(&url)
             .send()
             .await
-            .map_err(|_| RelishError::AgentUnreachable)?;
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -104,7 +198,7 @@ impl BunClient {
             .post(&url)
             .send()
             .await
-            .map_err(|_| RelishError::AgentUnreachable)?;
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -123,7 +217,7 @@ impl BunClient {
             .get(&url)
             .send()
             .await
-            .map_err(|_| RelishError::AgentUnreachable)?;
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {

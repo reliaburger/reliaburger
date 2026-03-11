@@ -22,12 +22,36 @@ use super::BunError;
 use super::probe::probe_health;
 use super::supervisor::WorkloadSupervisor;
 
+/// A progress event emitted during a deploy operation.
+///
+/// Sent over an `mpsc` channel so the API layer can stream events
+/// to the client via SSE. The client displays `Progress` messages
+/// in real time and collects the final `Complete` or `Error` event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ApplyEvent {
+    /// Informational progress update.
+    Progress { message: String },
+    /// A single instance was created and started.
+    InstanceCreated { id: String, app: String },
+    /// The deploy finished successfully.
+    Complete {
+        created: usize,
+        instances: Vec<String>,
+    },
+    /// The deploy failed.
+    Error { message: String },
+}
+
 /// Commands sent to the agent over the command channel.
 pub enum AgentCommand {
     /// Deploy workloads from a parsed Config.
+    ///
+    /// Progress events are streamed over the `events` channel so the
+    /// API can relay them to the client in real time.
     Deploy {
         config: Config,
-        response: oneshot::Sender<Result<ApplyResult, BunError>>,
+        events: mpsc::Sender<ApplyEvent>,
     },
     /// Stop all instances of an app in a namespace.
     Stop {
@@ -122,9 +146,8 @@ impl<G: Grill> BunAgent<G> {
     /// Handle a single command.
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
-            AgentCommand::Deploy { config, response } => {
-                let result = self.deploy(config).await;
-                let _ = response.send(result);
+            AgentCommand::Deploy { config, events } => {
+                self.deploy(config, &events).await;
             }
             AgentCommand::Stop {
                 app_name,
@@ -149,22 +172,61 @@ impl<G: Grill> BunAgent<G> {
         }
     }
 
-    /// Deploy all apps and jobs from a config.
-    async fn deploy(&mut self, config: Config) -> Result<ApplyResult, BunError> {
+    /// Deploy all apps and jobs from a config, streaming progress events.
+    async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
         let now = Instant::now();
         let mut all_ids = Vec::new();
 
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
-            let ids = self
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: format!("deploying app {app_name} (replicas: {})", spec.replicas),
+                })
+                .await;
+
+            let ids = match self
                 .supervisor
                 .deploy_app(app_name, namespace, spec, now)
-                .await?;
+                .await
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
             // Drive each instance through Pending → Preparing → Starting → HealthWait
             for id in &ids {
-                self.drive_instance_startup(id, app_name, namespace, spec)
-                    .await?;
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!("creating instance {}", id.0),
+                    })
+                    .await;
+
+                if let Err(e) = self
+                    .drive_instance_startup(id, app_name, namespace, spec)
+                    .await
+                {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+
+                let _ = events
+                    .send(ApplyEvent::InstanceCreated {
+                        id: id.0.clone(),
+                        app: app_name.to_string(),
+                    })
+                    .await;
             }
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
@@ -172,23 +234,64 @@ impl<G: Grill> BunAgent<G> {
 
         for (job_name, spec) in &config.job {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
-            let ids = self
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: format!("deploying job {job_name}"),
+                })
+                .await;
+
+            let ids = match self
                 .supervisor
                 .deploy_job(job_name, namespace, spec, now)
-                .await?;
+                .await
+            {
+                Ok(ids) => ids,
+                Err(e) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
             for id in &ids {
-                self.drive_job_startup(id, job_name, namespace, spec)
-                    .await?;
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!("creating instance {}", id.0),
+                    })
+                    .await;
+
+                if let Err(e) = self
+                    .drive_job_startup(id, job_name, namespace, spec)
+                    .await
+                {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+
+                let _ = events
+                    .send(ApplyEvent::InstanceCreated {
+                        id: id.0.clone(),
+                        app: job_name.to_string(),
+                    })
+                    .await;
             }
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
-        Ok(ApplyResult {
-            created: all_ids.len(),
-            instances: all_ids,
-        })
+        let _ = events
+            .send(ApplyEvent::Complete {
+                created: all_ids.len(),
+                instances: all_ids,
+            })
+            .await;
     }
 
     /// Drive a newly created instance through the startup state machine.
@@ -711,6 +814,40 @@ mod tests {
         (agent, tx, shutdown, grill_handle)
     }
 
+    /// Send a Deploy command and collect all events. Returns the list
+    /// of events (the last one should be Complete or Error).
+    async fn send_deploy(
+        tx: &mpsc::Sender<AgentCommand>,
+        config: Config,
+    ) -> Vec<ApplyEvent> {
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config,
+            events: event_tx,
+        })
+        .await
+        .unwrap();
+
+        let mut events = Vec::new();
+        while let Some(e) = event_rx.recv().await {
+            events.push(e);
+        }
+        events
+    }
+
+    /// Extract the Complete event from a list of deploy events.
+    /// Panics if the last event is an Error or if there are no events.
+    fn expect_complete(events: &[ApplyEvent]) -> (usize, &[String]) {
+        match events.last().expect("no events received") {
+            ApplyEvent::Complete {
+                created,
+                instances,
+            } => (*created, instances),
+            ApplyEvent::Error { message } => panic!("deploy failed: {message}"),
+            other => panic!("unexpected final event: {other:?}"),
+        }
+    }
+
     fn basic_config() -> Config {
         let toml_str = r#"
             [app.web]
@@ -740,17 +877,38 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: basic_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
+        let events = send_deploy(&tx, basic_config()).await;
+        let (created, instances) = expect_complete(&events);
+        assert_eq!(created, 1);
+        assert_eq!(instances, &["web-0"]);
 
-        let result = resp_rx.await.unwrap().unwrap();
-        assert_eq!(result.created, 1);
-        assert_eq!(result.instances, vec!["web-0"]);
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_streams_progress_events() {
+        let (mut agent, tx, shutdown) = test_agent();
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let events = send_deploy(&tx, basic_config()).await;
+
+        // Should have progress events before the final Complete
+        let progress_count = events
+            .iter()
+            .filter(|e| matches!(e, ApplyEvent::Progress { .. }))
+            .count();
+        assert!(progress_count >= 1, "expected progress events");
+
+        let instance_created = events
+            .iter()
+            .any(|e| matches!(e, ApplyEvent::InstanceCreated { id, .. } if id == "web-0"));
+        assert!(instance_created, "expected InstanceCreated for web-0");
+
+        expect_complete(&events);
 
         shutdown.cancel();
         agent_handle.await.unwrap();
@@ -765,14 +923,8 @@ mod tests {
         });
 
         // Deploy first
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: basic_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        let events = send_deploy(&tx, basic_config()).await;
+        expect_complete(&events);
 
         // Then get status
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -799,14 +951,8 @@ mod tests {
         });
 
         // Deploy
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: basic_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        let events = send_deploy(&tx, basic_config()).await;
+        expect_complete(&events);
 
         // Stop
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -839,14 +985,8 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: config_with_health(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        let events = send_deploy(&tx, config_with_health()).await;
+        expect_complete(&events);
 
         let (resp_tx, resp_rx) = oneshot::channel();
         tx.send(AgentCommand::Status { response: resp_tx })
@@ -875,14 +1015,8 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: basic_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        let events = send_deploy(&tx, basic_config()).await;
+        expect_complete(&events);
 
         shutdown.cancel();
         agent_handle.await.unwrap();
@@ -897,14 +1031,8 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: basic_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        let events = send_deploy(&tx, basic_config()).await;
+        expect_complete(&events);
 
         let (resp_tx, resp_rx) = oneshot::channel();
         tx.send(AgentCommand::Logs {
@@ -998,17 +1126,10 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: job_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-
-        let result = resp_rx.await.unwrap().unwrap();
-        assert_eq!(result.created, 1);
-        assert_eq!(result.instances, vec!["migrate-0"]);
+        let events = send_deploy(&tx, job_config()).await;
+        let (created, instances) = expect_complete(&events);
+        assert_eq!(created, 1);
+        assert_eq!(instances, &["migrate-0"]);
 
         shutdown.cancel();
         agent_handle.await.unwrap();
@@ -1022,14 +1143,8 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: job_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        let events = send_deploy(&tx, job_config()).await;
+        expect_complete(&events);
 
         let (resp_tx, resp_rx) = oneshot::channel();
         tx.send(AgentCommand::Status { response: resp_tx })
@@ -1053,16 +1168,9 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: mixed_config(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-
-        let result = resp_rx.await.unwrap().unwrap();
-        assert_eq!(result.created, 2);
+        let events = send_deploy(&tx, mixed_config()).await;
+        let (created, _instances) = expect_complete(&events);
+        assert_eq!(created, 2);
 
         let (resp_tx, resp_rx) = oneshot::channel();
         tx.send(AgentCommand::Status { response: resp_tx })
@@ -1101,16 +1209,9 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: config_with_init_container(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-
-        let result = resp_rx.await.unwrap().unwrap();
-        assert_eq!(result.created, 1);
+        let events = send_deploy(&tx, config_with_init_container()).await;
+        let (created, _instances) = expect_complete(&events);
+        assert_eq!(created, 1);
 
         // App should reach running after successful init
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -1137,16 +1238,12 @@ mod tests {
             agent.run().await;
         });
 
-        let (resp_tx, resp_rx) = oneshot::channel();
-        tx.send(AgentCommand::Deploy {
-            config: config_with_init_container(),
-            response: resp_tx,
-        })
-        .await
-        .unwrap();
-
-        let result = resp_rx.await.unwrap();
-        assert!(result.is_err());
+        let events = send_deploy(&tx, config_with_init_container()).await;
+        let last = events.last().expect("no events");
+        assert!(
+            matches!(last, ApplyEvent::Error { .. }),
+            "expected Error event, got {last:?}"
+        );
 
         shutdown.cancel();
         agent_handle.await.unwrap();
