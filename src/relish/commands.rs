@@ -164,8 +164,12 @@ mod tests {
 
     #[tokio::test]
     async fn apply_with_missing_file_errors() {
-        let result =
-            apply_with_client(Path::new("/nonexistent/config.toml"), OutputFormat::Human, &bogus_client()).await;
+        let result = apply_with_client(
+            Path::new("/nonexistent/config.toml"),
+            OutputFormat::Human,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -218,7 +222,9 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_returns_agent_unreachable() {
-        let err = inspect_with_client("web", &bogus_client()).await.unwrap_err();
+        let err = inspect_with_client("web", &bogus_client())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 }
