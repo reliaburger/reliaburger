@@ -468,6 +468,57 @@ async fn logs_with_tail_returns_limited_lines() {
 }
 
 #[tokio::test]
+async fn logs_follow_returns_output_for_completed_job() {
+    let harness = TestHarness::start().await;
+
+    // Deploy a job (not an app) — the agent's check_jobs loop detects
+    // process exit and updates state, which lets follow_logs terminate.
+    let config = Config::parse(
+        r#"
+        [job.echoer2]
+        image = "test:v1"
+        command = ["sh", "-c", "echo follow-line1; echo follow-line2"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for the job to complete and state to be updated
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Send FollowLogs — for a stopped process, ProcessGrill sends
+    // buffered output then returns when it sees state == Stopped.
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    harness
+        .cmd_tx
+        .send(reliaburger::bun::agent::AgentCommand::FollowLogs {
+            app_name: "echoer2".to_string(),
+            namespace: "default".to_string(),
+            tail: None,
+            lines: event_tx,
+        })
+        .await
+        .unwrap();
+
+    // Use a timeout to avoid hanging if something goes wrong
+    let mut lines = Vec::new();
+    let collect = async {
+        while let Some(line) = event_rx.recv().await {
+            lines.push(line);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), collect).await;
+
+    assert!(
+        lines.len() >= 2,
+        "expected at least 2 lines from follow, got: {lines:?}"
+    );
+    assert_eq!(lines[0], "follow-line1");
+    assert_eq!(lines[1], "follow-line2");
+}
+
+#[tokio::test]
 async fn exec_runs_command_and_returns_output() {
     let harness = TestHarness::start().await;
 

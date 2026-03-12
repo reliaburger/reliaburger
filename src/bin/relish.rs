@@ -54,6 +54,11 @@ enum Command {
         /// Resource name.
         name: String,
     },
+    /// Stop all instances of an app.
+    Stop {
+        /// App name.
+        app: String,
+    },
     /// Initialise a new project with starter config files.
     Init {
         /// Directory to create config files in.
@@ -79,6 +84,7 @@ async fn main() -> ExitCode {
             ref command,
         } => commands::exec(app, command).await,
         Command::Inspect { ref name } => commands::inspect(name).await,
+        Command::Stop { ref app } => commands::stop(app).await,
         Command::Init { ref dir } => commands::init(dir),
     };
 
@@ -162,6 +168,12 @@ mod tests {
     fn invalid_output_format_rejected() {
         let result = parse(&["relish", "--output", "csv", "status"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_stop_command() {
+        let cli = parse(&["relish", "stop", "web"]).unwrap();
+        assert!(matches!(cli.command, Command::Stop { ref app } if app == "web"));
     }
 
     #[test]

@@ -117,6 +117,17 @@ async fn exec_with_client(
     Ok(())
 }
 
+/// Stop all instances of an app.
+pub async fn stop(app: &str) -> Result<(), RelishError> {
+    stop_with_client(app, &BunClient::default_local()).await
+}
+
+async fn stop_with_client(app: &str, client: &BunClient) -> Result<(), RelishError> {
+    client.stop(app, "default").await?;
+    println!("stopped {app}");
+    Ok(())
+}
+
 /// Show detailed info about an app, node, or job.
 pub async fn inspect(name: &str) -> Result<(), RelishError> {
     inspect_with_client(name, &BunClient::default_local()).await
@@ -287,6 +298,12 @@ mod tests {
         let err = exec_with_client("web", &["sh".to_string()], &bogus_client())
             .await
             .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable));
+    }
+
+    #[tokio::test]
+    async fn stop_returns_agent_unreachable() {
+        let err = stop_with_client("web", &bogus_client()).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 
