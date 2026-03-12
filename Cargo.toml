@@ -45,8 +45,13 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "gossip"
+harness = false

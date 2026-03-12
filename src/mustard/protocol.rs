@@ -45,7 +45,7 @@ pub struct MustardNode<T: MustardTransport> {
     /// Protocol configuration.
     pub config: GossipConfig,
     /// Network transport.
-    transport: T,
+    pub transport: T,
     /// Lamport clock for causal ordering.
     lamport: u64,
 }
@@ -303,7 +303,7 @@ impl<T: MustardTransport> MustardNode<T> {
     }
 
     /// Pick a random alive peer to probe (not ourselves).
-    fn pick_probe_target(&self) -> Option<(NodeId, SocketAddr)> {
+    pub fn pick_probe_target(&self) -> Option<(NodeId, SocketAddr)> {
         let candidates: Vec<_> = self
             .membership
             .active_members()
