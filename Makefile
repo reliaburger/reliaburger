@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf loc help
+.PHONY: build test check fmt lint clean pdf loc help examples
 
 CARGO = cargo
 
@@ -24,6 +24,21 @@ fmt-check: ## Check formatting without modifying files
 
 lint: ## Run clippy with warnings as errors
 	$(CARGO) clippy -- -D warnings
+
+examples: build ## Dry-run every example config with relish
+	@failed=0; total=0; \
+	for f in $$(find examples -name '*.toml' | sort); do \
+		total=$$((total + 1)); \
+		if $(CARGO) run --quiet --bin relish -- apply "$$f" >/dev/null 2>&1; then \
+			printf "  ✓ %s\n" "$$f"; \
+		else \
+			printf "  ✗ %s\n" "$$f"; \
+			failed=$$((failed + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "$$total examples, $$failed failed."; \
+	[ $$failed -eq 0 ]
 
 ci: fmt-check lint test ## Run everything CI would run
 
