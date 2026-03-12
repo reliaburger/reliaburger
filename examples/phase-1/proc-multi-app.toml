@@ -1,0 +1,35 @@
+# Multiple apps in a single config file (ProcessGrill version).
+#
+# All three apps deploy together and run testapp on different ports.
+# See container-multi-app.toml for the real-runtime version with OCI images.
+#
+# Build first:
+#   cargo build
+#
+# Deploy with:
+#   cargo run --bin relish -- apply examples/phase-1/proc-multi-app.toml
+
+[app.web]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+port = 8080
+replicas = 2
+
+[app.web.health]
+path = "/"
+
+[app.api]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "3000"]
+port = 3000
+replicas = 2
+
+[app.api.env]
+NODE_ENV = "production"
+
+[app.api.health]
+path = "/healthz"
+
+[app.worker]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "9090"]

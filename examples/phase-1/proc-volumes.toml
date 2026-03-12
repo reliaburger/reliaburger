@@ -1,0 +1,35 @@
+# Volume mounts example (ProcessGrill version).
+#
+# Two modes:
+#   - HostPath: specify `source` to bind-mount a host directory directly.
+#   - Managed:  omit `source` and Reliaburger picks a directory under
+#               storage.volumes/{namespace}/{app}/{path}.
+#
+# This version uses testapp so everything works without a container
+# runtime. See container-volumes.toml for the real-runtime version with OCI images.
+#
+# Build first:
+#   cargo build
+#
+# Deploy with:
+#   cargo run --bin relish -- apply examples/phase-1/proc-volumes.toml
+
+[app.redis]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "6379"]
+port = 6379
+
+# Managed volume — Reliaburger creates the host directory automatically.
+[[app.redis.volumes]]
+path = "/data"
+size = "10Gi"
+
+[app.nginx]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+port = 8080
+
+# HostPath volume — bind-mount a specific host directory.
+[[app.nginx.volumes]]
+source = "/var/www/html"
+path = "/usr/share/nginx/html"
