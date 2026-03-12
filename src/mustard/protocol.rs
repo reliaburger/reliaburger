@@ -568,17 +568,21 @@ mod tests {
         assert!(node2.membership.get(&NodeId::new("n3")).is_some());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn gossip_convergence_five_nodes() {
         // 5 nodes in a ring topology (each knows the next).
         // After enough cycles, all nodes should know about all others.
-        // Uses paused time for deterministic, fast execution.
+        //
+        // We manually drive PING/ACK exchanges rather than spawning
+        // concurrent tasks (tokio::spawn + start_paused is unreliable
+        // under parallel test load; see tokio #3709). And we use
+        // try_recv() to drain messages without involving timers, so
+        // the test is fully deterministic modulo random target selection.
         let net = InMemoryNetwork::new();
         let config = fast_config();
 
         let mut nodes = Vec::new();
         let mut addresses = Vec::new();
-        let shutdown = CancellationToken::new();
 
         for i in 0u16..5 {
             let a = addr(100 + i);
@@ -589,36 +593,44 @@ mod tests {
         }
 
         // Wire each node to know the next one (ring)
-        let node_count = nodes.len();
-        for (i, node) in nodes.iter_mut().enumerate() {
-            let next = (i + 1) % node_count;
-            node.add_seed(NodeId::new(format!("n{next}")), addresses[next]);
+        for i in 0..nodes.len() {
+            let next = (i + 1) % nodes.len();
+            let id = NodeId::new(format!("n{next}"));
+            let a = addresses[next];
+            nodes[i].add_seed(id, a);
         }
 
-        // Spawn all nodes
-        let mut handles = Vec::new();
-        for mut node in nodes {
-            let sd = shutdown.clone();
-            handles.push(tokio::spawn(async move {
-                node.run(sd).await;
-                node
-            }));
-        }
+        // Simulate gossip rounds. Each round:
+        // 1. Every node picks a random peer and sends a PING
+        // 2. Every node drains its inbox (processing PINGs → sending
+        //    ACKs, applying piggybacked updates)
+        // 3. Every node drains again (picking up the ACKs)
+        for _ in 0..50 {
+            // Phase 1: each node sends a PING to a random peer
+            for node in &mut nodes {
+                if let Some((_target_id, target_addr)) = node.pick_probe_target() {
+                    let updates = node.dissemination.select_updates();
+                    let ping = GossipMessage::new(
+                        node.node_id.clone(),
+                        node.incarnation,
+                        GossipPayload::Ping { updates },
+                    );
+                    let _ = node.transport.send(target_addr, &ping).await;
+                }
+            }
 
-        // With paused time, advance enough for gossip to converge.
-        // Ring of 5 with 50ms interval: info needs ~N/2 hops, each
-        // taking one probe cycle. 2s of virtual time gives ~40 cycles.
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        shutdown.cancel();
-
-        let mut final_nodes = Vec::new();
-        for handle in handles {
-            final_nodes.push(handle.await.unwrap());
+            // Phase 2+3: drain messages twice (PINGs then ACKs)
+            for _ in 0..2 {
+                for node in &mut nodes {
+                    while let Some((from, msg)) = node.transport.try_recv() {
+                        node.handle_message(from, msg).await;
+                    }
+                }
+            }
         }
 
         // Every node should know about all 5 members
-        for node in &final_nodes {
+        for node in &nodes {
             let alive_count = node.membership.active_members().len();
             assert_eq!(
                 alive_count, 5,

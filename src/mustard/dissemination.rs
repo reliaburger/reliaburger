@@ -130,14 +130,18 @@ impl Default for DisseminationQueue {
 }
 
 /// Calculate how many times an update should be broadcast.
-/// `ceil(log2(cluster_size))`, minimum 1.
+///
+/// Uses `ceil(log2(cluster_size))` with a minimum of 3. The minimum
+/// ensures updates survive long enough during early cluster formation
+/// when the cluster is small and every update has few peers to
+/// piggyback onto.
 fn broadcast_count(cluster_size: usize) -> u32 {
     if cluster_size <= 1 {
-        return 1;
+        return 3;
     }
     // ceil(log2(n)) = 64 - leading_zeros(n - 1) for n > 1
     let bits = usize::BITS - (cluster_size - 1).leading_zeros();
-    bits.max(1)
+    bits.max(3)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,22 +168,22 @@ mod tests {
 
     #[test]
     fn broadcast_count_zero_cluster() {
-        assert_eq!(broadcast_count(0), 1);
+        assert_eq!(broadcast_count(0), 3);
     }
 
     #[test]
     fn broadcast_count_single_node() {
-        assert_eq!(broadcast_count(1), 1);
+        assert_eq!(broadcast_count(1), 3);
     }
 
     #[test]
     fn broadcast_count_two_nodes() {
-        assert_eq!(broadcast_count(2), 1);
+        assert_eq!(broadcast_count(2), 3);
     }
 
     #[test]
     fn broadcast_count_four_nodes() {
-        assert_eq!(broadcast_count(4), 2);
+        assert_eq!(broadcast_count(4), 3);
     }
 
     #[test]
@@ -219,13 +223,15 @@ mod tests {
     #[test]
     fn updates_expire_after_broadcast_count() {
         let mut queue = DisseminationQueue::new();
-        // cluster_size=2 -> broadcast_count=1
+        // cluster_size=2 -> broadcast_count=3 (minimum)
         queue.enqueue(update("n1", NodeState::Alive), 2);
 
-        let first = queue.select_updates();
-        assert_eq!(first.len(), 1);
-
-        // Should be gone now (only 1 broadcast needed)
+        // Should be selectable 3 times (minimum broadcast count)
+        for _ in 0..3 {
+            let selected = queue.select_updates();
+            assert_eq!(selected.len(), 1);
+        }
+        // Fourth time should be empty
         let second = queue.select_updates();
         assert!(second.is_empty());
     }
@@ -233,15 +239,15 @@ mod tests {
     #[test]
     fn update_broadcast_multiple_times_for_larger_cluster() {
         let mut queue = DisseminationQueue::new();
-        // cluster_size=8 -> broadcast_count=3
-        queue.enqueue(update("n1", NodeState::Alive), 8);
+        // cluster_size=100 -> broadcast_count=7
+        queue.enqueue(update("n1", NodeState::Alive), 100);
 
-        // Should be selectable 3 times
-        for _ in 0..3 {
+        // Should be selectable 7 times
+        for _ in 0..7 {
             let selected = queue.select_updates();
             assert_eq!(selected.len(), 1);
         }
-        // Fourth time should be empty
+        // Eighth time should be empty
         let selected = queue.select_updates();
         assert!(selected.is_empty());
     }

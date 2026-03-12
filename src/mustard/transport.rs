@@ -106,6 +106,19 @@ pub struct InMemoryTransport {
     rx: Mutex<mpsc::Receiver<(SocketAddr, GossipMessage)>>,
 }
 
+impl InMemoryTransport {
+    /// Non-blocking receive. Returns immediately if no message is available.
+    /// Used in tests to drain messages without involving timers.
+    pub fn try_recv(&self) -> Option<(SocketAddr, GossipMessage)> {
+        // try_lock: if the mutex is held, no message for us right now
+        if let Ok(mut rx) = self.rx.try_lock() {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
+    }
+}
+
 impl MustardTransport for InMemoryTransport {
     async fn send(&self, target: SocketAddr, message: &GossipMessage) -> Result<(), MustardError> {
         let inner = self.network.lock().await;
