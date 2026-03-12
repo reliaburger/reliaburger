@@ -9,4 +9,5 @@
 pub mod bun;
 pub mod config;
 pub mod grill;
+pub mod patty;
 pub mod relish;
