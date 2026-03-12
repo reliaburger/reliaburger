@@ -1243,7 +1243,7 @@ Both apps and jobs have an optional `command` field in their TOML config:
 
 ```toml
 [app.web]
-image = "myapp:v1"
+image = "proc-grill:image-ignored"
 command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
 port = 8080
 ```
@@ -1262,7 +1262,7 @@ cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
 cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
 ```
 
-It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
+It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/proc-minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
 
 ## Health checking: priority queues and state transitions
 

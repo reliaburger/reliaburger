@@ -200,10 +200,10 @@ Examples:
 
 ```sh
 # Deploy the example app (agent must be running)
-cargo run --bin relish -- apply examples/phase-1/minimal-app.toml
+cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
 
 # Deploy without agent (shows dry-run plan)
-cargo run --bin relish -- apply examples/phase-1/minimal-app.toml
+cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
 
 # List running workloads
 cargo run --bin relish -- status
@@ -218,7 +218,7 @@ cargo run --bin relish -- logs web
 If no agent is running, `apply` falls back to a dry-run plan showing what *would* happen:
 
 ```
-app "web" (myapp:v1)
+app "web" (proc-grill:image-ignored)
   1 replica, port 8080
   health: GET /healthz every 10s
 
@@ -240,27 +240,27 @@ Used in the example configs to demonstrate health checks, restarts, and lifecycl
 
 ## Configuration
 
-### Running real containers (Apple Container)
+### Running real containers
 
-If you have Apple Container installed, you can run real Docker Hub images:
+If you have a real container runtime (Apple Container on macOS, runc on Linux), you can run real Docker Hub images:
 
 ```sh
-# Terminal 1 — start the agent with Apple Container runtime
-cargo run --bin bun -- --runtime apple
+# Terminal 1 — start the agent with a real runtime
+cargo run --bin bun -- --runtime apple   # or --runtime runc
 
 # Terminal 2 — deploy nginx with health checks
-cargo run --bin relish -- apply examples/phase-1/apple-container-nginx.toml
+cargo run --bin relish -- apply examples/phase-1/container-nginx.toml
 
 # Check status (nginx should reach Running after health checks pass)
 cargo run --bin relish -- status
 
 # Or run a quick Alpine hello world job
-cargo run --bin relish -- apply examples/phase-1/apple-container-hello.toml
+cargo run --bin relish -- apply examples/phase-1/container-hello.toml
 ```
 
 The first deploy will pull the image from Docker Hub, which takes a few seconds. Subsequent deploys reuse the cached image.
 
-The ProcessGrill examples (minimal-app, restarts, etc.) use `command` to run local binaries and work without any container runtime. The apple-container examples use `image` to pull and run real OCI containers.
+The `proc-*` examples use `command` to run local binaries and work without any container runtime. The `container-*` examples use `image` to pull and run real OCI containers.
 
 ## Configuration
 
@@ -268,19 +268,31 @@ Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-appl
 
 | Example | Demonstrates |
 |---------|-------------|
-| [`minimal-app.toml`](../examples/phase-1/minimal-app.toml) | App with health check + worker without |
-| [`restarts.toml`](../examples/phase-1/restarts.toml) | App that goes unhealthy and gets restarted |
-| [`job-success.toml`](../examples/phase-1/job-success.toml) | Job that runs to completion |
-| [`job-failure.toml`](../examples/phase-1/job-failure.toml) | Job that fails and gets retried |
-| [`init-container.toml`](../examples/phase-1/init-container.toml) | App with init container |
-| [`apple-container-hello.toml`](../examples/phase-1/apple-container-hello.toml) | Real container: Alpine hello world |
-| [`apple-container-nginx.toml`](../examples/phase-1/apple-container-nginx.toml) | Real container: nginx with health check |
+| Example | Demonstrates |
+|---------|-------------|
+| **ProcessGrill** (`proc-*`) | **Runs local processes — no container runtime needed** |
+| [`proc-minimal-app.toml`](../examples/phase-1/proc-minimal-app.toml) | App with health check + worker |
+| [`proc-restarts.toml`](../examples/phase-1/proc-restarts.toml) | App that goes unhealthy and gets restarted |
+| [`proc-job-success.toml`](../examples/phase-1/proc-job-success.toml) | Job that runs to completion |
+| [`proc-job-failure.toml`](../examples/phase-1/proc-job-failure.toml) | Job that fails and gets retried |
+| [`proc-init-container.toml`](../examples/phase-1/proc-init-container.toml) | App with init container |
+| [`proc-full-featured.toml`](../examples/phase-1/proc-full-featured.toml) | All Phase 1 features |
+| [`proc-multi-app.toml`](../examples/phase-1/proc-multi-app.toml) | Multiple apps in one config |
+| [`proc-volumes.toml`](../examples/phase-1/proc-volumes.toml) | Managed and HostPath volumes |
+| **Real containers** (`container-*`) | **Pulls OCI images — requires runc or Apple Container** |
+| [`container-hello.toml`](../examples/phase-1/container-hello.toml) | Alpine hello world job |
+| [`container-nginx.toml`](../examples/phase-1/container-nginx.toml) | nginx with health check |
+| [`container-job-failure.toml`](../examples/phase-1/container-job-failure.toml) | Job that fails and gets retried |
+| [`container-init-container.toml`](../examples/phase-1/container-init-container.toml) | App with init container |
+| [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
+| [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
+| [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
 
 ### Apps
 
 ```toml
 [app.web]
-image = "myapp:v1"
+image = "proc-grill:image-ignored"
 command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
 port = 8080
 
@@ -290,7 +302,7 @@ interval = 10
 timeout = 5
 ```
 
-The `image` field is required for real runtimes (runc, Apple Container) but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
+The `image` field is required for real runtimes (runc, Apple Container) but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. ProcessGrill examples use `proc-grill:image-ignored` to make this explicit. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
 
 ### Jobs
 
@@ -298,7 +310,7 @@ Jobs are run-to-completion tasks. They retry up to 3 times with exponential back
 
 ```toml
 [job.migrate]
-image = "myapp:v1"
+image = "proc-grill:image-ignored"
 command = ["echo", "migration complete"]
 ```
 
@@ -308,7 +320,7 @@ Init containers run sequentially before the main app starts. If any init contain
 
 ```toml
 [app.web]
-image = "myapp:v1"
+image = "proc-grill:image-ignored"
 command = ["sleep", "60"]
 
 [[app.web.init]]

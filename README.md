@@ -23,7 +23,7 @@ cargo build
 cargo run --bin bun
 
 # In another terminal — deploy the example app
-cargo run --bin relish -- apply examples/phase-1/minimal-app.toml
+cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
 
 # Check what's running
 cargo run --bin relish -- status
@@ -65,13 +65,21 @@ docs/
   _quarto/             # PDF build configuration
 examples/
   phase-1/
-    minimal-app.toml           # App with health check + worker
-    restarts.toml              # App that goes unhealthy and restarts
-    job-success.toml           # Job that runs to completion
-    job-failure.toml           # Job that fails and gets retried
-    init-container.toml        # App with init container
-    apple-container-hello.toml # Real container: Alpine hello world
-    apple-container-nginx.toml # Real container: nginx with health check
+    proc-minimal-app.toml         # App with health check + worker
+    proc-restarts.toml             # App that goes unhealthy and restarts
+    proc-job-success.toml          # Job that runs to completion
+    proc-job-failure.toml          # Job that fails and gets retried
+    proc-init-container.toml       # App with init container
+    proc-full-featured.toml        # All Phase 1 features
+    proc-multi-app.toml            # Multiple apps in one config
+    proc-volumes.toml              # Managed and HostPath volumes
+    container-hello.toml           # Alpine hello world (real OCI image)
+    container-nginx.toml           # nginx with health check (real OCI image)
+    container-job-failure.toml     # Job that fails (real OCI image)
+    container-init-container.toml  # App with init container (real OCI image)
+    container-full-featured.toml   # All Phase 1 features (real OCI image)
+    container-multi-app.toml       # Multiple apps in one config (real OCI image)
+    container-volumes.toml         # Managed and HostPath volumes (real OCI image)
 assets/
   images/              # Logo and project media
 Makefile               # Build, test, lint, format targets
