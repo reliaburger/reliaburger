@@ -437,23 +437,125 @@ Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since high
 
 The most satisfying test: five nodes arranged in a ring, where each only knows its immediate neighbour. Can gossip propagate membership information to every node?
 
+Our first instinct was to spawn all five nodes as concurrent tokio tasks and let them run for a while:
+
 ```rust
+// The naive approach — DON'T DO THIS
 #[tokio::test(start_paused = true)]
 async fn gossip_convergence_five_nodes() {
-    // ...setup 5 nodes in a ring...
+    // ...spawn 5 nodes...
     tokio::time::sleep(Duration::from_secs(2)).await;
     shutdown.cancel();
+    // ...check all nodes know about all others...
+}
+```
 
-    for node in &final_nodes {
-        let alive_count = node.membership.active_members().len();
-        assert_eq!(alive_count, 5);
+This looks clean. The `start_paused = true` annotation tells tokio to use a fake clock — time only advances when all tasks are idle. No real seconds pass. `sleep(2s)` completes instantly. Deterministic, right?
+
+Wrong. It passed in isolation but failed randomly when run alongside our other 400 tests. Can you see why?
+
+### Tokio's paused time: powerful but tricky
+
+`start_paused = true` forces the `current_thread` runtime flavour. All spawned tasks run cooperatively on a single OS thread, only making progress when they yield at `.await` points. The runtime decides which task to poll next, and that order is non-deterministic.
+
+Here's where it falls apart. When we call `tokio::time::sleep(2s)`, tokio auto-advances the clock to the nearest pending timer. But with five spawned tasks all using `tokio::time::interval` and `tokio::time::timeout`, the clock advances can fire timeouts before channel messages have been processed. Node A sends a PING to Node B, but the runtime polls Node A's timeout before it polls Node B's recv. Node A concludes B is dead. Oops.
+
+This is a known issue ([tokio #3709](https://github.com/tokio-rs/tokio/issues/3709)): there's no ordering guarantee between a task that advances time and other tasks whose timers have expired. Under parallel test load (400 other tests competing for CPU), the problem gets worse because the single-threaded runtime gets less scheduling time.
+
+It gets sneakier. Tokio uses a process-wide static flag (`DID_PAUSE_CLOCK`) to track whether any test has ever paused the clock. Once set, it stays set for the entire process lifetime, changing the code path for `Instant::now()` in every subsequent test — even ones that don't use paused time.
+
+The lesson: `start_paused = true` works brilliantly for testing a single task's timer logic. It breaks down when you need multiple spawned tasks to interact through channels and timers simultaneously. Go's `testing` package doesn't have this problem because goroutines are preemptively scheduled. Tokio's cooperative scheduling is a different beast.
+
+### Manual protocol driving
+
+The fix: don't spawn concurrent tasks. Drive the protocol manually from the test, separating PING sending from message processing:
+
+```rust
+#[tokio::test]
+async fn gossip_convergence_five_nodes() {
+    // ...setup 5 nodes in a ring...
+
+    for _ in 0..50 {
+        // Phase 1: each node sends a PING to a random peer
+        for node in &mut nodes {
+            if let Some((_, target_addr)) = node.pick_probe_target() {
+                let updates = node.dissemination.select_updates();
+                let ping = GossipMessage::new(/* ... */);
+                let _ = node.transport.send(target_addr, &ping).await;
+            }
+        }
+
+        // Phase 2+3: drain messages twice (PINGs then ACKs)
+        for _ in 0..2 {
+            for node in &mut nodes {
+                while let Some((from, msg)) = node.transport.try_recv() {
+                    node.handle_message(from, msg).await;
+                }
+            }
+        }
+    }
+
+    for node in &nodes {
+        assert_eq!(node.membership.active_members().len(), 5);
     }
 }
 ```
 
-The `start_paused = true` annotation deserves attention. It tells Tokio to use a fake clock that only advances when all tasks are idle. When we call `tokio::time::sleep(Duration::from_secs(2))`, no real time passes — the runtime skips forward instantly. This makes the test both fast and deterministic. No more "wait 500ms and hope the gossip converges" flakiness.
+Each round, every node sends one PING, then we drain all inboxes twice: first to process PINGs (which generate ACKs), then to process ACKs (which apply piggybacked updates). No timers, no spawned tasks, no flakiness. The `try_recv()` method returns immediately if the channel is empty, so no clock manipulation is needed at all.
 
-The test passes because of the dissemination mechanism we built. When n0 pings n1, n1 learns about n0 and enqueues a dissemination update. When n1 later pings n2, that update piggybacks on the PING. Within a few cycles, information about every node has rippled through the ring. The `MembershipUpdate` struct carries the node's address alongside its state, so nodes discovered via gossip (not direct contact) know how to reach each other.
+Why 50 rounds? Because gossip propagation depends on random target selection, and with a ring topology each node initially knows only one peer. Information has to hop through intermediaries. The minimum broadcast count of 3 ensures updates survive long enough during early cluster formation when the cluster is small, but random target selection means some rounds are "wasted" pinging a node that already knows the update. 50 rounds gives enough margin for even the unluckiest random sequences.
+
+The test passes because of the dissemination mechanism. When n0 pings n1, n1 learns about n0 and enqueues a dissemination update. When n1 later pings n2, that update piggybacks on the PING. n2 receives it, re-enqueues it for further dissemination, and the ripple continues. The `MembershipUpdate` struct carries the node's address alongside its state, so nodes discovered via gossip (not direct contact) know how to reach each other.
+
+### Benchmarking with criterion
+
+In Go, you'd write `func BenchmarkFoo(b *testing.B)` and `go test -bench .` gives you nanoseconds-per-operation. Rust's built-in `#[bench]` exists but is nightly-only. The stable equivalent is the `criterion` crate, which goes further: statistical analysis, confidence intervals, and automatic regression detection between runs.
+
+```rust
+fn bench_single_gossip_round(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    c.bench_function("single_gossip_round", |b| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                // ...setup two nodes...
+                let start = Instant::now();
+                for _ in 0..iters {
+                    // Send PING, process it, send ACK, process it
+                }
+                start.elapsed()
+            })
+        });
+    });
+}
+```
+
+A few things to notice. First, `iter_custom` lets us control the timing loop ourselves, which we need because setting up the tokio runtime and network shouldn't be measured. Second, `rt.block_on()` runs async code inside a synchronous benchmark — criterion doesn't natively understand async, so we bridge the gap manually. Third, criterion automatically determines how many iterations to run. No `b.N` equivalent to worry about.
+
+We benchmark four things:
+
+1. **Transport throughput** — raw InMemoryTransport send + recv. ~120ns per message, or about 8 million messages per second. This tells us the test infrastructure isn't the bottleneck.
+
+2. **Single gossip round** — full PING → process → ACK → process cycle between two nodes. ~530ns. This is the per-node cost of one protocol period.
+
+3. **Convergence scaling** — how long until all nodes in a ring know about all others, measured across cluster sizes from 5 to 250 nodes. This validates SWIM's theoretical O(log N) convergence guarantee and catches regressions in the dissemination logic.
+
+4. **Dissemination queue** — enqueue 20 updates and drain them through the priority queue. ~13µs. The `BinaryHeap` ordering (Dead > Suspect > Alive) is the hot path for every outgoing message.
+
+The convergence benchmark is the most interesting. Here's what we measured:
+
+| Nodes | Time |
+|------:|-----:|
+| 5 | 1.6 ms |
+| 10 | 6.7 ms |
+| 25 | 18 ms |
+| 50 | 52 ms |
+| 100 | 158 ms |
+| 250 | 3.1 s |
+
+The scaling is roughly O(N² log N) in the benchmark, because we're simulating all N nodes sequentially. In a real deployment, nodes run concurrently, so the wall-clock convergence time is just O(log N) protocol intervals — about 3.5 seconds for a 1000-node cluster at 500ms intervals. The benchmark measures the computational cost of the protocol, not how long you'd actually wait.
+
+Run `cargo bench --bench gossip` to check for regressions. Criterion stores previous results in `target/criterion/` and reports whether performance changed. If you accidentally introduce an O(N²) loop where O(N) was expected, the benchmark will catch it before any user does.
 
 ### What's next
 
