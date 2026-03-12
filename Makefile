@@ -55,7 +55,8 @@ pdf: ## Build all PDFs
 # --- Stats ---
 
 loc: ## Count lines of .rs, .md, and .toml files
-	@echo "  .rs:   $$(find . -name '*.rs'   | xargs cat 2>/dev/null | wc -l)"
+	@echo "  .rs (src):  $$(find ./src -name '*.rs' | xargs awk 'FNR==1{t=0} /^#\[cfg\(test\)\]/{t=1} !t{n++} END{print n+0}')"
+	@echo "  .rs (test): $$(( $$(find ./src -name '*.rs' | xargs awk 'FNR==1{t=0} /^#\[cfg\(test\)\]/{t=1} t{n++} END{print n+0}') + $$(find ./tests -name '*.rs' | xargs cat 2>/dev/null | wc -l | tr -d ' ') ))"
 	@echo "  .md:   $$(find . -name '*.md'   | xargs cat 2>/dev/null | wc -l)"
 	@echo "  .toml: $$(find . -name '*.toml' | xargs cat 2>/dev/null | wc -l)"
 	@echo "  total: $$(find . -name '*.rs' -o -name '*.md' -o -name '*.toml' | xargs cat 2>/dev/null | wc -l)"
