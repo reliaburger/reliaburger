@@ -187,8 +187,12 @@ Commands:
 | `apply <path>` | Deploy workloads from a TOML config file |
 | `status` | List all running workloads |
 | `logs <name>` | Show captured stdout/stderr for an app |
+| `logs <name> --tail N` | Show only the last N lines |
+| `logs <name> --follow` / `-f` | Stream new log lines as they appear |
 | `inspect <name>` | Detailed info about an app |
-| `exec <app> <cmd...>` | Execute a command in a running container (Phase 8) |
+| `exec <app> <cmd...>` | Execute a command inside a running instance |
+| `stop <app>` | Stop all instances of an app |
+| `init [dir]` | Scaffold starter config files in a directory |
 
 Global flags:
 
@@ -213,6 +217,21 @@ cargo run --bin relish -- --output json status
 
 # Show logs
 cargo run --bin relish -- logs web
+
+# Show last 20 lines
+cargo run --bin relish -- logs web --tail 20
+
+# Stream logs in real time
+cargo run --bin relish -- logs web --follow
+
+# Execute a command inside a running instance
+cargo run --bin relish -- exec web echo hello
+
+# Stop an app
+cargo run --bin relish -- stop web
+
+# Scaffold a new project
+cargo run --bin relish -- init myproject
 ```
 
 If no agent is running, `apply` falls back to a dry-run plan showing what *would* happen:
@@ -266,8 +285,6 @@ The `proc-*` examples use `command` to run local binaries and work without any c
 
 Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-apply configs:
 
-| Example | Demonstrates |
-|---------|-------------|
 | Example | Demonstrates |
 |---------|-------------|
 | **ProcessGrill** (`proc-*`) | **Runs local processes — no container runtime needed** |
@@ -350,7 +367,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/status` | List all instances |
 | `GET` | `/v1/status/{app}/{namespace}` | Status for a specific app |
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
-| `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr |
+| `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
+| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
 
 The CLI uses this API internally. You can also call it directly:
 

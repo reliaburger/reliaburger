@@ -31,7 +31,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Streaming apply progress via SSE (real-time deploy feedback instead of blocking response)
 - [x] HostPath-style volumes (dual-mode: explicit source for hostPath, managed for auto-provisioned storage)
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
-- [x] All Phase 1 tests green (321 tests)
+- [x] Log tailing (`--tail N`) and streaming (`--follow`/`-f`)
+- [x] Relish exec command (run commands in running instances)
+- [x] All Phase 1 tests green (336 tests)
 
 ## Phase 2: Cluster Formation
 

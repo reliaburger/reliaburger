@@ -1563,7 +1563,13 @@ struct Cli {
 enum Command {
     Apply { path: PathBuf },
     Status,
-    Logs { name: String },
+    Logs {
+        name: String,
+        #[arg(long)]
+        tail: Option<usize>,
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     Exec {
         app: String,
         #[arg(trailing_var_arg = true)]
@@ -1842,7 +1848,7 @@ mod tests {
 
 `Cli::try_parse_from` parses from a string slice instead of reading `std::env::args()`. Same parsing logic, no process spawning needed. The test for invalid output proves that clap rejects unknown formats at parse time — our `ValueEnum` derive handles it.
 
-The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. The stub commands get one test each, proving they return the right `AgentRequired` error variant.
+The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. Commands like `status`, `logs`, and `exec` get tested by pointing them at a bogus agent address and verifying they return the right `AgentUnreachable` error.
 
 With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). The CLI parses five subcommands with a global `--output` flag. `apply` does real work — it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats — human, JSON, YAML — work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
 
@@ -2772,6 +2778,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - `cargo run --bin relish -- apply app.toml` deploys workloads to the running agent
 - `cargo run --bin relish -- status` shows what's running
 - `cargo run --bin relish -- logs web` shows captured output, with `--tail N` for the last N lines and `--follow` to stream new output
+- `cargo run --bin relish -- exec web echo hello` runs a command inside a running instance
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
 - `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
 - RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
@@ -2780,7 +2787,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-332 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, and 17 integration tests that exercise the full stack end to end.
+336 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, exec command execution, and 20 integration tests that exercise the full stack end to end.
 
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 
