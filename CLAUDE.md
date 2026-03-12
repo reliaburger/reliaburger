@@ -129,6 +129,17 @@ The book chapters live in `docs/book/` and are written in Markdown. Chapter mapp
 - **Formatting**: rustfmt defaults, enforced in CI. Always run `cargo fmt` before committing.
 - **Linting**: clippy with default lints, warnings are errors in CI
 
+## Example Naming Convention
+
+Example configs in `examples/phase-N/` use a runtime prefix so it's immediately clear what runtime they target:
+
+- **`proc-*`** — ProcessGrill (runs local processes, no container runtime needed). Uses `proc-grill:image-ignored` as the image name and `target/debug/testapp` or shell commands as the command.
+- **`container-*`** — Real OCI images pulled from Docker Hub. Works with runc (`--runtime runc`) or Apple Container (`--runtime apple`).
+- **`apple-*`** — Tests Apple Container-specific features (macOS only).
+- **`runc-*`** — Tests runc-specific features (Linux only).
+
+When adding a new example, pick the prefix that matches its runtime requirement.
+
 ## Rust Best Practices
 
 The Conventions section says *what* crates to use. This section says *how* to write the code.
