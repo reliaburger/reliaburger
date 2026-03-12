@@ -102,9 +102,7 @@ impl MembershipTable {
                     update.node_id.clone(),
                     NodeMembership {
                         node_id: update.node_id.clone(),
-                        // Address is learned from the transport layer, not from gossip.
-                        // Use a placeholder until we get a real address from a PING/ACK.
-                        address: SocketAddr::from(([0, 0, 0, 0], 0)),
+                        address: update.address,
                         state: NodeState::Alive,
                         incarnation: update.incarnation,
                         first_seen: now,
@@ -126,7 +124,8 @@ impl MembershipTable {
     ///
     /// Used when a node joins via a direct connection (seed node, or
     /// PING received from a new peer). If the node already exists,
-    /// updates its address only.
+    /// updates its address only. Returns `true` if this was a
+    /// previously unknown node.
     pub fn add_node(
         &mut self,
         node_id: NodeId,
@@ -134,29 +133,35 @@ impl MembershipTable {
         incarnation: u64,
         labels: BTreeMap<String, String>,
         now: Instant,
-    ) {
-        self.members
-            .entry(node_id.clone())
-            .and_modify(|m| {
+    ) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.members.entry(node_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                let m = entry.get_mut();
                 m.address = address;
                 if incarnation > m.incarnation {
                     m.incarnation = incarnation;
                     m.state = NodeState::Alive;
                 }
                 m.last_ack = now;
-            })
-            .or_insert_with(|| NodeMembership {
-                node_id,
-                address,
-                state: NodeState::Alive,
-                incarnation,
-                first_seen: now,
-                last_ack: now,
-                resources: None,
-                labels,
-                is_council: false,
-                is_leader: false,
-            });
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(NodeMembership {
+                    node_id,
+                    address,
+                    state: NodeState::Alive,
+                    incarnation,
+                    first_seen: now,
+                    last_ack: now,
+                    resources: None,
+                    labels,
+                    is_council: false,
+                    is_leader: false,
+                });
+                true
+            }
+        }
     }
 
     /// Mark a node as Suspect.
@@ -276,6 +281,7 @@ mod tests {
     fn alive_update(node: &str, incarnation: u64) -> MembershipUpdate {
         MembershipUpdate {
             node_id: NodeId::new(node),
+            address: addr(9000),
             state: NodeState::Alive,
             incarnation,
             lamport: 0,
@@ -285,6 +291,7 @@ mod tests {
     fn suspect_update(node: &str, incarnation: u64) -> MembershipUpdate {
         MembershipUpdate {
             node_id: NodeId::new(node),
+            address: addr(9000),
             state: NodeState::Suspect,
             incarnation,
             lamport: 0,
@@ -294,6 +301,7 @@ mod tests {
     fn dead_update(node: &str, incarnation: u64) -> MembershipUpdate {
         MembershipUpdate {
             node_id: NodeId::new(node),
+            address: addr(9000),
             state: NodeState::Dead,
             incarnation,
             lamport: 0,
@@ -508,6 +516,7 @@ mod tests {
         table.apply_update(
             &MembershipUpdate {
                 node_id: NodeId::new("left"),
+                address: addr(4),
                 state: NodeState::Left,
                 incarnation: 1,
                 lamport: 0,

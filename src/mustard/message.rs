@@ -4,6 +4,8 @@
 /// (max 1400 bytes). Membership updates are piggybacked on every
 /// PING/ACK exchange, achieving O(log N) convergence without
 /// dedicated broadcast messages.
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::patty::NodeId;
@@ -85,10 +87,14 @@ impl GossipPayload {
 ///
 /// Carries the node's identity, its new state, the incarnation number
 /// for conflict resolution, and a Lamport timestamp for causal ordering.
+/// The address is included so that nodes learning about a peer through
+/// gossip (not direct contact) can reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipUpdate {
     /// Which node this update concerns.
     pub node_id: NodeId,
+    /// The node's cluster address.
+    pub address: SocketAddr,
     /// The reported state of the node.
     pub state: NodeState,
     /// Incarnation number for CRDT-like conflict resolution.
@@ -118,10 +124,15 @@ mod tests {
         assert_eq!(msg.incarnation, 1);
     }
 
+    fn test_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], 9000))
+    }
+
     #[test]
     fn gossip_payload_updates_extracts_from_ping() {
         let updates = vec![MembershipUpdate {
             node_id: NodeId::new("node-2"),
+            address: test_addr(),
             state: NodeState::Alive,
             incarnation: 1,
             lamport: 1,
@@ -136,6 +147,7 @@ mod tests {
     fn gossip_payload_updates_extracts_from_ping_req() {
         let updates = vec![MembershipUpdate {
             node_id: NodeId::new("node-3"),
+            address: test_addr(),
             state: NodeState::Suspect,
             incarnation: 2,
             lamport: 5,
@@ -158,6 +170,7 @@ mod tests {
     fn membership_update_serialisation_round_trip() {
         let update = MembershipUpdate {
             node_id: NodeId::new("node-1"),
+            address: test_addr(),
             state: NodeState::Suspect,
             incarnation: 42,
             lamport: 100,
@@ -175,6 +188,7 @@ mod tests {
             GossipPayload::Ping {
                 updates: vec![MembershipUpdate {
                     node_id: NodeId::new("target"),
+                    address: test_addr(),
                     state: NodeState::Dead,
                     incarnation: 3,
                     lamport: 10,

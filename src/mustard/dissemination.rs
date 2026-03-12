@@ -153,6 +153,7 @@ mod tests {
     fn update(node: &str, state: NodeState) -> MembershipUpdate {
         MembershipUpdate {
             node_id: NodeId::new(node),
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 9000)),
             state,
             incarnation: 1,
             lamport: 0,

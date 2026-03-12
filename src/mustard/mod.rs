@@ -11,15 +11,17 @@ pub mod config;
 pub mod dissemination;
 pub mod membership;
 pub mod message;
+pub mod protocol;
 pub mod state;
-
-// TODO(Phase 2): transport, protocol modules
+pub mod transport;
 
 pub use config::GossipConfig;
 pub use dissemination::DisseminationQueue;
 pub use membership::{MembershipTable, NodeMembership, ResourceSummary};
 pub use message::{GossipMessage, GossipPayload, MAX_PIGGYBACK_UPDATES, MembershipUpdate};
+pub use protocol::MustardNode;
 pub use state::NodeState;
+pub use transport::{InMemoryNetwork, InMemoryTransport, MustardTransport};
 
 /// Errors from Mustard gossip operations.
 #[derive(Debug, thiserror::Error)]
