@@ -126,7 +126,7 @@ async fn rounds_to_converge(cluster_size: usize) -> usize {
         nodes[i].add_seed(id, a);
     }
 
-    for round in 1..500 {
+    for round in 1..2000 {
         // Each node sends a PING
         for node in &mut nodes {
             if let Some((_id, target_addr)) = node.pick_probe_target() {
@@ -158,7 +158,7 @@ async fn rounds_to_converge(cluster_size: usize) -> usize {
         }
     }
 
-    500 // didn't converge
+    2000 // didn't converge
 }
 
 /// Benchmark rounds-to-converge for different cluster sizes.
@@ -167,7 +167,10 @@ fn bench_convergence(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("gossip_convergence");
-    for &size in &[5, 10, 25, 50] {
+    // Larger clusters need more time per sample
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(20));
+    for &size in &[5, 10, 25, 50, 100, 250] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| rt.block_on(rounds_to_converge(size)));
         });
