@@ -6,10 +6,10 @@
 # Watch restart_count increment with: relish status
 #
 # Build first:  cargo build
-# Deploy with:  cargo run --bin relish -- apply examples/phase-1-restarts.toml
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-restarts.toml
 
 [app.flaky]
-image = "flaky:v1"
+image = "proc-grill:image-ignored"
 command = ["target/debug/testapp", "--mode", "unhealthy-after", "--count", "5", "--port", "8080"]
 port = 8080
 

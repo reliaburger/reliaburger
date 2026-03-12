@@ -1,0 +1,30 @@
+# Multiple apps in a single config file.
+#
+# This config is designed for real container runtimes (runc or Apple
+# Container). On ProcessGrill (the default), apps without a `command`
+# field just sleep. See proc-multi-app.toml for a ProcessGrill version that
+# uses testapp.
+#
+# Deploy with a real runtime:
+#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-multi-app.toml
+
+[app.web]
+image = "nginx:latest"
+port = 80
+replicas = 2
+
+[app.web.health]
+path = "/"
+
+[app.api]
+image = "nginx:latest"
+port = 8080
+replicas = 2
+
+[app.api.health]
+path = "/"
+
+[app.worker]
+image = "alpine:latest"
+command = ["sleep", "3600"]

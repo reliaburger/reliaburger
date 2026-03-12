@@ -4,8 +4,8 @@
 # failed jobs up to the restart limit, then marks them as Failed.
 # Check status with: relish status
 #
-# Deploy with:  cargo run --bin relish -- apply examples/phase-1-job-failure.toml
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-job-failure.toml
 
 [job.broken]
-image = "broken:v1"
+image = "proc-grill:image-ignored"
 command = ["false"]

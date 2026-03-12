@@ -1,11 +1,11 @@
 # Real container: Alpine hello world
 #
 # Pulls alpine:latest from Docker Hub and runs echo.
-# Requires Apple Container: brew install container && container system start
+# Requires a real container runtime (runc or Apple Container).
 #
-# Usage:
-#   cargo run --bin bun -- --runtime apple
-#   cargo run --bin relish -- apply examples/phase-1/apple-container-hello.toml
+# Deploy with:
+#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-hello.toml
 #   cargo run --bin relish -- status
 
 [job.hello]

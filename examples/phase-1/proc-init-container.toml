@@ -5,10 +5,10 @@
 # Here, the init runs "echo" (succeeds), then the main app starts.
 #
 # Build first:  cargo build
-# Deploy with:  cargo run --bin relish -- apply examples/phase-1-init-container.toml
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-init-container.toml
 
 [app.web]
-image = "myapp:v1"
+image = "proc-grill:image-ignored"
 command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
 port = 8080
 
