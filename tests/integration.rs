@@ -466,3 +466,74 @@ async fn logs_with_tail_returns_limited_lines() {
     assert_eq!(lines.len(), 1, "expected 1 line, got: {result:?}");
     assert_eq!(lines[0], "line3");
 }
+
+#[tokio::test]
+async fn exec_runs_command_and_returns_output() {
+    let harness = TestHarness::start().await;
+
+    // Deploy a long-running app so it stays in Running state
+    let config = Config::parse(
+        r#"
+        [app.sleeper]
+        image = "test:v1"
+        command = ["sleep", "60"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    let output = harness
+        .client
+        .exec(
+            "sleeper",
+            "default",
+            &["echo".to_string(), "hello".to_string()],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.trim(), "hello");
+}
+
+#[tokio::test]
+async fn exec_nonexistent_app_returns_error() {
+    let harness = TestHarness::start().await;
+
+    let result = harness
+        .client
+        .exec("nope", "default", &["echo".to_string()])
+        .await;
+
+    assert!(result.is_err(), "expected error for nonexistent app");
+}
+
+#[tokio::test]
+async fn volume_config_deploys_successfully() {
+    let harness = TestHarness::start().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let host_path = dir.path().join("data");
+    std::fs::create_dir_all(&host_path).unwrap();
+
+    let config = Config::parse(&format!(
+        r#"
+        [app.volapp]
+        image = "test:v1"
+        command = ["sleep", "60"]
+
+        [[app.volapp.volumes]]
+        path = "/data"
+        source = "{}"
+    "#,
+        host_path.display()
+    ))
+    .unwrap();
+
+    let result = harness.client.apply(&config).await.unwrap();
+    assert_eq!(result.created, 1);
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(statuses[0].app_name, "volapp");
+    assert_eq!(statuses[0].state, "running");
+}

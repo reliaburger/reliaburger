@@ -168,6 +168,32 @@ impl super::Grill for AppleContainerGrill {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        if command.is_empty() {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "no command specified".to_string(),
+            });
+        }
+
+        let mut args = vec!["exec", &instance.0, "--"];
+        let cmd_refs: Vec<&str> = command.iter().map(|s| s.as_str()).collect();
+        args.extend(&cmd_refs);
+
+        let output = Self::container_command(&args, instance).await?;
+        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.is_empty() {
+                if !result.is_empty() && !result.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push_str(&stderr);
+            }
+        }
+        Ok(result)
+    }
+
     async fn follow_logs(
         &self,
         instance: &InstanceId,

@@ -78,6 +78,13 @@ pub enum AgentCommand {
         tail: Option<usize>,
         lines: mpsc::Sender<String>,
     },
+    /// Execute a command inside a running instance.
+    Exec {
+        app_name: String,
+        namespace: String,
+        command: Vec<String>,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
 }
 
 /// Result of a deploy operation.
@@ -193,6 +200,15 @@ impl<G: Grill> BunAgent<G> {
             } => {
                 self.follow_app_logs(&app_name, &namespace, tail, lines)
                     .await;
+            }
+            AgentCommand::Exec {
+                app_name,
+                namespace,
+                command,
+                response,
+            } => {
+                let result = self.exec_app(&app_name, &namespace, &command).await;
+                let _ = response.send(result);
             }
         }
     }
@@ -856,6 +872,36 @@ impl<G: Grill> BunAgent<G> {
             // (process exits or channel closes), we move to the next.
             grill.follow_logs(&id, tx).await;
         }
+    }
+
+    /// Execute a command inside a running instance of an app.
+    ///
+    /// Finds the first running instance of the app in the given namespace
+    /// and delegates to `grill.exec()`. In Phase 1 (ProcessGrill), this
+    /// just spawns the command directly. Phase 3+ will add namespace entry.
+    async fn exec_app(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        command: &[String],
+    ) -> Result<String, BunError> {
+        let instance_id = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|i| {
+                i.app_name == app_name
+                    && i.namespace == namespace
+                    && i.state == ContainerState::Running
+            })
+            .map(|i| i.id.clone())
+            .ok_or_else(|| BunError::AppNotFound {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+            })?;
+
+        let output = self.supervisor.grill().exec(&instance_id, command).await?;
+        Ok(output)
     }
 
     /// Gracefully stop all instances.

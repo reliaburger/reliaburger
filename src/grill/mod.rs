@@ -146,6 +146,22 @@ pub trait Grill: Send + Sync {
         let _ = (instance, lines_tx);
         std::future::ready(())
     }
+
+    /// Execute a command in the context of a running instance.
+    ///
+    /// Runs the given command and returns its combined stdout/stderr
+    /// output. For process-based runtimes this spawns a new process;
+    /// for container runtimes it enters the container's namespaces.
+    fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> impl std::future::Future<Output = Result<String, GrillError>> + Send {
+        let _ = (instance, command);
+        std::future::ready(Err(GrillError::NotFound {
+            instance: InstanceId("exec not supported".to_string()),
+        }))
+    }
 }
 
 /// Runtime-selected Grill implementation.
@@ -252,6 +268,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx).await,
+        }
+    }
+
+    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.exec(instance, command).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.exec(instance, command).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.exec(instance, command).await,
         }
     }
 }

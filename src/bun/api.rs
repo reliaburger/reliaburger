@@ -37,6 +37,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
+        .route("/v1/exec/{app}/{namespace}", post(exec_handler))
         .with_state(state)
 }
 
@@ -279,6 +280,52 @@ async fn logs_handler(
     }
 }
 
+/// Request body for the exec endpoint.
+#[derive(Deserialize)]
+struct ExecRequest {
+    command: Vec<String>,
+}
+
+/// Execute a command inside a running instance.
+async fn exec_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Json(body): Json<ExecRequest>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Exec {
+            app_name: app,
+            namespace,
+            command: body.command,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(Ok(output)) => Json(serde_json::json!({ "output": output })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +515,26 @@ mod tests {
                     .method("POST")
                     .uri("/v1/stop/nope/default")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn exec_nonexistent_app_returns_404() {
+        let (app, shutdown) = test_setup();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/exec/nope/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"command":["echo","hi"]}"#))
                     .unwrap(),
             )
             .await

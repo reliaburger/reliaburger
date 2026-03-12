@@ -101,10 +101,20 @@ async fn logs_with_client(
 }
 
 /// Execute a command inside a running container.
-pub async fn exec(_app: &str, _command: &[String]) -> Result<(), RelishError> {
-    Err(RelishError::AgentRequired {
-        command: "exec".to_string(),
-    })
+pub async fn exec(app: &str, command: &[String]) -> Result<(), RelishError> {
+    exec_with_client(app, command, &BunClient::default_local()).await
+}
+
+async fn exec_with_client(
+    app: &str,
+    command: &[String],
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let output = client.exec(app, "default", command).await?;
+    if !output.is_empty() {
+        print!("{output}");
+    }
+    Ok(())
 }
 
 /// Show detailed info about an app, node, or job.
@@ -273,9 +283,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_returns_agent_required() {
-        let err = exec("web", &["sh".to_string()]).await.unwrap_err();
-        assert!(matches!(err, RelishError::AgentRequired { ref command } if command == "exec"));
+    async fn exec_returns_agent_unreachable() {
+        let err = exec_with_client("web", &["sh".to_string()], &bogus_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable));
     }
 
     #[test]

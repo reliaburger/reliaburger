@@ -262,6 +262,49 @@ impl super::Grill for ProcessGrill {
         Ok(String::from_utf8_lossy(&stdout).into_owned())
     }
 
+    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        // Verify the instance exists and is running
+        {
+            let procs = self.processes.lock().await;
+            let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
+                instance: instance.clone(),
+            })?;
+            if entry.state != ContainerState::Running {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("instance is not running (state: {})", entry.state),
+                });
+            }
+        }
+
+        if command.is_empty() {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "no command specified".to_string(),
+            });
+        }
+
+        // Spawn the command directly (no namespace entry for ProcessGrill)
+        let output = Command::new(&command[0])
+            .args(&command[1..])
+            .output()
+            .await
+            .map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("exec failed: {e}"),
+            })?;
+
+        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+        Ok(result)
+    }
+
     async fn follow_logs(
         &self,
         instance: &InstanceId,

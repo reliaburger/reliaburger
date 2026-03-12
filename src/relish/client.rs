@@ -267,4 +267,34 @@ impl BunClient {
             Ok(json["logs"].as_str().unwrap_or("").to_string())
         }
     }
+
+    /// Execute a command inside a running instance.
+    pub async fn exec(
+        &self,
+        app: &str,
+        namespace: &str,
+        command: &[String],
+    ) -> Result<String, RelishError> {
+        let url = format!("{}/v1/exec/{}/{}", self.base_url, app, namespace);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "command": command }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+
+        Ok(json["output"].as_str().unwrap_or("").to_string())
+    }
 }
