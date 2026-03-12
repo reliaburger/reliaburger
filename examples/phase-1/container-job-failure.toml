@@ -1,0 +1,14 @@
+# Job that fails and gets retried (real container).
+#
+# The "false" command always exits with code 1. The agent retries
+# failed jobs up to the restart limit, then marks them as Failed.
+# Requires a real container runtime (runc or Apple Container).
+#
+# Deploy with:
+#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-job-failure.toml
+#   cargo run --bin relish -- status
+
+[job.broken]
+image = "alpine:latest"
+command = ["false"]

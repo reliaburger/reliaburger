@@ -1,0 +1,26 @@
+# App with an init container (real container).
+#
+# Init containers run sequentially before the main app starts.
+# If any init container fails, the app transitions to Failed.
+# Here, the init runs "echo" (succeeds), then nginx starts.
+# Requires a real container runtime (runc or Apple Container).
+#
+# Deploy with:
+#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-init-container.toml
+#   cargo run --bin relish -- status
+
+[app.web]
+image = "nginx:latest"
+port = 80
+
+[[app.web.init]]
+image = "alpine:latest"
+command = ["echo", "initialising database"]
+
+[app.web.health]
+path = "/"
+interval = 5
+timeout = 2
+threshold_unhealthy = 3
+threshold_healthy = 1

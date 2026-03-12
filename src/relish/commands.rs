@@ -3,6 +3,7 @@
 /// Each subcommand is an async function that returns `Result<(), RelishError>`.
 /// Commands try to reach the live Bun agent first. If the agent is
 /// unreachable, `apply` falls back to a dry-run plan.
+use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
@@ -15,16 +16,23 @@ use super::plan::generate_plan;
 /// Parse, validate, and deploy a config file.
 ///
 /// If a Bun agent is running, sends the config for deployment.
+/// Progress events are streamed to stderr in real time.
 /// If no agent is reachable, falls back to showing the dry-run plan.
 pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+    apply_with_client(path, output, &BunClient::default_local()).await
+}
+
+async fn apply_with_client(
+    path: &Path,
+    output: OutputFormat,
+    client: &BunClient,
+) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
 
-    let client = BunClient::default_local();
-
     match client.health().await {
         Ok(()) => {
-            // Agent is alive — send the config
+            // Agent is alive — send the config (progress streams to stderr)
             let result = client.apply(&config).await?;
             println!(
                 "deployed {} instance(s): {}",
@@ -46,7 +54,10 @@ pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError>
 
 /// Show cluster and app status.
 pub async fn status() -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+    status_with_client(&BunClient::default_local()).await
+}
+
+async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
     let statuses = client.status().await?;
 
     if statuses.is_empty() {
@@ -72,23 +83,57 @@ pub async fn status() -> Result<(), RelishError> {
 }
 
 /// Stream logs from an app or job.
-pub async fn logs(name: &str) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
-    let log_output = client.logs(name, "default").await?;
-    println!("{log_output}");
+pub async fn logs(name: &str, tail: Option<usize>, follow: bool) -> Result<(), RelishError> {
+    logs_with_client(name, tail, follow, &BunClient::default_local()).await
+}
+
+async fn logs_with_client(
+    name: &str,
+    tail: Option<usize>,
+    follow: bool,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let log_output = client.logs(name, "default", tail, follow).await?;
+    if !log_output.is_empty() {
+        println!("{log_output}");
+    }
     Ok(())
 }
 
 /// Execute a command inside a running container.
-pub async fn exec(_app: &str, _command: &[String]) -> Result<(), RelishError> {
-    Err(RelishError::AgentRequired {
-        command: "exec".to_string(),
-    })
+pub async fn exec(app: &str, command: &[String]) -> Result<(), RelishError> {
+    exec_with_client(app, command, &BunClient::default_local()).await
+}
+
+async fn exec_with_client(
+    app: &str,
+    command: &[String],
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let output = client.exec(app, "default", command).await?;
+    if !output.is_empty() {
+        print!("{output}");
+    }
+    Ok(())
+}
+
+/// Stop all instances of an app.
+pub async fn stop(app: &str) -> Result<(), RelishError> {
+    stop_with_client(app, &BunClient::default_local()).await
+}
+
+async fn stop_with_client(app: &str, client: &BunClient) -> Result<(), RelishError> {
+    client.stop(app, "default").await?;
+    println!("stopped {app}");
+    Ok(())
 }
 
 /// Show detailed info about an app, node, or job.
 pub async fn inspect(name: &str) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+    inspect_with_client(name, &BunClient::default_local()).await
+}
+
+async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
     let statuses = client.status().await?;
     let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == name).collect();
 
@@ -114,10 +159,63 @@ pub async fn inspect(name: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Initialise a new project with starter config files.
+///
+/// Creates `reliaburger.toml` (node config) and `app.toml` (sample app)
+/// in the given directory. Refuses to overwrite existing files.
+pub fn init(dir: &Path) -> Result<(), RelishError> {
+    let node_path = dir.join("reliaburger.toml");
+    let app_path = dir.join("app.toml");
+
+    if node_path.exists() {
+        return Err(RelishError::FileExists {
+            path: node_path.display().to_string(),
+        });
+    }
+    if app_path.exists() {
+        return Err(RelishError::FileExists {
+            path: app_path.display().to_string(),
+        });
+    }
+
+    let node_config = crate::config::node::NodeConfig::default();
+    let node_toml = format!(
+        "# Reliaburger node configuration.\n\
+         # See docs/README.md for full reference.\n\n{}",
+        toml::to_string_pretty(&node_config).expect("failed to serialise default node config")
+    );
+
+    let app_toml = "\
+# Sample Reliaburger app configuration.
+# Deploy with: relish apply app.toml
+
+[app.web]
+image = \"nginx:latest\"
+port = 8080
+
+[app.web.health]
+path = \"/\"
+";
+
+    fs::write(&node_path, node_toml)?;
+    fs::write(&app_path, app_toml)?;
+
+    println!("created {}", node_path.display());
+    println!("created {}", app_path.display());
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    /// Port 1 on localhost — nothing listens there, so connections
+    /// are refused immediately without waiting for a timeout.
+    fn bogus_client() -> BunClient {
+        BunClient::new("http://127.0.0.1:1")
+    }
 
     fn write_temp_config(content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -134,13 +232,21 @@ mod tests {
             port = 8080
         "#,
         );
-        // No agent running, so this falls back to dry-run
-        assert!(apply(f.path(), OutputFormat::Human).await.is_ok());
+        assert!(
+            apply_with_client(f.path(), OutputFormat::Human, &bogus_client())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn apply_with_missing_file_errors() {
-        let result = apply(Path::new("/nonexistent/config.toml"), OutputFormat::Human).await;
+        let result = apply_with_client(
+            Path::new("/nonexistent/config.toml"),
+            OutputFormat::Human,
+            &bogus_client(),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -152,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply(f.path(), OutputFormat::Human).await;
+        let result = apply_with_client(f.path(), OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err());
     }
 
@@ -164,7 +270,7 @@ mod tests {
             replicas = 3
         "#,
         );
-        let result = apply(f.path(), OutputFormat::Human).await;
+        let result = apply_with_client(f.path(), OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -175,25 +281,66 @@ mod tests {
 
     #[tokio::test]
     async fn status_returns_agent_unreachable() {
-        let err = status().await.unwrap_err();
+        let err = status_with_client(&bogus_client()).await.unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
-        let err = logs("web").await.unwrap_err();
+        let err = logs_with_client("web", None, false, &bogus_client())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 
     #[tokio::test]
-    async fn exec_returns_agent_required() {
-        let err = exec("web", &["sh".to_string()]).await.unwrap_err();
-        assert!(matches!(err, RelishError::AgentRequired { ref command } if command == "exec"));
+    async fn exec_returns_agent_unreachable() {
+        let err = exec_with_client("web", &["sh".to_string()], &bogus_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable));
+    }
+
+    #[tokio::test]
+    async fn stop_returns_agent_unreachable() {
+        let err = stop_with_client("web", &bogus_client()).await.unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable));
+    }
+
+    #[test]
+    fn init_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        assert!(dir.path().join("reliaburger.toml").exists());
+        assert!(dir.path().join("app.toml").exists());
+    }
+
+    #[test]
+    fn init_refuses_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+        let err = init(dir.path()).unwrap_err();
+        assert!(matches!(err, RelishError::FileExists { .. }));
+    }
+
+    #[test]
+    fn init_generated_config_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path()).unwrap();
+
+        let node_content = std::fs::read_to_string(dir.path().join("reliaburger.toml")).unwrap();
+        let _: crate::config::node::NodeConfig = toml::from_str(&node_content).unwrap();
+
+        let app_content = std::fs::read_to_string(dir.path().join("app.toml")).unwrap();
+        let config = Config::parse(&app_content).unwrap();
+        config.validate().unwrap();
     }
 
     #[tokio::test]
     async fn inspect_returns_agent_unreachable() {
-        let err = inspect("web").await.unwrap_err();
+        let err = inspect_with_client("web", &bogus_client())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 }

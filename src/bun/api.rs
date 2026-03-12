@@ -1,19 +1,24 @@
-use axum::Router;
 /// Bun local HTTP API.
 ///
 /// An axum server on `127.0.0.1:9117` that bridges HTTP requests to
 /// the agent's command channel. Handlers are thin — they construct an
 /// `AgentCommand`, send it over the `mpsc` channel, and await the
-/// `oneshot` response.
-use axum::extract::{Path, State};
+/// `oneshot` response. The `apply` endpoint streams progress events
+/// via Server-Sent Events (SSE).
+use axum::Router;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
+use futures_util::StreamExt;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::Config;
 
-use super::agent::{AgentCommand, InstanceStatus};
+use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -32,6 +37,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
+        .route("/v1/exec/{app}/{namespace}", post(exec_handler))
         .with_state(state)
 }
 
@@ -40,7 +46,11 @@ async fn health_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-/// Deploy workloads from JSON config.
+/// Deploy workloads, streaming progress via SSE.
+///
+/// Returns a Server-Sent Events stream. Each event's `data` field
+/// contains a JSON-serialised `ApplyEvent`. The stream ends after
+/// the `Complete` or `Error` event.
 async fn apply_handler(State(state): State<ApiState>, body: String) -> Response {
     let config = match Config::parse(&body) {
         Ok(c) => c,
@@ -61,12 +71,12 @@ async fn apply_handler(State(state): State<ApiState>, body: String) -> Response 
             .into_response();
     }
 
-    let (resp_tx, resp_rx) = oneshot::channel();
+    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     if state
         .cmd_tx
         .send(AgentCommand::Deploy {
             config,
-            response: resp_tx,
+            events: event_tx,
         })
         .await
         .is_err()
@@ -78,19 +88,12 @@ async fn apply_handler(State(state): State<ApiState>, body: String) -> Response 
             .into_response();
     }
 
-    match resp_rx.await {
-        Ok(Ok(result)) => (StatusCode::OK, Json(serde_json::json!(result))).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
-    }
+    let stream = ReceiverStream::new(event_rx).map(|apply_event| {
+        let json = serde_json::to_string(&apply_event).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    });
+
+    Sse::new(stream).into_response()
 }
 
 /// List all instances.
@@ -200,17 +203,56 @@ async fn stop_handler(
     }
 }
 
+/// Query parameters for the logs endpoint.
+#[derive(Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+    follow: Option<bool>,
+}
+
 /// Get logs for an app.
+///
+/// Supports `?tail=N` to return only the last N lines, and
+/// `?follow=true` to stream new lines as an SSE stream.
 async fn logs_handler(
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<LogsQuery>,
 ) -> Response {
+    let follow = query.follow.unwrap_or(false);
+
+    if follow {
+        let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
+        if state
+            .cmd_tx
+            .send(AgentCommand::FollowLogs {
+                app_name: app,
+                namespace,
+                tail: query.tail,
+                lines: lines_tx,
+            })
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "agent unavailable" })),
+            )
+                .into_response();
+        }
+
+        let stream = ReceiverStream::new(lines_rx)
+            .map(|line| Ok::<_, std::convert::Infallible>(Event::default().data(line)));
+        return Sse::new(stream).into_response();
+    }
+
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::Logs {
             app_name: app,
             namespace,
+            tail: query.tail,
             response: resp_tx,
         })
         .await
@@ -225,6 +267,52 @@ async fn logs_handler(
 
     match resp_rx.await {
         Ok(Ok(logs)) => Json(serde_json::json!({ "logs": logs })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for the exec endpoint.
+#[derive(Deserialize)]
+struct ExecRequest {
+    command: Vec<String>,
+}
+
+/// Execute a command inside a running instance.
+async fn exec_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Json(body): Json<ExecRequest>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Exec {
+            app_name: app,
+            namespace,
+            command: body.command,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(Ok(output)) => Json(serde_json::json!({ "output": output })).into_response(),
         Ok(Err(e)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -284,6 +372,16 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Parse SSE events from a response body. Each event is a line
+    /// starting with "data:" followed by JSON.
+    fn parse_sse_events(body: &[u8]) -> Vec<super::ApplyEvent> {
+        let text = String::from_utf8_lossy(body);
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|data| serde_json::from_str(data.trim()).ok())
+            .collect()
+    }
+
     #[tokio::test]
     async fn apply_deploys_workloads() {
         let (app, shutdown) = test_setup();
@@ -308,8 +406,14 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["created"], 1);
+        let events = parse_sse_events(&body);
+
+        // Should end with a Complete event
+        let last = events.last().expect("no SSE events in response");
+        match last {
+            super::ApplyEvent::Complete { created, .. } => assert_eq!(*created, 1),
+            other => panic!("expected Complete event, got {other:?}"),
+        }
 
         shutdown.cancel();
     }
@@ -348,7 +452,7 @@ mod tests {
         let app = router(cmd_tx.clone());
 
         // Deploy first via channel
-        let (resp_tx, resp_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::channel(64);
         cmd_tx
             .send(AgentCommand::Deploy {
                 config: crate::config::Config::parse(
@@ -359,11 +463,11 @@ mod tests {
                 "#,
                 )
                 .unwrap(),
-                response: resp_tx,
+                events: event_tx,
             })
             .await
             .unwrap();
-        resp_rx.await.unwrap().unwrap();
+        while event_rx.recv().await.is_some() {}
 
         let response = app
             .oneshot(
@@ -411,6 +515,26 @@ mod tests {
                     .method("POST")
                     .uri("/v1/stop/nope/default")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn exec_nonexistent_app_returns_404() {
+        let (app, shutdown) = test_setup();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/exec/nope/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"command":["echo","hi"]}"#))
                     .unwrap(),
             )
             .await

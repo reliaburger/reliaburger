@@ -177,7 +177,13 @@ enum Command {
     /// Show cluster and app status.
     Status,
     /// Stream logs from an app or job.
-    Logs { name: String },
+    Logs {
+        name: String,
+        #[arg(long)]
+        tail: Option<usize>,
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     /// Execute a command inside a running container.
     Exec {
         app: String,
@@ -190,6 +196,8 @@ enum Command {
 ```
 
 This is clap's derive API. The `Cli` struct *is* the argument parser. Each variant of the `Command` enum is a subcommand. The `///` doc comments become the help text automatically. If someone passes invalid arguments, clap generates the error message. If someone runs `relish --help`, clap generates the help output. We get all of that for free — no manual parsing, no string matching.
+
+Look at `Logs` for a moment. The `name` field is a positional argument (no `#[arg]` annotation), so `relish logs web` captures "web" as the app name. The `--tail` flag takes an optional number (`Option<usize>` means it's not required), and `--follow` is a boolean flag with a `-f` short alias. So `relish logs web --tail 10` shows the last 10 lines, `relish logs web -f` streams new output as it's produced, and `relish logs web --follow --tail 5` shows the last 5 lines then keeps streaming. All of that falls out of the type definitions — clap figures out the argument parsing from the struct fields.
 
 Can you see what we're doing here? We're letting the type system do the work. The compiler guarantees that every subcommand is handled in the `match` statement. Add a new variant to `Command` and forget to handle it? Compilation error. That's the kind of guarantee we'll lean on throughout this book.
 
@@ -385,7 +393,9 @@ host = "myapp.com"
 [app.redis]
 image = "redis:7-alpine"
 port = 6379
-volume = { path = "/data", size = "10Gi" }
+[[app.redis.volumes]]
+path = "/data"
+size = "10Gi"
 
 [job.db-migrate]
 image = "myapp:v1.4.2"
@@ -675,17 +685,15 @@ test result: ok. 66 passed; 0 failed; 0 ignored
 
 Now we need something that actually runs containers. That something is Grill.
 
-The name follows the burger theme (Reliaburger, Bun, Relish, Patty, Mustard...), but the architecture is practical. When you run a container on Linux, three layers are involved:
+The name follows the burger theme (Reliaburger, Bun, Relish, Patty, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
 
 1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
 
-2. **containerd** manages runc. It pulls images, stores them, keeps track of which containers are running, and provides a gRPC API for other programs to talk to. When a container's process dies, containerd knows about it. When the machine reboots, containerd can tell you what was running before.
+2. **Grill** manages runc. It translates our `AppSpec` configuration into the OCI runtime specification that runc expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
 
-3. **Grill** manages containerd. It translates our `AppSpec` configuration into the OCI runtime specification that containerd expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
+In the Docker and Kubernetes world, there's usually a third layer in between: **containerd**, a daemon that manages runc, pulls images, persists state across reboots, and exposes a gRPC API. We skip it. containerd adds protobuf serialisation, a socket connection, and a daemon that needs to be running. We talk to runc directly, and handle image pulling ourselves. This gives us fewer moving parts, no daemon dependency, and full control over the lifecycle. If we need containerd later, we'll add another `Grill` implementation. The trait boundary makes that a local change.
 
-Why not talk to runc directly? Because containerd handles image management, process supervision, and state persistence. Without it, we'd need to reimplement all of that ourselves. And why not use containerd's higher-level CRI (Container Runtime Interface)? Because CRI is designed for Kubernetes, and carries assumptions about pods, sandboxes, and other concepts we don't need. We use containerd's lower-level API and keep full control.
-
-For Phase 1, we're building the parts of Grill that don't need a running containerd daemon: the state machine, port allocation, cgroup computation, and OCI spec generation. These are pure logic, testable on any platform. The actual containerd integration comes later.
+For Phase 1, we're building the parts of Grill that work without real containers: the state machine, port allocation, cgroup computation, and OCI spec generation. These are pure logic, testable on any platform. The runc integration and image pulling come later in this chapter.
 
 ## State machines in Rust
 
@@ -745,6 +753,7 @@ impl ContainerState {
                 | (Unhealthy, Stopping)
                 | (Stopping, Stopped)
                 | (Stopped, Pending)
+                | (Stopped, Failed)
         )
     }
 }
@@ -1007,9 +1016,9 @@ pub enum GrillError {
 
 `#[from]` on a variant generates a `From<InvalidTransition> for GrillError` implementation. This means anywhere you have a `Result<_, InvalidTransition>`, you can use `?` to automatically convert it to `Result<_, GrillError>`. No manual error wrapping, no `map_err` calls. The `?` operator does three things: if the result is `Ok`, unwrap the value and continue; if it's `Err`, convert the error using `From` and return early. It's the Rust equivalent of Go's `if err != nil { return err }`, but in three characters instead of three lines.
 
-With the trait defined, Phase 1's implementation focuses on the parts that don't need containerd: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
+With the trait defined, Phase 1's implementation focuses on the parts that don't need a real container runtime: the state machine, port allocator, cgroup computation, and OCI spec generation. Together, these four modules add 69 tests to the project — bringing the total to 135. Every transition in the state machine is validated. Every edge case in port allocation is covered. Every cgroup parameter is verified against known-correct values. And the OCI spec serialises to valid JSON with the right structure.
 
-When we implement the actual containerd integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
+When we implement the runc integration (the part that creates real containers), we'll write a struct that implements the `Grill` trait. For testing, we can write a mock that also implements the trait. The business logic that uses Grill — the supervisor, the health checker, the scheduler — won't know or care which implementation it's talking to. That's the point of the trait boundary.
 
 ## The process supervisor
 
@@ -1234,7 +1243,7 @@ Both apps and jobs have an optional `command` field in their TOML config:
 
 ```toml
 [app.web]
-image = "myapp:v1"
+image = "proc-grill:image-ignored"
 command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
 port = 8080
 ```
@@ -1253,7 +1262,7 @@ cargo run --bin testapp -- --mode unhealthy-after --count 5 --port 8080
 cargo run --bin testapp -- --mode slow --delay 3000 --port 8080
 ```
 
-It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
+It serves `/healthz` with configurable behaviour: always healthy, healthy for N requests then unhealthy, slow responses, or total hang. The example configs reference it via `command`, so when you `relish apply examples/phase-1/proc-minimal-app.toml` with a running agent, you get real health checks against a real HTTP server. No containers needed.
 
 ## Health checking: priority queues and state transitions
 
@@ -1554,7 +1563,13 @@ struct Cli {
 enum Command {
     Apply { path: PathBuf },
     Status,
-    Logs { name: String },
+    Logs {
+        name: String,
+        #[arg(long)]
+        tail: Option<usize>,
+        #[arg(long, short = 'f')]
+        follow: bool,
+    },
     Exec {
         app: String,
         #[arg(trailing_var_arg = true)]
@@ -1743,6 +1758,12 @@ pub enum RelishError {
 
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
+
+    #[error("bun agent not reachable at localhost:9117 (is it running?)")]
+    AgentUnreachable,
+
+    #[error("API error (status {status}): {body}")]
+    ApiError { status: u16, body: String },
 }
 ```
 
@@ -1753,11 +1774,12 @@ Second, the two serialisation variants (`SerialiseJson` and `SerialiseYaml`) don
 The binary's `main()` function doesn't use `anyhow::Result` anymore. Instead, it returns `ExitCode`:
 
 ```rust
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Apply { ref path } => commands::apply(path, cli.output),
-        Command::Status => commands::status(),
+        Command::Apply { ref path } => commands::apply(path, cli.output).await,
+        Command::Status => commands::status().await,
         // ...
     };
     match result {
@@ -1770,7 +1792,7 @@ fn main() -> ExitCode {
 }
 ```
 
-`ExitCode` is from Rust's standard library (`std::process::ExitCode`). It lets you return a proper exit code to the shell without going through `anyhow`'s default error printing, which includes a `Error:` prefix and the Debug representation. We want clean, lowercase error messages on stderr, so we format them ourselves with `eprintln!`.
+`ExitCode` is from Rust's standard library (`std::process::ExitCode`). The `#[tokio::main]` macro sets up the async runtime, same as in `bun`. We need async here because the command functions talk to the bun agent over HTTP. `ExitCode` lets you return a proper exit code to the shell without going through `anyhow`'s default error printing, which includes a `Error:` prefix and the Debug representation. We want clean, lowercase error messages on stderr, so we format them ourselves with `eprintln!`.
 
 The split is: `thiserror` in the library for structured, matchable errors. Manual `ExitCode` in the binary for clean user-facing output. The library defines *what* went wrong; the binary decides *how* to tell the user.
 
@@ -1826,7 +1848,7 @@ mod tests {
 
 `Cli::try_parse_from` parses from a string slice instead of reading `std::env::args()`. Same parsing logic, no process spawning needed. The test for invalid output proves that clap rejects unknown formats at parse time — our `ValueEnum` derive handles it.
 
-The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. The stub commands get one test each, proving they return the right `AgentRequired` error variant.
+The command functions themselves are tested through the library. `apply()` gets tested with temporary files (created by the `tempfile` crate), exercising the full pipeline: read file, parse TOML, validate config, generate plan, format output. Commands like `status`, `logs`, and `exec` get tested by pointing them at a bogus agent address and verifying they return the right `AgentUnreachable` error.
 
 With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). The CLI parses five subcommands with a global `--output` flag. `apply` does real work — it reads, validates, and plans. The other four commands fail gracefully instead of panicking. Three output formats — human, JSON, YAML — work through a single `format_output` function that dispatches on a type-safe enum. And the error handling follows the pattern we'll use everywhere: `thiserror` in the library, manual formatting in the binary.
 
@@ -1834,7 +1856,7 @@ With the Relish CLI skeleton, we've added 36 tests (bringing the total to 233). 
 
 We have a `Grill` trait that knows how to create, start, stop, and query containers. We have an OCI spec generator that produces the right cgroup limits and port mappings. We have a state machine that tracks what's Pending, Running, or Stopped. But none of it does anything yet. Time to give Grill a body.
 
-The obvious choice would be to jump straight to `runc` or `containerd`. But those only work on Linux, and half the development is happening on macOS. We need something that works everywhere so the test suite runs on every developer's machine.
+The obvious choice would be to jump straight to `runc`. But runc only works on Linux, and half the development is happening on macOS. We need something that works everywhere so the test suite runs on every developer's machine.
 
 The answer is `ProcessGrill`: a `Grill` implementation that spawns child processes instead of containers. Each "container" is just an OS process. No namespaces, no cgroups, no rootfs. But it implements the same trait, so the agent doesn't know the difference.
 
@@ -1849,6 +1871,7 @@ struct ProcessEntry {
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
+    exit_code: Option<i32>,
 }
 ```
 
@@ -1989,7 +2012,7 @@ match status {
 }
 ```
 
-Why call `runc` directly instead of going through `containerd` with gRPC? Because `containerd` adds a layer of protobuf serialisation, a socket connection, and a daemon that needs to be running. For Phase 1 we don't need any of that. `runc` is simpler: one binary, no daemon, no protobuf. If we need containerd later, we'll add another `Grill` implementation. The trait makes that a local change.
+As we discussed earlier, we call runc directly rather than going through containerd. One binary, no daemon, no protobuf.
 
 `RuncGrill` is Linux-only, gated behind `#[cfg(target_os = "linux")]`. Its tests require root privileges and `runc` installed, so they're further gated behind an environment variable: `RELIABURGER_RUNC_TESTS=1`.
 
@@ -2207,7 +2230,7 @@ async fn drive_instance_startup(
     instance.state = instance.state.transition_to(ContainerState::Preparing)?;
 
     // Generate OCI spec and create the container
-    let oci_spec = generate_oci_spec(app_name, spec, host_port, idx)?;
+    let oci_spec = generate_oci_spec(app_name, namespace, spec, host_port, &cgroup_str);
     self.supervisor.grill().create(instance_id, &oci_spec).await?;
 
     // Preparing → Starting
@@ -2343,7 +2366,8 @@ if !spec.init.is_empty() {
     for (i, init_spec) in spec.init.iter().enumerate() {
         let init_id = InstanceId(format!("{}-init-{i}", instance_id.0));
         let init_oci = generate_init_oci_spec(
-            &init_spec.command, namespace, app_name, &cgroup_str,
+            &init_spec.command, namespace, app_name,
+            spec.image.as_deref(), &cgroup_str,
         );
 
         self.supervisor.grill().create(&init_id, &init_oci).await?;
@@ -2462,6 +2486,8 @@ async fn apply_handler(State(state): State<ApiState>, body: String) -> Response 
 }
 ```
 
+The logs endpoint supports two query parameters: `?tail=N` returns only the last N lines, and `?follow=true` switches from a JSON response to an SSE stream. When following, the API sends each new log line as a Server-Sent Event, reusing the same streaming pattern we built for `apply`. The client reads the stream and prints each line to stdout. When the process exits or the user hits Ctrl-C, the stream ends cleanly. This gives us `tail -f` behaviour without polling.
+
 The API listens on `127.0.0.1:9117` — localhost only. In Phase 1, there's no cluster, no mTLS, no authentication. Opening it to the network would be a security hole. We'll add proper auth in Phase 4 and bind to all interfaces when the cluster needs it.
 
 ## Relish talks to Bun
@@ -2513,9 +2539,7 @@ pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError>
 }
 ```
 
-Two new `RelishError` variants handle the failure modes: `AgentUnreachable` (can't connect at all) and `ApiError { status, body }` (connected but got an error response). The error enum grows with each phase, but every variant carries enough context to display a useful error message.
-
-Making `main()` async was a one-line change: `fn main()` became `#[tokio::main] async fn main()`. All the command functions were already returning `Result` — we just added `.await` to the calls.
+The two new `RelishError` variants we saw earlier handle the failure modes: `AgentUnreachable` (can't connect at all) and `ApiError { status, body }` (connected but got an error response). The error enum grows with each phase, but every variant carries enough context to display a useful error message.
 
 ## Integration tests: the full lifecycle
 
@@ -2581,7 +2605,9 @@ Here's what the integration tests cover:
 
 **`status_empty_when_nothing_deployed`** — verify that a fresh agent reports no instances.
 
-**`logs_for_deployed_app`** — deploy an app, fetch logs, verify they contain the app name.
+**`logs_for_deployed_app`** — deploy an app, fetch logs, verify the call succeeds.
+
+**`logs_with_tail_returns_limited_lines`** — deploy an app that echoes three lines ("line1", "line2", "line3"), then fetch logs with `tail=1`. Verify we get exactly one line back, and it's "line3". This exercises the full `--tail` pipeline: query param parsing in the API, tail truncation in the agent, and the client passing the parameter through.
 
 **`relish_status_returns_expected_output`** — deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
 
@@ -2751,7 +2777,8 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - `cargo run --bin bun` starts a node agent that auto-detects the runtime, spawns containers (or processes), and runs health checks on a timer
 - `cargo run --bin relish -- apply app.toml` deploys workloads to the running agent
 - `cargo run --bin relish -- status` shows what's running
-- `cargo run --bin relish -- logs web` shows captured output
+- `cargo run --bin relish -- logs web` shows captured output, with `--tail N` for the last N lines and `--follow` to stream new output
+- `cargo run --bin relish -- exec web echo hello` runs a command inside a running instance
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
 - `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
 - RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
@@ -2760,7 +2787,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff
 
-306 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI, and 14 integration tests that exercise the full stack end to end.
+339 tests verify all of it: config parsing, validation, state machine transitions, OCI spec generation, cgroup computation, port allocation, health check decisions, HTTP probing, process management, exit code tracking, job lifecycle, init container execution, restart re-drive, image reference parsing, layer unpacking with whiteouts, rootless spec modifications, the agent event loop, the API server, the CLI with its init command, streaming apply progress via SSE, log tailing and follow support, exec command execution, and 21 integration tests that exercise the full stack end to end.
 
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 

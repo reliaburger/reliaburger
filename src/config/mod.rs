@@ -186,7 +186,9 @@ mod tests {
             [app.redis]
             image = "redis:7-alpine"
             port = 6379
-            volume = { path = "/data", size = "10Gi" }
+            [[app.redis.volumes]]
+            path = "/data"
+            size = "10Gi"
 
             [job.db-migrate]
             image = "myapp:v1.4.2"
@@ -225,7 +227,8 @@ mod tests {
         assert!(!web.env.get("NODE_ENV").unwrap().is_encrypted());
 
         let redis = &config.app["redis"];
-        assert_eq!(redis.volume.as_ref().unwrap().size, "10Gi");
+        assert_eq!(redis.volumes.len(), 1);
+        assert_eq!(redis.volumes[0].size.as_deref(), Some("10Gi"));
 
         let ns = &config.namespace["team-backend"];
         assert_eq!(ns.gpu, Some(2));

@@ -1,0 +1,53 @@
+# Full-featured app using most Phase 1 capabilities (ProcessGrill version).
+#
+# Demonstrates: replicas, port, health checks, environment variables,
+# volumes, init containers, resource limits, and a one-shot job.
+#
+# This is the ProcessGrill version — it uses testapp so everything works
+# without a container runtime. See container-full-featured.toml for the real-runtime
+# version with OCI images.
+#
+# Build first:
+#   cargo build
+#
+# Deploy with:
+#   cargo run --bin relish -- apply examples/phase-1/proc-full-featured.toml
+
+[app.myapp]
+image = "proc-grill:image-ignored"
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+port = 8080
+replicas = 3
+cpu = "100m-500m"
+memory = "128Mi-512Mi"
+
+[app.myapp.health]
+path = "/healthz"
+interval = 10
+timeout = 3
+threshold_unhealthy = 3
+threshold_healthy = 1
+
+[app.myapp.env]
+DATABASE_URL = "postgres://db:5432/myapp"
+LOG_LEVEL = "info"
+
+# Run database migrations before the app starts.
+[[app.myapp.init]]
+image = "proc-grill:image-ignored"
+command = ["echo", "running migrations..."]
+
+# Managed volume for persistent data.
+[[app.myapp.volumes]]
+path = "/data"
+size = "5Gi"
+
+# HostPath volume for shared config.
+[[app.myapp.volumes]]
+source = "/etc/myapp"
+path = "/etc/myapp"
+
+# A one-shot migration job that runs independently.
+[job.db-seed]
+image = "proc-grill:image-ignored"
+command = ["echo", "seeding database..."]

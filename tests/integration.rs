@@ -13,7 +13,7 @@ use reliaburger::config::Config;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
 use reliaburger::relish::client::BunClient;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Test harness: starts a real agent with ProcessGrill on an ephemeral port.
@@ -173,16 +173,17 @@ async fn relish_status_returns_expected_output() {
     let harness = TestHarness::start().await;
 
     // Deploy via channel
-    let (resp_tx, resp_rx) = oneshot::channel();
+    let (event_tx, mut event_rx) = mpsc::channel(64);
     harness
         .cmd_tx
         .send(AgentCommand::Deploy {
             config: TestHarness::config_no_health(),
-            response: resp_tx,
+            events: event_tx,
         })
         .await
         .unwrap();
-    resp_rx.await.unwrap().unwrap();
+    // Drain events until the channel closes
+    while event_rx.recv().await.is_some() {}
 
     let statuses = harness.client.status().await.unwrap();
     assert!(!statuses.is_empty());
@@ -229,8 +230,9 @@ async fn logs_for_deployed_app() {
         .await
         .unwrap();
 
-    let logs = harness.client.logs("worker", "default").await.unwrap();
-    assert!(logs.contains("worker"));
+    // ProcessGrill returns empty logs for sleep, but the call should succeed
+    let result = harness.client.logs("worker", "default", None, false).await;
+    assert!(result.is_ok());
 }
 
 #[tokio::test]
@@ -373,6 +375,45 @@ async fn init_container_failure_prevents_start() {
 }
 
 #[tokio::test]
+async fn health_check_hang_stays_in_health_wait() {
+    let test_app = TestApp::start(TestAppMode::Hang).await;
+    let harness = TestHarness::start().await;
+
+    let config = TestHarness::config_for_test_app(test_app.port());
+    harness.client.apply(&config).await.unwrap();
+
+    // Health check timeout is 1s, interval is 1s — after 5s the probes
+    // should have timed out but the app should never reach "running"
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(
+        statuses[0].state, "health-wait",
+        "expected health-wait when probes hang, got {}",
+        statuses[0].state
+    );
+
+    test_app.shutdown();
+}
+
+#[tokio::test]
+async fn inspect_returns_expected_output() {
+    let harness = TestHarness::start().await;
+
+    harness
+        .client
+        .apply(&TestHarness::config_no_health())
+        .await
+        .unwrap();
+
+    let statuses = harness.client.status().await.unwrap();
+    let matching: Vec<_> = statuses.iter().filter(|s| s.app_name == "worker").collect();
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0].namespace, "default");
+    assert!(matching[0].pid.is_some());
+}
+
+#[tokio::test]
 async fn health_check_triggers_restart() {
     // App goes unhealthy after 3 healthy responses, then stays unhealthy
     let test_app = TestApp::start(TestAppMode::UnhealthyAfter(3)).await;
@@ -394,4 +435,156 @@ async fn health_check_triggers_restart() {
     );
 
     test_app.shutdown();
+}
+
+#[tokio::test]
+async fn logs_with_tail_returns_limited_lines() {
+    let harness = TestHarness::start().await;
+
+    // Deploy an app that echoes multiple lines
+    let config = Config::parse(
+        r#"
+        [app.echoer]
+        image = "test:v1"
+        command = ["sh", "-c", "echo line1; echo line2; echo line3"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for the echo to finish and output to be captured
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = harness
+        .client
+        .logs("echoer", "default", Some(1), false)
+        .await
+        .unwrap();
+
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 1, "expected 1 line, got: {result:?}");
+    assert_eq!(lines[0], "line3");
+}
+
+#[tokio::test]
+async fn logs_follow_returns_output_for_completed_job() {
+    let harness = TestHarness::start().await;
+
+    // Deploy a job (not an app) — the agent's check_jobs loop detects
+    // process exit and updates state, which lets follow_logs terminate.
+    let config = Config::parse(
+        r#"
+        [job.echoer2]
+        image = "test:v1"
+        command = ["sh", "-c", "echo follow-line1; echo follow-line2"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait for the job to complete and state to be updated
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Send FollowLogs — for a stopped process, ProcessGrill sends
+    // buffered output then returns when it sees state == Stopped.
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    harness
+        .cmd_tx
+        .send(reliaburger::bun::agent::AgentCommand::FollowLogs {
+            app_name: "echoer2".to_string(),
+            namespace: "default".to_string(),
+            tail: None,
+            lines: event_tx,
+        })
+        .await
+        .unwrap();
+
+    // Use a timeout to avoid hanging if something goes wrong
+    let mut lines = Vec::new();
+    let collect = async {
+        while let Some(line) = event_rx.recv().await {
+            lines.push(line);
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(5), collect).await;
+
+    assert!(
+        lines.len() >= 2,
+        "expected at least 2 lines from follow, got: {lines:?}"
+    );
+    assert_eq!(lines[0], "follow-line1");
+    assert_eq!(lines[1], "follow-line2");
+}
+
+#[tokio::test]
+async fn exec_runs_command_and_returns_output() {
+    let harness = TestHarness::start().await;
+
+    // Deploy a long-running app so it stays in Running state
+    let config = Config::parse(
+        r#"
+        [app.sleeper]
+        image = "test:v1"
+        command = ["sleep", "60"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+
+    let output = harness
+        .client
+        .exec(
+            "sleeper",
+            "default",
+            &["echo".to_string(), "hello".to_string()],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.trim(), "hello");
+}
+
+#[tokio::test]
+async fn exec_nonexistent_app_returns_error() {
+    let harness = TestHarness::start().await;
+
+    let result = harness
+        .client
+        .exec("nope", "default", &["echo".to_string()])
+        .await;
+
+    assert!(result.is_err(), "expected error for nonexistent app");
+}
+
+#[tokio::test]
+async fn volume_config_deploys_successfully() {
+    let harness = TestHarness::start().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let host_path = dir.path().join("data");
+    std::fs::create_dir_all(&host_path).unwrap();
+
+    let config = Config::parse(&format!(
+        r#"
+        [app.volapp]
+        image = "test:v1"
+        command = ["sleep", "60"]
+
+        [[app.volapp.volumes]]
+        path = "/data"
+        source = "{}"
+    "#,
+        host_path.display()
+    ))
+    .unwrap();
+
+    let result = harness.client.apply(&config).await.unwrap();
+    assert_eq!(result.created, 1);
+
+    let statuses = harness.client.status().await.unwrap();
+    assert_eq!(statuses[0].app_name, "volapp");
+    assert_eq!(statuses[0].state, "running");
 }

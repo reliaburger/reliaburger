@@ -20,6 +20,8 @@ pub mod state;
 
 use std::fmt;
 
+use tokio::sync::mpsc;
+
 pub use cgroup::{CgroupParams, cgroup_path, compute_cgroup_params, cpu_max_from_millicores};
 pub use image::ImageStore;
 pub use oci::{OciSpec, generate_job_oci_spec, generate_oci_spec};
@@ -118,6 +120,48 @@ pub trait Grill: Send + Sync {
         let _ = instance;
         std::future::ready(None)
     }
+
+    /// Get captured logs for an instance.
+    ///
+    /// Returns whatever output the runtime has captured. The default
+    /// returns an empty string for runtimes that don't capture logs.
+    fn logs(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<String, GrillError>> + Send {
+        let _ = instance;
+        std::future::ready(Ok(String::new()))
+    }
+
+    /// Stream logs for an instance.
+    ///
+    /// Sends new log lines over the channel as they are produced.
+    /// The default does nothing (stream closes immediately). Runtimes
+    /// that support streaming override this.
+    fn follow_logs(
+        &self,
+        instance: &InstanceId,
+        lines_tx: mpsc::Sender<String>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        let _ = (instance, lines_tx);
+        std::future::ready(())
+    }
+
+    /// Execute a command in the context of a running instance.
+    ///
+    /// Runs the given command and returns its combined stdout/stderr
+    /// output. For process-based runtimes this spawns a new process;
+    /// for container runtimes it enters the container's namespaces.
+    fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> impl std::future::Future<Output = Result<String, GrillError>> + Send {
+        let _ = (instance, command);
+        std::future::ready(Err(GrillError::NotFound {
+            instance: InstanceId("exec not supported".to_string()),
+        }))
+    }
 }
 
 /// Runtime-selected Grill implementation.
@@ -204,6 +248,36 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.exit_code(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.exit_code(instance).await,
+        }
+    }
+
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.logs(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.logs(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.logs(instance).await,
+        }
+    }
+
+    async fn follow_logs(&self, instance: &InstanceId, lines_tx: mpsc::Sender<String>) {
+        match self {
+            AnyGrill::Process(g) => g.follow_logs(instance, lines_tx).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.follow_logs(instance, lines_tx).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.follow_logs(instance, lines_tx).await,
+        }
+    }
+
+    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.exec(instance, command).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.exec(instance, command).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.exec(instance, command).await,
         }
     }
 }

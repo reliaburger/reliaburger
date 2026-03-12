@@ -1,0 +1,51 @@
+# Full-featured app using most Phase 1 capabilities.
+#
+# Demonstrates: image, port, health checks, environment variables,
+# volumes, init containers, resource limits, and replicas.
+#
+# This config is designed for real container runtimes (runc or Apple
+# Container). On ProcessGrill (the default), apps without a `command`
+# field just sleep. See proc-full-featured.toml for a ProcessGrill version
+# that uses testapp.
+#
+# Deploy with a real runtime:
+#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-full-featured.toml
+
+[app.myapp]
+image = "nginx:latest"
+port = 80
+replicas = 3
+cpu = "100m-500m"
+memory = "128Mi-512Mi"
+
+[app.myapp.health]
+path = "/"
+interval = 10
+timeout = 3
+threshold_unhealthy = 3
+threshold_healthy = 1
+
+[app.myapp.env]
+NGINX_HOST = "localhost"
+LOG_LEVEL = "info"
+
+# Print a message before the main app starts.
+[[app.myapp.init]]
+image = "alpine:latest"
+command = ["echo", "running pre-start checks"]
+
+# Managed volume for persistent data.
+[[app.myapp.volumes]]
+path = "/data"
+size = "5Gi"
+
+# HostPath volume for shared config.
+[[app.myapp.volumes]]
+source = "/etc/myapp"
+path = "/etc/myapp"
+
+# A one-shot setup job that runs independently.
+[job.setup]
+image = "alpine:latest"
+command = ["echo", "seeding complete"]

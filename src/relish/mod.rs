@@ -36,7 +36,19 @@ pub enum RelishError {
     #[error("bun agent not reachable at localhost:9117 (is it running?)")]
     AgentUnreachable,
 
+    /// A request to the agent timed out. The operation may still be running.
+    #[error("request timed out (the operation may still be running on the agent)")]
+    RequestTimeout,
+
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },
+
+    /// File already exists (init refuses to overwrite).
+    #[error("{path} already exists (refusing to overwrite)")]
+    FileExists { path: String },
+
+    /// IO error.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 }

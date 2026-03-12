@@ -53,6 +53,24 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         }
     }
 
+    // Volumes: paths must be absolute
+    for vol in &app.volumes {
+        if !vol.path.is_absolute() {
+            return Err(ConfigError::InvalidVolume {
+                name: name.to_string(),
+                reason: format!("mount path {:?} must be absolute", vol.path.display()),
+            });
+        }
+        if let Some(ref source) = vol.source
+            && !source.is_absolute()
+        {
+            return Err(ConfigError::InvalidVolume {
+                name: name.to_string(),
+                reason: format!("source path {:?} must be absolute", source.display()),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -220,5 +238,47 @@ mod tests {
     fn validate_valid_node_config_passes() {
         let nc = NodeConfig::default();
         nc.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_volume_relative_mount_path_rejected() {
+        let mut app = minimal_app();
+        app.volumes.push(crate::config::types::VolumeSpec {
+            path: PathBuf::from("relative/data"),
+            source: None,
+            size: None,
+        });
+        let config = config_with_app("test", app);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidVolume { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_volume_relative_source_path_rejected() {
+        let mut app = minimal_app();
+        app.volumes.push(crate::config::types::VolumeSpec {
+            path: PathBuf::from("/data"),
+            source: Some(PathBuf::from("relative/host/path")),
+            size: None,
+        });
+        let config = config_with_app("test", app);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidVolume { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_volume_absolute_paths_passes() {
+        let mut app = minimal_app();
+        app.volumes.push(crate::config::types::VolumeSpec {
+            path: PathBuf::from("/data"),
+            source: Some(PathBuf::from("/host/data")),
+            size: None,
+        });
+        let config = config_with_app("test", app);
+        config.validate().unwrap();
     }
 }

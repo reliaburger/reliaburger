@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf loc help
+.PHONY: build test check fmt lint clean pdf loc help examples
 
 CARGO = cargo
 
@@ -25,6 +25,21 @@ fmt-check: ## Check formatting without modifying files
 lint: ## Run clippy with warnings as errors
 	$(CARGO) clippy -- -D warnings
 
+examples: build ## Dry-run every example config with relish
+	@failed=0; total=0; \
+	for f in $$(find examples -name '*.toml' | sort); do \
+		total=$$((total + 1)); \
+		if $(CARGO) run --quiet --bin relish -- apply "$$f" >/dev/null 2>&1; then \
+			printf "  ✓ %s\n" "$$f"; \
+		else \
+			printf "  ✗ %s\n" "$$f"; \
+			failed=$$((failed + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "$$total examples, $$failed failed."; \
+	[ $$failed -eq 0 ]
+
 ci: fmt-check lint test ## Run everything CI would run
 
 # --- Documentation targets ---
@@ -40,7 +55,8 @@ pdf: ## Build all PDFs
 # --- Stats ---
 
 loc: ## Count lines of .rs, .md, and .toml files
-	@echo "  .rs:   $$(find . -name '*.rs'   | xargs cat 2>/dev/null | wc -l)"
+	@echo "  .rs (src):  $$(find ./src -name '*.rs' | xargs awk 'FNR==1{t=0} /^#\[cfg\(test\)\]/{t=1} !t{n++} END{print n+0}')"
+	@echo "  .rs (test): $$(( $$(find ./src -name '*.rs' | xargs awk 'FNR==1{t=0} /^#\[cfg\(test\)\]/{t=1} t{n++} END{print n+0}') + $$(find ./tests -name '*.rs' | xargs cat 2>/dev/null | wc -l | tr -d ' ') ))"
 	@echo "  .md:   $$(find . -name '*.md'   | xargs cat 2>/dev/null | wc -l)"
 	@echo "  .toml: $$(find . -name '*.toml' | xargs cat 2>/dev/null | wc -l)"
 	@echo "  total: $$(find . -name '*.rs' -o -name '*.md' -o -name '*.toml' | xargs cat 2>/dev/null | wc -l)"

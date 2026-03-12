@@ -39,6 +39,9 @@ pub enum ConfigError {
     #[error("invalid port range {value:?}: {reason}")]
     InvalidPortRange { value: String, reason: String },
 
+    #[error("volume in app {name:?}: {reason}")]
+    InvalidVolume { name: String, reason: String },
+
     #[error("{field} in {context:?}: {reason}")]
     Validation {
         field: String,

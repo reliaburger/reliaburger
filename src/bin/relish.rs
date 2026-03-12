@@ -34,6 +34,12 @@ enum Command {
     Logs {
         /// App or job name.
         name: String,
+        /// Show only the last N lines.
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Follow log output (stream new lines as they appear).
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Execute a command inside a running container.
     Exec {
@@ -48,6 +54,17 @@ enum Command {
         /// Resource name.
         name: String,
     },
+    /// Stop all instances of an app.
+    Stop {
+        /// App name.
+        app: String,
+    },
+    /// Initialise a new project with starter config files.
+    Init {
+        /// Directory to create config files in.
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -57,12 +74,18 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Apply { ref path } => commands::apply(path, cli.output).await,
         Command::Status => commands::status().await,
-        Command::Logs { ref name } => commands::logs(name).await,
+        Command::Logs {
+            ref name,
+            tail,
+            follow,
+        } => commands::logs(name, tail, follow).await,
         Command::Exec {
             ref app,
             ref command,
         } => commands::exec(app, command).await,
         Command::Inspect { ref name } => commands::inspect(name).await,
+        Command::Stop { ref app } => commands::stop(app).await,
+        Command::Init { ref dir } => commands::init(dir),
     };
 
     match result {
@@ -128,8 +151,67 @@ mod tests {
     }
 
     #[test]
+    fn parse_init_command() {
+        let cli = parse(&["relish", "init"]).unwrap();
+        assert!(matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some(".")));
+    }
+
+    #[test]
+    fn parse_init_with_dir() {
+        let cli = parse(&["relish", "init", "/tmp/myproject"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some("/tmp/myproject"))
+        );
+    }
+
+    #[test]
     fn invalid_output_format_rejected() {
         let result = parse(&["relish", "--output", "csv", "status"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_stop_command() {
+        let cli = parse(&["relish", "stop", "web"]).unwrap();
+        assert!(matches!(cli.command, Command::Stop { ref app } if app == "web"));
+    }
+
+    #[test]
+    fn parse_logs_with_tail() {
+        let cli = parse(&["relish", "logs", "web", "--tail", "10"]).unwrap();
+        match cli.command {
+            Command::Logs { name, tail, follow } => {
+                assert_eq!(name, "web");
+                assert_eq!(tail, Some(10));
+                assert!(!follow);
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_follow_short() {
+        let cli = parse(&["relish", "logs", "web", "-f"]).unwrap();
+        match cli.command {
+            Command::Logs { name, tail, follow } => {
+                assert_eq!(name, "web");
+                assert_eq!(tail, None);
+                assert!(follow);
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_follow_and_tail() {
+        let cli = parse(&["relish", "logs", "web", "--follow", "--tail", "5"]).unwrap();
+        match cli.command {
+            Command::Logs { name, tail, follow } => {
+                assert_eq!(name, "web");
+                assert_eq!(tail, Some(5));
+                assert!(follow);
+            }
+            _ => panic!("expected Logs command"),
+        }
     }
 }

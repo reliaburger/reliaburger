@@ -1,0 +1,33 @@
+# Volume mounts example.
+#
+# Two modes:
+#   - HostPath: specify `source` to bind-mount a host directory directly.
+#   - Managed:  omit `source` and Reliaburger picks a directory under
+#               storage.volumes/{namespace}/{app}/{path}.
+#
+# This config is designed for real container runtimes (runc or Apple
+# Container). On ProcessGrill (the default), apps without a `command`
+# field just sleep. See proc-volumes.toml for a ProcessGrill version
+# that uses testapp.
+#
+# Deploy with a real runtime:
+#   cargo run --bin bun -- --runtime apple   # or --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-volumes.toml
+
+[app.redis]
+image = "redis:7-alpine"
+port = 6379
+
+# Managed volume — Reliaburger creates the host directory automatically.
+[[app.redis.volumes]]
+path = "/data"
+size = "10Gi"
+
+[app.nginx]
+image = "nginx:latest"
+port = 8080
+
+# HostPath volume — bind-mount a specific host directory.
+[[app.nginx.volumes]]
+source = "/var/www/html"
+path = "/usr/share/nginx/html"

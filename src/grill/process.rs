@@ -256,6 +256,120 @@ impl super::Grill for ProcessGrill {
         let entry = procs.get(instance)?;
         entry.exit_code
     }
+
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        let stdout = self.stdout(instance).await?;
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        // Verify the instance exists and is running
+        {
+            let procs = self.processes.lock().await;
+            let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
+                instance: instance.clone(),
+            })?;
+            if entry.state != ContainerState::Running {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("instance is not running (state: {})", entry.state),
+                });
+            }
+        }
+
+        if command.is_empty() {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "no command specified".to_string(),
+            });
+        }
+
+        // Spawn the command directly (no namespace entry for ProcessGrill)
+        let output = Command::new(&command[0])
+            .args(&command[1..])
+            .output()
+            .await
+            .map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("exec failed: {e}"),
+            })?;
+
+        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+        Ok(result)
+    }
+
+    async fn follow_logs(
+        &self,
+        instance: &InstanceId,
+        lines_tx: tokio::sync::mpsc::Sender<String>,
+    ) {
+        let stdout_buf = {
+            let procs = self.processes.lock().await;
+            match procs.get(instance) {
+                Some(entry) => entry.stdout_buf.clone(),
+                None => return,
+            }
+        };
+
+        let mut offset = 0usize;
+        let mut partial_line = String::new();
+
+        loop {
+            let new_data = {
+                let buf = stdout_buf.lock().await;
+                if offset < buf.len() {
+                    let data = buf[offset..].to_vec();
+                    offset = buf.len();
+                    Some(data)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(data) = new_data {
+                partial_line.push_str(&String::from_utf8_lossy(&data));
+
+                // Send all complete lines
+                while let Some(newline_pos) = partial_line.find('\n') {
+                    let line = partial_line[..newline_pos].to_string();
+                    partial_line = partial_line[newline_pos + 1..].to_string();
+                    if lines_tx.send(line).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
+            // Check if process has exited and no more data is coming
+            {
+                let procs = self.processes.lock().await;
+                if let Some(entry) = procs.get(instance) {
+                    let exited = entry.state == ContainerState::Stopped
+                        || entry.state == ContainerState::Stopping;
+                    if exited {
+                        let buf = entry.stdout_buf.lock().await;
+                        if offset >= buf.len() {
+                            // Send any remaining partial line
+                            if !partial_line.is_empty() {
+                                let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
+                            }
+                            return;
+                        }
+                    }
+                } else {
+                    return;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
 }
 
 #[cfg(test)]
