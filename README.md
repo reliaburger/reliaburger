@@ -88,7 +88,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete** (single-node container lifecycle). 336 passing tests.
+**Phase 1 complete** (single-node container lifecycle). 339 passing tests.
 
 - TOML config parsing for all 7 resource types with custom serde deserialisers
 - Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
@@ -104,7 +104,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 - HostPath-style volumes: dual-mode with explicit source (hostPath) or managed storage
 - HTTP health probing with configurable intervals, timeouts, and thresholds
 - TestApp standalone binary for demos and integration tests
-- 20 integration tests exercising the full stack end to end
+- 21 integration tests exercising the full stack end to end
 
 See [progress.md](docs/progress.md) for the full checklist.
 

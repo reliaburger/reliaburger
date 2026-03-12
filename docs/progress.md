@@ -33,17 +33,22 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
 - [x] Log tailing (`--tail N`) and streaming (`--follow`/`-f`)
 - [x] Relish exec command (run commands in running instances)
-- [x] All Phase 1 tests green (336 tests)
+- [x] All Phase 1 tests green (339 tests)
 
 ## Phase 2: Cluster Formation
 
-- [ ] Mustard gossip protocol (SWIM membership, failure detection, leader broadcast)
-- [ ] Raft consensus (leader election, desired-state replication)
-- [ ] Council formation and selection (stability, zone diversity)
-- [ ] Hierarchical reporting tree (worker → council → leader aggregation)
-- [ ] State reconstruction protocol (learning period, StateReport, diff/correction)
-- [ ] Patty scheduler (multi-node placement, labels, GPU-aware scheduling)
-- [ ] All Phase 2 tests green
+- [ ] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/patty/types.rs`)
+- [ ] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
+- [ ] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
+- [ ] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication
+- [ ] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7
+- [ ] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel
+- [ ] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction
+- [ ] Patty scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas
+- [ ] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
+- [ ] CLI extensions: `relish members`, `relish council`, `relish join`
+- [ ] Chaos tests: council partition, worker isolation, full council loss recovery
+- [ ] Book chapter + docs: `02-finding-friends.md`, update README and progress
 
 ## Phase 3: Networking
 
