@@ -13,10 +13,12 @@
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod selection;
 pub mod state_machine;
 pub mod types;
 
 pub use node::CouncilNode;
+pub use selection::{CouncilSelectionConfig, select_council_candidates};
 pub use types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,
 };
