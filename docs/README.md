@@ -117,7 +117,7 @@ make release     # compile (optimised)
 make test        # run all tests
 make lint        # clippy with warnings as errors
 make fmt         # format with rustfmt
-make ci          # fmt-check + lint + test (what CI runs)
+make ci          # fmt-check + lint + test + bench (what CI runs)
 make clean       # remove build artefacts
 ```
 
@@ -127,6 +127,39 @@ Or use cargo directly:
 cargo build
 cargo test
 ```
+
+## Testing and benchmarking
+
+### Tests
+
+```sh
+make test          # run all tests (unit + integration)
+make ci            # fmt-check + lint + test + bench (what CI runs)
+```
+
+Some tests require specific runtimes or network access and are gated behind environment variables:
+
+| Variable | What it enables |
+|----------|----------------|
+| `RELIABURGER_RUNC_TESTS=1` | runc container runtime tests (Linux only) |
+| `RELIABURGER_APPLE_CONTAINER_TESTS=1` | Apple Container tests (macOS only) |
+| `RELIABURGER_IMAGE_PULL_TESTS=1` | OCI image pull tests (requires network) |
+
+### Benchmarks
+
+Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
+
+```sh
+make bench         # fast benchmarks: transport, single round, convergence 5-250 nodes (~2 min)
+make bench-large   # large cluster benchmarks: 500 and 1000 nodes (~10 min)
+make bench-10k     # 10,000 node convergence validation (~1 hour)
+```
+
+The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
+
+The large benchmarks (`cargo bench --bench gossip_large`) test the same convergence logic at 500 and 1000 nodes. These take longer because the simulation is O(N² log N) — all N nodes are driven sequentially each round.
+
+The 10k test (`make bench-10k`) is not a criterion benchmark but an ignored test that runs a single 10,000-node convergence simulation. It validates the whitepaper's scalability target and prints progress as membership knowledge spreads through the cluster. Run it when you want to verify the protocol scales, not on every commit.
 
 ## Running
 

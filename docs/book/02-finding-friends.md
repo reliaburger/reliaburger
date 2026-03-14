@@ -557,6 +557,8 @@ These numbers improved dramatically when we switched from `ceil(log2(N))` to `3 
 
 Run `cargo bench --bench gossip` to check for regressions. Criterion stores previous results in `target/criterion/` and reports whether performance changed. If you accidentally introduce an O(N²) loop where O(N) was expected, the benchmark will catch it before any user does.
 
+For larger clusters, `cargo bench --bench gossip_large` tests 500 and 1000 nodes (~10 minutes). And for the ultimate validation — 10,000 nodes, matching the whitepaper's scalability target — there's `make bench-10k`. That one takes about an hour because we're simulating all 10k nodes sequentially on a single thread. It's not something you run every commit, but it proves the protocol converges at the scale we promised. The test prints progress every 50 rounds so you can watch membership knowledge spread through the cluster in real time.
+
 ### What's next
 
 We have a working gossip protocol. Nodes discover each other, detect failures, and propagate membership changes. But gossip only gives us eventual consistency — every node eventually agrees on who's alive, but there's no single source of truth. For scheduling decisions, app deployments, and configuration changes, we need something stronger. That's where Raft comes in.

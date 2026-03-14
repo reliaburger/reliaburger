@@ -55,3 +55,7 @@ tower = { version = "0.5", features = ["util"] }
 [[bench]]
 name = "gossip"
 harness = false
+
+[[bench]]
+name = "gossip_large"
+harness = false
