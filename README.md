@@ -98,7 +98,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete.** **Phase 2 in progress** (cluster formation). 399 passing tests.
+**Phase 1 complete.** **Phase 2 in progress** (cluster formation). 437 passing tests.
 
 ### Phase 1 — Single-node container lifecycle
 
@@ -123,7 +123,8 @@ CLAUDE.md              # Project guide, conventions, writing style
 - Shared cluster types: `NodeId`, `AppId`, `Resources` with saturating arithmetic, `NodeCapacity`, `SchedulingDecision`
 - Mustard SWIM gossip protocol: `NodeState` state machine (Alive → Suspect → Dead), incarnation-based conflict resolution, membership table, piggyback dissemination queue with priority ordering
 - Transport abstraction: `MustardTransport` trait with `InMemoryNetwork` for testing (supports partition injection for chaos tests)
-- SWIM probe cycle: `MustardNode` protocol driver with PING → ACK → PING-REQ → Suspect flow, indirect probing, suspicion refutation, gossip convergence across 5-node ring topology
+- SWIM probe cycle: `MustardNode` protocol driver with PING → ACK → PING-REQ → Suspect flow, indirect probing with relay ACK forwarding, suspicion refutation, gossip convergence across 5-node ring topology
+- Property-based testing for incarnation conflict resolution, criterion benchmarks for convergence scaling (5–250 nodes)
 
 See [progress.md](docs/progress.md) for the full checklist.
 

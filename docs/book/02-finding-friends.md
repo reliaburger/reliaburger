@@ -534,26 +534,26 @@ A few things to notice. First, `iter_custom` lets us control the timing loop our
 
 We benchmark four things:
 
-1. **Transport throughput** — raw InMemoryTransport send + recv. ~120ns per message, or about 8 million messages per second. This tells us the test infrastructure isn't the bottleneck.
+1. **Transport throughput** — raw InMemoryTransport send + recv. ~115ns per message, or about 8.7 million messages per second. This tells us the test infrastructure isn't the bottleneck.
 
-2. **Single gossip round** — full PING → process → ACK → process cycle between two nodes. ~530ns. This is the per-node cost of one protocol period.
+2. **Single gossip round** — full PING → process → ACK → process cycle between two nodes. ~520ns. This is the per-node cost of one protocol period.
 
 3. **Convergence scaling** — how long until all nodes in a ring know about all others, measured across cluster sizes from 5 to 250 nodes. This validates SWIM's theoretical O(log N) convergence guarantee and catches regressions in the dissemination logic.
 
-4. **Dissemination queue** — enqueue 20 updates and drain them through the priority queue. ~13µs. The `BinaryHeap` ordering (Dead > Suspect > Alive) is the hot path for every outgoing message.
+4. **Dissemination queue** — enqueue 20 updates and drain them through the priority queue. ~38µs. The `BinaryHeap` ordering (Dead > Suspect > Alive) is the hot path for every outgoing message. This is higher than you might expect because each update gets broadcast `3 * ceil(log2(N))` times (the SWIM lambda parameter), so the queue does more work draining 20 updates with a cluster size of 100.
 
 The convergence benchmark is the most interesting. Here's what we measured:
 
 | Nodes | Time |
 |------:|-----:|
-| 5 | 1.6 ms |
-| 10 | 6.7 ms |
-| 25 | 18 ms |
-| 50 | 52 ms |
-| 100 | 158 ms |
-| 250 | 3.1 s |
+| 5 | 35 µs |
+| 10 | 133 µs |
+| 25 | 1.1 ms |
+| 50 | 5.7 ms |
+| 100 | 30 ms |
+| 250 | 337 ms |
 
-The scaling is roughly O(N² log N) in the benchmark, because we're simulating all N nodes sequentially. In a real deployment, nodes run concurrently, so the wall-clock convergence time is just O(log N) protocol intervals — about 3.5 seconds for a 1000-node cluster at 500ms intervals. The benchmark measures the computational cost of the protocol, not how long you'd actually wait.
+These numbers improved dramatically when we switched from `ceil(log2(N))` to `3 * ceil(log2(N))` for the broadcast count. The SWIM paper calls this multiplier *lambda*. With lambda=1, updates expired before reaching all nodes, forcing extra gossip rounds. With lambda=3, updates survive long enough that convergence happens in fewer rounds — a case where doing more work per round means less total work. The scaling is roughly O(N² log N) in the benchmark, because we're simulating all N nodes sequentially. In a real deployment, nodes run concurrently, so the wall-clock convergence time is just O(log N) protocol intervals — about 3.5 seconds for a 1000-node cluster at 500ms intervals.
 
 Run `cargo bench --bench gossip` to check for regressions. Criterion stores previous results in `target/criterion/` and reports whether performance changed. If you accidentally introduce an O(N²) loop where O(N) was expected, the benchmark will catch it before any user does.
 
