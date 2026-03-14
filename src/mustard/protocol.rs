@@ -224,9 +224,14 @@ impl<T: MustardTransport> MustardNode<T> {
             GossipPayload::PingReq {
                 target, requester, ..
             } => {
-                // Probe the target on behalf of the requester
+                // Probe the target on behalf of the requester.
+                // If the target responds, forward an ACK to the requester
+                // with sender = target's NodeId so the requester's
+                // wait_for_ack recognises it.
                 if let Some(target_member) = self.membership.get(target) {
                     let target_addr = target_member.address;
+                    let requester = requester.clone();
+                    let target = target.clone();
                     let updates = self.dissemination.select_updates();
                     let ping = GossipMessage::new(
                         self.node_id.clone(),
@@ -234,11 +239,29 @@ impl<T: MustardTransport> MustardNode<T> {
                         GossipPayload::Ping { updates },
                     );
                     let _ = self.transport.send(target_addr, &ping).await;
-                    // If we get an ACK, forward it to the requester.
-                    // For simplicity, the requester waits for any ACK
-                    // about the target — it doesn't need to come from us.
-                    let _ = requester; // Used in the message but forwarding
-                    // happens implicitly via the probe.
+
+                    // Wait for target's ACK (simple inline wait to avoid
+                    // async recursion through handle_message → wait_for_ack)
+                    let got_ack = self
+                        .wait_for_relay_ack(&target, self.config.probe_timeout)
+                        .await;
+
+                    if got_ack {
+                        // Forward ACK to the original requester
+                        if let Some(req_member) = self.membership.get(&requester) {
+                            let req_addr = req_member.address;
+                            let target_inc = self.membership_incarnation_of(&target);
+                            let fwd_updates = self.dissemination.select_updates();
+                            let fwd_ack = GossipMessage::new(
+                                target,
+                                target_inc,
+                                GossipPayload::Ack {
+                                    updates: fwd_updates,
+                                },
+                            );
+                            let _ = self.transport.send(req_addr, &fwd_ack).await;
+                        }
+                    }
                 }
             }
             GossipPayload::Ack { .. } => {
@@ -363,6 +386,45 @@ impl<T: MustardTransport> MustardNode<T> {
                 }
                 Ok(None) => return false, // Transport shut down
                 Err(_) => return false,   // Timeout
+            }
+        }
+    }
+
+    /// Wait for an ACK from the target during a relay probe.
+    ///
+    /// Unlike `wait_for_ack`, this does not recursively call `handle_message`
+    /// (which would cause async recursion). It only checks for ACKs and
+    /// applies piggybacked updates from them.
+    async fn wait_for_relay_ack(
+        &mut self,
+        target_id: &NodeId,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            match tokio::time::timeout(remaining, self.transport.recv()).await {
+                Ok(Some((_from, message))) => {
+                    let is_ack_from_target = matches!(&message.payload, GossipPayload::Ack { .. })
+                        && message.sender == *target_id;
+
+                    // Apply piggybacked updates without full handle_message
+                    let now = Instant::now();
+                    for update in message.payload.updates() {
+                        self.membership.apply_update(update, now);
+                    }
+
+                    if is_ack_from_target {
+                        return true;
+                    }
+                }
+                Ok(None) => return false,
+                Err(_) => return false,
             }
         }
     }
@@ -569,6 +631,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ping_timeout_triggers_ping_req() {
+        // 3 nodes: A, B, C. Partition A↔B. When A probes B, the direct
+        // PING times out. A should then send a PingReq to C (the only relay).
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let _tb = net.register(addr(2)).await;
+        let tc = net.register(addr(3)).await;
+
+        let mut node_a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        node_a.add_seed(NodeId::new("b"), addr(2));
+        node_a.add_seed(NodeId::new("c"), addr(3));
+
+        // Partition A↔B so direct PING is dropped
+        net.partition(addr(1), addr(2)).await;
+
+        // Run cycles until A picks B as the probe target. If A picks C
+        // (reachable), the cycle completes normally — try again.
+        // We know A picked B if B becomes Suspect afterwards (since the
+        // PingReq relay also can't help — C isn't running to handle it).
+        for _ in 0..20 {
+            node_a.run_one_cycle().await;
+            if node_a
+                .membership
+                .get(&NodeId::new("b"))
+                .is_some_and(|m| m.state == NodeState::Suspect)
+            {
+                break;
+            }
+        }
+
+        // A should have marked B as Suspect (after failed direct + indirect probe)
+        assert_eq!(
+            node_a.membership.get(&NodeId::new("b")).unwrap().state,
+            NodeState::Suspect,
+        );
+
+        // C should have received at least one PingReq asking to probe B
+        let mut saw_ping_req = false;
+        while let Some((_from, msg)) = tc.try_recv() {
+            if let GossipPayload::PingReq {
+                target, requester, ..
+            } = &msg.payload
+            {
+                assert_eq!(*target, NodeId::new("b"));
+                assert_eq!(*requester, NodeId::new("a"));
+                saw_ping_req = true;
+            }
+        }
+        assert!(saw_ping_req, "C should have received a PingReq for B");
+    }
+
+    #[tokio::test]
+    async fn ping_req_relay_forwards_to_target_and_requester() {
+        // When C receives a PingReq from A asking to probe B, C should:
+        // 1. Send a Ping to B
+        // 2. If B responds with Ack, forward an Ack to A (with sender=B)
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let tc = net.register(addr(3)).await;
+
+        let mut node_b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), tb);
+        let mut node_c = MustardNode::new(NodeId::new("c"), addr(3), fast_config(), tc);
+        node_b.add_seed(NodeId::new("c"), addr(3));
+        node_c.add_seed(NodeId::new("a"), addr(1));
+        node_c.add_seed(NodeId::new("b"), addr(2));
+
+        // A sends a PingReq to C
+        let ping_req = GossipMessage::new(
+            NodeId::new("a"),
+            1,
+            GossipPayload::PingReq {
+                target: NodeId::new("b"),
+                requester: NodeId::new("a"),
+                updates: vec![],
+            },
+        );
+        ta.send(addr(3), &ping_req).await.unwrap();
+
+        // C processes the PingReq — spawns a Ping to B and waits for ACK.
+        // We need B to respond, so spawn B's handler concurrently.
+        let shutdown = CancellationToken::new();
+        let shutdown_b = shutdown.clone();
+        let handle_b = tokio::spawn(async move {
+            node_b.run(shutdown_b).await;
+            node_b
+        });
+
+        // C handles the PingReq (will send Ping to B, wait for ACK, forward to A)
+        let (from, msg) = node_c.transport.recv().await.unwrap();
+        node_c.handle_message(from, msg).await;
+
+        shutdown.cancel();
+        let _node_b = handle_b.await.unwrap();
+
+        // A should have received a forwarded ACK with sender=B
+        let mut saw_forwarded_ack = false;
+        while let Some((_from, msg)) = ta.try_recv() {
+            if matches!(&msg.payload, GossipPayload::Ack { .. }) && msg.sender == NodeId::new("b") {
+                saw_forwarded_ack = true;
+            }
+        }
+        assert!(
+            saw_forwarded_ack,
+            "A should have received a forwarded ACK with sender=B"
+        );
+    }
+
+    #[tokio::test]
+    async fn indirect_probe_success_prevents_suspect() {
+        // A↔B partitioned, but A↔C and B↔C are fine. When A probes B,
+        // the direct PING fails, but C relays successfully. B should
+        // remain Alive in A's membership.
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let tc = net.register(addr(3)).await;
+
+        let mut node_b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), tb);
+        let mut node_c = MustardNode::new(NodeId::new("c"), addr(3), fast_config(), tc);
+        node_b.add_seed(NodeId::new("c"), addr(3));
+        node_c.add_seed(NodeId::new("a"), addr(1));
+        node_c.add_seed(NodeId::new("b"), addr(2));
+
+        // Partition A↔B only
+        net.partition(addr(1), addr(2)).await;
+
+        let mut node_a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        node_a.add_seed(NodeId::new("b"), addr(2));
+        node_a.add_seed(NodeId::new("c"), addr(3));
+
+        // Spawn B and C so they can handle messages while A runs its probe cycle.
+        // A's run_one_cycle will: PING B (dropped), timeout, PingReq to C,
+        // C probes B (succeeds), C forwards ACK to A, A receives it.
+        let shutdown = CancellationToken::new();
+        let shutdown_b = shutdown.clone();
+        let shutdown_c = shutdown.clone();
+        let handle_b = tokio::spawn(async move {
+            node_b.run(shutdown_b).await;
+            node_b
+        });
+        let handle_c = tokio::spawn(async move {
+            node_c.run(shutdown_c).await;
+            node_c
+        });
+
+        // Run cycles until A probes B. If A picks C, the cycle succeeds
+        // normally. We keep going until A has probed B at least once.
+        for _ in 0..20 {
+            node_a.run_one_cycle().await;
+        }
+
+        shutdown.cancel();
+        let _ = handle_b.await;
+        let _ = handle_c.await;
+
+        // B should still be Alive (indirect probe via C saved it)
+        let b_state = node_a.membership.get(&NodeId::new("b")).unwrap().state;
+        assert_eq!(
+            b_state,
+            NodeState::Alive,
+            "B should be Alive thanks to indirect probe via C, but was {b_state}"
+        );
+    }
+
+    #[tokio::test]
     async fn gossip_convergence_five_nodes() {
         // 5 nodes in a ring topology (each knows the next).
         // After enough cycles, all nodes should know about all others.
@@ -605,7 +833,7 @@ mod tests {
         // 2. Every node drains its inbox (processing PINGs → sending
         //    ACKs, applying piggybacked updates)
         // 3. Every node drains again (picking up the ACKs)
-        for _ in 0..50 {
+        for _ in 0..100 {
             // Phase 1: each node sends a PING to a random peer
             for node in &mut nodes {
                 if let Some((_target_id, target_addr)) = node.pick_probe_target() {
