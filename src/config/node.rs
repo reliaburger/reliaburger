@@ -17,6 +17,7 @@ pub struct NodeConfig {
     pub storage: StorageSection,
     pub resources: ResourcesSection,
     pub network: NetworkSection,
+    pub reporting_tree: ReportingTreeSection,
     // TODO(Phase 5): images section
     // TODO(Phase 6): logs, metrics sections
     // TODO(Phase 3): ingress section
@@ -127,6 +128,31 @@ impl Default for PortRange {
         Self {
             start: 10000,
             end: 60000,
+        }
+    }
+}
+
+/// Reporting tree configuration.
+///
+/// Controls how often worker nodes send state reports to their assigned
+/// council member, and when reports are considered stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReportingTreeSection {
+    /// How often worker nodes send StateReports (seconds).
+    pub report_interval_secs: u64,
+    /// Maximum events in a single report's event log.
+    pub max_events_per_report: usize,
+    /// Time after which a report is considered stale (seconds).
+    pub stale_report_timeout_secs: u64,
+}
+
+impl Default for ReportingTreeSection {
+    fn default() -> Self {
+        Self {
+            report_interval_secs: 5,
+            max_events_per_report: 100,
+            stale_report_timeout_secs: 30,
         }
     }
 }

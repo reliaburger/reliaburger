@@ -44,6 +44,7 @@ dirs = "6"
 tokio-stream = "0.1"
 futures-util = "0.3"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+bincode = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
