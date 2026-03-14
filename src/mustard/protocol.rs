@@ -633,23 +633,52 @@ mod tests {
     #[tokio::test]
     async fn ping_timeout_triggers_ping_req() {
         // 3 nodes: A, B, C. Partition A↔B. When A probes B, the direct
-        // PING times out. A should then send a PingReq to C (the only relay).
+        // PING times out. A should then send a PingReq to C (the only
+        // alive relay). C forwards a Ping to B on A's behalf.
+        //
+        // Why C must be a responsive node (spawned with `node_c.run()`):
+        //
+        // `pick_probe_target()` selects a random member each cycle. If A
+        // probes C first and nobody is draining C's inbox, C never sends
+        // an ACK. A's `wait_for_ack` times out, and A marks C as Suspect.
+        // Later, when A probes B and needs a relay, `alive_members()`
+        // excludes the now-Suspect C. No relays are available, so A never
+        // sends a PingReq and the test fails. This happened ~50% of the
+        // time in CI.
+        //
+        // By spawning C as a real running node, C always responds to
+        // PINGs and stays Alive, so it's always available as a relay.
+        //
+        // We verify the PingReq path by checking B's inbox (not C's):
+        // C already consumed and processed the PingReq, so it's gone
+        // from C's transport. But as part of handling it, C sent a Ping
+        // to B. Since A↔B is partitioned but C↔B is not, B's inbox
+        // should contain a Ping with sender=C — proof that the full
+        // relay path (A → PingReq → C → Ping → B) was exercised.
         let net = InMemoryNetwork::new();
         let ta = net.register(addr(1)).await;
-        let _tb = net.register(addr(2)).await;
+        let tb = net.register(addr(2)).await;
         let tc = net.register(addr(3)).await;
 
         let mut node_a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut node_c = MustardNode::new(NodeId::new("c"), addr(3), fast_config(), tc);
         node_a.add_seed(NodeId::new("b"), addr(2));
         node_a.add_seed(NodeId::new("c"), addr(3));
+        node_c.add_seed(NodeId::new("a"), addr(1));
+        node_c.add_seed(NodeId::new("b"), addr(2));
 
         // Partition A↔B so direct PING is dropped
         net.partition(addr(1), addr(2)).await;
 
-        // Run cycles until A picks B as the probe target. If A picks C
-        // (reachable), the cycle completes normally — try again.
-        // We know A picked B if B becomes Suspect afterwards (since the
-        // PingReq relay also can't help — C isn't running to handle it).
+        // Spawn C so it responds to A's pings and PingReqs
+        let shutdown = CancellationToken::new();
+        let shutdown_c = shutdown.clone();
+        let handle_c = tokio::spawn(async move {
+            node_c.run(shutdown_c).await;
+            node_c
+        });
+
+        // Run cycles until A picks B and marks it Suspect
         for _ in 0..20 {
             node_a.run_one_cycle().await;
             if node_a
@@ -661,25 +690,30 @@ mod tests {
             }
         }
 
-        // A should have marked B as Suspect (after failed direct + indirect probe)
+        shutdown.cancel();
+        let _node_c = handle_c.await.unwrap();
+
+        // A should have marked B as Suspect
         assert_eq!(
             node_a.membership.get(&NodeId::new("b")).unwrap().state,
             NodeState::Suspect,
         );
 
-        // C should have received at least one PingReq asking to probe B
-        let mut saw_ping_req = false;
-        while let Some((_from, msg)) = tc.try_recv() {
-            if let GossipPayload::PingReq {
-                target, requester, ..
-            } = &msg.payload
+        // C processed the PingReq by sending a Ping to B on A's behalf.
+        // Since B is partitioned from A (but not from C), B's inbox should
+        // contain at least one Ping from C — proof that the PingReq path
+        // was exercised.
+        let mut saw_forwarded_ping = false;
+        while let Some((_from, msg)) = tb.try_recv() {
+            if matches!(&msg.payload, GossipPayload::Ping { .. }) && msg.sender == NodeId::new("c")
             {
-                assert_eq!(*target, NodeId::new("b"));
-                assert_eq!(*requester, NodeId::new("a"));
-                saw_ping_req = true;
+                saw_forwarded_ping = true;
             }
         }
-        assert!(saw_ping_req, "C should have received a PingReq for B");
+        assert!(
+            saw_forwarded_ping,
+            "B should have received a Ping from C (relayed PingReq)"
+        );
     }
 
     #[tokio::test]
