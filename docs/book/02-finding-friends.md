@@ -1003,3 +1003,110 @@ Most of the complexity lives in the tests, not the implementation. The adapter c
 ### What's next
 
 We have gossip for membership and Raft for consensus. The next pieces connect them: council selection decides which gossip members become Raft voters, the reporting tree gets runtime state from workers to the council, and the Patty scheduler turns desired state into placement decisions. Gossip is the nervous system, Raft is the brain. Now we need the decision-making.
+
+## Choosing the council
+
+The Raft council can grow from 1 to 7 members, but who gets promoted? In a small cluster you might pick nodes manually. In a 5,000-node deployment, that doesn't scale. We need an algorithm that examines the membership table and produces a ranked list of candidates.
+
+Council selection is a pure function. It takes a snapshot of the membership table, the current council roster, a target size, and some configuration. It returns a list of node IDs, best candidates first. No Raft calls, no gossip mutations, no async. The caller — the agent integration layer we'll build later — reads the output and drives `add_learner()` and `change_membership()` on the Raft node.
+
+### Four criteria
+
+The algorithm evaluates candidates on four things, in priority order.
+
+**Stability.** A node must have been alive for at least `min_node_age` (default: 10 minutes) before it's eligible. A node that joined 30 seconds ago might be flapping — restarting repeatedly, hitting a boot loop, or just barely connecting. We don't want it making quorum decisions. The age check uses `now.duration_since(node.first_seen)`, where `first_seen` is set when the node first appears in the membership table via gossip.
+
+**Resource availability.** A council member runs the Raft engine, stores the log, applies entries to the state machine. That's not free. If a node is already at 95% CPU, adding council duties might push it over the edge. We filter out nodes where CPU usage exceeds 90% of capacity or memory exceeds 85%. These thresholds come from `ResourceSummary`, the compact resource snapshot that nodes piggyback on gossip messages.
+
+What about nodes that haven't reported resources yet? They're excluded. No data means no guarantee they're not overloaded. A node has to have reported at least once to be eligible.
+
+**Zone diversity.** If all your council members are in the same rack and that rack loses power, your entire consensus layer dies. The algorithm collects the zones already represented in the current council (from the `"zone"` label in each node's labels map), then ranks candidates from *unrepresented* zones higher. A candidate in zone-c when the council already has members in zone-a and zone-b is more valuable than another zone-a candidate.
+
+Candidates without a zone label don't get the diversity bonus. No label means no diversity information, so they rank the same as candidates in an already-represented zone.
+
+**Deterministic tiebreak.** After filtering and scoring, multiple candidates might look identical — same zone novelty, same approximate age. The sort uses node ID (lexicographic) as the final tiebreaker. This is fully deterministic: same inputs, same output, every time. No randomness, no hash seeds. If you're debugging why node "beta" was chosen over node "gamma", you can reproduce the decision exactly by replaying the same membership table.
+
+### The sort
+
+The implementation is a single `sort_by` call with chained comparators:
+
+```rust
+candidates.sort_by(|a, b| {
+    let a_novel = a.labels.get(&config.zone_label_key)
+        .is_some_and(|z| !council_zones.contains(z.as_str()));
+    let b_novel = b.labels.get(&config.zone_label_key)
+        .is_some_and(|z| !council_zones.contains(z.as_str()));
+
+    b_novel.cmp(&a_novel)                           // novel zones first
+        .then_with(|| a.first_seen.cmp(&b.first_seen))  // oldest first
+        .then_with(|| a.node_id.cmp(&b.node_id))        // lexicographic
+});
+```
+
+`then_with` is Rust's way of chaining comparison keys. If the first comparison is `Equal`, it evaluates the next one. If that's also `Equal`, the next. The chain terminates at `node_id`, which is unique, so no two candidates ever compare equal. This gives us a total order — no ambiguity, no instability in the sort.
+
+`is_some_and` is a method on `Option<T>` that returns `false` for `None` and applies the predicate for `Some`. It replaced the `map_or(false, |x| ...)` pattern in Rust 1.70. Cleaner to read, same semantics.
+
+Comparing `bool` values works because `false < true` in Rust. So `b_novel.cmp(&a_novel)` puts `true` (novel) before `false` (not novel).
+
+### Making time testable
+
+The age check needs the current time. We could call `Instant::now()` inside the function, but then we can't write deterministic tests. Instead, we pass `now: Instant` as a parameter:
+
+```rust
+pub fn select_council_candidates(
+    membership: &MembershipTable,
+    current_council: &[NodeId],
+    target_size: usize,
+    config: &CouncilSelectionConfig,
+    now: Instant,
+) -> Vec<NodeId>
+```
+
+In production, the caller passes `Instant::now()`. In tests, we control both `now` and `first_seen` to create precise age differences:
+
+```rust
+let now = Instant::now();
+let old = Duration::from_secs(700);
+// This node's first_seen is 700 seconds before `now`.
+add_node(&mut table, "old", 1, now, old, None, Some(healthy_resources()));
+```
+
+The test helper calls `table.apply_update(&update, now - age)`, which sets `first_seen` to a point in the past. When the algorithm computes `now.duration_since(first_seen)`, it gets exactly 700 seconds. No sleeps, no mocking, no global time override.
+
+This is a general Rust pattern worth internalising: when a function depends on something external (time, randomness, I/O), pass it as a parameter instead of reaching for it internally. You get testability for free and the function signature documents its dependencies.
+
+### Testing the algorithm
+
+The test suite exercises each filter individually. Here's the zone diversity test:
+
+```rust
+#[test]
+fn prefers_novel_zones() {
+    let now = Instant::now();
+    let mut table = MembershipTable::new();
+    let old = Duration::from_secs(700);
+
+    // Council member already in zone-a.
+    let council_id = add_node(&mut table, "council-1", 1, now, old,
+        Some("zone-a"), Some(healthy_resources()));
+
+    // Two candidates: zone-a (same) and zone-b (novel).
+    let _same_zone = add_node(&mut table, "candidate-a", 2, now, old,
+        Some("zone-a"), Some(healthy_resources()));
+    let novel_zone = add_node(&mut table, "candidate-b", 3, now, old,
+        Some("zone-b"), Some(healthy_resources()));
+
+    let result = select_council_candidates(
+        &table, &[council_id], 3, &default_config(), now);
+    assert_eq!(result[0], novel_zone);
+}
+```
+
+The council already has a member in zone-a. Two candidates apply — one also in zone-a, one in zone-b. The algorithm should pick zone-b first because it adds diversity. Both candidates are old enough, have healthy resources, and aren't on the council. The only differentiator is zone novelty.
+
+The bounds tests verify clamping: asking for target size 1 gets clamped to the minimum of 3, asking for 20 gets clamped to the maximum of 7. And the empty-result tests verify that the algorithm gracefully returns nothing when the council is already full or no candidates pass the filters.
+
+### What's next
+
+Council selection produces a ranked list of candidates. The agent integration step will wire this into the actual Raft membership changes — calling `add_learner()` for each selected candidate, waiting for them to catch up, then promoting them with `change_membership()`. Before that, we need the reporting tree: how worker nodes get their runtime state to the council, and how the council aggregates it for the leader.
