@@ -81,7 +81,9 @@ impl<T: MustardTransport> MustardNode<T> {
 
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                _ = shutdown.cancelled() => {
+                    break;
+                }
                 _ = interval.tick() => {
                     self.run_one_cycle().await;
                 }
@@ -101,6 +103,9 @@ impl<T: MustardTransport> MustardNode<T> {
     /// so tests can drive the protocol step-by-step.
     pub async fn run_one_cycle(&mut self) {
         self.promote_expired_suspects();
+        let now = Instant::now();
+        self.membership
+            .reap_expired_dead(self.config.cleanup_timeout, now);
 
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
@@ -269,6 +274,7 @@ impl<T: MustardTransport> MustardNode<T> {
                 if let Some(member) = self.membership.get_mut(&message.sender) {
                     if member.state == NodeState::Suspect {
                         member.state = NodeState::Alive;
+                        member.state_changed = now;
                     }
                     member.last_ack = now;
                 }
@@ -461,6 +467,7 @@ mod tests {
             probe_timeout: Duration::from_millis(20),
             suspicion_timeout: Duration::from_millis(100),
             indirect_probe_count: 2,
+            cleanup_timeout: Duration::from_millis(200),
         }
     }
 
@@ -901,4 +908,5 @@ mod tests {
             );
         }
     }
+
 }

@@ -24,6 +24,7 @@ fn fast_config() -> GossipConfig {
         probe_timeout: std::time::Duration::from_millis(20),
         suspicion_timeout: std::time::Duration::from_millis(100),
         indirect_probe_count: 2,
+        cleanup_timeout: std::time::Duration::from_secs(60),
     }
 }
 

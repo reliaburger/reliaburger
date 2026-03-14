@@ -40,6 +40,8 @@ pub struct NodeMembership {
     pub first_seen: Instant,
     /// Last time we received a direct or indirect ACK from this node.
     pub last_ack: Instant,
+    /// When the node last changed state (used for reap timing).
+    pub state_changed: Instant,
     /// Resource summary, updated via gossip piggyback.
     pub resources: Option<ResourceSummary>,
     /// Node labels (zone, region, etc.), set at join time.
@@ -86,6 +88,9 @@ impl MembershipTable {
             );
 
             if new_state != old_state || new_incarnation != old_incarnation {
+                if new_state != old_state {
+                    existing.state_changed = now;
+                }
                 existing.state = new_state;
                 existing.incarnation = new_incarnation;
                 if new_state == NodeState::Alive {
@@ -107,6 +112,7 @@ impl MembershipTable {
                         incarnation: update.incarnation,
                         first_seen: now,
                         last_ack: now,
+                        state_changed: now,
                         resources: None,
                         labels: BTreeMap::new(),
                         is_council: false,
@@ -141,6 +147,9 @@ impl MembershipTable {
                 m.address = address;
                 if incarnation > m.incarnation {
                     m.incarnation = incarnation;
+                    if m.state != NodeState::Alive {
+                        m.state_changed = now;
+                    }
                     m.state = NodeState::Alive;
                 }
                 m.last_ack = now;
@@ -154,6 +163,7 @@ impl MembershipTable {
                     incarnation,
                     first_seen: now,
                     last_ack: now,
+                    state_changed: now,
                     resources: None,
                     labels,
                     is_council: false,
@@ -172,6 +182,7 @@ impl MembershipTable {
             && member.state == NodeState::Alive
         {
             member.state = NodeState::Suspect;
+            member.state_changed = Instant::now();
             return true;
         }
         false
@@ -185,18 +196,34 @@ impl MembershipTable {
             && !member.state.is_down()
         {
             member.state = NodeState::Dead;
+            member.state_changed = Instant::now();
             return true;
         }
         false
     }
 
-    /// Remove all Dead and Left nodes from the table.
-    ///
-    /// Called periodically to prevent the table from growing without
-    /// bound. Only removes nodes that have been down for long enough
-    /// that all other nodes will have learned about the departure.
+    /// Remove all Dead and Left nodes from the table unconditionally.
     pub fn reap_dead(&mut self) {
         self.members.retain(|_, m| !m.state.is_down());
+    }
+
+    /// Remove Dead and Left nodes that have been down for longer than `timeout`.
+    ///
+    /// Called each probe cycle to prevent the table from growing without
+    /// bound. Only removes nodes that have been in a terminal state long
+    /// enough for all cluster members to have learned about the departure
+    /// via gossip dissemination.
+    pub fn reap_expired_dead(&mut self, timeout: std::time::Duration, now: Instant) -> Vec<NodeId> {
+        let mut reaped = Vec::new();
+        self.members.retain(|id, m| {
+            if m.state.is_down() && now.duration_since(m.state_changed) > timeout {
+                reaped.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        reaped
     }
 
     /// Get a node's membership record.
@@ -268,6 +295,8 @@ impl Default for MembershipTable {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn now() -> Instant {
@@ -581,4 +610,96 @@ mod tests {
         table.declare_dead(&NodeId::new("c1"));
         assert!(table.council_members().is_empty());
     }
+
+    // -- reap_expired_dead ---------------------------------------------------
+
+    #[test]
+    fn dead_node_not_reaped_before_cleanup_timeout() {
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("n1"), addr(1), 1, BTreeMap::new(), t);
+        table.declare_dead(&NodeId::new("n1"));
+
+        // Reap immediately — timeout hasn't elapsed
+        let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
+        assert!(reaped.is_empty());
+        assert!(table.get(&NodeId::new("n1")).is_some());
+    }
+
+    #[test]
+    fn dead_node_reaped_after_cleanup_timeout() {
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("n1"), addr(1), 1, BTreeMap::new(), t);
+        table.declare_dead(&NodeId::new("n1"));
+
+        // Backdate state_changed so the timeout has elapsed
+        table.get_mut(&NodeId::new("n1")).unwrap().state_changed =
+            Instant::now() - Duration::from_secs(61);
+
+        let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
+        assert_eq!(reaped, vec![NodeId::new("n1")]);
+        assert!(table.get(&NodeId::new("n1")).is_none());
+    }
+
+    #[test]
+    fn left_node_reaped_after_cleanup_timeout() {
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("n1"), addr(1), 1, BTreeMap::new(), t);
+        table.apply_update(
+            &MembershipUpdate {
+                node_id: NodeId::new("n1"),
+                address: addr(1),
+                state: NodeState::Left,
+                incarnation: 1,
+                lamport: 0,
+            },
+            t,
+        );
+
+        // Backdate state_changed
+        table.get_mut(&NodeId::new("n1")).unwrap().state_changed =
+            Instant::now() - Duration::from_secs(61);
+
+        let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
+        assert_eq!(reaped, vec![NodeId::new("n1")]);
+    }
+
+    #[test]
+    fn alive_and_suspect_nodes_never_reaped() {
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("alive"), addr(1), 1, BTreeMap::new(), t);
+        table.add_node(NodeId::new("suspect"), addr(2), 1, BTreeMap::new(), t);
+        table.add_node(NodeId::new("dead"), addr(3), 1, BTreeMap::new(), t);
+        table.add_node(NodeId::new("left"), addr(4), 1, BTreeMap::new(), t);
+
+        table.suspect(&NodeId::new("suspect"));
+        table.declare_dead(&NodeId::new("dead"));
+        table.apply_update(
+            &MembershipUpdate {
+                node_id: NodeId::new("left"),
+                address: addr(4),
+                state: NodeState::Left,
+                incarnation: 1,
+                lamport: 0,
+            },
+            t,
+        );
+
+        // Backdate all state_changed to long ago
+        let old = Instant::now() - Duration::from_secs(120);
+        for m in table.members.values_mut() {
+            m.state_changed = old;
+        }
+
+        let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
+        assert_eq!(reaped.len(), 2);
+        assert!(table.get(&NodeId::new("alive")).is_some());
+        assert!(table.get(&NodeId::new("suspect")).is_some());
+        assert!(table.get(&NodeId::new("dead")).is_none());
+        assert!(table.get(&NodeId::new("left")).is_none());
+    }
+
 }
