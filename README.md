@@ -63,6 +63,12 @@ src/
     transport.rs       # MustardTransport trait + InMemoryNetwork
     protocol.rs        # SWIM probe cycle (MustardNode)
     config.rs          # GossipConfig (intervals, timeouts)
+  council/             # Raft consensus (3–7 council nodes)
+    types.rs           # TypeConfig, RaftRequest, CouncilResponse, DesiredState
+    log_store.rs       # MemLogStore (in-memory Raft log + vote storage)
+    state_machine.rs   # CouncilStateMachine (applies entries, snapshots)
+    network.rs         # InMemoryRaftRouter (test network with partitions)
+    node.rs            # CouncilNode (high-level wrapper over openraft)
   patty/               # Scheduler (shared types, placement TBD)
     types.rs           # NodeId, AppId, Resources, NodeCapacity
 docs/
@@ -98,7 +104,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete.** **Phase 2 in progress** (cluster formation). 437 passing tests.
+**Phase 1 complete.** **Phase 2 in progress** (cluster formation). 488 passing tests.
 
 ### Phase 1 — Single-node container lifecycle
 
@@ -125,6 +131,9 @@ CLAUDE.md              # Project guide, conventions, writing style
 - Transport abstraction: `MustardTransport` trait with `InMemoryNetwork` for testing (supports partition injection for chaos tests)
 - SWIM probe cycle: `MustardNode` protocol driver with PING → ACK → PING-REQ → Suspect flow, indirect probing with relay ACK forwarding, suspicion refutation, gossip convergence across 5-node ring topology
 - Property-based testing for incarnation conflict resolution, criterion benchmarks for convergence scaling (5–250 nodes)
+- Raft consensus via openraft: in-memory log store (`BTreeMap`-backed), state machine applying `RaftRequest` entries to `DesiredState` with JSON snapshots, in-memory network with partition simulation
+- `CouncilNode` high-level API: single-node bootstrap, learner-based growth to 3–7 voters, leader election, log replication, failover, partition tolerance
+- 43 council tests: types, storage, state machine, network routing, leader election (3/5 node), replication, failover with state preservation, network partition majority/minority
 
 See [progress.md](docs/progress.md) for the full checklist.
 
