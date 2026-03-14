@@ -41,6 +41,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
 - [x] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
 - [x] Indirect probe (PING-REQ) ACK routing, proptest for conflict resolution, broadcast count lambda=3
+- [x] Dead node reap timer (cleanup_timeout=60s), graceful leave protocol (Left state broadcast on shutdown)
 - [ ] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication
 - [ ] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7
 - [ ] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel

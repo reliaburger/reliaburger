@@ -433,6 +433,71 @@ fn refute(&mut self) {
 
 Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. The refutation update jumps onto the very next outgoing ACK message, so it propagates quickly.
 
+### Dead node cleanup
+
+Nodes transition through Alive → Suspect → Dead, but what happens to Dead entries in the membership table? Without cleanup they accumulate forever, wasting memory and slowing down iteration.
+
+The SWIM paper doesn't say much about this — it's an implementation detail. Our approach: track when each node last changed state via a `state_changed` timestamp on `NodeMembership`, then periodically remove Dead and Left nodes whose `state_changed` is older than `cleanup_timeout` (60 seconds by default).
+
+Why 60 seconds? At 500ms gossip intervals, a 10,000-node cluster needs about `3 × ceil(log2(10000))` = 42 rounds (21 seconds) for an update to reach every node. 60 seconds gives nearly three times that margin. We don't want to reap a Dead node before all other nodes have learned about its death, because a late-arriving node might add it back as Alive from stale gossip.
+
+The reap runs every probe cycle (500ms). Iterating the membership table and comparing timestamps is trivial — even at 10,000 nodes it takes microseconds.
+
+### Graceful leave
+
+When a node shuts down on purpose (as opposed to crashing), it's wasteful for the rest of the cluster to go through the full Suspect → Dead → reap dance. That takes `suspicion_timeout` (5s) plus `cleanup_timeout` (60s) — over a minute of uncertainty.
+
+Instead, a departing node broadcasts a `Left` update. The `Left` state is terminal and sticky: once a node is Left, no amount of Alive updates at any incarnation can bring it back (see `resolve_conflict` in `state.rs`). This means the departure propagates cleanly through the cluster without any ambiguity.
+
+```rust
+pub async fn leave(&mut self) {
+    // Mark ourselves as Left
+    if let Some(member) = self.membership.get_mut(&self.node_id) {
+        member.state = NodeState::Left;
+        member.state_changed = now;
+    }
+    // Enqueue for dissemination + send to up to 10 peers
+    // ...
+}
+```
+
+The `run()` loop calls `leave()` automatically when the `CancellationToken` fires:
+
+```rust
+_ = shutdown.cancelled() => {
+    self.leave().await;
+    break;
+}
+```
+
+This is fire-and-forget: the node can't stick around waiting for acknowledgement because it's shutting down. But that's fine. The dissemination queue ensures the update gets broadcast `3 × ceil(log2(N))` times, and we send an immediate burst to up to 10 peers to maximise the chance that it reaches enough of the cluster on the first try. Even if it only reaches one node, that node will re-disseminate it.
+
+### Coming back after maintenance
+
+So what happens when the node finishes maintenance and rejoins the cluster?
+
+Left is terminal. No Alive update, at any incarnation number, can override it. This is deliberate: if a node said "I'm leaving," we don't want stale gossip from before the departure to accidentally resurrect it. The other nodes must agree that the node is gone before it can come back.
+
+The mechanism that makes this work is the cleanup timeout. After 60 seconds in the Left state, `reap_expired_dead` removes the entry from every node's membership table. When the returning node sends its first PING, none of its peers recognise it — so `add_node` creates a fresh entry with state Alive. From the cluster's perspective, it's a brand new node joining for the first time.
+
+The `add_node` method enforces this explicitly:
+
+```rust
+Entry::Occupied(mut entry) => {
+    let m = entry.get_mut();
+    // Left is terminal — a returning node must wait for the
+    // cleanup timeout to reap the old entry before rejoining.
+    if m.state == NodeState::Left {
+        return false;
+    }
+    // ...
+}
+```
+
+This means there's a minimum rejoin delay of `cleanup_timeout` (60 seconds). In practice that's fine. You're not going to reboot a server and have it back in under a minute. And if you do, the 60-second cooldown actually helps: it prevents flapping where a misconfigured node repeatedly joins and leaves, generating a storm of membership updates.
+
+If you absolutely need faster rejoins (testing, development), reduce `cleanup_timeout`. The only constraint is that it must be long enough for the Left update to propagate to all nodes — at least a few seconds for any reasonable cluster size.
+
 ### Testing convergence
 
 The most satisfying test: five nodes arranged in a ring, where each only knows its immediate neighbour. Can gossip propagate membership information to every node?

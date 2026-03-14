@@ -144,6 +144,11 @@ impl MembershipTable {
         match self.members.entry(node_id.clone()) {
             Entry::Occupied(mut entry) => {
                 let m = entry.get_mut();
+                // Left is terminal — a returning node must wait for the
+                // cleanup timeout to reap the old entry before rejoining.
+                if m.state == NodeState::Left {
+                    return false;
+                }
                 m.address = address;
                 if incarnation > m.incarnation {
                     m.incarnation = incarnation;
@@ -702,4 +707,65 @@ mod tests {
         assert!(table.get(&NodeId::new("left")).is_none());
     }
 
+    // -- left node rejoin ----------------------------------------------------
+
+    #[test]
+    fn add_node_does_not_override_left() {
+        // A node that gracefully left cannot rejoin until its entry is
+        // reaped. Even a higher incarnation from add_node (direct PING)
+        // must not override Left.
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("n1"), addr(1), 1, BTreeMap::new(), t);
+        table.apply_update(
+            &MembershipUpdate {
+                node_id: NodeId::new("n1"),
+                address: addr(1),
+                state: NodeState::Left,
+                incarnation: 1,
+                lamport: 0,
+            },
+            t,
+        );
+
+        // Node comes back with higher incarnation — still blocked
+        table.add_node(NodeId::new("n1"), addr(1), 5, BTreeMap::new(), now());
+        assert_eq!(
+            table.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Left,
+        );
+    }
+
+    #[test]
+    fn left_node_rejoins_after_reap() {
+        // After the cleanup timeout reaps the Left entry, the returning
+        // node is treated as a fresh join.
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("n1"), addr(1), 1, BTreeMap::new(), t);
+        table.apply_update(
+            &MembershipUpdate {
+                node_id: NodeId::new("n1"),
+                address: addr(1),
+                state: NodeState::Left,
+                incarnation: 1,
+                lamport: 0,
+            },
+            t,
+        );
+
+        // Backdate and reap
+        table.get_mut(&NodeId::new("n1")).unwrap().state_changed =
+            Instant::now() - Duration::from_secs(61);
+        table.reap_expired_dead(Duration::from_secs(60), Instant::now());
+        assert!(table.get(&NodeId::new("n1")).is_none());
+
+        // Node rejoins — accepted as a new member
+        let is_new = table.add_node(NodeId::new("n1"), addr(1), 1, BTreeMap::new(), now());
+        assert!(is_new);
+        assert_eq!(
+            table.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Alive,
+        );
+    }
 }

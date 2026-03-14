@@ -51,6 +51,9 @@ pub struct MustardNode<T: MustardTransport> {
 }
 
 impl<T: MustardTransport> MustardNode<T> {
+    /// Maximum number of peers to notify during graceful leave.
+    const MAX_LEAVE_FANOUT: usize = 10;
+
     /// Create a new Mustard node.
     pub fn new(node_id: NodeId, address: SocketAddr, config: GossipConfig, transport: T) -> Self {
         let mut membership = MembershipTable::new();
@@ -75,13 +78,66 @@ impl<T: MustardTransport> MustardNode<T> {
             .add_node(node_id, address, 1, BTreeMap::new(), Instant::now());
     }
 
+    /// Announce graceful departure from the cluster.
+    ///
+    /// Sets own state to Left, enqueues the update for dissemination,
+    /// and sends a best-effort burst of PINGs to spread the update
+    /// quickly. The node does not wait for acknowledgement.
+    pub async fn leave(&mut self) {
+        let now = Instant::now();
+
+        // Mark ourselves as Left
+        if let Some(member) = self.membership.get_mut(&self.node_id) {
+            member.state = NodeState::Left;
+            member.state_changed = now;
+        }
+
+        // Enqueue Left update for dissemination
+        self.tick_lamport();
+        self.dissemination.enqueue(
+            MembershipUpdate {
+                node_id: self.node_id.clone(),
+                address: self.address,
+                state: NodeState::Left,
+                incarnation: self.incarnation,
+                lamport: self.lamport,
+            },
+            self.membership.len(),
+        );
+
+        // Best-effort fanout to accelerate propagation
+        let peers: Vec<SocketAddr> = self
+            .membership
+            .alive_members()
+            .into_iter()
+            .filter(|m| m.node_id != self.node_id)
+            .map(|m| m.address)
+            .take(Self::MAX_LEAVE_FANOUT)
+            .collect();
+
+        for peer_addr in peers {
+            let updates = self.dissemination.select_updates();
+            let ping = GossipMessage::new(
+                self.node_id.clone(),
+                self.incarnation,
+                GossipPayload::Ping { updates },
+            );
+            let _ = self.transport.send(peer_addr, &ping).await;
+        }
+    }
+
     /// Run the protocol loop until cancelled.
+    ///
+    /// On shutdown, announces graceful departure via [`leave()`] before
+    /// returning, so other nodes learn about the departure immediately
+    /// rather than waiting for the suspicion timeout.
     pub async fn run(&mut self, shutdown: CancellationToken) {
         let mut interval = tokio::time::interval(self.config.protocol_interval);
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
+                    self.leave().await;
                     break;
                 }
                 _ = interval.tick() => {
@@ -909,4 +965,111 @@ mod tests {
         }
     }
 
+    // -- graceful leave -------------------------------------------------------
+
+    #[tokio::test]
+    async fn leave_broadcasts_left_state() {
+        // When a node calls leave(), it should send PINGs containing
+        // a Left update for itself to its peers.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        node1.leave().await;
+
+        // n1 should now be Left in its own table
+        assert_eq!(
+            node1.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Left,
+        );
+
+        // n2's inbox should contain a PING with a Left update for n1
+        let mut saw_left_update = false;
+        while let Some((_from, msg)) = t2.try_recv() {
+            for update in msg.payload.updates() {
+                if update.node_id == NodeId::new("n1") && update.state == NodeState::Left {
+                    saw_left_update = true;
+                }
+            }
+        }
+        assert!(
+            saw_left_update,
+            "n2 should have received a Left update for n1"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_node_applies_left_update() {
+        // When n2 receives n1's Left update, it should mark n1 as Left.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+        node2.add_seed(NodeId::new("n1"), addr(1));
+
+        node1.leave().await;
+
+        // n2 handles the incoming message
+        while let Some((from, msg)) = node2.transport.try_recv() {
+            node2.handle_message(from, msg).await;
+        }
+
+        assert_eq!(
+            node2.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Left,
+        );
+    }
+
+    #[tokio::test]
+    async fn left_node_not_selected_as_probe_target() {
+        // A node in the Left state should not be picked for probing.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let _t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        // Mark n2 as Left
+        node1.membership.get_mut(&NodeId::new("n2")).unwrap().state = NodeState::Left;
+
+        // n1 should have no probe targets (only itself is alive)
+        assert!(node1.pick_probe_target().is_none());
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_sends_leave() {
+        // When run() exits via CancellationToken, it should call leave()
+        // and the peer should receive a Left update.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+        node2.add_seed(NodeId::new("n1"), addr(1));
+
+        // Run n1 briefly then cancel
+        let shutdown = CancellationToken::new();
+        let shutdown1 = shutdown.clone();
+        shutdown.cancel();
+        node1.run(shutdown1).await;
+
+        // n2 handles whatever n1 sent during shutdown
+        while let Some((from, msg)) = node2.transport.try_recv() {
+            node2.handle_message(from, msg).await;
+        }
+
+        assert_eq!(
+            node2.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Left,
+        );
+    }
 }
