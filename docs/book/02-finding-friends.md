@@ -627,3 +627,379 @@ For larger clusters, `cargo bench --bench gossip_large` tests 500 and 1000 nodes
 ### What's next
 
 We have a working gossip protocol. Nodes discover each other, detect failures, and propagate membership changes. But gossip only gives us eventual consistency — every node eventually agrees on who's alive, but there's no single source of truth. For scheduling decisions, app deployments, and configuration changes, we need something stronger. That's where Raft comes in.
+
+## Raft consensus
+
+Gossip tells every node who's in the cluster. It doesn't tell them what should be running. If two nodes both think they're the scheduler, they'll make conflicting placement decisions — and now you have two copies of an app that should only have one, or zero copies of an app that should have two. You need a single source of truth, and you need agreement on who gets to update it.
+
+That's consensus. Specifically, we use Raft, a protocol designed to be understandable. The original paper by Diego Ongaro and John Ousterhout ("In Search of an Understandable Consensus Algorithm", 2014) is worth reading in full — it's one of those rare academic papers that's actually pleasant to get through.
+
+Here's the 60-second version. A Raft cluster has a leader and some followers. The leader accepts writes, appends them to a log, and replicates that log to followers. Once a majority (a quorum) acknowledges an entry, it's committed — guaranteed to survive crashes. If the leader dies, the remaining nodes hold an election. The candidate with the most up-to-date log wins. The new leader picks up where the old one left off. Clients only talk to the leader for writes; any node can serve reads.
+
+We don't need Raft on all 10,000 nodes. Consensus is expensive: every write requires a round trip to a majority. We run Raft on a small "council" of 3 to 7 nodes, separate from the gossip layer. The council replicates desired state — which apps should run, where they should be placed, cluster-wide config. The other nodes learn about this through gossip and the reporting tree (covered later in this chapter).
+
+### Standing on the shoulders of openraft
+
+We're not implementing Raft from scratch. The openraft crate (v0.9) is a mature, async-native, tokio-compatible implementation with pre-vote support and a clean trait-based adapter pattern. Implementing Raft correctly is notoriously fiddly — edge cases around log compaction, split votes, and pre-vote alone would cost us weeks. openraft handles all of that and has been battle-tested by other projects.
+
+What we do implement are three adapter traits that tell openraft how to store logs, apply entries to our state machine, and send messages between nodes:
+
+1. **`RaftLogStorage`** — where the log entries and vote records live. We use an in-memory `BTreeMap` for now. Production would back this with disk.
+2. **`RaftStateMachine`** — what happens when a committed entry gets applied. Our state machine maintains `DesiredState`: the set of apps, scheduling placements, and configuration the cluster should converge towards.
+3. **`RaftNetworkFactory` + `RaftNetwork`** — how to send RPCs (append entries, vote requests, snapshot transfers) to other nodes. We start with an in-memory router for testing; TCP comes later.
+
+The openraft API revolves around a type configuration macro:
+
+```rust
+openraft::declare_raft_types!(
+    pub TypeConfig:
+        D            = RaftRequest,
+        R            = CouncilResponse,
+        NodeId       = u64,
+        Node         = CouncilNodeInfo,
+        Entry        = openraft::Entry<TypeConfig>,
+        SnapshotData = Cursor<Vec<u8>>,
+);
+```
+
+This macro generates a type bundle that threads through the entire openraft API. `D` is the data you write to the log. `R` is what the state machine returns after applying an entry. `NodeId` and `Node` identify cluster members. `Entry` and `SnapshotData` control the wire format. If you've used associated types in Rust traits before, this is the same idea — just bundled into one declaration.
+
+### The u64 problem
+
+Our `NodeId` from the shared types module is a `String` newtype:
+
+```rust
+pub struct NodeId(pub String);
+```
+
+openraft requires its `NodeId` to be `Copy`. That's a hard constraint — the protocol needs to cheaply duplicate node IDs everywhere, and `Copy` guarantees this happens without allocation. `String` can't be `Copy` because it owns heap memory. Making a `String` `Copy` would mean copying the pointer without duplicating the buffer — a double-free waiting to happen. Rust won't let you.
+
+So we use `u64` for Raft's internal node IDs and carry the human-readable name in a separate struct:
+
+```rust
+pub struct CouncilNodeInfo {
+    pub addr: SocketAddr,
+    pub name: String,
+}
+```
+
+openraft attaches `CouncilNodeInfo` to each node in the membership. When we need to display node names in logs or map between the gossip layer (which uses `NodeId(String)`) and the Raft layer (which uses `u64`), the info struct is right there.
+
+This is a pattern you'll hit often in Rust: a library requires a trait bound your type doesn't satisfy, so you introduce an adapter. In Go, you'd just pass an `int64` and a `string` separately and hope nobody mixes them up. In Rust, the type system makes the relationship explicit — `u64` is the identity, `CouncilNodeInfo` is the metadata, and openraft's `Node` trait ties them together.
+
+### What goes in the log
+
+Every mutation to the cluster's desired state is a `RaftRequest`:
+
+```rust
+pub enum RaftRequest {
+    AppSpec { app_id: AppId, spec: Box<AppSpec> },
+    AppDelete { app_id: AppId },
+    SchedulingDecision(SchedulingDecision),
+    ConfigSet { key: String, value: String },
+    Noop,
+}
+```
+
+`AppSpec` registers or updates an app. `AppDelete` removes one. `SchedulingDecision` records where replicas should run. `ConfigSet` handles cluster-wide key-value config. `Noop` exists for leader election — when a new leader takes over, it commits a no-op to establish its authority and advance the commit index.
+
+Notice the `Box<AppSpec>` on the first variant. `AppSpec` is a large struct (800+ bytes with all its optional fields), while other variants are 72 bytes or less. Without the `Box`, clippy warns about `large_enum_variant` — the enum is sized for its largest variant, so every `Noop` would waste 800 bytes of stack space. Boxing the large payload puts it on the heap, so the enum itself stays small.
+
+The state machine applies these entries in log order:
+
+```rust
+fn apply_request(&mut self, request: &RaftRequest) {
+    match request {
+        RaftRequest::AppSpec { app_id, spec } => {
+            self.state.apps.insert(app_id.clone(), *spec.clone());
+        }
+        RaftRequest::AppDelete { app_id } => {
+            self.state.apps.remove(app_id);
+            self.state.scheduling.remove(app_id);
+        }
+        RaftRequest::SchedulingDecision(decision) => {
+            self.state.scheduling
+                .insert(decision.app_id.clone(), decision.placements.clone());
+        }
+        RaftRequest::ConfigSet { key, value } => {
+            self.state.config.insert(key.clone(), value.clone());
+        }
+        RaftRequest::Noop => {}
+    }
+}
+```
+
+Exhaustive `match` — add a new variant and the compiler forces you to handle it everywhere. Compare that to a `switch` in Go, where a forgotten `case` silently falls through to nothing.
+
+### Snapshots and the JSON key problem
+
+When a follower falls far behind the leader's log, re-sending thousands of entries one by one is wasteful. Raft handles this with snapshots: the leader serialises the current state machine into a blob and sends it in one shot. The follower installs the snapshot and picks up replication from there.
+
+We serialise `DesiredState` to JSON. Simple, debuggable, good enough for testing. One wrinkle: `DesiredState` has `HashMap<AppId, AppSpec>` fields, and JSON requires object keys to be strings. `AppId` is a struct with `name` and `namespace` fields. Serialising it as a JSON key would require a custom string representation that's also reversible. Instead, we sidestep the problem:
+
+```rust
+mod map_as_vec {
+    pub fn serialize<K, V, S>(map: &HashMap<K, V>, serializer: S)
+        -> Result<S::Ok, S::Error>
+    where
+        K: Serialize + Eq + Hash,
+        V: Serialize,
+        S: Serializer,
+    {
+        let vec: Vec<(&K, &V)> = map.iter().collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D)
+        -> Result<HashMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Eq + Hash,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(K, V)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
+}
+```
+
+This serialises `HashMap<AppId, AppSpec>` as a JSON array of `[key, value]` pairs instead of a JSON object. It's applied with serde's field-level attributes:
+
+```rust
+pub struct DesiredState {
+    #[serde(serialize_with = "map_as_vec::serialize",
+            deserialize_with = "map_as_vec::deserialize")]
+    pub apps: HashMap<AppId, AppSpec>,
+    // ...
+}
+```
+
+The `'de` lifetime on the deserialise function is serde's way of tracking the lifetime of the input data. If you're deserialising from a borrowed `&str`, the `K` and `V` types could borrow from that string (if they contain `&str` fields). The `'de` lifetime makes this safe. Our types all own their data (they use `String`, not `&str`), so the lifetime doesn't change runtime behaviour — but serde's trait bounds require it regardless.
+
+### The in-memory log store
+
+The log store is the simplest adapter. It stores entries in a `BTreeMap<u64, Entry>` keyed by log index:
+
+```rust
+struct LogStoreInner {
+    vote: Option<Vote<u64>>,
+    committed: Option<LogId<u64>>,
+    log: BTreeMap<u64, Entry<TypeConfig>>,
+    last_purged_log_id: Option<LogId<u64>>,
+}
+```
+
+Why `BTreeMap` instead of `Vec`? After a snapshot purge, the log has a gap — indices 1 through 1000 get deleted, and the log starts at 1001. A `Vec` would either waste memory on empty slots or need index arithmetic. `BTreeMap` handles sparse indices naturally, gives us O(log N) lookups, and makes range queries trivial with `.range()`.
+
+The `vote` field tracks which candidate this node voted for in the current term. Raft requires this to be durable — if a node votes for candidate A, crashes, and restarts, it must not accidentally vote for candidate B in the same term. In our in-memory store, "durable" means "until the process dies", which is fine for tests.
+
+The `last_purged_log_id` is what you need after compaction. When the state machine takes a snapshot at log index 1000, entries 1 through 1000 can be purged. But we still need to know that the log *started* at 1001, so the field records where we left off.
+
+### Testing consensus without a network
+
+We tested gossip with `InMemoryNetwork` — a fake transport that routes messages between nodes in the same process. We use the same trick for Raft, but the shape is different. Gossip sends datagrams. Raft sends RPCs: request-response pairs where the caller blocks until the target responds.
+
+The `InMemoryRaftRouter` holds a map of Raft handles:
+
+```rust
+pub struct InMemoryRaftRouter {
+    rafts: Arc<Mutex<HashMap<u64, Raft<TypeConfig>>>>,
+    partitions: Arc<Mutex<HashSet<(u64, u64)>>>,
+}
+```
+
+When node 1 wants to send an `AppendEntries` RPC to node 3, it looks up node 3's `Raft<TypeConfig>` handle and calls its method directly. No serialisation, no TCP, no latency. The response comes back as the return value of a function call. This makes tests fast and deterministic.
+
+The `partitions` set simulates network partitions. If `(1, 3)` is in the set, messages from node 1 to node 3 return `Unreachable`. Partitions are bidirectional — adding `(1, 3)` also adds `(3, 1)`.
+
+One subtlety: `Raft<TypeConfig>` doesn't implement `Debug`. Rust requires `Debug` for `HashMap` values if you want to derive `Debug` on the containing struct. So we write a manual `Debug` impl:
+
+```rust
+impl fmt::Debug for InMemoryRaftRouter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InMemoryRaftRouter")
+            .field("num_rafts", &"<opaque>")
+            .field("partitions", &self.partitions)
+            .finish()
+    }
+}
+```
+
+In Go, `fmt.Sprintf("%+v", router)` would just print the pointer. In Rust, you have to be explicit about what you can and can't display. It's more work upfront, but you never get surprised by accidental sensitive data in logs.
+
+### The CouncilNode wrapper
+
+Raw openraft is powerful but verbose. `CouncilNode` wraps it into the API the rest of Reliaburger actually needs:
+
+```rust
+pub struct CouncilNode {
+    raft: Raft<TypeConfig>,
+    raft_id: u64,
+    state_machine: CouncilStateMachine,
+}
+```
+
+The key methods:
+
+- **`initialize(members)`** — called once on the very first node, with itself as the sole member. It becomes leader immediately (quorum of 1 = itself).
+- **`write(request)`** — submits a `RaftRequest` to the leader. Returns `ForwardToLeader` if this node isn't in charge.
+- **`add_learner(id, info)`** — adds a node that receives log replication but doesn't vote yet.
+- **`change_membership(members)`** — promotes learners to voters, changing the quorum.
+- **`desired_state()`** — reads the current state machine. Any node can serve this, not just the leader.
+
+The `write` method shows a common pattern for wrapping library error types:
+
+```rust
+pub async fn write(&self, request: RaftRequest)
+    -> Result<CouncilResponse, CouncilError>
+{
+    let result = self.raft.client_write(request).await;
+    match result {
+        Ok(resp) => Ok(resp.data),
+        Err(e) => match e {
+            RaftError::APIError(ClientWriteError::ForwardToLeader(fwd)) => {
+                Err(CouncilError::ForwardToLeader {
+                    leader: fwd.leader_id,
+                })
+            }
+            other => Err(CouncilError::WriteFailed(other.to_string())),
+        },
+    }
+}
+```
+
+We match on the specific error variant we care about (`ForwardToLeader`) and flatten everything else into a generic string. This is deliberate — the caller needs to know whether to retry on a different node, but doesn't need to distinguish between the dozen other failure modes openraft defines.
+
+### Bootstrap: the loneliest node
+
+How does a cluster start from nothing? If you need a majority to elect a leader, and you start with zero nodes, you're stuck. Raft solves this with an explicit initialisation step.
+
+The first node starts a 1-member Raft group:
+
+```rust
+let mut members = BTreeMap::new();
+members.insert(1, node_info(1));
+nodes[0].initialize(members).await.unwrap();
+```
+
+With one member, quorum is 1 (itself), so it immediately becomes leader. It can accept writes — deploy an app, set config, record scheduling decisions. There's no "pre-Raft" special mode. From the very first node, all state changes go through Raft. One code path, always.
+
+The tradeoff: a 1-node council has zero fault tolerance. If that node dies, everything is gone. But that's inherent to having one physical machine. You can't tolerate failures you don't have redundancy for. As soon as a second and third node join, the council grows and real fault tolerance kicks in.
+
+### Growing the council
+
+Growth happens in two steps: add a learner, then promote it to voter.
+
+```rust
+// Leader adds node 2 as a learner.
+leader.add_learner(2, node_info(2)).await.unwrap();
+
+// Node 2 catches up on the log via replication...
+
+// Leader promotes all three to voters.
+leader.change_membership(BTreeSet::from([1, 2, 3])).await.unwrap();
+```
+
+Why the learner phase? If you immediately add a new node as a voter, it has an empty log. The cluster now needs this node's vote for quorum, but the node can't meaningfully participate — it doesn't know what's been committed. Worse, the cluster might lose availability while the new node downloads gigabytes of log. The learner phase lets the new node receive replication and catch up *before* it gets a vote.
+
+The progression is:
+
+1. **1 node** — leader by definition. Quorum = 1. Zero fault tolerance, but you can write.
+2. **2 nodes** — quorum = 2. Losing either blocks writes. Still fragile.
+3. **3 nodes** — quorum = 2. Losing one node is survivable. This is the minimum production topology.
+4. **5 nodes** — quorum = 3. Tolerates 2 failures.
+5. **7 nodes** — quorum = 4. Tolerates 3 failures. This is our upper bound.
+
+Beyond 7, more council members means slower commits (more nodes to wait for) without meaningful benefit. Additional nodes join the gossip layer but stay out of the council.
+
+### Testing the full lifecycle
+
+The integration tests exercise the complete lifecycle: bootstrap, growth, replication, failover, and partitions. Here's the pattern they all follow:
+
+```rust
+async fn create_cluster(n: u64) -> (Vec<CouncilNode>, InMemoryRaftRouter) {
+    let router = InMemoryRaftRouter::new();
+    let mut nodes = Vec::new();
+    for id in 1..=n {
+        let network = InMemoryRaftNetworkFactory::new(id, router.clone());
+        let node = CouncilNode::new(id, fast_config(), network,
+            MemLogStore::new(), CouncilStateMachine::new())
+            .await.unwrap();
+        router.register(id, node.raft().clone()).await;
+        nodes.push(node);
+    }
+    (nodes, router)
+}
+```
+
+Each test creates a cluster, initialises it, waits for a leader, and then does something interesting.
+
+The failover test shuts down the leader and checks that a new one gets elected:
+
+```rust
+// Shut down the leader.
+nodes[(leader_id - 1) as usize].shutdown().await.unwrap();
+
+// Surviving nodes elect a new leader.
+let new_leader = wait_for_leader_refs(&remaining, Duration::from_secs(5),
+    Some(leader_id)).await;
+assert!(new_leader.is_some());
+assert_ne!(new_leader.unwrap(), leader_id);
+```
+
+The `Some(leader_id)` argument to `wait_for_leader_refs` tells the helper to ignore the old leader's ID. Without this, surviving nodes might briefly report the old leader before they notice it's gone and trigger an election. A subtle race condition that would make the test flaky.
+
+The partition test is the most complex. It splits a 5-node cluster into a majority (3 nodes) and a minority (2 nodes), verifies the majority can still write and the minority can't, then heals the partition and verifies convergence:
+
+```rust
+// Partition: isolate nodes 4 and 5 from 1, 2, 3.
+for &m in &[4, 5] {
+    for &j in &[1, 2, 3] {
+        router.partition(m, j).await;
+    }
+}
+
+// Majority writes succeed.
+ml.write(RaftRequest::ConfigSet {
+    key: "after".to_string(),
+    value: "partition".to_string(),
+}).await.unwrap();
+
+// Minority doesn't see the write.
+let minority_state = nodes[3].desired_state().await;
+assert!(!minority_state.config.contains_key("after"));
+
+// Heal and wait for convergence.
+router.heal().await;
+tokio::time::sleep(Duration::from_millis(2000)).await;
+
+// Now everyone has everything.
+for node in &nodes {
+    let state = node.desired_state().await;
+    assert_eq!(state.config.get("after").map(String::as_str),
+        Some("partition"));
+}
+```
+
+This is the fundamental Raft guarantee: as long as a majority is connected, the cluster makes progress. The minority falls behind but catches up automatically when connectivity is restored. No manual intervention, no data loss.
+
+The test configuration uses aggressive timers (50ms heartbeat, 200-400ms election timeout) so elections happen quickly. In production, you'd use longer intervals to avoid unnecessary elections during brief network hiccups.
+
+### What we built
+
+The council module is about 700 lines of Rust across 6 files, plus 38 tests. Here's what each file does:
+
+| File | Lines | Purpose |
+|------|------:|---------|
+| `types.rs` | 225 | Type config, request/response envelopes, desired state model |
+| `log_store.rs` | 200 | In-memory log and vote storage |
+| `state_machine.rs` | 215 | Applies entries, builds and installs snapshots |
+| `network.rs` | 145 | In-memory RPC routing with partition simulation |
+| `node.rs` | 165 | High-level API wrapping openraft |
+| `mod.rs` | 38 | Module root, error enum, re-exports |
+
+Most of the complexity lives in the tests, not the implementation. The adapter code is straightforward — openraft does the hard work. What we get for our 700 lines is a replicated state machine with automatic leader election, log compaction, and partition tolerance. Try building that from scratch in a weekend.
+
+### What's next
+
+We have gossip for membership and Raft for consensus. The next pieces connect them: council selection decides which gossip members become Raft voters, the reporting tree gets runtime state from workers to the council, and the Patty scheduler turns desired state into placement decisions. Gossip is the nervous system, Raft is the brain. Now we need the decision-making.
