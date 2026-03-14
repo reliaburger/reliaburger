@@ -11,6 +11,7 @@
 /// - `CouncilStateMachine` — applies entries to desired cluster state
 /// - `InMemoryRaftRouter` — in-memory network for testing
 pub mod log_store;
+pub mod state_machine;
 pub mod types;
 
 pub use types::{
