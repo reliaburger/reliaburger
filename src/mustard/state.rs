@@ -103,6 +103,7 @@ pub fn resolve_conflict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn alive_to_suspect() {
@@ -212,6 +213,51 @@ mod tests {
             let json = serde_json::to_string(&state).unwrap();
             let decoded: NodeState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, decoded);
+        }
+    }
+
+    fn arb_node_state() -> impl Strategy<Value = NodeState> {
+        prop_oneof![
+            Just(NodeState::Alive),
+            Just(NodeState::Suspect),
+            Just(NodeState::Dead),
+            Just(NodeState::Left),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn resolve_conflict_is_deterministic(
+            old_state in arb_node_state(),
+            old_inc in 0u64..100,
+            new_state in arb_node_state(),
+            new_inc in 0u64..100,
+        ) {
+            let (r1, i1) = resolve_conflict(old_state, old_inc, new_state, new_inc);
+            let (r2, i2) = resolve_conflict(old_state, old_inc, new_state, new_inc);
+
+            // Deterministic: same inputs always produce same output
+            prop_assert_eq!(r1, r2);
+            prop_assert_eq!(i1, i2);
+
+            // Winner incarnation is one of the two inputs
+            prop_assert!(i1 == old_inc || i1 == new_inc);
+
+            // Left is terminal: if either side is Left, result is Left
+            if old_state == NodeState::Left || new_state == NodeState::Left {
+                prop_assert_eq!(r1, NodeState::Left);
+            }
+
+            // Higher incarnation wins (when neither is Left)
+            if old_state != NodeState::Left && new_state != NodeState::Left {
+                if new_inc > old_inc {
+                    prop_assert_eq!(r1, new_state);
+                    prop_assert_eq!(i1, new_inc);
+                } else if new_inc < old_inc {
+                    prop_assert_eq!(r1, old_state);
+                    prop_assert_eq!(i1, old_inc);
+                }
+            }
         }
     }
 }

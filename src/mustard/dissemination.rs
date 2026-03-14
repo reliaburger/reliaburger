@@ -130,14 +130,19 @@ impl Default for DisseminationQueue {
 }
 
 /// Calculate how many times an update should be broadcast.
-/// `ceil(log2(cluster_size))`, minimum 1.
+///
+/// Uses `3 * ceil(log2(cluster_size))` — the multiplier of 3 (lambda
+/// in the SWIM paper) compensates for the fact that each gossip round
+/// burns a broadcast on both the PING and ACK, and not every broadcast
+/// reaches a node that hasn't seen the update yet. A minimum of 6
+/// ensures updates survive long enough during early cluster formation.
 fn broadcast_count(cluster_size: usize) -> u32 {
     if cluster_size <= 1 {
-        return 1;
+        return 6;
     }
     // ceil(log2(n)) = 64 - leading_zeros(n - 1) for n > 1
     let bits = usize::BITS - (cluster_size - 1).leading_zeros();
-    bits.max(1)
+    (bits * 3).max(6)
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +158,7 @@ mod tests {
     fn update(node: &str, state: NodeState) -> MembershipUpdate {
         MembershipUpdate {
             node_id: NodeId::new(node),
+            address: std::net::SocketAddr::from(([127, 0, 0, 1], 9000)),
             state,
             incarnation: 1,
             lamport: 0,
@@ -163,37 +169,37 @@ mod tests {
 
     #[test]
     fn broadcast_count_zero_cluster() {
-        assert_eq!(broadcast_count(0), 1);
+        assert_eq!(broadcast_count(0), 6);
     }
 
     #[test]
     fn broadcast_count_single_node() {
-        assert_eq!(broadcast_count(1), 1);
+        assert_eq!(broadcast_count(1), 6);
     }
 
     #[test]
     fn broadcast_count_two_nodes() {
-        assert_eq!(broadcast_count(2), 1);
+        assert_eq!(broadcast_count(2), 6);
     }
 
     #[test]
     fn broadcast_count_four_nodes() {
-        assert_eq!(broadcast_count(4), 2);
+        assert_eq!(broadcast_count(4), 6);
     }
 
     #[test]
     fn broadcast_count_eight_nodes() {
-        assert_eq!(broadcast_count(8), 3);
+        assert_eq!(broadcast_count(8), 9);
     }
 
     #[test]
     fn broadcast_count_hundred_nodes() {
-        assert_eq!(broadcast_count(100), 7);
+        assert_eq!(broadcast_count(100), 21);
     }
 
     #[test]
     fn broadcast_count_ten_thousand_nodes() {
-        assert_eq!(broadcast_count(10_000), 14);
+        assert_eq!(broadcast_count(10_000), 42);
     }
 
     // -- enqueue and select ---------------------------------------------------
@@ -218,29 +224,31 @@ mod tests {
     #[test]
     fn updates_expire_after_broadcast_count() {
         let mut queue = DisseminationQueue::new();
-        // cluster_size=2 -> broadcast_count=1
+        // cluster_size=2 -> broadcast_count=6 (minimum)
         queue.enqueue(update("n1", NodeState::Alive), 2);
 
-        let first = queue.select_updates();
-        assert_eq!(first.len(), 1);
-
-        // Should be gone now (only 1 broadcast needed)
-        let second = queue.select_updates();
-        assert!(second.is_empty());
+        // Should be selectable 6 times (minimum broadcast count)
+        for _ in 0..6 {
+            let selected = queue.select_updates();
+            assert_eq!(selected.len(), 1);
+        }
+        // Seventh time should be empty
+        let selected = queue.select_updates();
+        assert!(selected.is_empty());
     }
 
     #[test]
     fn update_broadcast_multiple_times_for_larger_cluster() {
         let mut queue = DisseminationQueue::new();
-        // cluster_size=8 -> broadcast_count=3
-        queue.enqueue(update("n1", NodeState::Alive), 8);
+        // cluster_size=100 -> broadcast_count=21 (3 * ceil(log2(100)))
+        queue.enqueue(update("n1", NodeState::Alive), 100);
 
-        // Should be selectable 3 times
-        for _ in 0..3 {
+        // Should be selectable 21 times
+        for _ in 0..21 {
             let selected = queue.select_updates();
             assert_eq!(selected.len(), 1);
         }
-        // Fourth time should be empty
+        // 22nd time should be empty
         let selected = queue.select_updates();
         assert!(selected.is_empty());
     }

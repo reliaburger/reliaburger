@@ -55,6 +55,16 @@ src/
   relish/              # CLI internals
     client.rs          # HTTP client for bun agent
     commands.rs        # Subcommand implementations
+  mustard/             # SWIM gossip protocol
+    state.rs           # NodeState enum and conflict resolution
+    message.rs         # GossipMessage, MembershipUpdate, piggybacked payloads
+    membership.rs      # MembershipTable (who's in the cluster)
+    dissemination.rs   # Piggyback queue with priority ordering
+    transport.rs       # MustardTransport trait + InMemoryNetwork
+    protocol.rs        # SWIM probe cycle (MustardNode)
+    config.rs          # GossipConfig (intervals, timeouts)
+  patty/               # Scheduler (shared types, placement TBD)
+    types.rs           # NodeId, AppId, Resources, NodeCapacity
 docs/
   README.md            # User documentation (install, build, run)
   whitepaper.md        # Full architectural vision (the "what and why")
@@ -88,7 +98,9 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete** (single-node container lifecycle). 339 passing tests.
+**Phase 1 complete.** **Phase 2 in progress** (cluster formation). 437 passing tests.
+
+### Phase 1 — Single-node container lifecycle
 
 - TOML config parsing for all 7 resource types with custom serde deserialisers
 - Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
@@ -105,6 +117,14 @@ CLAUDE.md              # Project guide, conventions, writing style
 - HTTP health probing with configurable intervals, timeouts, and thresholds
 - TestApp standalone binary for demos and integration tests
 - 21 integration tests exercising the full stack end to end
+
+### Phase 2 — Cluster formation (in progress)
+
+- Shared cluster types: `NodeId`, `AppId`, `Resources` with saturating arithmetic, `NodeCapacity`, `SchedulingDecision`
+- Mustard SWIM gossip protocol: `NodeState` state machine (Alive → Suspect → Dead), incarnation-based conflict resolution, membership table, piggyback dissemination queue with priority ordering
+- Transport abstraction: `MustardTransport` trait with `InMemoryNetwork` for testing (supports partition injection for chaos tests)
+- SWIM probe cycle: `MustardNode` protocol driver with PING → ACK → PING-REQ → Suspect flow, indirect probing with relay ACK forwarding, suspicion refutation, gossip convergence across 5-node ring topology
+- Property-based testing for incarnation conflict resolution, criterion benchmarks for convergence scaling (5–250 nodes)
 
 See [progress.md](docs/progress.md) for the full checklist.
 

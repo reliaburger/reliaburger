@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf loc help examples
+.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k
 
 CARGO = cargo
 
@@ -40,7 +40,16 @@ examples: build ## Dry-run every example config with relish
 	echo "$$total examples, $$failed failed."; \
 	[ $$failed -eq 0 ]
 
-ci: fmt-check lint test ## Run everything CI would run
+bench: ## Run fast benchmarks (transport, single round, convergence 5-250)
+	$(CARGO) bench --bench gossip
+
+bench-large: ## Run large cluster benchmarks (500, 1000 nodes — ~10 min)
+	$(CARGO) bench --bench gossip_large
+
+bench-10k: ## Run 10k node convergence test (~1 hour)
+	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
+
+ci: fmt-check lint test bench ## Run everything CI would run
 
 # --- Documentation targets ---
 

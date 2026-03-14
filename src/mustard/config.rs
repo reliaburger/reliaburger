@@ -16,6 +16,8 @@ pub struct GossipConfig {
     pub suspicion_timeout: Duration,
     /// Number of indirect probe relays to use on PING timeout.
     pub indirect_probe_count: usize,
+    /// How long Dead/Left nodes stay in the membership table before removal.
+    pub cleanup_timeout: Duration,
 }
 
 impl Default for GossipConfig {
@@ -25,6 +27,7 @@ impl Default for GossipConfig {
             probe_timeout: Duration::from_millis(200),
             suspicion_timeout: Duration::from_secs(5),
             indirect_probe_count: 3,
+            cleanup_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -40,5 +43,6 @@ mod tests {
         assert_eq!(cfg.probe_timeout, Duration::from_millis(200));
         assert_eq!(cfg.suspicion_timeout, Duration::from_secs(5));
         assert_eq!(cfg.indirect_probe_count, 3);
+        assert_eq!(cfg.cleanup_timeout, Duration::from_secs(60));
     }
 }

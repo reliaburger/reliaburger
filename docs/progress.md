@@ -33,13 +33,15 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
 - [x] Log tailing (`--tail N`) and streaming (`--follow`/`-f`)
 - [x] Relish exec command (run commands in running instances)
-- [x] All Phase 1 tests green (339 tests)
+- [x] All Phase 1 tests green (321 tests)
 
 ## Phase 2: Cluster Formation
 
-- [ ] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/patty/types.rs`)
-- [ ] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
-- [ ] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
+- [x] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/patty/types.rs`)
+- [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
+- [x] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
+- [x] Indirect probe (PING-REQ) ACK routing, proptest for conflict resolution, broadcast count lambda=3
+- [x] Dead node reap timer (cleanup_timeout=60s), graceful leave protocol (Left state broadcast on shutdown)
 - [ ] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication
 - [ ] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7
 - [ ] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel
