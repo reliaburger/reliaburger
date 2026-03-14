@@ -12,9 +12,11 @@
 /// - `InMemoryRaftRouter` — in-memory network for testing
 pub mod log_store;
 pub mod network;
+pub mod node;
 pub mod state_machine;
 pub mod types;
 
+pub use node::CouncilNode;
 pub use types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,
 };
