@@ -13,6 +13,8 @@ use super::client::BunClient;
 use super::output::{OutputFormat, format_output};
 use super::plan::generate_plan;
 
+use crate::bun::agent::CouncilStatus;
+
 /// Parse, validate, and deploy a config file.
 ///
 /// If a Bun agent is running, sends the config for deployment.
@@ -206,6 +208,95 @@ path = \"/\"
     Ok(())
 }
 
+/// List cluster nodes and their gossip state.
+pub async fn nodes(output: OutputFormat) -> Result<(), RelishError> {
+    nodes_with_client(output, &BunClient::default_local()).await
+}
+
+async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
+    let nodes = client.nodes().await?;
+
+    if nodes.is_empty() {
+        println!("no cluster nodes (single-node mode)");
+    } else {
+        match output {
+            OutputFormat::Human => {
+                println!(
+                    "{:<20} {:<22} {:<10} {:<8} {:<8}",
+                    "NODE", "ADDRESS", "STATE", "COUNCIL", "LEADER"
+                );
+                for n in &nodes {
+                    println!(
+                        "{:<20} {:<22} {:<10} {:<8} {:<8}",
+                        n.node_id,
+                        n.address,
+                        n.state,
+                        if n.is_council { "yes" } else { "-" },
+                        if n.is_leader { "yes" } else { "-" },
+                    );
+                }
+            }
+            OutputFormat::Json => {
+                let json =
+                    serde_json::to_string_pretty(&nodes).map_err(RelishError::SerialiseJson)?;
+                println!("{json}");
+            }
+            OutputFormat::Yaml => {
+                let yaml = serde_yaml::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
+                print!("{yaml}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show council (Raft) composition and status.
+pub async fn council(output: OutputFormat) -> Result<(), RelishError> {
+    council_with_client(output, &BunClient::default_local()).await
+}
+
+async fn council_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
+    let council = client.council().await?;
+
+    match output {
+        OutputFormat::Human => {
+            print_council_human(&council);
+        }
+        OutputFormat::Json => {
+            let json =
+                serde_json::to_string_pretty(&council).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = serde_yaml::to_string(&council).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
+        }
+    }
+
+    Ok(())
+}
+
+fn print_council_human(council: &CouncilStatus) {
+    let leader = council.leader.as_deref().unwrap_or("(none)");
+    println!("Leader: {leader}");
+    println!("Term:   {}", council.term);
+    println!("Apps:   {}", council.app_count);
+    if let Some(idx) = council.last_applied_log {
+        println!("Log:    {idx}");
+    }
+    println!();
+
+    if council.members.is_empty() {
+        println!("no council nodes (single-node mode)");
+    } else {
+        println!("{:<10} {:<20} {:<22}", "RAFT_ID", "NAME", "ADDRESS");
+        for m in &council.members {
+            println!("{:<10} {:<20} {:<22}", m.raft_id, m.name, m.address);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +433,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
+    }
+
+    #[tokio::test]
+    async fn nodes_returns_agent_unreachable() {
+        let err = nodes_with_client(OutputFormat::Human, &bogus_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn council_returns_agent_unreachable() {
+        let err = council_with_client(OutputFormat::Human, &bogus_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 }

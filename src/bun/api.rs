@@ -38,6 +38,8 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route("/v1/exec/{app}/{namespace}", post(exec_handler))
+        .route("/v1/cluster/nodes", get(nodes_handler))
+        .route("/v1/cluster/council", get(council_handler))
         .with_state(state)
 }
 
@@ -326,6 +328,58 @@ async fn exec_handler(
     }
 }
 
+/// List cluster nodes.
+async fn nodes_handler(State(state): State<ApiState>) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Nodes { response: resp_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(nodes) => Json(serde_json::json!(nodes)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Show council (Raft) status.
+async fn council_handler(State(state): State<ApiState>) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Council { response: resp_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(council) => Json(serde_json::json!(council)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +595,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn nodes_endpoint_returns_empty_list() {
+        let (app, shutdown) = test_setup();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cluster/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn council_endpoint_returns_default_status() {
+        let (app, shutdown) = test_setup();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cluster/council")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["term"], 0);
+        assert!(json["leader"].is_null());
+        assert_eq!(json["app_count"], 0);
+        assert!(json["members"].as_array().unwrap().is_empty());
         shutdown.cancel();
     }
 }

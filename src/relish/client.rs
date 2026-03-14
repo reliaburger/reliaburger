@@ -8,7 +8,7 @@
 /// the final result.
 use futures_util::StreamExt;
 
-use crate::bun::agent::{ApplyEvent, ApplyResult, InstanceStatus};
+use crate::bun::agent::{ApplyEvent, ApplyResult, CouncilStatus, InstanceStatus, NodeStatus};
 use crate::config::Config;
 
 use super::RelishError;
@@ -296,5 +296,43 @@ impl BunClient {
         })?;
 
         Ok(json["output"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Get cluster node membership.
+    pub async fn nodes(&self) -> Result<Vec<NodeStatus>, RelishError> {
+        let url = format!("{}/v1/cluster/nodes", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let nodes: Vec<NodeStatus> = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+
+        Ok(nodes)
+    }
+
+    /// Get council (Raft) status.
+    pub async fn council(&self) -> Result<CouncilStatus, RelishError> {
+        let url = format!("{}/v1/cluster/council", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let council: CouncilStatus = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+
+        Ok(council)
     }
 }

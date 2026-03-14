@@ -65,6 +65,10 @@ enum Command {
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
+    /// List cluster nodes and their gossip state.
+    Nodes,
+    /// Show council (Raft) composition and status.
+    Council,
 }
 
 #[tokio::main]
@@ -86,6 +90,8 @@ async fn main() -> ExitCode {
         Command::Inspect { ref name } => commands::inspect(name).await,
         Command::Stop { ref app } => commands::stop(app).await,
         Command::Init { ref dir } => commands::init(dir),
+        Command::Nodes => commands::nodes(cli.output).await,
+        Command::Council => commands::council(cli.output).await,
     };
 
     match result {
@@ -162,6 +168,18 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some("/tmp/myproject"))
         );
+    }
+
+    #[test]
+    fn parse_nodes_command() {
+        let cli = parse(&["relish", "nodes"]).unwrap();
+        assert!(matches!(cli.command, Command::Nodes));
+    }
+
+    #[test]
+    fn parse_council_command() {
+        let cli = parse(&["relish", "council"]).unwrap();
+        assert!(matches!(cli.command, Command::Council));
     }
 
     #[test]

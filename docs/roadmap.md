@@ -99,8 +99,8 @@ Each step is a self-contained PR with its own tests-first cycle.
 6. **Reporting tree.** Non-council nodes send `StateReport` to assigned council member every 5s. Assignment via consistent hashing. Council members aggregate for leader. Uses `tokio::sync::watch` for latest-value broadcasting.
 7. **State reconstruction.** After leader election, new leader enters learning period. Collects StateReports, loads desired state from Raft log, diffs, issues corrections. No scheduling until 95% of nodes report or 15s timeout.
 8. **Patty scheduler.** Four-phase placement pipeline (Filter → Score → Select → Commit). Bin-packing, required/preferred labels, daemon mode, GPU-aware, namespace quota enforcement. Property-based tests for scheduler correctness.
-9. **Agent integration.** Wire mustard, raft, and patty into `BunAgent` as spawned tasks communicating via channels. Extend `ClusterSection` config with gossip/raft ports. Add cluster API endpoints (`/v1/cluster/members`, `/v1/cluster/council`, `/v1/cluster/leader`).
-10. **CLI extensions.** New relish subcommands: `members`, `council`, `join` (unauthenticated until Phase 4).
+9. **Agent integration.** Wire mustard, raft, and patty into `BunAgent` as spawned tasks communicating via channels. Extend `ClusterSection` config with gossip/raft ports. Add cluster API endpoints (`/v1/cluster/nodes`, `/v1/cluster/council`, `/v1/cluster/leader`).
+10. **CLI extensions.** New relish subcommands: `nodes`, `council`, `join` (unauthenticated until Phase 4).
 11. **Chaos tests.** Council partition 3/2 (majority elects, minority read-only, heal and reconcile). Worker isolation (apps continue, state-unknown). Full council loss (recovery candidate assumes leadership).
 12. **Book chapter and docs.** Write `docs/book/02-finding-friends.md`. Update progress, README.
 
