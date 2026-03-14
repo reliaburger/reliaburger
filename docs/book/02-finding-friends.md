@@ -1177,3 +1177,170 @@ no council nodes (single-node mode)
 This isn't a stub in the "unfinished code" sense. The pipeline is complete and tested end-to-end. The data source is the only thing missing. When Step 9 connects the gossip and Raft subsystems to the agent, these commands will start returning real data without changing a single line in the CLI, client, or API layer.
 
 Both commands support `--output json` and `--output yaml` from day one, so scripting against the cluster state works the moment we have real data flowing through.
+
+## The reporting tree
+
+We have gossip for membership and Raft for desired state. But there's a gap: how does the leader know what's actually running on each worker node? A node might have three apps running, one healthy and two crashing. It might be low on memory or have unusual CPU usage. This runtime state is variable-size, and the design doc is unambiguous: variable-size payloads do not go over gossip. Gossip messages are fixed-size UDP datagrams. If we started stuffing app lists into PING/ACK exchanges, we'd blow past the 1400-byte limit that avoids IP fragmentation, and gossip convergence would suffer.
+
+So we need a third communication layer: the reporting tree.
+
+### The architecture
+
+The reporting tree is hierarchical. Each worker node is assigned to exactly one council member as its "parent." Workers send a full `StateReport` to their parent every 5 seconds. Council members aggregate the reports from their assigned workers and make the data available via a `tokio::sync::watch` channel.
+
+```
+                ┌────────────┐
+                │   Leader   │
+                └─────┬──────┘
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+    ┌──────────┐ ┌──────────┐ ┌──────────┐
+    │Council-A │ │Council-B │ │Council-C │
+    └────┬─────┘ └────┬─────┘ └────┬─────┘
+     ┌───┼───┐    ┌───┼───┐    ┌───┼───┐
+     ▼   ▼   ▼    ▼   ▼   ▼    ▼   ▼   ▼
+    W1  W2  W3   W4  W5  W6   W7  W8  W9
+```
+
+With a council of 5 and 10,000 nodes, each council member aggregates reports from about 2,000 workers. That's 2,000 reports of 1-10 KB each, every 5 seconds. Plenty manageable.
+
+### Parent assignment
+
+Parent assignment is deterministic. Given the same worker ID and the same council member list, every node in the cluster computes the same parent independently. No coordination needed.
+
+The formula is simple: sort the council members by `NodeId` (they implement `Ord`), hash the worker's `NodeId`, and take the modulo:
+
+```rust
+pub fn assign_parent(worker_id: &NodeId, council_members: &[NodeId]) -> Option<NodeId> {
+    if council_members.is_empty() {
+        return None;
+    }
+
+    let mut sorted: Vec<&NodeId> = council_members.iter().collect();
+    sorted.sort();
+
+    let mut hasher = DefaultHasher::new();
+    worker_id.hash(&mut hasher);
+    let hash = hasher.finish();
+    let index = (hash as usize) % sorted.len();
+
+    Some(sorted[index].clone())
+}
+```
+
+Why sort? Because different nodes might learn about council members in different orders through gossip. If node A sees `[c3, c1, c2]` and node B sees `[c1, c2, c3]`, they'd compute different parents for the same worker. Sorting eliminates that problem.
+
+Why `DefaultHasher`? It uses SipHash, which is deterministic within the same binary. Since all nodes run the same Reliaburger binary, cross-node agreement is guaranteed. If we ever need to handle mixed binary versions during rolling upgrades, we can switch to a fixed hasher, but that's a problem for another day.
+
+### The StateReport
+
+A `StateReport` contains everything the leader needs to know about a worker's runtime state:
+
+```rust
+pub struct StateReport {
+    pub node_id: NodeId,
+    pub timestamp: SystemTime,
+    pub running_apps: Vec<RunningApp>,
+    pub cached_specs: Vec<CachedSpec>,
+    pub resource_usage: ResourceUsage,
+    pub event_log: Vec<NodeEvent>,
+}
+```
+
+Each `RunningApp` carries the app name, instance index, image, port, health status, uptime, and resource usage. The `ReportHealthStatus` enum is distinct from `bun::health::HealthStatus` on purpose. The probe-level health status tracks individual check results (HTTP 200, timeout, connection refused). The report-level status summarises the outcome: is the instance healthy, unhealthy, starting, or unknown?
+
+```rust
+pub enum ReportHealthStatus {
+    Healthy,
+    Unhealthy { consecutive_failures: u32 },
+    Starting,
+    Unknown,
+}
+```
+
+The `event_log` is bounded to `max_events_per_report` (default 100) and carries recent events like container starts, crashes, health check failures, and image pulls. These are for the leader's benefit during state reconstruction.
+
+### The transport trait
+
+We follow the same pattern as `MustardTransport`: define a trait, implement an in-memory version for testing, and add real TCP later.
+
+```rust
+pub trait ReportingTransport: Send + Sync {
+    fn send(
+        &self,
+        target: SocketAddr,
+        message: &ReportingMessage,
+    ) -> impl Future<Output = Result<(), ReportingError>> + Send;
+
+    fn recv(
+        &self,
+    ) -> impl Future<Output = Option<(SocketAddr, ReportingMessage)>> + Send;
+}
+```
+
+`InMemoryReportingNetwork` has the same structure as its gossip counterpart: `Arc<Mutex<NetworkInner>>` with per-address inboxes and partition injection for chaos testing. This is a bit of repetition, but keeping the transport implementations separate means we can evolve them independently. Gossip uses UDP; the reporting tree uses TCP with bincode encoding.
+
+### The worker side
+
+On each non-council node, a `ReportWorker` runs as a spawned task. Its event loop is straightforward:
+
+```rust
+loop {
+    tokio::select! {
+        _ = self.shutdown.cancelled() => break,
+        _ = interval.tick() => {
+            self.send_report().await;
+        }
+        result = self.council_rx.changed() => {
+            if result.is_ok() {
+                self.update_parent();
+            }
+        }
+    }
+}
+```
+
+Two things can happen: the interval fires (time to send a report) or the council membership changes (time to re-hash and possibly connect to a different parent).
+
+How does the worker get the data for the report? It can't just reach into the `WorkloadSupervisor` because the supervisor is owned by the `BunAgent` event loop. Instead, the worker sends a snapshot request over a channel and waits for the response. This follows the same request-response pattern we already use for `AgentCommand::Status`:
+
+```rust
+pub struct CollectSnapshotRequest {
+    pub response: oneshot::Sender<AgentSnapshot>,
+}
+```
+
+The agent builds the snapshot during one iteration of its `tokio::select!` loop, so the snapshot is point-in-time consistent. No partial state, no lock contention.
+
+### The council side
+
+On each council member, a `ReportAggregator` runs as a spawned task. It receives reports, stores the latest one per worker, and publishes the aggregated view through a `watch` channel:
+
+```rust
+let (watch_tx, watch_rx) = watch::channel(AggregatedState::default());
+```
+
+Why `watch`? Because the consumer (the leader, the scheduler, the API) always wants the latest state, not a queue of historical states. If the aggregator receives three reports in quick succession, the consumer only sees the final result. This is exactly what `watch` is designed for: single-producer, multiple-consumer, latest-value-only semantics.
+
+The aggregator also tracks stale reports. If a worker's last report is older than `stale_report_timeout` (default 30 seconds), it shows up in `AggregatedState.stale_nodes`. This is useful for the leader during scheduling: don't send work to a node that hasn't checked in.
+
+### Failover
+
+When a council member departs, workers need to re-hash and connect to a surviving member. The `ReportWorker` watches the council membership via a `watch::Receiver<Vec<(NodeId, SocketAddr)>>`. When the membership changes, the worker calls `assign_parent()` again and updates its `parent_address`.
+
+The new parent receives a full `StateReport` from each reassigned worker on the next reporting cycle. No explicit "handoff" protocol is needed. The new parent simply starts accumulating reports.
+
+We test this end-to-end in the integration test: set up 3 council members and 2 workers, let reports flow, remove a council member, and verify that both workers re-hash to surviving members and reports arrive correctly.
+
+### Configuration
+
+The reporting tree section in `node.toml` has three knobs:
+
+```toml
+[reporting_tree]
+report_interval_secs = 5
+max_events_per_report = 100
+stale_report_timeout_secs = 30
+```
+
+The defaults are sensible for most clusters. Smaller clusters might lower the interval; very large clusters might raise it to reduce load on council members.
