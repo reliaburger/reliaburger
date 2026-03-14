@@ -118,8 +118,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
 - [ ] `relish test --chaos` (integration tests + Smoker fault injection)
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
-- [ ] Self-upgrade mechanism (rolling binary replacement, dual-signature, auto-rollback)
-- [ ] Relish TUI (apps, nodes, jobs, events, logs, routes, search views)
 - [ ] `relish wtf` (automated cluster health diagnosis)
 - [ ] `relish trace` (end-to-end connectivity debugging)
+- [ ] Relish TUI (apps, nodes, jobs, events, logs, routes, search views)
+- [ ] Self-upgrade mechanism (rolling binary replacement, dual-signature, auto-rollback)
 - [ ] All Phase 9 tests green
