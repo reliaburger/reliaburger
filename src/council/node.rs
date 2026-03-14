@@ -394,6 +394,41 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // is_leader and metrics tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn is_leader_returns_true_for_leader() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader = &nodes[(leader_id - 1) as usize];
+        assert!(leader.is_leader().await);
+
+        // A follower should not be leader.
+        let follower_idx = if leader_id == 1 { 1 } else { 0 };
+        assert!(!nodes[follower_idx].is_leader().await);
+    }
+
+    #[tokio::test]
+    async fn metrics_reflects_leader_state() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader = &nodes[(leader_id - 1) as usize];
+
+        let metrics = leader.metrics().borrow().clone();
+        assert_eq!(metrics.current_leader, Some(leader_id));
+        assert_eq!(metrics.id, leader_id);
+    }
+
+    // -----------------------------------------------------------------------
     // Leader election tests
     // -----------------------------------------------------------------------
 

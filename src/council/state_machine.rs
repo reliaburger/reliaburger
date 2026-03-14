@@ -402,6 +402,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_membership_entry_updates_membership() {
+        let mut sm = CouncilStateMachine::new();
+
+        let membership = Membership::new(
+            vec![std::collections::BTreeSet::from([1, 2, 3])],
+            None::<std::collections::BTreeSet<u64>>,
+        );
+        let entry = openraft::Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Membership(membership.clone()),
+        };
+
+        let responses = sm.apply(vec![entry]).await.unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(matches!(
+            responses[0],
+            CouncilResponse::Applied { log_index: 1 }
+        ));
+
+        let (last_applied, stored_membership) = sm.applied_state().await.unwrap();
+        assert_eq!(last_applied, Some(log_id(1, 1)));
+        assert_eq!(
+            stored_membership.membership().get_joint_config().len(),
+            membership.get_joint_config().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_current_snapshot_returns_none_initially() {
+        let mut sm = CouncilStateMachine::new();
+        assert!(sm.get_current_snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn install_snapshot_replaces_state() {
         let mut sm = CouncilStateMachine::new();
 

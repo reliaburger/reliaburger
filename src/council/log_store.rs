@@ -349,4 +349,17 @@ mod tests {
         let entries = reader.try_get_log_entries(5..10).await.unwrap();
         assert!(entries.is_empty());
     }
+
+    #[tokio::test]
+    async fn save_and_read_committed() {
+        let mut store = MemLogStore::new();
+        assert!(store.read_committed().await.unwrap().is_none());
+
+        let lid = log_id(1, 5);
+        store.save_committed(Some(lid)).await.unwrap();
+        assert_eq!(store.read_committed().await.unwrap(), Some(lid));
+
+        store.save_committed(None).await.unwrap();
+        assert!(store.read_committed().await.unwrap().is_none());
+    }
 }
