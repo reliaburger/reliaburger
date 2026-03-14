@@ -1110,3 +1110,70 @@ The bounds tests verify clamping: asking for target size 1 gets clamped to the m
 ### What's next
 
 Council selection produces a ranked list of candidates. The agent integration step will wire this into the actual Raft membership changes — calling `add_learner()` for each selected candidate, waiting for them to catch up, then promoting them with `change_membership()`. Before that, we need the reporting tree: how worker nodes get their runtime state to the council, and how the council aggregates it for the leader.
+
+## Looking at the cluster
+
+We have gossip, Raft consensus, and a council selection algorithm. That's a lot of internal machinery with no way for an operator to peek inside. Before wiring the subsystems together, let's add two CLI commands: `relish nodes` (list gossip members) and `relish council` (show Raft state). Building the full pipeline now means we can test it in isolation, and when the agent integration step connects the real data sources, the commands just work.
+
+### The pipeline
+
+Every Relish command follows the same path: CLI binary → HTTP client → axum API endpoint → agent command channel → oneshot response. We saw this pattern in Chapter 1 with `relish status`. The cluster commands are identical, just with different types.
+
+The CLI binary parses the subcommand:
+
+```rust
+/// List cluster nodes and their gossip state.
+Nodes,
+/// Show council (Raft) composition and status.
+Council,
+```
+
+Each command calls a function in `commands.rs`, which creates a `BunClient` pointing at `localhost:9117` and calls the relevant method. The client sends an HTTP GET, the axum handler turns that into an `AgentCommand`, sends it over the `mpsc` channel, and awaits the `oneshot` response. The agent processes the command and sends back the data.
+
+### Wire types vs internal types
+
+The gossip layer uses `NodeMembership` internally, with `Instant` for timestamps and `NodeId` as a newtype wrapper. None of that serialises cleanly to JSON. So we define separate wire types — flat structs with strings and integers — that travel between the agent and the CLI.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub address: String,
+    pub state: String,
+    pub incarnation: u64,
+    pub is_council: bool,
+    pub is_leader: bool,
+    pub labels: BTreeMap<String, String>,
+}
+```
+
+Same idea for `CouncilStatus` — it captures the Raft term, leader name, member list, and app count as plain types. The agent handler converts from internal types to wire types when the subsystems are connected. For now, the handlers return empty data.
+
+### Stubs before wiring
+
+The Bun agent doesn't have a membership table or Raft node yet. That's the agent integration step. So the handlers return empty responses:
+
+```rust
+AgentCommand::Nodes { response } => {
+    // TODO(Phase 2): return real membership from mustard
+    let _ = response.send(Vec::new());
+}
+```
+
+The CLI handles the empty case with a short message:
+
+```
+$ relish nodes
+no cluster nodes (single-node mode)
+
+$ relish council
+Leader: (none)
+Term:   0
+Apps:   0
+
+no council nodes (single-node mode)
+```
+
+This isn't a stub in the "unfinished code" sense. The pipeline is complete and tested end-to-end. The data source is the only thing missing. When Step 9 connects the gossip and Raft subsystems to the agent, these commands will start returning real data without changing a single line in the CLI, client, or API layer.
+
+Both commands support `--output json` and `--output yaml` from day one, so scripting against the cluster state works the moment we have real data flowing through.

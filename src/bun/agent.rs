@@ -4,6 +4,7 @@
 /// into a single async event loop. Commands arrive over an `mpsc` channel;
 /// health checks fire on a timer; shutdown is coordinated via a
 /// `CancellationToken`.
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -85,6 +86,14 @@ pub enum AgentCommand {
         command: Vec<String>,
         response: oneshot::Sender<Result<String, BunError>>,
     },
+    /// Get cluster node membership from the gossip layer.
+    Nodes {
+        response: oneshot::Sender<Vec<NodeStatus>>,
+    },
+    /// Get council (Raft) status.
+    Council {
+        response: oneshot::Sender<CouncilStatus>,
+    },
 }
 
 /// Result of a deploy operation.
@@ -113,6 +122,54 @@ pub struct InstanceStatus {
     pub host_port: Option<u16>,
     /// OS process ID, if available.
     pub pid: Option<u32>,
+}
+
+/// Status of a single cluster node, as returned by the nodes API.
+///
+/// Flat, wire-friendly representation of `NodeMembership`. Uses strings
+/// instead of newtypes and omits `Instant` fields (not serialisable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    /// Node identifier.
+    pub node_id: String,
+    /// Node address (gossip endpoint).
+    pub address: String,
+    /// Current SWIM state: "alive", "suspect", "dead", or "left".
+    pub state: String,
+    /// SWIM incarnation number.
+    pub incarnation: u64,
+    /// Whether this node is a council (Raft voter) member.
+    pub is_council: bool,
+    /// Whether this node is the current Raft leader.
+    pub is_leader: bool,
+    /// Node labels (zone, region, etc.).
+    pub labels: BTreeMap<String, String>,
+}
+
+/// Info about a single council member, as returned by the council API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouncilMemberInfo {
+    /// Raft numeric node ID.
+    pub raft_id: u64,
+    /// Human-readable node name (maps to `NodeId`).
+    pub name: String,
+    /// Raft RPC address.
+    pub address: String,
+}
+
+/// Status of the Raft council, as returned by the council API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouncilStatus {
+    /// Council member nodes.
+    pub members: Vec<CouncilMemberInfo>,
+    /// Current leader node name, if known.
+    pub leader: Option<String>,
+    /// Current Raft term.
+    pub term: u64,
+    /// Last applied log index.
+    pub last_applied_log: Option<u64>,
+    /// Number of registered apps in desired state.
+    pub app_count: usize,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
@@ -209,6 +266,20 @@ impl<G: Grill> BunAgent<G> {
             } => {
                 let result = self.exec_app(&app_name, &namespace, &command).await;
                 let _ = response.send(result);
+            }
+            AgentCommand::Nodes { response } => {
+                // TODO(Phase 2): return real membership from mustard
+                let _ = response.send(Vec::new());
+            }
+            AgentCommand::Council { response } => {
+                // TODO(Phase 2): return real council state from raft
+                let _ = response.send(CouncilStatus {
+                    members: Vec::new(),
+                    leader: None,
+                    term: 0,
+                    last_applied_log: None,
+                    app_count: 0,
+                });
             }
         }
     }
@@ -1425,6 +1496,44 @@ mod tests {
     #[test]
     fn tail_lines_no_trailing_newline() {
         assert_eq!(super::tail_lines("a\nb\nc", 2), "b\nc");
+    }
+
+    #[test]
+    fn node_status_serialisation_round_trip() {
+        let status = NodeStatus {
+            node_id: "node-1".to_string(),
+            address: "192.168.1.1:9116".to_string(),
+            state: "alive".to_string(),
+            incarnation: 42,
+            is_council: true,
+            is_leader: false,
+            labels: BTreeMap::from([("zone".to_string(), "us-east-1a".to_string())]),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let decoded: NodeStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.node_id, "node-1");
+        assert_eq!(decoded.incarnation, 42);
+        assert!(decoded.is_council);
+    }
+
+    #[test]
+    fn council_status_serialisation_round_trip() {
+        let status = CouncilStatus {
+            members: vec![CouncilMemberInfo {
+                raft_id: 1,
+                name: "node-1".to_string(),
+                address: "192.168.1.1:9200".to_string(),
+            }],
+            leader: Some("node-1".to_string()),
+            term: 5,
+            last_applied_log: Some(42),
+            app_count: 3,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let decoded: CouncilStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.term, 5);
+        assert_eq!(decoded.leader, Some("node-1".to_string()));
+        assert_eq!(decoded.members.len(), 1);
     }
 
     #[tokio::test]
