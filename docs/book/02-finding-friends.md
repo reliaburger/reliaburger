@@ -1517,3 +1517,56 @@ The `check_quota` function is straightforward: for each limit that's set, check 
 The scheduler doesn't query gossip or the reporting tree directly. Instead, it maintains a `ClusterStateCache` with one `SchedulerNodeState` per node. This cache holds the allocatable resources, current allocations, labels, readiness status, and set of running apps. After each placement, the cache is updated immediately, so the next placement sees the correct available resources.
 
 This is a critical design choice. If the scheduler placed 3 replicas without updating the cache between placements, all three might land on the same node (it would appear to have the most free resources each time). The iterative update prevents this.
+
+## Wiring it all together
+
+We've built gossip, Raft, the reporting tree, state reconstruction, and the scheduler as standalone modules, each with their own in-memory transport for testing. Now we connect them to the running agent so `bun` can form a real cluster.
+
+### Real network transports
+
+Each subsystem gets a production transport alongside its in-memory test double:
+
+**UDP for gossip.** `UdpMustardTransport` binds a single UDP socket. Gossip messages are small (under 1400 bytes to avoid IP fragmentation), so UDP is a natural fit. Each `send()` serialises the message with bincode and calls `sendto()`. Each `recv()` reads from the socket and deserialises. Malformed datagrams are silently skipped — the gossip protocol is resilient to lost messages anyway.
+
+**TCP for reporting.** `TcpReportingTransport` uses length-prefixed framing: 4 bytes for the payload length, then the bincode payload. The server side (council members) spawns an accept loop that pushes inbound messages into a channel. The client side (workers) opens a new connection for each report. At a 5-second reporting interval, one connection per report is fine.
+
+**TCP for Raft.** `TcpRaftNetwork` implements openraft's `RaftNetwork` trait over length-prefixed TCP, just like reporting. The Raft RPC server accepts connections, reads the request envelope (`AppendEntries`, `Vote`, or `InstallSnapshot`), dispatches to the local Raft instance, and writes the response. Connect-per-RPC is acceptable for Raft because RPC volume is low (heartbeats every 150ms, but they're tiny).
+
+All three transports use plain TCP/UDP for now. mTLS comes in Phase 4.
+
+### The ClusterHandle
+
+The agent needs to answer questions like "who's in the cluster?" and "who's the leader?" without holding mutable borrows on gossip or Raft. We use watch channels for this.
+
+`MustardNode` publishes a `Vec<MembershipSnapshot>` on a watch channel after each gossip cycle. `CouncilNode` already exposes a `watch::Receiver<RaftMetrics>` via its `metrics()` method. The agent subscribes to both.
+
+```rust
+pub struct ClusterHandle {
+    pub membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    pub raft_metrics_rx: Option<watch::Receiver<RaftMetrics>>,
+    pub council: Option<Arc<CouncilNode>>,
+    pub snapshot_rx: mpsc::Receiver<CollectSnapshotRequest>,
+}
+```
+
+The `BunAgent` holds an `Option<ClusterHandle>`. When it's `None`, the agent runs in single-node mode (same as Phase 1). When it's `Some`, the Nodes and Council API endpoints return real data from the gossip and Raft subsystems.
+
+### Snapshot requests
+
+The reporting worker needs data from the agent's supervisor (running instances, health status, ports). It can't borrow the supervisor directly because the supervisor lives inside the agent's event loop. Instead, the worker sends a `CollectSnapshotRequest` over a channel, and the agent responds with an `AgentSnapshot`.
+
+This follows the same request-response pattern we use for every other agent command. The agent's `tokio::select!` loop has a new branch for snapshot requests, sitting alongside the command channel and health check timer.
+
+### Configuration
+
+The cluster section in `node.toml` now includes ports for all three protocols:
+
+```toml
+[cluster]
+join = ["10.0.1.5:9443"]
+gossip_port = 9443
+raft_port = 9444
+reporting_port = 9445
+```
+
+The `join` addresses point to existing nodes' gossip ports. Raft and reporting ports are discovered through the cluster — Raft addresses come from `CouncilNodeInfo.addr` in the Raft membership, and reporting parent addresses come from the council membership watch channel.
