@@ -3,6 +3,7 @@
 /// Separates CLI logic from the binary so it can be tested as a library.
 /// The binary (`src/bin/relish.rs`) handles argument parsing and exit codes;
 /// this module handles everything else.
+pub mod chaos;
 pub mod client;
 pub mod commands;
 pub mod output;

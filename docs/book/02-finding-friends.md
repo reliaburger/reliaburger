@@ -1675,3 +1675,71 @@ The leader calls this function periodically (every gossip cycle, since it's chea
 ### What happens to running apps during a council change?
 
 Nothing. Council changes affect the control plane only. Running workloads are managed by the Bun agent on each node, which doesn't care about Raft membership. Apps keep serving traffic. Health checks keep running. The gossip protocol keeps probing. The only visible effect is that the reporting tree rebalances: workers re-hash their parent assignments when the council membership changes, and the new parent starts receiving reports on the next cycle.
+
+## Breaking things on purpose
+
+You don't know if your cluster recovers from failure until you actually break something. Hoping it works is not a strategy. So we built chaos testing into Reliaburger as a first-class citizen.
+
+### Two layers of chaos testing
+
+**Cargo tests** run in-memory clusters with simulated partitions. They're fast, deterministic, and run in CI. The `InMemoryNetwork::partition()` and `InMemoryRaftRouter::partition()` methods silently drop messages between specified nodes, simulating a network split without any real networking.
+
+**`relish chaos`** operates on real running clusters. It talks to actual Bun agents, tells them to inject partitions via the `/v1/chaos/partition` API, and then watches the cluster heal in real time. Every fault injection is time-bound with automatic cleanup — if the CLI crashes, the agent auto-heals when the TTL expires.
+
+### The council partition test
+
+Split a 5-member council into a majority (3) and a minority (2):
+
+1. Write a value to Raft before the partition
+2. Isolate the minority from the majority
+3. Verify: the majority can still elect a leader and accept writes
+4. Verify: the minority cannot write (no quorum)
+5. Heal the partition
+6. Verify: all 5 nodes converge to the same state
+
+This is the most important test in the cluster. If the council can't survive a minority partition, the system is broken.
+
+### The worker isolation test
+
+Partition a worker from all council members:
+
+1. The worker's apps keep running (data plane is independent of control plane)
+2. The leader stops receiving StateReports from the worker
+3. After the stale timeout, the leader marks the worker as unschedulable
+4. When the partition heals, the worker reports again and becomes schedulable
+
+This tests the key invariant: running workloads survive control plane disruption.
+
+### `relish chaos` in action
+
+```
+$ relish chaos council-partition
+
+CHAOS  Council Partition
+───────────────────────────────────────────────────────
+
+  [0.00s]  DISCOVER  querying cluster topology...
+  [0.12s]  DISCOVER  found 5 nodes: node-1 (leader, council), ...
+  [0.15s]  INJECT    partitioning node-3 from 2 peer(s), duration: 30s
+  [3.20s]  POLL      leader: node-1, term: 1, members: 3
+  [10.0s]  HEAL      removing partition...
+  [12.1s]  VERIFY    cluster has 5 nodes, leader: node-1
+
+  PASSED  council partition scenario in 12.1s
+```
+
+Every injection has a TTL. If you forget to heal, the agent does it for you. `relish chaos status` shows active partitions and their remaining time. `relish chaos heal` cleans up immediately.
+
+This is a foundation. Phase 8 adds Smoker, which uses eBPF for fine-grained fault injection: network delays, packet drops, DNS failures, CPU stress. But the principle is the same: inject, observe, heal, verify. Make failure routine so recovery is trustworthy.
+
+## What we built
+
+Take a step back and look at what happened in this chapter. We started with a single-node container agent and turned it into a distributed system.
+
+We built three communication layers: gossip for wide-scale membership (Mustard, SWIM protocol), Raft for strong consensus among a small council (openraft), and a hierarchical reporting tree that keeps variable-size runtime state off the gossip mesh. We added a scheduler (Meat) that places workloads across the cluster using a four-phase pipeline. We wired everything together with real network transports and built chaos testing into the system as a first-class citizen.
+
+Along the way, we learned about newtypes for type safety, saturating arithmetic for resource tracking, trait-based transport abstraction for testability, watch channels for broadcasting latest-value state, and the `tokio::select!` event loop pattern that holds the whole thing together.
+
+The cluster handles the hard cases: council member departure, minority partition, worker isolation. In every case, the data plane keeps running — apps serve traffic while the control plane sorts itself out. That's the whole point of a distributed orchestrator: your workloads survive infrastructure failures.
+
+Next up: networking. Chapter 3 gives each container its own network namespace, adds eBPF-based service discovery so containers can find each other by name, and puts an ingress proxy in front of the cluster. The nodes can talk to each other now; it's time to let the apps do the same.

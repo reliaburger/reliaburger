@@ -301,16 +301,39 @@ async fn handle_raft_rpc(mut stream: tokio::net::TcpStream, raft: Raft<TypeConfi
 }
 
 /// Creates TCP-based Raft network connections.
-#[derive(Debug, Clone)]
+///
+/// Supports a runtime blocklist for chaos testing.
+#[derive(Clone)]
 pub struct TcpRaftNetworkFactory {
     #[allow(dead_code)]
     source_id: u64,
+    blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+}
+
+impl fmt::Debug for TcpRaftNetworkFactory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpRaftNetworkFactory")
+            .field("source_id", &self.source_id)
+            .finish()
+    }
 }
 
 impl TcpRaftNetworkFactory {
     /// Create a new factory for a specific source node.
     pub fn new(source_id: u64) -> Self {
-        Self { source_id }
+        Self {
+            source_id,
+            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+        }
+    }
+
+    /// Get a handle to the blocklist for chaos injection.
+    pub fn blocklist(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>> {
+        std::sync::Arc::clone(&self.blocklist)
     }
 }
 
@@ -320,19 +343,35 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
     async fn new_client(&mut self, _target: u64, node: &CouncilNodeInfo) -> Self::Network {
         TcpRaftNetwork {
             target_addr: node.addr,
+            blocklist: std::sync::Arc::clone(&self.blocklist),
         }
     }
 }
 
 /// A single TCP connection to a Raft peer.
-#[derive(Debug)]
 pub struct TcpRaftNetwork {
     target_addr: SocketAddr,
+    blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+}
+
+impl fmt::Debug for TcpRaftNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TcpRaftNetwork")
+            .field("target_addr", &self.target_addr)
+            .finish()
+    }
 }
 
 impl TcpRaftNetwork {
     /// Send an RPC and read the response.
     async fn rpc(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
+        // Check blocklist for chaos testing
+        if self.blocklist.read().await.contains(&self.target_addr) {
+            return Err(Unreachable::new(&RouterError(
+                "blocked by chaos partition".into(),
+            )));
+        }
+
         let payload = bincode::serialize(&rpc)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
 

@@ -50,8 +50,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [x] CLI extensions: `relish join`
-- [ ] Chaos tests: council partition, worker isolation, full council loss recovery
-- [ ] Book chapter + docs: `02-finding-friends.md`, update README and progress
+- [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8)
+- [x] Book chapter + docs: `02-finding-friends.md`, update README and progress (588 tests)
 
 ## Phase 3: Networking
 

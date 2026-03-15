@@ -226,6 +226,10 @@ Commands:
 | `exec <app> <cmd...>` | Execute a command inside a running instance |
 | `stop <app>` | Stop all instances of an app |
 | `init [dir]` | Scaffold starter config files in a directory |
+| `nodes` | List cluster nodes and their gossip state |
+| `council` | Show council (Raft) composition and status |
+| `join --token <token> <addr>` | Join an existing cluster |
+| `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
 
 Global flags:
 
@@ -402,6 +406,12 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
+| `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership) |
+| `GET` | `/v1/cluster/council` | Council (Raft) status |
+| `POST` | `/v1/cluster/join` | Join a cluster (JSON body: `{"token":"...","addr":"..."}`) |
+| `POST` | `/v1/chaos/partition` | Inject network partition (JSON: `{"peers":[...],"duration_secs":N}`) |
+| `POST` | `/v1/chaos/heal` | Remove all active partitions |
+| `GET` | `/v1/chaos/status` | Query active chaos state |
 
 The CLI uses this API internally. You can also call it directly:
 
