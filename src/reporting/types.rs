@@ -35,6 +35,8 @@ pub struct StateReport {
 pub struct RunningApp {
     /// Name of the app.
     pub app_name: String,
+    /// Namespace the app belongs to.
+    pub namespace: String,
     /// Instance index (e.g. 0 for "web-0").
     pub instance_id: u32,
     /// OCI image reference.
@@ -144,6 +146,7 @@ mod tests {
             timestamp: SystemTime::now(),
             running_apps: vec![RunningApp {
                 app_name: "web".to_string(),
+                namespace: "default".to_string(),
                 instance_id: 0,
                 image: "nginx:latest".to_string(),
                 port: Some(8080),

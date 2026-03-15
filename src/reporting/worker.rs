@@ -28,6 +28,8 @@ use super::types::{
 pub struct InstanceSnapshot {
     /// App name.
     pub app_name: String,
+    /// Namespace the app belongs to.
+    pub namespace: String,
     /// Instance index (parsed from InstanceId, e.g. "web-0" -> 0).
     pub instance_id: u32,
     /// OCI image reference (or empty for process workloads).
@@ -187,6 +189,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
 
                 RunningApp {
                     app_name: inst.app_name.clone(),
+                    namespace: inst.namespace.clone(),
                     instance_id: inst.instance_id,
                     image: inst.image.clone(),
                     port: inst.port,
@@ -249,6 +252,7 @@ mod tests {
                             let snapshot = AgentSnapshot {
                                 instances: vec![InstanceSnapshot {
                                     app_name: "web".to_string(),
+                                    namespace: "default".to_string(),
                                     instance_id: 0,
                                     image: "nginx:latest".to_string(),
                                     port: Some(8080),

@@ -43,6 +43,7 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                         let snapshot = AgentSnapshot {
                             instances: vec![InstanceSnapshot {
                                 app_name: "web".to_string(),
+                                namespace: "default".to_string(),
                                 instance_id: 0,
                                 image: "nginx:latest".to_string(),
                                 port: Some(8080),
