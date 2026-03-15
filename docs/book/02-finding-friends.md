@@ -1459,3 +1459,61 @@ learning_period_timeout_secs = 15
 large_cluster_timeout_secs = 30
 large_cluster_node_count = 5000
 ```
+
+## The Meat scheduler
+
+We know who's in the cluster (Mustard gossip). We know who's in charge (Raft council). We know what's running where (reporting tree). We know how to recover after a leadership change (state reconstruction). Now we can finally answer the question that started this chapter: given an app with 3 replicas, which 3 nodes should run them?
+
+That's the Meat scheduler's job.
+
+### The four-phase pipeline
+
+Meat uses a four-phase placement pipeline: Filter → Score → Select → Commit. For each replica, the pipeline runs once. After placing a replica, the cluster state cache is updated before placing the next. This prevents the scheduler from accidentally sending all replicas to the same node.
+
+**Phase 1: Filter.** Eliminate nodes that can't run the workload. A node is filtered out if it's not ready (hasn't reported since the leader election, or is being drained), doesn't have enough CPU/memory/GPU capacity, or doesn't match the app's required placement labels.
+
+```rust
+pub fn filter_nodes(
+    resources: &Resources,
+    required_labels: &BTreeMap<String, String>,
+    cluster: &ClusterStateCache,
+) -> Vec<NodeId>
+```
+
+Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, only nodes with that label are eligible. If no nodes match, the app stays unscheduled. Preferred labels are soft constraints handled in scoring.
+
+**Phase 2: Score.** Rank the surviving candidates on a 0–100 scale. The score is a weighted sum of several dimensions:
+
+| Dimension | Weight | Logic |
+|-----------|--------|-------|
+| Bin-packing | 50% | Prefer fuller nodes (maximise density) |
+| Preferred labels | 20% | Prefer nodes matching soft constraints |
+| Image locality | 15% | Prefer nodes with cached images (Phase 5) |
+| Spread | 10% | Penalise nodes already running this app |
+| Stability | 5% | Prefer longer-running nodes |
+
+Bin-packing dominates on purpose. Reliaburger wants to pack workloads densely so idle nodes can be powered down. Spread is a secondary concern — it matters most when nodes are already heavily loaded, which is when you want replicas on different machines for resilience.
+
+**Phase 3: Select.** Pick the highest-scoring node. Ties are broken by `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
+
+**Phase 4: Commit.** Reserve the resources in the cluster state cache and record the placement. The `Scheduler.reserve()` method updates the node's allocated resources and marks the app as running there, which affects the next replica's scoring (spread penalty kicks in).
+
+### Daemon mode
+
+Some workloads need to run everywhere: log collectors, monitoring agents, security scanners. For these, you set `replicas = "*"` in the config. The scheduler skips the score/select loop and places one replica on every node that passes the filter. When a new node joins the cluster, the daemon app is automatically scheduled there too (that wiring happens in the agent integration step).
+
+### Namespace quotas
+
+Namespaces provide resource isolation. Each namespace can have limits on CPU, memory, GPUs, number of apps, and total replica count. The scheduler checks quotas before the filter phase. If a deployment would push a namespace over its budget, the scheduler rejects it with a clear error message:
+
+```
+namespace "staging" would exceed CPU quota: 1800+500 > 2000m
+```
+
+The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
+
+### The cluster state cache
+
+The scheduler doesn't query gossip or the reporting tree directly. Instead, it maintains a `ClusterStateCache` with one `SchedulerNodeState` per node. This cache holds the allocatable resources, current allocations, labels, readiness status, and set of running apps. After each placement, the cache is updated immediately, so the next placement sees the correct available resources.
+
+This is a critical design choice. If the scheduler placed 3 replicas without updating the cache between placements, all three might land on the same node (it would appear to have the most free resources each time). The iterative update prevents this.
