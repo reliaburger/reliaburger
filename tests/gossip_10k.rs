@@ -11,10 +11,10 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use reliaburger::meat::NodeId;
 use reliaburger::mustard::{
     GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, MustardNode, MustardTransport,
 };
-use reliaburger::patty::NodeId;
 
 fn node_addr(i: usize) -> SocketAddr {
     let port = (i % 60000) as u16 + 1024;

@@ -223,7 +223,7 @@ mod tests {
     use openraft::Membership;
 
     use crate::config::app::AppSpec;
-    use crate::patty::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
+    use crate::meat::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
 
     use super::*;
 

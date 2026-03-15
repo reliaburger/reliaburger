@@ -8,11 +8,11 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use reliaburger::meat::NodeId;
 use reliaburger::mustard::{
     DisseminationQueue, GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork,
     InMemoryTransport, MembershipUpdate, MustardNode, MustardTransport, NodeState,
 };
-use reliaburger::patty::NodeId;
 
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))

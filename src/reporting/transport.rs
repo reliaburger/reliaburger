@@ -147,7 +147,7 @@ impl ReportingTransport for InMemoryReportingTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patty::NodeId;
+    use crate::meat::NodeId;
     use crate::reporting::types::{ResourceUsage, StateReport};
     use std::time::{Duration, SystemTime};
 

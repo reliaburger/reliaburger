@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::council::types::DesiredState;
-use crate::patty::types::{AppId, NodeId};
+use crate::meat::types::{AppId, NodeId};
 use crate::reporting::aggregator::AggregatedState;
 
 use super::types::Correction;
@@ -92,7 +92,7 @@ mod tests {
 
     use super::*;
     use crate::council::types::DesiredState;
-    use crate::patty::types::{Placement, Resources};
+    use crate::meat::types::{Placement, Resources};
     use crate::reporting::types::{
         AppResourceUsage, ReportHealthStatus, ResourceUsage, RunningApp, StateReport,
     };

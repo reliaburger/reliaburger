@@ -37,7 +37,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 2: Cluster Formation
 
-- [x] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/patty/types.rs`)
+- [x] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/meat/types.rs`)
 - [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
 - [x] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
 - [x] Indirect probe (PING-REQ) ACK routing, proptest for conflict resolution, broadcast count lambda=3
@@ -46,7 +46,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7
 - [x] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel
 - [x] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction
-- [ ] Patty scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas
+- [x] Meat scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas
 - [ ] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [ ] CLI extensions: `relish join`

@@ -2,7 +2,7 @@
 
 Cross-cutting design for Reliaburger's deployment system: rolling deploys with zero downtime, automatic rollback on health check failure, dependency ordering via `run_before`, deploy history and audit trail, blue-green deploys, and built-in autoscaling.
 
-This subsystem is cross-cutting. It doesn't live in a single component; it coordinates across Patty (scheduling), Bun (container lifecycle), Wrapper (connection draining and routing pool updates), Onion (service map backend updates), and Ketchup (deploy event logging). The deploy orchestration loop itself runs on the leader node as part of the Patty scheduler.
+This subsystem is cross-cutting. It doesn't live in a single component; it coordinates across Meat (scheduling), Bun (container lifecycle), Wrapper (connection draining and routing pool updates), Onion (service map backend updates), and Ketchup (deploy event logging). The deploy orchestration loop itself runs on the leader node as part of the Meat scheduler.
 
 ---
 
@@ -29,7 +29,7 @@ Dependency ordering via `run_before` ensures that prerequisite jobs (e.g., datab
 
 | Component | Role in Deploy System |
 |---|---|
-| **Patty** (scheduler, leader) | Orchestrates the deploy state machine. Makes placement decisions for new instances. Coordinates the rolling sequence across nodes. Enforces namespace quotas at scheduling time. |
+| **Meat** (scheduler, leader) | Orchestrates the deploy state machine. Makes placement decisions for new instances. Coordinates the rolling sequence across nodes. Enforces namespace quotas at scheduling time. |
 | **Bun** (node agent) | Starts and stops containers on each node. Runs health checks against new instances. Reports instance state back to the leader via the reporting tree. Updates the eBPF service map (Onion) on the local node. |
 | **Wrapper** (ingress proxy) | Maintains the routing pool for external traffic. Adds new instances and removes old instances from the pool during transitions. Implements connection draining (stops sending new requests to draining instances, waits for in-flight requests to complete). |
 | **Onion** (service discovery) | Updates the eBPF service map on every node so that internal service-to-service traffic routes to the correct backends. Map updates are atomic and take microseconds. |
@@ -126,7 +126,7 @@ The deploy lifecycle is modeled as an explicit state machine. Each deploy has ex
 
 ### 3.2 Leader-Node Coordination
 
-The deploy orchestration loop runs on the leader node inside Patty. For each rollout step, the leader:
+The deploy orchestration loop runs on the leader node inside Meat. For each rollout step, the leader:
 
 1. Sends a `StartInstance` command to the target node's Bun agent (via the reporting tree).
 2. Bun starts the new container, allocates a host port, and begins health checking.
@@ -711,7 +711,7 @@ When a deploy includes both the migration job and the API app (e.g., both refere
 
 1. Parses the `DependencyGraph` from all jobs with `run_before` fields referencing the target app.
 2. Transitions the deploy to `RunningPreDeps` phase.
-3. Dispatches all dependency jobs to the Patty scheduler (jobs without inter-dependencies run in parallel).
+3. Dispatches all dependency jobs to the Meat scheduler (jobs without inter-dependencies run in parallel).
 4. Waits for all dependency jobs to complete successfully.
 5. On success: transitions to `Rolling` phase and begins the rolling update.
 6. On failure (any dependency job fails after exhausting retries): transitions to `Failed` with a clear error indicating which job failed and why. The app isn't modified.
@@ -764,7 +764,7 @@ auto_rollback = true        # if any green instance fails, abandon the green set
 
 ### 5.7 Autoscaling
 
-Autoscaling adjusts the runtime replica count based on observed metrics. The autoscaler runs as a periodic evaluation loop on the leader node (inside Patty), separate from the deploy state machine.
+Autoscaling adjusts the runtime replica count based on observed metrics. The autoscaler runs as a periodic evaluation loop on the leader node (inside Meat), separate from the deploy state machine.
 
 **Configuration:**
 
@@ -784,7 +784,7 @@ max = 10            # never scale above 10 replicas
 4. Clamp `desired` to `[min, max]`.
 5. If `desired != current_replicas` and the cooldown period has elapsed since the last scale event, initiate a scale operation.
 
-**Scale-up** starts new instances using the same placement logic as a deploy (Patty picks nodes, Bun starts containers, health checks run, Wrapper/Onion add to pools). Scale-up doesn't drain or stop any existing instances.
+**Scale-up** starts new instances using the same placement logic as a deploy (Meat picks nodes, Bun starts containers, health checks run, Wrapper/Onion add to pools). Scale-up doesn't drain or stop any existing instances.
 
 **Scale-down** removes excess instances using the drain protocol (remove from routing, wait for drain, stop). Instances are removed from least-loaded nodes first.
 
@@ -869,7 +869,7 @@ health_timeout = "60s"
 
 - **Starting / HealthChecking:** The new instance on the failed node is considered lost. The leader reschedules the step to a different healthy node. If no healthy node has capacity, the deploy halts.
 - **RoutingUpdate / Draining:** The old instance was already removed from the routing pool. The new instance may or may not be healthy. The leader checks whether the new instance was added to the routing pool before the node failed. If yes, the routing entry is stale (points to a dead node) and must be removed. The leader reschedules the app instance to a surviving node.
-- **Any phase:** If the failed node was running already-completed steps (instances from earlier steps that are now on the new version), those instances are lost and must be rescheduled to surviving nodes. This is handled by the normal Patty rescheduling logic, independent of the deploy system.
+- **Any phase:** If the failed node was running already-completed steps (instances from earlier steps that are now on the new version), those instances are lost and must be rescheduled to surviving nodes. This is handled by the normal Meat rescheduling logic, independent of the deploy system.
 
 **Mitigation:** Deploy state is persisted in Raft after every phase transition. If the leader itself fails, the new leader reads the deploy state from Raft and resumes from the last committed phase. The chaos test "kill leader mid-deploy, verify deploy completes after election" validates this path.
 
@@ -911,7 +911,7 @@ health_timeout = "60s"
 
 **Trigger:** There isn't enough CPU/memory on any eligible node to start a new instance alongside the existing one (required for `max_surge`).
 
-**Behaviour:** The deploy remains in `Rolling` state with the current step stuck in `Pending`. Patty's scheduler emits a warning: "deploy blocked: no eligible node has capacity for app.web (needs 500m CPU, 512Mi memory)". If resources aren't freed within a configurable deploy timeout (default: 30 minutes), the deploy halts.
+**Behaviour:** The deploy remains in `Rolling` state with the current step stuck in `Pending`. Meat's scheduler emits a warning: "deploy blocked: no eligible node has capacity for app.web (needs 500m CPU, 512Mi memory)". If resources aren't freed within a configurable deploy timeout (default: 30 minutes), the deploy halts.
 
 ---
 
@@ -1012,7 +1012,7 @@ The integration test "rolling deploy with zero downtime (continuous health probe
 5. Verify that the deploy completes and all instances are on the new version.
 6. Report the total deploy time and the number of successful probe requests.
 
-This test exercises the full deploy path: Patty orchestration, Bun container lifecycle, Wrapper routing pool updates, Onion service map updates, and connection draining.
+This test exercises the full deploy path: Meat orchestration, Bun container lifecycle, Wrapper routing pool updates, Onion service map updates, and connection draining.
 
 ### 10.2 Rollback Testing
 

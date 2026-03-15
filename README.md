@@ -69,7 +69,7 @@ src/
     state_machine.rs   # CouncilStateMachine (applies entries, snapshots)
     network.rs         # InMemoryRaftRouter (test network with partitions)
     node.rs            # CouncilNode (high-level wrapper over openraft)
-  patty/               # Scheduler (shared types, placement TBD)
+  meat/               # Scheduler (shared types, placement TBD)
     types.rs           # NodeId, AppId, Resources, NodeCapacity
 docs/
   README.md            # User documentation (install, build, run)
@@ -104,38 +104,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**Phase 1 complete.** **Phase 2 in progress** (cluster formation). 488 passing tests.
-
-### Phase 1 — Single-node container lifecycle
-
-- TOML config parsing for all 7 resource types with custom serde deserialisers
-- Container runtime interface: 10-state lifecycle state machine, concurrent port allocator, cgroup v2 parameter computation, OCI runtime spec generation
-- Three container runtimes: ProcessGrill (cross-platform), RuncGrill (Linux), AppleContainerGrill (macOS) with auto-detection
-- OCI image pulling: pull real images from Docker Hub, content-addressed blob caching, layer unpacking with whiteout support
-- Rootless runc: user namespace UID/GID mapping, rootless cgroups v2, no-sudo container execution
-- Bun node agent: event loop with health check timer, command channels, graceful shutdown
-- Job execution: run-to-completion tasks with exit code tracking, retry with exponential backoff
-- Init containers: sequential pre-start execution, failure prevents main app start
-- Restart re-drive: instances automatically restart through full lifecycle after health check or job failure
-- Local HTTP API (axum on port 9117): deploy, status, stop, logs, health endpoints with SSE streaming
-- Relish CLI: `init`, `apply` (with dry-run fallback and streaming progress), `status`, `logs` (with `--tail` and `--follow`), `exec`, `inspect`, three output formats
-- HostPath-style volumes: dual-mode with explicit source (hostPath) or managed storage
-- HTTP health probing with configurable intervals, timeouts, and thresholds
-- TestApp standalone binary for demos and integration tests
-- 21 integration tests exercising the full stack end to end
-
-### Phase 2 — Cluster formation (in progress)
-
-- Shared cluster types: `NodeId`, `AppId`, `Resources` with saturating arithmetic, `NodeCapacity`, `SchedulingDecision`
-- Mustard SWIM gossip protocol: `NodeState` state machine (Alive → Suspect → Dead), incarnation-based conflict resolution, membership table, piggyback dissemination queue with priority ordering
-- Transport abstraction: `MustardTransport` trait with `InMemoryNetwork` for testing (supports partition injection for chaos tests)
-- SWIM probe cycle: `MustardNode` protocol driver with PING → ACK → PING-REQ → Suspect flow, indirect probing with relay ACK forwarding, suspicion refutation, gossip convergence across 5-node ring topology
-- Property-based testing for incarnation conflict resolution, criterion benchmarks for convergence scaling (5–250 nodes)
-- Raft consensus via openraft: in-memory log store (`BTreeMap`-backed), state machine applying `RaftRequest` entries to `DesiredState` with JSON snapshots, in-memory network with partition simulation
-- `CouncilNode` high-level API: single-node bootstrap, learner-based growth to 3–7 voters, leader election, log replication, failover, partition tolerance
-- 43 council tests: types, storage, state machine, network routing, leader election (3/5 node), replication, failover with state preservation, network partition majority/minority
-
-See [progress.md](docs/progress.md) for the full checklist.
+See [progress.md](docs/progress.md) for the full implementation checklist.
 
 ## Licence
 

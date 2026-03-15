@@ -174,7 +174,7 @@ mod tests {
 
     use crate::config::app::AppSpec;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
-    use crate::patty::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
+    use crate::meat::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
 
     use super::*;
 

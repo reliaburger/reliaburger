@@ -33,7 +33,7 @@ Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a de
 |------------|-----------|-----|
 | **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated via HMAC derived from node certificates. Raft log entries are encrypted at rest. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
 | **Bun** (Agent) | Every node | Bun is the host process. Mustard, Raft, and the reporting tree all run as async tasks within the Bun process. Bun owns the node lifecycle (join, leave, shutdown) that Mustard reacts to. |
-| **Patty** (Scheduler) | Leader only | The leader runs Patty. Council selection criteria (resource availability, stability) are evaluated using data that Patty also consumes. The leader's scheduling decisions are replicated via Raft. |
+| **Meat** (Scheduler) | Leader only | The leader runs Meat. Council selection criteria (resource availability, stability) are evaluated using data that Meat also consumes. The leader's scheduling decisions are replicated via Raft. |
 | **Lettuce** (GitOps) | Council coordinator | When GitOps is enabled, the Lettuce engine provides the authoritative desired state. During state reconstruction, the new leader loads desired state from the git repository via Lettuce. |
 | **Onion** (Service Discovery) | All nodes | Onion's eBPF-based service map depends on knowing which apps are scheduled where, information that flows through the Raft log and is disseminated by council members. |
 | **Grill** (Container Runtime) | All nodes | Grill reports running container state to Bun, which feeds into StateReports sent via the reporting tree during reconstruction. |
@@ -336,7 +336,7 @@ enum RaftPayload {
     AppDelete {
         app_name: String,
     },
-    /// A scheduling decision was made by Patty.
+    /// A scheduling decision was made by Meat.
     SchedulingDecision {
         app_name: String,
         placements: Vec<Placement>,

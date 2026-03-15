@@ -17,7 +17,7 @@ use std::time::Instant;
 use rand::seq::SliceRandom;
 use tokio_util::sync::CancellationToken;
 
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 use super::config::GossipConfig;
 use super::dissemination::DisseminationQueue;

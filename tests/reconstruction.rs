@@ -12,7 +12,7 @@ use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRout
 use reliaburger::council::node::CouncilNode;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
-use reliaburger::patty::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
+use reliaburger::meat::types::{AppId, NodeId, Placement, Resources, SchedulingDecision};
 use reliaburger::reconstruction::controller::ReconstructionController;
 use reliaburger::reconstruction::types::{Correction, LearningOutcome, ReconstructionPhase};
 use reliaburger::reporting::aggregator::AggregatedState;

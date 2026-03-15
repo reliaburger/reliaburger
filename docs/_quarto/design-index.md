@@ -8,7 +8,7 @@ This document contains the detailed design specifications for each Reliaburger c
 
 {{< include design/gossip-mustard.md >}}
 
-{{< include design/scheduler-patty.md >}}
+{{< include design/scheduler-meat.md >}}
 
 {{< include design/discovery-onion.md >}}
 

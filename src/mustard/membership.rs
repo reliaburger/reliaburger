@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 use super::message::MembershipUpdate;
 use super::state::{self, NodeState};

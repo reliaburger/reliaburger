@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::node::ReportingTreeSection;
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 use super::transport::ReportingTransport;
 use super::types::{ReportingMessage, StateReport};

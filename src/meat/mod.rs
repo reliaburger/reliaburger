@@ -1,14 +1,16 @@
-/// Patty scheduler.
+/// Meat scheduler.
 ///
 /// Handles multi-node workload placement decisions. The scheduler runs
 /// on the leader node and uses a four-phase pipeline (Filter → Score →
 /// Select → Commit) to place replicas across the cluster.
-///
-/// This module is built incrementally across Phase 2. Currently it
-/// exports the shared cluster types; the placement logic arrives in
-/// later PRs.
+pub mod cluster_state;
+pub mod filter;
+pub mod quota;
+pub mod scheduler;
+pub mod score;
 pub mod types;
 
-// TODO(Phase 2): placement, scoring, cluster_state, quota modules
-
+pub use cluster_state::{ClusterStateCache, SchedulerNodeState};
+pub use quota::{NamespaceQuota, NamespaceUsage, QuotaError, check_quota};
+pub use scheduler::{ScheduleError, Scheduler};
 pub use types::{AppId, NodeCapacity, NodeId, Placement, Resources, SchedulingDecision};

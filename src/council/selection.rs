@@ -8,9 +8,9 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::meat::NodeId;
 use crate::mustard::membership::MembershipTable;
 use crate::mustard::state::NodeState;
-use crate::patty::NodeId;
 
 // ---------------------------------------------------------------------------
 // CouncilSelectionConfig

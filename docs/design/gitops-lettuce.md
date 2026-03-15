@@ -29,7 +29,7 @@ Lettuce isn't a separate daemon, sidecar, or CRD controller. It's a module withi
 | **Bun** | Host process. Lettuce runs as a module inside the Bun binary on the elected GitOps coordinator (a council member). | Shares the Bun process lifecycle, mTLS identity, and signal handling. |
 | **Raft (Council)** | Stores sync state, coordinator election, and desired state replication. Lettuce reads current desired state from Raft to compute diffs and forwards applies to the leader. | Coordinator election is a Raft-replicated state machine entry, not a separate protocol. |
 | **Sesame** | Provides the mTLS certificate used for git-over-HTTPS client authentication (if configured) and verifies GPG/SSH commit signatures against the cluster's trusted key set. | Lettuce calls into Sesame's signature verification API rather than implementing its own PGP/SSH parsing. |
-| **Patty** | Scheduler. After Lettuce applies a changed app spec to Raft, Patty handles scheduling decisions (replica placement, rolling deploys). | Lettuce doesn't schedule directly; it writes desired state and Patty reacts. |
+| **Meat** | Scheduler. After Lettuce applies a changed app spec to Raft, Meat handles scheduling decisions (replica placement, rolling deploys). | Lettuce doesn't schedule directly; it writes desired state and Meat reacts. |
 | **Brioche** | Web UI. Displays sync status, last applied commit, pending change preview, and sync history. | Brioche reads Lettuce state from the Raft-replicated `SyncState` struct. |
 | **Mustard** | Gossip protocol. Used to detect coordinator node health. If the coordinator's gossip heartbeat stops, the council elects a replacement. | Lettuce doesn't use Mustard directly; the council handles coordinator failover. |
 
@@ -583,8 +583,8 @@ The diff engine compares two `DesiredState` trees: one from the parsed git TOML,
 Only changed resources are written to Raft. The apply phase:
 
 1. For each `added` resource: write the full resource spec to Raft via the leader.
-2. For each `modified` resource: write the updated resource spec. Patty determines the deploy strategy (rolling, blue-green) based on what changed -- an image tag change triggers a rolling deploy, an env-only change may trigger a config reload if the app supports it.
-3. For each `removed` resource: write a deletion marker. Patty drains and stops the affected workloads.
+2. For each `modified` resource: write the updated resource spec. Meat determines the deploy strategy (rolling, blue-green) based on what changed -- an image tag change triggers a rolling deploy, an env-only change may trigger a config reload if the app supports it.
+3. For each `removed` resource: write a deletion marker. Meat drains and stops the affected workloads.
 4. All writes are batched into a single Raft proposal to ensure atomicity. Either all changes from a single commit are applied, or none are.
 
 **Partial failure handling:** If the Raft write fails (e.g., leader step-down during apply), the entire batch is retried on the next sync cycle. The `SyncState` isn't updated, so the next poll or webhook re-processes the same commit.
@@ -599,7 +599,7 @@ This is critical to prevent Lettuce from fighting the autoscaler during traffic 
 
 1. During diff computation, the `replicas` field is extracted and compared separately from all other fields.
 2. If `replicas` in git equals `replicas` in the Raft desired state (the git-sourced base, not the runtime count), the `replicas` field is excluded from the `modified` field changes, even if other fields changed.
-3. If `replicas` in git differs from `replicas` in the Raft desired state, the change is included and `replicas_changed` is set to `true` on the `ResourceChange`. Patty resets the autoscaler's baseline to the new value.
+3. If `replicas` in git differs from `replicas` in the Raft desired state, the change is included and `replicas_changed` is set to `true` on the `ResourceChange`. Meat resets the autoscaler's baseline to the new value.
 4. The autoscaler's `min` and `max` from `[app.*.autoscale]` are always synced from git (they are configuration, not runtime state).
 
 **Example scenario:**

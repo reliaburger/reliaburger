@@ -29,7 +29,7 @@ Core capabilities:
 | **Raft** (council consensus) | Stores image manifests (the metadata describing which layers compose an image) for consistency. The Raft state machine is the authoritative source for manifest data, tag-to-digest mappings, and the peer location map (which nodes hold which layers). |
 | **Mustard** (gossip protocol) | Provides cluster membership and peer discovery. Pickle uses Mustard to discover which nodes are alive and their network addresses, enabling peer selection for replication and parallel downloads. Mustard also disseminates node resource summaries that inform peer selection (e.g., least-loaded node). |
 | **Sesame** (security / mTLS / identity) | Provides the mTLS certificates for secure inter-node layer transfers, the workload identity JWTs used for keyless image signing, and the OIDC issuer infrastructure for Sigstore-compatible verification. |
-| **Patty** (scheduler) | Consumes image availability from Raft state to make scheduling decisions. Patty considers an image schedulable once its manifest exists in Raft with sufficient replication. Patty refuses to schedule unsigned images when `require_signatures = true`. |
+| **Meat** (scheduler) | Consumes image availability from Raft state to make scheduling decisions. Meat considers an image schedulable once its manifest exists in Raft with sufficient replication. Meat refuses to schedule unsigned images when `require_signatures = true`. |
 
 ---
 
@@ -106,7 +106,7 @@ Client (docker push / crane push / build job)
     │   reporting tree: "myapp:v1.4.2 available, layers [...], held by [...]"
     │
     ▼
-[6] Patty considers the image schedulable
+[6] Meat considers the image schedulable
 ```
 
 When `push_sync = false`, step [3] returns immediately after local storage (step [2]) and replication proceeds in the background. The client gets a faster response but loses the single-node-failure durability guarantee until background replication completes.
@@ -114,7 +114,7 @@ When `push_sync = false`, step [3] returns immediately after local storage (step
 ### 3.3 Pull Flow
 
 ```
-Patty schedules app.api to Node 4 → Node 4 needs myapp:v1.4.2
+Meat schedules app.api to Node 4 → Node 4 needs myapp:v1.4.2
   │
   ▼
 [1] Check local store
@@ -754,7 +754,7 @@ For images pushed from external CI systems:
 
 [2] Pickle receives the signature as an OCI artifact alongside the image.
 
-[3] On schedule, Patty verifies the signature against public keys
+[3] On schedule, Meat verifies the signature against public keys
     registered in cluster configuration:
     [images.trust_policy]
     keys = ["cosign-key:abc123..."]
@@ -767,7 +767,7 @@ For images pushed from external CI systems:
 When `require_signatures = true`:
 
 - Unsigned images are accepted into Pickle (pushes don't fail).
-- Unsigned images remain **unschedulable** -- Patty refuses to place them.
+- Unsigned images remain **unschedulable** -- Meat refuses to place them.
 - `relish inspect <image>` shows signature status.
 
 ```bash
@@ -813,7 +813,7 @@ async fn pre_pull_loop(
 }
 ```
 
-By the time Patty schedules a new replica on a node, the image may already be cached, reducing scheduling-to-running latency to near zero.
+By the time Meat schedules a new replica on a node, the image may already be cached, reducing scheduling-to-running latency to near zero.
 
 ### 5.8 Build Job Integration
 
@@ -892,7 +892,7 @@ external_registries = [
   { host = "docker.io", username = "myorg", password_secret = "dockerhub-token" },
 ]
 
-# Require all images to be signed before Patty will schedule them.
+# Require all images to be signed before Meat will schedule them.
 # Unsigned images are accepted into Pickle but remain unschedulable.
 # Default: false
 require_signatures = false
@@ -971,7 +971,7 @@ fn default_true() -> bool { true }
 
 **Scenario:** Through an unlikely sequence of failures (or misconfiguration with `redundancy = 0`), a node holding the only copy of an image's layers goes down.
 
-**Behaviour:** The image's `ReplicationState` transitions to `Lost`. Patty can't schedule new instances of the image. Running instances on other nodes (which have the layers cached locally from prior pulls) continue operating.
+**Behaviour:** The image's `ReplicationState` transitions to `Lost`. Meat can't schedule new instances of the image. Running instances on other nodes (which have the layers cached locally from prior pulls) continue operating.
 
 **Recovery:** If the node recovers, its layers become available again. If the node is permanently lost, the image must be re-pushed. `relish status` and `relish wtf` prominently warn about lost images. No silent data loss occurs -- the system explicitly reports the situation.
 
@@ -1006,7 +1006,7 @@ Build jobs are granted write access to Pickle only through a Unix socket mounted
 
 When `require_signatures = true`:
 
-- **Unsigned images are accepted but unschedulable.** Pushes never fail due to missing signatures, which avoids breaking CI pipelines. However, Patty refuses to schedule unsigned images. This creates a clear separation: the registry accepts all valid OCI images; the scheduler enforces trust policy.
+- **Unsigned images are accepted but unschedulable.** Pushes never fail due to missing signatures, which avoids breaking CI pipelines. However, Meat refuses to schedule unsigned images. This creates a clear separation: the registry accepts all valid OCI images; the scheduler enforces trust policy.
 - **Keyless signing eliminates key management.** Build jobs sign automatically using their workload identity JWT. No signing keys to rotate, distribute, or protect.
 - **External signatures use cosign-compatible verification.** Teams pushing from external CI register their public keys in the cluster configuration. Pickle verifies signatures against these keys using the standard cosign verification flow.
 - **Signature verification is cached.** Once a manifest's signature is verified and recorded in Raft, subsequent scheduling decisions don't re-verify. The signature status is part of the `ManifestMetadata`.
@@ -1165,13 +1165,13 @@ Test: build job auto-signs image
   - Run build job with build = true.
   - Verify image has keyless signature in Raft.
   - Verify signature identity matches build job's SPIFFE ID.
-  - Deploy app — verify Patty schedules it (signed).
+  - Deploy app — verify Meat schedules it (signed).
 
 Test: unsigned image is unschedulable
   - Enable require_signatures = true.
   - Push image externally without cosign signature.
   - Attempt to deploy app referencing the image.
-  - Verify Patty refuses to schedule (unsigned).
+  - Verify Meat refuses to schedule (unsigned).
   - Verify relish inspect shows "unsigned".
 
 Test: external cosign signature accepted
@@ -1182,7 +1182,7 @@ Test: external cosign signature accepted
 Test: require_signatures=false allows all images
   - Leave require_signatures at default (false).
   - Push unsigned image.
-  - Deploy app — verify Patty schedules it.
+  - Deploy app — verify Meat schedules it.
 ```
 
 ### 10.5 Pull-Through Cache

@@ -1,24 +1,24 @@
-# Patty: The Reliaburger Scheduler
+# Meat: The Reliaburger Scheduler
 
 ## 1. Overview
 
-Patty is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, allocating batch Jobs at high throughput, orchestrating rolling deployments, enforcing namespace resource quotas, and driving autoscaling reactions.
+Meat is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, allocating batch Jobs at high throughput, orchestrating rolling deployments, enforcing namespace resource quotas, and driving autoscaling reactions.
 
 ### Role in the System
 
-Patty is the single decision-maker for "what runs where." Every App placement, Job allocation, rolling deploy step, and autoscale event flows through Patty. It consumes desired state (from the Raft log or Lettuce GitOps engine), combines it with the cluster's reported runtime state (from the hierarchical reporting tree), and emits scheduling decisions that are committed to Raft and distributed to Bun agents on target nodes.
+Meat is the single decision-maker for "what runs where." Every App placement, Job allocation, rolling deploy step, and autoscale event flows through Meat. It consumes desired state (from the Raft log or Lettuce GitOps engine), combines it with the cluster's reported runtime state (from the hierarchical reporting tree), and emits scheduling decisions that are committed to Raft and distributed to Bun agents on target nodes.
 
 ### Key Design Decisions
 
 - **Single-leader scheduling.** All scheduling decisions are made on one node. This eliminates coordination overhead between multiple schedulers and makes the Raft log the single source of truth for placement decisions. The tradeoff -- a single point of decision-making -- is mitigated by fast leader failover (< 5 seconds) and the delegated batch model.
 
-- **Delegated batch execution.** Patty does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism that enables 100M+ jobs/day without the leader becoming a bottleneck.
+- **Delegated batch execution.** Meat does not schedule individual Jobs from high-throughput batch workloads. Instead, it allocates capacity budgets to nodes ("Node 7, here are your next 200 jobs"), and nodes execute and report completions asynchronously. This is the mechanism that enables 100M+ jobs/day without the leader becoming a bottleneck.
 
-- **Bin-packing first.** Patty uses a bin-packing algorithm as its primary placement strategy, maximising node utilisation before spreading to new nodes. This reduces the number of active nodes under low load and improves cache locality for images already present on a node.
+- **Bin-packing first.** Meat uses a bin-packing algorithm as its primary placement strategy, maximising node utilisation before spreading to new nodes. This reduces the number of active nodes under low load and improves cache locality for images already present on a node.
 
-- **Dedicated CPU budget.** When the cluster exceeds 1,000 nodes, Patty's async task is pinned to a specific CPU core on the leader node, ensuring that API serving, Brioche UI, metrics queries, and other leader responsibilities cannot starve the scheduling loop.
+- **Dedicated CPU budget.** When the cluster exceeds 1,000 nodes, Meat's async task is pinned to a specific CPU core on the leader node, ensuring that API serving, Brioche UI, metrics queries, and other leader responsibilities cannot starve the scheduling loop.
 
-- **Learning period before scheduling.** After a leader election, Patty enters a learning period (collecting StateReports from nodes) and does not make scheduling decisions until it has a sufficiently complete view of the cluster (95% of nodes reported or 15-second timeout). This prevents incorrect placements based on stale or incomplete state.
+- **Learning period before scheduling.** After a leader election, Meat enters a learning period (collecting StateReports from nodes) and does not make scheduling decisions until it has a sufficiently complete view of the cluster (95% of nodes reported or 15-second timeout). This prevents incorrect placements based on stale or incomplete state.
 
 ---
 
@@ -26,16 +26,16 @@ Patty is the single decision-maker for "what runs where." Every App placement, J
 
 | Component | Dependency Type | Why |
 |-----------|----------------|-----|
-| **Raft (Council)** | Hard | Patty reads desired state from the Raft log and commits scheduling decisions to it. Patty only runs on the Raft leader. |
+| **Raft (Council)** | Hard | Meat reads desired state from the Raft log and commits scheduling decisions to it. Meat only runs on the Raft leader. |
 | **Mustard (Gossip)** | Hard | Provides cluster membership, node liveness, leader identity broadcast, and per-node resource summaries (CPU/memory/GPU capacity and utilisation). |
-| **Hierarchical Reporting Tree** | Hard | Nodes report detailed runtime state (running apps, health, resource usage, job completions) to their assigned council member, which aggregates for the leader. This is Patty's primary source of "what is actually running." |
+| **Hierarchical Reporting Tree** | Hard | Nodes report detailed runtime state (running apps, health, resource usage, job completions) to their assigned council member, which aggregates for the leader. This is Meat's primary source of "what is actually running." |
 | **Bun (Agent)** | Hard | Executes scheduling decisions on each node. Bun starts/stops containers, enforces cgroups, and reports back via the reporting tree. |
-| **Grill (Container Runtime)** | Indirect | Bun uses Grill to start containers. Patty does not interact with Grill directly but must account for Grill's startup latency in scheduling decisions. |
-| **Lettuce (GitOps)** | Soft | When GitOps is enabled, Lettuce prepares change sets from git and forwards deploy requests to the leader. Patty processes these identically to CLI/API deploys. |
-| **Mayo (Metrics)** | Soft | Patty reads Mayo metrics for autoscaling decisions (CPU utilisation, custom metrics). Mayo runs on every node; the leader queries aggregated metrics from council members. |
-| **Pickle (Registry)** | Soft | Patty checks image availability on target nodes when making placement decisions. Scheduling to a node that already has the image cached avoids pull latency. |
-| **Wrapper (Ingress)** | Soft | During rolling deploys, Patty coordinates with Wrapper to add/remove instances from the routing pool and wait for connection draining. |
-| **Sesame (Security)** | Soft | Patty validates that deployers have the required permissions (e.g., `host-exec` for process workloads) before accepting scheduling requests. |
+| **Grill (Container Runtime)** | Indirect | Bun uses Grill to start containers. Meat does not interact with Grill directly but must account for Grill's startup latency in scheduling decisions. |
+| **Lettuce (GitOps)** | Soft | When GitOps is enabled, Lettuce prepares change sets from git and forwards deploy requests to the leader. Meat processes these identically to CLI/API deploys. |
+| **Mayo (Metrics)** | Soft | Meat reads Mayo metrics for autoscaling decisions (CPU utilisation, custom metrics). Mayo runs on every node; the leader queries aggregated metrics from council members. |
+| **Pickle (Registry)** | Soft | Meat checks image availability on target nodes when making placement decisions. Scheduling to a node that already has the image cached avoids pull latency. |
+| **Wrapper (Ingress)** | Soft | During rolling deploys, Meat coordinates with Wrapper to add/remove instances from the routing pool and wait for connection draining. |
+| **Sesame (Security)** | Soft | Meat validates that deployers have the required permissions (e.g., `host-exec` for process workloads) before accepting scheduling requests. |
 
 ---
 
@@ -43,7 +43,7 @@ Patty is the single decision-maker for "what runs where." Every App placement, J
 
 ### Internal Structure
 
-Patty is structured as a set of cooperating async tasks within the leader's Bun process. It is not a separate binary or process -- it is compiled into the single Reliaburger binary and activated only on the current leader node.
+Meat is structured as a set of cooperating async tasks within the leader's Bun process. It is not a separate binary or process -- it is compiled into the single Reliaburger binary and activated only on the current leader node.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -92,7 +92,7 @@ Patty is structured as a set of cooperating async tasks within the leader's Bun 
 
 ### Scheduling Algorithm
 
-Patty uses a four-phase placement pipeline for App scheduling:
+Meat uses a four-phase placement pipeline for App scheduling:
 
 **Phase 1: Filter.** Eliminate nodes that cannot run the workload.
 
@@ -111,7 +111,7 @@ Patty uses a four-phase placement pipeline for App scheduling:
 - **Spread score (weight 10):** Penalize nodes that already run other replicas of the same App. This provides failure-domain diversity.
 - **Node stability score (weight 5):** Prefer nodes with longer uptime and no recent restarts.
 
-**Phase 3: Select.** Pick the highest-scoring node. Ties are broken by node ID (deterministic). For multi-replica placements, Patty runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
+**Phase 3: Select.** Pick the highest-scoring node. Ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
 
 **Phase 4: Commit.** Write the scheduling decision to the Raft log. Once committed, the decision is replicated to council members and the assignment is sent to the target Bun agent via the reporting tree.
 
@@ -235,7 +235,7 @@ pub struct PlacementConstraint {
 /// Replica mode for an App.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ReplicaMode {
-    /// Exactly N instances, placed by Patty across available nodes.
+    /// Exactly N instances, placed by Meat across available nodes.
     Fixed(u32),
     /// One instance on every node matching placement constraints (daemon mode).
     /// Instances are added/removed as nodes join/leave.
@@ -438,7 +438,7 @@ pub struct SchedulingDecision {
 }
 
 /// A batch allocation decision for high-throughput jobs.
-/// Instead of scheduling individual jobs, Patty sends a batch to a node.
+/// Instead of scheduling individual jobs, Meat sends a batch to a node.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchAllocation {
     pub allocation_id: u64,
@@ -591,8 +591,8 @@ pub struct MetricSample {
 
 When an App spec with `replicas = 3` is submitted:
 
-1. Patty validates the spec (schema, permissions, namespace quota).
-2. For each replica (0..3), Patty runs the four-phase placement pipeline:
+1. Meat validates the spec (schema, permissions, namespace quota).
+2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
    - **Score:** Rank candidates using the weighted scoring model (bin-packing 50%, preferred labels 20%, image locality 15%, spread 10%, stability 5%).
    - **Select:** Pick the highest-scoring node.
@@ -645,12 +645,12 @@ Higher utilisation after placement is better (the node is more "full"). An imbal
 
 #### Daemon Mode (`replicas = "*"`)
 
-When `replicas = "*"` is specified, Patty does not run the placement pipeline. Instead:
+When `replicas = "*"` is specified, Meat does not run the placement pipeline. Instead:
 
 1. It queries all nodes from the cluster state cache.
 2. If placement `required` labels are specified, it filters to matching nodes.
 3. One instance is scheduled on every qualifying node.
-4. Patty subscribes to Mustard membership events: when a new node joins the cluster and matches the placement constraints, an instance is automatically scheduled. When a node leaves, the instance is removed.
+4. Meat subscribes to Mustard membership events: when a new node joins the cluster and matches the placement constraints, an instance is automatically scheduled. When a node leaves, the instance is removed.
 
 Daemon mode is not bin-packed -- every qualifying node gets exactly one instance regardless of its current load. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
 
@@ -661,8 +661,8 @@ The 100M jobs/day target (approximately 1,150 jobs/sec sustained) requires a fun
 #### Allocation Flow
 
 1. A batch job spec arrives (e.g., `job.render-frame` with `parallelism = 1000`).
-2. Patty computes eligible nodes using the Filter phase (resources, labels, process workload allowlist).
-3. Patty partitions the total instance count across eligible nodes, weighted by available resources:
+2. Meat computes eligible nodes using the Filter phase (resources, labels, process workload allowlist).
+3. Meat partitions the total instance count across eligible nodes, weighted by available resources:
 
 ```rust
 fn allocate_batch(
@@ -717,16 +717,16 @@ fn compute_job_capacity(node: &NodeCapacity, per_instance: &Resources) -> f64 {
 }
 ```
 
-4. Patty commits a single `BatchAllocation` entry per node to the Raft log (not per-instance).
+4. Meat commits a single `BatchAllocation` entry per node to the Raft log (not per-instance).
 5. Bun agents on target nodes receive their allocation and execute instances locally, managing concurrency up to the resource budget.
 6. Nodes report `BatchCompletionReport` back via the hierarchical reporting tree at configurable intervals (default: every 5 seconds or on batch completion, whichever is sooner).
-7. If a node reports `retries_exhausted > 0`, Patty re-allocates those failed instances to other eligible nodes.
+7. If a node reports `retries_exhausted > 0`, Meat re-allocates those failed instances to other eligible nodes.
 
 This model means the Raft log records O(nodes) entries per batch, not O(instances). For a 1000-instance batch across 50 nodes, that is 50 Raft entries instead of 1000.
 
 #### Scheduled Jobs (Cron)
 
-Patty maintains a cron scheduler (using a priority queue keyed by next-fire-time). When a scheduled job's cron expression matches, Patty treats it as a new job submission:
+Meat maintains a cron scheduler (using a priority queue keyed by next-fire-time). When a scheduled job's cron expression matches, Meat treats it as a new job submission:
 
 - If `parallelism` is set, it goes through the batch allocation path.
 - If `replicas = "*"`, the job runs on every qualifying node (e.g., log rotation on all nodes).
@@ -734,7 +734,7 @@ Patty maintains a cron scheduler (using a priority queue keyed by next-fire-time
 
 ### 5.3 Rolling Deploys
 
-When an App's image changes (new deploy via CLI, API, or Lettuce GitOps), Patty orchestrates a rolling deployment:
+When an App's image changes (new deploy via CLI, API, or Lettuce GitOps), Meat orchestrates a rolling deployment:
 
 ```
 For each instance (old version) in the App:
@@ -755,21 +755,21 @@ For each instance (old version) in the App:
 
 The `max_surge` parameter controls how many extra instances can exist simultaneously during the transition. With `max_surge = 1` (default), only one node is being transitioned at a time. With `max_surge = 2`, two nodes can be in transition simultaneously, cutting deploy time roughly in half at the cost of temporarily using more resources.
 
-Patty tracks the rolling deploy as a `RollingDeployState` in memory (and checkpointed to Raft after each step). If the leader fails mid-deploy, the new leader reconstructs the deploy state from the Raft log and resumes from the last committed step.
+Meat tracks the rolling deploy as a `RollingDeployState` in memory (and checkpointed to Raft after each step). If the leader fails mid-deploy, the new leader reconstructs the deploy state from the Raft log and resumes from the last committed step.
 
 #### Dependency Ordering
 
 Jobs with `run_before = ["app.api"]` create a deploy dependency. When a deploy includes both the job and the app:
 
-1. Patty schedules the job and waits for it to complete.
-2. Only after successful job completion does Patty begin the rolling deploy of the dependent App.
+1. Meat schedules the job and waits for it to complete.
+2. Only after successful job completion does Meat begin the rolling deploy of the dependent App.
 3. If the job fails, the deploy is halted and an alert fires.
 
-Dependencies are expressed as a DAG. Patty performs a topological sort at deploy time and executes stages in dependency order.
+Dependencies are expressed as a DAG. Meat performs a topological sort at deploy time and executes stages in dependency order.
 
 ### 5.4 Autoscaling Logic
 
-The autoscaler runs as a periodic task within Patty (default interval: 30 seconds).
+The autoscaler runs as a periodic task within Meat (default interval: 30 seconds).
 
 #### Algorithm
 
@@ -842,8 +842,8 @@ enum ScaleAction {
 
 When a scale action is determined:
 
-- **Scale up:** Patty runs the placement pipeline for the additional replicas, identical to initial placement.
-- **Scale down:** Patty selects replicas to remove using inverse scoring (remove from the lowest-scoring node first, to reclaim the least-efficient placements). Removed instances go through the drain flow (Wrapper removes from routing, wait for drain_timeout, stop).
+- **Scale up:** Meat runs the placement pipeline for the additional replicas, identical to initial placement.
+- **Scale down:** Meat selects replicas to remove using inverse scoring (remove from the lowest-scoring node first, to reclaim the least-efficient placements). Removed instances go through the drain flow (Wrapper removes from routing, wait for drain_timeout, stop).
 
 #### Interaction with GitOps (Lettuce)
 
@@ -856,7 +856,7 @@ This prevents Lettuce from fighting the autoscaler during traffic spikes.
 
 ### 5.5 Daemon Mode Reconciliation
 
-For `replicas = "*"` apps, Patty subscribes to Mustard membership events and runs a reconciliation loop:
+For `replicas = "*"` apps, Meat subscribes to Mustard membership events and runs a reconciliation loop:
 
 ```rust
 fn reconcile_daemon_apps(&self, membership_event: MembershipEvent) {
@@ -886,7 +886,7 @@ fn reconcile_daemon_apps(&self, membership_event: MembershipEvent) {
 
 ### 5.6 Namespace Quota Enforcement
 
-Quotas are enforced at scheduling time (admission check), not retroactively. Before running the placement pipeline, Patty checks:
+Quotas are enforced at scheduling time (admission check), not retroactively. Before running the placement pipeline, Meat checks:
 
 ```rust
 fn check_namespace_quota(
@@ -1015,12 +1015,12 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 **Response:**
 
-1. Patty marks all `BatchAllocation` entries assigned to the failed node as `PartiallyFailed`.
+1. Meat marks all `BatchAllocation` entries assigned to the failed node as `PartiallyFailed`.
 2. The number of instances that had not yet reported completion is computed: `remaining = allocation.instance_count - last_report.completed - last_report.failed`.
-3. Patty re-allocates these `remaining` instances to other eligible nodes via a new `BatchAllocation`.
+3. Meat re-allocates these `remaining` instances to other eligible nodes via a new `BatchAllocation`.
 4. Already-completed instances are not re-run (completion reports are idempotent and stored in the Raft log).
 
-**Edge case:** If the node was mid-execution and rejoins before the re-allocation, the node's Bun agent will report its completed instances. Patty deduplicates: if a re-allocated instance completes on both the original and new node, the second completion is ignored.
+**Edge case:** If the node was mid-execution and rejoins before the re-allocation, the node's Bun agent will report its completed instances. Meat deduplicates: if a re-allocated instance completes on both the original and new node, the second completion is ignored.
 
 ### 7.2 Scheduling with Incomplete State (Post-Election)
 
@@ -1031,7 +1031,7 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 1. The new leader enters the learning period and collects `StateReport` messages from nodes.
 2. It does not make scheduling decisions or accept new deploys during this period.
 3. The learning period ends when 95% of nodes (by Mustard membership count) have reported, or after 15 seconds.
-4. Unreported nodes are marked `NodeStatus::Unknown`. Patty will not schedule new work to them.
+4. Unreported nodes are marked `NodeStatus::Unknown`. Meat will not schedule new work to them.
 5. As `Unknown` nodes report in, they transition to `Ready` and become eligible.
 
 **Worst case:** If the timeout fires with less than 95% reporting, the leader begins scheduling using only the capacity of reported nodes. This may temporarily reduce cluster capacity but avoids incorrect decisions. Latent nodes become available as they report.
@@ -1071,9 +1071,9 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 **Response:**
 
-1. For each failed node's App instances, Patty attempts to reschedule to surviving nodes.
+1. For each failed node's App instances, Meat attempts to reschedule to surviving nodes.
 2. If surviving capacity is insufficient, some replicas remain unscheduled. An alert fires immediately.
-3. Patty prioritizes rescheduling by workload criticality: Apps with fewer remaining healthy replicas are rescheduled first.
+3. Meat prioritizes rescheduling by workload criticality: Apps with fewer remaining healthy replicas are rescheduled first.
 4. Batch jobs on failed nodes are re-allocated as described in 7.1.
 
 ---
@@ -1086,7 +1086,7 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 **Mitigation:**
 
-- All communication between Patty and Bun agents flows through the mTLS channel managed by Sesame. Scheduling decisions are signed by the leader's node certificate.
+- All communication between Meat and Bun agents flows through the mTLS channel managed by Sesame. Scheduling decisions are signed by the leader's node certificate.
 - Bun agents verify that scheduling directives come from the current Raft leader (whose identity they know via Mustard gossip).
 - Scheduling decisions are committed to the Raft log before being executed. A compromised non-leader node cannot write to the Raft log (it is not a council member, or if it is, it is not the leader).
 - The Raft log itself provides an audit trail: every scheduling decision is attributed to the leader that made it.
@@ -1098,8 +1098,8 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 **Mitigation:**
 
 - **Namespace quotas** cap the total CPU, memory, GPU, app count, and replica count per namespace. A single tenant cannot exceed their quota.
-- **Admission validation:** Patty validates all resource requests at submission time. Requests exceeding remaining quota are rejected immediately.
-- **Batch parallelism limits:** The `parallelism` field caps the maximum concurrent instances for a batch job. Patty enforces this limit and does not allocate more than `parallelism` instances across all nodes combined.
+- **Admission validation:** Meat validates all resource requests at submission time. Requests exceeding remaining quota are rejected immediately.
+- **Batch parallelism limits:** The `parallelism` field caps the maximum concurrent instances for a batch job. Meat enforces this limit and does not allocate more than `parallelism` instances across all nodes combined.
 - **Rate limiting:** The leader's API server rate-limits deploy and job submission requests per authenticated identity (configurable, default 100 requests/minute). This prevents a compromised CI pipeline from flooding the scheduler.
 
 ### 8.3 Process Workload Escalation
@@ -1109,7 +1109,7 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 **Mitigation:**
 
 - Process workloads require explicit `admin` or `host-exec` permission.
-- Operators must configure a binary allowlist in `node.toml`. Patty's Filter phase rejects process workloads targeting nodes without the required binary in the allowlist.
+- Operators must configure a binary allowlist in `node.toml`. Meat's Filter phase rejects process workloads targeting nodes without the required binary in the allowlist.
 - Even after scheduling, Bun enforces cgroup isolation, PID namespace, restricted mount namespace, seccomp profile, and the dedicated `burger` user.
 
 ### 8.4 Scheduling Decision Replay
@@ -1163,14 +1163,14 @@ Rolling deploy state:    ~2 KB per in-progress deploy
 Autoscale state:         ~4 KB per App (metric sample window)
 1,000 autoscaled Apps:   ~4 MB
 
-Total Patty memory:      ~28 MB (at 10,000 nodes, peak)
+Total Meat memory:      ~28 MB (at 10,000 nodes, peak)
 ```
 
-This fits comfortably within a typical server's memory. The 312 MB total Bun agent memory (at 500 apps) noted in the whitepaper benchmarks includes all Bun subsystems, not just Patty.
+This fits comfortably within a typical server's memory. The 312 MB total Bun agent memory (at 500 apps) noted in the whitepaper benchmarks includes all Bun subsystems, not just Meat.
 
 ### 9.4 CPU Budget
 
-Patty's scheduling loop is designed to consume < 15% of a single core at sustained throughput. At the 1,150 jobs/sec target:
+Meat's scheduling loop is designed to consume < 15% of a single core at sustained throughput. At the 1,150 jobs/sec target:
 
 - Each scheduling decision involves: one Filter pass (~50us), one Score pass (~20us), one Select (~1us), one Raft commit (~200us for the leader's local append; replication is async for scheduling decisions that are not App deploys).
 - Total: ~270us per decision. At 1,150 decisions/sec = ~310ms of CPU per second = 31% of one core.
@@ -1184,7 +1184,7 @@ In practice, the batch model means most scheduling decisions are batch allocatio
 
 ### 10.1 Scheduler Simulation
 
-Patty includes a deterministic simulation mode that can be driven without a real cluster. The simulator replaces the Raft log, Mustard gossip, and reporting tree with in-memory fakes.
+Meat includes a deterministic simulation mode that can be driven without a real cluster. The simulator replaces the Raft log, Mustard gossip, and reporting tree with in-memory fakes.
 
 ```rust
 #[cfg(test)]
@@ -1193,7 +1193,7 @@ mod simulation {
 
     /// A simulated cluster with configurable nodes and workloads.
     struct SchedulerSimulation {
-        scheduler: PattyScheduler,
+        scheduler: MeatScheduler,
         nodes: Vec<SimulatedNode>,
         clock: FakeClock,
         raft_log: Vec<RaftEntry>,
@@ -1240,7 +1240,7 @@ Key simulation test scenarios:
 
 ### 10.2 Integration Tests
 
-The following tests from the built-in `relish test` suite exercise Patty against a live cluster:
+The following tests from the built-in `relish test` suite exercise Meat against a live cluster:
 
 | Test | Description | Expected Duration |
 |------|-------------|-------------------|
@@ -1283,13 +1283,13 @@ The `relish bench` scheduler throughput test:
 
 The Kubernetes scheduler uses a similar filter-then-score pipeline (called "predicates" and "priorities" in older versions, now "filter" and "score" plugins in the Scheduling Framework). It evaluates all nodes for each Pod and selects the highest-scoring node.
 
-**What we borrow:** The filter/score two-phase architecture is well-proven and extensible. Patty adopts this structure.
+**What we borrow:** The filter/score two-phase architecture is well-proven and extensible. Meat adopts this structure.
 
 **What we do differently:**
 
-- Kubernetes scores with a plugin framework that supports arbitrary user-defined scorers. Patty uses a fixed set of scoring dimensions with configurable weights, trading extensibility for simplicity and predictable performance.
-- Kubernetes schedules every Pod individually through the scheduler, including batch Jobs. This becomes a bottleneck at high Job throughput. Patty delegates batch execution to nodes.
-- Kubernetes has no built-in concept of namespace resource quotas enforced at scheduling time (ResourceQuotas exist but are enforced by the API server admission controller, not the scheduler). Patty enforces quotas directly in the scheduler to prevent scheduling decisions that would violate quotas.
+- Kubernetes scores with a plugin framework that supports arbitrary user-defined scorers. Meat uses a fixed set of scoring dimensions with configurable weights, trading extensibility for simplicity and predictable performance.
+- Kubernetes schedules every Pod individually through the scheduler, including batch Jobs. This becomes a bottleneck at high Job throughput. Meat delegates batch execution to nodes.
+- Kubernetes has no built-in concept of namespace resource quotas enforced at scheduling time (ResourceQuotas exist but are enforced by the API server admission controller, not the scheduler). Meat enforces quotas directly in the scheduler to prevent scheduling decisions that would violate quotas.
 
 **Reference:** [Kubernetes Scheduling Framework (KEP-624)](https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/624-scheduling-framework), [Kubernetes Scheduler source](https://github.com/kubernetes/kubernetes/tree/master/pkg/scheduler)
 
@@ -1297,12 +1297,12 @@ The Kubernetes scheduler uses a similar filter-then-score pipeline (called "pred
 
 Nomad uses a bin-packing scheduler for services and a batch scheduler for batch jobs. The bin-packing algorithm maximizes node density, and Nomad supports both `binpack` and `spread` strategies as first-class options.
 
-**What we borrow:** Nomad's bin-packing approach and its clear separation between service (long-running) and batch (run-to-completion) scheduling. Patty's bin-packing score computation is directly inspired by Nomad's.
+**What we borrow:** Nomad's bin-packing approach and its clear separation between service (long-running) and batch (run-to-completion) scheduling. Meat's bin-packing score computation is directly inspired by Nomad's.
 
 **What we do differently:**
 
-- Nomad evaluates scheduling plans using a plan-apply model with optimistic concurrency. Multiple schedulers can compute plans concurrently, and the leader merges them. This is more complex than Patty's single-leader model but provides higher throughput in multi-datacenter deployments. Patty's single-leader model is simpler and sufficient for the single-cluster use case.
-- Nomad's batch scheduler queues individual allocations. Patty's delegated batch model pushes entire batches to nodes, keeping the leader's hot path O(nodes) rather than O(jobs).
+- Nomad evaluates scheduling plans using a plan-apply model with optimistic concurrency. Multiple schedulers can compute plans concurrently, and the leader merges them. This is more complex than Meat's single-leader model but provides higher throughput in multi-datacenter deployments. Meat's single-leader model is simpler and sufficient for the single-cluster use case.
+- Nomad's batch scheduler queues individual allocations. Meat's delegated batch model pushes entire batches to nodes, keeping the leader's hot path O(nodes) rather than O(jobs).
 
 **Reference:** [Nomad Scheduler Design](https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling), [Nomad Architecture](https://developer.hashicorp.com/nomad/docs/concepts/architecture)
 
@@ -1310,12 +1310,12 @@ Nomad uses a bin-packing scheduler for services and a batch scheduler for batch 
 
 Borg is Google's internal cluster manager. Its scheduler handles both long-running "production" workloads and batch workloads in a single system. Borg uses a priority-based model where production workloads preempt batch workloads when resources are scarce.
 
-**What we borrow:** Borg's batch model -- the insight that high-throughput batch scheduling requires delegation rather than centralized per-task decisions. Borg assigns "allocs" (resource reservations) and lets tasks fill them. Patty's `BatchAllocation` model is a simplified version of this concept.
+**What we borrow:** Borg's batch model -- the insight that high-throughput batch scheduling requires delegation rather than centralized per-task decisions. Borg assigns "allocs" (resource reservations) and lets tasks fill them. Meat's `BatchAllocation` model is a simplified version of this concept.
 
 **What we do differently:**
 
-- Borg supports preemption (killing low-priority batch jobs to make room for production workloads). Patty v1 does not implement preemption -- all workloads are co-equal once scheduled. Preemption is a v2 consideration.
-- Borg uses "cells" of ~10,000 machines each, managed by a single Borgmaster. Patty targets the same scale (10,000 nodes) with a conceptually similar single-leader architecture.
+- Borg supports preemption (killing low-priority batch jobs to make room for production workloads). Meat v1 does not implement preemption -- all workloads are co-equal once scheduled. Preemption is a v2 consideration.
+- Borg uses "cells" of ~10,000 machines each, managed by a single Borgmaster. Meat targets the same scale (10,000 nodes) with a conceptually similar single-leader architecture.
 
 **Reference:** [Large-Scale Cluster Management at Google with Borg (EuroSys 2015)](https://research.google/pubs/pub43438/)
 
@@ -1323,15 +1323,15 @@ Borg is Google's internal cluster manager. Its scheduler handles both long-runni
 
 Omega is a research system exploring shared-state, lock-free, optimistic concurrent scheduling. Multiple schedulers share a full view of the cluster state and make scheduling decisions in parallel, resolving conflicts via optimistic concurrency control.
 
-**What we borrow:** Omega's analysis of the scheduling bottleneck at scale informed the decision to delegate batch execution rather than schedule individually. However, Patty does not adopt Omega's shared-state model.
+**What we borrow:** Omega's analysis of the scheduling bottleneck at scale informed the decision to delegate batch execution rather than schedule individually. However, Meat does not adopt Omega's shared-state model.
 
-**What we do differently:** Omega's optimistic concurrency adds complexity (conflict resolution, retries, stale-state handling). Patty's single-leader model avoids these entirely. The tradeoff is that Patty cannot scale scheduling throughput horizontally by adding schedulers. The delegated batch model compensates by reducing the decision rate.
+**What we do differently:** Omega's optimistic concurrency adds complexity (conflict resolution, retries, stale-state handling). Meat's single-leader model avoids these entirely. The tradeoff is that Meat cannot scale scheduling throughput horizontally by adding schedulers. The delegated batch model compensates by reducing the decision rate.
 
 **Reference:** [Omega: Flexible, Scalable Schedulers for Large Compute Clusters (EuroSys 2013)](https://research.google/pubs/pub41684/)
 
 ### Summary
 
-| Aspect | Kubernetes | Nomad | Borg | Omega | Patty |
+| Aspect | Kubernetes | Nomad | Borg | Omega | Meat |
 |--------|-----------|-------|------|-------|-------|
 | Architecture | Single scheduler | Multi-scheduler (optimistic) | Single Borgmaster | Shared-state | Single leader |
 | Batch model | Per-Pod | Per-allocation | Delegated allocs | Per-task (concurrent) | Delegated batches |
@@ -1343,7 +1343,7 @@ Omega is a research system exploring shared-state, lock-free, optimistic concurr
 
 ## 12. Libraries & Dependencies
 
-Patty is compiled into the Reliaburger binary. The following Rust crates are used within the scheduler:
+Meat is compiled into the Reliaburger binary. The following Rust crates are used within the scheduler:
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
@@ -1368,11 +1368,11 @@ No external scheduling frameworks or orchestration libraries are used. The sched
 
 ### 13.1 Preemption
 
-Should Patty support preempting lower-priority batch jobs to make room for App placements when the cluster is at capacity? Borg does this. The argument for: it prevents Apps from being unschedulable when batch jobs have claimed all resources. The argument against: it adds complexity and makes batch job completion times unpredictable. **Current decision: deferred to v2.**
+Should Meat support preempting lower-priority batch jobs to make room for App placements when the cluster is at capacity? Borg does this. The argument for: it prevents Apps from being unschedulable when batch jobs have claimed all resources. The argument against: it adds complexity and makes batch job completion times unpredictable. **Current decision: deferred to v2.**
 
 ### 13.2 Multi-Scheduler for Batch
 
-At extreme scale (10,000+ nodes, sustained burst rates above 5,000 jobs/sec), should Patty delegate batch scheduling to secondary schedulers on non-leader nodes? This would adopt an Omega-like model for batch only while keeping App scheduling on the leader. **Current decision: not needed -- the delegated batch model keeps leader decision rate at O(nodes), not O(jobs). Revisit if benchmarks show a bottleneck.**
+At extreme scale (10,000+ nodes, sustained burst rates above 5,000 jobs/sec), should Meat delegate batch scheduling to secondary schedulers on non-leader nodes? This would adopt an Omega-like model for batch only while keeping App scheduling on the leader. **Current decision: not needed -- the delegated batch model keeps leader decision rate at O(nodes), not O(jobs). Revisit if benchmarks show a bottleneck.**
 
 ### 13.3 Fractional GPUs
 
@@ -1380,11 +1380,11 @@ V1 supports whole-device GPU allocation only (`gpu = 1`, `gpu = 2`). Fractional 
 
 ### 13.4 Spread Strategy as First-Class Alternative
 
-Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Patty support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. The current spread scoring weight (10/100) provides mild anti-affinity; a dedicated spread mode would set it to 50+ and reduce bin-packing weight.**
+Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. The current spread scoring weight (10/100) provides mild anti-affinity; a dedicated spread mode would set it to 50+ and reduce bin-packing weight.**
 
 ### 13.5 Topology-Aware Scheduling
 
-Should Patty understand rack topology (from node labels like `rack = "rack-3"`) and enforce spread across racks, not just across nodes? This would protect against rack-level failures. **Current decision: under consideration. Rack-aware spread could be implemented as an additional scoring dimension or as a hard constraint (e.g., `placement.spread_by = "rack"`).**
+Should Meat understand rack topology (from node labels like `rack = "rack-3"`) and enforce spread across racks, not just across nodes? This would protect against rack-level failures. **Current decision: under consideration. Rack-aware spread could be implemented as an additional scoring dimension or as a hard constraint (e.g., `placement.spread_by = "rack"`).**
 
 ### 13.6 Autoscaler Custom Metrics
 
@@ -1392,4 +1392,4 @@ The autoscaler currently supports `cpu`, `memory`, and a `Custom(String)` metric
 
 ### 13.7 Scheduling Latency SLO Enforcement
 
-Should Patty provide a hard guarantee that scheduling decisions complete within a latency bound (e.g., 50ms)? Currently, latency is best-effort and depends on cluster size and Raft commit speed. An SLO enforcement mode could shed load (reject submissions) when latency exceeds the bound. **Current decision: under consideration for v2.**
+Should Meat provide a hard guarantee that scheduling decisions complete within a latency bound (e.g., 50ms)? Currently, latency is best-effort and depends on cluster size and Raft commit speed. An SLO enforcement mode could shed load (reject submissions) when latency exceeds the bound. **Current decision: under consideration for v2.**

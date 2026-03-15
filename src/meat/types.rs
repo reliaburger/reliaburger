@@ -1,4 +1,4 @@
-/// Shared cluster types used by Mustard, Raft, and Patty.
+/// Shared cluster types used by Mustard, Raft, and Meat.
 ///
 /// These newtypes prevent accidentally mixing up identifiers
 /// (a `NodeId` is not an `AppId` is not an `InstanceId`) and
@@ -185,7 +185,7 @@ impl NodeCapacity {
 // SchedulingDecision
 // ---------------------------------------------------------------------------
 
-/// A placement decision made by the Patty scheduler.
+/// A placement decision made by the Meat scheduler.
 ///
 /// Records where each replica of an app should run, so the
 /// decision can be committed to the Raft log and replicated.

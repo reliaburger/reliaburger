@@ -33,7 +33,7 @@ The result is that operators get Prometheus + Thanos + Alertmanager functionalit
 | **Brioche** (web UI) | Queries Mayo via internal gRPC for dashboard rendering. Brioche displays cluster overview, app detail, node detail, and ingress dashboards -- all sourced from Mayo data. Alert state is also surfaced through Brioche. |
 | **Relish** (CLI) | `relish metrics`, `relish alerts`, and `relish top` query Mayo. The CLI can target a single node's TSDB or fan out through the leader for cross-node queries. |
 | **Mustard** (gossip) | Provides cluster membership and node identity, used by Mayo to determine which nodes are alive for query fan-out and which council member a node reports rollups to. |
-| **Patty** (scheduler) | Provides the app-to-node placement map so the leader knows which nodes to fan out to for single-app queries. |
+| **Meat** (scheduler) | Provides the app-to-node placement map so the leader knows which nodes to fan out to for single-app queries. |
 | **Wrapper** (ingress proxy) | Emits per-route ingress metrics (request count, latency percentiles, error rates) that Mayo collects. |
 
 ### External Interfaces
@@ -121,7 +121,7 @@ Single-app query path:
 
 **Council aggregator storage:** Council members store received rollups in a separate Mayo instance (or logically separated partition) with their own retention policy (default: 24 hours of 1-minute rollups, 30 days of 1-hour rollups). This data is used exclusively for cluster-wide queries.
 
-**Query fan-out for single-app queries:** The leader (or any council member handling the query) consults the Patty placement map to determine which nodes are running the target app, then fans the query out only to those nodes (typically 3-10). Each node evaluates the query against its local Mayo TSDB and returns results. The querying node merges the partial results.
+**Query fan-out for single-app queries:** The leader (or any council member handling the query) consults the Meat placement map to determine which nodes are running the target app, then fans the query out only to those nodes (typically 3-10). Each node evaluates the query against its local Mayo TSDB and returns results. The querying node merges the partial results.
 
 **Query fan-out for cluster-wide queries:** The querying node fans out to all council aggregators (3-7 nodes), each of which evaluates the query against its aggregated rollup data and returns results. The querying node merges the partial results. This bounds fan-out to the council size regardless of cluster size.
 
@@ -564,7 +564,7 @@ When a council member joins or leaves, nodes recompute their aggregator assignme
 **Single-app query** (e.g., "show CPU for app.web"):
 
 1. Query arrives at any council member or the leader.
-2. The query handler looks up the Patty placement map to find which nodes are running `app.web` (e.g., nodes 3, 7, 11).
+2. The query handler looks up the Meat placement map to find which nodes are running `app.web` (e.g., nodes 3, 7, 11).
 3. Query is fanned out in parallel to those 3 nodes.
 4. Each node evaluates the PromQL expression against its local Mayo TSDB.
 5. Results are merged (series concatenation, deduplication by labels+timestamp).

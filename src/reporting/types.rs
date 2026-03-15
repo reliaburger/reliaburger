@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::config::app::AppSpec;
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 /// Sent by each worker node to its assigned council member at the
 /// reporting interval. Also sent as a full report during the leader
