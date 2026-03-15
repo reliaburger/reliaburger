@@ -14,7 +14,9 @@ pub mod worker;
 
 pub use aggregator::{AggregatedState, ReportAggregator};
 pub use assignment::assign_parent;
-pub use transport::{InMemoryReportingNetwork, InMemoryReportingTransport, ReportingTransport};
+pub use transport::{
+    InMemoryReportingNetwork, InMemoryReportingTransport, ReportingTransport, TcpReportingTransport,
+};
 pub use types::{
     AppResourceUsage, EventKind, NodeEvent, ReportHealthStatus, ReportingMessage, ResourceUsage,
     RunningApp, StateReport,

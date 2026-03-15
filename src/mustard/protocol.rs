@@ -17,11 +17,13 @@ use std::time::Instant;
 use rand::seq::SliceRandom;
 use tokio_util::sync::CancellationToken;
 
+use tokio::sync::watch;
+
 use crate::meat::NodeId;
 
 use super::config::GossipConfig;
 use super::dissemination::DisseminationQueue;
-use super::membership::MembershipTable;
+use super::membership::{MembershipSnapshot, MembershipTable};
 use super::message::{GossipMessage, GossipPayload, MembershipUpdate};
 use super::state::NodeState;
 use super::transport::MustardTransport;
@@ -48,6 +50,9 @@ pub struct MustardNode<T: MustardTransport> {
     pub transport: T,
     /// Lamport clock for causal ordering.
     lamport: u64,
+    /// Optional watch channel for publishing membership snapshots.
+    /// Set when running inside the agent, None in standalone tests.
+    membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -69,6 +74,19 @@ impl<T: MustardTransport> MustardNode<T> {
             config,
             transport,
             lamport: 0,
+            membership_watch: None,
+        }
+    }
+
+    /// Set the membership watch channel for publishing snapshots.
+    pub fn set_membership_watch(&mut self, tx: watch::Sender<Vec<MembershipSnapshot>>) {
+        self.membership_watch = Some(tx);
+    }
+
+    /// Publish the current membership to the watch channel.
+    fn publish_membership(&self) {
+        if let Some(tx) = &self.membership_watch {
+            let _ = tx.send(self.membership.snapshot());
         }
     }
 
@@ -142,10 +160,12 @@ impl<T: MustardTransport> MustardNode<T> {
                 }
                 _ = interval.tick() => {
                     self.run_one_cycle().await;
+                    self.publish_membership();
                 }
                 msg = self.transport.recv() => {
                     if let Some((from, message)) = msg {
                         self.handle_message(from, message).await;
+                        self.publish_membership();
                     }
                 }
             }
