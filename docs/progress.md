@@ -45,7 +45,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication
 - [x] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7
 - [x] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel
-- [ ] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction
+- [x] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction
 - [ ] Patty scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas
 - [ ] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
