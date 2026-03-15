@@ -163,8 +163,13 @@ const MAX_UDP_PAYLOAD: usize = 1400;
 /// Binds a single UDP socket that handles both sending and receiving.
 /// Messages are serialised with bincode. Datagrams exceeding
 /// `MAX_UDP_PAYLOAD` bytes are rejected to avoid fragmentation.
+///
+/// Supports a runtime blocklist for chaos testing: messages to/from
+/// blocked addresses are silently dropped. The blocklist is shared
+/// via `Arc<RwLock>` so the agent can update it without restarting.
 pub struct UdpMustardTransport {
     socket: tokio::net::UdpSocket,
+    blocklist: Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
 }
 
 impl UdpMustardTransport {
@@ -176,7 +181,15 @@ impl UdpMustardTransport {
                 .map_err(|e| MustardError::SendFailed {
                     reason: format!("failed to bind UDP socket on {addr}: {e}"),
                 })?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            blocklist: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+        })
+    }
+
+    /// Get a handle to the blocklist for chaos injection.
+    pub fn blocklist(&self) -> Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>> {
+        Arc::clone(&self.blocklist)
     }
 
     /// The local address this socket is bound to.
@@ -189,6 +202,11 @@ impl UdpMustardTransport {
 
 impl MustardTransport for UdpMustardTransport {
     async fn send(&self, target: SocketAddr, message: &GossipMessage) -> Result<(), MustardError> {
+        // Check blocklist for chaos testing
+        if self.blocklist.read().await.contains(&target) {
+            return Ok(()); // silently drop
+        }
+
         let bytes =
             bincode::serialize(message).map_err(|e| MustardError::Serialisation(e.to_string()))?;
 
@@ -213,6 +231,10 @@ impl MustardTransport for UdpMustardTransport {
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((len, from)) => {
+                    // Check blocklist for chaos testing
+                    if self.blocklist.read().await.contains(&from) {
+                        continue; // silently drop
+                    }
                     match bincode::deserialize::<GossipMessage>(&buf[..len]) {
                         Ok(msg) => return Some((from, msg)),
                         Err(_) => {

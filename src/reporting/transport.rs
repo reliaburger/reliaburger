@@ -152,9 +152,11 @@ const MAX_REPORT_SIZE: usize = 1_048_576;
 /// Uses length-prefixed framing: 4-byte big-endian length + bincode payload.
 /// Server mode accepts incoming connections (council members).
 /// Client mode connects to the target for each send (workers).
+/// Supports a runtime blocklist for chaos testing.
 pub struct TcpReportingTransport {
     address: SocketAddr,
     inbound_rx: Mutex<mpsc::Receiver<(SocketAddr, ReportingMessage)>>,
+    blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
 }
 
 impl TcpReportingTransport {
@@ -185,12 +187,22 @@ impl TcpReportingTransport {
         Ok(Self {
             address: bound_addr,
             inbound_rx: Mutex::new(inbound_rx),
+            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
         })
     }
 
     /// The local address this transport is bound to.
     pub fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Get a handle to the blocklist for chaos injection.
+    pub fn blocklist(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>> {
+        std::sync::Arc::clone(&self.blocklist)
     }
 
     /// Background task: accept connections and read framed messages.
@@ -297,6 +309,9 @@ impl ReportingTransport for TcpReportingTransport {
         target: SocketAddr,
         message: &ReportingMessage,
     ) -> Result<(), ReportingError> {
+        if self.blocklist.read().await.contains(&target) {
+            return Ok(()); // silently drop for chaos testing
+        }
         Self::send_framed(target, message).await
     }
 

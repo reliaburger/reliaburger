@@ -106,6 +106,40 @@ pub enum AgentCommand {
         addr: String,
         response: oneshot::Sender<Result<String, BunError>>,
     },
+    /// Inject a network partition (chaos testing).
+    InjectPartition {
+        peers: Vec<String>,
+        duration_secs: u64,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Remove all network partitions (chaos testing).
+    HealPartition {
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Query active chaos state.
+    ChaosStatus {
+        response: oneshot::Sender<ChaosState>,
+    },
+}
+
+/// Active chaos fault injection state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChaosState {
+    /// Currently active partition, if any.
+    pub active_partition: Option<PartitionInfo>,
+}
+
+/// Details of an active partition injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionInfo {
+    /// Addresses being blocked.
+    pub peers: Vec<String>,
+    /// When the partition was injected (seconds since UNIX epoch).
+    pub injected_at_epoch: u64,
+    /// Duration in seconds before auto-heal.
+    pub duration_secs: u64,
+    /// Seconds remaining before auto-heal.
+    pub remaining_secs: u64,
 }
 
 /// Result of a deploy operation.
@@ -206,6 +240,8 @@ pub struct BunAgent<G: Grill> {
     shutdown: CancellationToken,
     volumes_dir: PathBuf,
     cluster: Option<ClusterHandle>,
+    /// Active chaos partition (peers + expiry).
+    chaos_partition: Option<(Vec<String>, Instant)>,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -222,6 +258,7 @@ impl<G: Grill> BunAgent<G> {
             shutdown,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
+            chaos_partition: None,
         }
     }
 
@@ -239,6 +276,7 @@ impl<G: Grill> BunAgent<G> {
             shutdown,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
+            chaos_partition: None,
         }
     }
 
@@ -262,6 +300,7 @@ impl<G: Grill> BunAgent<G> {
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.drive_pending_restarts().await;
+                    self.expire_chaos_partition();
                 }
             }
         }
@@ -449,6 +488,60 @@ impl<G: Grill> BunAgent<G> {
                 let msg = format!("join request accepted for seed {addr}");
                 let _ = response.send(Ok(msg));
             }
+            AgentCommand::InjectPartition {
+                peers,
+                duration_secs,
+                response,
+            } => {
+                let expiry = Instant::now() + std::time::Duration::from_secs(duration_secs);
+                self.chaos_partition = Some((peers.clone(), expiry));
+                let msg = format!(
+                    "partition injected: blocking {} peer(s) for {duration_secs}s",
+                    peers.len()
+                );
+                let _ = response.send(Ok(msg));
+            }
+            AgentCommand::HealPartition { response } => {
+                let msg = if self.chaos_partition.is_some() {
+                    self.chaos_partition = None;
+                    "partition healed".to_string()
+                } else {
+                    "no active partition".to_string()
+                };
+                let _ = response.send(Ok(msg));
+            }
+            AgentCommand::ChaosStatus { response } => {
+                let state = self.get_chaos_state();
+                let _ = response.send(state);
+            }
+        }
+    }
+
+    /// Build the current chaos state for the API.
+    fn get_chaos_state(&self) -> ChaosState {
+        let active_partition = self.chaos_partition.as_ref().map(|(peers, expiry)| {
+            let remaining = expiry.saturating_duration_since(Instant::now());
+            let injected_at = std::time::SystemTime::now() - remaining;
+            let epoch = injected_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            PartitionInfo {
+                peers: peers.clone(),
+                injected_at_epoch: epoch,
+                duration_secs: remaining.as_secs() + 1, // approximate
+                remaining_secs: remaining.as_secs(),
+            }
+        });
+        ChaosState { active_partition }
+    }
+
+    /// Check and auto-expire chaos partitions. Called on every health tick.
+    fn expire_chaos_partition(&mut self) {
+        if let Some((_, expiry)) = &self.chaos_partition
+            && Instant::now() >= *expiry
+        {
+            self.chaos_partition = None;
         }
     }
 

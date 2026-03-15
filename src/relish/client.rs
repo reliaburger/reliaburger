@@ -8,7 +8,9 @@
 /// the final result.
 use futures_util::StreamExt;
 
-use crate::bun::agent::{ApplyEvent, ApplyResult, CouncilStatus, InstanceStatus, NodeStatus};
+use crate::bun::agent::{
+    ApplyEvent, ApplyResult, ChaosState, CouncilStatus, InstanceStatus, NodeStatus,
+};
 use crate::config::Config;
 
 use super::RelishError;
@@ -359,5 +361,74 @@ impl BunClient {
         })?;
 
         Ok(council)
+    }
+
+    /// Inject a network partition (chaos testing).
+    pub async fn inject_partition(
+        &self,
+        peers: &[String],
+        duration_secs: u64,
+    ) -> Result<String, RelishError> {
+        let url = format!("{}/v1/chaos/partition", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "peers": peers, "duration_secs": duration_secs }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(json["message"].as_str().unwrap_or("ok").to_string())
+    }
+
+    /// Remove all network partitions (chaos testing).
+    pub async fn heal_partition(&self) -> Result<String, RelishError> {
+        let url = format!("{}/v1/chaos/heal", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(json["message"].as_str().unwrap_or("ok").to_string())
+    }
+
+    /// Query chaos status.
+    pub async fn chaos_status(&self) -> Result<ChaosState, RelishError> {
+        let url = format!("{}/v1/chaos/status", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let state: ChaosState = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(state)
     }
 }

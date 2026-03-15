@@ -77,6 +77,11 @@ enum Command {
         /// Address of an existing cluster member (gossip endpoint).
         addr: String,
     },
+    /// Run chaos testing scenarios or manage fault injections.
+    Chaos {
+        /// Scenario or action: council-partition, worker-isolation, status, heal.
+        action: String,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +109,7 @@ async fn main() -> ExitCode {
             ref token,
             ref addr,
         } => commands::join(token, addr).await,
+        Command::Chaos { ref action } => commands::chaos(action).await,
     };
 
     match result {
