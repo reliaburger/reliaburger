@@ -18,6 +18,7 @@ pub struct NodeConfig {
     pub resources: ResourcesSection,
     pub network: NetworkSection,
     pub reporting_tree: ReportingTreeSection,
+    pub reconstruction: ReconstructionSection,
     // TODO(Phase 5): images section
     // TODO(Phase 6): logs, metrics sections
     // TODO(Phase 3): ingress section
@@ -153,6 +154,34 @@ impl Default for ReportingTreeSection {
             report_interval_secs: 5,
             max_events_per_report: 100,
             stale_report_timeout_secs: 30,
+        }
+    }
+}
+
+/// State reconstruction configuration.
+///
+/// Controls the learning period after a new Raft leader is elected.
+/// The leader collects StateReports before reconciling desired vs actual state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReconstructionSection {
+    /// Percentage of alive nodes that must report before the learning period ends.
+    pub report_threshold_percent: u8,
+    /// Maximum duration of the learning period (seconds).
+    pub learning_period_timeout_secs: u64,
+    /// Extended timeout for large clusters (seconds).
+    pub large_cluster_timeout_secs: u64,
+    /// Node count threshold for switching to the large cluster timeout.
+    pub large_cluster_node_count: usize,
+}
+
+impl Default for ReconstructionSection {
+    fn default() -> Self {
+        Self {
+            report_threshold_percent: 95,
+            learning_period_timeout_secs: 15,
+            large_cluster_timeout_secs: 30,
+            large_cluster_node_count: 5000,
         }
     }
 }

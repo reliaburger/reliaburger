@@ -1344,3 +1344,118 @@ stale_report_timeout_secs = 30
 ```
 
 The defaults are sensible for most clusters. Smaller clusters might lower the interval; very large clusters might raise it to reduce load on council members.
+
+## State reconstruction
+
+We have gossip for membership, Raft for desired state, and the reporting tree for runtime state. But there's still a gap. When a new leader is elected, it inherits the Raft log (the desired state), but it has no idea what's actually running on each worker node. The old leader knew because it had been receiving StateReports. The new leader is starting from scratch.
+
+If the new leader immediately started scheduling work, it might deploy a second copy of an app that's already running somewhere. Or it might not notice that an app crashed 30 seconds ago and needs to be restarted. We need a learning period.
+
+### The five phases
+
+State reconstruction is a five-phase state machine:
+
+```
+              leader elected
+                    │
+                    ▼
+            ┌───────────────┐
+            │  ANNOUNCING   │   broadcast via gossip
+            └───────┬───────┘
+                    ▼
+            ┌───────────────┐
+            │   LEARNING    │   accept StateReports
+            │               │   no scheduling
+            │ track % nodes │   no new deploys
+            └───────┬───────┘
+                    │
+          ┌─────────┴─────────┐
+          │  95% reported OR  │
+          │  timeout (15s)    │
+          └─────────┬─────────┘
+                    ▼
+            ┌───────────────┐
+            │  RECONCILING  │   diff desired vs actual
+            │               │   compute corrections
+            └───────┬───────┘
+                    ▼
+            ┌───────────────┐
+            │    ACTIVE     │   resume scheduling
+            │               │   accept deploys
+            └───────────────┘
+```
+
+The ANNOUNCING phase broadcasts leadership via gossip so workers know where to send reports. The LEARNING phase collects reports. RECONCILING diffs and produces corrections. ACTIVE resumes normal operations.
+
+### Why 95% and why 15 seconds?
+
+We can't wait for 100% of nodes to report. One slow node, one node that's rebooting, one node that has a dodgy network cable — any of these would block the entire cluster from accepting work. So we use 95%.
+
+Why 15 seconds? At a 5-second reporting interval, three cycles is enough for healthy nodes to check in. If a node hasn't reported after 15 seconds, it's probably down or partitioned. The leader marks it as STATE_UNKNOWN and moves on. Those nodes become schedulable later when they do report.
+
+For large clusters (over 5,000 nodes), the fan-in at council members takes longer. The timeout extends to 30 seconds.
+
+```rust
+pub fn effective_timeout(&self) -> Duration {
+    if self.alive_count_at_start >= self.config.large_cluster_node_count {
+        Duration::from_secs(self.config.large_cluster_timeout_secs)
+    } else {
+        Duration::from_secs(self.config.learning_period_timeout_secs)
+    }
+}
+```
+
+### The diff engine
+
+The heart of reconstruction is a pure function. No async, no I/O, no side effects. It takes the desired state (from Raft) and the actual state (from aggregated reports) and produces a list of corrections.
+
+```rust
+pub fn compute_diff(
+    desired: &DesiredState,
+    actual: &AggregatedState,
+    alive_nodes: &[NodeId],
+    reported_nodes: &HashSet<NodeId>,
+) -> Vec<Correction>
+```
+
+The algorithm uses set operations. Build two sets of `(AppId, NodeId)` pairs: one from the desired scheduling decisions, one from the actual running apps. Then:
+
+- **Missing** = desired − actual. An app should be running on a node but isn't. Only checked for nodes that reported — we can't say an app is "missing" on a node we haven't heard from.
+- **Extra** = actual − desired. An app is running on a node but shouldn't be. Maybe an old deployment that was never cleaned up.
+- **Unknown** = alive nodes that didn't report. These get a `Correction::UnknownNode` and are excluded from scheduling until they check in.
+
+One subtlety here: `RunningApp` needs a `namespace` field, not just `app_name`. Without it, we can't construct an `AppId` to compare against the desired state. The `DesiredState.scheduling` map is keyed by `AppId { name, namespace }`, so we need both halves to do the comparison.
+
+### The controller
+
+The `ReconstructionController` is method-based rather than a long-lived event loop. It exposes four methods:
+
+- `on_leader_elected(alive_count)` — transition to Learning, start the clock
+- `on_leader_lost()` — reset to Idle
+- `on_report_received(aggregated, desired, alive_nodes)` — check coverage, maybe finish
+- `check_timeout(desired, alive_nodes, aggregated)` — check the clock, maybe finish
+
+The caller (the agent event loop, wired up in a later step) drives the controller by calling these methods at the right times. This makes the controller easy to test: no tokio runtime needed for unit tests, no faking of timers.
+
+```rust
+pub enum LearningOutcome {
+    ThresholdMet { reported: usize, total: usize },
+    TimedOut { reported: usize, total: usize },
+}
+```
+
+When the learning period ends — by threshold or timeout — the controller calls `compute_diff` and produces a `ReconstructionResult` with the corrections, the list of unknown nodes, and the list of reported nodes. The corrections aren't executed yet (the scheduler doesn't exist), but they're ready for when it does.
+
+### Key invariants
+
+Throughout reconstruction, the data plane is completely unaffected. Running apps continue serving traffic. Health checks continue running. The gossip protocol continues probing. Only the control plane pauses: no new deployments, no scheduling decisions, no autoscaling. Once the learning period ends and the diff is computed, the leader resumes normal operations.
+
+### Configuration
+
+```toml
+[reconstruction]
+report_threshold_percent = 95
+learning_period_timeout_secs = 15
+large_cluster_timeout_secs = 30
+large_cluster_node_count = 5000
+```
