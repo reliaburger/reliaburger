@@ -8,17 +8,23 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::config::app::AppSpec;
 use crate::config::job::JobSpec;
+use crate::council::node::CouncilNode;
+use crate::council::types::CouncilNodeInfo;
 use crate::grill::oci::{generate_job_oci_spec, generate_oci_spec};
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
+use crate::mustard::membership::MembershipSnapshot;
+use crate::reporting::worker::CollectSnapshotRequest;
 
 use super::BunError;
 use super::probe::probe_health;
@@ -94,6 +100,12 @@ pub enum AgentCommand {
     Council {
         response: oneshot::Sender<CouncilStatus>,
     },
+    /// Join an existing cluster.
+    Join {
+        token: String,
+        addr: String,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
 }
 
 /// Result of a deploy operation.
@@ -158,7 +170,7 @@ pub struct CouncilMemberInfo {
 }
 
 /// Status of the Raft council, as returned by the council API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CouncilStatus {
     /// Council member nodes.
     pub members: Vec<CouncilMemberInfo>,
@@ -172,16 +184,32 @@ pub struct CouncilStatus {
     pub app_count: usize,
 }
 
+/// Optional cluster subsystem references.
+///
+/// Holds communication channels to gossip, Raft, and reporting subsystems.
+/// `None` when running in single-node mode (no cluster config).
+pub struct ClusterHandle {
+    /// Membership snapshots from the gossip layer.
+    pub membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    /// Raft metrics (if this node is a council member).
+    pub raft_metrics_rx: Option<watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>>,
+    /// Council node handle (if this node is a council member).
+    pub council: Option<Arc<CouncilNode>>,
+    /// Channel for receiving snapshot requests from the reporting worker.
+    pub snapshot_rx: mpsc::Receiver<CollectSnapshotRequest>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
     command_rx: mpsc::Receiver<AgentCommand>,
     shutdown: CancellationToken,
     volumes_dir: PathBuf,
+    cluster: Option<ClusterHandle>,
 }
 
 impl<G: Grill> BunAgent<G> {
-    /// Create a new agent.
+    /// Create a new agent in single-node mode (no cluster).
     pub fn new(
         grill: G,
         port_allocator: PortAllocator,
@@ -193,6 +221,24 @@ impl<G: Grill> BunAgent<G> {
             command_rx,
             shutdown,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cluster: None,
+        }
+    }
+
+    /// Create a new agent with cluster subsystem handles.
+    pub fn with_cluster(
+        grill: G,
+        port_allocator: PortAllocator,
+        command_rx: mpsc::Receiver<AgentCommand>,
+        shutdown: CancellationToken,
+        cluster: ClusterHandle,
+    ) -> Self {
+        Self {
+            supervisor: WorkloadSupervisor::new(grill, port_allocator),
+            command_rx,
+            shutdown,
+            volumes_dir: crate::config::node::StorageSection::default().volumes,
+            cluster: Some(cluster),
         }
     }
 
@@ -209,12 +255,131 @@ impl<G: Grill> BunAgent<G> {
                 Some(cmd) = self.command_rx.recv() => {
                     self.handle_command(cmd).await;
                 }
+                Some(req) = Self::recv_snapshot(&mut self.cluster) => {
+                    self.handle_snapshot_request(req);
+                }
                 _ = health_interval.tick() => {
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.drive_pending_restarts().await;
                 }
             }
+        }
+    }
+
+    /// Receive a snapshot request from the cluster handle, or pend forever.
+    async fn recv_snapshot(cluster: &mut Option<ClusterHandle>) -> Option<CollectSnapshotRequest> {
+        match cluster {
+            Some(handle) => handle.snapshot_rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Handle a snapshot request from the reporting worker.
+    fn handle_snapshot_request(&self, req: CollectSnapshotRequest) {
+        use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
+
+        let instances = self.supervisor.list_instances();
+        let snapshot = AgentSnapshot {
+            instances: instances
+                .iter()
+                .map(|inst| {
+                    // Parse instance index from ID (e.g. "web-0" → 0)
+                    let instance_id = inst
+                        .id
+                        .0
+                        .rsplit_once('-')
+                        .and_then(|(_, n)| n.parse::<u32>().ok())
+                        .unwrap_or(0);
+
+                    InstanceSnapshot {
+                        app_name: inst.app_name.clone(),
+                        namespace: inst.namespace.clone(),
+                        instance_id,
+                        image: String::new(), // TODO(Phase 5): from OCI spec
+                        port: inst.host_port,
+                        container_state: inst.state,
+                        consecutive_unhealthy: inst.health_counters.consecutive_unhealthy,
+                        uptime: inst.created_at.elapsed(),
+                    }
+                })
+                .collect(),
+            allocated_ports: instances.iter().filter_map(|i| i.host_port).collect(),
+        };
+        let _ = req.response.send(snapshot);
+    }
+
+    /// Get cluster node membership from gossip, or empty if single-node.
+    fn get_cluster_nodes(&self) -> Vec<NodeStatus> {
+        match &self.cluster {
+            Some(handle) => {
+                let membership = handle.membership_rx.borrow();
+                membership
+                    .iter()
+                    .map(|m| NodeStatus {
+                        node_id: m.node_id.to_string(),
+                        address: m.address.to_string(),
+                        state: m.state.to_string(),
+                        incarnation: m.incarnation,
+                        is_council: m.is_council,
+                        is_leader: m.is_leader,
+                        labels: m.labels.clone(),
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Get Raft council status, or default if single-node/non-council.
+    async fn get_council_status(&self) -> CouncilStatus {
+        let Some(handle) = &self.cluster else {
+            return CouncilStatus::default();
+        };
+        let Some(council) = &handle.council else {
+            return CouncilStatus::default();
+        };
+        let Some(metrics_rx) = &handle.raft_metrics_rx else {
+            return CouncilStatus::default();
+        };
+
+        let metrics = metrics_rx.borrow().clone();
+        let desired = council.desired_state().await;
+
+        let leader_name = metrics.current_leader.and_then(|leader_id| {
+            metrics
+                .membership_config
+                .membership()
+                .get_joint_config()
+                .iter()
+                .flat_map(|ids| ids.iter())
+                .find(|&&id| id == leader_id)
+                .and_then(|_| {
+                    metrics
+                        .membership_config
+                        .membership()
+                        .get_node(&leader_id)
+                        .map(|info| info.name.clone())
+                })
+        });
+
+        let members = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, info)| CouncilMemberInfo {
+                raft_id: *id,
+                name: info.name.clone(),
+                address: info.addr.to_string(),
+            })
+            .collect();
+
+        CouncilStatus {
+            members,
+            leader: leader_name,
+            term: metrics.current_term,
+            last_applied_log: metrics.last_applied.map(|l| l.index),
+            app_count: desired.apps.len(),
         }
     }
 
@@ -268,18 +433,21 @@ impl<G: Grill> BunAgent<G> {
                 let _ = response.send(result);
             }
             AgentCommand::Nodes { response } => {
-                // TODO(Phase 2): return real membership from mustard
-                let _ = response.send(Vec::new());
+                let nodes = self.get_cluster_nodes();
+                let _ = response.send(nodes);
             }
             AgentCommand::Council { response } => {
-                // TODO(Phase 2): return real council state from raft
-                let _ = response.send(CouncilStatus {
-                    members: Vec::new(),
-                    leader: None,
-                    term: 0,
-                    last_applied_log: None,
-                    app_count: 0,
-                });
+                let status = self.get_council_status().await;
+                let _ = response.send(status);
+            }
+            AgentCommand::Join {
+                token: _,
+                addr,
+                response,
+            } => {
+                // TODO(Phase 4): validate join token via Sesame
+                let msg = format!("join request accepted for seed {addr}");
+                let _ = response.send(Ok(msg));
             }
         }
     }

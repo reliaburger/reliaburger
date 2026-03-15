@@ -141,6 +141,172 @@ impl ReportingTransport for InMemoryReportingTransport {
 }
 
 // ---------------------------------------------------------------------------
+// TCP transport for production
+// ---------------------------------------------------------------------------
+
+/// Maximum reporting message size (1 MiB).
+const MAX_REPORT_SIZE: usize = 1_048_576;
+
+/// Real TCP transport for reporting tree messages.
+///
+/// Uses length-prefixed framing: 4-byte big-endian length + bincode payload.
+/// Server mode accepts incoming connections (council members).
+/// Client mode connects to the target for each send (workers).
+pub struct TcpReportingTransport {
+    address: SocketAddr,
+    inbound_rx: Mutex<mpsc::Receiver<(SocketAddr, ReportingMessage)>>,
+}
+
+impl TcpReportingTransport {
+    /// Create a TCP reporting transport bound to the given address.
+    ///
+    /// Spawns a background accept loop to receive inbound messages.
+    pub async fn bind(
+        addr: SocketAddr,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<Self, ReportingError> {
+        let listener =
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| ReportingError::SendFailed {
+                    reason: format!("failed to bind TCP on {addr}: {e}"),
+                })?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|e| ReportingError::SendFailed {
+                reason: format!("failed to get local address: {e}"),
+            })?;
+
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+
+        // Spawn accept loop
+        tokio::spawn(Self::accept_loop(listener, inbound_tx, shutdown));
+
+        Ok(Self {
+            address: bound_addr,
+            inbound_rx: Mutex::new(inbound_rx),
+        })
+    }
+
+    /// The local address this transport is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Background task: accept connections and read framed messages.
+    async fn accept_loop(
+        listener: tokio::net::TcpListener,
+        tx: mpsc::Sender<(SocketAddr, ReportingMessage)>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer)) => {
+                            let tx = tx.clone();
+                            tokio::spawn(Self::handle_connection(stream, peer, tx));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read one framed message from a TCP connection.
+    async fn handle_connection(
+        mut stream: tokio::net::TcpStream,
+        peer: SocketAddr,
+        tx: mpsc::Sender<(SocketAddr, ReportingMessage)>,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        // Read 4-byte length prefix
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_REPORT_SIZE {
+            return;
+        }
+
+        // Read payload
+        let mut payload = vec![0u8; len];
+        if stream.read_exact(&mut payload).await.is_err() {
+            return;
+        }
+
+        // Deserialise
+        if let Ok(msg) = bincode::deserialize::<ReportingMessage>(&payload) {
+            let _ = tx.send((peer, msg)).await;
+        }
+    }
+
+    /// Send a length-prefixed bincode message over a new TCP connection.
+    async fn send_framed(
+        target: SocketAddr,
+        message: &ReportingMessage,
+    ) -> Result<(), ReportingError> {
+        use tokio::io::AsyncWriteExt;
+
+        let payload = bincode::serialize(message)
+            .map_err(|e| ReportingError::Serialisation(e.to_string()))?;
+        if payload.len() > MAX_REPORT_SIZE {
+            return Err(ReportingError::ReportTooLarge {
+                size: payload.len(),
+                max: MAX_REPORT_SIZE,
+            });
+        }
+
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(target),
+        )
+        .await
+        .map_err(|_| ReportingError::SendFailed {
+            reason: format!("TCP connect to {target} timed out"),
+        })?
+        .map_err(|e| ReportingError::SendFailed {
+            reason: format!("TCP connect to {target}: {e}"),
+        })?;
+
+        let len_bytes = (payload.len() as u32).to_be_bytes();
+        stream
+            .write_all(&len_bytes)
+            .await
+            .map_err(|e| ReportingError::SendFailed {
+                reason: format!("TCP write to {target}: {e}"),
+            })?;
+        stream
+            .write_all(&payload)
+            .await
+            .map_err(|e| ReportingError::SendFailed {
+                reason: format!("TCP write to {target}: {e}"),
+            })?;
+
+        Ok(())
+    }
+}
+
+impl ReportingTransport for TcpReportingTransport {
+    async fn send(
+        &self,
+        target: SocketAddr,
+        message: &ReportingMessage,
+    ) -> Result<(), ReportingError> {
+        Self::send_framed(target, message).await
+    }
+
+    async fn recv(&self) -> Option<(SocketAddr, ReportingMessage)> {
+        let mut rx = self.inbound_rx.lock().await;
+        rx.recv().await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

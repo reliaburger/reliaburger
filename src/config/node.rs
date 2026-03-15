@@ -55,11 +55,28 @@ pub struct NodeSection {
 }
 
 /// Cluster membership configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterSection {
     /// Addresses of existing cluster members to join. Empty for the first node.
     pub join: Vec<String>,
+    /// Port for Mustard SWIM gossip protocol.
+    pub gossip_port: u16,
+    /// Port for Raft council consensus RPCs.
+    pub raft_port: u16,
+    /// Port for reporting tree state reports.
+    pub reporting_port: u16,
+}
+
+impl Default for ClusterSection {
+    fn default() -> Self {
+        Self {
+            join: Vec::new(),
+            gossip_port: 9443,
+            raft_port: 9444,
+            reporting_port: 9445,
+        }
+    }
 }
 
 /// Storage paths for data, images, logs, metrics, and volumes.

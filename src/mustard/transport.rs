@@ -151,6 +151,83 @@ impl MustardTransport for InMemoryTransport {
 }
 
 // ---------------------------------------------------------------------------
+// UDP transport for production
+// ---------------------------------------------------------------------------
+
+/// Maximum UDP datagram size for gossip messages.
+/// Stays below typical MTU to avoid IP fragmentation.
+const MAX_UDP_PAYLOAD: usize = 1400;
+
+/// Real UDP transport for gossip messages.
+///
+/// Binds a single UDP socket that handles both sending and receiving.
+/// Messages are serialised with bincode. Datagrams exceeding
+/// `MAX_UDP_PAYLOAD` bytes are rejected to avoid fragmentation.
+pub struct UdpMustardTransport {
+    socket: tokio::net::UdpSocket,
+}
+
+impl UdpMustardTransport {
+    /// Bind a UDP socket to the given address.
+    pub async fn bind(addr: SocketAddr) -> Result<Self, MustardError> {
+        let socket =
+            tokio::net::UdpSocket::bind(addr)
+                .await
+                .map_err(|e| MustardError::SendFailed {
+                    reason: format!("failed to bind UDP socket on {addr}: {e}"),
+                })?;
+        Ok(Self { socket })
+    }
+
+    /// The local address this socket is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.socket
+            .local_addr()
+            .expect("UDP socket should have a local address")
+    }
+}
+
+impl MustardTransport for UdpMustardTransport {
+    async fn send(&self, target: SocketAddr, message: &GossipMessage) -> Result<(), MustardError> {
+        let bytes =
+            bincode::serialize(message).map_err(|e| MustardError::Serialisation(e.to_string()))?;
+
+        if bytes.len() > MAX_UDP_PAYLOAD {
+            return Err(MustardError::Serialisation(format!(
+                "gossip message too large: {} bytes (max {MAX_UDP_PAYLOAD})",
+                bytes.len()
+            )));
+        }
+
+        self.socket
+            .send_to(&bytes, target)
+            .await
+            .map_err(|e| MustardError::SendFailed {
+                reason: format!("UDP send to {target}: {e}"),
+            })?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> Option<(SocketAddr, GossipMessage)> {
+        let mut buf = [0u8; 1500];
+        loop {
+            match self.socket.recv_from(&mut buf).await {
+                Ok((len, from)) => {
+                    match bincode::deserialize::<GossipMessage>(&buf[..len]) {
+                        Ok(msg) => return Some((from, msg)),
+                        Err(_) => {
+                            // Skip malformed datagrams — don't crash on garbage.
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

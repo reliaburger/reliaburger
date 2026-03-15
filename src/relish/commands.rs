@@ -251,6 +251,17 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
     Ok(())
 }
 
+/// Join an existing cluster.
+pub async fn join(token: &str, addr: &str) -> Result<(), RelishError> {
+    join_with_client(token, addr, &BunClient::default_local()).await
+}
+
+async fn join_with_client(token: &str, addr: &str, client: &BunClient) -> Result<(), RelishError> {
+    let message = client.join(token, addr).await?;
+    println!("{message}");
+    Ok(())
+}
+
 /// Show council (Raft) composition and status.
 pub async fn council(output: OutputFormat) -> Result<(), RelishError> {
     council_with_client(output, &BunClient::default_local()).await

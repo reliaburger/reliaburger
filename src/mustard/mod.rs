@@ -17,11 +17,11 @@ pub mod transport;
 
 pub use config::GossipConfig;
 pub use dissemination::DisseminationQueue;
-pub use membership::{MembershipTable, NodeMembership, ResourceSummary};
+pub use membership::{MembershipSnapshot, MembershipTable, NodeMembership, ResourceSummary};
 pub use message::{GossipMessage, GossipPayload, MAX_PIGGYBACK_UPDATES, MembershipUpdate};
 pub use protocol::MustardNode;
 pub use state::NodeState;
-pub use transport::{InMemoryNetwork, InMemoryTransport, MustardTransport};
+pub use transport::{InMemoryNetwork, InMemoryTransport, MustardTransport, UdpMustardTransport};
 
 /// Errors from Mustard gossip operations.
 #[derive(Debug, thiserror::Error)]

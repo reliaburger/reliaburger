@@ -295,6 +295,43 @@ impl Default for MembershipTable {
 }
 
 // ---------------------------------------------------------------------------
+// MembershipSnapshot
+// ---------------------------------------------------------------------------
+
+/// A serialisable snapshot of a single node's membership state.
+///
+/// Used to publish membership data via a `watch` channel without
+/// sharing the `MembershipTable` across task boundaries.
+#[derive(Debug, Clone)]
+pub struct MembershipSnapshot {
+    pub node_id: NodeId,
+    pub address: SocketAddr,
+    pub state: NodeState,
+    pub incarnation: u64,
+    pub is_council: bool,
+    pub is_leader: bool,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl MembershipTable {
+    /// Produce a snapshot of all active (non-down) members.
+    pub fn snapshot(&self) -> Vec<MembershipSnapshot> {
+        self.active_members()
+            .into_iter()
+            .map(|m| MembershipSnapshot {
+                node_id: m.node_id.clone(),
+                address: m.address,
+                state: m.state,
+                incarnation: m.incarnation,
+                is_council: m.is_council,
+                is_leader: m.is_leader,
+                labels: m.labels.clone(),
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
