@@ -1731,3 +1731,15 @@ CHAOS  Council Partition
 Every injection has a TTL. If you forget to heal, the agent does it for you. `relish chaos status` shows active partitions and their remaining time. `relish chaos heal` cleans up immediately.
 
 This is a foundation. Phase 8 adds Smoker, which uses eBPF for fine-grained fault injection: network delays, packet drops, DNS failures, CPU stress. But the principle is the same: inject, observe, heal, verify. Make failure routine so recovery is trustworthy.
+
+## What we built
+
+Take a step back and look at what happened in this chapter. We started with a single-node container agent and turned it into a distributed system.
+
+We built three communication layers: gossip for wide-scale membership (Mustard, SWIM protocol), Raft for strong consensus among a small council (openraft), and a hierarchical reporting tree that keeps variable-size runtime state off the gossip mesh. We added a scheduler (Meat) that places workloads across the cluster using a four-phase pipeline. We wired everything together with real network transports and built chaos testing into the system as a first-class citizen.
+
+Along the way, we learned about newtypes for type safety, saturating arithmetic for resource tracking, trait-based transport abstraction for testability, watch channels for broadcasting latest-value state, and the `tokio::select!` event loop pattern that holds the whole thing together.
+
+The cluster handles the hard cases: council member departure, minority partition, worker isolation. In every case, the data plane keeps running — apps serve traffic while the control plane sorts itself out. That's the whole point of a distributed orchestrator: your workloads survive infrastructure failures.
+
+Next up: networking. Chapter 3 gives each container its own network namespace, adds eBPF-based service discovery so containers can find each other by name, and puts an ingress proxy in front of the cluster. The nodes can talk to each other now; it's time to let the apps do the same.

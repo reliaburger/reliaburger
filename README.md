@@ -69,8 +69,23 @@ src/
     state_machine.rs   # CouncilStateMachine (applies entries, snapshots)
     network.rs         # InMemoryRaftRouter (test network with partitions)
     node.rs            # CouncilNode (high-level wrapper over openraft)
-  meat/               # Scheduler (shared types, placement TBD)
+  meat/               # Scheduler
     types.rs           # NodeId, AppId, Resources, NodeCapacity
+    scheduler.rs       # Filter → Score → Select → Commit pipeline
+    cluster_state.rs   # Cluster state cache for scheduler
+    filter.rs          # Phase 1: node eligibility filtering
+    score.rs           # Phase 2: weighted scoring (bin-packing, labels, spread)
+    quota.rs           # Namespace resource quotas
+  reconstruction/      # State reconstruction after leader election
+    controller.rs      # Learning period state machine
+    diff.rs            # Desired vs actual state diff engine
+    types.rs           # ReconstructionPhase, Correction, LearningOutcome
+  reporting/           # Hierarchical reporting tree
+    types.rs           # StateReport, RunningApp, ReportHealthStatus
+    transport.rs       # ReportingTransport trait + InMemory + TCP
+    worker.rs          # ReportWorker (sends reports to council)
+    aggregator.rs      # ReportAggregator (council side, watch channel)
+    assignment.rs      # Consistent hash parent assignment
 docs/
   README.md            # User documentation (install, build, run)
   whitepaper.md        # Full architectural vision (the "what and why")

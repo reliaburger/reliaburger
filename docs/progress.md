@@ -51,7 +51,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [x] CLI extensions: `relish join`
 - [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8)
-- [ ] Book chapter + docs: `02-finding-friends.md`, update README and progress
+- [x] Book chapter + docs: `02-finding-friends.md`, update README and progress (588 tests)
 
 ## Phase 3: Networking
 
