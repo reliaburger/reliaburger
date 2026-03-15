@@ -1571,6 +1571,17 @@ reporting_port = 9445
 
 The `join` addresses point to existing nodes' gossip ports. Raft and reporting ports are discovered through the cluster — Raft addresses come from `CouncilNodeInfo.addr` in the Raft membership, and reporting parent addresses come from the council membership watch channel.
 
+### The `relish join` command
+
+You can also tell a running node to join a cluster at runtime:
+
+```
+$ relish join --token abc123 10.0.1.5:9443
+join request accepted for seed 10.0.1.5:9443
+```
+
+This follows the same pipeline as every other `relish` command: the CLI sends a POST to `/v1/cluster/join` on the local Bun agent, which processes the request and returns a confirmation. The `--token` flag is accepted but not validated yet — that's Phase 4's job (Sesame handles authentication). For now, the command is unauthenticated, which is fine for development and testing clusters.
+
 ## Bootstrapping a cluster
 
 Let's walk through what actually happens when you start three nodes from nothing. This is the moment where all those subsystems — gossip, Raft, reporting, scheduling — come alive.
