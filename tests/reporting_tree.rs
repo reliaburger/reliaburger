@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use reliaburger::grill::state::ContainerState;
-use reliaburger::patty::NodeId;
+use reliaburger::meat::NodeId;
 use reliaburger::reporting::aggregator::ReportAggregator;
 use reliaburger::reporting::assignment::assign_parent;
 use reliaburger::reporting::transport::InMemoryReportingNetwork;

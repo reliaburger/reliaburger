@@ -1002,7 +1002,7 @@ Most of the complexity lives in the tests, not the implementation. The adapter c
 
 ### What's next
 
-We have gossip for membership and Raft for consensus. The next pieces connect them: council selection decides which gossip members become Raft voters, the reporting tree gets runtime state from workers to the council, and the Patty scheduler turns desired state into placement decisions. Gossip is the nervous system, Raft is the brain. Now we need the decision-making.
+We have gossip for membership and Raft for consensus. The next pieces connect them: council selection decides which gossip members become Raft voters, the reporting tree gets runtime state from workers to the council, and the Meat scheduler turns desired state into placement decisions. Gossip is the nervous system, Raft is the brain. Now we need the decision-making.
 
 ## Choosing the council
 

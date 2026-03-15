@@ -685,7 +685,7 @@ test result: ok. 66 passed; 0 failed; 0 ignored
 
 Now we need something that actually runs containers. That something is Grill.
 
-The name follows the burger theme (Reliaburger, Bun, Relish, Patty, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
+The name follows the burger theme (Reliaburger, Bun, Relish, Meat, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
 
 1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
 

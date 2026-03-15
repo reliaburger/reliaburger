@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 use super::state::NodeState;
 

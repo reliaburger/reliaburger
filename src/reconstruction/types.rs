@@ -3,7 +3,7 @@
 /// The reconstruction process has five phases, produces a set of
 /// corrections (desired vs actual mismatches), and records whether
 /// the learning period ended by threshold or timeout.
-use crate::patty::types::{AppId, NodeId};
+use crate::meat::types::{AppId, NodeId};
 
 /// Phase of the state reconstruction process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

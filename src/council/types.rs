@@ -14,7 +14,7 @@ use openraft::storage::LogState;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::app::AppSpec;
-use crate::patty::types::{AppId, Placement, SchedulingDecision};
+use crate::meat::types::{AppId, Placement, SchedulingDecision};
 
 // ---------------------------------------------------------------------------
 // openraft type configuration
@@ -42,13 +42,13 @@ openraft::declare_raft_types!(
 /// Application-level data attached to each Raft node.
 ///
 /// openraft requires `NodeId` to be `Copy`, so we use `u64` internally.
-/// The human-readable name (mapping to our `patty::NodeId(String)`)
+/// The human-readable name (mapping to our `meat::NodeId(String)`)
 /// lives here, alongside the Raft RPC address.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CouncilNodeInfo {
     /// Raft RPC address.
     pub addr: SocketAddr,
-    /// Human-readable name, maps to `patty::NodeId`.
+    /// Human-readable name, maps to `meat::NodeId`.
     pub name: String,
 }
 
@@ -247,8 +247,8 @@ mod tests {
             RaftRequest::SchedulingDecision(SchedulingDecision {
                 app_id: AppId::new("web", "production"),
                 placements: vec![Placement {
-                    node_id: crate::patty::types::NodeId::new("node-1"),
-                    resources: crate::patty::types::Resources::new(500, 256 * 1024 * 1024, 0),
+                    node_id: crate::meat::types::NodeId::new("node-1"),
+                    resources: crate::meat::types::Resources::new(500, 256 * 1024 * 1024, 0),
                 }],
             }),
             RaftRequest::ConfigSet {

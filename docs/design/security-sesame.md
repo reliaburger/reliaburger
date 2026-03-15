@@ -32,8 +32,8 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 |-----------|---------------|
 | **Raft** (council) | Stores all persistent security state: intermediate CA private keys (encrypted), age secret encryption keypairs, API token hashes, CRL entries, OIDC signing keys. All writes to security state go through Raft consensus. |
 | **Bun** (worker agent) | Generates workload keypairs, sends CSRs to council, writes signed certificates to workload tmpfs mounts, manages nftables rules, loads eBPF firewall maps, handles secret decryption, rotates node certificates. |
-| **Council** (leader/followers) | Holds intermediate CA private keys (in-memory, decrypted from Raft log). Signs CSRs from worker nodes. Validates that CSR subjects match Patty's scheduling state. Distributes CRLs via the reporting tree. |
-| **Patty** (scheduler) | Provides the scheduling state that council uses to validate CSRs -- a worker node can only obtain a certificate for a workload that Patty has scheduled onto that node. |
+| **Council** (leader/followers) | Holds intermediate CA private keys (in-memory, decrypted from Raft log). Signs CSRs from worker nodes. Validates that CSR subjects match Meat's scheduling state. Distributes CRLs via the reporting tree. |
+| **Meat** (scheduler) | Provides the scheduling state that council uses to validate CSRs -- a worker node can only obtain a certificate for a workload that Meat has scheduled onto that node. |
 | **Mustard** (gossip) | Propagates the `cluster_nodes` IP set used by nftables perimeter rules. Membership changes trigger Bun to reconcile firewall state. |
 | **Onion** (eBPF service discovery) | Hosts the `connect()` interception point where eBPF firewall checks are enforced. The `firewall_map` BPF map is loaded alongside Onion's existing service map. |
 | **Wrapper** (ingress) | Consumes Ingress CA certificates for `tls = "cluster"` routes. Triggers certificate renewal through Bun. |
@@ -130,7 +130,7 @@ Worker Node (Bun)                     Council Node (nearest parent)
      |                              4. Validate: |
      |                   - Node cert is valid    |
      |                   - CSR subject matches   |
-     |                     Patty's scheduling    |
+     |                     Meat's scheduling    |
      |                     state for this node   |
      |                   - Workload IS scheduled |
      |                     on requesting node    |
@@ -769,7 +769,7 @@ Cluster initialised.
 Bun on each worker node maintains a rotation schedule for every running workload:
 
 1. **Initial issuance.** When Bun starts a workload, it immediately generates a keypair and sends a CSR to its nearest council parent.
-2. **Validation.** The council member checks that the requesting node (identified by its mTLS node certificate CN) is scheduled to run the workload (verified against Patty's scheduling state).
+2. **Validation.** The council member checks that the requesting node (identified by its mTLS node certificate CN) is scheduled to run the workload (verified against Meat's scheduling state).
 3. **Signing.** The council member signs the certificate with the Workload CA, sets a 1-hour lifetime, and returns it.
 4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, and `token` (OIDC JWT) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
 5. **Rotation timer.** Bun schedules the next rotation for 30 minutes later (half the certificate lifetime).
@@ -1125,7 +1125,7 @@ The threat model assumes:
 
 **What the attacker cannot do:**
 
-- Obtain certificates for workloads on other nodes (CSR validation checks Patty's scheduling state).
+- Obtain certificates for workloads on other nodes (CSR validation checks Meat's scheduling state).
 - Forge certificates for arbitrary workloads (no CA private keys on worker nodes).
 - Decrypt secrets for workloads in other namespaces (namespace-scoped keys, decryption happens on council).
 - Access the age private key, CA private keys, or OIDC signing key (stored only on council nodes).
@@ -1219,7 +1219,7 @@ The CSR flow (worker generates keypair, sends CSR to council, council validates 
 | Keypair generation (ECDSA P-256) | < 1 ms |
 | CSR creation and serialisation | < 1 ms |
 | Network round-trip to council (same datacenter) | 1-5 ms |
-| CSR validation (check Patty state) | < 1 ms |
+| CSR validation (check Meat state) | < 1 ms |
 | Certificate signing (ECDSA P-256) | < 1 ms |
 | **Total CSR round-trip** | **2-10 ms** |
 

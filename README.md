@@ -69,7 +69,7 @@ src/
     state_machine.rs   # CouncilStateMachine (applies entries, snapshots)
     network.rs         # InMemoryRaftRouter (test network with partitions)
     node.rs            # CouncilNode (high-level wrapper over openraft)
-  patty/               # Scheduler (shared types, placement TBD)
+  meat/               # Scheduler (shared types, placement TBD)
     types.rs           # NodeId, AppId, Resources, NodeCapacity
 docs/
   README.md            # User documentation (install, build, run)

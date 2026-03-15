@@ -8,7 +8,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 /// Assign a worker to its parent council member.
 ///

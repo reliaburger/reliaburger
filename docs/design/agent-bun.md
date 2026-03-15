@@ -55,7 +55,7 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 | **runc** | Runtime (external process, via containerd) | Low-level container execution (namespaces, cgroups, seccomp) |
 | **Linux kernel 5.7+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
-| **Patty (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Patty runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
+| **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
 | **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Worker nodes receive state via the reporting tree, not directly from Raft. |
 | **Onion (eBPF)** | Internal subsystem | Bun loads and manages the Onion eBPF programs and kernel maps. Onion depends on Bun for map updates when workloads start/stop or health checks change state. |
 | **Pickle (image registry)** | Internal subsystem | Image pull/push, binary distribution during self-upgrade. Bun participates as a Pickle storage node. |
@@ -115,7 +115,7 @@ Bun runs as a single Tokio async runtime with multiple subsystem tasks. Each sub
 **Inbound (workload scheduling):**
 
 ```
-Leader (Patty)
+Leader (Meat)
   → Reporting tree (council member parent)
     → Bun on this node
       → WorkloadSupervisor

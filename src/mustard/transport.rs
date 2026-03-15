@@ -157,8 +157,8 @@ impl MustardTransport for InMemoryTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meat::NodeId;
     use crate::mustard::message::{GossipMessage, GossipPayload};
-    use crate::patty::NodeId;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))

@@ -25,7 +25,7 @@ docs/
     agent-bun.md       # Node agent, container lifecycle, health checks
     cli-relish.md      # CLI and TUI
     gossip-mustard.md  # SWIM gossip protocol
-    scheduler-patty.md # Scheduler and placement
+    scheduler-meat.md # Scheduler and placement
     discovery-onion.md # eBPF service discovery
     ingress-wrapper.md # Ingress proxy
     security-sesame.md # PKI, mTLS, secrets, firewall

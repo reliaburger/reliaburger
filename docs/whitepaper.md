@@ -118,7 +118,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 
 **500 apps per node** demands that the Bun agent, Onion eBPF service map, Ketchup log collector, and Mayo metrics store all have sub-millisecond per-app overhead. Rust's zero-cost abstractions and lack of garbage collection pauses make this achievable in a way that a garbage-collected runtime would struggle to match at the tail.
 
-**100 million jobs per day** demands a scheduler (Patty) that can make placement decisions at high throughput without becoming a bottleneck. At a sustained rate, this is over a thousand jobs dispatched per second. The design implications (batch scheduling, delegated execution, and asynchronous reporting) are detailed in [design/scheduler-patty.md](design/scheduler-patty.md).
+**100 million jobs per day** demands a scheduler (Meat) that can make placement decisions at high throughput without becoming a bottleneck. At a sustained rate, this is over a thousand jobs dispatched per second. The design implications (batch scheduling, delegated execution, and asynchronous reporting) are detailed in [design/scheduler-meat.md](design/scheduler-meat.md).
 
 **GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. The Bun agent detects GPUs at startup via NVML and reports them as schedulable resources alongside CPU and memory.
 
@@ -166,7 +166,7 @@ Every component in the Reliaburger system is named after a burger part.
 |-----------|------|------|
 | Project | **Reliaburger** | The product |
 | Agent/daemon | **Bun** | Runs on every node; holds everything together |
-| Scheduler | **Patty** | The core scheduling engine |
+| Scheduler | **Meat** | The core scheduling engine |
 | Container runtime interface | **Grill** | Where containers get cooked |
 | Image registry | **Pickle** | Preserved image layers, distributed across the cluster |
 | Gossip protocol layer | **Mustard** | Spreads information everywhere |
@@ -230,7 +230,7 @@ required = ["region=us-east"]
 preferred = ["ssd=true"]
 ```
 
-> For scheduling algorithm details, see [design/scheduler-patty.md](design/scheduler-patty.md).
+> For scheduling algorithm details, see [design/scheduler-meat.md](design/scheduler-meat.md).
 
 ### 5.2 Job
 
@@ -247,11 +247,11 @@ image = "cleanup:latest"
 schedule = "0 3 * * *"
 ```
 
-**High-throughput batch scheduling:** At 100M jobs/day, Patty allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions.
+**High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions.
 
 **Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `build_push_to` field that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
 
-> For batch scheduling and build job details, see [design/scheduler-patty.md](design/scheduler-patty.md) and [design/registry-pickle.md](design/registry-pickle.md).
+> For batch scheduling and build job details, see [design/scheduler-meat.md](design/scheduler-meat.md) and [design/registry-pickle.md](design/registry-pickle.md).
 
 ### 5.3 Secret
 
@@ -391,7 +391,7 @@ Every node runs the same binary: **Bun**. There's no distinction between control
 │   • Web UI (Brioche)                                     │
 │                                                          │
 │  The leader additionally runs:                           │
-│   • Scheduler (Patty)                                    │
+│   • Scheduler (Meat)                                    │
 │                                                          │
 │  Council members additionally run:                       │
 │   • API server (reads from local Raft state)             │
@@ -402,7 +402,7 @@ Every node runs the same binary: **Bun**. There's no distinction between control
 
 ### 7.2 Leader and Council
 
-The leader is an ordinary node that additionally runs the Patty scheduler. Leadership is lightweight: the leader runs application workloads alongside its scheduling duties. Any council member serves API read requests; writes go to the leader via Raft.
+The leader is an ordinary node that additionally runs the Meat scheduler. Leadership is lightweight: the leader runs application workloads alongside its scheduling duties. Any council member serves API read requests; writes go to the leader via Raft.
 
 For large clusters with heavy API read load, additional non-council nodes can serve as **read replicas**, maintaining a read-only Raft state follower without participating in consensus.
 
@@ -942,7 +942,7 @@ The push is synchronous by default. The client receives a success response only 
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
-The leader doesn't schedule individual jobs. For batch workloads, Patty allocates job batches to nodes: "Node 7, here are your next 200 jobs." Nodes execute their assigned jobs and report completions asynchronously via the hierarchical reporting tree. The Raft log records only batch-level decisions, not individual job lifecycle events. The leader's hot path focuses on Apps (which change infrequently) and batch-level allocation decisions. The Patty scheduler runs on a dedicated async task with its own CPU budget, isolated from API serving, Brioche UI, and metrics queries.
+The leader doesn't schedule individual jobs. For batch workloads, Meat allocates job batches to nodes: "Node 7, here are your next 200 jobs." Nodes execute their assigned jobs and report completions asynchronously via the hierarchical reporting tree. The Raft log records only batch-level decisions, not individual job lifecycle events. The leader's hot path focuses on Apps (which change infrequently) and batch-level allocation decisions. The Meat scheduler runs on a dedicated async task with its own CPU budget, isolated from API serving, Brioche UI, and metrics queries.
 
 ### Q9: Local-only volumes with no distributed storage. How do teams not lose data?
 
@@ -962,7 +962,7 @@ Not in v1. Reliaburger v1 supports whole-device GPU allocation only (`gpu = 1`, 
 
 ### Q13: How does multi-tenancy work? Can one team starve the cluster?
 
-Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Patty scheduler enforces at deploy time. When a deploy would exceed a namespace's quota, Patty rejects it with a clear error. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
+Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces at deploy time. When a deploy would exceed a namespace's quota, Meat rejects it with a clear error. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
 
 ### Q14: What's the minimum cluster size?
 

@@ -10,10 +10,10 @@
 use std::net::SocketAddr;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use reliaburger::meat::NodeId;
 use reliaburger::mustard::{
     GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, MustardNode, MustardTransport,
 };
-use reliaburger::patty::NodeId;
 
 /// Generate a unique SocketAddr for node index i.
 /// Encodes index across IP octets and port to support up to ~16M nodes.

@@ -152,8 +152,8 @@ fn broadcast_count(cluster_size: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meat::NodeId;
     use crate::mustard::NodeState;
-    use crate::patty::NodeId;
 
     fn update(node: &str, state: NodeState) -> MembershipUpdate {
         MembershipUpdate {

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::node::ReconstructionSection;
 use crate::council::types::DesiredState;
-use crate::patty::types::NodeId;
+use crate::meat::types::NodeId;
 use crate::reporting::aggregator::AggregatedState;
 
 use super::diff::compute_diff;
@@ -229,7 +229,7 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::patty::types::{Placement, Resources};
+    use crate::meat::types::{Placement, Resources};
     use crate::reporting::types::{ResourceUsage, StateReport};
 
     fn node(name: &str) -> NodeId {
@@ -432,7 +432,7 @@ mod tests {
         // Desired: web/prod on n1
         let mut desired = DesiredState::default();
         desired.scheduling.insert(
-            crate::patty::types::AppId::new("web", "prod"),
+            crate::meat::types::AppId::new("web", "prod"),
             vec![Placement {
                 node_id: node("n1"),
                 resources: Resources::new(100, 128 * 1024 * 1024, 0),

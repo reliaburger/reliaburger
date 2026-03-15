@@ -66,7 +66,7 @@ Unit tests:
 
 - Mustard SWIM state machine: ALIVE → SUSPECT → DEAD transitions, incarnation number conflicts, piggyback dissemination
 - Council selection: zone diversity scoring, stability filtering, tiebreaking determinism
-- Patty scheduler simulation: bin-packing correctness, required/preferred label enforcement, daemon mode, quota enforcement, autoscaler stability
+- Meat scheduler simulation: bin-packing correctness, required/preferred label enforcement, daemon mode, quota enforcement, autoscaler stability
 
 Integration tests:
 
@@ -91,20 +91,20 @@ Chaos tests (network namespace / iptables simulation):
 
 Each step is a self-contained PR with its own tests-first cycle.
 
-1. **Shared types.** `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` newtypes in `src/patty/types.rs`. Foundation for all three subsystems.
+1. **Shared types.** `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` newtypes in `src/meat/types.rs`. Foundation for all three subsystems.
 2. **Mustard state machine.** SWIM node states (`Alive → Suspect → Dead`), incarnation-based conflict resolution, membership table, piggyback dissemination queue with priority ordering. Pure data structures, no networking yet.
 3. **Mustard transport and protocol.** `MustardTransport` trait with `InMemoryMustardTransport` for testing. SWIM probe cycle: PING → ACK, timeout → PING-REQ via relay, still no ACK → mark Suspect. Integration test for gossip convergence across 5 in-memory nodes.
 4. **Raft integration (openraft).** Wrap the `openraft` crate with three adapter implementations: `RaftLogStorage` (in-memory), `RaftNetwork` (TCP + in-memory mock), `RaftStateMachine` (applies `DesiredStateCommand` entries to cluster state). Integration tests for leader election, failover, and log replication.
 5. **Council selection.** Automatic council member selection from membership table. Scores stability (node age), zone diversity, resource availability. Deterministic tiebreak via seeded RNG. Council size 3–7.
 6. **Reporting tree.** Non-council nodes send `StateReport` to assigned council member every 5s. Assignment via consistent hashing. Council members aggregate for leader. Uses `tokio::sync::watch` for latest-value broadcasting.
 7. **State reconstruction.** After leader election, new leader enters learning period. Collects StateReports, loads desired state from Raft log, diffs, issues corrections. No scheduling until 95% of nodes report or 15s timeout.
-8. **Patty scheduler.** Four-phase placement pipeline (Filter → Score → Select → Commit). Bin-packing, required/preferred labels, daemon mode, GPU-aware, namespace quota enforcement. Property-based tests for scheduler correctness.
-9. **Agent integration.** Wire mustard, raft, and patty into `BunAgent` as spawned tasks communicating via channels. Extend `ClusterSection` config with gossip/raft ports. Add cluster API endpoints (`/v1/cluster/nodes`, `/v1/cluster/council`, `/v1/cluster/leader`).
+8. **Meat scheduler.** Four-phase placement pipeline (Filter → Score → Select → Commit). Bin-packing, required/preferred labels, daemon mode, GPU-aware, namespace quota enforcement. Property-based tests for scheduler correctness.
+9. **Agent integration.** Wire mustard, raft, and meat into `BunAgent` as spawned tasks communicating via channels. Extend `ClusterSection` config with gossip/raft ports. Add cluster API endpoints (`/v1/cluster/nodes`, `/v1/cluster/council`, `/v1/cluster/leader`).
 10. **CLI extensions.** New relish subcommands: `nodes`, `council`, `join` (unauthenticated until Phase 4).
 11. **Chaos tests.** Council partition 3/2 (majority elects, minority read-only, heal and reconcile). Worker isolation (apps continue, state-unknown). Full council loss (recovery candidate assumes leadership).
 12. **Book chapter and docs.** Write `docs/book/02-finding-friends.md`. Update progress, README.
 
-Design docs: [gossip-mustard.md](design/gossip-mustard.md), [scheduler-patty.md](design/scheduler-patty.md)
+Design docs: [gossip-mustard.md](design/gossip-mustard.md), [scheduler-meat.md](design/scheduler-meat.md)
 
 **Milestone:** 3-node cluster with leader election, gossip-based failure detection, and app scheduling across nodes. All Phase 2 tests pass.
 

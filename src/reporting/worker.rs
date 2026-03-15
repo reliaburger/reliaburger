@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::node::ReportingTreeSection;
 use crate::grill::state::ContainerState;
-use crate::patty::NodeId;
+use crate::meat::NodeId;
 
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;

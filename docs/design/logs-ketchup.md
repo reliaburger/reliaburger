@@ -30,7 +30,7 @@ The design goals for Ketchup are:
 | **Bun** (Agent) | Host process | Ketchup runs as a module inside Bun. Bun provides the lifecycle hooks for container start/stop events and access to container stdio file descriptors. |
 | **Grill** (Container Runtime Interface) | Stdio streams | Grill manages the container runtime (containerd/runc). When a container is created, Grill returns the stdout and stderr file descriptors (or named pipes) that Ketchup attaches to for log capture. For process workloads, Bun spawns the process with redirected stdout/stderr pipes that Ketchup reads from. |
 | **Mustard** (Gossip) | Cluster topology | Ketchup uses the Mustard membership list to know which nodes are running which apps, enabling the leader to fan out cross-node log queries to the correct subset of nodes. |
-| **Patty** (Scheduler) | App placement | The leader uses Patty's placement data to determine which nodes to query when a `relish logs` command targets an app with multiple instances across the cluster. |
+| **Meat** (Scheduler) | App placement | The leader uses Meat's placement data to determine which nodes to query when a `relish logs` command targets an app with multiple instances across the cluster. |
 
 ### External Dependencies
 
@@ -155,7 +155,7 @@ relish logs web --since 1h --grep "ERROR"
 Leader receives query
     │
     ├─ Lookup: which nodes run app "web"?
-    │   (from Patty placement state: node-01, node-02, node-03)
+    │   (from Meat placement state: node-01, node-02, node-03)
     │
     ├─ Fan out LogQuery to node-01, node-02, node-03 in parallel
     │

@@ -1,4 +1,4 @@
-/// Patty scheduler.
+/// Meat scheduler.
 ///
 /// Handles multi-node workload placement decisions. The scheduler runs
 /// on the leader node and uses a four-phase pipeline (Filter → Score →
