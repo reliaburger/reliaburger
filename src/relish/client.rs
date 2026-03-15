@@ -317,6 +317,31 @@ impl BunClient {
         Ok(nodes)
     }
 
+    /// Join an existing cluster.
+    pub async fn join(&self, token: &str, addr: &str) -> Result<String, RelishError> {
+        let url = format!("{}/v1/cluster/join", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "token": token, "addr": addr }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+
+        Ok(json["message"].as_str().unwrap_or("joined").to_string())
+    }
+
     /// Get council (Raft) status.
     pub async fn council(&self) -> Result<CouncilStatus, RelishError> {
         let url = format!("{}/v1/cluster/council", self.base_url);

@@ -40,6 +40,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/exec/{app}/{namespace}", post(exec_handler))
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
+        .route("/v1/cluster/join", post(join_handler))
         .with_state(state)
 }
 
@@ -380,6 +381,48 @@ async fn council_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+/// Request body for cluster join.
+#[derive(Deserialize)]
+struct JoinRequest {
+    token: String,
+    addr: String,
+}
+
+/// Join an existing cluster.
+async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Join {
+            token: body.token,
+            addr: body.addr,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +683,29 @@ mod tests {
         assert!(json["leader"].is_null());
         assert_eq!(json["app_count"], 0);
         assert!(json["members"].as_array().unwrap().is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn join_endpoint_returns_success() {
+        let (app, shutdown) = test_setup();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/cluster/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"abc123","addr":"10.0.1.5:9443"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["message"].as_str().unwrap().contains("10.0.1.5:9443"));
         shutdown.cancel();
     }
 }

@@ -69,6 +69,14 @@ enum Command {
     Nodes,
     /// Show council (Raft) composition and status.
     Council,
+    /// Join an existing cluster.
+    Join {
+        /// Join token (validated in Phase 4).
+        #[arg(long)]
+        token: String,
+        /// Address of an existing cluster member (gossip endpoint).
+        addr: String,
+    },
 }
 
 #[tokio::main]
@@ -92,6 +100,10 @@ async fn main() -> ExitCode {
         Command::Init { ref dir } => commands::init(dir),
         Command::Nodes => commands::nodes(cli.output).await,
         Command::Council => commands::council(cli.output).await,
+        Command::Join {
+            ref token,
+            ref addr,
+        } => commands::join(token, addr).await,
     };
 
     match result {
@@ -180,6 +192,24 @@ mod tests {
     fn parse_council_command() {
         let cli = parse(&["relish", "council"]).unwrap();
         assert!(matches!(cli.command, Command::Council));
+    }
+
+    #[test]
+    fn parse_join_command() {
+        let cli = parse(&["relish", "join", "--token", "abc123", "10.0.1.5:9443"]).unwrap();
+        match cli.command {
+            Command::Join { token, addr } => {
+                assert_eq!(token, "abc123");
+                assert_eq!(addr, "10.0.1.5:9443");
+            }
+            _ => panic!("expected Join command"),
+        }
+    }
+
+    #[test]
+    fn parse_join_missing_token_rejected() {
+        let result = parse(&["relish", "join", "10.0.1.5:9443"]);
+        assert!(result.is_err());
     }
 
     #[test]

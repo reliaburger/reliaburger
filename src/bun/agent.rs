@@ -100,6 +100,12 @@ pub enum AgentCommand {
     Council {
         response: oneshot::Sender<CouncilStatus>,
     },
+    /// Join an existing cluster.
+    Join {
+        token: String,
+        addr: String,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
 }
 
 /// Result of a deploy operation.
@@ -433,6 +439,15 @@ impl<G: Grill> BunAgent<G> {
             AgentCommand::Council { response } => {
                 let status = self.get_council_status().await;
                 let _ = response.send(status);
+            }
+            AgentCommand::Join {
+                token: _,
+                addr,
+                response,
+            } => {
+                // TODO(Phase 4): validate join token via Sesame
+                let msg = format!("join request accepted for seed {addr}");
+                let _ = response.send(Ok(msg));
             }
         }
     }
