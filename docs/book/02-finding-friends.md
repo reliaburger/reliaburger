@@ -1570,3 +1570,97 @@ reporting_port = 9445
 ```
 
 The `join` addresses point to existing nodes' gossip ports. Raft and reporting ports are discovered through the cluster — Raft addresses come from `CouncilNodeInfo.addr` in the Raft membership, and reporting parent addresses come from the council membership watch channel.
+
+## Bootstrapping a cluster
+
+Let's walk through what actually happens when you start three nodes from nothing. This is the moment where all those subsystems — gossip, Raft, reporting, scheduling — come alive.
+
+### The first node
+
+```
+$ bun --config node.toml
+```
+
+Node 1 starts. Its `[cluster]` section has an empty `join` list and `gossip_port = 9443`. Because `join` is empty, Bun knows this is the first node in a new cluster.
+
+Here's the sequence:
+
+1. **Bind ports.** UDP socket on `:9443` for gossip. TCP listener on `:9444` for Raft. TCP listener on `:9445` for reporting.
+2. **Create MustardNode.** It adds itself to its own membership table: one node, state `Alive`, incarnation 1. The gossip protocol starts cycling, but there's nobody to ping yet.
+3. **Self-promote to council.** With an empty `join` list, the node initialises a single-member Raft cluster with itself. It calls `CouncilNode::initialize()` with a one-member set. Raft immediately elects it as leader (quorum of 1 = itself). Term 1 begins.
+4. **Start the Raft RPC server.** TCP connections on the Raft port dispatch to the local `Raft<TypeConfig>` instance.
+5. **Start the ReportAggregator.** As a council member, this node aggregates state reports from workers. Right now there are no workers, so it sits idle.
+6. **Start the BunAgent.** The agent receives its `ClusterHandle` with the membership watch and Raft metrics. The Nodes endpoint returns one node (itself). The Council endpoint returns one member with itself as leader.
+
+At this point you have a fully functional cluster of one. You can deploy apps, and they'll run on this single node. Not very resilient, but it works.
+
+### The second node joins
+
+```
+$ bun --config node.toml
+```
+
+Node 2's config has `join = ["10.0.1.5:9443"]` — the first node's gossip address.
+
+1. **Bind ports.** Same as before, different host or different port numbers.
+2. **Create MustardNode with seed.** Node 2 adds the seed address to its membership table and starts the gossip protocol. On its first cycle, it pings `10.0.1.5:9443`.
+3. **Gossip discovery.** Node 1 receives the PING, learns about Node 2, and piggybacks this on its next outgoing messages. Node 2 receives Node 1's ACK with its membership list. Within one or two gossip periods (200ms each by default), both nodes know about each other.
+4. **No council yet.** Node 2 starts as a non-council worker. It doesn't run Raft.
+5. **Start ReportWorker.** Node 2 computes its parent via `assign_parent()`: with one council member, every worker reports to Node 1. It starts sending `StateReport` messages to Node 1 every 5 seconds.
+6. **Leader notices.** On Node 1, the leader checks whether the council should grow. With `min_council_size = 3`, it wants at least 3 council members. It only has 1 (itself), and Node 2 just appeared. But the selection algorithm requires `min_node_age = 10 minutes` before a node is eligible. So Node 2 waits.
+
+Two nodes. One is the council, the other is a worker. Apps can be scheduled on both.
+
+### The third node joins
+
+Same process as Node 2: bind ports, gossip discovery, start as a worker. Now the leader sees 3 total nodes, but still only 1 council member.
+
+After 10 minutes of Node 2 and Node 3 being alive and stable, the leader runs `select_council_candidates()`. Both nodes pass the eligibility filters (alive, old enough, not overloaded). The algorithm scores them for zone diversity (if they have different `zone` labels, that's a bonus) and picks the best candidates. With a target of 3 and only 1 current council member, it needs 2 more.
+
+The leader promotes them:
+
+1. **Add as learners.** `council.add_learner(2, info)` and `council.add_learner(3, info)`. The new nodes start receiving Raft log replication but can't vote yet.
+2. **Wait for catch-up.** The learners replay the existing log entries to build their `DesiredState`. For a fresh cluster this is fast — there might be only a few entries.
+3. **Change membership.** `council.change_membership({1, 2, 3})`. All three nodes are now voters. Raft requires a quorum of 2 for writes. The cluster can now survive the loss of any single node.
+
+Once promoted, Nodes 2 and 3 start their own `ReportAggregator` instances. Workers re-hash their parent assignments: with 3 council members, each gets roughly a third of the workers. The reporting tree rebalances automatically.
+
+You now have a proper 3-node council. If the leader dies, Raft elects a new one within 1–2 seconds. If a council member dies, the leader promotes a replacement from the worker pool.
+
+## Council membership changes
+
+The council isn't static. Nodes join, nodes leave, nodes crash. The council adapts.
+
+### What triggers a membership change?
+
+Three things:
+
+**1. A council member departs.** Either gracefully (it announces `Left` via gossip) or by crashing (detected by Raft heartbeat timeout, typically 1–2 seconds). The remaining members continue with reduced quorum. The leader evaluates the candidate pool and promotes a replacement.
+
+**2. The cluster grows past the current council size.** The council starts at 1 and grows towards `max_council_size` (default 7). With 3 nodes, you have 3 council members. With 50 nodes, you probably want 5. With 500 nodes, 7. The leader periodically checks whether the council should grow.
+
+**3. A council member becomes ineligible.** If a council member's CPU usage stays above 90% or its memory above 85% for an extended period, the leader may decide to replace it with a healthier node. This is a soft constraint — the leader doesn't immediately eject overloaded members, because that would cause unnecessary churn.
+
+### How it works mechanically
+
+The leader drives all council changes. Nobody else can modify the Raft membership. The sequence is always the same:
+
+1. **Evaluate.** The leader calls `select_council_candidates()` with the current gossip membership table. This returns a ranked list of eligible nodes.
+2. **Add learner.** `council.add_learner(new_id, CouncilNodeInfo { addr, name })`. The new node starts receiving log replication. It doesn't vote yet.
+3. **Wait for catch-up.** The leader watches the learner's `match_index` in the Raft metrics. Once it's caught up to the leader's commit index, the learner is ready.
+4. **Change membership.** `council.change_membership(new_voter_set)`. Raft handles the joint consensus protocol internally — openraft does the heavy lifting. The old set and new set overlap during the transition, so there's no moment where no quorum exists.
+
+If a council member is being *removed* rather than added, the leader first ensures the remaining members form a quorum, then issues the membership change. Raft's joint consensus guarantees safety.
+
+### The selection algorithm
+
+`select_council_candidates()` is a pure function. No side effects, no I/O. It takes a `MembershipTable` snapshot and returns candidates sorted by desirability:
+
+1. **Filter.** Only `Alive` nodes are eligible. Must not already be on the council. Must have been in the cluster for at least `min_node_age` (10 minutes). Must have reported resource usage, and that usage must be below the CPU/memory thresholds.
+2. **Score.** Zone diversity comes first: nodes in zones not yet represented on the council score higher. Then age: older nodes are more stable. Then a deterministic tiebreak by `NodeId` (lexicographic).
+
+The leader calls this function periodically (every gossip cycle, since it's cheap) and acts only when the result differs from the current council composition. Most of the time, nothing changes. When something does change — a member departed, a new zone came online, the cluster grew — the leader reacts within one gossip period.
+
+### What happens to running apps during a council change?
+
+Nothing. Council changes affect the control plane only. Running workloads are managed by the Bun agent on each node, which doesn't care about Raft membership. Apps keep serving traffic. Health checks keep running. The gossip protocol keeps probing. The only visible effect is that the reporting tree rebalances: workers re-hash their parent assignments when the council membership changes, and the new parent starts receiving reports on the next cycle.
