@@ -53,6 +53,14 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8)
 - [x] Book chapter + docs: `02-finding-friends.md`, update README and progress (588 tests)
 
+## Phase 2.1: Dev Cluster
+
+- [x] Lima wrapper: VM lifecycle (create, start, stop, delete), platform detection, YAML generation
+- [x] Node configuration: generate node.toml per VM with join addresses and cluster ports
+- [x] CLI: `relish dev create`, `status`, `shell`, `stop`, `start`, `destroy`
+- [x] GitHub release pipeline: cross-compile bun/relish for linux-aarch64 and linux-x86_64
+- [x] Docs: whitepaper dev cluster section, README, book getting-started guide
+
 ## Phase 3: Networking
 
 - [ ] Per-container network namespaces (veth pairs, port mapping)

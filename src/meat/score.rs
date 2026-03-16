@@ -57,10 +57,12 @@ fn compute_score(
 
     // Bin-packing: prefer nodes that will be more utilised after placement.
     // Score = utilisation_after / allocatable * 100
-    let bin_pack = {
-        let allocatable_cpu = node.allocatable.cpu_millicores.max(1);
+    // Nodes with zero allocatable CPU get a neutral score of 50.
+    let bin_pack = if node.allocatable.cpu_millicores == 0 {
+        50u32
+    } else {
         let allocated_after = node.allocated.cpu_millicores + resources.cpu_millicores;
-        let utilisation = (allocated_after * 100 / allocatable_cpu).min(100);
+        let utilisation = (allocated_after * 100 / node.allocatable.cpu_millicores).min(100);
         utilisation as u32
     };
 

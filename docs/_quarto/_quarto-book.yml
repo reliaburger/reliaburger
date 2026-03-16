@@ -13,6 +13,7 @@ book:
     - book/00-preface.md
     - book/01-hello-container.md
     - book/02-finding-friends.md
+    - book/02a-code-walkthrough.md
     - book/03-talking-to-each-other.md
     - book/04-trust-no-one.md
     - book/05-where-the-images-live.md

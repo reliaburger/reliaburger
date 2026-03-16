@@ -56,12 +56,17 @@ impl PortAllocator {
         }
 
         let mut rng = rand::thread_rng();
-        loop {
+        // Cap retries to avoid spinning when the pool is nearly exhausted.
+        for _ in 0..1000 {
             let port = rng.gen_range(self.range_start..self.range_end);
             if allocated.insert(port) {
                 return Ok(port);
             }
         }
+        Err(PortError::Exhausted {
+            start: self.range_start,
+            end: self.range_end,
+        })
     }
 
     /// Release a previously allocated port back to the pool.

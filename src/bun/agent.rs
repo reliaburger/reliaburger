@@ -529,7 +529,7 @@ impl<G: Grill> BunAgent<G> {
             PartitionInfo {
                 peers: peers.clone(),
                 injected_at_epoch: epoch,
-                duration_secs: remaining.as_secs() + 1, // approximate
+                duration_secs: (remaining.as_millis() as u64).div_ceil(1000),
                 remaining_secs: remaining.as_secs(),
             }
         });

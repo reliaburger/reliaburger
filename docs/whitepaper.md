@@ -357,6 +357,35 @@ Three commands from bare metal to a running, TLS-secured production application 
 
 > For the full `node.toml` reference, storage path design, and resource configuration, see [design/agent-bun.md](design/agent-bun.md).
 
+### Dev cluster
+
+Getting started with Kubernetes locally means choosing between minikube, kind, k3d, Docker Desktop's built-in cluster, or Rancher Desktop. Each has trade-offs, none gives you a real multi-node cluster, and you still need to install a CNI plugin, ingress controller, and metrics stack before you can do anything useful.
+
+Reliaburger gives you a real multi-node cluster with a single command:
+
+```bash
+$ relish dev create --nodes 3
+```
+
+This spins up 3 Ubuntu VMs (via Lima), installs rootless runc and the Reliaburger binaries, configures gossip networking and Raft consensus, and hands you a working cluster. Real VMs, real networking, real containers. You can immediately deploy apps, run chaos tests, and benchmark the scheduler.
+
+```bash
+$ relish --agent http://192.168.105.2:9117 nodes
+NODE                 ADDRESS              STATE      COUNCIL  LEADER
+reliaburger-1        192.168.105.2:9443   alive      yes      yes
+reliaburger-2        192.168.105.3:9443   alive      yes      -
+reliaburger-3        192.168.105.4:9443   alive      yes      -
+
+$ relish --agent http://192.168.105.2:9117 chaos council-partition
+CHAOS  Council Partition
+  ...
+  PASSED  council partition recovery in 12.1s
+
+$ relish dev destroy
+```
+
+The dev cluster runs the same binary as production. There's no special "dev mode" or reduced-functionality variant. What you test locally is what you deploy.
+
 ---
 
 ## 7. Cluster Architecture

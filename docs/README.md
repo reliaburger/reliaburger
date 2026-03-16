@@ -230,6 +230,12 @@ Commands:
 | `council` | Show council (Raft) composition and status |
 | `join --token <token> <addr>` | Join an existing cluster |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
+| `dev create` | Create a local dev cluster (Lima VMs with rootless runc) |
+| `dev status` | Show dev cluster status |
+| `dev shell <node>` | Open a shell on a dev cluster node |
+| `dev stop` | Stop a dev cluster (VMs stay on disk) |
+| `dev start` | Start a stopped dev cluster |
+| `dev destroy` | Destroy a dev cluster (delete all VMs) |
 
 Global flags:
 

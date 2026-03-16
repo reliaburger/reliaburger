@@ -227,6 +227,7 @@ async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
     stream.read_exact(&mut len_buf).await.ok()?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_RAFT_RPC_SIZE {
+        eprintln!("raft: dropping oversized frame: {len} bytes (max {MAX_RAFT_RPC_SIZE})");
         return None;
     }
     let mut payload = vec![0u8; len];
@@ -364,6 +365,9 @@ impl fmt::Debug for TcpRaftNetwork {
 
 impl TcpRaftNetwork {
     /// Send an RPC and read the response.
+    ///
+    /// The entire operation (connect + write + read) is wrapped in a
+    /// 10-second timeout to prevent hangs from slow or stalled peers.
     async fn rpc(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
         // Check blocklist for chaos testing
         if self.blocklist.read().await.contains(&self.target_addr) {
@@ -372,16 +376,20 @@ impl TcpRaftNetwork {
             )));
         }
 
+        // Wrap the entire RPC in a timeout — covers connect, write, and read.
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.rpc_inner(rpc))
+            .await
+            .map_err(|_| Unreachable::new(&RouterError("rpc timeout (10s)".into())))?
+    }
+
+    /// Inner RPC implementation (called within a timeout).
+    async fn rpc_inner(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
         let payload = bincode::serialize(&rpc)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
 
-        let mut stream = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::net::TcpStream::connect(self.target_addr),
-        )
-        .await
-        .map_err(|_| Unreachable::new(&RouterError("connect timeout".into())))?
-        .map_err(|e| Unreachable::new(&RouterError(format!("connect: {e}"))))?;
+        let mut stream = tokio::net::TcpStream::connect(self.target_addr)
+            .await
+            .map_err(|e| Unreachable::new(&RouterError(format!("connect: {e}"))))?;
 
         write_frame(&mut stream, &payload)
             .await
