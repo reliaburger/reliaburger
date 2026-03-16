@@ -110,6 +110,22 @@ Design docs: [gossip-mustard.md](design/gossip-mustard.md), [scheduler-meat.md](
 
 ---
 
+## Phase 2.1: Dev Cluster (`relish dev`)
+
+One-command dev cluster using Lima VMs. The Reliaburger equivalent of `minikube start`. Spins up real Ubuntu VMs with rootless runc, gossip networking, and Raft consensus — a proper multi-node cluster on a laptop.
+
+### Implementation
+
+1. **Lima wrapper.** Shell out to `limactl` for VM lifecycle (create, start, stop, delete). Detect platform (arm64/amd64). Generate Lima YAML with Ubuntu cloud image, shared networking, and provisioning script that installs runc + downloads bun/relish from GitHub releases.
+2. **Node configuration.** Generate `node.toml` per VM with correct join addresses and cluster ports. First node bootstraps Raft; subsequent nodes join via gossip.
+3. **CLI subcommand.** `relish dev create`, `status`, `shell`, `stop`, `start`, `destroy`.
+4. **GitHub release pipeline.** Cross-compile bun and relish for `linux-aarch64` and `linux-x86_64`. Attach to GitHub releases alongside PDFs.
+5. **Docs.** Whitepaper section, README, book getting-started guide.
+
+**Milestone:** `relish dev create --nodes 3` produces a working 3-node cluster. `relish chaos council-partition` runs against it successfully.
+
+---
+
 ## Phase 3: Networking, Service Discovery and Ingress
 
 Enable service-to-service communication and external traffic ingress.

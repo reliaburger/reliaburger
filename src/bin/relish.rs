@@ -82,6 +82,59 @@ enum Command {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
     },
+    /// Manage a local dev cluster (Lima VMs).
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevAction {
+    /// Create a new dev cluster.
+    Create {
+        /// Number of nodes.
+        #[arg(long, default_value = "3")]
+        nodes: usize,
+        /// CPUs per node.
+        #[arg(long, default_value = "2")]
+        cpus: usize,
+        /// Memory per node (e.g. "2GiB").
+        #[arg(long, default_value = "2GiB")]
+        memory: String,
+        /// Cluster name.
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
+    /// Show dev cluster status.
+    Status {
+        /// Cluster name.
+        #[arg(default_value = "default")]
+        name: String,
+    },
+    /// Open a shell on a node.
+    Shell {
+        /// Node name (e.g. reliaburger-1).
+        node: String,
+    },
+    /// Stop a dev cluster (VMs stay on disk).
+    Stop {
+        /// Cluster name.
+        #[arg(default_value = "default")]
+        name: String,
+    },
+    /// Start a stopped dev cluster.
+    Start {
+        /// Cluster name.
+        #[arg(default_value = "default")]
+        name: String,
+    },
+    /// Destroy a dev cluster (delete all VMs).
+    Destroy {
+        /// Cluster name.
+        #[arg(default_value = "default")]
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -110,6 +163,19 @@ async fn main() -> ExitCode {
             ref addr,
         } => commands::join(token, addr).await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Dev { action } => match &action {
+            DevAction::Create {
+                nodes,
+                cpus,
+                memory,
+                name,
+            } => reliaburger::relish::dev::create(name, *nodes, *cpus, memory).await,
+            DevAction::Status { name } => reliaburger::relish::dev::status(name).await,
+            DevAction::Shell { node } => reliaburger::relish::dev::shell(node).await,
+            DevAction::Stop { name } => reliaburger::relish::dev::stop(name).await,
+            DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
+            DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
+        },
     };
 
     match result {
@@ -266,6 +332,76 @@ mod tests {
                 assert!(follow);
             }
             _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_dev_create_defaults() {
+        let cli = parse(&["relish", "dev", "create"]).unwrap();
+        match cli.command {
+            Command::Dev {
+                action:
+                    DevAction::Create {
+                        nodes,
+                        cpus,
+                        memory,
+                        name,
+                    },
+            } => {
+                assert_eq!(nodes, 3);
+                assert_eq!(cpus, 2);
+                assert_eq!(memory, "2GiB");
+                assert_eq!(name, "default");
+            }
+            _ => panic!("expected Dev Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_dev_create_custom() {
+        let cli = parse(&[
+            "relish", "dev", "create", "--nodes", "5", "--cpus", "4", "--memory", "4GiB", "--name",
+            "big",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Dev {
+                action:
+                    DevAction::Create {
+                        nodes,
+                        cpus,
+                        memory,
+                        name,
+                    },
+            } => {
+                assert_eq!(nodes, 5);
+                assert_eq!(cpus, 4);
+                assert_eq!(memory, "4GiB");
+                assert_eq!(name, "big");
+            }
+            _ => panic!("expected Dev Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_dev_destroy() {
+        let cli = parse(&["relish", "dev", "destroy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Dev {
+                action: DevAction::Destroy { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_dev_shell() {
+        let cli = parse(&["relish", "dev", "shell", "reliaburger-1"]).unwrap();
+        match cli.command {
+            Command::Dev {
+                action: DevAction::Shell { node },
+            } => assert_eq!(node, "reliaburger-1"),
+            _ => panic!("expected Dev Shell command"),
         }
     }
 }

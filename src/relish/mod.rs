@@ -6,6 +6,7 @@
 pub mod chaos;
 pub mod client;
 pub mod commands;
+pub mod dev;
 pub mod output;
 pub mod plan;
 
@@ -48,6 +49,24 @@ pub enum RelishError {
     /// File already exists (init refuses to overwrite).
     #[error("{path} already exists (refusing to overwrite)")]
     FileExists { path: String },
+
+    /// Lima (limactl) not found in PATH.
+    #[error(
+        "limactl not found — install Lima: brew install lima (macOS) or see https://lima-vm.io"
+    )]
+    LimaNotFound,
+
+    /// Lima command failed.
+    #[error("lima error ({command}): {stderr}")]
+    LimaError { command: String, stderr: String },
+
+    /// Dev cluster not found.
+    #[error("dev cluster {name:?} not found — run `relish dev create` first")]
+    DevClusterNotFound { name: String },
+
+    /// Dev cluster already exists.
+    #[error("dev cluster {name:?} already exists — destroy it first with `relish dev destroy`")]
+    DevClusterAlreadyExists { name: String },
 
     /// IO error.
     #[error("{0}")]
