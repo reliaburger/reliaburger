@@ -53,6 +53,9 @@ pub struct MustardNode<T: MustardTransport> {
     /// Optional watch channel for publishing membership snapshots.
     /// Set when running inside the agent, None in standalone tests.
     membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
+    /// Membership size at last publish. Used to avoid redundant publishes
+    /// when nothing changed.
+    last_published_member_count: usize,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -75,6 +78,7 @@ impl<T: MustardTransport> MustardNode<T> {
             transport,
             lamport: 0,
             membership_watch: None,
+            last_published_member_count: 0,
         }
     }
 
@@ -83,10 +87,14 @@ impl<T: MustardTransport> MustardNode<T> {
         self.membership_watch = Some(tx);
     }
 
-    /// Publish the current membership to the watch channel.
-    fn publish_membership(&self) {
-        if let Some(tx) = &self.membership_watch {
-            let _ = tx.send(self.membership.snapshot());
+    /// Publish the current membership to the watch channel if it changed.
+    fn publish_membership(&mut self) {
+        let current_count = self.membership.len();
+        if current_count != self.last_published_member_count {
+            if let Some(tx) = &self.membership_watch {
+                let _ = tx.send(self.membership.snapshot());
+            }
+            self.last_published_member_count = current_count;
         }
     }
 
