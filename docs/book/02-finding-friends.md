@@ -1743,3 +1743,5 @@ Along the way, we learned about newtypes for type safety, saturating arithmetic 
 The cluster handles the hard cases: council member departure, minority partition, worker isolation. In every case, the data plane keeps running — apps serve traffic while the control plane sorts itself out. That's the whole point of a distributed orchestrator: your workloads survive infrastructure failures.
 
 Next up: networking. Chapter 3 gives each container its own network namespace, adds eBPF-based service discovery so containers can find each other by name, and puts an ingress proxy in front of the cluster. The nodes can talk to each other now; it's time to let the apps do the same.
+
+If you want to dig into the code itself, the [Phase 2 Code Walkthrough](02a-code-walkthrough.md) walks through every module in the order that makes sense, highlights the critical paths, and points out where the interesting bits are.
