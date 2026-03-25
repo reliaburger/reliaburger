@@ -279,10 +279,10 @@ impl super::Grill for RuncGrill {
         }
 
         // Tear down per-container networking
-        if let Some(network) = self.networks.lock().await.remove(instance) {
-            if let Err(e) = netns::teardown_container_network(&network).await {
-                eprintln!("warning: network teardown failed for {instance}: {e}");
-            }
+        if let Some(network) = self.networks.lock().await.remove(instance)
+            && let Err(e) = netns::teardown_container_network(&network).await
+        {
+            eprintln!("warning: network teardown failed for {instance}: {e}");
         }
 
         Ok(())

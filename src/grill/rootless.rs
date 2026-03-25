@@ -240,8 +240,7 @@ pub async fn add_slirp4netns_port_forward(
     let response = String::from_utf8_lossy(&buf[..n]);
 
     if response.contains("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("slirp4netns port forward failed: {response}"),
         ));
     }
