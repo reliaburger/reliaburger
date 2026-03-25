@@ -158,6 +158,37 @@ async fn run_tcp_proxy(
 
 Each connection gets its own spawned task with bidirectional `tokio::io::copy`. The `CancellationToken` from `tokio_util` lets us shut down the proxy cleanly when the container is torn down — cancel the token, and the `select!` loop exits.
 
+### Why nftables, not iptables
+
+You might wonder why we chose nftables over the more familiar iptables. The answer is scaling.
+
+iptables evaluates rules linearly. Every packet walks the chain from top to bottom until something matches. Ten rules? Fine. Ten thousand rules, one per container port mapping in a busy cluster? That's up to ten thousand comparisons per packet. Kubernetes clusters with large iptables rule sets have measurably higher latency and CPU usage on every node.
+
+nftables takes a different approach. It compiles rules into a bytecode VM running in the kernel, and for certain match types it can use **sets** and **maps** — essentially hash tables or interval trees. Matching a port against a set of 10,000 ports is O(1), not O(n).
+
+Our current code adds individual rules, one per port mapping:
+
+```
+nft add rule ip reliaburger prerouting tcp dport 30001 dnat to 10.0.2.2:8080
+nft add rule ip reliaburger prerouting tcp dport 30002 dnat to 10.0.2.3:8080
+# ... one per container
+```
+
+That's fine for Phase 3 where we're proving the plumbing works. But at scale, we should switch to an nftables **map** — a single rule that does an O(1) lookup:
+
+```
+nft add map ip reliaburger portmap { type inet_service : ipv4_addr . inet_service \; }
+nft add element ip reliaburger portmap { 30001 : 10.0.2.2 . 8080 }
+nft add element ip reliaburger portmap { 30002 : 10.0.2.3 . 8080 }
+nft add rule ip reliaburger prerouting dnat to tcp dport map @portmap
+```
+
+One rule, one hash lookup per packet, regardless of how many port mappings exist.
+
+There's another advantage that matters more in practice: nftables rule updates are **atomic**. You can replace an entire table in a single transaction. iptables serialises on a global chain lock — so if two containers start simultaneously, the second one blocks until the first finishes modifying the rules. In a cluster that's scaling up dozens of containers at once, that lock becomes a bottleneck.
+
+That said, at real production scale, nftables only handles host-to-container port forwarding. The bulk of inter-container traffic goes through Onion's eBPF maps (which we'll build in the next section), and those are always O(1) hash lookups in the kernel. nftables handles the edge case; eBPF handles the common case.
+
 ### Wiring it into the OCI spec
 
 The key integration point is the OCI spec. Our `standard_namespaces()` function now takes an optional namespace path:
