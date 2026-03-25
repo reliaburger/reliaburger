@@ -698,6 +698,8 @@ impl<G: Grill> BunAgent<G> {
             .unwrap_or(0);
         let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, instance_index);
         let cgroup_str = cgroup_path.to_string_lossy();
+        // TODO(Phase 3): pass netns_path from ContainerNetwork when RuncGrill
+        // sets up per-container networking
         let oci_spec = generate_oci_spec(
             app_name,
             namespace,
@@ -705,6 +707,7 @@ impl<G: Grill> BunAgent<G> {
             host_port,
             &cgroup_str,
             Some(&self.volumes_dir),
+            None,
         );
 
         self.supervisor
@@ -738,6 +741,7 @@ impl<G: Grill> BunAgent<G> {
                     app_name,
                     spec.image.as_deref(),
                     &cgroup_str,
+                    None,
                 );
 
                 self.supervisor.grill().create(&init_id, &init_oci).await?;
@@ -825,7 +829,7 @@ impl<G: Grill> BunAgent<G> {
             .unwrap_or(0);
         let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, job_name, instance_index);
         let cgroup_str = cgroup_path.to_string_lossy();
-        let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str);
+        let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str, None);
 
         self.supervisor
             .grill()

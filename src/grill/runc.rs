@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::image::{ImageStore, looks_like_image_ref};
+use super::netns::{self, ContainerNetwork};
 use super::oci::OciSpec;
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
@@ -42,6 +43,13 @@ pub struct RuncGrill {
     /// current user; in rootless mode this is under $XDG_RUNTIME_DIR.
     state_dir: PathBuf,
     entries: Arc<Mutex<HashMap<InstanceId, RuncEntry>>>,
+    /// Per-container network namespaces (root mode only).
+    /// Rootless mode uses slirp4netns instead.
+    networks: Arc<Mutex<HashMap<InstanceId, ContainerNetwork>>>,
+    /// Node index for IP address assignment (maps to a /23 subnet).
+    node_index: u16,
+    /// Counter for assigning container indices within the node's subnet.
+    next_container_index: Arc<Mutex<u16>>,
 }
 
 impl RuncGrill {
@@ -52,12 +60,23 @@ impl RuncGrill {
         rootless: bool,
         state_dir: PathBuf,
     ) -> Self {
+        // Default node index from hostname. Will be overridden when
+        // the node joins a cluster and gets a proper node ID.
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_else(|_| "localhost".to_string())
+            .trim()
+            .to_string();
+        let node_index = netns::node_index_from_id(&hostname);
+
         Self {
             bundle_base,
             image_store,
             rootless,
             state_dir,
             entries: Arc::new(Mutex::new(HashMap::new())),
+            networks: Arc::new(Mutex::new(HashMap::new())),
+            node_index,
+            next_container_index: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -98,6 +117,38 @@ impl super::Grill for RuncGrill {
             })?;
 
         let mut spec = spec.clone();
+
+        // Set up per-container networking (root mode only, non-rootless).
+        // For rootless, slirp4netns is set up after runc create (needs PID).
+        if !self.rootless {
+            let container_index = {
+                let mut idx = self.next_container_index.lock().await;
+                let current = *idx;
+                *idx = idx.wrapping_add(1);
+                current
+            };
+
+            match netns::setup_container_network(instance, self.node_index, container_index, false)
+                .await
+            {
+                Ok(network) => {
+                    // Update the OCI spec to join our pre-created network namespace
+                    let ns_path_str = network.namespace_path.to_string_lossy().to_string();
+                    for ns in &mut spec.linux.namespaces {
+                        if ns.ns_type == "network" {
+                            ns.path = Some(ns_path_str.clone());
+                        }
+                    }
+
+                    self.networks.lock().await.insert(instance.clone(), network);
+                }
+                Err(e) => {
+                    // Network setup failed. Log and continue without isolation —
+                    // the container will use an empty new network namespace.
+                    eprintln!("warning: container network setup failed for {instance}: {e}");
+                }
+            }
+        }
 
         // If root.path looks like an image reference, pull and unpack it
         if looks_like_image_ref(&spec.root.path) {
@@ -225,6 +276,13 @@ impl super::Grill for RuncGrill {
                 instance: instance.clone(),
                 reason: format!("runc kill SIGKILL failed: {stderr}"),
             });
+        }
+
+        // Tear down per-container networking
+        if let Some(network) = self.networks.lock().await.remove(instance) {
+            if let Err(e) = netns::teardown_container_network(&network).await {
+                eprintln!("warning: network teardown failed for {instance}: {e}");
+            }
         }
 
         Ok(())
@@ -362,7 +420,7 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
-                namespaces: crate::grill::oci::standard_namespaces(),
+                namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
                 uid_mappings: None,

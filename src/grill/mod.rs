@@ -9,6 +9,8 @@ pub mod cgroup;
 pub mod image;
 #[cfg(test)]
 pub mod mock;
+#[cfg(target_os = "linux")]
+pub mod netns;
 pub mod oci;
 pub mod port;
 pub mod process;
