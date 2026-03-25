@@ -63,7 +63,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 3: Networking
 
-- [ ] Per-container network namespaces (veth pairs, port mapping)
+- [x] Per-container network namespaces (veth pairs, port mapping)
+  - [ ] Switch port mapping from individual nftables rules to nftables maps for O(1) lookup at scale
 - [ ] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
 - [ ] Wrapper ingress proxy (host/path routing, TLS, WebSocket, load balancing, draining, rate limiting)
 - [ ] nftables perimeter firewall (cluster boundary rules, management access)

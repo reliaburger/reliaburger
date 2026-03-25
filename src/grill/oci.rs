@@ -129,12 +129,13 @@ pub fn generate_oci_spec(
     host_port: Option<u16>,
     cgroup_path: &str,
     volumes_dir: Option<&Path>,
+    netns_path: Option<&str>,
 ) -> OciSpec {
     let env = build_env(spec);
     let args = build_args(app_name, spec);
     let mounts = build_mounts(spec, host_port, app_name, namespace, volumes_dir);
 
-    let namespaces = standard_namespaces();
+    let namespaces = standard_namespaces(netns_path);
 
     let resources = build_resources(spec);
 
@@ -239,7 +240,11 @@ fn build_mounts(
 }
 
 /// Standard Linux namespaces for container isolation.
-pub fn standard_namespaces() -> Vec<OciNamespace> {
+///
+/// If `netns_path` is provided, the container joins that pre-created
+/// network namespace (where the veth pair is already configured)
+/// instead of creating a new empty one.
+pub fn standard_namespaces(netns_path: Option<&str>) -> Vec<OciNamespace> {
     vec![
         OciNamespace {
             ns_type: "pid".to_string(),
@@ -259,7 +264,7 @@ pub fn standard_namespaces() -> Vec<OciNamespace> {
         },
         OciNamespace {
             ns_type: "network".to_string(),
-            path: None, // TODO(Phase 3): set to the container's network namespace path
+            path: netns_path.map(String::from),
         },
     ]
 }
@@ -328,6 +333,7 @@ pub fn generate_job_oci_spec(
     namespace: &str,
     spec: &JobSpec,
     cgroup_path: &str,
+    netns_path: Option<&str>,
 ) -> OciSpec {
     let env: Vec<String> = spec
         .env
@@ -371,7 +377,7 @@ pub fn generate_job_oci_spec(
         },
         mounts: standard_mounts(),
         linux: OciLinux {
-            namespaces: standard_namespaces(),
+            namespaces: standard_namespaces(netns_path),
             resources,
             cgroups_path: Some(cgroup_path.to_string()),
             uid_mappings: None,
@@ -391,6 +397,7 @@ pub fn generate_init_oci_spec(
     app_name: &str,
     image: Option<&str>,
     cgroup_path: &str,
+    netns_path: Option<&str>,
 ) -> OciSpec {
     OciSpec {
         root: OciRoot {
@@ -410,7 +417,7 @@ pub fn generate_init_oci_spec(
         },
         mounts: standard_mounts(),
         linux: OciLinux {
-            namespaces: standard_namespaces(),
+            namespaces: standard_namespaces(netns_path),
             resources: None,
             cgroups_path: Some(cgroup_path.to_string()),
             uid_mappings: None,
@@ -431,7 +438,7 @@ mod tests {
     #[test]
     fn generate_minimal_app() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         assert_eq!(oci.root.path, "test:v1");
         assert_eq!(oci.process.cwd, "/");
@@ -442,7 +449,7 @@ mod tests {
     #[test]
     fn generate_without_image_uses_filesystem_path() {
         let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         assert_eq!(
             oci.root.path,
@@ -461,7 +468,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         assert!(oci.process.env.contains(&"FOO=bar".to_string()));
         assert!(oci.process.env.contains(&"BAZ=qux".to_string()));
@@ -477,7 +484,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         assert!(
             oci.process
@@ -495,7 +502,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let resources = oci.linux.resources.unwrap();
         let cpu = resources.cpu.unwrap();
@@ -512,7 +519,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let resources = oci.linux.resources.unwrap();
         let memory = resources.memory.unwrap();
@@ -522,14 +529,14 @@ mod tests {
     #[test]
     fn generate_without_resources_has_no_resources_block() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
         assert!(oci.linux.resources.is_none());
     }
 
     #[test]
     fn generate_has_all_namespaces() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let ns_types: Vec<&str> = oci
             .linux
@@ -554,6 +561,7 @@ mod tests {
             None,
             "/sys/fs/cgroup/reliaburger/default/web/0",
             None,
+            None,
         );
 
         assert_eq!(
@@ -565,7 +573,7 @@ mod tests {
     #[test]
     fn generate_has_standard_mounts() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let mount_paths: Vec<&str> = oci
             .mounts
@@ -585,7 +593,7 @@ mod tests {
             content: Some("key = value".to_string()),
             source: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let cf_mount = oci
             .mounts
@@ -603,7 +611,7 @@ mod tests {
             source: Some(PathBuf::from("/host/data")),
             size: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let vol_mount = oci
             .mounts
@@ -630,6 +638,7 @@ mod tests {
             None,
             "/cgroup/path",
             Some(&volumes_dir),
+            None,
         );
 
         let vol_mount = oci
@@ -659,7 +668,7 @@ mod tests {
             source: None,
             size: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let data_mount = oci
             .mounts
@@ -676,7 +685,7 @@ mod tests {
     #[test]
     fn generate_serialises_to_json() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let json = serde_json::to_string_pretty(&oci).unwrap();
         assert!(json.contains("\"root\""));
@@ -700,7 +709,7 @@ mod tests {
     #[test]
     fn generate_job_minimal() {
         let spec = minimal_job();
-        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cgroup/path");
+        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cgroup/path", None);
 
         assert_eq!(oci.root.path, "myapp:v1");
         assert_eq!(
@@ -714,7 +723,7 @@ mod tests {
     #[test]
     fn generate_job_has_standard_mounts() {
         let spec = minimal_job();
-        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cgroup/path");
+        let oci = generate_job_oci_spec("migrate", "default", &spec, "/cgroup/path", None);
 
         let mount_paths: Vec<&str> = oci
             .mounts
@@ -729,7 +738,7 @@ mod tests {
     #[test]
     fn generate_job_with_no_command() {
         let spec: JobSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
-        let oci = generate_job_oci_spec("cleanup", "default", &spec, "/cgroup/path");
+        let oci = generate_job_oci_spec("cleanup", "default", &spec, "/cgroup/path", None);
 
         assert!(oci.process.args.is_empty());
     }
@@ -752,10 +761,48 @@ mod tests {
     #[test]
     fn uid_gid_mappings_omitted_when_none() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None);
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let json = serde_json::to_string(&oci).unwrap();
         assert!(!json.contains("uidMappings"));
         assert!(!json.contains("gidMappings"));
+    }
+
+    // -- Network namespace path -----------------------------------------------
+
+    #[test]
+    fn standard_namespaces_without_netns_path() {
+        let ns = standard_namespaces(None);
+        let net = ns.iter().find(|n| n.ns_type == "network").unwrap();
+        assert!(net.path.is_none());
+    }
+
+    #[test]
+    fn standard_namespaces_with_netns_path() {
+        let ns = standard_namespaces(Some("/var/run/netns/rb-web-0"));
+        let net = ns.iter().find(|n| n.ns_type == "network").unwrap();
+        assert_eq!(net.path.as_deref(), Some("/var/run/netns/rb-web-0"));
+    }
+
+    #[test]
+    fn generate_with_netns_path_sets_network_namespace() {
+        let spec = minimal_app();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            None,
+            "/cgroup/path",
+            None,
+            Some("/var/run/netns/rb-web-0"),
+        );
+
+        let net_ns = oci
+            .linux
+            .namespaces
+            .iter()
+            .find(|n| n.ns_type == "network")
+            .unwrap();
+        assert_eq!(net_ns.path.as_deref(), Some("/var/run/netns/rb-web-0"));
     }
 }

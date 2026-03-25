@@ -4,6 +4,7 @@
 /// from app specs, tracking their lifecycle state, processing health
 /// check results, and deciding when to restart failed instances.
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use crate::config::app::AppSpec;
@@ -39,6 +40,10 @@ pub struct WorkloadInstance {
     pub last_restart: Option<Instant>,
     /// Host port allocated for this instance, if any.
     pub host_port: Option<u16>,
+    /// Container IP address (set when per-container networking is active).
+    /// Used for health checks and service discovery. `None` for ProcessGrill
+    /// or when the container shares the host network.
+    pub container_ip: Option<Ipv4Addr>,
     /// When this instance was created.
     pub created_at: Instant,
     /// Restart policy governing this instance.
@@ -130,6 +135,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 restart_count: 0,
                 last_restart: None,
                 host_port,
+                container_ip: None,
                 created_at: now,
                 restart_policy: RestartPolicy::default(),
                 health_config,
@@ -171,6 +177,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             restart_count: 0,
             last_restart: None,
             host_port: None,
+            container_ip: None,
             created_at: now,
             restart_policy: RestartPolicy::for_job(3),
             health_config: None,

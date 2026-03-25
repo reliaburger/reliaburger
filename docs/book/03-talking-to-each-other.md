@@ -1,3 +1,267 @@
 # Talking to Each Other
 
-TODO: Phase 3 — Networking. eBPF service discovery, ingress proxy, DNS interception.
+In Chapter 2, our containers found friends — nodes gossip, elect a council, and the scheduler places workloads across the cluster. But every container still shares the host's network stack. That's like putting everyone in the same room and hoping they don't shout over each other.
+
+Phase 3 gives each container its own private network, its own IP address, and a way for other containers to find it. By the end of this chapter, our containers will talk to each other across the cluster without knowing (or caring) where anyone physically lives.
+
+We'll do this in three steps. First, per-container network namespaces — giving every container its own network stack. Then Onion, our eBPF-based service discovery that lets containers find each other by name. And finally Wrapper, the ingress proxy that routes external traffic into the cluster.
+
+Let's start with the plumbing.
+
+## Per-Container Network Namespaces
+
+### Why containers need their own network
+
+Up to now, ProcessGrill runs everything on the host's network and RuncGrill creates a new network namespace but does nothing to configure it. That means containers either share the host (convenient but chaotic) or get an empty namespace with no connectivity (useless).
+
+What we want is simple: every container gets its own IP address. The host can reach the container, and the container can reach the outside world. We use Linux network namespaces and virtual Ethernet (veth) pairs to make this happen.
+
+### The architecture
+
+```
+Host namespace                    Container namespace (per container)
+┌─────────────────┐              ┌─────────────────┐
+│                 │   veth pair  │                 │
+│  veth-{id}-h ←──────────────────→ eth0          │
+│  10.x.y.1/23    │              │  10.x.y.C/23    │
+│                 │              │                 │
+│  nftables DNAT  │              │  default route  │
+│  host:P → C:P   │              │  → 10.x.y.1     │
+└─────────────────┘              └─────────────────┘
+```
+
+Each node gets a `/23` subnet from the `10.0.0.0/8` private range. A /23 gives 510 usable host addresses (enough for 500 containers per node), and we have room for 32,768 /23 blocks in the /8 space (enough for 10k+ nodes). Node N's block starts at `10.{(N*2) >> 8}.{(N*2) & 0xFF}.0/23`. So node 0 gets `10.0.0.0/23`, node 1 gets `10.0.2.0/23`, and node 5000 gets `10.39.16.0/23`.
+
+Why /23 and not /24? A /24 only has 254 usable addresses. In a busy cluster, 500 pods on a single node isn't unusual. A /23 doubles that to 510, which covers the target with a bit of headroom.
+
+The gateway sits at the first usable address in the block, and containers start at gateway + 1. A veth pair — think of it as a virtual cable with a plug on each end — connects the container to the host. One end (`eth0`) lives inside the container's namespace, the other (`veth-{id}-h`) lives on the host.
+
+### Three strategies for three runtimes
+
+Not every runtime needs the same approach:
+
+**RuncGrill (root mode):** Full namespace isolation. We create the namespace, set up the veth pair, assign IPs, configure the default route, and use nftables for port mapping. This is the real deal.
+
+**RuncGrill (rootless mode):** Uses `slirp4netns`, the same tool Podman relies on. It creates a TAP device inside the user namespace with a userspace TCP/IP stack. No root needed. Port forwarding goes through its API socket.
+
+**AppleContainerGrill (macOS):** Apple Container already runs each container in a lightweight VM with its own vmnet interface. The network isolation is free. We just need to discover the container's IP via `container inspect`.
+
+**ProcessGrill:** No network isolation. Processes share the host network. This is the cross-platform dev/test fallback.
+
+### Network namespaces in Rust
+
+Here's the core struct that tracks a container's network resources:
+
+```rust
+pub struct ContainerNetwork {
+    pub namespace_path: PathBuf,   // /var/run/netns/{instance_id}
+    pub container_ip: Ipv4Addr,    // 10.0.N.C
+    pub gateway_ip: Ipv4Addr,      // 10.0.N.1
+    pub host_veth: String,         // veth-{id}-h
+    pub container_veth: String,    // eth0
+    pub rootless: bool,            // true = Rust proxy, false = nftables
+}
+```
+
+Setting up the network is a sequence of `ip` commands. We could use the `netlink` interface directly (that's what `ip` does under the hood), but these are one-time setup operations, not hot path. Shelling out to `ip` means we can debug with `ip netns list` and `ip link show` — much easier than inspecting raw netlink messages.
+
+The sequence:
+
+1. Create the namespace: `ip netns add rb-{instance_id}`
+2. Create the veth pair: `ip link add veth-{id}-h type veth peer name eth0`
+3. Move one end into the namespace: `ip link set eth0 netns rb-{instance_id}`
+4. Assign IPs to both ends
+5. Bring everything up
+6. Set the default route inside the namespace to point at the gateway
+7. Enable IP forwarding on the host
+
+The `rb-` prefix on namespace names avoids collisions with other tools that might create network namespaces.
+
+### IP address calculation
+
+The maths behind the /23 addressing is a bit more involved than a simple byte-per-field scheme. Each node's block starts at an offset of `node_index * 2` /24-blocks into the 10.0.0.0/8 space (because a /23 is two /24 blocks):
+
+```rust
+fn subnet_base(node_index: u16) -> (u8, u8) {
+    let offset = (node_index as u32) * 2;
+    let second_octet = (offset >> 8) as u8;
+    let third_octet = (offset & 0xFF) as u8;
+    (second_octet, third_octet)
+}
+```
+
+Containers within a node are numbered starting from 0. The gateway takes the first address in the block, and containers start at gateway + 1:
+
+```rust
+pub fn container_ip(node_index: u16, container_index: u16) -> Ipv4Addr {
+    let (oct2, oct3) = subnet_base(node_index);
+    let host_offset = (container_index as u32) + 2;
+    let third = oct3.wrapping_add((host_offset >> 8) as u8);
+    let fourth = (host_offset & 0xFF) as u8;
+    Ipv4Addr::new(10, oct2, third, fourth)
+}
+```
+
+The `wrapping_add` is intentional. In Rust, default integer arithmetic panics on overflow in debug mode, a common surprise for programmers coming from C or Go where overflow wraps silently. When we want wrapping behaviour (and here we do, because the /23 spans two /24 blocks, so the fourth octet legitimately wraps from one block into the next), we have to say so explicitly.
+
+To assign each node its index, we hash the node's hostname with djb2:
+
+```rust
+pub fn node_index_from_id(node_id: &str) -> u16 {
+    let hash: u32 = node_id
+        .bytes()
+        .fold(5381u32, |acc, b| acc.wrapping_mul(33).wrapping_add(b as u32));
+    ((hash % 32_767) + 1) as u16
+}
+```
+
+The `|acc, b|` syntax is a closure (Rust's lambdas). The pipes delimit the parameter list, like parentheses in `def f(acc, b):` in Python or `func(acc, b int)` in Go. The body follows directly. Short closures can be a single expression with no braces; longer ones get `{ }` just like a function. Rust infers the parameter types from context, so we don't need to annotate them.
+
+The `fold` method is Rust's version of a reduce. We start with an accumulator (5381, the traditional djb2 seed) and combine each byte of the node ID into the running hash. djb2 isn't cryptographic, but we don't need it to be. We just need reasonable distribution across 32k buckets so that different nodes don't collide. In production, the council assigns sequential node indices on join, but the hash gives us a sensible default before the cluster is formed.
+
+### Port mapping: two strategies
+
+Containers have their own IPs, but external clients don't know about `10.0.N.C`. We need port mapping to forward traffic from a host port to the container.
+
+**Root mode uses nftables**, Linux's modern packet filtering framework. We create a `reliaburger` table with a prerouting chain for DNAT (Destination Network Address Translation):
+
+```
+nft add table ip reliaburger
+nft add chain ip reliaburger prerouting { type nat hook prerouting priority -100 ; }
+nft add rule ip reliaburger prerouting tcp dport {host_port} dnat to {container_ip}:{service_port}
+```
+
+This is kernel-level forwarding. Zero copies, zero userspace overhead. We reuse this same nftables table later for the perimeter firewall.
+
+**Rootless mode uses a Rust TCP proxy.** We can't touch nftables without root, so we spawn a tokio task that binds the host port and forwards connections to the container:
+
+```rust
+async fn run_tcp_proxy(
+    host_port: u16,
+    container_ip: Ipv4Addr,
+    container_port: u16,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", host_port)).await?;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accept = listener.accept() => {
+                let (client, _) = accept?;
+                // ... forward to container_ip:container_port
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+Each connection gets its own spawned task with bidirectional `tokio::io::copy`. The `CancellationToken` from `tokio_util` lets us shut down the proxy cleanly when the container is torn down — cancel the token, and the `select!` loop exits.
+
+### Why nftables, not iptables
+
+You might wonder why we chose nftables over the more familiar iptables. The answer is scaling.
+
+iptables evaluates rules linearly. Every packet walks the chain from top to bottom until something matches. Ten rules? Fine. Ten thousand rules, one per container port mapping in a busy cluster? That's up to ten thousand comparisons per packet. Kubernetes clusters with large iptables rule sets have measurably higher latency and CPU usage on every node.
+
+nftables takes a different approach. It compiles rules into a bytecode VM running in the kernel, and for certain match types it can use **sets** and **maps** — essentially hash tables or interval trees. Matching a port against a set of 10,000 ports is O(1), not O(n).
+
+Our current code adds individual rules, one per port mapping:
+
+```
+nft add rule ip reliaburger prerouting tcp dport 30001 dnat to 10.0.2.2:8080
+nft add rule ip reliaburger prerouting tcp dport 30002 dnat to 10.0.2.3:8080
+# ... one per container
+```
+
+That's fine for Phase 3 where we're proving the plumbing works. But at scale, we should switch to an nftables **map** — a single rule that does an O(1) lookup:
+
+```
+nft add map ip reliaburger portmap { type inet_service : ipv4_addr . inet_service \; }
+nft add element ip reliaburger portmap { 30001 : 10.0.2.2 . 8080 }
+nft add element ip reliaburger portmap { 30002 : 10.0.2.3 . 8080 }
+nft add rule ip reliaburger prerouting dnat to tcp dport map @portmap
+```
+
+One rule, one hash lookup per packet, regardless of how many port mappings exist.
+
+There's another advantage that matters more in practice: nftables rule updates are **atomic**. You can replace an entire table in a single transaction. iptables serialises on a global chain lock — so if two containers start simultaneously, the second one blocks until the first finishes modifying the rules. In a cluster that's scaling up dozens of containers at once, that lock becomes a bottleneck.
+
+That said, at real production scale, nftables only handles host-to-container port forwarding. The bulk of inter-container traffic goes through Onion's eBPF maps (which we'll build in the next section), and those are always O(1) hash lookups in the kernel. nftables handles the edge case; eBPF handles the common case.
+
+### Wiring it into the OCI spec
+
+The key integration point is the OCI spec. Our `standard_namespaces()` function now takes an optional namespace path:
+
+```rust
+pub fn standard_namespaces(netns_path: Option<&str>) -> Vec<OciNamespace> {
+    vec![
+        // ... pid, ipc, uts, mount ...
+        OciNamespace {
+            ns_type: "network".into(),
+            path: netns_path.map(String::from),
+        },
+    ]
+}
+```
+
+When `path` is `Some`, runc joins the pre-created namespace (where our veth is already configured) rather than creating a new empty one. When `None`, runc creates a fresh namespace — the Phase 1 behaviour.
+
+### Rootless networking with slirp4netns
+
+For rootless containers, we use `slirp4netns`, the same tool Podman uses. It implements a userspace TCP/IP stack via a TAP device inside the user namespace:
+
+1. Runc creates a new network namespace (we no longer strip it from the spec)
+2. After `runc create`, we get the container's PID
+3. We spawn: `slirp4netns --configure --mtu=65520 --disable-host-loopback {pid} tap0`
+4. The container gets IP `10.0.2.100` with gateway `10.0.2.2`
+5. Port forwarding uses slirp4netns's API socket — we send JSON commands to map ports
+
+The `--disable-host-loopback` flag is important: it prevents the container from reaching services on the host's loopback. Without it, a compromised container could probe the host's `localhost`-only services.
+
+### Apple Container: the easy case
+
+Apple Container runs each container in a lightweight VM with its own vmnet interface. The network isolation comes for free. We just need to discover the IP:
+
+```rust
+async fn discover_container_ip(instance: &InstanceId) -> Result<Ipv4Addr, GrillError> {
+    let output = Self::container_command(&["inspect", &instance.0], instance).await?;
+    let inspect: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let ip_str = inspect["NetworkSettings"]["IPAddress"].as_str()
+        .ok_or_else(|| /* ... */)?;
+    ip_str.parse::<Ipv4Addr>().map_err(|e| /* ... */)
+}
+```
+
+After `container start`, we call `container inspect` and fish out the IP from the JSON output. The IP is stored on the `AppleEntry` and exposed via `container_ip()`.
+
+### Testing without root
+
+Most of the netns code needs root (or at least `CAP_NET_ADMIN`). But the pure logic — IP calculation, namespace path generation, nftables rule formatting — is testable without any privileges. The integration tests that actually create namespaces are gated behind `RELIABURGER_NETNS_TESTS=1`.
+
+```rust
+#[test]
+fn container_ip_first_container_node_1() {
+    // Node 1: subnet base = 10.0.2.0/23, gateway = .2.1, first container = .2.2
+    let ip = container_ip(1, 0);
+    assert_eq!(ip, Ipv4Addr::new(10, 0, 2, 2));
+}
+
+#[test]
+fn ten_thousand_nodes_fit() {
+    let gw = gateway_ip(10_000);
+    assert_eq!(gw, Ipv4Addr::new(10, 78, 32, 1));
+}
+
+#[test]
+fn five_hundred_containers_fit() {
+    let ip = container_ip(1, 499);
+    assert_eq!(ip, Ipv4Addr::new(10, 0, 3, 245));
+}
+```
+
+This pattern — test the logic, gate the I/O — means `cargo test` stays fast on any developer's machine, while the full suite runs in a privileged CI environment.
+
+<!-- TODO(Phase 3): Onion eBPF service discovery section -->
+<!-- TODO(Phase 3): Wrapper ingress proxy section -->
+<!-- TODO(Phase 3): nftables perimeter firewall section -->

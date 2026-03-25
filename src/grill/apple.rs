@@ -2,8 +2,11 @@
 ///
 /// Implements the `Grill` trait by calling Apple's `container` CLI
 /// (github.com/apple/container). Runs Linux containers in lightweight
-/// VMs on Apple Silicon.
+/// VMs on Apple Silicon. Each VM gets its own vmnet interface with a
+/// unique IP address, providing network isolation without us touching
+/// any kernel networking.
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -18,6 +21,9 @@ struct AppleEntry {
     spec: OciSpec,
     #[allow(dead_code)]
     image: String,
+    /// The container's IP address, discovered via `container inspect`.
+    /// Set after the container is started.
+    container_ip: Option<Ipv4Addr>,
 }
 
 /// Apple Container-based Grill implementation.
@@ -35,6 +41,53 @@ impl AppleContainerGrill {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get the container's IP address, if known.
+    ///
+    /// The IP is discovered after `start()` by inspecting the container.
+    /// Returns `None` if the container hasn't been started or the IP
+    /// couldn't be determined.
+    pub async fn container_ip(&self, instance: &InstanceId) -> Option<Ipv4Addr> {
+        let entries = self.entries.lock().await;
+        entries.get(instance).and_then(|e| e.container_ip)
+    }
+
+    /// Discover a container's IP address from `container inspect`.
+    ///
+    /// Apple Container VMs get their IP via vmnet. The inspect output
+    /// contains the IP in various possible JSON paths.
+    async fn discover_container_ip(instance: &InstanceId) -> Result<Ipv4Addr, GrillError> {
+        let output = Self::container_command(&["inspect", &instance.0], instance).await?;
+
+        if !output.status.success() {
+            return Err(GrillError::NotFound {
+                instance: instance.clone(),
+            });
+        }
+
+        let inspect: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to parse container inspect: {e}"),
+            })?;
+
+        // Try common JSON paths for the IP address
+        let ip_str = inspect["NetworkSettings"]["IPAddress"]
+            .as_str()
+            .or_else(|| inspect["networkSettings"]["ipAddress"].as_str())
+            .or_else(|| inspect["network"]["ip"].as_str())
+            .ok_or_else(|| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "no IP address found in container inspect output".to_string(),
+            })?;
+
+        ip_str
+            .parse::<Ipv4Addr>()
+            .map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("invalid IP address from inspect: {e}"),
+            })
     }
 
     /// Run a container CLI command and return its output.
@@ -115,6 +168,7 @@ impl super::Grill for AppleContainerGrill {
             AppleEntry {
                 spec: spec.clone(),
                 image,
+                container_ip: None,
             },
         );
 
@@ -130,6 +184,14 @@ impl super::Grill for AppleContainerGrill {
                 instance: instance.clone(),
                 reason: format!("container start failed: {stderr}"),
             });
+        }
+
+        // Discover the container's IP address from its VM's network interface
+        if let Ok(ip) = Self::discover_container_ip(instance).await {
+            let mut entries = self.entries.lock().await;
+            if let Some(entry) = entries.get_mut(instance) {
+                entry.container_ip = Some(ip);
+            }
         }
 
         Ok(())

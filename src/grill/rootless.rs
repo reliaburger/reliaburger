@@ -1,9 +1,9 @@
 /// Rootless OCI spec modifications (Linux only).
 ///
 /// Adjusts an OCI runtime spec to run under runc's rootless mode.
-/// Adds user namespace mappings, removes the network namespace
-/// (sharing the host network for Phase 1), adjusts /sys to a
-/// bind mount, and sets up cgroup paths for systemd delegation.
+/// Adds user namespace mappings, keeps the network namespace for
+/// slirp4netns-based networking (Phase 3), adjusts /sys to a bind
+/// mount, and sets up cgroup paths for systemd delegation.
 use super::oci::{OciIdMapping, OciMount, OciNamespace, OciSpec};
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Changes:
 /// - Adds `user` namespace
-/// - Removes `network` namespace (share host network, Phase 3 handles isolation)
+/// - Keeps `network` namespace (slirp4netns provides connectivity in Phase 3)
 /// - Adds UID/GID mappings (current user → container root)
 /// - Adjusts `/sys` mount to `bind,ro` instead of `sysfs` (which needs privileges)
 /// - Sets rootless cgroups path
@@ -26,8 +26,8 @@ pub fn make_rootless(spec: &mut OciSpec, instance_name: &str) {
         });
     }
 
-    // Remove network namespace (share host network for Phase 1)
-    spec.linux.namespaces.retain(|ns| ns.ns_type != "network");
+    // Keep the network namespace. slirp4netns (Phase 3) provides
+    // userspace networking inside the user namespace — no root needed.
 
     // Add UID/GID mappings: map current user to container root (UID 0)
     let uid = nix::unistd::getuid().as_raw();
@@ -158,6 +158,96 @@ fn parse_subid_file(path: &str, username: &str) -> Result<(u32, u32), std::io::E
     ))
 }
 
+// ---------------------------------------------------------------------------
+// slirp4netns support (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Handle to a running slirp4netns process.
+///
+/// slirp4netns creates a TAP device inside the container's network
+/// namespace with a userspace TCP/IP stack, giving rootless containers
+/// outbound connectivity without needing CAP_NET_ADMIN.
+pub struct Slirp4netnsHandle {
+    /// The child process. Killed on drop via `kill()`.
+    child: tokio::process::Child,
+    /// Path to the API socket for port forwarding commands.
+    pub api_socket: PathBuf,
+}
+
+impl Slirp4netnsHandle {
+    /// Shut down the slirp4netns process.
+    pub async fn shutdown(mut self) {
+        let _ = self.child.kill().await;
+        let _ = tokio::fs::remove_file(&self.api_socket).await;
+    }
+}
+
+/// Spawn slirp4netns for a container's PID.
+///
+/// Creates a TAP device (`tap0`) inside the container's network
+/// namespace with IP `10.0.2.100`, gateway `10.0.2.2`. The
+/// `--api-socket` flag enables runtime port forwarding.
+///
+/// Returns a handle that must be kept alive for the duration of the
+/// container's lifetime. Dropping it kills slirp4netns.
+pub async fn setup_slirp4netns(
+    pid: u32,
+    api_socket_path: &Path,
+) -> Result<Slirp4netnsHandle, std::io::Error> {
+    let child = tokio::process::Command::new("slirp4netns")
+        .args([
+            "--configure",
+            "--mtu=65520",
+            "--disable-host-loopback",
+            "--api-socket",
+        ])
+        .arg(api_socket_path)
+        .arg(pid.to_string())
+        .arg("tap0")
+        .spawn()?;
+
+    // Give slirp4netns a moment to create the API socket
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    Ok(Slirp4netnsHandle {
+        child,
+        api_socket: api_socket_path.to_path_buf(),
+    })
+}
+
+/// Add a port forward via the slirp4netns API socket.
+///
+/// Sends a JSON command to map `host_port` on the host to
+/// `guest_port` inside the container (at `10.0.2.100`).
+pub async fn add_slirp4netns_port_forward(
+    api_socket: &Path,
+    host_port: u16,
+    guest_port: u16,
+) -> Result<(), std::io::Error> {
+    let stream = tokio::net::UnixStream::connect(api_socket).await?;
+
+    let request = format!(
+        r#"{{"execute":"add_hostfwd","arguments":{{"proto":"tcp","host_addr":"","host_port":{host_port},"guest_addr":"10.0.2.100","guest_port":{guest_port}}}}}"#
+    );
+
+    stream.writable().await?;
+    stream.try_write(request.as_bytes())?;
+
+    // Read the response
+    let mut buf = vec![0u8; 256];
+    stream.readable().await?;
+    let n = stream.try_read(&mut buf)?;
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    if response.contains("error") {
+        return Err(std::io::Error::other(format!(
+            "slirp4netns port forward failed: {response}"
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn make_rootless_removes_network_namespace() {
+    fn make_rootless_keeps_network_namespace() {
         let mut spec = sample_spec();
         make_rootless(&mut spec, "test-0");
 
@@ -245,7 +335,10 @@ mod tests {
             .namespaces
             .iter()
             .any(|ns| ns.ns_type == "network");
-        assert!(!has_network);
+        assert!(
+            has_network,
+            "network namespace should be kept for slirp4netns"
+        );
     }
 
     #[test]
