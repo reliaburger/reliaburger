@@ -12,3 +12,6 @@
 pub mod service_map;
 pub mod types;
 pub mod vip;
+
+#[cfg(target_os = "linux")]
+pub mod ebpf;
