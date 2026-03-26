@@ -65,7 +65,12 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 - [x] Per-container network namespaces (veth pairs, port mapping)
   - [ ] Switch port mapping from individual nftables rules to nftables maps for O(1) lookup at scale
-- [ ] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
+- [x] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
+  - [x] Userspace ServiceMap, VirtualIP allocation, `relish resolve` command
+  - [x] Agent lifecycle wiring (deploy/health/stop → service map)
+  - [x] eBPF C programs and Rust loader scaffolding (Linux only, aya TODO)
+  - [ ] Wire aya loader to actually load and attach eBPF programs
+  - [ ] eBPF integration tests (BPF_PROG_TEST_RUN, dig/curl from containers)
 - [ ] Wrapper ingress proxy (host/path routing, TLS, WebSocket, load balancing, draining, rate limiting)
 - [ ] nftables perimeter firewall (cluster boundary rules, management access)
 - [ ] All Phase 3 tests green

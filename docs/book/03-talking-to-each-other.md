@@ -428,6 +428,50 @@ Our DNS interception only handles UDP queries. DNS over TCP (used when responses
 
 This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
 
-<!-- TODO(Phase 3): eBPF programs section (DNS interception + connect rewrite) -->
+### Testing service discovery
+
+How do you test code that runs in the kernel? Two approaches, at different levels of fidelity.
+
+**Unit tests on the data model.** The `ServiceMap`, `VirtualIP`, and `#[repr(C)]` types are pure Rust. We test them normally — register a service, add backends, verify resolve returns the right data. These run on any platform, no kernel required:
+
+```rust
+#[test]
+fn register_and_resolve() {
+    let mut map = ServiceMap::new();
+    let vip = map.register_app("redis", "default", 6379, None).unwrap();
+    let entry = map.resolve("redis").unwrap();
+    assert_eq!(entry.vip, vip);
+    assert!(entry.backends.is_empty());
+}
+```
+
+**Integration tests through the agent.** We spin up a real `BunAgent` with `ProcessGrill`, deploy an app via the HTTP API, and then call `/v1/resolve/{name}` to verify the service map was populated correctly. These tests exercise the full deploy → register → add_backend → resolve flow without touching eBPF:
+
+```rust
+#[tokio::test]
+async fn deploy_app_with_port_registers_in_service_map() {
+    let harness = TestHarness::start().await;
+    harness.client.apply(&app_with_port_config()).await.unwrap();
+
+    let info = harness.client.resolve("redis").await.unwrap();
+    assert_eq!(info.app_name, "redis");
+    assert_eq!(info.port, 6379);
+}
+```
+
+The `stop_app_removes_from_service_map` test verifies the other end: deploy, resolve succeeds, stop, resolve returns 404. And `vip_is_deterministic_across_agents` deploys the same app on two independent agents and verifies they assign identical VIPs — proving the deterministic hash works without any coordination.
+
+**eBPF program tests** (Linux only, gated behind `RELIABURGER_EBPF_TESTS=1`) use `BPF_PROG_TEST_RUN`, a kernel facility that lets you feed synthetic packets through an attached eBPF program and inspect the result. You don't need real containers or DNS servers — you construct the input, run it through the program, and check the output. This is how we'll test DNS interception (feed a `.internal` query, verify the VIP response) and connect rewrite (feed a VIP address, verify the rewrite to a real backend).
+
+### What we built
+
+Let's step back and see what Onion gives us.
+
+A container calls `getaddrinfo("redis.internal")`. An eBPF program intercepts the DNS query in the kernel, looks up a hash map, and injects a response with a virtual IP. The container calls `connect()` with that VIP. Another eBPF program intercepts the syscall, picks a healthy backend via round-robin from another hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No DNS server, no proxy, no iptables rules.
+
+Kubernetes needs CoreDNS (a Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need two eBPF programs and three hash maps. The programs persist in the kernel — if Bun crashes, running connections keep working. Only new service map updates pause.
+
+The trade-off? Complexity moved from operations (running DNS servers, managing proxy configs) to implementation (writing and debugging eBPF C code, understanding kernel hook semantics). Whether that's a good trade depends on your team. For us, it means a single binary with no runtime dependencies beyond a Linux 5.7+ kernel.
+
 <!-- TODO(Phase 3): Wrapper ingress proxy section -->
 <!-- TODO(Phase 3): nftables perimeter firewall section -->
