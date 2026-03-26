@@ -1,29 +1,81 @@
 /// eBPF program loader and lifecycle management.
 ///
-/// Loads compiled BPF object files via aya, attaches programs to
-/// cgroup hooks, and provides handles for the BPF maps. Checks
-/// kernel prerequisites (version, BTF, cgroup v2) before loading.
+/// When the `ebpf` feature is enabled, loads compiled BPF object
+/// files via aya, attaches programs to cgroup hooks, and provides
+/// handles for the BPF maps. Without the feature, provides stubs
+/// that always report "not attached".
 use std::path::{Path, PathBuf};
 
 use super::super::types::OnionError;
 
 /// Handle to loaded eBPF programs.
-///
-/// Holds the aya `Bpf` objects for the connect and DNS programs.
-/// Dropping this detaches the programs from the cgroup.
 pub struct OnionEbpf {
-    /// Path to the cgroup v2 mount point.
     _cgroup_path: PathBuf,
-    // TODO(Phase 3, Step 2b): Add aya::Bpf handles when aya
-    // dependency is enabled. For now this is a placeholder
-    // that compiles without the aya crate.
+    #[cfg(feature = "ebpf")]
+    _connect_link: aya::programs::cgroup_sock_addr::CgroupSockAddrLink,
+    #[cfg(feature = "ebpf")]
+    pub(super) bpf: aya::Ebpf,
+    attached: bool,
 }
 
 impl OnionEbpf {
-    /// Load eBPF programs from compiled object files.
+    /// Load and attach the connect rewrite eBPF program.
     ///
-    /// Looks for `onion_connect.bpf.o` and `onion_dns.bpf.o` in the
-    /// given directory (typically `target/bpf/` or the build output dir).
+    /// Loads `onion_connect.bpf.o` from `program_dir` and attaches
+    /// the `onion_connect` program to the root cgroup v2.
+    #[cfg(feature = "ebpf")]
+    pub fn load(program_dir: &Path, cgroup_path: &Path) -> Result<Self, OnionError> {
+        use aya::programs::CgroupSockAddr;
+
+        check_prerequisites()?;
+
+        let obj_path = program_dir.join("onion_connect.bpf.o");
+        if !obj_path.exists() {
+            return Err(OnionError::EbpfLoadFailed {
+                reason: format!("onion_connect.bpf.o not found in {}", program_dir.display()),
+            });
+        }
+
+        let mut bpf = aya::Ebpf::load_file(&obj_path).map_err(|e| OnionError::EbpfLoadFailed {
+            reason: format!("failed to load eBPF program: {e}"),
+        })?;
+
+        // Attach the connect4 program to the root cgroup
+        let prog: &mut CgroupSockAddr = bpf
+            .program_mut("onion_connect")
+            .ok_or_else(|| OnionError::EbpfLoadFailed {
+                reason: "onion_connect program not found in object file".to_string(),
+            })?
+            .try_into()
+            .map_err(|e| OnionError::EbpfLoadFailed {
+                reason: format!("wrong program type: {e}"),
+            })?;
+
+        prog.load().map_err(|e| OnionError::EbpfLoadFailed {
+            reason: format!("failed to load program into kernel: {e}"),
+        })?;
+
+        let cgroup_fd =
+            std::fs::File::open(cgroup_path).map_err(|e| OnionError::EbpfLoadFailed {
+                reason: format!("failed to open cgroup {}: {e}", cgroup_path.display()),
+            })?;
+
+        let link = prog
+            .attach(cgroup_fd, aya::programs::CgroupAttachMode::Single)
+            .map_err(|e| OnionError::EbpfLoadFailed {
+                reason: format!("failed to attach to cgroup: {e}"),
+            })?;
+
+        Ok(Self {
+            _cgroup_path: cgroup_path.to_path_buf(),
+            _connect_link: link,
+            bpf,
+            attached: true,
+        })
+    }
+
+    /// Stub loader when eBPF feature is not enabled.
+    #[cfg(not(feature = "ebpf"))]
     pub fn load(program_dir: &Path, cgroup_path: &Path) -> Result<Self, OnionError> {
         check_prerequisites()?;
 
@@ -33,22 +85,21 @@ impl OnionEbpf {
             });
         }
 
-        // TODO(Phase 3, Step 2b): Load via aya::Bpf::load_file(),
-        // attach to cgroup. For now, return a placeholder.
         Ok(Self {
             _cgroup_path: cgroup_path.to_path_buf(),
+            attached: false,
         })
     }
 
     /// Check if eBPF programs are currently attached.
     pub fn is_attached(&self) -> bool {
-        // TODO(Phase 3, Step 2b): Check via aya program handles
-        false
+        self.attached
     }
 
     /// Detach eBPF programs from the cgroup.
     pub fn detach(&mut self) {
-        // TODO(Phase 3, Step 2b): Detach via aya
+        self.attached = false;
+        // Links are dropped when self is dropped, which detaches the program
     }
 }
 
@@ -66,7 +117,6 @@ fn check_kernel_version() -> Result<(), OnionError> {
             reason: format!("failed to read /proc/version: {e}"),
         })?;
 
-    // Parse "Linux version X.Y.Z ..."
     let parts: Vec<&str> = version.split_whitespace().collect();
     if parts.len() < 3 {
         return Err(OnionError::EbpfLoadFailed {
@@ -99,7 +149,6 @@ fn check_cgroup_v2() -> Result<(), OnionError> {
         });
     }
 
-    // cgroup v2 has a "cgroup.controllers" file at the root
     let controllers = cgroup_path.join("cgroup.controllers");
     if !controllers.exists() {
         return Err(OnionError::EbpfLoadFailed {
@@ -116,15 +165,10 @@ mod tests {
 
     #[test]
     fn check_kernel_version_on_test_host() {
-        // This test just verifies the function doesn't panic.
-        // On macOS (where /proc/version doesn't exist), it will
-        // return an error, which is expected.
         let result = check_kernel_version();
         if cfg!(target_os = "linux") {
-            // On Linux CI, this should pass (kernel 5.7+)
             assert!(result.is_ok(), "kernel version check failed: {result:?}");
         } else {
-            // On macOS, /proc/version doesn't exist
             assert!(result.is_err());
         }
     }
@@ -133,8 +177,6 @@ mod tests {
     fn check_cgroup_v2_on_test_host() {
         let result = check_cgroup_v2();
         if cfg!(target_os = "linux") {
-            // Most modern Linux CI has cgroup v2
-            // Don't assert — some CI environments might not
             let _ = result;
         } else {
             assert!(result.is_err());

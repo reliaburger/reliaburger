@@ -513,7 +513,8 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
         "cd {repo_path} && source $HOME/.cargo/env && \
          RELIABURGER_RUNC_TESTS=1 \
          RELIABURGER_NETNS_TESTS=1 \
-         cargo test"
+         RELIABURGER_EBPF_TESTS=1 \
+         cargo test --features ebpf"
     );
 
     if let Some(f) = filter {

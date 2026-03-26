@@ -68,8 +68,10 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
   - [x] Userspace ServiceMap, VirtualIP allocation, `relish resolve` command
   - [x] Agent lifecycle wiring (deploy/health/stop → service map)
-  - [x] eBPF C programs and Rust loader scaffolding (Linux only, aya TODO)
-  - [ ] Wire aya loader to actually load and attach eBPF programs
+  - [x] eBPF C programs and Rust loader scaffolding (Linux only)
+  - [x] Wire aya loader for connect rewrite (cgroup/connect4)
+  - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis)
+  - [x] `relish dev test` runs Linux + eBPF tests from macOS via Lima
   - [ ] eBPF integration tests (BPF_PROG_TEST_RUN, dig/curl from containers)
 - [ ] Wrapper ingress proxy (host/path routing, TLS, WebSocket, load balancing, draining, rate limiting)
 - [ ] nftables perimeter firewall (cluster boundary rules, management access)

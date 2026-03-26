@@ -1,10 +1,9 @@
 /// BPF map operations for Onion service discovery.
 ///
-/// Wraps the BPF hash maps with typed Rust methods for updating
-/// DNS entries, backend lists, and firewall rules. When aya is
-/// available, these write directly to kernel BPF maps. Without
-/// aya, they are no-ops (the userspace `ServiceMap` handles
-/// everything).
+/// When the `ebpf` feature is enabled, wraps aya map handles and
+/// writes directly to kernel BPF hash maps. Without the feature,
+/// all map methods are no-ops — the userspace `ServiceMap` still
+/// works for `relish resolve`.
 use std::net::Ipv4Addr;
 
 use super::super::service_map::ServiceMap;
@@ -14,39 +13,29 @@ use super::super::types::{
 use super::super::vip::VirtualIP;
 
 /// Manages BPF map synchronisation from the userspace `ServiceMap`.
-///
-/// On Linux with the `ebpf` feature, this holds aya map handles
-/// and writes directly to the kernel. Without aya, all methods
-/// are no-ops.
 pub struct BpfServiceMap {
-    // TODO(Phase 3, Step 2b): Add aya HashMap handles when the
-    // aya dependency is enabled. For now, track whether we've
-    // been initialised so callers can check.
     initialised: bool,
 }
 
 impl BpfServiceMap {
-    /// Create a new BPF service map manager.
-    ///
-    /// Call `sync_from_service_map()` after loading eBPF programs
-    /// to populate the kernel maps from the current service state.
     pub fn new() -> Self {
         Self { initialised: false }
     }
 
     /// Full sync: write all entries from the userspace `ServiceMap`
     /// into the BPF maps.
-    ///
-    /// Called on startup after loading eBPF programs, and after
-    /// reconnecting to an existing pinned BPF filesystem.
-    pub fn sync_from_service_map(&mut self, map: &ServiceMap) {
-        for entry in map.resolve_all() {
-            let dns_key = DnsMapKey::from_name(&format!("{}.internal", entry.app_name));
-            let dns_value = DnsMapValue {
-                vip: entry.vip.to_network_byte_order(),
-            };
+    #[cfg(feature = "ebpf")]
+    pub fn sync_from_service_map(&mut self, map: &ServiceMap, ebpf: &mut super::loader::OnionEbpf) {
+        use aya::maps::HashMap;
 
-            // Build the backend value
+        let Ok(mut backend_map): Result<HashMap<_, BackendKey, BackendValue>, _> =
+            HashMap::try_from(ebpf.bpf.map_mut("backend_map").unwrap())
+        else {
+            eprintln!("warning: failed to get backend_map handle");
+            return;
+        };
+
+        for entry in map.resolve_all() {
             let backend_key = BackendKey {
                 vip: entry.vip.to_network_byte_order(),
                 port: entry.port.to_be(),
@@ -54,51 +43,80 @@ impl BpfServiceMap {
             };
             let backend_value = service_entry_to_backend_value(entry);
 
-            // TODO(Phase 3, Step 2b): Write to actual BPF maps via aya
-            let _ = (dns_key, dns_value, backend_key, backend_value);
+            if let Err(e) = backend_map.insert(backend_key, backend_value, 0) {
+                eprintln!(
+                    "warning: failed to update backend_map for {}: {e}",
+                    entry.app_name
+                );
+            }
+        }
+
+        self.initialised = true;
+    }
+
+    /// No-op sync when eBPF is not available.
+    #[cfg(not(feature = "ebpf"))]
+    pub fn sync_from_service_map(&mut self, map: &ServiceMap) {
+        // Walk the map to validate the conversion logic even without BPF
+        for entry in map.resolve_all() {
+            let _key = BackendKey {
+                vip: entry.vip.to_network_byte_order(),
+                port: entry.port.to_be(),
+                _pad: 0,
+            };
+            let _value = service_entry_to_backend_value(entry);
         }
         self.initialised = true;
     }
 
-    /// Update the DNS map for a single service.
-    pub fn update_dns(&self, app_name: &str, vip: VirtualIP) {
-        let _key = DnsMapKey::from_name(&format!("{app_name}.internal"));
-        let _value = DnsMapValue {
-            vip: vip.to_network_byte_order(),
-        };
-        // TODO(Phase 3, Step 2b): bpf_map.insert(&key, &value, 0)
-    }
-
-    /// Remove a DNS map entry.
-    pub fn remove_dns(&self, app_name: &str) {
-        let _key = DnsMapKey::from_name(&format!("{app_name}.internal"));
-        // TODO(Phase 3, Step 2b): bpf_map.remove(&key)
-    }
-
-    /// Update the backend map for a service.
-    pub fn update_backends(
+    /// Update the backend map for a single service.
+    #[cfg(feature = "ebpf")]
+    pub fn update_backends_bpf(
         &self,
+        ebpf: &mut super::loader::OnionEbpf,
         vip: VirtualIP,
         port: u16,
         entry: &super::super::types::ServiceEntry,
     ) {
-        let _key = BackendKey {
+        use aya::maps::HashMap;
+
+        let Ok(mut backend_map): Result<HashMap<_, BackendKey, BackendValue>, _> =
+            HashMap::try_from(ebpf.bpf.map_mut("backend_map").unwrap())
+        else {
+            return;
+        };
+
+        let key = BackendKey {
             vip: vip.to_network_byte_order(),
             port: port.to_be(),
             _pad: 0,
         };
-        let _value = service_entry_to_backend_value(entry);
-        // TODO(Phase 3, Step 2b): bpf_map.insert(&key, &value, 0)
+        let value = service_entry_to_backend_value(entry);
+        let _ = backend_map.insert(key, value, 0);
     }
 
     /// Remove a backend map entry.
-    pub fn remove_backends(&self, vip: VirtualIP, port: u16) {
-        let _key = BackendKey {
+    #[cfg(feature = "ebpf")]
+    pub fn remove_backends_bpf(
+        &self,
+        ebpf: &mut super::loader::OnionEbpf,
+        vip: VirtualIP,
+        port: u16,
+    ) {
+        use aya::maps::HashMap;
+
+        let Ok(mut backend_map): Result<HashMap<_, BackendKey, BackendValue>, _> =
+            HashMap::try_from(ebpf.bpf.map_mut("backend_map").unwrap())
+        else {
+            return;
+        };
+
+        let key = BackendKey {
             vip: vip.to_network_byte_order(),
             port: port.to_be(),
             _pad: 0,
         };
-        // TODO(Phase 3, Step 2b): bpf_map.remove(&key)
+        let _ = backend_map.remove(&key);
     }
 
     /// Whether the BPF maps have been initialised.
@@ -114,7 +132,7 @@ impl Default for BpfServiceMap {
 }
 
 /// Convert a `ServiceEntry` into a `BackendValue` for the BPF map.
-fn service_entry_to_backend_value(entry: &super::super::types::ServiceEntry) -> BackendValue {
+pub fn service_entry_to_backend_value(entry: &super::super::types::ServiceEntry) -> BackendValue {
     let mut backends = [BackendEndpoint {
         host_ip: 0,
         host_port: 0,
@@ -195,7 +213,6 @@ mod tests {
         let entry = test_entry();
         let value = service_entry_to_backend_value(&entry);
 
-        // 10.0.2.2 = 0x0A000202, in network byte order (big-endian)
         let expected = u32::from(Ipv4Addr::new(10, 0, 2, 2)).to_be();
         assert_eq!(value.backends[0].host_ip, expected);
     }
@@ -218,12 +235,17 @@ mod tests {
     }
 
     #[test]
-    fn sync_from_service_map_marks_initialised() {
+    fn sync_marks_initialised() {
         let mut bpf_map = BpfServiceMap::new();
         assert!(!bpf_map.is_initialised());
 
         let map = ServiceMap::new();
+        #[cfg(not(feature = "ebpf"))]
         bpf_map.sync_from_service_map(&map);
+
+        // Can't test the ebpf path without a loaded program, but
+        // the non-ebpf path should mark as initialised
+        #[cfg(not(feature = "ebpf"))]
         assert!(bpf_map.is_initialised());
     }
 

@@ -47,6 +47,14 @@ futures-util = "0.3"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", optional = true }
+aya-log = { version = "0.2", optional = true }
+
+[features]
+default = []
+ebpf = ["aya", "aya-log"]
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 http-body-util = "0.1"
