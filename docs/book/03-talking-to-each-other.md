@@ -270,17 +270,17 @@ Every container has its own IP now. But when your web frontend needs to reach Re
 
 Kubernetes solves this with CoreDNS (a real DNS server) and kube-proxy (iptables rules or IPVS for load balancing). That's three moving parts: a DNS server to operate, a proxy to configure, and a pile of iptables rules that grow linearly with the number of services. CoreDNS alone consumes 170MB of RAM in a default cluster. And if kube-proxy falls behind on rule updates, you get stale routing.
 
-We're going to do something different. We'll intercept DNS and connections at the socket level using eBPF, before any packets are created. No DNS server process. No proxy in the data path. No iptables rules. The eBPF programs live in the kernel, so they survive Bun crashes — running applications keep connecting to backends even if the orchestrator is temporarily down.
+We're going to do something different. DNS resolution goes through a tiny UDP responder built into Bun — no separate CoreDNS to operate. And connections to backends are rewritten at the socket level by an eBPF program, before any packets are created. No proxy in the data path. No iptables rules. The eBPF connect hook lives in the kernel, so running connections survive even if Bun crashes.
 
 ### How it works: the 30-second version
 
-Two eBPF programs, two steps:
+Two steps, one in userspace, one in the kernel:
 
-1. Your app calls `getaddrinfo("redis.internal")`. The C library constructs a DNS query. Our eBPF program intercepts it *in the kernel*, looks up the name in a hash map, and injects a fake DNS response with a virtual IP: `127.128.0.3`. No DNS packet ever leaves the node.
+1. Your app calls `getaddrinfo("redis.internal")`. The C library sends a DNS query to `127.0.0.53:53` — a tiny UDP server built into Bun. Bun looks up "redis" in the service map and responds with a virtual IP: `127.128.0.3`. The query never leaves localhost. Takes about 50 microseconds.
 
-2. Your app calls `connect(127.128.0.3, 6379)`. A second eBPF program intercepts the `connect()` syscall, looks up the VIP in another hash map, picks a healthy backend via round-robin, and rewrites the destination to `10.0.2.5:30891`. Your app's TCP connection goes directly to the backend. No proxy.
+2. Your app calls `connect(127.128.0.3, 6379)`. An eBPF program intercepts the `connect()` syscall *before the kernel sends any packets*, looks up the VIP in a hash map, picks a healthy backend via round-robin, and rewrites the destination to `10.0.2.5:30891`. Your app's TCP connection goes directly to the backend. No proxy.
 
-Total added latency: zero. The rewrites happen before the kernel sends any packets. Your app sees a normal TCP connection that just happens to land on the right backend.
+The DNS lookup adds ~50 microseconds (one localhost UDP round trip). The connect rewrite adds zero — it happens before the TCP handshake. Compare that to CoreDNS over the pod network (~500 microseconds) plus kube-proxy iptables traversal. Your app sees a normal TCP connection that just happens to land on the right backend.
 
 ### Virtual IPs
 
@@ -422,9 +422,21 @@ Can you see why we need both? The reporting tree is accurate but slow — bounde
 
 There's a subtlety worth noting. During a network partition, a node might be marked Dead by gossip even though it's still running containers. If those containers are serving traffic to local clients (same-node connections don't go through the network), they'll keep working fine. The service map on the partitioned node still has the local backends. Only cross-node connections are affected, which is exactly what you'd expect from a partition. When the partition heals, Mustard's incarnation counter mechanism (remember that from Chapter 2?) ensures the node rejoins cleanly and its backends reappear in everyone's service maps.
 
+### Why userspace DNS, not eBPF?
+
+The original design called for fully in-kernel DNS interception using `cgroup/sendmsg4` and `cgroup/recvmsg4` eBPF hooks. We tried it. It doesn't work.
+
+The problem is that these hooks let you modify the *destination address* of a UDP sendmsg, but they can't read the *packet payload*. You can redirect where a DNS query goes, but you can't parse the query name or synthesise a response. The BPF helper you'd need (`bpf_msg_pull_data`) only works with `SK_MSG` programs (stream parsers for TCP), not cgroup socket address hooks.
+
+So we run a userspace DNS responder instead. It's about 80 lines of code in `src/onion/dns.rs`: one `tokio::select!` loop reading from a UDP socket. Bun configures containers' `/etc/resolv.conf` to point at `127.0.0.53`, and the responder handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
+
+The cost is ~50 microseconds per DNS lookup (localhost UDP round trip). That's 10x faster than CoreDNS over the pod network, but it's not zero. Most applications cache DNS results anyway, so this hit happens once per connection lifetime, not per request.
+
+The connect rewrite — the part that actually matters for latency — is still fully in-kernel eBPF. Once your app has the VIP from DNS, every `connect()` call is rewritten at zero cost.
+
 ### UDP only: a deliberate limitation
 
-Our DNS interception only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) bypasses Onion entirely and goes to the upstream resolver.
+The DNS responder only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) goes to the upstream resolver, which doesn't know about `.internal` names.
 
 This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
 
@@ -505,11 +517,11 @@ Why not Docker? Two reasons. First, building Rust inside a Docker container on m
 
 Let's step back and see what Onion gives us.
 
-A container calls `getaddrinfo("redis.internal")`. An eBPF program intercepts the DNS query in the kernel, looks up a hash map, and injects a response with a virtual IP. The container calls `connect()` with that VIP. Another eBPF program intercepts the syscall, picks a healthy backend via round-robin from another hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No DNS server, no proxy, no iptables rules.
+A container calls `getaddrinfo("redis.internal")`. Bun's built-in DNS responder looks up the service map and responds with a virtual IP — one localhost UDP round trip, about 50 microseconds. The container calls `connect()` with that VIP. An eBPF program intercepts the syscall, picks a healthy backend via round-robin from a kernel hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No proxy in the data path, no iptables rules.
 
-Kubernetes needs CoreDNS (a Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need two eBPF programs and three hash maps. The programs persist in the kernel — if Bun crashes, running connections keep working. Only new service map updates pause.
+Kubernetes needs CoreDNS (a separate Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need a single binary with a built-in DNS responder, one eBPF program, and a hash map. The eBPF connect hook persists in the kernel — if Bun crashes, running connections keep working. DNS resolution pauses (since Bun runs the responder), but that only affects new connections. Existing TCP sessions are fine.
 
-The trade-off? Complexity moved from operations (running DNS servers, managing proxy configs) to implementation (writing and debugging eBPF C code, understanding kernel hook semantics). Whether that's a good trade depends on your team. For us, it means a single binary with no runtime dependencies beyond a Linux 5.7+ kernel.
+We originally planned to do DNS entirely in-kernel too. It turned out the BPF hooks we needed can't read DNS packet payloads. So we went with the pragmatic approach: userspace DNS at 50 microseconds, in-kernel connect rewrite at zero. Pragmatism over purity. The 50 microsecond DNS hit is invisible to any real application, and it saved us from fighting kernel limitations that would have taken weeks to work around (if they're even solvable with current BPF).
 
 <!-- TODO(Phase 3): Wrapper ingress proxy section -->
 <!-- TODO(Phase 3): nftables perimeter firewall section -->
