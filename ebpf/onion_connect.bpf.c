@@ -85,17 +85,24 @@ int onion_connect(struct bpf_sock_addr *ctx)
     __u32 selected_idx = 0;
     int found = 0;
 
-    /* Try up to count times to find a healthy backend */
+    /* Try up to count times to find a healthy backend.
+     * We increment rr_index non-atomically. BPF map lookups return
+     * a pointer to a copy, so true atomicity isn't possible anyway.
+     * The slight skew from concurrent access is acceptable for
+     * round-robin — it's still roughly even distribution. */
+    __u32 rr = val->rr_index;
+
     #pragma unroll
     for (int i = 0; i < MAX_BACKENDS; i++) {
         if (i >= val->count)
             break;
 
-        __u32 idx = __sync_fetch_and_add(&val->rr_index, 1) % val->count;
+        __u32 idx = (rr + i) % val->count;
 
         if (idx < MAX_BACKENDS && val->backends[idx].healthy == 1) {
             selected_idx = idx;
             found = 1;
+            val->rr_index = rr + i + 1;
             break;
         }
     }

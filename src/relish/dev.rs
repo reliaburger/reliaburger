@@ -435,7 +435,7 @@ fn generate_test_vm_yaml() -> String {
   - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
     arch: "x86_64"
 cpus: 4
-memory: "4GiB"
+memory: "8GiB"
 disk: "20GiB"
 mountType: "virtiofs"
 mounts:
@@ -515,9 +515,14 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
     // target dir makes incremental builds 5-10x faster.
     let vm_target = format!("/tmp/reliaburger-target{}", repo_path.replace('/', "-"));
 
+    // Use sudo for tests that need root (netns, runc, eBPF).
+    // Pass through the cargo env and HOME so rustup/cargo work.
+    // Use --test-threads=1 because netns/veth tests can't run in
+    // parallel (they share the host network namespace).
     let mut test_cmd = format!(
         "cd {repo_path} && source $HOME/.cargo/env && \
          mkdir -p {vm_target} && \
+         sudo -E env PATH=\"$PATH\" \
          CARGO_TARGET_DIR={vm_target} \
          RELIABURGER_RUNC_TESTS=1 \
          RELIABURGER_NETNS_TESTS=1 \
@@ -529,6 +534,7 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
         test_cmd.push(' ');
         test_cmd.push_str(f);
     }
+    test_cmd.push_str(" -- --test-threads=1");
 
     eprintln!("running tests in VM...");
     eprintln!();

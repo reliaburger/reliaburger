@@ -30,7 +30,7 @@ pub const FIREWALL_DENY: u32 = 0;
 ///
 /// The name is null-terminated, lowercase-normalised, max 255 chars + null.
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct DnsMapKey {
     pub name: [u8; 256],
 }
@@ -58,6 +58,10 @@ pub struct DnsMapValue {
 }
 
 /// Key for the `backend_map` BPF hash map.
+///
+/// # Safety
+/// This type is `#[repr(C)]` with no padding holes, making it safe
+/// to interpret as raw bytes for BPF map operations.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct BackendKey {
@@ -85,7 +89,7 @@ pub struct BackendEndpoint {
 
 /// Value for the `backend_map` BPF hash map.
 #[repr(C)]
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct BackendValue {
     /// Total number of backends (healthy + unhealthy).
     pub count: u32,
@@ -118,6 +122,28 @@ pub struct FirewallValue {
     /// `FIREWALL_DENY` (0) or `FIREWALL_ALLOW` (1).
     pub action: u32,
 }
+
+// ---------------------------------------------------------------------------
+// aya Pod implementations (Linux + ebpf feature only)
+// ---------------------------------------------------------------------------
+
+// SAFETY: All BPF map structs are #[repr(C)], Copy, 'static, and have
+// no padding holes (all padding is explicit via _pad fields). This makes
+// them safe to interpret as raw bytes for BPF map operations.
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for BackendKey {}
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for BackendEndpoint {}
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for BackendValue {}
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for DnsMapKey {}
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for DnsMapValue {}
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for FirewallKey {}
+#[cfg(feature = "ebpf")]
+unsafe impl aya::Pod for FirewallValue {}
 
 // ---------------------------------------------------------------------------
 // Rust-side service state (userspace, not sent to BPF directly)

@@ -12,7 +12,7 @@ use super::super::types::OnionError;
 pub struct OnionEbpf {
     _cgroup_path: PathBuf,
     #[cfg(feature = "ebpf")]
-    _connect_link: aya::programs::cgroup_sock_addr::CgroupSockAddrLink,
+    _connect_link_id: aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId,
     #[cfg(feature = "ebpf")]
     pub(super) bpf: aya::Ebpf,
     attached: bool,
@@ -60,7 +60,7 @@ impl OnionEbpf {
                 reason: format!("failed to open cgroup {}: {e}", cgroup_path.display()),
             })?;
 
-        let link = prog
+        let link_id = prog
             .attach(cgroup_fd, aya::programs::CgroupAttachMode::Single)
             .map_err(|e| OnionError::EbpfLoadFailed {
                 reason: format!("failed to attach to cgroup: {e}"),
@@ -68,7 +68,7 @@ impl OnionEbpf {
 
         Ok(Self {
             _cgroup_path: cgroup_path.to_path_buf(),
-            _connect_link: link,
+            _connect_link_id: link_id,
             bpf,
             attached: true,
         })

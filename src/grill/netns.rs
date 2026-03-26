@@ -198,7 +198,17 @@ pub async fn setup_container_network(
     let c_ip = container_ip(node_index, container_index);
     let gw_ip = gateway_ip(node_index);
     let h_veth = host_veth_name(instance_id);
-    let c_veth = "eth0".to_string();
+    // Use a unique container-side veth name. We use the last 13 chars
+    // of a hash to avoid truncation collisions with the host-side name.
+    let c_hash = {
+        let h: u32 = instance_id
+            .0
+            .bytes()
+            .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+        format!("c-{h:08x}")
+    };
+    let c_veth_tmp = format!("vt{c_hash}");
+    // vt + c- + 8 hex = 12 chars, well under the 15-char limit
     let ns_name = format!("rb-{}", instance_id.0);
 
     // 1. Create the network namespace
@@ -210,11 +220,18 @@ pub async fn setup_container_network(
     )
     .await?;
 
-    // 2. Create the veth pair
+    // 2. Create the veth pair (using a temporary name for the container side)
     run_cmd(
         "ip",
         &[
-            "link", "add", &h_veth, "type", "veth", "peer", "name", &c_veth,
+            "link",
+            "add",
+            &h_veth,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &c_veth_tmp,
         ],
         instance_id,
         "create veth pair",
@@ -224,9 +241,29 @@ pub async fn setup_container_network(
     // 3. Move the container-side veth into the namespace
     run_cmd(
         "ip",
-        &["link", "set", &c_veth, "netns", &ns_name],
+        &["link", "set", &c_veth_tmp, "netns", &ns_name],
         instance_id,
         "move veth to namespace",
+    )
+    .await?;
+
+    // 3b. Rename to eth0 inside the namespace
+    let c_veth = "eth0".to_string();
+    run_cmd(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &ns_name,
+            "ip",
+            "link",
+            "set",
+            &c_veth_tmp,
+            "name",
+            &c_veth,
+        ],
+        instance_id,
+        "rename veth to eth0 in namespace",
     )
     .await?;
 
@@ -791,6 +828,20 @@ mod tests {
         }
 
         let id = InstanceId("netns-test-0".to_string());
+        // Clean up any leftovers from a previous failed run
+        let _ = run_cmd_raw(
+            "ip",
+            &["link", "del", &host_veth_name(&id)],
+            "pre-cleanup veth",
+        )
+        .await;
+        let _ = run_cmd_raw(
+            "ip",
+            &["netns", "del", "rb-netns-test-0"],
+            "pre-cleanup netns",
+        )
+        .await;
+
         // Use node_index 99: subnet base = 10.0.198.0/23
         let network = setup_container_network(&id, 99, 0, false)
             .await
@@ -835,6 +886,20 @@ mod tests {
         }
 
         let id = InstanceId("netns-portmap-0".to_string());
+        // Clean up any leftovers from a previous failed run
+        let _ = run_cmd_raw(
+            "ip",
+            &["link", "del", &host_veth_name(&id)],
+            "pre-cleanup veth",
+        )
+        .await;
+        let _ = run_cmd_raw(
+            "ip",
+            &["netns", "del", "rb-netns-portmap-0"],
+            "pre-cleanup netns",
+        )
+        .await;
+
         let network = setup_container_network(&id, 98, 0, false)
             .await
             .expect("failed to set up container network");
