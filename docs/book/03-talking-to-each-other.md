@@ -463,6 +463,44 @@ The `stop_app_removes_from_service_map` test verifies the other end: deploy, res
 
 **eBPF program tests** (Linux only, gated behind `RELIABURGER_EBPF_TESTS=1`) use `BPF_PROG_TEST_RUN`, a kernel facility that lets you feed synthetic packets through an attached eBPF program and inspect the result. You don't need real containers or DNS servers — you construct the input, run it through the program, and check the output. This is how we'll test DNS interception (feed a `.internal` query, verify the VIP response) and connect rewrite (feed a VIP address, verify the rewrite to a real backend).
 
+### Running Linux tests from a MacBook
+
+Here's a problem we hit early: most of the interesting tests need Linux. Network namespaces, veth pairs, runc containers, eBPF programs — none of these exist on macOS. You could push to CI and wait, but that's a slow feedback loop when you're debugging a failing test.
+
+Our solution: `relish dev test`. One command that runs all the Linux-gated tests inside a Lima VM on your Mac.
+
+```
+$ relish dev test              # run everything
+$ relish dev test netns        # just the netns tests
+$ relish dev test onion        # just the onion tests
+```
+
+The first run takes a couple of minutes — it downloads an Ubuntu VM image, installs Rust, runc, slirp4netns, and clang. After that, the VM persists on disk. Subsequent runs go straight to `cargo test`.
+
+The trick is that Lima mounts your home directory into the VM with read-write access. The repo isn't copied — it's the same files. When you edit code on your Mac and run `relish dev test`, the VM compiles your latest changes. The cargo cache and target directory also persist inside the VM, so incremental builds are fast.
+
+Under the hood, `relish dev test` does three things:
+
+1. Creates a Lima VM named `reliaburger-test` if it doesn't exist (4 CPUs, 4GB RAM, Ubuntu Noble).
+2. Starts the VM if it's stopped.
+3. Runs `limactl shell reliaburger-test bash -c "cd /path/to/repo && cargo test"` with the Linux test env vars set (`RELIABURGER_RUNC_TESTS=1`, `RELIABURGER_NETNS_TESTS=1`).
+
+The VM provisioning script installs everything the tests need:
+
+```yaml
+provision:
+  - mode: system
+    script: |
+      apt-get install -y runc uidmap slirp4netns curl build-essential pkg-config libssl-dev clang llvm
+  - mode: user
+    script: |
+      curl https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+```
+
+This is the same idea as `relish dev create` for dev clusters, but focused on testing rather than running a cluster. You don't need three VMs to run `cargo test` — one is enough.
+
+Why not Docker? Two reasons. First, building Rust inside a Docker container on macOS means either bind-mounting the target directory (slow due to virtiofs overhead for the thousands of small files in a Rust build) or keeping it inside the container (losing it on every rebuild). Lima's VM mount is faster because the VM runs a real Linux kernel with a real filesystem. Second, we need to test network namespaces and cgroup operations, which require privileges that Docker-in-Docker handles poorly.
+
 ### What we built
 
 Let's step back and see what Onion gives us.
