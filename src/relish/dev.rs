@@ -418,6 +418,135 @@ pub async fn destroy(name: &str) -> Result<(), RelishError> {
 }
 
 // ---------------------------------------------------------------------------
+// Test VM
+// ---------------------------------------------------------------------------
+
+const TEST_VM_NAME: &str = "reliaburger-test";
+
+/// Generate Lima YAML for the test VM.
+///
+/// Installs Rust toolchain, runc, slirp4netns, and build tools.
+/// The home directory is mounted read-write so the repo and cargo
+/// cache are shared with the host.
+fn generate_test_vm_yaml() -> String {
+    r#"images:
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    arch: "x86_64"
+cpus: 4
+memory: "4GiB"
+disk: "20GiB"
+mountType: "virtiofs"
+mounts:
+  - location: "~"
+    writable: true
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      apt-get update -qq
+      apt-get install -y -qq runc uidmap slirp4netns curl build-essential pkg-config libssl-dev clang llvm
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      if [ ! -f "$HOME/.cargo/bin/rustup" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+      fi
+"#
+    .to_string()
+}
+
+/// Run cargo test inside a Lima VM with all Linux test env vars.
+///
+/// Creates the test VM on first run, reuses it afterwards. The
+/// repo is mounted from the host, so no code copying needed. The
+/// Rust toolchain and cargo cache persist inside the VM.
+pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
+    if !lima_available() {
+        eprintln!("error: limactl not found in PATH");
+        eprintln!();
+        eprintln!("Install Lima:");
+        eprintln!("  macOS:  brew install lima");
+        eprintln!("  Linux:  https://lima-vm.io/docs/installation/");
+        return Err(RelishError::LimaNotFound);
+    }
+
+    // Create the test VM if it doesn't exist
+    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    if !list.lines().any(|l| l.trim() == TEST_VM_NAME) {
+        eprintln!("creating test VM ({TEST_VM_NAME})...");
+        let yaml = generate_test_vm_yaml();
+        let yaml_path = std::env::temp_dir().join("reliaburger-test.yaml");
+        std::fs::write(&yaml_path, &yaml)?;
+        limactl(&[
+            "create",
+            "--name",
+            TEST_VM_NAME,
+            yaml_path.to_str().unwrap(),
+        ])
+        .await?;
+        limactl(&["start", TEST_VM_NAME]).await?;
+        eprintln!("test VM ready.");
+    }
+
+    // Check if it's running
+    let info = limactl(&["list", "--format", "{{.Name}} {{.Status}}"]).await?;
+    let is_running = info
+        .lines()
+        .any(|l| l.starts_with(TEST_VM_NAME) && l.contains("Running"));
+    if !is_running {
+        eprintln!("starting test VM...");
+        limactl(&["start", TEST_VM_NAME]).await?;
+    }
+
+    // Build the cargo test command
+    let repo_dir = std::env::current_dir().map_err(|e| RelishError::LimaError {
+        command: "get cwd".to_string(),
+        stderr: e.to_string(),
+    })?;
+    let repo_path = repo_dir.to_string_lossy();
+
+    let mut test_cmd = format!(
+        "cd {repo_path} && source $HOME/.cargo/env && \
+         RELIABURGER_RUNC_TESTS=1 \
+         RELIABURGER_NETNS_TESTS=1 \
+         cargo test"
+    );
+
+    if let Some(f) = filter {
+        test_cmd.push(' ');
+        test_cmd.push_str(f);
+    }
+
+    eprintln!("running tests in VM...");
+    eprintln!();
+
+    // Run interactively so output streams to the terminal
+    let status = std::process::Command::new("limactl")
+        .args(["shell", TEST_VM_NAME, "bash", "-c", &test_cmd])
+        .status()
+        .map_err(|e| RelishError::LimaError {
+            command: "run tests".to_string(),
+            stderr: e.to_string(),
+        })?;
+
+    if !status.success() {
+        return Err(RelishError::LimaError {
+            command: "cargo test".to_string(),
+            stderr: format!(
+                "tests failed with exit code {}",
+                status.code().unwrap_or(-1)
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -476,6 +605,13 @@ mod tests {
         assert_eq!(decoded.name, "test");
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(decoded.nodes[0].ip.as_deref(), Some("192.168.105.2"));
+    }
+
+    #[test]
+    fn test_vm_yaml_has_rust_provisioning() {
+        let yaml = generate_test_vm_yaml();
+        assert!(yaml.contains("rustup"));
+        assert!(yaml.contains("runc"));
     }
 
     #[test]

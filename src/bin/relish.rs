@@ -140,6 +140,11 @@ enum DevAction {
         #[arg(default_value = "default")]
         name: String,
     },
+    /// Run tests in a Linux VM (all Linux-gated tests enabled).
+    Test {
+        /// Optional test name filter (passed to cargo test).
+        filter: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -181,6 +186,7 @@ async fn main() -> ExitCode {
             DevAction::Stop { name } => reliaburger::relish::dev::stop(name).await,
             DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
             DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
+            DevAction::Test { filter } => reliaburger::relish::dev::test(filter.as_deref()).await,
         },
     };
 
