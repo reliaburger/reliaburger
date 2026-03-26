@@ -467,7 +467,7 @@ The `stop_app_removes_from_service_map` test verifies the other end: deploy, res
 
 Here's a problem we hit early: most of the interesting tests need Linux. Network namespaces, veth pairs, runc containers, eBPF programs — none of these exist on macOS. You could push to CI and wait, but that's a slow feedback loop when you're debugging a failing test.
 
-Our solution: `relish dev test`. One command that runs all the Linux-gated tests inside a Lima VM on your Mac.
+Our solution: `relish dev test`. One command that runs all the Linux-gated tests inside a Lima VM on your Mac. If you've been following along, you already have the `relish` binary — it's `cargo run --bin relish` or just `relish` if you've added `target/debug` to your PATH.
 
 ```
 $ relish dev test              # run everything
