@@ -404,6 +404,24 @@ The service map needs to stay in sync with reality. Four events matter:
 
 The ordering matters. We register the service *before* starting instances so that the DNS name resolves as early as possible. We unregister *after* stopping so that in-flight connections can drain. And we update health synchronously in the event loop so there's no window where the map disagrees with reality.
 
+### How gossip keeps the service map consistent
+
+Everything above describes what happens on a single node. But a 10-node cluster has 10 service maps, and they all need to agree. When the scheduler places `redis-0` on node A, node B needs to know about it too — otherwise `curl redis.internal` from a container on node B goes nowhere.
+
+This is where the reporting tree from Chapter 2 comes back. Remember the hierarchy: worker nodes report to their assigned council member every 5 seconds, council members aggregate for the leader, and the leader pushes scheduling decisions back down. When the leader tells node A to run `redis-0`, node A starts the container, and the state change propagates through the reporting tree to every other node's Bun agent. Each agent updates its own service map and (on Linux) writes the corresponding BPF map entries.
+
+Gossip plays a different role. Mustard doesn't carry service map data directly — that would be too much traffic for O(log N) convergence with piggybacked updates. Instead, gossip handles *failure detection*. When node A crashes, Mustard marks it as Dead within a few probe cycles (typically 2-5 seconds depending on cluster size). Every Bun agent that receives the Dead notification can then scrub node A's backends from its service map. The backends were already unreachable — the crash took them down — but scrubbing the map means new connections stop trying.
+
+So the data flow is:
+
+1. **Scheduling decisions** flow through the reporting tree (Raft → council → workers). This is how backend entries get *added*.
+2. **Failure detection** flows through gossip (Mustard SWIM protocol). This is how backend entries get *removed* when a node dies.
+3. **Health check results** are local to each node's Bun agent. They flip the `healthy` flag for backends running on that node.
+
+Can you see why we need both? The reporting tree is accurate but slow — bounded by the 5-second reporting interval. Gossip is fast but coarse — it knows a node is dead, not which specific instance failed. Health checks are precise but local — they know exactly which instance is unhealthy, but only for instances running on the same node. Together, they cover all the failure modes: planned shutdowns (reporting tree), node crashes (gossip), and application bugs (health checks).
+
+There's a subtlety worth noting. During a network partition, a node might be marked Dead by gossip even though it's still running containers. If those containers are serving traffic to local clients (same-node connections don't go through the network), they'll keep working fine. The service map on the partitioned node still has the local backends. Only cross-node connections are affected, which is exactly what you'd expect from a partition. When the partition heals, Mustard's incarnation counter mechanism (remember that from Chapter 2?) ensures the node rejoins cleanly and its backends reappear in everyone's service maps.
+
 ### UDP only: a deliberate limitation
 
 Our DNS interception only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) bypasses Onion entirely and goes to the upstream resolver.
