@@ -39,6 +39,7 @@ oci-distribution = { version = "0.11", default-features = false, features = ["ru
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"
+siphasher = "1"
 hex = "0.4"
 dirs = "6"
 tokio-stream = "0.1"

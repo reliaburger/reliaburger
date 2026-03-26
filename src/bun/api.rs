@@ -44,6 +44,8 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
+        .route("/v1/resolve", get(resolve_all_handler))
+        .route("/v1/resolve/{name}", get(resolve_handler))
         .with_state(state)
 }
 
@@ -524,6 +526,66 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
 
     match resp_rx.await {
         Ok(status) => Json(serde_json::json!(status)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Resolve a service name to its VIP and backends.
+async fn resolve_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Resolve {
+            app_name: name.clone(),
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(Some(info)) => Json(serde_json::json!(info)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("service {name:?} not found") })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// List all registered services.
+async fn resolve_all_handler(State(state): State<ApiState>) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::ResolveAll { response: resp_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(entries) => Json(serde_json::json!(entries)).into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),

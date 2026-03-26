@@ -12,6 +12,7 @@ pub mod council;
 pub mod grill;
 pub mod meat;
 pub mod mustard;
+pub mod onion;
 pub mod reconstruction;
 pub mod relish;
 pub mod reporting;

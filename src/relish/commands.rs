@@ -332,6 +332,40 @@ fn print_council_human(council: &CouncilStatus) {
     }
 }
 
+/// Resolve a service name to its VIP and backends.
+pub async fn resolve(name: &str) -> Result<(), RelishError> {
+    resolve_with_client(name, &BunClient::default_local()).await
+}
+
+async fn resolve_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
+    let info = client.resolve(name).await?;
+
+    println!("Service:  {}", info.app_name);
+    println!("VIP:      {}", info.vip);
+    println!("Port:     {}", info.port);
+    println!(
+        "Backends: {}/{} healthy",
+        info.healthy_backends, info.total_backends
+    );
+
+    if !info.backends.is_empty() {
+        println!();
+        println!(
+            "  {:<20} {:<18} {:<8} {:<8}",
+            "INSTANCE", "NODE", "PORT", "HEALTH"
+        );
+        for b in &info.backends {
+            let health = if b.healthy { "healthy" } else { "unhealthy" };
+            println!(
+                "  {:<20} {:<18} {:<8} {:<8}",
+                b.instance_id, b.node_ip, b.host_port, health
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

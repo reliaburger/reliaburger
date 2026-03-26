@@ -120,6 +120,15 @@ pub enum AgentCommand {
     ChaosStatus {
         response: oneshot::Sender<ChaosState>,
     },
+    /// Resolve a service name to its VIP and backends.
+    Resolve {
+        app_name: String,
+        response: oneshot::Sender<Option<crate::onion::types::ResolveResponse>>,
+    },
+    /// List all registered services.
+    ResolveAll {
+        response: oneshot::Sender<Vec<crate::onion::types::ResolveResponse>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -242,6 +251,8 @@ pub struct BunAgent<G: Grill> {
     cluster: Option<ClusterHandle>,
     /// Active chaos partition (peers + expiry).
     chaos_partition: Option<(Vec<String>, Instant)>,
+    /// Onion service map: app names → VIPs + backends.
+    service_map: crate::onion::service_map::ServiceMap,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -259,6 +270,7 @@ impl<G: Grill> BunAgent<G> {
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             chaos_partition: None,
+            service_map: crate::onion::service_map::ServiceMap::new(),
         }
     }
 
@@ -277,6 +289,7 @@ impl<G: Grill> BunAgent<G> {
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             chaos_partition: None,
+            service_map: crate::onion::service_map::ServiceMap::new(),
         }
     }
 
@@ -513,6 +526,22 @@ impl<G: Grill> BunAgent<G> {
             AgentCommand::ChaosStatus { response } => {
                 let state = self.get_chaos_state();
                 let _ = response.send(state);
+            }
+            AgentCommand::Resolve { app_name, response } => {
+                let result = self
+                    .service_map
+                    .resolve(&app_name)
+                    .map(|e| e.to_resolve_response());
+                let _ = response.send(result);
+            }
+            AgentCommand::ResolveAll { response } => {
+                let results = self
+                    .service_map
+                    .resolve_all()
+                    .iter()
+                    .map(|e| e.to_resolve_response())
+                    .collect();
+                let _ = response.send(results);
             }
         }
     }

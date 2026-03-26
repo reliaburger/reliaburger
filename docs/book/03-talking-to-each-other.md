@@ -262,6 +262,140 @@ fn five_hundred_containers_fit() {
 
 This pattern — test the logic, gate the I/O — means `cargo test` stays fast on any developer's machine, while the full suite runs in a privileged CI environment.
 
-<!-- TODO(Phase 3): Onion eBPF service discovery section -->
+## Onion: Service Discovery Without Servers
+
+### The problem
+
+Every container has its own IP now. But when your web frontend needs to reach Redis, it can't hardcode `10.0.2.5:30891`. That IP changes every time Redis restarts, every time the scheduler moves it to a different node. You need a name: `redis.internal`. Something that always resolves to wherever Redis is currently running.
+
+Kubernetes solves this with CoreDNS (a real DNS server) and kube-proxy (iptables rules or IPVS for load balancing). That's three moving parts: a DNS server to operate, a proxy to configure, and a pile of iptables rules that grow linearly with the number of services. CoreDNS alone consumes 170MB of RAM in a default cluster. And if kube-proxy falls behind on rule updates, you get stale routing.
+
+We're going to do something different. We'll intercept DNS and connections at the socket level using eBPF, before any packets are created. No DNS server process. No proxy in the data path. No iptables rules. The eBPF programs live in the kernel, so they survive Bun crashes — running applications keep connecting to backends even if the orchestrator is temporarily down.
+
+### How it works: the 30-second version
+
+Two eBPF programs, two steps:
+
+1. Your app calls `getaddrinfo("redis.internal")`. The C library constructs a DNS query. Our eBPF program intercepts it *in the kernel*, looks up the name in a hash map, and injects a fake DNS response with a virtual IP: `127.128.0.3`. No DNS packet ever leaves the node.
+
+2. Your app calls `connect(127.128.0.3, 6379)`. A second eBPF program intercepts the `connect()` syscall, looks up the VIP in another hash map, picks a healthy backend via round-robin, and rewrites the destination to `10.0.2.5:30891`. Your app's TCP connection goes directly to the backend. No proxy.
+
+Total added latency: zero. The rewrites happen before the kernel sends any packets. Your app sees a normal TCP connection that just happens to land on the right backend.
+
+### Virtual IPs
+
+Each service gets a virtual IP from the `127.128.0.0/16` range. This lives within the loopback block (`127.0.0.0/8`), so it never conflicts with real network addresses. No packets with these addresses ever leave the node — the `connect()` hook rewrites them before the kernel acts on them.
+
+The VIP is derived deterministically from the app name using SipHash:
+
+```rust
+pub struct VirtualIP(pub Ipv4Addr);
+
+impl VirtualIP {
+    pub fn from_app_name(name: &str) -> Self {
+        let mut hasher = SipHasher24::new_with_keys(
+            0xDEAD_BEEF_CAFE_F00D,
+            0xBAAD_F00D_DEAD_BEEF,
+        );
+        name.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let offset = (hash % 65534) as u32 + 1;
+        let ip = 0x7F80_0000u32 | (offset & 0xFFFF);
+        VirtualIP(Ipv4Addr::from(ip))
+    }
+}
+```
+
+Same name, same VIP, every time, on every node. No coordination needed. SipHash is a keyed hash function (the `new_with_keys` call) originally designed for hash table collision resistance. We use it here because it distributes names evenly across the 65,534 available addresses with very low collision probability. It's not cryptographic, but it doesn't need to be — we just need a good spread.
+
+The `0xDEAD_BEEF_CAFE_F00D` and `0xBAAD_F00D_DEAD_BEEF` keys are fixed seeds. They're arbitrary constants, but using the same ones on every node is what makes the VIP deterministic cluster-wide.
+
+### The service map
+
+Before we get to the eBPF programs, we need the data model they operate on. The `ServiceMap` is Bun's userspace record of which services exist, what their VIPs are, and where their backends live:
+
+```rust
+pub struct ServiceMap {
+    entries: HashMap<String, ServiceEntry>,
+}
+
+pub struct ServiceEntry {
+    pub app_name: String,
+    pub namespace: String,
+    pub vip: VirtualIP,
+    pub port: u16,
+    pub backends: Vec<BackendInstance>,
+    pub firewall_allow_from: Option<Vec<String>>,
+}
+
+pub struct BackendInstance {
+    pub instance_id: String,
+    pub node_ip: Ipv4Addr,
+    pub host_port: u16,
+    pub healthy: bool,
+}
+```
+
+When Bun deploys an app with a port, it calls `service_map.register_app("redis", "default", 6379, None)`. That computes the VIP and creates an entry with an empty backend list. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister_app()` removes everything.
+
+On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in the kernel. On macOS and for ProcessGrill, the map still works — it powers `relish resolve` — but there are no eBPF programs reading it.
+
+### The BPF maps
+
+The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps (plus a supplementary one for namespace isolation):
+
+**`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string (`redis.internal`), value is a 4-byte IPv4 address in network byte order. When the DNS interception program sees a `.internal` query, it looks up this map.
+
+**`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend.
+
+**`firewall_map`**: Maps `(source_cgroup_id, destination_app_id)` to allow/deny. This is how we enforce namespace isolation and per-app firewall rules at the connection level.
+
+All three are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
+
+```rust
+#[repr(C)]
+pub struct BackendKey {
+    pub vip: u32,     // network byte order
+    pub port: u16,    // network byte order
+    pub _pad: u16,
+}
+
+#[repr(C)]
+pub struct BackendEndpoint {
+    pub host_ip: u32,    // network byte order
+    pub host_port: u16,  // network byte order
+    pub healthy: u8,     // 1 or 0
+    pub _pad: u8,
+}
+```
+
+The `#[repr(C)]` attribute tells Rust to lay out the struct's fields in declaration order with C-compatible alignment and padding. Without it, Rust is free to reorder fields for efficiency, which would break the BPF program's assumptions about where each field lives in memory. The `_pad` fields make the alignment explicit rather than leaving it to the compiler.
+
+### `relish resolve`: debugging service discovery
+
+You can query the service map from the CLI:
+
+```
+$ relish resolve redis
+Service:  redis
+VIP:      127.128.0.3
+Port:     6379
+Backends: 2/2 healthy
+
+  INSTANCE             NODE               PORT     HEALTH
+  redis-0              10.0.2.2           30891    healthy
+  redis-1              10.0.4.2           31022    healthy
+```
+
+This calls the Bun agent's `/v1/resolve/{name}` endpoint, which reads from the userspace `ServiceMap`. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+
+### UDP only: a deliberate limitation
+
+Our DNS interception only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) bypasses Onion entirely and goes to the upstream resolver.
+
+This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
+
+<!-- TODO(Phase 3): eBPF programs section (DNS interception + connect rewrite) -->
 <!-- TODO(Phase 3): Wrapper ingress proxy section -->
 <!-- TODO(Phase 3): nftables perimeter firewall section -->
