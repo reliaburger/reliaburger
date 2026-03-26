@@ -509,8 +509,16 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
     })?;
     let repo_path = repo_dir.to_string_lossy();
 
+    // Use a VM-local target directory to avoid virtiofs overhead.
+    // The host-mounted repo has thousands of small files in target/
+    // that are very slow over the filesystem bridge. A native ext4
+    // target dir makes incremental builds 5-10x faster.
+    let vm_target = format!("/tmp/reliaburger-target{}", repo_path.replace('/', "-"));
+
     let mut test_cmd = format!(
         "cd {repo_path} && source $HOME/.cargo/env && \
+         mkdir -p {vm_target} && \
+         CARGO_TARGET_DIR={vm_target} \
          RELIABURGER_RUNC_TESTS=1 \
          RELIABURGER_NETNS_TESTS=1 \
          RELIABURGER_EBPF_TESTS=1 \
