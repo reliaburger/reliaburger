@@ -14,7 +14,7 @@ pub struct OnionEbpf {
     #[cfg(feature = "ebpf")]
     _connect_link_id: aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId,
     #[cfg(feature = "ebpf")]
-    pub(super) bpf: aya::Ebpf,
+    pub bpf: aya::Ebpf,
     attached: bool,
 }
 

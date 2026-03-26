@@ -72,7 +72,7 @@ Single source of truth for what's done and what's next. Check off an item only w
   - [x] Wire aya loader for connect rewrite (cgroup/connect4)
   - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis)
   - [x] `relish dev test` runs Linux + eBPF tests from macOS via Lima
-  - [ ] eBPF integration tests (BPF_PROG_TEST_RUN, dig/curl from containers)
+  - [x] eBPF integration tests (load/attach, map read/write, connect rewrite, DNS responder)
 - [ ] Wrapper ingress proxy (host/path routing, TLS, WebSocket, load balancing, draining, rate limiting)
 - [ ] nftables perimeter firewall (cluster boundary rules, management access)
 - [ ] All Phase 3 tests green

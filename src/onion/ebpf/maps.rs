@@ -117,6 +117,30 @@ impl BpfServiceMap {
         let _ = backend_map.remove(&key);
     }
 
+    /// Read a backend entry from the BPF map.
+    #[cfg(feature = "ebpf")]
+    pub fn read_backends(
+        &self,
+        ebpf: &mut super::loader::OnionEbpf,
+        vip: VirtualIP,
+        port: u16,
+    ) -> Option<BackendValue> {
+        use aya::maps::HashMap;
+
+        let Ok(backend_map): Result<HashMap<_, BackendKey, BackendValue>, _> =
+            HashMap::try_from(ebpf.bpf.map_mut("backend_map").unwrap())
+        else {
+            return None;
+        };
+
+        let key = BackendKey {
+            vip: vip.to_network_byte_order(),
+            port: port.to_be(),
+            _pad: 0,
+        };
+        backend_map.get(&key, 0).ok()
+    }
+
     /// Whether the BPF maps have been initialised.
     pub fn is_initialised(&self) -> bool {
         self.initialised
