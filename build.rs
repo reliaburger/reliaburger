@@ -25,15 +25,32 @@ fn compile_ebpf() {
 
         println!("cargo:rerun-if-changed={}", src.display());
 
+        // Detect the host architecture for kernel header include path
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".to_string());
+        let linux_arch = match arch.as_str() {
+            "x86_64" => "x86",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let asm_include = format!(
+            "/usr/include/{}-linux-gnu",
+            match arch.as_str() {
+                "x86_64" => "x86_64",
+                "aarch64" => "aarch64",
+                other => other,
+            }
+        );
+
         let status = Command::new("clang")
             .args([
                 "-O2",
                 "-target",
                 "bpf",
                 "-g",
-                "-D__TARGET_ARCH_x86",
+                &format!("-D__TARGET_ARCH_{linux_arch}"),
                 "-I/usr/include",
                 "-I/usr/include/bpf",
+                &format!("-I{asm_include}"),
                 "-c",
             ])
             .arg(&src)
