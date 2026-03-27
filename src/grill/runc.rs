@@ -345,16 +345,20 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("state");
+        // Use rootless=true to skip per-container networking setup,
+        // which needs real network namespace permissions. This test
+        // is about verifying the runc CLI interaction, not networking.
         let grill = RuncGrill::new(
             tmp.path().join("bundles"),
             ImageStore::new(tmp.path().join("images")),
-            false,
+            true,
             state_dir,
         );
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
             root: crate::grill::oci::OciRoot {
-                path: "rootfs".to_string(),
+                // Use a path (not an image ref) to skip the image pull step
+                path: "./rootfs".to_string(),
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
@@ -373,8 +377,8 @@ mod tests {
             },
         };
 
-        // This will fail without runc installed, which is expected
-        // when tests are not enabled
+        // runc create will fail (no real rootfs), but the bundle dir
+        // and config.json should still be written before the runc call.
         let result = grill.create(&id, &spec).await;
         // The bundle dir should exist regardless
         assert!(tmp.path().join("bundles/runc-test-0").exists());

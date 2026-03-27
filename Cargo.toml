@@ -39,12 +39,21 @@ oci-distribution = { version = "0.11", default-features = false, features = ["ru
 flate2 = "1"
 tar = "0.4"
 sha2 = "0.10"
+siphasher = "1"
 hex = "0.4"
 dirs = "6"
 tokio-stream = "0.1"
 futures-util = "0.3"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.13", optional = true }
+aya-log = { version = "0.2", optional = true }
+
+[features]
+default = []
+ebpf = ["aya", "aya-log"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

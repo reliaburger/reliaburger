@@ -262,6 +262,292 @@ fn five_hundred_containers_fit() {
 
 This pattern — test the logic, gate the I/O — means `cargo test` stays fast on any developer's machine, while the full suite runs in a privileged CI environment.
 
-<!-- TODO(Phase 3): Onion eBPF service discovery section -->
+## Onion: Service Discovery Without Servers
+
+### The problem
+
+Every container has its own IP now. But when your web frontend needs to reach Redis, it can't hardcode `10.0.2.5:30891`. That IP changes every time Redis restarts, every time the scheduler moves it to a different node. You need a name: `redis.internal`. Something that always resolves to wherever Redis is currently running.
+
+Kubernetes solves this with CoreDNS (a real DNS server) and kube-proxy (iptables rules or IPVS for load balancing). That's three moving parts: a DNS server to operate, a proxy to configure, and a pile of iptables rules that grow linearly with the number of services. CoreDNS alone consumes 170MB of RAM in a default cluster. And if kube-proxy falls behind on rule updates, you get stale routing.
+
+We're going to do something different. DNS resolution goes through a tiny UDP responder built into Bun — no separate CoreDNS to operate. And connections to backends are rewritten at the socket level by an eBPF program, before any packets are created. No proxy in the data path. No iptables rules. The eBPF connect hook lives in the kernel, so running connections survive even if Bun crashes.
+
+### How it works: the 30-second version
+
+Two steps, one in userspace, one in the kernel:
+
+1. Your app calls `getaddrinfo("redis.internal")`. The C library sends a DNS query to `127.0.0.53:53` — a tiny UDP server built into Bun. Bun looks up "redis" in the service map and responds with a virtual IP: `127.128.0.3`. The query never leaves localhost. Takes about 50 microseconds.
+
+2. Your app calls `connect(127.128.0.3, 6379)`. An eBPF program intercepts the `connect()` syscall *before the kernel sends any packets*, looks up the VIP in a hash map, picks a healthy backend via round-robin, and rewrites the destination to `10.0.2.5:30891`. Your app's TCP connection goes directly to the backend. No proxy.
+
+The DNS lookup adds ~50 microseconds (one localhost UDP round trip). The connect rewrite adds zero — it happens before the TCP handshake. Compare that to CoreDNS over the pod network (~500 microseconds) plus kube-proxy iptables traversal. Your app sees a normal TCP connection that just happens to land on the right backend.
+
+### Virtual IPs
+
+Each service gets a virtual IP from the `127.128.0.0/16` range. This lives within the loopback block (`127.0.0.0/8`), so it never conflicts with real network addresses. No packets with these addresses ever leave the node — the `connect()` hook rewrites them before the kernel acts on them.
+
+The VIP is derived deterministically from the app name using SipHash:
+
+```rust
+pub struct VirtualIP(pub Ipv4Addr);
+
+impl VirtualIP {
+    pub fn from_app_name(name: &str) -> Self {
+        let mut hasher = SipHasher24::new_with_keys(
+            0xDEAD_BEEF_CAFE_F00D,
+            0xBAAD_F00D_DEAD_BEEF,
+        );
+        name.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let offset = (hash % 65534) as u32 + 1;
+        let ip = 0x7F80_0000u32 | (offset & 0xFFFF);
+        VirtualIP(Ipv4Addr::from(ip))
+    }
+}
+```
+
+Same name, same VIP, every time, on every node. No coordination needed. SipHash is a keyed hash function (the `new_with_keys` call) originally designed for hash table collision resistance. We use it here because it distributes names evenly across the 65,534 available addresses with very low collision probability. It's not cryptographic, but it doesn't need to be — we just need a good spread.
+
+The `0xDEAD_BEEF_CAFE_F00D` and `0xBAAD_F00D_DEAD_BEEF` keys are fixed seeds. They're arbitrary constants, but using the same ones on every node is what makes the VIP deterministic cluster-wide.
+
+### The service map
+
+Before we get to the eBPF programs, we need the data model they operate on. The `ServiceMap` is Bun's userspace record of which services exist, what their VIPs are, and where their backends live:
+
+```rust
+pub struct ServiceMap {
+    entries: HashMap<String, ServiceEntry>,
+}
+
+pub struct ServiceEntry {
+    pub app_name: String,
+    pub namespace: String,
+    pub vip: VirtualIP,
+    pub port: u16,
+    pub backends: Vec<BackendInstance>,
+    pub firewall_allow_from: Option<Vec<String>>,
+}
+
+pub struct BackendInstance {
+    pub instance_id: String,
+    pub node_ip: Ipv4Addr,
+    pub host_port: u16,
+    pub healthy: bool,
+}
+```
+
+When Bun deploys an app with a port, it calls `service_map.register_app("redis", "default", 6379, None)`. That computes the VIP and creates an entry with an empty backend list. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister_app()` removes everything.
+
+On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in the kernel. On macOS and for ProcessGrill, the map still works — it powers `relish resolve` — but there are no eBPF programs reading it.
+
+### The BPF maps
+
+The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps (plus a supplementary one for namespace isolation):
+
+**`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string (`redis.internal`), value is a 4-byte IPv4 address in network byte order. When the DNS interception program sees a `.internal` query, it looks up this map.
+
+**`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend.
+
+**`firewall_map`**: Maps `(source_cgroup_id, destination_app_id)` to allow/deny. This is how we enforce namespace isolation and per-app firewall rules at the connection level.
+
+All three are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
+
+```rust
+#[repr(C)]
+pub struct BackendKey {
+    pub vip: u32,     // network byte order
+    pub port: u16,    // network byte order
+    pub _pad: u16,
+}
+
+#[repr(C)]
+pub struct BackendEndpoint {
+    pub host_ip: u32,    // network byte order
+    pub host_port: u16,  // network byte order
+    pub healthy: u8,     // 1 or 0
+    pub _pad: u8,
+}
+```
+
+The `#[repr(C)]` attribute tells Rust to lay out the struct's fields in declaration order with C-compatible alignment and padding. Without it, Rust is free to reorder fields for efficiency, which would break the BPF program's assumptions about where each field lives in memory. The `_pad` fields make the alignment explicit rather than leaving it to the compiler.
+
+### `relish resolve`: debugging service discovery
+
+You can query the service map from the CLI:
+
+```
+$ relish resolve redis
+Service:  redis
+VIP:      127.128.0.3
+Port:     6379
+Backends: 2/2 healthy
+
+  INSTANCE             NODE               PORT     HEALTH
+  redis-0              10.0.2.2           30891    healthy
+  redis-1              10.0.4.2           31022    healthy
+```
+
+This calls the Bun agent's `/v1/resolve/{name}` endpoint, which reads from the userspace `ServiceMap`. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+
+### Wiring the service map into the agent
+
+The service map needs to stay in sync with reality. Four events matter:
+
+**Deploy.** When `deploy()` processes an app with a port, it registers the service immediately — before any instances start. This creates the `ServiceEntry` with the VIP and an empty backend list. The VIP is available for DNS resolution straight away, even though there are no backends yet. A `connect()` at this point gets `ECONNREFUSED`, which is the correct answer: the service exists but isn't ready.
+
+**Instance startup.** When `drive_instance_startup()` transitions an instance to Running (or HealthWait with no health checks), it calls `add_backend()` with the instance's real IP and host port. This is when the service actually becomes reachable. If the container has network isolation, we use its `container_ip`. For ProcessGrill on macOS, we fall back to `127.0.0.1`.
+
+**Health transition.** The health check loop already calls `process_health_result()` and handles Running→Unhealthy and Unhealthy→Running transitions. We hook into the same spot: when the transition fires, we call `set_backend_health()` on the service map. The eBPF connect hook reads the `healthy` flag and skips unhealthy backends during round-robin selection. So a failing health check removes a backend from rotation without touching any iptables rules or proxy configuration. One byte flip in a BPF hash map, and the backend is out.
+
+**Stop.** When `stop_app()` shuts down an app, we remove each instance from the backend list and then unregister the service entirely. After this, DNS queries for the name return nothing (pass through to upstream), and `connect()` calls to the now-stale VIP get `ECONNREFUSED`.
+
+The ordering matters. We register the service *before* starting instances so that the DNS name resolves as early as possible. We unregister *after* stopping so that in-flight connections can drain. And we update health synchronously in the event loop so there's no window where the map disagrees with reality.
+
+### How gossip keeps the service map consistent
+
+Everything above describes what happens on a single node. But a 10-node cluster has 10 service maps, and they all need to agree. When the scheduler places `redis-0` on node A, node B needs to know about it too — otherwise `curl redis.internal` from a container on node B goes nowhere.
+
+This is where the reporting tree from Chapter 2 comes back. Remember the hierarchy: worker nodes report to their assigned council member every 5 seconds, council members aggregate for the leader, and the leader pushes scheduling decisions back down. When the leader tells node A to run `redis-0`, node A starts the container, and the state change propagates through the reporting tree to every other node's Bun agent. Each agent updates its own service map and (on Linux) writes the corresponding BPF map entries.
+
+Gossip plays a different role. Mustard doesn't carry service map data directly — that would be too much traffic for O(log N) convergence with piggybacked updates. Instead, gossip handles *failure detection*. When node A crashes, Mustard marks it as Dead within a few probe cycles (typically 2-5 seconds depending on cluster size). Every Bun agent that receives the Dead notification can then scrub node A's backends from its service map. The backends were already unreachable — the crash took them down — but scrubbing the map means new connections stop trying.
+
+So the data flow is:
+
+1. **Scheduling decisions** flow through the reporting tree (Raft → council → workers). This is how backend entries get *added*.
+2. **Failure detection** flows through gossip (Mustard SWIM protocol). This is how backend entries get *removed* when a node dies.
+3. **Health check results** are local to each node's Bun agent. They flip the `healthy` flag for backends running on that node.
+
+Can you see why we need both? The reporting tree is accurate but slow — bounded by the 5-second reporting interval. Gossip is fast but coarse — it knows a node is dead, not which specific instance failed. Health checks are precise but local — they know exactly which instance is unhealthy, but only for instances running on the same node. Together, they cover all the failure modes: planned shutdowns (reporting tree), node crashes (gossip), and application bugs (health checks).
+
+There's a subtlety worth noting. During a network partition, a node might be marked Dead by gossip even though it's still running containers. If those containers are serving traffic to local clients (same-node connections don't go through the network), they'll keep working fine. The service map on the partitioned node still has the local backends. Only cross-node connections are affected, which is exactly what you'd expect from a partition. When the partition heals, Mustard's incarnation counter mechanism (remember that from Chapter 2?) ensures the node rejoins cleanly and its backends reappear in everyone's service maps.
+
+### Why userspace DNS, not eBPF?
+
+The original design called for fully in-kernel DNS interception using `cgroup/sendmsg4` and `cgroup/recvmsg4` eBPF hooks. We tried it. It doesn't work.
+
+The problem is that these hooks let you modify the *destination address* of a UDP sendmsg, but they can't read the *packet payload*. You can redirect where a DNS query goes, but you can't parse the query name or synthesise a response. The BPF helper you'd need (`bpf_msg_pull_data`) only works with `SK_MSG` programs (stream parsers for TCP), not cgroup socket address hooks.
+
+So we run a userspace DNS responder instead. It's about 80 lines of code in `src/onion/dns.rs`: one `tokio::select!` loop reading from a UDP socket. Bun configures containers' `/etc/resolv.conf` to point at `127.0.0.53`, and the responder handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
+
+The cost is ~50 microseconds per DNS lookup (localhost UDP round trip). That's 10x faster than CoreDNS over the pod network, but it's not zero. Most applications cache DNS results anyway, so this hit happens once per connection lifetime, not per request.
+
+The connect rewrite — the part that actually matters for latency — is still fully in-kernel eBPF. Once your app has the VIP from DNS, every `connect()` call is rewritten at zero cost.
+
+### UDP only: a deliberate limitation
+
+The DNS responder only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) goes to the upstream resolver, which doesn't know about `.internal` names.
+
+This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
+
+### Testing service discovery
+
+How do you test code that runs in the kernel? Two approaches, at different levels of fidelity.
+
+**Unit tests on the data model.** The `ServiceMap`, `VirtualIP`, and `#[repr(C)]` types are pure Rust. We test them normally — register a service, add backends, verify resolve returns the right data. These run on any platform, no kernel required:
+
+```rust
+#[test]
+fn register_and_resolve() {
+    let mut map = ServiceMap::new();
+    let vip = map.register_app("redis", "default", 6379, None).unwrap();
+    let entry = map.resolve("redis").unwrap();
+    assert_eq!(entry.vip, vip);
+    assert!(entry.backends.is_empty());
+}
+```
+
+**Integration tests through the agent.** We spin up a real `BunAgent` with `ProcessGrill`, deploy an app via the HTTP API, and then call `/v1/resolve/{name}` to verify the service map was populated correctly. These tests exercise the full deploy → register → add_backend → resolve flow without touching eBPF:
+
+```rust
+#[tokio::test]
+async fn deploy_app_with_port_registers_in_service_map() {
+    let harness = TestHarness::start().await;
+    harness.client.apply(&app_with_port_config()).await.unwrap();
+
+    let info = harness.client.resolve("redis").await.unwrap();
+    assert_eq!(info.app_name, "redis");
+    assert_eq!(info.port, 6379);
+}
+```
+
+The `stop_app_removes_from_service_map` test verifies the other end: deploy, resolve succeeds, stop, resolve returns 404. And `vip_is_deterministic_across_agents` deploys the same app on two independent agents and verifies they assign identical VIPs — proving the deterministic hash works without any coordination.
+
+**eBPF program tests** (Linux only, gated behind `RELIABURGER_EBPF_TESTS=1`) load real eBPF programs into a real kernel and verify the connect rewrite actually happens. This is the test that matters most:
+
+```rust
+#[tokio::test]
+async fn ebpf_connect_to_vip_rewrites_destination() {
+    let mut ebpf = OnionEbpf::load(&obj_dir, "/sys/fs/cgroup".as_ref()).unwrap();
+
+    // Start a TCP listener — this is our "backend"
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+
+    // Tell the BPF map: VIP 127.128.x.y:9999 → 127.0.0.1:{backend_port}
+    let vip = VirtualIP::from_app_name("test-service");
+    // ... populate service map and sync to BPF ...
+
+    // Connect to the VIP. If this succeeds, the kernel rewrote the address.
+    let vip_addr = SocketAddr::new(vip.0.into(), 9999);
+    let stream = TcpStream::connect_timeout(&vip_addr, Duration::from_secs(2));
+    assert!(stream.is_ok());  // The eBPF program did its job
+}
+```
+
+The application connects to `127.128.x.y:9999`, an address that doesn't exist anywhere. But the eBPF `connect4` hook intercepts the syscall, looks up the VIP in the `backend_map`, finds our listener at `127.0.0.1:{backend_port}`, and rewrites the destination before the TCP handshake starts. The connection succeeds. If the eBPF program weren't attached, you'd get `ECONNREFUSED` (nobody's listening on that VIP).
+
+We also test the failure cases: connecting to a VIP with no backends returns `EPERM` (the BPF hook returns 0 to deny the syscall), and connecting to a non-VIP address passes through untouched.
+
+One surprise: returning 0 from a `cgroup/connect4` hook gives `EPERM`, not `ECONNREFUSED`. The kernel interprets "BPF program returned 0" as "permission denied", not "connection refused". It's a subtle distinction that only matters if your application distinguishes between the two error codes. Most don't.
+
+### Running Linux tests from a MacBook
+
+Here's a problem we hit early: most of the interesting tests need Linux. Network namespaces, veth pairs, runc containers, eBPF programs — none of these exist on macOS. You could push to CI and wait, but that's a slow feedback loop when you're debugging a failing test.
+
+Our solution: `relish dev test`. One command that runs all the Linux-gated tests inside a Lima VM on your Mac. If you've been following along, you already have the `relish` binary — it's `cargo run --bin relish` or just `relish` if you've added `target/debug` to your PATH.
+
+```
+$ relish dev test              # run everything
+$ relish dev test netns        # just the netns tests
+$ relish dev test onion        # just the onion tests
+```
+
+The first run takes a couple of minutes — it downloads an Ubuntu VM image, installs Rust, runc, slirp4netns, and clang. After that, the VM persists on disk. Subsequent runs go straight to `cargo test`.
+
+The trick is that Lima mounts your home directory into the VM with read-write access. The repo isn't copied — it's the same files. When you edit code on your Mac and run `relish dev test`, the VM compiles your latest changes. The cargo cache and target directory also persist inside the VM, so incremental builds are fast.
+
+Under the hood, `relish dev test` does three things:
+
+1. Creates a Lima VM named `reliaburger-test` if it doesn't exist (4 CPUs, 4GB RAM, Ubuntu Noble).
+2. Starts the VM if it's stopped.
+3. Runs `limactl shell reliaburger-test bash -c "cd /path/to/repo && cargo test"` with the Linux test env vars set (`RELIABURGER_RUNC_TESTS=1`, `RELIABURGER_NETNS_TESTS=1`).
+
+The VM provisioning script installs everything the tests need:
+
+```yaml
+provision:
+  - mode: system
+    script: |
+      apt-get install -y runc uidmap slirp4netns curl build-essential pkg-config libssl-dev clang llvm
+  - mode: user
+    script: |
+      curl https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+```
+
+This is the same idea as `relish dev create` for dev clusters, but focused on testing rather than running a cluster. You don't need three VMs to run `cargo test` — one is enough.
+
+Why not Docker? Two reasons. First, building Rust inside a Docker container on macOS means either bind-mounting the target directory (slow due to virtiofs overhead for the thousands of small files in a Rust build) or keeping it inside the container (losing it on every rebuild). Lima's VM mount is faster because the VM runs a real Linux kernel with a real filesystem. Second, we need to test network namespaces and cgroup operations, which require privileges that Docker-in-Docker handles poorly.
+
+### What we built
+
+Let's step back and see what Onion gives us.
+
+A container calls `getaddrinfo("redis.internal")`. Bun's built-in DNS responder looks up the service map and responds with a virtual IP — one localhost UDP round trip, about 50 microseconds. The container calls `connect()` with that VIP. An eBPF program intercepts the syscall, picks a healthy backend via round-robin from a kernel hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No proxy in the data path, no iptables rules.
+
+Kubernetes needs CoreDNS (a separate Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need a single binary with a built-in DNS responder, one eBPF program, and a hash map. The eBPF connect hook persists in the kernel — if Bun crashes, running connections keep working. DNS resolution pauses (since Bun runs the responder), but that only affects new connections. Existing TCP sessions are fine.
+
+We originally planned to do DNS entirely in-kernel too. It turned out the BPF hooks we needed can't read DNS packet payloads. So we went with the pragmatic approach: userspace DNS at 50 microseconds, in-kernel connect rewrite at zero. Pragmatism over purity. The 50 microsecond DNS hit is invisible to any real application, and it saved us from fighting kernel limitations that would have taken weeks to work around (if they're even solvable with current BPF).
+
 <!-- TODO(Phase 3): Wrapper ingress proxy section -->
 <!-- TODO(Phase 3): nftables perimeter firewall section -->

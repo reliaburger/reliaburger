@@ -9,7 +9,7 @@ use reliaburger::config::app::{AppSpec, PlacementSpec};
 use reliaburger::config::types::{Replicas, ResourceRange};
 use reliaburger::meat::cluster_state::{ClusterStateCache, SchedulerNodeState};
 use reliaburger::meat::quota::{NamespaceQuota, NamespaceUsage, QuotaError, check_quota};
-use reliaburger::meat::scheduler::{ScheduleError, Scheduler};
+use reliaburger::meat::scheduler::Scheduler;
 use reliaburger::meat::types::{AppId, NodeId, Resources};
 
 fn default_spec() -> AppSpec {

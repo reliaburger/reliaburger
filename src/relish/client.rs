@@ -431,4 +431,43 @@ impl BunClient {
         })?;
         Ok(state)
     }
+
+    /// Resolve a service name to its VIP and backends.
+    pub async fn resolve(
+        &self,
+        name: &str,
+    ) -> Result<crate::onion::types::ResolveResponse, RelishError> {
+        let url = format!("{}/v1/resolve/{name}", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse resolve response: {e}"),
+        })
+    }
+
+    /// List all registered services.
+    pub async fn resolve_all(
+        &self,
+    ) -> Result<Vec<crate::onion::types::ResolveResponse>, RelishError> {
+        let url = format!("{}/v1/resolve", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse resolve response: {e}"),
+        })
+    }
 }

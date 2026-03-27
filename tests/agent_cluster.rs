@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use reliaburger::bun::agent::{AgentCommand, BunAgent, ClusterHandle, NodeStatus};
+use reliaburger::bun::agent::{AgentCommand, BunAgent, ClusterHandle};
 use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
 use reliaburger::council::node::CouncilNode;
