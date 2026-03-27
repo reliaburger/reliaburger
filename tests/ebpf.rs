@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::onion::ebpf::loader::OnionEbpf;
-use reliaburger::onion::ebpf::maps::{BpfServiceMap, service_entry_to_backend_value};
+use reliaburger::onion::ebpf::maps::BpfServiceMap;
 use reliaburger::onion::service_map::ServiceMap;
-use reliaburger::onion::types::{BackendInstance, BackendKey};
+use reliaburger::onion::types::BackendInstance;
 use reliaburger::onion::vip::VirtualIP;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
