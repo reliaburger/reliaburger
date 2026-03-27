@@ -191,6 +191,7 @@ fn ip_to_network_byte_order(ip: Ipv4Addr) -> u32 {
 mod tests {
     use super::*;
     use crate::onion::types::{BackendInstance, DnsMapKey, ServiceEntry};
+    use crate::onion::vip::VirtualIP;
 
     fn test_entry() -> ServiceEntry {
         ServiceEntry {
