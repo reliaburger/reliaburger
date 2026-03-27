@@ -5,14 +5,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use tokio_util::sync::CancellationToken;
-
 use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
 use reliaburger::council::node::CouncilNode;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
-use reliaburger::meat::NodeId;
 
 fn fast_config() -> CouncilConfig {
     CouncilConfig {
