@@ -473,7 +473,33 @@ async fn deploy_app_with_port_registers_in_service_map() {
 
 The `stop_app_removes_from_service_map` test verifies the other end: deploy, resolve succeeds, stop, resolve returns 404. And `vip_is_deterministic_across_agents` deploys the same app on two independent agents and verifies they assign identical VIPs — proving the deterministic hash works without any coordination.
 
-**eBPF program tests** (Linux only, gated behind `RELIABURGER_EBPF_TESTS=1`) use `BPF_PROG_TEST_RUN`, a kernel facility that lets you feed synthetic packets through an attached eBPF program and inspect the result. You don't need real containers or DNS servers — you construct the input, run it through the program, and check the output. This is how we'll test DNS interception (feed a `.internal` query, verify the VIP response) and connect rewrite (feed a VIP address, verify the rewrite to a real backend).
+**eBPF program tests** (Linux only, gated behind `RELIABURGER_EBPF_TESTS=1`) load real eBPF programs into a real kernel and verify the connect rewrite actually happens. This is the test that matters most:
+
+```rust
+#[tokio::test]
+async fn ebpf_connect_to_vip_rewrites_destination() {
+    let mut ebpf = OnionEbpf::load(&obj_dir, "/sys/fs/cgroup".as_ref()).unwrap();
+
+    // Start a TCP listener — this is our "backend"
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+
+    // Tell the BPF map: VIP 127.128.x.y:9999 → 127.0.0.1:{backend_port}
+    let vip = VirtualIP::from_app_name("test-service");
+    // ... populate service map and sync to BPF ...
+
+    // Connect to the VIP. If this succeeds, the kernel rewrote the address.
+    let vip_addr = SocketAddr::new(vip.0.into(), 9999);
+    let stream = TcpStream::connect_timeout(&vip_addr, Duration::from_secs(2));
+    assert!(stream.is_ok());  // The eBPF program did its job
+}
+```
+
+The application connects to `127.128.x.y:9999`, an address that doesn't exist anywhere. But the eBPF `connect4` hook intercepts the syscall, looks up the VIP in the `backend_map`, finds our listener at `127.0.0.1:{backend_port}`, and rewrites the destination before the TCP handshake starts. The connection succeeds. If the eBPF program weren't attached, you'd get `ECONNREFUSED` (nobody's listening on that VIP).
+
+We also test the failure cases: connecting to a VIP with no backends returns `EPERM` (the BPF hook returns 0 to deny the syscall), and connecting to a non-VIP address passes through untouched.
+
+One surprise: returning 0 from a `cgroup/connect4` hook gives `EPERM`, not `ECONNREFUSED`. The kernel interprets "BPF program returned 0" as "permission denied", not "connection refused". It's a subtle distinction that only matters if your application distinguishes between the two error codes. Most don't.
 
 ### Running Linux tests from a MacBook
 
