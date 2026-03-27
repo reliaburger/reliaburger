@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 
 use super::super::service_map::ServiceMap;
 use super::super::types::{BackendEndpoint, BackendKey, BackendValue, MAX_BACKENDS};
+#[cfg(feature = "ebpf")]
 use super::super::vip::VirtualIP;
 
 /// Manages BPF map synchronisation from the userspace `ServiceMap`.
