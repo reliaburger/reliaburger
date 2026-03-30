@@ -1,5 +1,6 @@
 /// Types and configuration for the Wrapper ingress proxy.
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,18 +22,28 @@ pub enum WrapperError {
 pub struct WrapperConfig {
     /// HTTP listen port (default: 80).
     pub http_port: u16,
+    /// HTTPS listen port (default: 443).
+    pub https_port: u16,
     /// Maximum concurrent proxy connections (default: 10,000).
     pub max_connections: usize,
     /// Number of tokio worker threads for the proxy runtime (default: 4).
     pub worker_threads: usize,
+    /// Path to a TLS certificate PEM file. If not set, a self-signed
+    /// cert is generated on startup.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to a TLS private key PEM file.
+    pub tls_key_path: Option<PathBuf>,
 }
 
 impl Default for WrapperConfig {
     fn default() -> Self {
         Self {
             http_port: 80,
+            https_port: 443,
             max_connections: 10_000,
             worker_threads: 4,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }

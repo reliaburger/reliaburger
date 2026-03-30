@@ -79,12 +79,12 @@ Single source of truth for what's done and what's next. Check off an item only w
   - [x] Per-client-IP token bucket rate limiting (429 + Retry-After)
   - [x] Connection draining protocol (zero-downtime deploys)
   - [x] Agent wiring (routing table rebuilds on deploy/stop/health, `relish routes` command)
-  - [ ] TLS termination with self-signed certs (Phase 4 adds ACME + Sesame)
+  - [x] TLS termination with self-signed certs (rcgen + rustls, Phase 4 adds ACME + Sesame)
   - [ ] WebSocket upgrade proxying
 - [x] nftables perimeter firewall (cluster boundary rules, management access)
-  - [x] Ruleset generation (ingress ports, cluster node IPs, admin CIDRs, default drop)
+  - [x] Ruleset generation (targeted blocking of Reliaburger ports, policy accept)
   - [x] `apply_ruleset()` via `nft -f` (Linux), no-op on macOS
-  - [ ] Wire into agent (reconcile on gossip membership changes, 30s interval)
+  - [x] Wire into agent (reconcile on gossip membership changes, auto-disabled in rootless mode)
 - [x] All Phase 3 tests green (702 tests)
 
 ## Phase 4: Security

@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the perimeter firewall.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerimeterConfig {
+    /// Whether the firewall is enabled. Defaults to `true` on Linux
+    /// with root, `false` in rootless mode (nftables needs CAP_NET_ADMIN).
+    pub enabled: bool,
     /// Container host port range (dynamically allocated, default: 30000-31000).
     /// External access to these ports is blocked — traffic reaches
     /// containers via Wrapper on the ingress ports instead.
@@ -32,10 +35,22 @@ pub struct PerimeterConfig {
 impl Default for PerimeterConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host_port_range: (30000, 31000),
             cluster_ports: vec![9443, 9444, 9445],
             admin_cidrs: Vec::new(),
             management_port: 9117,
+        }
+    }
+}
+
+impl PerimeterConfig {
+    /// Config for rootless mode: firewall disabled since nftables
+    /// requires CAP_NET_ADMIN which non-root users don't have.
+    pub fn for_rootless() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
         }
     }
 }

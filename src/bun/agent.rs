@@ -261,6 +261,10 @@ pub struct BunAgent<G: Grill> {
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
     ingress_configs: std::collections::HashMap<String, crate::config::app::IngressSpec>,
+    /// Perimeter firewall config. Disabled in rootless mode.
+    perimeter_config: crate::firewall::rules::PerimeterConfig,
+    /// Last known cluster node count for firewall reconciliation.
+    last_firewall_node_count: usize,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -283,6 +287,12 @@ impl<G: Grill> BunAgent<G> {
                 crate::wrapper::routing::RoutingTable::new(),
             )),
             ingress_configs: std::collections::HashMap::new(),
+            // Single-node mode: no nftables needed (no cluster ports to protect)
+            perimeter_config: crate::firewall::rules::PerimeterConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            last_firewall_node_count: 0,
         }
     }
 
@@ -306,6 +316,18 @@ impl<G: Grill> BunAgent<G> {
                 crate::wrapper::routing::RoutingTable::new(),
             )),
             ingress_configs: std::collections::HashMap::new(),
+            #[cfg(target_os = "linux")]
+            perimeter_config: if crate::grill::rootless::is_rootless() {
+                crate::firewall::rules::PerimeterConfig::for_rootless()
+            } else {
+                crate::firewall::rules::PerimeterConfig::default()
+            },
+            #[cfg(not(target_os = "linux"))]
+            perimeter_config: crate::firewall::rules::PerimeterConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            last_firewall_node_count: 0,
         }
     }
 
@@ -330,6 +352,7 @@ impl<G: Grill> BunAgent<G> {
                     self.check_jobs().await;
                     self.drive_pending_restarts().await;
                     self.expire_chaos_partition();
+                    self.reconcile_firewall().await;
                 }
             }
         }
@@ -1224,6 +1247,45 @@ impl<G: Grill> BunAgent<G> {
     async fn rebuild_routing_table(&self) {
         let mut table = self.routing_table.write().await;
         table.rebuild(&self.service_map, &self.ingress_configs);
+    }
+
+    /// Reconcile the perimeter firewall if cluster membership changed.
+    async fn reconcile_firewall(&mut self) {
+        if !self.perimeter_config.enabled {
+            return;
+        }
+
+        // Collect cluster node IPs from gossip membership
+        let cluster_nodes = self.collect_cluster_node_ips();
+        let node_count = cluster_nodes.len();
+
+        // Only regenerate if membership changed
+        if node_count == self.last_firewall_node_count {
+            return;
+        }
+
+        let ruleset =
+            crate::firewall::rules::generate_ruleset(&self.perimeter_config, &cluster_nodes);
+
+        if let Err(e) = crate::firewall::rules::apply_ruleset(&ruleset).await {
+            eprintln!("warning: firewall reconciliation failed: {e}");
+        } else {
+            self.last_firewall_node_count = node_count;
+        }
+    }
+
+    /// Collect cluster node IPs from the gossip membership table.
+    fn collect_cluster_node_ips(&self) -> crate::firewall::rules::ClusterNodes {
+        let mut nodes = crate::firewall::rules::ClusterNodes::new();
+
+        if let Some(ref cluster) = self.cluster {
+            let membership = cluster.membership_rx.borrow();
+            for snapshot in membership.iter() {
+                nodes.insert(snapshot.address.ip());
+            }
+        }
+
+        nodes
     }
 
     /// Get status of all instances.

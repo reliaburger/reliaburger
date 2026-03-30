@@ -11,4 +11,5 @@ pub mod draining;
 pub mod proxy;
 pub mod rate_limit;
 pub mod routing;
+pub mod tls;
 pub mod types;

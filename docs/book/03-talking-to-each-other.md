@@ -663,3 +663,27 @@ fn cluster_nodes_bypass_all_blocks() {
 ```
 
 Applying the rules to the kernel (`nft -f -`) is a separate function that only runs on Linux. The same split we use everywhere: pure logic is cross-platform, I/O is platform-gated.
+
+### Rootless and the firewall
+
+If you're running Bun in rootless mode (no root, user namespaces), the firewall is automatically disabled. nftables needs `CAP_NET_ADMIN`, which non-root users don't have. This is fine for development — single-user dev setups don't need a perimeter firewall. The `PerimeterConfig` has an `enabled` flag that's set to `false` automatically when rootless mode is detected.
+
+You can also disable it manually in `node.toml` for any node that shouldn't apply perimeter rules (e.g., if you're behind an external firewall that handles this).
+
+### TLS: the self-signed stub
+
+Wrapper listens on port 443 with TLS 1.2+ enforced via `rustls` (a memory-safe TLS implementation — no OpenSSL). For Phase 3, we generate a self-signed certificate on startup using `rcgen`:
+
+```rust
+pub fn generate_self_signed_cert()
+-> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), TlsError> {
+    let cert = rcgen::generate_simple_self_signed(
+        vec!["localhost".to_string(), "127.0.0.1".to_string()]
+    )?;
+    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.key_pair.serialize_der())?))
+}
+```
+
+Operators can also provide their own cert and key via config (`tls_cert_path`, `tls_key_path`) for environments where a real certificate is available outside of Reliaburger's control.
+
+Phase 4 replaces this with Sesame, our built-in PKI: ACME for public-facing services (Let's Encrypt integration), or cluster CA for air-gapped environments. The self-signed stub is just enough to get the TLS listener working and the handshake tests passing.

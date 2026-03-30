@@ -46,6 +46,10 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+rustls-pemfile = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", optional = true }
