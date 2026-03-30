@@ -82,6 +82,8 @@ enum Command {
         /// Service name (e.g. "redis").
         name: String,
     },
+    /// Show ingress routing table.
+    Routes,
     /// Run chaos testing scenarios or manage fault injections.
     Chaos {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
@@ -173,6 +175,7 @@ async fn main() -> ExitCode {
             ref addr,
         } => commands::join(token, addr).await,
         Command::Resolve { ref name } => commands::resolve(name).await,
+        Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
         Command::Dev { action } => match &action {
             DevAction::Create {

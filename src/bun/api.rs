@@ -46,6 +46,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/chaos/status", get(chaos_status_handler))
         .route("/v1/resolve", get(resolve_all_handler))
         .route("/v1/resolve/{name}", get(resolve_handler))
+        .route("/v1/routes", get(routes_handler))
         .with_state(state)
 }
 
@@ -586,6 +587,32 @@ async fn resolve_all_handler(State(state): State<ApiState>) -> Response {
 
     match resp_rx.await {
         Ok(entries) => Json(serde_json::json!(entries)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// List all ingress routes.
+async fn routes_handler(State(state): State<ApiState>) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Routes { response: resp_tx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(routes) => Json(serde_json::json!(routes)).into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),

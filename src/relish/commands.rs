@@ -366,6 +366,34 @@ async fn resolve_with_client(name: &str, client: &BunClient) -> Result<(), Relis
     Ok(())
 }
 
+/// Show ingress routing table.
+pub async fn routes() -> Result<(), RelishError> {
+    routes_with_client(&BunClient::default_local()).await
+}
+
+async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
+    let routes = client.routes().await?;
+
+    if routes.is_empty() {
+        println!("no ingress routes configured");
+    } else {
+        println!(
+            "{:<30} {:<10} {:<15} {:<12} {:<6}",
+            "HOST", "PATH", "APP", "BACKENDS", "WS"
+        );
+        for r in &routes {
+            let backends = format!("{}/{}", r.healthy_backends, r.total_backends);
+            let ws = if r.websocket { "yes" } else { "no" };
+            println!(
+                "{:<30} {:<10} {:<15} {:<12} {:<6}",
+                r.host, r.path, r.app_name, backends, ws
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -129,6 +129,10 @@ pub enum AgentCommand {
     ResolveAll {
         response: oneshot::Sender<Vec<crate::onion::types::ResolveResponse>>,
     },
+    /// List all ingress routes.
+    Routes {
+        response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -253,6 +257,14 @@ pub struct BunAgent<G: Grill> {
     chaos_partition: Option<(Vec<String>, Instant)>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
+    routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
+    /// Ingress configs for deployed apps (app_name → IngressSpec).
+    ingress_configs: std::collections::HashMap<String, crate::config::app::IngressSpec>,
+    /// Perimeter firewall config. Disabled in rootless mode.
+    perimeter_config: crate::firewall::rules::PerimeterConfig,
+    /// Last known cluster node count for firewall reconciliation.
+    last_firewall_node_count: usize,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -271,6 +283,16 @@ impl<G: Grill> BunAgent<G> {
             cluster: None,
             chaos_partition: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::wrapper::routing::RoutingTable::new(),
+            )),
+            ingress_configs: std::collections::HashMap::new(),
+            // Single-node mode: no nftables needed (no cluster ports to protect)
+            perimeter_config: crate::firewall::rules::PerimeterConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            last_firewall_node_count: 0,
         }
     }
 
@@ -290,6 +312,22 @@ impl<G: Grill> BunAgent<G> {
             cluster: Some(cluster),
             chaos_partition: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::wrapper::routing::RoutingTable::new(),
+            )),
+            ingress_configs: std::collections::HashMap::new(),
+            #[cfg(target_os = "linux")]
+            perimeter_config: if crate::grill::rootless::is_rootless() {
+                crate::firewall::rules::PerimeterConfig::for_rootless()
+            } else {
+                crate::firewall::rules::PerimeterConfig::default()
+            },
+            #[cfg(not(target_os = "linux"))]
+            perimeter_config: crate::firewall::rules::PerimeterConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            last_firewall_node_count: 0,
         }
     }
 
@@ -314,6 +352,7 @@ impl<G: Grill> BunAgent<G> {
                     self.check_jobs().await;
                     self.drive_pending_restarts().await;
                     self.expire_chaos_partition();
+                    self.reconcile_firewall().await;
                 }
             }
         }
@@ -543,6 +582,10 @@ impl<G: Grill> BunAgent<G> {
                     .collect();
                 let _ = response.send(results);
             }
+            AgentCommand::Routes { response } => {
+                let table = self.routing_table.read().await;
+                let _ = response.send(table.list_routes());
+            }
         }
     }
 
@@ -615,6 +658,12 @@ impl<G: Grill> BunAgent<G> {
                 let _ = self
                     .service_map
                     .register_app(app_name, namespace, port, firewall);
+            }
+
+            // Store ingress config for routing table
+            if let Some(ref ingress) = spec.ingress {
+                self.ingress_configs
+                    .insert(app_name.to_string(), ingress.clone());
             }
 
             // Drive each instance through Pending → Preparing → Starting → HealthWait
@@ -698,6 +747,9 @@ impl<G: Grill> BunAgent<G> {
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
+
+        // Rebuild the routing table now that all instances are started
+        self.rebuild_routing_table().await;
 
         let _ = events
             .send(ApplyEvent::Complete {
@@ -1184,8 +1236,56 @@ impl<G: Grill> BunAgent<G> {
             let _ = self.service_map.remove_backend(app_name, &id.0);
         }
         let _ = self.service_map.unregister_app(app_name);
+        self.ingress_configs.remove(app_name);
+        self.rebuild_routing_table().await;
 
         Ok(())
+    }
+
+    /// Rebuild the Wrapper routing table from the current service map
+    /// and ingress configs.
+    async fn rebuild_routing_table(&self) {
+        let mut table = self.routing_table.write().await;
+        table.rebuild(&self.service_map, &self.ingress_configs);
+    }
+
+    /// Reconcile the perimeter firewall if cluster membership changed.
+    async fn reconcile_firewall(&mut self) {
+        if !self.perimeter_config.enabled {
+            return;
+        }
+
+        // Collect cluster node IPs from gossip membership
+        let cluster_nodes = self.collect_cluster_node_ips();
+        let node_count = cluster_nodes.len();
+
+        // Only regenerate if membership changed
+        if node_count == self.last_firewall_node_count {
+            return;
+        }
+
+        let ruleset =
+            crate::firewall::rules::generate_ruleset(&self.perimeter_config, &cluster_nodes);
+
+        if let Err(e) = crate::firewall::rules::apply_ruleset(&ruleset).await {
+            eprintln!("warning: firewall reconciliation failed: {e}");
+        } else {
+            self.last_firewall_node_count = node_count;
+        }
+    }
+
+    /// Collect cluster node IPs from the gossip membership table.
+    fn collect_cluster_node_ips(&self) -> crate::firewall::rules::ClusterNodes {
+        let mut nodes = crate::firewall::rules::ClusterNodes::new();
+
+        if let Some(ref cluster) = self.cluster {
+            let membership = cluster.membership_rx.borrow();
+            for snapshot in membership.iter() {
+                nodes.insert(snapshot.address.ip());
+            }
+        }
+
+        nodes
     }
 
     /// Get status of all instances.
