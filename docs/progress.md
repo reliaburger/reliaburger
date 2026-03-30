@@ -65,7 +65,14 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 - [x] Per-container network namespaces (veth pairs, port mapping)
   - [ ] Switch port mapping from individual nftables rules to nftables maps for O(1) lookup at scale
-- [ ] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
+- [x] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
+  - [x] Userspace ServiceMap, VirtualIP allocation, `relish resolve` command
+  - [x] Agent lifecycle wiring (deploy/health/stop → service map)
+  - [x] eBPF C programs and Rust loader scaffolding (Linux only)
+  - [x] Wire aya loader for connect rewrite (cgroup/connect4)
+  - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis)
+  - [x] `relish dev test` runs Linux + eBPF tests from macOS via Lima
+  - [x] eBPF integration tests (load/attach, map read/write, connect rewrite, DNS responder)
 - [ ] Wrapper ingress proxy (host/path routing, TLS, WebSocket, load balancing, draining, rate limiting)
 - [ ] nftables perimeter firewall (cluster boundary rules, management access)
 - [ ] All Phase 3 tests green

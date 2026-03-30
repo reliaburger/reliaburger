@@ -52,11 +52,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross
-        run: cargo install cross --locked
+      - name: Install cross and eBPF build deps
+        run: |
+          cargo install cross --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev linux-headers-$(uname -r)
 
-      - name: Build release binaries
-        run: cross build --release --target ${{ matrix.target }}
+      - name: Build release binaries (with eBPF support)
+        run: cross build --release --features ebpf --target ${{ matrix.target }}
 
       - name: Package binaries
         run: |

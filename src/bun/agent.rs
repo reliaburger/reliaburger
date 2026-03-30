@@ -120,6 +120,15 @@ pub enum AgentCommand {
     ChaosStatus {
         response: oneshot::Sender<ChaosState>,
     },
+    /// Resolve a service name to its VIP and backends.
+    Resolve {
+        app_name: String,
+        response: oneshot::Sender<Option<crate::onion::types::ResolveResponse>>,
+    },
+    /// List all registered services.
+    ResolveAll {
+        response: oneshot::Sender<Vec<crate::onion::types::ResolveResponse>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -242,6 +251,8 @@ pub struct BunAgent<G: Grill> {
     cluster: Option<ClusterHandle>,
     /// Active chaos partition (peers + expiry).
     chaos_partition: Option<(Vec<String>, Instant)>,
+    /// Onion service map: app names → VIPs + backends.
+    service_map: crate::onion::service_map::ServiceMap,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -259,6 +270,7 @@ impl<G: Grill> BunAgent<G> {
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             chaos_partition: None,
+            service_map: crate::onion::service_map::ServiceMap::new(),
         }
     }
 
@@ -277,6 +289,7 @@ impl<G: Grill> BunAgent<G> {
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             chaos_partition: None,
+            service_map: crate::onion::service_map::ServiceMap::new(),
         }
     }
 
@@ -514,6 +527,22 @@ impl<G: Grill> BunAgent<G> {
                 let state = self.get_chaos_state();
                 let _ = response.send(state);
             }
+            AgentCommand::Resolve { app_name, response } => {
+                let result = self
+                    .service_map
+                    .resolve(&app_name)
+                    .map(|e| e.to_resolve_response());
+                let _ = response.send(result);
+            }
+            AgentCommand::ResolveAll { response } => {
+                let results = self
+                    .service_map
+                    .resolve_all()
+                    .iter()
+                    .map(|e| e.to_resolve_response())
+                    .collect();
+                let _ = response.send(results);
+            }
         }
     }
 
@@ -573,6 +602,20 @@ impl<G: Grill> BunAgent<G> {
                     return;
                 }
             };
+
+            // Register the app in the service map if it declares a port
+            if let Some(port) = spec.port {
+                let firewall = spec.firewall.as_ref().and_then(|f| {
+                    if f.allow_from.is_empty() {
+                        None
+                    } else {
+                        Some(f.allow_from.clone())
+                    }
+                });
+                let _ = self
+                    .service_map
+                    .register_app(app_name, namespace, port, firewall);
+            }
 
             // Drive each instance through Pending → Preparing → Starting → HealthWait
             for id in &ids {
@@ -797,6 +840,22 @@ impl<G: Grill> BunAgent<G> {
             }
         }
 
+        // Register as a backend in the service map if the instance has a port
+        if let Some(instance) = self.supervisor.get_instance(instance_id)
+            && let Some(host_port) = instance.host_port
+        {
+            let node_ip = instance
+                .container_ip
+                .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+            let backend = crate::onion::types::BackendInstance {
+                instance_id: instance_id.0.clone(),
+                node_ip,
+                host_port,
+                healthy: instance.state == ContainerState::Running,
+            };
+            let _ = self.service_map.add_backend(app_name, backend);
+        }
+
         Ok(())
     }
 
@@ -894,6 +953,29 @@ impl<G: Grill> BunAgent<G> {
                 let status = probe_health(&config, "127.0.0.1").await;
 
                 let transition = self.supervisor.process_health_result(&instance_id, status);
+
+                // Propagate health transitions to the service map
+                match &transition {
+                    Ok(Some(ContainerState::Running)) => {
+                        if let Some(inst) = self.supervisor.get_instance(&instance_id) {
+                            let _ = self.service_map.set_backend_health(
+                                &inst.app_name,
+                                &instance_id.0,
+                                true,
+                            );
+                        }
+                    }
+                    Ok(Some(ContainerState::Unhealthy)) => {
+                        if let Some(inst) = self.supervisor.get_instance(&instance_id) {
+                            let _ = self.service_map.set_backend_health(
+                                &inst.app_name,
+                                &instance_id.0,
+                                false,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
 
                 // Handle restart if unhealthy
                 if let Ok(Some(ContainerState::Unhealthy)) = transition {
@@ -1096,6 +1178,12 @@ impl<G: Grill> BunAgent<G> {
                     });
             }
         }
+
+        // Remove backends and unregister from the service map
+        for id in &instances {
+            let _ = self.service_map.remove_backend(app_name, &id.0);
+        }
+        let _ = self.service_map.unregister_app(app_name);
 
         Ok(())
     }

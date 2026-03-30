@@ -77,6 +77,11 @@ enum Command {
         /// Address of an existing cluster member (gossip endpoint).
         addr: String,
     },
+    /// Resolve a service name to its VIP and backends.
+    Resolve {
+        /// Service name (e.g. "redis").
+        name: String,
+    },
     /// Run chaos testing scenarios or manage fault injections.
     Chaos {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
@@ -135,6 +140,11 @@ enum DevAction {
         #[arg(default_value = "default")]
         name: String,
     },
+    /// Run tests in a Linux VM (all Linux-gated tests enabled).
+    Test {
+        /// Optional test name filter (passed to cargo test).
+        filter: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -162,6 +172,7 @@ async fn main() -> ExitCode {
             ref token,
             ref addr,
         } => commands::join(token, addr).await,
+        Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Chaos { ref action } => commands::chaos(action).await,
         Command::Dev { action } => match &action {
             DevAction::Create {
@@ -175,6 +186,7 @@ async fn main() -> ExitCode {
             DevAction::Stop { name } => reliaburger::relish::dev::stop(name).await,
             DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
             DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
+            DevAction::Test { filter } => reliaburger::relish::dev::test(filter.as_deref()).await,
         },
     };
 
@@ -288,6 +300,12 @@ mod tests {
     fn invalid_output_format_rejected() {
         let result = parse(&["relish", "--output", "csv", "status"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_resolve_command() {
+        let cli = parse(&["relish", "resolve", "redis"]).unwrap();
+        assert!(matches!(cli.command, Command::Resolve { ref name } if name == "redis"));
     }
 
     #[test]
