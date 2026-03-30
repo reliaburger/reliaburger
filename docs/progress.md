@@ -73,7 +73,14 @@ Single source of truth for what's done and what's next. Check off an item only w
   - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis)
   - [x] `relish dev test` runs Linux + eBPF tests from macOS via Lima
   - [x] eBPF integration tests (load/attach, map read/write, connect rewrite, DNS responder)
-- [ ] Wrapper ingress proxy (host/path routing, TLS, WebSocket, load balancing, draining, rate limiting)
+- [x] Wrapper ingress proxy (host/path routing, load balancing, draining, rate limiting)
+  - [x] Routing table (host/path → backend pool, longest prefix match, round-robin LB)
+  - [x] HTTP reverse proxy on dedicated tokio runtime (DDoS isolation, connection limit)
+  - [x] Per-client-IP token bucket rate limiting (429 + Retry-After)
+  - [x] Connection draining protocol (zero-downtime deploys)
+  - [x] Agent wiring (routing table rebuilds on deploy/stop/health, `relish routes` command)
+  - [ ] TLS termination with self-signed certs (Phase 4 adds ACME + Sesame)
+  - [ ] WebSocket upgrade proxying
 - [ ] nftables perimeter firewall (cluster boundary rules, management access)
 - [ ] All Phase 3 tests green
 

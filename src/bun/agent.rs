@@ -129,6 +129,10 @@ pub enum AgentCommand {
     ResolveAll {
         response: oneshot::Sender<Vec<crate::onion::types::ResolveResponse>>,
     },
+    /// List all ingress routes.
+    Routes {
+        response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -253,6 +257,10 @@ pub struct BunAgent<G: Grill> {
     chaos_partition: Option<(Vec<String>, Instant)>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
+    routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
+    /// Ingress configs for deployed apps (app_name → IngressSpec).
+    ingress_configs: std::collections::HashMap<String, crate::config::app::IngressSpec>,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -271,6 +279,10 @@ impl<G: Grill> BunAgent<G> {
             cluster: None,
             chaos_partition: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::wrapper::routing::RoutingTable::new(),
+            )),
+            ingress_configs: std::collections::HashMap::new(),
         }
     }
 
@@ -290,6 +302,10 @@ impl<G: Grill> BunAgent<G> {
             cluster: Some(cluster),
             chaos_partition: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::wrapper::routing::RoutingTable::new(),
+            )),
+            ingress_configs: std::collections::HashMap::new(),
         }
     }
 
@@ -543,6 +559,10 @@ impl<G: Grill> BunAgent<G> {
                     .collect();
                 let _ = response.send(results);
             }
+            AgentCommand::Routes { response } => {
+                let table = self.routing_table.read().await;
+                let _ = response.send(table.list_routes());
+            }
         }
     }
 
@@ -615,6 +635,12 @@ impl<G: Grill> BunAgent<G> {
                 let _ = self
                     .service_map
                     .register_app(app_name, namespace, port, firewall);
+            }
+
+            // Store ingress config for routing table
+            if let Some(ref ingress) = spec.ingress {
+                self.ingress_configs
+                    .insert(app_name.to_string(), ingress.clone());
             }
 
             // Drive each instance through Pending → Preparing → Starting → HealthWait
@@ -698,6 +724,9 @@ impl<G: Grill> BunAgent<G> {
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
+
+        // Rebuild the routing table now that all instances are started
+        self.rebuild_routing_table().await;
 
         let _ = events
             .send(ApplyEvent::Complete {
@@ -1184,8 +1213,17 @@ impl<G: Grill> BunAgent<G> {
             let _ = self.service_map.remove_backend(app_name, &id.0);
         }
         let _ = self.service_map.unregister_app(app_name);
+        self.ingress_configs.remove(app_name);
+        self.rebuild_routing_table().await;
 
         Ok(())
+    }
+
+    /// Rebuild the Wrapper routing table from the current service map
+    /// and ingress configs.
+    async fn rebuild_routing_table(&self) {
+        let mut table = self.routing_table.write().await;
+        table.rebuild(&self.service_map, &self.ingress_configs);
     }
 
     /// Get status of all instances.
