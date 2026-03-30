@@ -85,7 +85,7 @@ Single source of truth for what's done and what's next. Check off an item only w
   - [x] Ruleset generation (ingress ports, cluster node IPs, admin CIDRs, default drop)
   - [x] `apply_ruleset()` via `nft -f` (Linux), no-op on macOS
   - [ ] Wire into agent (reconcile on gossip membership changes, 30s interval)
-- [ ] All Phase 3 tests green
+- [x] All Phase 3 tests green (702 tests)
 
 ## Phase 4: Security
 
