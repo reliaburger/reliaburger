@@ -9,6 +9,7 @@
 pub mod bun;
 pub mod config;
 pub mod council;
+pub mod firewall;
 pub mod grill;
 pub mod meat;
 pub mod mustard;

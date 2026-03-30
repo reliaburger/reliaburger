@@ -81,7 +81,10 @@ Single source of truth for what's done and what's next. Check off an item only w
   - [x] Agent wiring (routing table rebuilds on deploy/stop/health, `relish routes` command)
   - [ ] TLS termination with self-signed certs (Phase 4 adds ACME + Sesame)
   - [ ] WebSocket upgrade proxying
-- [ ] nftables perimeter firewall (cluster boundary rules, management access)
+- [x] nftables perimeter firewall (cluster boundary rules, management access)
+  - [x] Ruleset generation (ingress ports, cluster node IPs, admin CIDRs, default drop)
+  - [x] `apply_ruleset()` via `nft -f` (Linux), no-op on macOS
+  - [ ] Wire into agent (reconcile on gossip membership changes, 30s interval)
 - [ ] All Phase 3 tests green
 
 ## Phase 4: Security
