@@ -125,25 +125,31 @@ pub fn generate_ruleset(config: &PerimeterConfig, cluster_nodes: &ClusterNodes) 
 /// Apply the firewall ruleset to the kernel via nftables.
 #[cfg(target_os = "linux")]
 pub async fn apply_ruleset(ruleset: &str) -> Result<(), FirewallError> {
-    let output = tokio::process::Command::new("nft")
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("nft")
         .arg("-f")
         .arg("-")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(ruleset.as_bytes())?;
-            }
-            Ok(child)
-        })
         .map_err(|e| FirewallError::ApplyFailed {
             reason: format!("failed to spawn nft: {e}"),
         })?;
 
-    let result = output
+    if let Some(ref mut stdin) = child.stdin {
+        stdin
+            .write_all(ruleset.as_bytes())
+            .await
+            .map_err(|e| FirewallError::ApplyFailed {
+                reason: format!("failed to write ruleset to nft stdin: {e}"),
+            })?;
+    }
+    // Drop stdin to signal EOF
+    child.stdin.take();
+
+    let result = child
         .wait_with_output()
         .await
         .map_err(|e| FirewallError::ApplyFailed {
