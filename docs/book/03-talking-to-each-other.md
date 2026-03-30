@@ -549,5 +549,117 @@ Kubernetes needs CoreDNS (a separate Go binary consuming 170MB of RAM), kube-pro
 
 We originally planned to do DNS entirely in-kernel too. It turned out the BPF hooks we needed can't read DNS packet payloads. So we went with the pragmatic approach: userspace DNS at 50 microseconds, in-kernel connect rewrite at zero. Pragmatism over purity. The 50 microsecond DNS hit is invisible to any real application, and it saved us from fighting kernel limitations that would have taken weeks to work around (if they're even solvable with current BPF).
 
-<!-- TODO(Phase 3): Wrapper ingress proxy section -->
-<!-- TODO(Phase 3): nftables perimeter firewall section -->
+## Wrapper: The Front Door
+
+Onion handles traffic inside the cluster. But when a browser hits `myapp.com`, that traffic comes from the internet. It can't use VIPs or eBPF hooks — it needs a real port to connect to. Wrapper is the reverse proxy that receives external traffic on ports 80 and 443 and routes it to the right backend.
+
+### Why not just expose the containers directly?
+
+Each container gets a dynamically allocated host port (30000-31000). You could map DNS to `node-ip:30891` and call it a day. Three problems:
+
+1. The port changes every time the container restarts or moves to a different node.
+2. You'd need one DNS record per container per app. With 10 replicas across 5 nodes, that's 50 records to manage.
+3. No TLS termination, no load balancing, no health-aware routing.
+
+A reverse proxy solves all three. External clients talk to `myapp.com:443`, and Wrapper figures out where the traffic should go.
+
+### Architecture
+
+Wrapper runs inside Bun as a set of async tasks — not a separate process. But it runs on its own tokio runtime with its own thread pool. This is the key design decision: if someone points a botnet at port 80, the flood of connections saturates Wrapper's threads but can't starve the gossip protocol, the Raft consensus, the health checker, or the scheduler. Resource isolation through separate runtimes.
+
+On top of that, a concurrent connection limit (default 10,000) rejects new connections with 503 once the cap is hit. So a DDoS attacker faces: per-IP rate limiting, a global connection ceiling, and runtime isolation that protects the rest of the system.
+
+### The routing table
+
+The routing table maps `(host, path)` pairs to backend pools:
+
+```rust
+pub struct RoutingTable {
+    routes: HashMap<String, Vec<PathRoute>>,
+}
+```
+
+Each host maps to a list of path routes, sorted by path length descending. When a request arrives, we extract the `Host` header, find the matching host (case-insensitive), then walk the path routes looking for the first prefix match. Longest prefix wins — `/api/v1` matches before `/api`, which matches before `/`.
+
+The table is rebuilt from the `ServiceMap` whenever apps with ingress config are deployed, stopped, or have health changes. Rebuilding is cheap (microseconds for typical clusters) and writes are behind a `RwLock`. In-flight requests hold a read lock and are never blocked by a rebuild.
+
+### What happens when things go wrong
+
+Three error codes tell the client exactly what happened:
+
+- **404 Not Found**: No route matches the `Host` header. The request is for a domain we don't know about.
+- **502 Bad Gateway**: A route matches, but all backends are unhealthy. The app is deployed but broken.
+- **503 Service Unavailable**: The connection limit was reached. We're overloaded.
+
+### Connection draining
+
+When an app is being redeployed (rolling update), the old instances need to finish serving in-flight requests before they're stopped. This is the drain protocol:
+
+1. Bun tells Wrapper: "drain instance web-0, deadline 30 seconds"
+2. Wrapper moves the backend from the active pool to a draining pool — no new requests go to it
+3. In-flight requests complete normally
+4. When all connections are done (or the 30-second deadline hits), Wrapper tells Bun: "drain complete"
+5. Bun stops the old container
+
+The app never drops below its replica count during a deploy. If you have 3 replicas and `max_surge = 1`, the sequence is: start replica 4, drain replica 1, start replica 4', drain replica 2, and so on.
+
+### Rate limiting
+
+Each client IP gets a token bucket. Tokens refill at a configured rate (requests per second). When the bucket is empty, the request gets a 429 Too Many Requests response with a `Retry-After` header telling the client exactly when to retry.
+
+Rate limiting is per-node, not cluster-wide. An attacker hitting all nodes gets N times the rate limit. For serious DDoS protection, you'd put something like Cloudflare or AWS Shield in front. Our rate limiter is there for reasonable load shedding, not nation-state defence.
+
+Stale token buckets (no requests for 5 minutes) are garbage collected every 60 seconds to bound memory growth.
+
+### TLS
+
+Phase 3 ships with a TLS stub — we can listen on port 443 with self-signed certificates for testing. Real certificate management (ACME for Let's Encrypt, or cluster CA for air-gapped environments) comes in Phase 4 when we build Sesame, the PKI layer. TLS 1.0 and 1.1 are rejected; only 1.2 and 1.3 are accepted.
+
+## The Perimeter: nftables Firewall
+
+### What we're protecting
+
+A Reliaburger node exposes a lot of ports: container host ports (30000-31000), gossip (9443), Raft (9444), reporting (9445), the management API (9117), plus whatever the operator runs (SSH, monitoring, etc.). Not all of these should be reachable from the outside.
+
+The obvious approach would be a default-deny firewall: block everything, then poke holes for what's needed. We tried that. Turns out, blocking *everything* also blocks SSH, and the first time you apply a default-deny ruleset on a remote server without an out-of-band console, you learn that lesson the hard way.
+
+So we took a different approach. We only block *our* ports. SSH, the operator's monitoring agent, whatever else they're running — we don't touch it. We're a container orchestrator, not a host firewall.
+
+### What gets blocked
+
+The nftables input chain in the `reliaburger` table has `policy accept` (everything passes by default) and explicit `drop` rules for three port ranges:
+
+1. **Container host ports (30000-31000)**: Dynamically allocated by the port allocator. External clients should reach containers through Wrapper (ports 80/443), not by hitting these ports directly.
+
+2. **Cluster ports (9443, 9444, 9445)**: Gossip, Raft consensus, and reporting tree communication. Only cluster node IPs should reach these.
+
+3. **Management port (9117)**: The Bun agent API. Only cluster nodes and admin CIDRs.
+
+Cluster nodes get a blanket `accept` rule that comes *before* all the `drop` rules. So inter-node traffic is never blocked — gossip, scheduling, state replication all work normally. Admin CIDRs get access to the management port specifically.
+
+The order matters in nftables: first match wins. Cluster node accept → admin CIDR accept → drop rules → everything else passes.
+
+### Testable without root
+
+The ruleset generation is a pure function: it takes a config and a set of cluster node IPs, and returns a string of nftables rules. No kernel interaction. We test it on macOS just like any other unit test:
+
+```rust
+#[test]
+fn ssh_not_mentioned() {
+    let config = PerimeterConfig::default();
+    let rules = generate_ruleset(&config, &ClusterNodes::new());
+    assert!(!rules.contains("dport 22"));
+}
+
+#[test]
+fn cluster_nodes_bypass_all_blocks() {
+    let nodes = cluster_with_nodes(&["10.0.1.1"]);
+    let rules = generate_ruleset(&config, &nodes);
+    // Accept comes before drop
+    let accept_pos = rules.find("10.0.1.1 } accept").unwrap();
+    let drop_pos = rules.find("30000-31000 drop").unwrap();
+    assert!(accept_pos < drop_pos);
+}
+```
+
+Applying the rules to the kernel (`nft -f -`) is a separate function that only runs on Linux. The same split we use everywhere: pure logic is cross-platform, I/O is platform-gated.

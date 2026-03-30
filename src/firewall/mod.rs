@@ -1,9 +1,9 @@
 /// nftables perimeter firewall.
 ///
-/// Enforces cluster boundary rules: only ingress ports (80/443),
-/// inter-node cluster traffic (gossip, Raft, reporting), and
-/// management access (admin CIDRs) are allowed. Everything else
-/// is dropped.
+/// Blocks external access to Reliaburger's own ports: container
+/// host ports (30000-31000), cluster ports (gossip, Raft, reporting),
+/// and the management API. Cluster nodes and admin CIDRs bypass
+/// the blocks. Everything else (SSH, operator services) is untouched.
 ///
 /// Uses the `reliaburger` nftables table (shared with netns port
 /// mapping). Rules are reconciled on cluster membership changes
