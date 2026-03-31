@@ -3,6 +3,7 @@
 //! Provides the cryptographic foundation for Reliaburger: CA hierarchy,
 //! certificate signing, key wrapping, secret encryption, and API tokens.
 
+pub mod auth;
 pub mod ca;
 pub mod cert;
 pub mod crypto;

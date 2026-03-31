@@ -95,10 +95,44 @@ enum Command {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
     },
+    /// Manage API tokens.
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
     /// Manage a local dev cluster (Lima VMs).
     Dev {
         #[command(subcommand)]
         action: DevAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Create a new API token.
+    Create {
+        /// Token name (e.g. "ci-deploy").
+        #[arg(long)]
+        name: String,
+        /// Role: admin, deployer, or read-only.
+        #[arg(long, default_value = "read-only")]
+        role: String,
+        /// Restrict to specific apps (comma-separated).
+        #[arg(long)]
+        apps: Option<String>,
+        /// Restrict to specific namespaces (comma-separated).
+        #[arg(long)]
+        namespaces: Option<String>,
+        /// TTL in days (e.g. 90).
+        #[arg(long)]
+        ttl_days: Option<u64>,
+    },
+    /// List all API tokens.
+    List,
+    /// Revoke an API token by name.
+    Revoke {
+        /// Token name to revoke.
+        name: String,
     },
 }
 
@@ -187,6 +221,23 @@ async fn main() -> ExitCode {
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Token { action } => match &action {
+            TokenAction::Create {
+                name,
+                role,
+                apps,
+                namespaces,
+                ttl_days,
+            } => commands::token_create(
+                name,
+                role,
+                apps.as_deref(),
+                namespaces.as_deref(),
+                *ttl_days,
+            ),
+            TokenAction::List => commands::token_list().await,
+            TokenAction::Revoke { name } => commands::token_revoke(name).await,
+        },
         Command::Dev { action } => match &action {
             DevAction::Create {
                 nodes,
