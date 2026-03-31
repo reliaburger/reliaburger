@@ -68,6 +68,10 @@ pub enum RelishError {
     #[error("dev cluster {name:?} already exists — destroy it first with `relish dev destroy`")]
     DevClusterAlreadyExists { name: String },
 
+    /// Cluster init (PKI generation) failed.
+    #[error("cluster initialisation failed: {0}")]
+    InitFailed(String),
+
     /// IO error.
     #[error("{0}")]
     Io(#[from] std::io::Error),

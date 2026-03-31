@@ -59,11 +59,17 @@ enum Command {
         /// App name.
         app: String,
     },
-    /// Initialise a new project with starter config files.
+    /// Initialise a new cluster (generates CAs, age keypair, join token).
     Init {
         /// Directory to create config files in.
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// Cluster name.
+        #[arg(long, default_value = "default")]
+        cluster_name: String,
+        /// Node ID for this node.
+        #[arg(long, default_value = "node-01")]
+        node_id: String,
     },
     /// List cluster nodes and their gossip state.
     Nodes,
@@ -167,7 +173,11 @@ async fn main() -> ExitCode {
         } => commands::exec(app, command).await,
         Command::Inspect { ref name } => commands::inspect(name).await,
         Command::Stop { ref app } => commands::stop(app).await,
-        Command::Init { ref dir } => commands::init(dir),
+        Command::Init {
+            ref dir,
+            ref cluster_name,
+            ref node_id,
+        } => commands::init(dir, cluster_name, node_id),
         Command::Nodes => commands::nodes(cli.output).await,
         Command::Council => commands::council(cli.output).await,
         Command::Join {
@@ -258,15 +268,37 @@ mod tests {
     #[test]
     fn parse_init_command() {
         let cli = parse(&["relish", "init"]).unwrap();
-        assert!(matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some(".")));
+        match cli.command {
+            Command::Init {
+                ref dir,
+                ref cluster_name,
+                ref node_id,
+            } => {
+                assert_eq!(dir.to_str(), Some("."));
+                assert_eq!(cluster_name, "default");
+                assert_eq!(node_id, "node-01");
+            }
+            _ => panic!("expected Init command"),
+        }
     }
 
     #[test]
     fn parse_init_with_dir() {
         let cli = parse(&["relish", "init", "/tmp/myproject"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some("/tmp/myproject"))
+            matches!(cli.command, Command::Init { ref dir, .. } if dir.to_str() == Some("/tmp/myproject"))
         );
+    }
+
+    #[test]
+    fn parse_init_with_cluster_name() {
+        let cli = parse(&["relish", "init", "--cluster-name", "prod"]).unwrap();
+        match cli.command {
+            Command::Init {
+                ref cluster_name, ..
+            } => assert_eq!(cluster_name, "prod"),
+            _ => panic!("expected Init command"),
+        }
     }
 
     #[test]

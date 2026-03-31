@@ -161,11 +161,12 @@ async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), Relis
     Ok(())
 }
 
-/// Initialise a new project with starter config files.
+/// Initialise a new cluster with starter config files and PKI.
 ///
 /// Creates `reliaburger.toml` (node config) and `app.toml` (sample app)
-/// in the given directory. Refuses to overwrite existing files.
-pub fn init(dir: &Path) -> Result<(), RelishError> {
+/// in the given directory. Generates the CA hierarchy, age keypair,
+/// first node certificate, and a join token.
+pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishError> {
     let node_path = dir.join("reliaburger.toml");
     let app_path = dir.join("app.toml");
 
@@ -179,6 +180,14 @@ pub fn init(dir: &Path) -> Result<(), RelishError> {
             path: app_path.display().to_string(),
         });
     }
+
+    // Generate the security state (CAs, age keypair, join token)
+    let init_result = crate::sesame::init::initialize_cluster(cluster_name, node_id, dir)
+        .map_err(|e| RelishError::InitFailed(e.to_string()))?;
+
+    // Output the init summary to stderr (join token is sensitive)
+    let output = crate::sesame::init::format_init_output(&init_result);
+    eprint!("{output}");
 
     let node_config = crate::config::node::NodeConfig::default();
     let node_toml = format!(
@@ -498,7 +507,7 @@ mod tests {
     #[test]
     fn init_creates_files() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path()).unwrap();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
         assert!(dir.path().join("reliaburger.toml").exists());
         assert!(dir.path().join("app.toml").exists());
     }
@@ -506,15 +515,15 @@ mod tests {
     #[test]
     fn init_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path()).unwrap();
-        let err = init(dir.path()).unwrap_err();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
+        let err = init(dir.path(), "test-cluster", "node-01").unwrap_err();
         assert!(matches!(err, RelishError::FileExists { .. }));
     }
 
     #[test]
     fn init_generated_config_parses() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path()).unwrap();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
 
         let node_content = std::fs::read_to_string(dir.path().join("reliaburger.toml")).unwrap();
         let _: crate::config::node::NodeConfig = toml::from_str(&node_content).unwrap();
@@ -522,6 +531,13 @@ mod tests {
         let app_content = std::fs::read_to_string(dir.path().join("app.toml")).unwrap();
         let config = Config::parse(&app_content).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn init_creates_sealed_root_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path(), "mycluster", "node-01").unwrap();
+        assert!(dir.path().join("mycluster-root-ca.age").exists());
     }
 
     #[tokio::test]

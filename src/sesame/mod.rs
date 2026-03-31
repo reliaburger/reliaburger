@@ -6,6 +6,8 @@
 pub mod ca;
 pub mod cert;
 pub mod crypto;
+pub mod init;
+pub mod join;
 pub mod secret;
 pub mod token;
 pub mod types;
