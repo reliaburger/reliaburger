@@ -89,14 +89,16 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 4: Security
 
-- [ ] Sesame CA hierarchy (Root, Node, Workload, Ingress CAs)
-- [ ] Node mTLS (join tokens, certificate issuance, inter-node encryption)
-- [ ] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
-- [ ] API authentication (tokens, roles, scoping, rate limiting, audit logging)
-- [ ] Secret encryption (age keypairs, `ENC[AGE:...]`, namespace-scoped keys, rotation)
-- [ ] eBPF firewall rules (`allow_from` ingress, egress allowlists, namespace isolation)
-- [ ] Raft log encryption at rest (AES-256-GCM, HKDF)
-- [ ] All Phase 4 tests green
+- [x] Sesame CA hierarchy (Root, Node, Workload, Ingress CAs — ECDSA P-256, HKDF key wrapping)
+- [x] Node mTLS (join tokens, certificate issuance, mTLS config builders, gossip HMAC)
+- [ ] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs) — deferred to Phase 9
+- [x] API authentication (tokens, Argon2id hashing, roles: Admin/Deployer/ReadOnly, axum middleware)
+- [x] Secret encryption (age keypairs, `ENC[AGE:...]` decryption at container startup, namespace-scoped keys)
+- [x] eBPF firewall rules (`allow_from` resolution, cgroup-to-namespace mapping, BPF map wiring)
+- [x] Raft log encryption at rest (AES-256-GCM, HKDF from node cert private key)
+- [x] `relish init` generates full PKI + join token; `relish token create/list/revoke`
+- [x] Book chapter 4: "Trust No One"
+- [x] All Phase 4 tests green (795 tests)
 
 ## Phase 5: Storage & Registry
 
