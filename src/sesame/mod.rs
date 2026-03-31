@@ -8,6 +8,7 @@ pub mod cert;
 pub mod crypto;
 pub mod init;
 pub mod join;
+pub mod mtls;
 pub mod secret;
 pub mod token;
 pub mod types;
