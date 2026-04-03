@@ -15,6 +15,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::app::AppSpec;
 use crate::meat::types::{AppId, Placement, SchedulingDecision};
+use crate::pickle::types::{
+    DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
+};
 
 // ---------------------------------------------------------------------------
 // openraft type configuration
@@ -98,6 +101,14 @@ pub enum RaftRequest {
     SchedulingDecision(SchedulingDecision),
     /// Set a cluster-wide configuration key.
     ConfigSet { key: String, value: String },
+    /// Commit an image manifest to the Pickle registry catalog.
+    ManifestCommit(ManifestCommit),
+    /// Update which nodes hold copies of specific layers.
+    UpdateLayerLocations(UpdateLayerLocations),
+    /// Report that a node deleted layers during garbage collection.
+    GcReport(GcReport),
+    /// Delete a tag from the Pickle manifest catalog.
+    DeleteTag(DeleteTag),
     /// No-op entry (used for leader commit on election).
     Noop,
 }
@@ -139,6 +150,9 @@ pub struct DesiredState {
     pub scheduling: HashMap<AppId, Vec<Placement>>,
     /// Cluster-wide configuration key-value pairs.
     pub config: HashMap<String, String>,
+    /// Pickle image registry manifest catalog.
+    #[serde(default)]
+    pub manifest_catalog: ManifestCatalog,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

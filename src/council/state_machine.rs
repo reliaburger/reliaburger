@@ -44,6 +44,18 @@ impl StateMachineInner {
             RaftRequest::ConfigSet { key, value } => {
                 self.state.config.insert(key.clone(), value.clone());
             }
+            RaftRequest::ManifestCommit(commit) => {
+                self.state.manifest_catalog.apply_manifest_commit(commit);
+            }
+            RaftRequest::UpdateLayerLocations(update) => {
+                self.state.manifest_catalog.apply_update_locations(update);
+            }
+            RaftRequest::GcReport(report) => {
+                self.state.manifest_catalog.apply_gc_report(report);
+            }
+            RaftRequest::DeleteTag(delete) => {
+                self.state.manifest_catalog.apply_delete_tag(delete);
+            }
             RaftRequest::Noop => {}
         }
     }

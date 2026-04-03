@@ -19,7 +19,7 @@ pub struct NodeConfig {
     pub network: NetworkSection,
     pub reporting_tree: ReportingTreeSection,
     pub reconstruction: ReconstructionSection,
-    // TODO(Phase 5): images section
+    pub images: ImagesSection,
     // TODO(Phase 6): logs, metrics sections
     // TODO(Phase 3): ingress section
     // TODO(Phase 8): process_workloads section
@@ -199,6 +199,37 @@ impl Default for ReconstructionSection {
             learning_period_timeout_secs: 15,
             large_cluster_timeout_secs: 30,
             large_cluster_node_count: 5000,
+        }
+    }
+}
+
+/// Pickle image registry configuration.
+///
+/// Controls replication, garbage collection, and storage limits
+/// for the built-in OCI image registry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImagesSection {
+    /// Maximum storage for image blobs (e.g. "50Gi"). 0 means unlimited.
+    pub max_storage: String,
+    /// Number of replicas for each layer (including the original pusher).
+    pub redundancy: u32,
+    /// Days to retain unreferenced images before GC.
+    pub gc_retain_days: u32,
+    /// Hours between GC sweeps.
+    pub gc_interval_hours: u32,
+    /// Port for the OCI Distribution API (Pickle registry).
+    pub registry_port: u16,
+}
+
+impl Default for ImagesSection {
+    fn default() -> Self {
+        Self {
+            max_storage: "0".to_string(),
+            redundancy: 2,
+            gc_retain_days: 7,
+            gc_interval_hours: 1,
+            registry_port: 5000,
         }
     }
 }
