@@ -270,6 +270,46 @@ mod tests {
                 value: "100".to_string(),
             },
             RaftRequest::Noop,
+            RaftRequest::ManifestCommit(ManifestCommit {
+                manifest: crate::pickle::types::ImageManifest {
+                    digest: crate::pickle::types::Digest::from_sha256_hex(
+                        "0000000000000000000000000000000000000000000000000000000000000001",
+                    ),
+                    config: crate::pickle::types::LayerDescriptor {
+                        digest: crate::pickle::types::Digest::from_sha256_hex(
+                            "0000000000000000000000000000000000000000000000000000000000000002",
+                        ),
+                        size: 1024,
+                        media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                    },
+                    layers: vec![],
+                    repository: "myapp".to_string(),
+                    tags: std::collections::BTreeSet::new(),
+                    total_size: 1024,
+                    pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                    pushed_by: 1,
+                },
+                tag: "latest".to_string(),
+                holder_nodes: std::collections::BTreeSet::from([1, 2]),
+            }),
+            RaftRequest::UpdateLayerLocations(UpdateLayerLocations {
+                updates: vec![(
+                    crate::pickle::types::Digest::from_sha256_hex(
+                        "0000000000000000000000000000000000000000000000000000000000000003",
+                    ),
+                    std::collections::BTreeSet::from([1, 2, 3]),
+                )],
+            }),
+            RaftRequest::GcReport(GcReport {
+                node_id: 2,
+                deleted_layers: vec![crate::pickle::types::Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000004",
+                )],
+            }),
+            RaftRequest::DeleteTag(DeleteTag {
+                repository: "myapp".to_string(),
+                tag: "old".to_string(),
+            }),
         ];
 
         for req in &requests {

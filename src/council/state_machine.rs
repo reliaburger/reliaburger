@@ -492,4 +492,130 @@ mod tests {
         assert_eq!(state.config.get("installed").unwrap(), "true");
         assert_eq!(state.last_applied_log, Some(log_id(2, 10)));
     }
+
+    // -- Pickle state machine tests ------------------------------------------
+
+    fn test_digest(suffix: &str) -> crate::pickle::types::Digest {
+        crate::pickle::types::Digest(format!("sha256:{suffix:0>64}"))
+    }
+
+    fn test_manifest_commit() -> crate::pickle::types::ManifestCommit {
+        crate::pickle::types::ManifestCommit {
+            manifest: crate::pickle::types::ImageManifest {
+                digest: test_digest("m1"),
+                config: crate::pickle::types::LayerDescriptor {
+                    digest: test_digest("cfg"),
+                    size: 512,
+                    media_type: String::new(),
+                },
+                layers: vec![crate::pickle::types::LayerDescriptor {
+                    digest: test_digest("layer1"),
+                    size: 4096,
+                    media_type: String::new(),
+                }],
+                repository: "myapp".to_string(),
+                tags: std::collections::BTreeSet::new(),
+                total_size: 4608,
+                pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                pushed_by: 1,
+            },
+            tag: "latest".to_string(),
+            holder_nodes: std::collections::BTreeSet::from([1, 2]),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_manifest_commit_updates_catalog() {
+        let mut sm = CouncilStateMachine::new();
+        let commit = test_manifest_commit();
+        let entry = normal_entry(1, 1, RaftRequest::ManifestCommit(commit));
+
+        sm.apply(vec![entry]).await.unwrap();
+
+        let state = sm.desired_state().await;
+        let found = state
+            .manifest_catalog
+            .get_manifest_by_tag("myapp", "latest");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().repository, "myapp");
+    }
+
+    #[tokio::test]
+    async fn apply_update_layer_locations() {
+        let mut sm = CouncilStateMachine::new();
+        let digest = test_digest("layer1");
+        let update = crate::pickle::types::UpdateLayerLocations {
+            updates: vec![(digest.clone(), std::collections::BTreeSet::from([3, 4]))],
+        };
+        let entry = normal_entry(1, 1, RaftRequest::UpdateLayerLocations(update));
+
+        sm.apply(vec![entry]).await.unwrap();
+
+        let state = sm.desired_state().await;
+        let holders = state.manifest_catalog.layer_holders(digest.as_str());
+        assert_eq!(holders, std::collections::BTreeSet::from([3, 4]));
+    }
+
+    #[tokio::test]
+    async fn apply_gc_report_removes_holder() {
+        let mut sm = CouncilStateMachine::new();
+
+        // First: set up layer locations
+        let digest = test_digest("layer1");
+        let update = crate::pickle::types::UpdateLayerLocations {
+            updates: vec![(digest.clone(), std::collections::BTreeSet::from([1, 2, 3]))],
+        };
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::UpdateLayerLocations(update),
+        )])
+        .await
+        .unwrap();
+
+        // Then: GC report removes node 2
+        let report = crate::pickle::types::GcReport {
+            node_id: 2,
+            deleted_layers: vec![digest.clone()],
+        };
+        sm.apply(vec![normal_entry(1, 2, RaftRequest::GcReport(report))])
+            .await
+            .unwrap();
+
+        let state = sm.desired_state().await;
+        let holders = state.manifest_catalog.layer_holders(digest.as_str());
+        assert_eq!(holders, std::collections::BTreeSet::from([1, 3]));
+    }
+
+    #[tokio::test]
+    async fn apply_delete_tag_removes_manifest() {
+        let mut sm = CouncilStateMachine::new();
+
+        // Push a manifest with tag "latest"
+        let commit = test_manifest_commit();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::ManifestCommit(commit),
+        )])
+        .await
+        .unwrap();
+
+        // Delete the tag
+        let delete = crate::pickle::types::DeleteTag {
+            repository: "myapp".to_string(),
+            tag: "latest".to_string(),
+        };
+        sm.apply(vec![normal_entry(1, 2, RaftRequest::DeleteTag(delete))])
+            .await
+            .unwrap();
+
+        let state = sm.desired_state().await;
+        assert!(
+            state
+                .manifest_catalog
+                .get_manifest_by_tag("myapp", "latest")
+                .is_none()
+        );
+    }
 }

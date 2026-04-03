@@ -266,7 +266,13 @@ async fn manifest_put(
 ) -> Response {
     // Compute manifest digest and store the raw bytes
     let manifest_digest = compute_sha256(&body);
-    let _ = state.store.write_blob(&body, &manifest_digest);
+    if let Err(e) = state.store.write_blob(&body, &manifest_digest) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to store manifest blob: {e}")})),
+        )
+            .into_response();
+    }
 
     // Try to parse as JSON
     let manifest_json: OciManifestJson = match serde_json::from_slice(&body) {
@@ -363,12 +369,20 @@ async fn manifest_put(
 
     let mut layers = Vec::new();
     for layer in &manifest_json.layers {
-        if let Ok(d) = Digest::new(&layer.digest) {
-            layers.push(LayerDescriptor {
-                digest: d,
-                size: layer.size,
-                media_type: layer.media_type.clone().unwrap_or_default(),
-            });
+        match Digest::new(&layer.digest) {
+            Ok(d) => {
+                layers.push(LayerDescriptor {
+                    digest: d,
+                    size: layer.size,
+                    media_type: layer.media_type.clone().unwrap_or_default(),
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "pickle: skipping layer with invalid digest {:?}: {e}",
+                    layer.digest
+                );
+            }
         }
     }
 
