@@ -5,6 +5,7 @@
 //! and garbage collection with sole-copy protection.
 
 pub mod api;
+pub mod gc;
 pub mod pull;
 pub mod replication;
 pub mod store;
