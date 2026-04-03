@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, head, patch, post, put};
@@ -39,6 +39,7 @@ pub fn router(state: PickleState) -> Router {
             put(manifest_put).get(manifest_get),
         )
         .route("/v2/{name}/tags/list", get(tags_list))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB for large layers
         .with_state(state)
 }
 
