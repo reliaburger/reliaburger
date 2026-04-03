@@ -4,4 +4,6 @@
 //! for push/pull, synchronous replication, pull-through caching,
 //! and garbage collection with sole-copy protection.
 
+pub mod api;
+pub mod store;
 pub mod types;
