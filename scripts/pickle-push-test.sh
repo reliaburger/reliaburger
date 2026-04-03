@@ -48,6 +48,25 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
+# Check insecure registry is configured (Docker defaults to HTTPS)
+if ! docker info 2>/dev/null | grep -q "${REGISTRY}"; then
+    echo ""
+    echo "WARNING: ${REGISTRY} may not be configured as an insecure registry."
+    echo ""
+    echo "Docker defaults to HTTPS for all registries. To use Pickle over HTTP,"
+    echo "add ${REGISTRY} to Docker's insecure registries:"
+    echo ""
+    echo "  Docker Desktop: Settings → Docker Engine → add to insecure-registries"
+    echo "  Linux daemon:   /etc/docker/daemon.json"
+    echo ""
+    echo '  { "insecure-registries": ["localhost:5050"] }'
+    echo ""
+    echo "Then restart Docker and re-run this script."
+    echo ""
+    echo "Attempting push anyway (will fail if not configured)..."
+    echo ""
+fi
+
 # Start bun if needed
 if ${START_BUN}; then
     echo "--- building bun ---"
