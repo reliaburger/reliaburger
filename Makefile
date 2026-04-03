@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k
+.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos
 
 CARGO = cargo
 
@@ -49,7 +49,7 @@ bench-large: ## Run large cluster benchmarks (500, 1000 nodes — ~10 min)
 bench-10k: ## Run 10k node convergence test (~1 hour)
 	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
 
-pickle-test: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
+pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
 	./scripts/pickle-push-test.sh
 
 ci: fmt-check lint test bench ## Run everything CI would run
