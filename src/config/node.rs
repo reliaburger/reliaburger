@@ -229,7 +229,7 @@ impl Default for ImagesSection {
             redundancy: 2,
             gc_retain_days: 7,
             gc_interval_hours: 1,
-            registry_port: 5000,
+            registry_port: 5050,
         }
     }
 }

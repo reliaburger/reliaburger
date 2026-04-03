@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REGISTRY="localhost:5000"
+REGISTRY="localhost:5050"
 IMAGE_NAME="pickle-test"
 IMAGE_TAG="v1"
 FULL_REF="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
