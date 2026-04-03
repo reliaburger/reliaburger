@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-REGISTRY="localhost:5050"
+REGISTRY="host.docker.internal:5050"
 IMAGE_NAME="pickle-test"
 IMAGE_TAG="v1"
 FULL_REF="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
@@ -49,17 +49,17 @@ if ! docker info &>/dev/null; then
 fi
 
 # Check insecure registry is configured (Docker defaults to HTTPS)
-if ! docker info 2>/dev/null | grep -q "${REGISTRY}"; then
+if ! docker info 2>/dev/null | grep -q "host.docker.internal:5050"; then
     echo ""
-    echo "WARNING: ${REGISTRY} may not be configured as an insecure registry."
+    echo "WARNING: host.docker.internal:5050 may not be configured as an insecure registry."
     echo ""
     echo "Docker defaults to HTTPS for all registries. To use Pickle over HTTP,"
-    echo "add ${REGISTRY} to Docker's insecure registries:"
+    echo "add host.docker.internal:5050 to Docker's insecure registries:"
     echo ""
     echo "  Docker Desktop: Settings → Docker Engine → add to insecure-registries"
     echo "  Linux daemon:   /etc/docker/daemon.json"
     echo ""
-    echo '  { "insecure-registries": ["localhost:5050"] }'
+    echo '  { "insecure-registries": ["host.docker.internal:5050"] }'
     echo ""
     echo "Then restart Docker and re-run this script."
     echo ""
@@ -90,11 +90,11 @@ if ${START_BUN}; then
     echo "bun is ready (pid ${BUN_PID})"
 fi
 
-# Verify Pickle registry is up
+# Verify Pickle registry is up (check from host, not via Docker)
 echo ""
 echo "--- checking Pickle registry ---"
-curl -sf "http://${REGISTRY}/v2/" || {
-    echo "error: Pickle registry not responding at ${REGISTRY}"
+curl -sf "http://localhost:5050/v2/" || {
+    echo "error: Pickle registry not responding at localhost:5050"
     exit 1
 }
 echo "Pickle registry is up"
@@ -112,11 +112,11 @@ echo ""
 echo "--- pushing to Pickle ---"
 docker push "${FULL_REF}"
 
-# Check the tag list
+# Check the tag list (from host)
 echo ""
 echo "--- checking tag list ---"
-curl -sf "http://${REGISTRY}/v2/${IMAGE_NAME}/tags/list" | python3 -m json.tool 2>/dev/null || \
-    curl -sf "http://${REGISTRY}/v2/${IMAGE_NAME}/tags/list"
+curl -sf "http://localhost:5050/v2/${IMAGE_NAME}/tags/list" | python3 -m json.tool 2>/dev/null || \
+    curl -sf "http://localhost:5050/v2/${IMAGE_NAME}/tags/list"
 
 # Remove local copies
 echo ""
