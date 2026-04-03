@@ -221,6 +221,14 @@ mod tests {
 
     #[test]
     fn create_managed_volume_with_size_without_root() {
+        // This test only makes sense when NOT running as root.
+        // Under root (e.g. `sudo cargo test` in the dev VM),
+        // the code actually attempts fallocate + mkfs + mount.
+        if super::is_root() {
+            eprintln!("skipping: running as root");
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let vm = VolumeManager::new(dir.path());
 
