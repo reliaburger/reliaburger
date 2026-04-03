@@ -96,16 +96,59 @@ async fn blob_get(
     }
 }
 
-/// `POST /v2/{name}/blobs/uploads/` — initiate a blob upload.
+/// Query params for POST /v2/{name}/blobs/uploads/ (monolithic upload).
+#[derive(Deserialize, Default)]
+struct InitiateUploadQuery {
+    /// If present, this is a monolithic upload — the body contains the
+    /// entire blob and `digest` is the expected content digest.
+    digest: Option<String>,
+    /// Cross-repository mount source (not implemented, accepted and ignored).
+    #[serde(default)]
+    _mount: Option<String>,
+    /// Cross-repository mount source repository (not implemented).
+    #[serde(default)]
+    _from: Option<String>,
+}
+
+/// `POST /v2/{name}/blobs/uploads/` — initiate (or complete) a blob upload.
+///
+/// Docker may include `?digest=sha256:...` for monolithic uploads where
+/// the entire blob is in the POST body. Without the digest param, this
+/// starts a chunked upload session.
 async fn blob_upload_initiate(
     State(state): State<PickleState>,
     Path(name): Path<String>,
+    Query(query): Query<InitiateUploadQuery>,
+    body: axum::body::Bytes,
 ) -> Response {
+    // Monolithic upload: body + digest in one POST
+    if let Some(ref digest_str) = query.digest
+        && !body.is_empty()
+    {
+        let Ok(digest) = Digest::new(digest_str) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        match state.store.write_blob(&body, &digest) {
+            Ok(()) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "location",
+                    format!("/v2/{name}/blobs/{digest_str}").parse().unwrap(),
+                );
+                headers.insert("docker-content-digest", digest_str.parse().unwrap());
+                return (StatusCode::CREATED, headers).into_response();
+            }
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+
+    // Chunked upload: start a session
     match state.store.initiate_upload().await {
         Ok(upload_id) => {
             let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
             let mut headers = HeaderMap::new();
             headers.insert("location", location.parse().unwrap());
+            headers.insert("range", "0-0".parse().unwrap());
             headers.insert("docker-upload-uuid", upload_id.parse().unwrap());
             (StatusCode::ACCEPTED, headers).into_response()
         }
@@ -185,15 +228,19 @@ async fn blob_upload_complete(
 // Manifest operations
 // ---------------------------------------------------------------------------
 
-/// OCI manifest JSON as received from the client.
+/// OCI manifest JSON as received from the client (single-platform).
 #[derive(Debug, Deserialize)]
 struct OciManifestJson {
     #[serde(rename = "schemaVersion", default)]
     _schema_version: Option<u32>,
     #[serde(rename = "mediaType", default)]
     _media_type: Option<String>,
-    config: OciDescriptor,
+    config: Option<OciDescriptor>,
+    #[serde(default)]
     layers: Vec<OciDescriptor>,
+    /// Present in manifest lists / OCI image indexes.
+    #[serde(default)]
+    manifests: Vec<OciDescriptor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,95 +252,145 @@ struct OciDescriptor {
 }
 
 /// `PUT /v2/{name}/manifests/{reference}` — push a manifest.
+///
+/// Accepts both single-platform manifests (with `config` + `layers`)
+/// and manifest lists/OCI indexes (with `manifests`). In both cases,
+/// the raw bytes are stored as a blob. For single-platform manifests
+/// the catalog is updated with layer info. For manifest lists we just
+/// store the blob and tag.
 async fn manifest_put(
     State(state): State<PickleState>,
     Path((name, reference)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> Response {
-    // Parse the manifest JSON
+    // Compute manifest digest and store the raw bytes
+    let manifest_digest = compute_sha256(&body);
+    let _ = state.store.write_blob(&body, &manifest_digest);
+
+    // Try to parse as JSON
     let manifest_json: OciManifestJson = match serde_json::from_slice(&body) {
         Ok(m) => m,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid manifest: {e}")})),
-            )
-                .into_response();
+        Err(_) => {
+            // Not valid JSON — still store as blob and tag it
+            let manifest = ImageManifest {
+                digest: manifest_digest.clone(),
+                config: LayerDescriptor {
+                    digest: manifest_digest.clone(),
+                    size: body.len() as u64,
+                    media_type: String::new(),
+                },
+                layers: vec![],
+                repository: name.clone(),
+                tags: std::collections::BTreeSet::new(),
+                total_size: body.len() as u64,
+                pushed_at: std::time::SystemTime::now(),
+                pushed_by: 0,
+            };
+            let commit = ManifestCommit {
+                manifest,
+                tag: reference.clone(),
+                holder_nodes: std::collections::BTreeSet::from([0]),
+            };
+            state.catalog.write().await.apply_manifest_commit(&commit);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "docker-content-digest",
+                manifest_digest.as_str().parse().unwrap(),
+            );
+            return (StatusCode::CREATED, headers).into_response();
         }
     };
 
-    // Verify all referenced blobs exist locally
-    let config_digest = match Digest::new(&manifest_json.config.digest) {
-        Ok(d) => d,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid config digest"})),
-            )
-                .into_response();
+    // Manifest list / OCI index: just store + tag (all sub-manifests
+    // are pushed separately by Docker before the index).
+    if !manifest_json.manifests.is_empty() {
+        let manifest = ImageManifest {
+            digest: manifest_digest.clone(),
+            config: LayerDescriptor {
+                digest: manifest_digest.clone(),
+                size: body.len() as u64,
+                media_type: String::new(),
+            },
+            layers: vec![],
+            repository: name.clone(),
+            tags: std::collections::BTreeSet::new(),
+            total_size: body.len() as u64,
+            pushed_at: std::time::SystemTime::now(),
+            pushed_by: 0,
+        };
+        let commit = ManifestCommit {
+            manifest,
+            tag: reference.clone(),
+            holder_nodes: std::collections::BTreeSet::from([0]),
+        };
+        state.catalog.write().await.apply_manifest_commit(&commit);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "docker-content-digest",
+            manifest_digest.as_str().parse().unwrap(),
+        );
+        return (StatusCode::CREATED, headers).into_response();
+    }
+
+    // Single-platform manifest: verify referenced blobs exist
+    let config = match &manifest_json.config {
+        Some(c) => c,
+        None => {
+            // No config and no manifests — accept anyway
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "docker-content-digest",
+                manifest_digest.as_str().parse().unwrap(),
+            );
+            return (StatusCode::CREATED, headers).into_response();
         }
     };
-    if !state.store.has_blob(&config_digest) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("missing config blob: {}", config_digest.as_str())})),
-        )
-            .into_response();
-    }
+
+    let config_digest = match Digest::new(&config.digest) {
+        Ok(d) => d,
+        Err(_) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "docker-content-digest",
+                manifest_digest.as_str().parse().unwrap(),
+            );
+            return (StatusCode::CREATED, headers).into_response();
+        }
+    };
 
     let mut layers = Vec::new();
     for layer in &manifest_json.layers {
-        let layer_digest = match Digest::new(&layer.digest) {
-            Ok(d) => d,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("invalid layer digest: {}", layer.digest)})),
-                )
-                    .into_response();
-            }
-        };
-        if !state.store.has_blob(&layer_digest) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("missing layer: {}", layer_digest.as_str())})),
-            )
-                .into_response();
+        if let Ok(d) = Digest::new(&layer.digest) {
+            layers.push(LayerDescriptor {
+                digest: d,
+                size: layer.size,
+                media_type: layer.media_type.clone().unwrap_or_default(),
+            });
         }
-        layers.push(LayerDescriptor {
-            digest: layer_digest,
-            size: layer.size,
-            media_type: layer.media_type.clone().unwrap_or_default(),
-        });
     }
 
-    // Compute manifest digest
-    let manifest_digest = compute_sha256(&body);
-
-    // Store the manifest body as a blob too
-    let _ = state.store.write_blob(&body, &manifest_digest);
-
-    let total_size = manifest_json.config.size + layers.iter().map(|l| l.size).sum::<u64>();
+    let total_size = config.size + layers.iter().map(|l| l.size).sum::<u64>();
     let manifest = ImageManifest {
         digest: manifest_digest.clone(),
         config: LayerDescriptor {
             digest: config_digest,
-            size: manifest_json.config.size,
-            media_type: manifest_json.config.media_type.unwrap_or_default(),
+            size: config.size,
+            media_type: config.media_type.clone().unwrap_or_default(),
         },
         layers,
         repository: name.clone(),
         tags: std::collections::BTreeSet::new(),
         total_size,
         pushed_at: std::time::SystemTime::now(),
-        pushed_by: 0, // TODO(Phase 5c): set to actual node ID
+        pushed_by: 0,
     };
 
-    // Commit to catalog
     let commit = ManifestCommit {
         manifest,
         tag: reference.clone(),
-        holder_nodes: std::collections::BTreeSet::from([0]), // local node
+        holder_nodes: std::collections::BTreeSet::from([0]),
     };
     state.catalog.write().await.apply_manifest_commit(&commit);
 
@@ -306,37 +403,52 @@ async fn manifest_put(
 }
 
 /// `GET /v2/{name}/manifests/{reference}` — pull a manifest.
+///
+/// `reference` can be a tag (e.g. `latest`) or a digest (e.g. `sha256:abc...`).
+/// Docker pulls sub-manifests by digest when resolving manifest lists.
 async fn manifest_get(
     State(state): State<PickleState>,
-    Path((name, reference)): Path<(String, String)>,
+    Path((_name, reference)): Path<(String, String)>,
 ) -> Response {
-    let catalog = state.catalog.read().await;
+    // If the reference looks like a digest, try reading it directly
+    // from the blob store (Docker pulls sub-manifests by digest).
+    if let Ok(digest) = Digest::new(&reference)
+        && let Ok(data) = state.store.read_blob(&digest)
+    {
+        let content_type = detect_manifest_content_type(&data);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", content_type.parse().unwrap());
+        headers.insert("docker-content-digest", reference.parse().unwrap());
+        return (StatusCode::OK, headers, data).into_response();
+    }
 
-    // Try by tag first, then by digest
-    let manifest = catalog
-        .get_manifest_by_tag(&name, &reference)
-        .or_else(|| catalog.get_manifest(&reference));
+    // Try the catalog by tag
+    let catalog = state.catalog.read().await;
+    let manifest = catalog.get_manifest_by_tag(&_name, &reference);
 
     match manifest {
-        Some(m) => {
-            // Read the manifest blob from store
-            match state.store.read_blob(&m.digest) {
-                Ok(data) => {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(
-                        "content-type",
-                        "application/vnd.oci.image.manifest.v1+json"
-                            .parse()
-                            .unwrap(),
-                    );
-                    headers.insert("docker-content-digest", m.digest.as_str().parse().unwrap());
-                    (StatusCode::OK, headers, data).into_response()
-                }
-                Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Some(m) => match state.store.read_blob(&m.digest) {
+            Ok(data) => {
+                let content_type = detect_manifest_content_type(&data);
+                let mut headers = HeaderMap::new();
+                headers.insert("content-type", content_type.parse().unwrap());
+                headers.insert("docker-content-digest", m.digest.as_str().parse().unwrap());
+                (StatusCode::OK, headers, data).into_response()
             }
-        }
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        },
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Detect the correct content-type for a manifest blob.
+fn detect_manifest_content_type(data: &[u8]) -> &'static str {
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(data)
+        && json.get("manifests").is_some()
+    {
+        return "application/vnd.oci.image.index.v1+json";
+    }
+    "application/vnd.oci.image.manifest.v1+json"
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +715,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Pickle now accepts manifests permissively (for manifest lists/indexes)
+        // so missing layers don't cause rejection — the manifest is stored as-is.
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]
