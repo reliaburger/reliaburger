@@ -615,8 +615,8 @@ pub async fn clean() -> Result<(), RelishError> {
 
     eprintln!("cleaning cargo build artefacts in test VM...");
 
-    let cmd = "du -sh /tmp/reliaburger-target-* 2>/dev/null && \
-               rm -rf /tmp/reliaburger-target-* && \
+    let cmd = "sudo du -sh /tmp/reliaburger-target-* 2>/dev/null && \
+               sudo rm -rf /tmp/reliaburger-target-* && \
                echo 'cleaned.' || echo 'nothing to clean'";
 
     let status = std::process::Command::new("limactl")
