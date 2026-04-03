@@ -119,6 +119,44 @@ After deletion, the node proposes a `GcReport` to Raft, which removes it from th
 
 Not every image is pushed explicitly. Your apps might reference `alpine:latest` or `nginx:1.25`. The first time any node needs an image that's not in Pickle, it pulls from Docker Hub (using the existing `oci-distribution` client from Phase 1), stores the layers locally, and commits the manifest to Raft. The next node to need the same image gets it from a peer — Docker Hub is never contacted again.
 
+## How it compares to Docker Hub
+
+Let's walk through what deploying an image looks like with Docker Hub versus Pickle.
+
+**Docker Hub workflow:**
+
+1. Build your image locally
+2. `docker login` (hope your credentials haven't expired)
+3. `docker tag myapp:v1 myorg/myapp:v1`
+4. `docker push myorg/myapp:v1`
+5. On every cluster node, `docker pull myorg/myapp:v1` (hope Docker Hub is up, hope you haven't hit the rate limit)
+6. If you're on a private repo, configure registry credentials on every node
+7. Set up network policies to allow outbound HTTPS to `registry-1.docker.io` from every node
+
+**Pickle workflow:**
+
+1. Build your image locally
+2. `docker push localhost:5000/myapp:v1` (Pickle's OCI API on the cluster)
+3. Done. Pickle replicates internally. Every node can pull from its peers.
+
+No login. No credentials to rotate. No rate limits. No outbound internet from worker nodes.
+
+Now, Docker Hub does things Pickle doesn't try to do. It's a public registry with millions of images. You can browse, search, read READMEs, check vulnerability scans. Pickle is a private cluster registry, not a community marketplace. For public base images like `alpine` or `nginx`, you still reference Docker Hub in your config. The pull-through cache handles the rest.
+
+The real comparison isn't features. It's operational burden. Docker Hub is a dependency you manage. Pickle is infrastructure you already have.
+
+## What happens when Docker Hub goes down
+
+It's happened before. In November 2020, Docker Hub had a major outage that broke CI/CD pipelines across the industry. In 2023, rate limiting changes caught teams off guard when their automated builds suddenly started failing with 429 responses. These aren't hypothetical risks.
+
+When your registry is external, your deploy pipeline inherits its uptime. Docker Hub goes down? You can't deploy. Your cloud provider's container registry has a bad day? Same story. You're at the mercy of someone else's infrastructure.
+
+With Pickle, the cluster *is* the registry. If the cluster is up, the registry is up. There's no separate SLA to track, no status page to monitor, no fallback to configure.
+
+And the pull-through cache makes this even better. The first time you deploy `nginx:1.25`, Pickle pulls it from Docker Hub and caches it. Every subsequent deploy of that image, on any node, comes from a cluster peer. Docker Hub could vanish entirely and your existing deployments wouldn't notice.
+
+Can you deploy a *brand new* Docker Hub image during an outage? No. But how often do you deploy something you've never deployed before versus something you've deployed a hundred times? In production, most deploys are updates to images you already have. Pickle keeps them all.
+
 ## Volume size enforcement
 
 Phase 1 added volume support with `VolumeSpec.size`, but the size field was ignored. Phase 5 enforces it.
