@@ -87,7 +87,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the Pickle OCI registry server
     let registry_addr = format!("0.0.0.0:{}", config.images.registry_port);
-    let blob_store = BlobStore::new(&config.storage.images);
+    let pickle_dir = if std::fs::create_dir_all(&config.storage.images).is_ok() {
+        config.storage.images.clone()
+    } else {
+        // Fall back to user-writable directory (e.g. on macOS without root)
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger")
+            .join("images");
+        std::fs::create_dir_all(&fallback).expect("failed to create pickle directory");
+        eprintln!(
+            "bun: using fallback image store at {} (cannot write to {})",
+            fallback.display(),
+            config.storage.images.display()
+        );
+        fallback
+    };
+    let blob_store = BlobStore::new(&pickle_dir);
     let pickle_state = PickleState {
         store: Arc::new(blob_store),
         catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
