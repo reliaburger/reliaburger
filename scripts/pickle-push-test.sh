@@ -2,8 +2,14 @@
 #
 # Live push/pull test for the Pickle OCI registry.
 #
-# Builds a tiny Docker image, pushes it to a local Pickle instance,
-# pulls it back, and verifies it runs. Requires Docker daemon.
+# macOS only — uses host.docker.internal (Docker Desktop) to reach
+# the host from inside the Docker VM. On Linux, Docker runs natively
+# and localhost works directly; a separate script would be needed.
+#
+# Prerequisites:
+#   - Docker Desktop running
+#   - "host.docker.internal:5050" in Docker's insecure-registries
+#     (Settings → Docker Engine → insecure-registries)
 #
 # Usage:
 #   ./scripts/pickle-push-test.sh          # starts bun automatically
