@@ -4,9 +4,10 @@
 //! health checks, and reports state to the cluster leader.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use reliaburger::bun::agent::BunAgent;
@@ -14,6 +15,9 @@ use reliaburger::bun::api;
 use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
+use reliaburger::pickle::api::PickleState;
+use reliaburger::pickle::store::BlobStore;
+use reliaburger::pickle::types::ManifestCatalog;
 
 #[derive(Parser)]
 #[command(name = "bun", version, about = "Reliaburger node agent")]
@@ -81,6 +85,27 @@ async fn main() -> anyhow::Result<()> {
             .ok();
     });
 
+    // Start the Pickle OCI registry server
+    let registry_addr = format!("0.0.0.0:{}", config.images.registry_port);
+    let blob_store = BlobStore::new(&config.storage.images);
+    let pickle_state = PickleState {
+        store: Arc::new(blob_store),
+        catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+    };
+    let pickle_app = reliaburger::pickle::api::router(pickle_state);
+    let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
+    println!("bun: Pickle registry listening on {registry_addr}");
+
+    let pickle_shutdown = shutdown.clone();
+    let pickle_handle = tokio::spawn(async move {
+        axum::serve(pickle_listener, pickle_app)
+            .with_graceful_shutdown(async move {
+                pickle_shutdown.cancelled().await;
+            })
+            .await
+            .ok();
+    });
+
     // Wait for SIGINT or SIGTERM
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -91,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Wait for everything to finish
-    let _ = tokio::join!(agent_handle, server_handle);
+    let _ = tokio::join!(agent_handle, server_handle, pickle_handle);
     println!("bun: shutdown complete");
 
     Ok(())
