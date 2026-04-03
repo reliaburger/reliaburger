@@ -48,24 +48,9 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
-# Check insecure registry is configured (Docker defaults to HTTPS)
-if ! docker info 2>/dev/null | grep -q "host.docker.internal:5050"; then
-    echo ""
-    echo "WARNING: host.docker.internal:5050 may not be configured as an insecure registry."
-    echo ""
-    echo "Docker defaults to HTTPS for all registries. To use Pickle over HTTP,"
-    echo "add host.docker.internal:5050 to Docker's insecure registries:"
-    echo ""
-    echo "  Docker Desktop: Settings → Docker Engine → add to insecure-registries"
-    echo "  Linux daemon:   /etc/docker/daemon.json"
-    echo ""
-    echo '  { "insecure-registries": ["host.docker.internal:5050"] }'
-    echo ""
-    echo "Then restart Docker and re-run this script."
-    echo ""
-    echo "Attempting push anyway (will fail if not configured)..."
-    echo ""
-fi
+# Note: Docker Desktop requires host.docker.internal:5050 in insecure-registries.
+# If push fails with "https" errors, add to Docker Desktop → Settings → Docker Engine:
+#   { "insecure-registries": ["host.docker.internal:5050"] }
 
 # Start bun if needed
 if ${START_BUN}; then
