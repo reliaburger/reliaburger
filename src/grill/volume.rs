@@ -58,8 +58,14 @@ impl VolumeManager {
             let size_bytes = parse_resource_value(size_str)
                 .map_err(|e| VolumeError::InvalidSize(format!("{size_str}: {e}")))?;
 
-            if cfg!(target_os = "linux") {
+            if cfg!(target_os = "linux") && is_root() {
                 self.setup_loop_mount(&host_path, size_bytes)?;
+            } else if cfg!(target_os = "linux") {
+                eprintln!(
+                    "warning: volume size enforcement requires root; \
+                     size limit {size_str} not enforced for {}",
+                    host_path.display()
+                );
             } else {
                 eprintln!(
                     "warning: volume size enforcement requires Linux; \
@@ -163,6 +169,18 @@ impl VolumeManager {
     }
 }
 
+/// Check if the current process is running as root.
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Parse a volume size string (e.g. "10Gi") into bytes.
 pub fn parse_volume_size(s: &str) -> Result<u64, VolumeError> {
     parse_resource_value(s).map_err(|e| VolumeError::InvalidSize(e.to_string()))
@@ -202,11 +220,12 @@ mod tests {
     }
 
     #[test]
-    fn create_managed_volume_with_size_on_non_linux() {
+    fn create_managed_volume_with_size_without_root() {
         let dir = tempfile::tempdir().unwrap();
         let vm = VolumeManager::new(dir.path());
 
-        // On macOS/CI, this creates a plain directory with a warning
+        // Without root (or on macOS), this creates a plain directory
+        // with a warning instead of a loop mount.
         let path = vm
             .create_managed_volume("default", "redis", Path::new("/data"), Some("10Gi"))
             .unwrap();
