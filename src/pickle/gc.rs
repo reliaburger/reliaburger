@@ -135,7 +135,6 @@ pub fn gc_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pickle::store::compute_sha256;
     use crate::pickle::types::{ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
     use std::collections::BTreeSet;
 

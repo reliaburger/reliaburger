@@ -436,7 +436,7 @@ fn generate_test_vm_yaml() -> String {
     arch: "x86_64"
 cpus: 4
 memory: "8GiB"
-disk: "20GiB"
+disk: "40GiB"
 mountType: "virtiofs"
 mounts:
   - location: "~"
@@ -555,6 +555,82 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
                 "tests failed with exit code {}",
                 status.code().unwrap_or(-1)
             ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Show disk usage inside the test VM.
+///
+/// Prints filesystem usage and the size of the cargo target directory.
+pub async fn disk() -> Result<(), RelishError> {
+    if !lima_available() {
+        return Err(RelishError::LimaNotFound);
+    }
+
+    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    if !list.lines().any(|l| l.trim() == TEST_VM_NAME) {
+        eprintln!("test VM ({TEST_VM_NAME}) does not exist — nothing to show");
+        return Ok(());
+    }
+
+    let cmd = "echo '=== Filesystem ===' && df -h / && \
+               echo && echo '=== Cargo target dirs ===' && \
+               du -sh /tmp/reliaburger-target-* 2>/dev/null || echo '(none)'";
+
+    let status = std::process::Command::new("limactl")
+        .args(["shell", TEST_VM_NAME, "bash", "-c", cmd])
+        .status()
+        .map_err(|e| RelishError::LimaError {
+            command: "disk usage".to_string(),
+            stderr: e.to_string(),
+        })?;
+
+    if !status.success() {
+        return Err(RelishError::LimaError {
+            command: "disk usage".to_string(),
+            stderr: "failed to query disk usage".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Clean cargo build artefacts inside the test VM.
+///
+/// Removes the VM-local target directories to free disk space without
+/// destroying the VM (which would require re-downloading the Rust
+/// toolchain and system packages).
+pub async fn clean() -> Result<(), RelishError> {
+    if !lima_available() {
+        return Err(RelishError::LimaNotFound);
+    }
+
+    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    if !list.lines().any(|l| l.trim() == TEST_VM_NAME) {
+        eprintln!("test VM ({TEST_VM_NAME}) does not exist — nothing to clean");
+        return Ok(());
+    }
+
+    eprintln!("cleaning cargo build artefacts in test VM...");
+
+    let cmd = "du -sh /tmp/reliaburger-target-* 2>/dev/null && \
+               rm -rf /tmp/reliaburger-target-* && \
+               echo 'cleaned.' || echo 'nothing to clean'";
+
+    let status = std::process::Command::new("limactl")
+        .args(["shell", TEST_VM_NAME, "bash", "-c", cmd])
+        .status()
+        .map_err(|e| RelishError::LimaError {
+            command: "clean".to_string(),
+            stderr: e.to_string(),
+        })?;
+
+    if !status.success() {
+        return Err(RelishError::LimaError {
+            command: "clean".to_string(),
+            stderr: "failed to clean artefacts".to_string(),
         });
     }
 

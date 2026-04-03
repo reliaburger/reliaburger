@@ -189,6 +189,10 @@ enum DevAction {
         /// Optional test name filter (passed to cargo test).
         filter: Option<String>,
     },
+    /// Show disk usage in the test VM.
+    Disk,
+    /// Clean cargo build artefacts in the test VM.
+    Clean,
 }
 
 #[tokio::main]
@@ -254,6 +258,8 @@ async fn main() -> ExitCode {
             DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
             DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
             DevAction::Test { filter } => reliaburger::relish::dev::test(filter.as_deref()).await,
+            DevAction::Disk => reliaburger::relish::dev::disk().await,
+            DevAction::Clean => reliaburger::relish::dev::clean().await,
         },
     };
 
