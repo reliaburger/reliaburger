@@ -161,11 +161,12 @@ async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), Relis
     Ok(())
 }
 
-/// Initialise a new project with starter config files.
+/// Initialise a new cluster with starter config files and PKI.
 ///
 /// Creates `reliaburger.toml` (node config) and `app.toml` (sample app)
-/// in the given directory. Refuses to overwrite existing files.
-pub fn init(dir: &Path) -> Result<(), RelishError> {
+/// in the given directory. Generates the CA hierarchy, age keypair,
+/// first node certificate, and a join token.
+pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishError> {
     let node_path = dir.join("reliaburger.toml");
     let app_path = dir.join("app.toml");
 
@@ -179,6 +180,14 @@ pub fn init(dir: &Path) -> Result<(), RelishError> {
             path: app_path.display().to_string(),
         });
     }
+
+    // Generate the security state (CAs, age keypair, join token)
+    let init_result = crate::sesame::init::initialize_cluster(cluster_name, node_id, dir)
+        .map_err(|e| RelishError::InitFailed(e.to_string()))?;
+
+    // Output the init summary to stderr (join token is sensitive)
+    let output = crate::sesame::init::format_init_output(&init_result);
+    eprint!("{output}");
 
     let node_config = crate::config::node::NodeConfig::default();
     let node_toml = format!(
@@ -394,6 +403,77 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Create a new API token (local operation — no agent needed).
+///
+/// Generates a token, hashes it with Argon2id, and prints the plaintext
+/// to stdout (shown once, never stored).
+pub fn token_create(
+    name: &str,
+    role_str: &str,
+    apps: Option<&str>,
+    namespaces: Option<&str>,
+    ttl_days: Option<u64>,
+) -> Result<(), RelishError> {
+    use crate::sesame::token::create_token;
+    use crate::sesame::types::{ApiRole, TokenScope};
+    use std::time::{Duration, SystemTime};
+
+    let role = match role_str {
+        "admin" => ApiRole::Admin,
+        "deployer" => ApiRole::Deployer,
+        "read-only" | "readonly" => ApiRole::ReadOnly,
+        other => {
+            return Err(RelishError::InitFailed(format!(
+                "unknown role: {other} (expected admin, deployer, or read-only)"
+            )));
+        }
+    };
+
+    let scope = TokenScope {
+        apps: apps.map(|a| a.split(',').map(|s| s.trim().to_string()).collect()),
+        namespaces: namespaces.map(|n| n.split(',').map(|s| s.trim().to_string()).collect()),
+    };
+
+    let expires_at = ttl_days.map(|days| SystemTime::now() + Duration::from_secs(days * 86400));
+
+    let created = create_token(name, role, scope, expires_at)
+        .map_err(|e| RelishError::InitFailed(e.to_string()))?;
+
+    eprintln!("Token created: {name}");
+    eprintln!("  Role: {role}");
+    if let Some(apps) = apps {
+        eprintln!("  Apps: {apps}");
+    }
+    if let Some(namespaces) = namespaces {
+        eprintln!("  Namespaces: {namespaces}");
+    }
+    if let Some(days) = ttl_days {
+        eprintln!("  TTL: {days} days");
+    }
+    eprintln!();
+    println!("{}", created.plaintext);
+
+    Ok(())
+}
+
+/// List API tokens (stub — requires agent for Raft-stored tokens).
+pub async fn token_list() -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.health().await?;
+    // TODO(Phase 4): fetch token list from agent
+    println!("no tokens configured (token list requires agent connection)");
+    Ok(())
+}
+
+/// Revoke an API token by name (stub — requires agent for Raft write).
+pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.health().await?;
+    // TODO(Phase 4): send revoke to agent
+    println!("token revocation requires agent connection (token: {name})");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,7 +578,7 @@ mod tests {
     #[test]
     fn init_creates_files() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path()).unwrap();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
         assert!(dir.path().join("reliaburger.toml").exists());
         assert!(dir.path().join("app.toml").exists());
     }
@@ -506,15 +586,15 @@ mod tests {
     #[test]
     fn init_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path()).unwrap();
-        let err = init(dir.path()).unwrap_err();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
+        let err = init(dir.path(), "test-cluster", "node-01").unwrap_err();
         assert!(matches!(err, RelishError::FileExists { .. }));
     }
 
     #[test]
     fn init_generated_config_parses() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path()).unwrap();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
 
         let node_content = std::fs::read_to_string(dir.path().join("reliaburger.toml")).unwrap();
         let _: crate::config::node::NodeConfig = toml::from_str(&node_content).unwrap();
@@ -522,6 +602,13 @@ mod tests {
         let app_content = std::fs::read_to_string(dir.path().join("app.toml")).unwrap();
         let config = Config::parse(&app_content).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn init_creates_sealed_root_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path(), "mycluster", "node-01").unwrap();
+        assert!(dir.path().join("mycluster-root-ca.age").exists());
     }
 
     #[tokio::test]

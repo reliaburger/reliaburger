@@ -59,11 +59,17 @@ enum Command {
         /// App name.
         app: String,
     },
-    /// Initialise a new project with starter config files.
+    /// Initialise a new cluster (generates CAs, age keypair, join token).
     Init {
         /// Directory to create config files in.
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// Cluster name.
+        #[arg(long, default_value = "default")]
+        cluster_name: String,
+        /// Node ID for this node.
+        #[arg(long, default_value = "node-01")]
+        node_id: String,
     },
     /// List cluster nodes and their gossip state.
     Nodes,
@@ -89,10 +95,44 @@ enum Command {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
     },
+    /// Manage API tokens.
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
     /// Manage a local dev cluster (Lima VMs).
     Dev {
         #[command(subcommand)]
         action: DevAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// Create a new API token.
+    Create {
+        /// Token name (e.g. "ci-deploy").
+        #[arg(long)]
+        name: String,
+        /// Role: admin, deployer, or read-only.
+        #[arg(long, default_value = "read-only")]
+        role: String,
+        /// Restrict to specific apps (comma-separated).
+        #[arg(long)]
+        apps: Option<String>,
+        /// Restrict to specific namespaces (comma-separated).
+        #[arg(long)]
+        namespaces: Option<String>,
+        /// TTL in days (e.g. 90).
+        #[arg(long)]
+        ttl_days: Option<u64>,
+    },
+    /// List all API tokens.
+    List,
+    /// Revoke an API token by name.
+    Revoke {
+        /// Token name to revoke.
+        name: String,
     },
 }
 
@@ -167,7 +207,11 @@ async fn main() -> ExitCode {
         } => commands::exec(app, command).await,
         Command::Inspect { ref name } => commands::inspect(name).await,
         Command::Stop { ref app } => commands::stop(app).await,
-        Command::Init { ref dir } => commands::init(dir),
+        Command::Init {
+            ref dir,
+            ref cluster_name,
+            ref node_id,
+        } => commands::init(dir, cluster_name, node_id),
         Command::Nodes => commands::nodes(cli.output).await,
         Command::Council => commands::council(cli.output).await,
         Command::Join {
@@ -177,6 +221,23 @@ async fn main() -> ExitCode {
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Token { action } => match &action {
+            TokenAction::Create {
+                name,
+                role,
+                apps,
+                namespaces,
+                ttl_days,
+            } => commands::token_create(
+                name,
+                role,
+                apps.as_deref(),
+                namespaces.as_deref(),
+                *ttl_days,
+            ),
+            TokenAction::List => commands::token_list().await,
+            TokenAction::Revoke { name } => commands::token_revoke(name).await,
+        },
         Command::Dev { action } => match &action {
             DevAction::Create {
                 nodes,
@@ -258,15 +319,37 @@ mod tests {
     #[test]
     fn parse_init_command() {
         let cli = parse(&["relish", "init"]).unwrap();
-        assert!(matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some(".")));
+        match cli.command {
+            Command::Init {
+                ref dir,
+                ref cluster_name,
+                ref node_id,
+            } => {
+                assert_eq!(dir.to_str(), Some("."));
+                assert_eq!(cluster_name, "default");
+                assert_eq!(node_id, "node-01");
+            }
+            _ => panic!("expected Init command"),
+        }
     }
 
     #[test]
     fn parse_init_with_dir() {
         let cli = parse(&["relish", "init", "/tmp/myproject"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Init { ref dir } if dir.to_str() == Some("/tmp/myproject"))
+            matches!(cli.command, Command::Init { ref dir, .. } if dir.to_str() == Some("/tmp/myproject"))
         );
+    }
+
+    #[test]
+    fn parse_init_with_cluster_name() {
+        let cli = parse(&["relish", "init", "--cluster-name", "prod"]).unwrap();
+        match cli.command {
+            Command::Init {
+                ref cluster_name, ..
+            } => assert_eq!(cluster_name, "prod"),
+            _ => panic!("expected Init command"),
+        }
     }
 
     #[test]

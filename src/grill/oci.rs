@@ -170,14 +170,40 @@ pub fn generate_oci_spec(
 }
 
 fn build_env(spec: &AppSpec) -> Vec<String> {
+    build_env_with_decryptor(spec, None)
+}
+
+/// A callback for decrypting `ENC[AGE:...]` values.
+///
+/// Accepts the encrypted string (including the `ENC[AGE:...]` wrapper)
+/// and returns the decrypted plaintext. If decryption fails, the error
+/// message is used instead (prefixed with `DECRYPT_ERROR:`).
+pub type SecretDecryptor = Box<dyn Fn(&str) -> Result<String, String>>;
+
+/// Build env vars with optional secret decryption.
+///
+/// When a `SecretDecryptor` is provided, `ENC[AGE:...]` values are
+/// decrypted before injection. Without a decryptor, they're passed
+/// through as literal strings (pre-Phase 4 behaviour).
+pub fn build_env_with_decryptor(
+    spec: &AppSpec,
+    decryptor: Option<&SecretDecryptor>,
+) -> Vec<String> {
     let mut env = Vec::new();
     for (key, value) in &spec.env {
         match value {
             EnvValue::Plain(v) => env.push(format!("{key}={v}")),
-            // TODO(Phase 4): decrypt via Sesame PKI. For now, pass
-            // the encrypted blob through. The container will see the
-            // literal ENC[AGE:...] string until Sesame is implemented.
-            EnvValue::Encrypted(v) => env.push(format!("{key}={v}")),
+            EnvValue::Encrypted(v) => {
+                if let Some(decrypt) = decryptor {
+                    match decrypt(v) {
+                        Ok(plaintext) => env.push(format!("{key}={plaintext}")),
+                        Err(e) => env.push(format!("{key}=DECRYPT_ERROR:{e}")),
+                    }
+                } else {
+                    // No decryptor available — pass through as-is
+                    env.push(format!("{key}={v}"));
+                }
+            }
         }
     }
     env
@@ -804,5 +830,58 @@ mod tests {
             .find(|n| n.ns_type == "network")
             .unwrap();
         assert_eq!(net_ns.path.as_deref(), Some("/var/run/netns/rb-web-0"));
+    }
+
+    // -- Secret decryption ---------------------------------------------------
+
+    #[test]
+    fn build_env_with_decryptor_decrypts_secrets() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            [env]
+            PLAIN = "hello"
+            SECRET = "ENC[AGE:encrypted-data]"
+            "#,
+        )
+        .unwrap();
+
+        let decryptor: SecretDecryptor = Box::new(|_encrypted| Ok("decrypted-value".to_string()));
+        let env = build_env_with_decryptor(&spec, Some(&decryptor));
+
+        assert!(env.contains(&"PLAIN=hello".to_string()));
+        assert!(env.contains(&"SECRET=decrypted-value".to_string()));
+    }
+
+    #[test]
+    fn build_env_with_decryptor_handles_error() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            [env]
+            SECRET = "ENC[AGE:bad-data]"
+            "#,
+        )
+        .unwrap();
+
+        let decryptor: SecretDecryptor = Box::new(|_encrypted| Err("key not found".to_string()));
+        let env = build_env_with_decryptor(&spec, Some(&decryptor));
+
+        assert!(env[0].starts_with("SECRET=DECRYPT_ERROR:"));
+    }
+
+    #[test]
+    fn build_env_without_decryptor_passes_through() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            [env]
+            SECRET = "ENC[AGE:abc123]"
+            "#,
+        )
+        .unwrap();
+
+        let env = build_env_with_decryptor(&spec, None);
+        assert!(env.contains(&"SECRET=ENC[AGE:abc123]".to_string()));
     }
 }
