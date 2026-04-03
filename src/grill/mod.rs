@@ -19,6 +19,7 @@ pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
 pub mod state;
+pub mod volume;
 
 use std::fmt;
 
