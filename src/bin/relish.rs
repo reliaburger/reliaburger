@@ -95,6 +95,8 @@ enum Command {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
     },
+    /// List images in the local Pickle registry.
+    Images,
     /// Manage API tokens.
     Token {
         #[command(subcommand)]
@@ -187,6 +189,10 @@ enum DevAction {
         /// Optional test name filter (passed to cargo test).
         filter: Option<String>,
     },
+    /// Show disk usage in the test VM.
+    Disk,
+    /// Clean cargo build artefacts in the test VM.
+    Clean,
 }
 
 #[tokio::main]
@@ -221,6 +227,7 @@ async fn main() -> ExitCode {
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Images => commands::images().await,
         Command::Token { action } => match &action {
             TokenAction::Create {
                 name,
@@ -251,6 +258,8 @@ async fn main() -> ExitCode {
             DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
             DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
             DevAction::Test { filter } => reliaburger::relish::dev::test(filter.as_deref()).await,
+            DevAction::Disk => reliaburger::relish::dev::disk().await,
+            DevAction::Clean => reliaburger::relish::dev::clean().await,
         },
     };
 
@@ -507,5 +516,11 @@ mod tests {
             } => assert_eq!(node, "reliaburger-1"),
             _ => panic!("expected Dev Shell command"),
         }
+    }
+
+    #[test]
+    fn parse_images_command() {
+        let cli = parse(&["relish", "images"]).unwrap();
+        assert!(matches!(cli.command, Command::Images));
     }
 }

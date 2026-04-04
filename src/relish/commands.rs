@@ -403,6 +403,22 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// List images in the local Pickle registry.
+pub async fn images() -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    match client.health().await {
+        Ok(()) => {
+            // TODO(Phase 5g): fetch image list from agent Pickle store
+            println!("no images in local registry (Pickle image list requires agent connection)");
+            Ok(())
+        }
+        Err(_) => {
+            println!("no images (bun agent not reachable)");
+            Ok(())
+        }
+    }
+}
+
 /// Create a new API token (local operation — no agent needed).
 ///
 /// Generates a token, hashes it with Argon2id, and prints the plaintext

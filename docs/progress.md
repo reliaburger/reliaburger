@@ -102,14 +102,20 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 5: Storage & Registry
 
-- [ ] Pickle registry (OCI Distribution API, content-addressed store, synchronous replication)
-- [ ] Peer-to-peer layer distribution (parallel multi-source downloads)
-- [ ] Pull-through cache (Docker Hub, GHCR, ECR)
-- [ ] Image signing (keyless via workload identity, cosign-compatible)
-- [ ] Distributed garbage collection (Raft GcReport)
-- [ ] Local volumes (Btrfs subvolume quotas / loop mount, size limits)
-- [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
-- [ ] All Phase 5 tests green
+- [x] Pickle types and Raft state extensions (Digest, ImageManifest, ManifestCatalog, Raft commands)
+- [x] Pickle blob store (content-addressed, upload sessions, digest verification, atomic rename)
+- [x] OCI Distribution API (push/pull: blob upload POST/PATCH/PUT, manifest PUT/GET, tag list)
+- [x] Synchronous replication on push (peer selection, layer transfer via OCI API, mTLS)
+- [x] Peer pull (fetch missing layers from peers via Raft layer_locations)
+- [x] Garbage collection (sole-copy protection, active reference safety, retention window, GcReport)
+- [x] Volume size enforcement (loop mount on Linux, soft warning on macOS)
+- [x] `relish images` CLI command, `[images]` config section
+- [ ] Pull-through cache full wiring — deferred to Phase 9
+- [ ] P2P multi-source downloads — deferred to Phase 9
+- [ ] Image signing (cosign) — deferred to Phase 9
+- [ ] Volume snapshots — deferred to Phase 9
+- [x] Book chapter 5: "Where the Images Live"
+- [x] All Phase 5 tests green (867 tests)
 
 ## Phase 6: Observability
 

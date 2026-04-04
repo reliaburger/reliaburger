@@ -15,6 +15,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::app::AppSpec;
 use crate::meat::types::{AppId, Placement, SchedulingDecision};
+use crate::pickle::types::{
+    DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
+};
 
 // ---------------------------------------------------------------------------
 // openraft type configuration
@@ -98,6 +101,14 @@ pub enum RaftRequest {
     SchedulingDecision(SchedulingDecision),
     /// Set a cluster-wide configuration key.
     ConfigSet { key: String, value: String },
+    /// Commit an image manifest to the Pickle registry catalog.
+    ManifestCommit(ManifestCommit),
+    /// Update which nodes hold copies of specific layers.
+    UpdateLayerLocations(UpdateLayerLocations),
+    /// Report that a node deleted layers during garbage collection.
+    GcReport(GcReport),
+    /// Delete a tag from the Pickle manifest catalog.
+    DeleteTag(DeleteTag),
     /// No-op entry (used for leader commit on election).
     Noop,
 }
@@ -139,6 +150,9 @@ pub struct DesiredState {
     pub scheduling: HashMap<AppId, Vec<Placement>>,
     /// Cluster-wide configuration key-value pairs.
     pub config: HashMap<String, String>,
+    /// Pickle image registry manifest catalog.
+    #[serde(default)]
+    pub manifest_catalog: ManifestCatalog,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -256,6 +270,46 @@ mod tests {
                 value: "100".to_string(),
             },
             RaftRequest::Noop,
+            RaftRequest::ManifestCommit(ManifestCommit {
+                manifest: crate::pickle::types::ImageManifest {
+                    digest: crate::pickle::types::Digest::from_sha256_hex(
+                        "0000000000000000000000000000000000000000000000000000000000000001",
+                    ),
+                    config: crate::pickle::types::LayerDescriptor {
+                        digest: crate::pickle::types::Digest::from_sha256_hex(
+                            "0000000000000000000000000000000000000000000000000000000000000002",
+                        ),
+                        size: 1024,
+                        media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+                    },
+                    layers: vec![],
+                    repository: "myapp".to_string(),
+                    tags: std::collections::BTreeSet::new(),
+                    total_size: 1024,
+                    pushed_at: std::time::SystemTime::UNIX_EPOCH,
+                    pushed_by: 1,
+                },
+                tag: "latest".to_string(),
+                holder_nodes: std::collections::BTreeSet::from([1, 2]),
+            }),
+            RaftRequest::UpdateLayerLocations(UpdateLayerLocations {
+                updates: vec![(
+                    crate::pickle::types::Digest::from_sha256_hex(
+                        "0000000000000000000000000000000000000000000000000000000000000003",
+                    ),
+                    std::collections::BTreeSet::from([1, 2, 3]),
+                )],
+            }),
+            RaftRequest::GcReport(GcReport {
+                node_id: 2,
+                deleted_layers: vec![crate::pickle::types::Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000004",
+                )],
+            }),
+            RaftRequest::DeleteTag(DeleteTag {
+                repository: "myapp".to_string(),
+                tag: "old".to_string(),
+            }),
         ];
 
         for req in &requests {
