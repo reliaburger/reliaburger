@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::config::Config;
+use crate::ketchup::store::KetchupStore;
+use crate::mayo::alert::AlertEvaluator;
 use crate::mayo::store::MayoStore;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
@@ -30,11 +32,23 @@ pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
     /// Shared metrics store (read-heavy, queries don't block the agent).
     pub mayo: Option<Arc<RwLock<MayoStore>>>,
+    /// Shared log store.
+    pub ketchup: Option<Arc<RwLock<KetchupStore>>>,
+    /// Alert evaluator.
+    pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
 }
 
 /// Build the API router.
 pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoStore>>>) -> Router {
-    let state = ApiState { cmd_tx, mayo };
+    let alerts = mayo
+        .as_ref()
+        .map(|_| Arc::new(RwLock::new(AlertEvaluator::with_defaults())));
+    let state = ApiState {
+        cmd_tx,
+        mayo,
+        ketchup: None,
+        alerts,
+    };
 
     Router::new()
         .route("/v1/health", get(health_handler))
@@ -56,6 +70,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoSt
         .route("/v1/metrics", get(metrics_query_handler))
         .route("/v1/metrics/summary", get(metrics_summary_handler))
         .route("/v1/metrics/keys", get(metrics_keys_handler))
+        .route("/v1/alerts", get(alerts_handler))
         .with_state(state)
 }
 
@@ -715,6 +730,16 @@ async fn metrics_summary_handler(State(state): State<ApiState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `GET /v1/alerts` — list all alert statuses.
+async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let Some(alerts) = &state.alerts else {
+        return Json(serde_json::json!({"alerts": []}));
+    };
+    let evaluator = alerts.read().await;
+    let statuses = evaluator.all_statuses();
+    Json(serde_json::json!({"alerts": statuses}))
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.

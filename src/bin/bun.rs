@@ -15,6 +15,9 @@ use reliaburger::bun::api;
 use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
+use reliaburger::ketchup::store::KetchupStore;
+use reliaburger::mayo::collector::SystemCollector;
+use reliaburger::mayo::store::MayoStore;
 use reliaburger::pickle::api::PickleState;
 use reliaburger::pickle::store::BlobStore;
 use reliaburger::pickle::types::ManifestCatalog;
@@ -70,11 +73,68 @@ async fn main() -> anyhow::Result<()> {
         agent.run().await;
     });
 
+    // Create observability stores
+    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
+        config.storage.metrics.clone()
+    } else {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger")
+            .join("metrics");
+        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
+        fallback
+    };
+    let mayo_store = Arc::new(RwLock::new(MayoStore::new(metrics_dir)));
+
+    let logs_dir = if std::fs::create_dir_all(&config.storage.logs).is_ok() {
+        config.storage.logs.clone()
+    } else {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger")
+            .join("logs");
+        std::fs::create_dir_all(&fallback).expect("failed to create logs directory");
+        fallback
+    };
+    let _ketchup_store = Arc::new(RwLock::new(KetchupStore::new(logs_dir)));
+
+    println!("bun: observability enabled (metrics + logs + alerts)");
+
+    // Spawn metrics collection task
+    let collection_mayo = Arc::clone(&mayo_store);
+    let collection_interval = config.metrics.collection_interval_secs;
+    let collection_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut collector = SystemCollector::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
+        let mut flush_counter = 0u64;
+        loop {
+            tokio::select! {
+                _ = collection_shutdown.cancelled() => break,
+                _ = tick.tick() => {
+                    collector.refresh();
+                    let metrics = collector.collect_node_metrics();
+                    let mut store = collection_mayo.write().await;
+                    for m in &metrics {
+                        store.insert_now(&m.key, m.value);
+                    }
+                    flush_counter += 1;
+                    // Flush to Parquet every 6 ticks (~60s at 10s interval)
+                    if flush_counter.is_multiple_of(6)
+                        && let Err(e) = store.flush().await
+                    {
+                        eprintln!("bun: metrics flush error: {e}");
+                    }
+                }
+            }
+        }
+    });
+
     // Start the API server
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
-    let app = api::router(cmd_tx, None); // Mayo wired in Step 6d agent integration
+    let app = api::router(cmd_tx, Some(Arc::clone(&mayo_store)));
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)
