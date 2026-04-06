@@ -75,7 +75,17 @@ curl -sf http://localhost:9117/v1/alerts | python3 -m json.tool 2>/dev/null || \
     curl -sf http://localhost:9117/v1/alerts
 
 echo ""
+echo "--- SQL log query (note: same DataFusion engine as metrics) ---"
+curl -sf -G --data-urlencode 'q=SELECT timestamp,app,line FROM logs ORDER BY timestamp LIMIT 5' http://localhost:9117/v1/logs/sql | python3 -m json.tool 2>/dev/null || \
+    curl -sf -G --data-urlencode 'q=SELECT timestamp,app,line FROM logs ORDER BY timestamp LIMIT 5' http://localhost:9117/v1/logs/sql
+
+echo ""
 echo "=== Dashboard available at: http://localhost:9117/ ==="
+echo ""
+echo "Try these SQL queries:"
+echo "  Metrics:  curl 'http://localhost:9117/v1/metrics?name=node_cpu_usage_percent'"
+echo "  Logs:     curl -G --data-urlencode 'q=SELECT timestamp,app,line FROM logs LIMIT 5' http://localhost:9117/v1/logs/sql"
+echo '  Log grep: curl -G --data-urlencode "q=SELECT timestamp,line FROM logs WHERE line LIKE '"'"'%ERROR%'"'"' LIMIT 5" http://localhost:9117/v1/logs/sql'
 echo ""
 echo "Press Ctrl+C to stop."
 wait "${BUN_PID}"

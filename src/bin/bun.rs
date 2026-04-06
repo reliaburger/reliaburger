@@ -15,6 +15,7 @@ use reliaburger::bun::api;
 use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
+use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::store::KetchupStore;
 use reliaburger::mayo::collector::SystemCollector;
 use reliaburger::mayo::store::MayoStore;
@@ -96,7 +97,29 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&fallback).expect("failed to create logs directory");
         fallback
     };
-    let _ketchup_store = Arc::new(RwLock::new(KetchupStore::new(logs_dir)));
+    let _ketchup_store = Arc::new(RwLock::new(KetchupStore::new(&logs_dir)));
+
+    // Create Arrow/DataFusion log store (SQL queries over logs)
+    let log_store_dir = logs_dir.join("parquet");
+    std::fs::create_dir_all(&log_store_dir).ok();
+    // Seed the log store with startup events so it's never empty
+    let mut log_store_inner = LogStore::new(log_store_dir);
+    log_store_inner.append(
+        "bun",
+        "system",
+        reliaburger::ketchup::types::LogStream::Stdout,
+        &format!(
+            "reliaburger node agent v{} started",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+    log_store_inner.append(
+        "bun",
+        "system",
+        reliaburger::ketchup::types::LogStream::Stdout,
+        &format!("runtime: {}", cli.runtime),
+    );
+    let log_store = Arc::new(RwLock::new(log_store_inner));
 
     println!("bun: observability enabled (metrics + logs + alerts)");
 
@@ -130,11 +153,33 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Spawn log store flush task (every 60s)
+    let log_flush_store = Arc::clone(&log_store);
+    let log_flush_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = log_flush_shutdown.cancelled() => break,
+                _ = tick.tick() => {
+                    let mut store = log_flush_store.write().await;
+                    if let Err(e) = store.flush().await {
+                        eprintln!("bun: log flush error: {e}");
+                    }
+                }
+            }
+        }
+    });
+
     // Start the API server
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
-    let app = api::router(cmd_tx, Some(Arc::clone(&mayo_store)));
+    let app = api::router(
+        cmd_tx,
+        Some(Arc::clone(&mayo_store)),
+        Some(Arc::clone(&log_store)),
+    );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)

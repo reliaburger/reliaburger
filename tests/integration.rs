@@ -40,7 +40,7 @@ impl TestHarness {
         // Bind API to ephemeral port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = api::router(cmd_tx.clone(), None);
+        let app = api::router(cmd_tx.clone(), None, None);
         let server_shutdown = shutdown.clone();
 
         tokio::spawn(async move {
