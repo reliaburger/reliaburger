@@ -6,5 +6,6 @@
 //! InfluxDB IOx.
 
 pub mod collector;
+pub mod scrape;
 pub mod store;
 pub mod types;

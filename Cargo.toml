@@ -59,6 +59,7 @@ base64 = "0.22"
 datafusion = "45"
 object_store = { version = "0.12", features = ["fs"] }
 sysinfo = "0.33"
+prometheus-parse = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", optional = true }
