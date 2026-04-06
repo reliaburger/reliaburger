@@ -519,6 +519,8 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
     // Pass through the cargo env and HOME so rustup/cargo work.
     // Use --test-threads=1 because netns/veth tests can't run in
     // parallel (they share the host network namespace).
+    // Use -j 2 to limit parallel compile/link jobs — DataFusion + Arrow
+    // produce large binaries and the linker can OOM the VM at -j 4.
     let mut test_cmd = format!(
         "cd {repo_path} && source $HOME/.cargo/env && \
          mkdir -p {vm_target} && \
@@ -527,7 +529,7 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
          RELIABURGER_RUNC_TESTS=1 \
          RELIABURGER_NETNS_TESTS=1 \
          RELIABURGER_EBPF_TESTS=1 \
-         cargo test --features ebpf"
+         cargo test -j 2 --features ebpf"
     );
 
     if let Some(f) = filter {

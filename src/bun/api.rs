@@ -7,7 +7,7 @@
 /// via Server-Sent Events (SSE).
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -16,7 +16,14 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::brioche::dashboard::{DashboardApp, DashboardData, render_dashboard};
 use crate::config::Config;
+use crate::ketchup::store::KetchupStore;
+use crate::mayo::alert::AlertEvaluator;
+use crate::mayo::store::MayoStore;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -24,13 +31,28 @@ use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 #[derive(Clone)]
 pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
+    /// Shared metrics store (read-heavy, queries don't block the agent).
+    pub mayo: Option<Arc<RwLock<MayoStore>>>,
+    /// Shared log store.
+    pub ketchup: Option<Arc<RwLock<KetchupStore>>>,
+    /// Alert evaluator.
+    pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
 }
 
 /// Build the API router.
-pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
-    let state = ApiState { cmd_tx };
+pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoStore>>>) -> Router {
+    let alerts = mayo
+        .as_ref()
+        .map(|_| Arc::new(RwLock::new(AlertEvaluator::with_defaults())));
+    let state = ApiState {
+        cmd_tx,
+        mayo,
+        ketchup: None,
+        alerts,
+    };
 
     Router::new()
+        .route("/", get(dashboard_handler))
         .route("/v1/health", get(health_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
@@ -47,6 +69,10 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>) -> Router {
         .route("/v1/resolve", get(resolve_all_handler))
         .route("/v1/resolve/{name}", get(resolve_handler))
         .route("/v1/routes", get(routes_handler))
+        .route("/v1/metrics", get(metrics_query_handler))
+        .route("/v1/metrics/summary", get(metrics_summary_handler))
+        .route("/v1/metrics/keys", get(metrics_keys_handler))
+        .route("/v1/alerts", get(alerts_handler))
         .with_state(state)
 }
 
@@ -621,6 +647,163 @@ async fn routes_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Metrics endpoints (Mayo)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MetricsQueryParams {
+    name: Option<String>,
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+/// `GET /v1/metrics?name=X&start=S&end=E` — query time-series data.
+async fn metrics_query_handler(
+    State(state): State<ApiState>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    let Some(mayo) = &state.mayo else {
+        return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
+    };
+
+    let store = mayo.read().await;
+    let name = params.name.as_deref().unwrap_or("*");
+    let start = params.start.unwrap_or(0);
+    let end = params.end.unwrap_or(u64::MAX);
+
+    if name == "*" {
+        let sql = format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE timestamp >= {start} AND timestamp <= {end} \
+             ORDER BY timestamp LIMIT 10000"
+        );
+        match store.query_sql(&sql).await {
+            Ok(results) => {
+                let data: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|(ts, name, labels, val)| {
+                        serde_json::json!({"timestamp": ts, "metric_name": name, "labels": labels, "value": val})
+                    })
+                    .collect();
+                Json(data).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        match store.query(name, start, end).await {
+            Ok(results) => {
+                let data: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|(ts, name, labels, val)| {
+                        serde_json::json!({"timestamp": ts, "metric_name": name, "labels": labels, "value": val})
+                    })
+                    .collect();
+                Json(data).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// `GET /v1/metrics/summary` — latest value for each metric.
+async fn metrics_summary_handler(State(state): State<ApiState>) -> Response {
+    let Some(mayo) = &state.mayo else {
+        return Json(serde_json::json!([])).into_response();
+    };
+
+    let store = mayo.read().await;
+    match store.metric_names().await {
+        Ok(names) => {
+            // Return the list of known metrics (full summary requires more complex SQL)
+            Json(serde_json::json!({"metrics": names})).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /` — serve the Brioche cluster overview dashboard.
+async fn dashboard_handler(State(state): State<ApiState>) -> Response {
+    // Gather app statuses
+    let (tx, rx) = oneshot::channel();
+    let _ = state
+        .cmd_tx
+        .send(AgentCommand::Status { response: tx })
+        .await;
+    let statuses = rx.await.unwrap_or_default();
+
+    let apps: Vec<DashboardApp> = statuses
+        .iter()
+        .map(|s| DashboardApp {
+            name: s.app_name.clone(),
+            namespace: s.namespace.clone(),
+            instances_running: 1,
+            instances_desired: 1,
+            state: s.state.clone(),
+        })
+        .collect();
+
+    let alert_count = if let Some(ref alerts) = state.alerts {
+        alerts.read().await.firing_alerts().len()
+    } else {
+        0
+    };
+
+    let data = DashboardData {
+        cluster_name: String::new(),
+        node_count: 1,
+        app_count: apps.len(),
+        alert_count,
+        apps,
+        nodes: vec![],
+        alerts: vec![],
+    };
+
+    let html = render_dashboard(&data);
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+    (StatusCode::OK, headers, html).into_response()
+}
+
+/// `GET /v1/alerts` — list all alert statuses.
+async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let Some(alerts) = &state.alerts else {
+        return Json(serde_json::json!({"alerts": []}));
+    };
+    let evaluator = alerts.read().await;
+    let statuses = evaluator.all_statuses();
+    Json(serde_json::json!({"alerts": statuses}))
+}
+
+/// `GET /v1/metrics/keys` — list all distinct metric names.
+async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
+    let Some(mayo) = &state.mayo else {
+        return Json(serde_json::json!({"keys": []})).into_response();
+    };
+
+    let store = mayo.read().await;
+    match store.metric_names().await {
+        Ok(names) => Json(serde_json::json!({"keys": names})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,7 +828,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx);
+        let app = router(cmd_tx, None);
         (app, shutdown)
     }
 
@@ -744,7 +927,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone());
+        let app = router(cmd_tx.clone(), None);
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);

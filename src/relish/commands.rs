@@ -403,6 +403,34 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Show live resource usage for all apps and nodes.
+pub async fn top() -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let statuses = client.status().await?;
+
+    if statuses.is_empty() {
+        println!("no workloads running");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<12} {:<10} {:<10} {:<10}",
+        "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+    );
+    for s in &statuses {
+        let pid = s
+            .pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<20} {:<12} {:<10} {:<10} {:<10}",
+            s.app_name, s.namespace, s.state, pid, s.restart_count
+        );
+    }
+
+    Ok(())
+}
+
 /// List images in the local Pickle registry.
 pub async fn images() -> Result<(), RelishError> {
     let client = BunClient::default_local();

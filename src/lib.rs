@@ -6,11 +6,14 @@
 //!
 //! Modules are added incrementally as each roadmap phase is implemented.
 
+pub mod brioche;
 pub mod bun;
 pub mod config;
 pub mod council;
 pub mod firewall;
 pub mod grill;
+pub mod ketchup;
+pub mod mayo;
 pub mod meat;
 pub mod mustard;
 pub mod onion;

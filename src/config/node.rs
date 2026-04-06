@@ -20,7 +20,8 @@ pub struct NodeConfig {
     pub reporting_tree: ReportingTreeSection,
     pub reconstruction: ReconstructionSection,
     pub images: ImagesSection,
-    // TODO(Phase 6): logs, metrics sections
+    pub metrics: MetricsSection,
+    pub logs: LogsSection,
     // TODO(Phase 3): ingress section
     // TODO(Phase 8): process_workloads section
     // TODO(Phase 9): upgrades section
@@ -234,6 +235,54 @@ impl Default for ImagesSection {
     }
 }
 
+/// Metrics collection and storage configuration (Mayo).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsSection {
+    /// How often to collect system and process metrics (seconds).
+    pub collection_interval_secs: u64,
+    /// Days to retain metric data before pruning.
+    pub retention_days: u32,
+    /// How often to scrape Prometheus /metrics endpoints (seconds).
+    pub scrape_interval_secs: u64,
+    /// Enable built-in alert evaluation.
+    pub alerts_enabled: bool,
+    /// Object store URL for metric persistence. Empty = local filesystem.
+    /// Set to `s3://bucket/prefix` for S3-backed storage.
+    pub object_store_url: String,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            collection_interval_secs: 10,
+            retention_days: 7,
+            scrape_interval_secs: 30,
+            alerts_enabled: true,
+            object_store_url: String::new(),
+        }
+    }
+}
+
+/// Log collection configuration (Ketchup).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogsSection {
+    /// Days to retain log files before deletion.
+    pub retention_days: u32,
+    /// Maximum size of a single log file in MB before rotation.
+    pub max_file_size_mb: u64,
+}
+
+impl Default for LogsSection {
+    fn default() -> Self {
+        Self {
+            retention_days: 7,
+            max_file_size_mb: 100,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -332,5 +381,51 @@ mod tests {
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.storage.data, PathBuf::from("/opt/reliaburger/data"));
         assert_eq!(nc.storage.images, PathBuf::from("/opt/reliaburger/images"));
+    }
+
+    #[test]
+    fn parse_metrics_section_defaults() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.metrics.collection_interval_secs, 10);
+        assert_eq!(nc.metrics.retention_days, 7);
+        assert_eq!(nc.metrics.scrape_interval_secs, 30);
+        assert!(nc.metrics.alerts_enabled);
+        assert!(nc.metrics.object_store_url.is_empty());
+    }
+
+    #[test]
+    fn parse_metrics_section_custom() {
+        let toml_str = r#"
+            [metrics]
+            collection_interval_secs = 5
+            retention_days = 30
+            scrape_interval_secs = 15
+            alerts_enabled = false
+            object_store_url = "s3://my-bucket/metrics"
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.metrics.collection_interval_secs, 5);
+        assert_eq!(nc.metrics.retention_days, 30);
+        assert_eq!(nc.metrics.object_store_url, "s3://my-bucket/metrics");
+        assert!(!nc.metrics.alerts_enabled);
+    }
+
+    #[test]
+    fn parse_logs_section_defaults() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.logs.retention_days, 7);
+        assert_eq!(nc.logs.max_file_size_mb, 100);
+    }
+
+    #[test]
+    fn parse_logs_section_custom() {
+        let toml_str = r#"
+            [logs]
+            retention_days = 14
+            max_file_size_mb = 500
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.logs.retention_days, 14);
+        assert_eq!(nc.logs.max_file_size_mb, 500);
     }
 }
