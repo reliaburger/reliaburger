@@ -175,7 +175,48 @@ impl LogStore {
         Ok(ctx)
     }
 
-    /// Query logs using SQL.
+    /// Query logs using SQL and return raw JSON rows.
+    ///
+    /// Unlike `query_sql()`, this returns arbitrary columns as JSON
+    /// objects, so `SELECT timestamp, line FROM logs` works without
+    /// requiring all 5 columns.
+    pub async fn query_sql_json(&self, sql: &str) -> Result<Vec<serde_json::Value>, KetchupError> {
+        let ctx = self.session().await?;
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let schema = batch.schema();
+            for row in 0..batch.num_rows() {
+                let mut obj = serde_json::Map::new();
+                for (col_idx, field) in schema.fields().iter().enumerate() {
+                    let col = batch.column(col_idx);
+                    let value = if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+                        serde_json::Value::Number(arr.value(row).into())
+                    } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                        serde_json::Value::String(arr.value(row).to_string())
+                    } else {
+                        serde_json::Value::String(format!("{:?}", col))
+                    };
+                    obj.insert(field.name().clone(), value);
+                }
+                results.push(serde_json::Value::Object(obj));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Query logs using SQL, returning structured LogEntry results.
+    /// Requires the query to return all 5 columns in schema order.
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
         let ctx = self.session().await?;
         let df = ctx

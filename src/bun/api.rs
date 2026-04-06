@@ -804,20 +804,8 @@ async fn logs_sql_handler(
     };
 
     let store = log_store.read().await;
-    match store.query_sql(sql).await {
-        Ok(entries) => {
-            let data: Vec<serde_json::Value> = entries
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "timestamp": e.timestamp,
-                        "stream": format!("{:?}", e.stream).to_lowercase(),
-                        "line": e.line,
-                    })
-                })
-                .collect();
-            Json(data).into_response()
-        }
+    match store.query_sql_json(sql).await {
+        Ok(rows) => Json(rows).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

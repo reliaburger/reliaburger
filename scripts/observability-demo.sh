@@ -85,7 +85,7 @@ echo ""
 echo "Try these SQL queries:"
 echo "  Metrics:  curl 'http://localhost:9117/v1/metrics?name=node_cpu_usage_percent'"
 echo "  Logs:     curl -G --data-urlencode 'q=SELECT timestamp,app,line FROM logs LIMIT 5' http://localhost:9117/v1/logs/sql"
-echo "  Log grep: curl -G --data-urlencode 'q=SELECT timestamp,line FROM logs WHERE line LIKE \"%ERROR%\" LIMIT 5' http://localhost:9117/v1/logs/sql"
+echo '  Log grep: curl -G --data-urlencode "q=SELECT timestamp,line FROM logs WHERE line LIKE '"'"'%ERROR%'"'"' LIMIT 5" http://localhost:9117/v1/logs/sql'
 echo ""
 echo "Press Ctrl+C to stop."
 wait "${BUN_PID}"
