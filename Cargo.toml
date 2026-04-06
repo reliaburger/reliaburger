@@ -56,6 +56,8 @@ pem = "3"
 argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
+datafusion = "45"
+object_store = { version = "0.12", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", optional = true }

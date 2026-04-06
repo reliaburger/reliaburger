@@ -11,6 +11,7 @@ pub mod config;
 pub mod council;
 pub mod firewall;
 pub mod grill;
+pub mod mayo;
 pub mod meat;
 pub mod mustard;
 pub mod onion;

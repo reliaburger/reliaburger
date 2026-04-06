@@ -20,7 +20,8 @@ pub struct NodeConfig {
     pub reporting_tree: ReportingTreeSection,
     pub reconstruction: ReconstructionSection,
     pub images: ImagesSection,
-    // TODO(Phase 6): logs, metrics sections
+    pub metrics: MetricsSection,
+    pub logs: LogsSection,
     // TODO(Phase 3): ingress section
     // TODO(Phase 8): process_workloads section
     // TODO(Phase 9): upgrades section
@@ -230,6 +231,54 @@ impl Default for ImagesSection {
             gc_retain_days: 7,
             gc_interval_hours: 1,
             registry_port: 5050,
+        }
+    }
+}
+
+/// Metrics collection and storage configuration (Mayo).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsSection {
+    /// How often to collect system and process metrics (seconds).
+    pub collection_interval_secs: u64,
+    /// Days to retain metric data before pruning.
+    pub retention_days: u32,
+    /// How often to scrape Prometheus /metrics endpoints (seconds).
+    pub scrape_interval_secs: u64,
+    /// Enable built-in alert evaluation.
+    pub alerts_enabled: bool,
+    /// Object store URL for metric persistence. Empty = local filesystem.
+    /// Set to `s3://bucket/prefix` for S3-backed storage.
+    pub object_store_url: String,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            collection_interval_secs: 10,
+            retention_days: 7,
+            scrape_interval_secs: 30,
+            alerts_enabled: true,
+            object_store_url: String::new(),
+        }
+    }
+}
+
+/// Log collection configuration (Ketchup).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogsSection {
+    /// Days to retain log files before deletion.
+    pub retention_days: u32,
+    /// Maximum size of a single log file in MB before rotation.
+    pub max_file_size_mb: u64,
+}
+
+impl Default for LogsSection {
+    fn default() -> Self {
+        Self {
+            retention_days: 7,
+            max_file_size_mb: 100,
         }
     }
 }
