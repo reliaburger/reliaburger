@@ -6,6 +6,7 @@
 //!
 //! Modules are added incrementally as each roadmap phase is implemented.
 
+pub mod brioche;
 pub mod bun;
 pub mod config;
 pub mod council;
