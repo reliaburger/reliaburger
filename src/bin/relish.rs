@@ -40,7 +40,18 @@ enum Command {
         /// Follow log output (stream new lines as they appear).
         #[arg(long, short = 'f')]
         follow: bool,
+        /// Filter lines matching this substring.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Show logs since this time (e.g. "1h", "30m", epoch seconds).
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter structured JSON logs by field (key=value).
+        #[arg(long)]
+        json_field: Option<String>,
     },
+    /// Show live resource usage (CPU, memory) for all apps.
+    Top,
     /// Execute a command inside a running container.
     Exec {
         /// App name.
@@ -206,7 +217,11 @@ async fn main() -> ExitCode {
             ref name,
             tail,
             follow,
+            grep: ref _grep,
+            since: ref _since,
+            json_field: ref _json_field,
         } => commands::logs(name, tail, follow).await,
+        Command::Top => commands::top().await,
         Command::Exec {
             ref app,
             ref command,
@@ -413,7 +428,9 @@ mod tests {
     fn parse_logs_with_tail() {
         let cli = parse(&["relish", "logs", "web", "--tail", "10"]).unwrap();
         match cli.command {
-            Command::Logs { name, tail, follow } => {
+            Command::Logs {
+                name, tail, follow, ..
+            } => {
                 assert_eq!(name, "web");
                 assert_eq!(tail, Some(10));
                 assert!(!follow);
@@ -426,7 +443,9 @@ mod tests {
     fn parse_logs_with_follow_short() {
         let cli = parse(&["relish", "logs", "web", "-f"]).unwrap();
         match cli.command {
-            Command::Logs { name, tail, follow } => {
+            Command::Logs {
+                name, tail, follow, ..
+            } => {
                 assert_eq!(name, "web");
                 assert_eq!(tail, None);
                 assert!(follow);
@@ -439,7 +458,9 @@ mod tests {
     fn parse_logs_with_follow_and_tail() {
         let cli = parse(&["relish", "logs", "web", "--follow", "--tail", "5"]).unwrap();
         match cli.command {
-            Command::Logs { name, tail, follow } => {
+            Command::Logs {
+                name, tail, follow, ..
+            } => {
                 assert_eq!(name, "web");
                 assert_eq!(tail, Some(5));
                 assert!(follow);
@@ -522,5 +543,29 @@ mod tests {
     fn parse_images_command() {
         let cli = parse(&["relish", "images"]).unwrap();
         assert!(matches!(cli.command, Command::Images));
+    }
+
+    #[test]
+    fn parse_top_command() {
+        let cli = parse(&["relish", "top"]).unwrap();
+        assert!(matches!(cli.command, Command::Top));
+    }
+
+    #[test]
+    fn parse_logs_with_grep() {
+        let cli = parse(&["relish", "logs", "web", "--grep", "ERROR"]).unwrap();
+        match cli.command {
+            Command::Logs { grep, .. } => assert_eq!(grep.as_deref(), Some("ERROR")),
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_since() {
+        let cli = parse(&["relish", "logs", "web", "--since", "1h"]).unwrap();
+        match cli.command {
+            Command::Logs { since, .. } => assert_eq!(since.as_deref(), Some("1h")),
+            _ => panic!("expected Logs command"),
+        }
     }
 }
