@@ -169,4 +169,11 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [ ] Relish TUI (apps, nodes, jobs, events, logs, routes, search views)
 - [ ] Self-upgrade mechanism (rolling binary replacement, dual-signature, auto-rollback)
+- [ ] Parquet bloom filters on log `line` column (skip row groups in LIKE queries)
+- [ ] PromQL-to-SQL compatibility layer (rate, sum by, avg by, histogram_quantile)
+- [ ] Hierarchical metrics aggregation via council (cluster-wide queries)
+- [ ] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts)
+- [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
+- [ ] Log export to S3/GCS (scheduled, jsonl.gz)
+- [ ] Zstd seekable frame compression for archived logs
 - [ ] All Phase 9 tests green
