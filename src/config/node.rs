@@ -382,4 +382,50 @@ mod tests {
         assert_eq!(nc.storage.data, PathBuf::from("/opt/reliaburger/data"));
         assert_eq!(nc.storage.images, PathBuf::from("/opt/reliaburger/images"));
     }
+
+    #[test]
+    fn parse_metrics_section_defaults() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.metrics.collection_interval_secs, 10);
+        assert_eq!(nc.metrics.retention_days, 7);
+        assert_eq!(nc.metrics.scrape_interval_secs, 30);
+        assert!(nc.metrics.alerts_enabled);
+        assert!(nc.metrics.object_store_url.is_empty());
+    }
+
+    #[test]
+    fn parse_metrics_section_custom() {
+        let toml_str = r#"
+            [metrics]
+            collection_interval_secs = 5
+            retention_days = 30
+            scrape_interval_secs = 15
+            alerts_enabled = false
+            object_store_url = "s3://my-bucket/metrics"
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.metrics.collection_interval_secs, 5);
+        assert_eq!(nc.metrics.retention_days, 30);
+        assert_eq!(nc.metrics.object_store_url, "s3://my-bucket/metrics");
+        assert!(!nc.metrics.alerts_enabled);
+    }
+
+    #[test]
+    fn parse_logs_section_defaults() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.logs.retention_days, 7);
+        assert_eq!(nc.logs.max_file_size_mb, 100);
+    }
+
+    #[test]
+    fn parse_logs_section_custom() {
+        let toml_str = r#"
+            [logs]
+            retention_days = 14
+            max_file_size_mb = 500
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.logs.retention_days, 14);
+        assert_eq!(nc.logs.max_file_size_mb, 500);
+    }
 }
