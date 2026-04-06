@@ -91,7 +91,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 - [x] Sesame CA hierarchy (Root, Node, Workload, Ingress CAs — ECDSA P-256, HKDF key wrapping)
 - [x] Node mTLS (join tokens, certificate issuance, mTLS config builders, gossip HMAC)
-- [ ] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs) — deferred to Phase 9
+- [ ] Workload identity — deferred to Phase 9
 - [x] API authentication (tokens, Argon2id hashing, roles: Admin/Deployer/ReadOnly, axum middleware)
 - [x] Secret encryption (age keypairs, `ENC[AGE:...]` decryption at container startup, namespace-scoped keys)
 - [x] eBPF firewall rules (`allow_from` resolution, cgroup-to-namespace mapping, BPF map wiring)
@@ -110,10 +110,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Garbage collection (sole-copy protection, active reference safety, retention window, GcReport)
 - [x] Volume size enforcement (loop mount on Linux, soft warning on macOS)
 - [x] `relish images` CLI command, `[images]` config section
-- [ ] Pull-through cache full wiring — deferred to Phase 9
-- [ ] P2P multi-source downloads — deferred to Phase 9
-- [ ] Image signing (cosign) — deferred to Phase 9
-- [ ] Volume snapshots — deferred to Phase 9
+- [ ] Pull-through cache, P2P downloads, image signing, volume snapshots — deferred to Phase 9
 - [x] Book chapter 5: "Where the Images Live"
 - [x] All Phase 5 tests green (867 tests)
 
@@ -129,9 +126,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Brioche dashboard (server-rendered HTML, dark theme, auto-refresh)
 - [x] `relish top` command, `relish logs --grep/--since/--json-field`
 - [x] Config: `[metrics]` and `[logs]` sections with object_store_url
-- [ ] Hierarchical metrics aggregation — deferred to Phase 9
-- [ ] Full Brioche UI (app/node detail, charts, HTMX) — deferred to Phase 9
-- [ ] Alert webhooks, PromQL compatibility — deferred to Phase 9
+- [ ] Hierarchical aggregation, full Brioche UI, alert webhooks, PromQL — deferred to Phase 9
 - [x] Cross-node log queries (fan-out to nodes, merge by timestamp, dedup)
 - [x] Agent wiring (Mayo collection task, Ketchup store, AlertEvaluator, `/v1/alerts`)
 - [x] `make observability-demo` for local testing
@@ -162,6 +157,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 9: Production Hardening
 
+**Core Phase 9:**
 - [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
 - [ ] `relish test --chaos` (integration tests + Smoker fault injection)
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
@@ -169,6 +165,23 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [ ] Relish TUI (apps, nodes, jobs, events, logs, routes, search views)
 - [ ] Self-upgrade mechanism (rolling binary replacement, dual-signature, auto-rollback)
+
+**Deferred from Phase 3 (Networking):**
+- [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
+- [ ] WebSocket upgrade proxying in Wrapper ingress
+
+**Deferred from Phase 4 (Security):**
+- [ ] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
+- [ ] TPM sealing, CRL distribution, egress DNS resolution
+
+**Deferred from Phase 5 (Storage & Registry):**
+- [ ] P2P multi-source image downloads (parallel fan-out)
+- [ ] Image signing (keyless via workload identity, cosign-compatible)
+- [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
+- [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
+- [ ] Btrfs subvolume quotas (alternative to loop mount)
+
+**Deferred from Phase 6 (Observability):**
 - [ ] Parquet bloom filters on log `line` column (skip row groups in LIKE queries)
 - [ ] PromQL-to-SQL compatibility layer (rate, sum by, avg by, histogram_quantile)
 - [ ] Hierarchical metrics aggregation via council (cluster-wide queries)
@@ -176,4 +189,6 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
 - [ ] Log export to S3/GCS (scheduled, jsonl.gz)
 - [ ] Zstd seekable frame compression for archived logs
+- [ ] Cross-node log queries via Raft (leader fan-out, merge-sort)
+
 - [ ] All Phase 9 tests green
