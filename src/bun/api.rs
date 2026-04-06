@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 
 use crate::brioche::dashboard::{DashboardApp, DashboardData, render_dashboard};
 use crate::config::Config;
+use crate::ketchup::log_store::LogStore;
 use crate::ketchup::store::KetchupStore;
 use crate::mayo::alert::AlertEvaluator;
 use crate::mayo::store::MayoStore;
@@ -33,14 +34,20 @@ pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
     /// Shared metrics store (read-heavy, queries don't block the agent).
     pub mayo: Option<Arc<RwLock<MayoStore>>>,
-    /// Shared log store.
+    /// Shared log store (flat files for follow mode).
     pub ketchup: Option<Arc<RwLock<KetchupStore>>>,
+    /// Shared log store (Arrow/DataFusion for SQL queries).
+    pub log_store: Option<Arc<RwLock<LogStore>>>,
     /// Alert evaluator.
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
 }
 
 /// Build the API router.
-pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoStore>>>) -> Router {
+pub fn router(
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    mayo: Option<Arc<RwLock<MayoStore>>>,
+    log_store: Option<Arc<RwLock<LogStore>>>,
+) -> Router {
     let alerts = mayo
         .as_ref()
         .map(|_| Arc::new(RwLock::new(AlertEvaluator::with_defaults())));
@@ -48,6 +55,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoSt
         cmd_tx,
         mayo,
         ketchup: None,
+        log_store,
         alerts,
     };
 
@@ -73,6 +81,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoSt
         .route("/v1/metrics/summary", get(metrics_summary_handler))
         .route("/v1/metrics/keys", get(metrics_keys_handler))
         .route("/v1/alerts", get(alerts_handler))
+        .route("/v1/logs/sql", get(logs_sql_handler))
         .with_state(state)
 }
 
@@ -777,6 +786,46 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, headers, html).into_response()
 }
 
+/// `GET /v1/logs/sql?q=SELECT...` — query logs via DataFusion SQL.
+async fn logs_sql_handler(
+    State(state): State<ApiState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(log_store) = &state.log_store else {
+        return Json(serde_json::json!({"error": "log store not enabled"})).into_response();
+    };
+
+    let Some(sql) = params.get("q") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing 'q' query parameter"})),
+        )
+            .into_response();
+    };
+
+    let store = log_store.read().await;
+    match store.query_sql(sql).await {
+        Ok(entries) => {
+            let data: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "timestamp": e.timestamp,
+                        "stream": format!("{:?}", e.stream).to_lowercase(),
+                        "line": e.line,
+                    })
+                })
+                .collect();
+            Json(data).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/alerts` — list all alert statuses.
 async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(alerts) = &state.alerts else {
@@ -828,7 +877,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None);
+        let app = router(cmd_tx, None, None);
         (app, shutdown)
     }
 
@@ -927,7 +976,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone(), None);
+        let app = router(cmd_tx.clone(), None, None);
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);
