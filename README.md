@@ -13,6 +13,24 @@ This repo produces two things simultaneously:
 
 The full architectural vision lives in the [whitepaper](docs/whitepaper.md). For installation and usage instructions, see the [documentation](docs/README.md).
 
+## What's included
+
+Everything runs inside a single `bun` binary. No sidecars, no separate databases, no external dependencies.
+
+| Component | What it does |
+|-----------|-------------|
+| **Grill** | Container runtime (runc, Apple Container, process fallback) |
+| **Mustard** | SWIM gossip protocol for cluster membership |
+| **Council** | Raft consensus for leader election and state |
+| **Meat** | Bin-packing scheduler with labels, quotas, daemon mode |
+| **Onion** | eBPF service discovery (DNS + connect rewrite) |
+| **Wrapper** | Ingress proxy (host/path routing, rate limiting, TLS) |
+| **Sesame** | PKI, mTLS, API auth, secret encryption, Raft encryption |
+| **Pickle** | Built-in OCI image registry (push/pull, replication, GC) |
+| **Mayo** | Time-series metrics (Arrow + DataFusion + Parquet) |
+| **Ketchup** | Log collection (append-only, indexed, JSON-aware) |
+| **Brioche** | Web dashboard (server-rendered, auto-refresh) |
+
 ## Quick start
 
 ```sh
@@ -27,9 +45,23 @@ cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
 
 # Check what's running
 cargo run --bin relish -- status
+
+# View the dashboard
+open http://localhost:9117/
+
+# Show live resource usage
+cargo run --bin relish -- top
 ```
 
 See [docs/README.md](docs/README.md) for prerequisites, container runtime setup, and full CLI reference.
+
+## Try it
+
+```sh
+make test                    # run all tests (979 and counting)
+make observability-demo      # start bun, collect metrics, query APIs, show dashboard
+make pickle-test-macos       # push/pull a Docker image through the Pickle registry
+```
 
 ## Repo layout
 
@@ -39,87 +71,61 @@ src/
   bin/bun.rs           # Node agent (daemon)
   bin/relish.rs        # CLI entry point
   bin/testapp.rs       # Configurable test HTTP server
-  config/              # TOML configuration parsing (7 resource types)
-  grill/               # Container runtime interface (state machine, ports, cgroups, OCI)
-    process.rs         # Cross-platform process-based runtime
-    runc.rs            # Linux runc runtime (image pulling, rootless support)
-    apple.rs           # macOS Apple Container runtime
-    image.rs           # OCI image pulling and layer unpacking
-    rootless.rs        # Rootless runc spec modifications (Linux only)
-  bun/                 # Node agent internals
-    agent.rs           # Event loop (tokio::select, command channels)
-    api.rs             # Local HTTP API (axum, port 9117)
-    probe.rs           # HTTP health probing
-    supervisor.rs      # Workload lifecycle management
-    health.rs          # Health check state machine
-  relish/              # CLI internals
-    client.rs          # HTTP client for bun agent
-    commands.rs        # Subcommand implementations
+  config/              # TOML configuration parsing
+  grill/               # Container runtime (runc, Apple Container, process)
+  bun/                 # Node agent (event loop, API, health, supervisor)
+  relish/              # CLI (commands, client, output, plan, chaos, dev)
   mustard/             # SWIM gossip protocol
-    state.rs           # NodeState enum and conflict resolution
-    message.rs         # GossipMessage, MembershipUpdate, piggybacked payloads
-    membership.rs      # MembershipTable (who's in the cluster)
-    dissemination.rs   # Piggyback queue with priority ordering
-    transport.rs       # MustardTransport trait + InMemoryNetwork
-    protocol.rs        # SWIM probe cycle (MustardNode)
-    config.rs          # GossipConfig (intervals, timeouts)
-  council/             # Raft consensus (3–7 council nodes)
-    types.rs           # TypeConfig, RaftRequest, CouncilResponse, DesiredState
-    log_store.rs       # MemLogStore (in-memory Raft log + vote storage)
-    state_machine.rs   # CouncilStateMachine (applies entries, snapshots)
-    network.rs         # InMemoryRaftRouter (test network with partitions)
-    node.rs            # CouncilNode (high-level wrapper over openraft)
-  meat/               # Scheduler
-    types.rs           # NodeId, AppId, Resources, NodeCapacity
-    scheduler.rs       # Filter → Score → Select → Commit pipeline
-    cluster_state.rs   # Cluster state cache for scheduler
-    filter.rs          # Phase 1: node eligibility filtering
-    score.rs           # Phase 2: weighted scoring (bin-packing, labels, spread)
-    quota.rs           # Namespace resource quotas
+  council/             # Raft consensus
+  meat/                # Scheduler (filter, score, select, commit)
   reconstruction/      # State reconstruction after leader election
-    controller.rs      # Learning period state machine
-    diff.rs            # Desired vs actual state diff engine
-    types.rs           # ReconstructionPhase, Correction, LearningOutcome
   reporting/           # Hierarchical reporting tree
-    types.rs           # StateReport, RunningApp, ReportHealthStatus
-    transport.rs       # ReportingTransport trait + InMemory + TCP
-    worker.rs          # ReportWorker (sends reports to council)
-    aggregator.rs      # ReportAggregator (council side, watch channel)
-    assignment.rs      # Consistent hash parent assignment
+  onion/               # eBPF service discovery
+  wrapper/             # Ingress proxy
+  firewall/            # nftables perimeter firewall
+  sesame/              # PKI, mTLS, secrets, API auth, Raft encryption
+  pickle/              # OCI image registry (blob store, API, replication, GC)
+  mayo/                # Time-series metrics (Arrow, DataFusion, Parquet)
+  ketchup/             # Log collection (append-only, indexed, queries)
+  brioche/             # Web dashboard
 docs/
   README.md            # User documentation (install, build, run)
-  whitepaper.md        # Full architectural vision (the "what and why")
-  roadmap.md           # 9 implementation phases, tests-first ordering
+  whitepaper.md        # Full architectural vision
+  roadmap.md           # 9 implementation phases
   progress.md          # What's done, what's next
   design/              # Detailed design docs per component (14 files)
-  book/                # "Building Reliaburger" chapter drafts
+  book/                # "Building Reliaburger" chapter drafts (6 chapters)
   _quarto/             # PDF build configuration
-examples/
-  phase-1/
-    proc-minimal-app.toml         # App with health check + worker
-    proc-restarts.toml             # App that goes unhealthy and restarts
-    proc-job-success.toml          # Job that runs to completion
-    proc-job-failure.toml          # Job that fails and gets retried
-    proc-init-container.toml       # App with init container
-    proc-full-featured.toml        # All Phase 1 features
-    proc-multi-app.toml            # Multiple apps in one config
-    proc-volumes.toml              # Managed and HostPath volumes
-    container-hello.toml           # Alpine hello world (real OCI image)
-    container-nginx.toml           # nginx with health check (real OCI image)
-    container-job-failure.toml     # Job that fails (real OCI image)
-    container-init-container.toml  # App with init container (real OCI image)
-    container-full-featured.toml   # All Phase 1 features (real OCI image)
-    container-multi-app.toml       # Multiple apps in one config (real OCI image)
-    container-volumes.toml         # Managed and HostPath volumes (real OCI image)
-assets/
-  images/              # Logo and project media
-Makefile               # Build, test, lint, format targets
+examples/              # Example app and job configs
+scripts/               # Test and demo scripts
+assets/                # Logo and project media
+Makefile               # Build, test, lint, format, demo targets
 CLAUDE.md              # Project guide, conventions, writing style
 ```
 
 ## Current status
 
-See [progress.md](docs/progress.md) for the full implementation checklist.
+**979 tests across 6 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
+
+| Phase | Status | Tests |
+|-------|--------|-------|
+| 1. Foundation | Done | 321 |
+| 2. Cluster Formation | Done | 588 |
+| 3. Networking | Done | 702 |
+| 4. Security | Done | 795 |
+| 5. Storage & Registry | Done | 871 |
+| 6. Observability | Done | 979 |
+
+## The book
+
+Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rust and distributed systems through the implementation:
+
+1. [Hello, Container](docs/book/01-hello-container.md)
+2. [Finding Friends](docs/book/02-finding-friends.md)
+3. [Talking to Each Other](docs/book/03-talking-to-each-other.md)
+4. [Trust No One](docs/book/04-trust-no-one.md)
+5. [Where the Images Live](docs/book/05-where-the-images-live.md)
+6. [Watching Everything](docs/book/06-watching-everything.md)
 
 ## Licence
 
