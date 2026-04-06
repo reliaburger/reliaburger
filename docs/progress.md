@@ -132,9 +132,11 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] Hierarchical metrics aggregation — deferred to Phase 9
 - [ ] Full Brioche UI (app/node detail, charts, HTMX) — deferred to Phase 9
 - [ ] Alert webhooks, PromQL compatibility — deferred to Phase 9
-- [ ] Cross-node log queries — deferred to Phase 9
+- [x] Cross-node log queries (fan-out to nodes, merge by timestamp, dedup)
+- [x] Agent wiring (Mayo collection task, Ketchup store, AlertEvaluator, `/v1/alerts`)
+- [x] `make observability-demo` for local testing
 - [x] Book chapter 6: "Watching Everything"
-- [x] All Phase 6 tests green (967 tests)
+- [x] All Phase 6 tests green (977 tests)
 
 ## Phase 7: GitOps & Deployments
 
