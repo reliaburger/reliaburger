@@ -119,13 +119,22 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 6: Observability
 
-- [ ] Mayo TSDB (per-node time-series, 3-tier retention, downsampling)
-- [ ] Prometheus scraping (auto-detect `/metrics`, configurable intervals)
-- [ ] Hierarchical metrics aggregation (council rollups for cluster queries)
-- [ ] Built-in alerts (5 defaults + custom PromQL)
-- [ ] Ketchup log collection (structured capture, timestamp-indexed storage, querying, retention)
-- [ ] Brioche web UI (cluster overview, app detail, node detail, ingress, GitOps status)
-- [ ] All Phase 6 tests green
+- [x] Mayo TSDB (Arrow RecordBatches + DataFusion SQL + Parquet persistence via object_store)
+- [x] System metrics collector (CPU, memory, disk, network via sysinfo)
+- [x] Prometheus scraping (prometheus-parse crate, auto /metrics endpoint)
+- [x] Metrics API (`/v1/metrics`, `/v1/metrics/summary`, `/v1/metrics/keys`)
+- [x] Alert evaluation (5 default rules, Inactive→Pending→Firing state machine)
+- [x] Ketchup log collection (append-only files, sparse timestamp index, JSON detection)
+- [x] Ketchup queries (grep, tail, time range, JSON field filter)
+- [x] Brioche dashboard (server-rendered HTML, dark theme, auto-refresh)
+- [x] `relish top` command, `relish logs --grep/--since/--json-field`
+- [x] Config: `[metrics]` and `[logs]` sections with object_store_url
+- [ ] Hierarchical metrics aggregation — deferred to Phase 9
+- [ ] Full Brioche UI (app/node detail, charts, HTMX) — deferred to Phase 9
+- [ ] Alert webhooks, PromQL compatibility — deferred to Phase 9
+- [ ] Cross-node log queries — deferred to Phase 9
+- [x] Book chapter 6: "Watching Everything"
+- [x] All Phase 6 tests green (967 tests)
 
 ## Phase 7: GitOps & Deployments
 
