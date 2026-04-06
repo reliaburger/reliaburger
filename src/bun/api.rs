@@ -7,7 +7,7 @@
 /// via Server-Sent Events (SSE).
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -19,6 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::brioche::dashboard::{DashboardApp, DashboardData, render_dashboard};
 use crate::config::Config;
 use crate::ketchup::store::KetchupStore;
 use crate::mayo::alert::AlertEvaluator;
@@ -51,6 +52,7 @@ pub fn router(cmd_tx: mpsc::Sender<AgentCommand>, mayo: Option<Arc<RwLock<MayoSt
     };
 
     Router::new()
+        .route("/", get(dashboard_handler))
         .route("/v1/health", get(health_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
@@ -730,6 +732,49 @@ async fn metrics_summary_handler(State(state): State<ApiState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `GET /` — serve the Brioche cluster overview dashboard.
+async fn dashboard_handler(State(state): State<ApiState>) -> Response {
+    // Gather app statuses
+    let (tx, rx) = oneshot::channel();
+    let _ = state
+        .cmd_tx
+        .send(AgentCommand::Status { response: tx })
+        .await;
+    let statuses = rx.await.unwrap_or_default();
+
+    let apps: Vec<DashboardApp> = statuses
+        .iter()
+        .map(|s| DashboardApp {
+            name: s.app_name.clone(),
+            namespace: s.namespace.clone(),
+            instances_running: 1,
+            instances_desired: 1,
+            state: s.state.clone(),
+        })
+        .collect();
+
+    let alert_count = if let Some(ref alerts) = state.alerts {
+        alerts.read().await.firing_alerts().len()
+    } else {
+        0
+    };
+
+    let data = DashboardData {
+        cluster_name: String::new(),
+        node_count: 1,
+        app_count: apps.len(),
+        alert_count,
+        apps,
+        nodes: vec![],
+        alerts: vec![],
+    };
+
+    let html = render_dashboard(&data);
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+    (StatusCode::OK, headers, html).into_response()
 }
 
 /// `GET /v1/alerts` — list all alert statuses.

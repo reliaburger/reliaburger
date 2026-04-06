@@ -137,18 +137,24 @@ impl MayoStore {
         Ok(())
     }
 
-    /// Build a DataFusion session with all accumulated batches as a MemTable.
+    /// Build a DataFusion session with all data (flushed + unflushed buffer).
     async fn session(&self) -> Result<SessionContext, MayoError> {
         let ctx = SessionContext::new();
-        if self.batches.is_empty() {
-            // Register an empty table so SQL doesn't error on "table not found"
+
+        // Collect all batches: flushed + current buffer
+        let mut all_batches = self.batches.clone();
+        if let Some(buffer_batch) = self.buffer_to_batch()? {
+            all_batches.push(buffer_batch);
+        }
+
+        if all_batches.is_empty() {
             let empty = RecordBatch::new_empty(Arc::new(metrics_schema()));
             let table = MemTable::try_new(Arc::new(metrics_schema()), vec![vec![empty]])
                 .map_err(|e| MayoError::DataFusion(e.to_string()))?;
             ctx.register_table("metrics", Arc::new(table))
                 .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         } else {
-            let table = MemTable::try_new(Arc::new(metrics_schema()), vec![self.batches.clone()])
+            let table = MemTable::try_new(Arc::new(metrics_schema()), vec![all_batches])
                 .map_err(|e| MayoError::DataFusion(e.to_string()))?;
             ctx.register_table("metrics", Arc::new(table))
                 .map_err(|e| MayoError::DataFusion(e.to_string()))?;
@@ -442,5 +448,31 @@ mod tests {
         let (store, _dir) = test_store();
         let results = store.query("anything", 0, 9999).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_unflushed_buffer_visible() {
+        let (mut store, _dir) = test_store();
+        let key = MetricKey::simple("live_metric");
+        store.insert(&key, Sample::at(1000, 42.0));
+        // Don't flush — query should still see buffer data
+        let results = store.query("live_metric", 0, 9999).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].3, 42.0);
+    }
+
+    #[tokio::test]
+    async fn query_sees_both_flushed_and_unflushed() {
+        let (mut store, _dir) = test_store();
+        store.insert(&MetricKey::simple("m"), Sample::at(1, 10.0));
+        store.flush().await.unwrap();
+
+        store.insert(&MetricKey::simple("m"), Sample::at(2, 20.0));
+        // Second sample not flushed
+
+        let results = store.query("m", 0, 9999).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].3, 10.0);
+        assert_eq!(results[1].3, 20.0);
     }
 }
