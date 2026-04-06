@@ -102,27 +102,24 @@ async fn main() -> anyhow::Result<()> {
     // Create Arrow/DataFusion log store (SQL queries over logs)
     let log_store_dir = logs_dir.join("parquet");
     std::fs::create_dir_all(&log_store_dir).ok();
-    let log_store = Arc::new(RwLock::new(LogStore::new(log_store_dir)));
-
-    // Log bun startup events so the log store is never empty
-    {
-        let mut ls = log_store.blocking_write();
-        ls.append(
-            "bun",
-            "system",
-            reliaburger::ketchup::types::LogStream::Stdout,
-            &format!(
-                "reliaburger node agent v{} started",
-                env!("CARGO_PKG_VERSION")
-            ),
-        );
-        ls.append(
-            "bun",
-            "system",
-            reliaburger::ketchup::types::LogStream::Stdout,
-            &format!("runtime: {}", cli.runtime),
-        );
-    }
+    // Seed the log store with startup events so it's never empty
+    let mut log_store_inner = LogStore::new(log_store_dir);
+    log_store_inner.append(
+        "bun",
+        "system",
+        reliaburger::ketchup::types::LogStream::Stdout,
+        &format!(
+            "reliaburger node agent v{} started",
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
+    log_store_inner.append(
+        "bun",
+        "system",
+        reliaburger::ketchup::types::LogStream::Stdout,
+        &format!("runtime: {}", cli.runtime),
+    );
+    let log_store = Arc::new(RwLock::new(log_store_inner));
 
     println!("bun: observability enabled (metrics + logs + alerts)");
 
