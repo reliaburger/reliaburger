@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos
+.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo
 
 CARGO = cargo
 
@@ -55,7 +55,9 @@ observability-demo: build ## Start bun, collect metrics, query them, show dashbo
 pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
 	./scripts/pickle-push-test.sh
 
-ci: fmt-check lint test bench ## Run everything CI would run
+ci: fmt-check lint test ## Run CI checks (fmt, clippy, tests — no benchmarks)
+
+ci-full: fmt-check lint test bench ## Run everything including benchmarks
 
 # --- Documentation targets ---
 
