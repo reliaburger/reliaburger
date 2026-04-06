@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
-    let app = api::router(cmd_tx);
+    let app = api::router(cmd_tx, None); // Mayo wired in Step 6d agent integration
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
         axum::serve(listener, app)
