@@ -101,6 +101,48 @@ JSON auto-detection examines the first 10 lines. If they parse as JSON objects, 
 relish logs api --json-field level=error
 ```
 
+## SQL over logs
+
+Here's something you don't see in most observability stacks: the same SQL engine that queries your metrics also queries your logs.
+
+Ketchup stores logs in the same Arrow/DataFusion/Parquet stack that Mayo uses for metrics. The schema is five columns: `timestamp`, `app`, `namespace`, `stream`, and `line`. Want to find all errors from the web app in the last hour?
+
+```sql
+SELECT timestamp, line FROM logs
+WHERE app = 'web'
+AND timestamp > 1704067200
+AND line LIKE '%ERROR%'
+ORDER BY timestamp
+```
+
+No new query language. No log-specific DSL. Just SQL.
+
+### Why columnar storage works for logs
+
+You might think logs are just text, so columnar storage wouldn't help. But most of the data in a log line isn't the message — it's the metadata. The `app` column for 10,000 lines from the same app stores "web" once in a dictionary and references it 10,000 times. The `namespace` and `stream` columns work the same way. Timestamps delta-encode beautifully.
+
+Even the `line` column compresses well. If your app is stuck in an error loop printing the same stack trace 10,000 times, Parquet's dictionary encoding stores it once. An error loop that eats 2MB as flat text might be 10KB in Parquet.
+
+Overall, expect 3-5x compression versus flat log files.
+
+### How LIKE queries work without full-text indexes
+
+When you write `WHERE line LIKE '%ERROR%'`, DataFusion doesn't have an inverted index to consult. It scans the `line` column. But columnar storage makes this much faster than grep on a flat file:
+
+1. **Columnar pruning.** DataFusion only reads the `line` column, not timestamp/app/namespace/stream. That alone can skip 60% of the data.
+
+2. **Predicate pushdown.** A query like `WHERE app = 'web' AND timestamp > X AND line LIKE '%ERROR%'` filters by app first (dictionary lookup, instant), then by timestamp (range check), and only scans `line` for the surviving rows. If 99% of rows are eliminated before the LIKE, the scan is tiny.
+
+3. **Row group statistics.** Parquet files are split into row groups. Each group stores min/max values per column. A time-range query can skip entire groups without reading them.
+
+This isn't a full-text search engine. If you need to search millions of unique log lines by arbitrary substring, you'd want something like Elasticsearch. But for the common case — filter by app and time first, then grep — it's fast.
+
+A future improvement: Parquet supports bloom filters per column. Writing a bloom filter on the `line` column during flush would let DataFusion skip row groups that definitely don't contain the search term.
+
+### The unified query path
+
+Both the flushed Parquet files and the unflushed in-memory buffer are included in every DataFusion query. Same trick we use for metrics. There's no blind spot — you see logs from 30 seconds ago in the same SQL query as logs from last week. No merging, no separate code paths, no seams.
+
 ## The dashboard
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
@@ -111,4 +153,4 @@ Total payload: under 10KB. First paint: instant.
 
 ## Test count
 
-Phase 6 adds 96 tests, bringing the total to 967. The new tests cover Arrow schema validation, DataFusion SQL queries, Parquet persistence, system metrics collection (CPU, memory, disk, network), Prometheus text parsing, alert state machine transitions, log append/query/grep/tail/JSON filtering, sparse index binary search, and dashboard HTML rendering.
+Phase 6 adds 120 tests, bringing the total to 991. The new tests cover Arrow schema validation, DataFusion SQL queries over both metrics and logs, Parquet persistence, system metrics collection (CPU, memory, disk, network), Prometheus text parsing, alert state machine transitions, log append/query/grep/tail/JSON filtering, LogStore SQL queries (app filter, time range, LIKE grep, LIMIT), sparse index binary search, cross-node log merge, and dashboard HTML rendering.

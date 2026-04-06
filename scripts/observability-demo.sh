@@ -75,7 +75,17 @@ curl -sf http://localhost:9117/v1/alerts | python3 -m json.tool 2>/dev/null || \
     curl -sf http://localhost:9117/v1/alerts
 
 echo ""
+echo "--- SQL log query (note: same DataFusion engine as metrics) ---"
+curl -sf "http://localhost:9117/v1/logs/sql?q=SELECT%20count(*)%20as%20total%20FROM%20logs" | python3 -m json.tool 2>/dev/null || \
+    curl -sf "http://localhost:9117/v1/logs/sql?q=SELECT%20count(*)%20as%20total%20FROM%20logs"
+
+echo ""
 echo "=== Dashboard available at: http://localhost:9117/ ==="
+echo ""
+echo "Try these SQL queries:"
+echo "  Metrics:  curl 'http://localhost:9117/v1/metrics?name=node_cpu_usage_percent'"
+echo "  Logs:     curl 'http://localhost:9117/v1/logs/sql?q=SELECT * FROM logs LIMIT 5'"
+echo "  Log grep: curl 'http://localhost:9117/v1/logs/sql?q=SELECT * FROM logs WHERE line LIKE \"%25ERROR%25\" LIMIT 5'"
 echo ""
 echo "Press Ctrl+C to stop."
 wait "${BUN_PID}"

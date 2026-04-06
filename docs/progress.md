@@ -136,7 +136,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Agent wiring (Mayo collection task, Ketchup store, AlertEvaluator, `/v1/alerts`)
 - [x] `make observability-demo` for local testing
 - [x] Book chapter 6: "Watching Everything"
-- [x] All Phase 6 tests green (977 tests)
+- [x] LogStore: SQL over logs via Arrow/DataFusion/Parquet (same engine as metrics)
+- [x] `/v1/logs/sql` endpoint for SQL log queries
+- [x] All Phase 6 tests green (991 tests)
 
 ## Phase 7: GitOps & Deployments
 
