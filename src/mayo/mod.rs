@@ -5,5 +5,6 @@
 //! local/S3/GCS storage abstraction. The same architecture as
 //! InfluxDB IOx.
 
+pub mod collector;
 pub mod store;
 pub mod types;
