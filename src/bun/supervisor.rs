@@ -238,8 +238,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
         };
 
         for id in &ids {
-            // Kill the process
-            let _ = self.grill.stop(id).await;
+            // Force-kill the process (SIGKILL, immediate, sets state to Stopped)
+            let _ = self.grill.kill(id).await;
             self.health_checker.unregister(id);
             self.instances.remove(id);
         }

@@ -66,6 +66,11 @@ echo "--- status after v1 ---"
 "${RELISH}" status || true
 
 echo ""
+echo "--- calling v1 (testapp health endpoint on :8080) ---"
+curl -sf http://localhost:8080/health && echo "" || echo "(not reachable — testapp binds to 0.0.0.0)"
+sleep 1
+
+echo ""
 echo "--- top ---"
 "${RELISH}" top || true
 
@@ -91,6 +96,12 @@ sleep 2
 echo ""
 echo "--- status after v2 (should show new instance) ---"
 "${RELISH}" status || true
+
+echo ""
+echo "--- calling v2 (should be on :8081 now) ---"
+curl -sf http://localhost:8081/health && echo "" || echo "(not reachable)"
+echo "--- v1 should be gone ---"
+curl -sf http://localhost:8080/health && echo " ← v1 still running!" || echo "v1 stopped ✓"
 
 # ---------------------------------------------------------------
 # Step 3: Deploy broken v3 (exits immediately)
@@ -129,6 +140,10 @@ sleep 2
 echo ""
 echo "--- status after recovery ---"
 "${RELISH}" status || true
+
+echo ""
+echo "--- calling recovered v2 ---"
+curl -sf http://localhost:8081/health && echo " ← v2 healthy again" || echo "(not reachable)"
 
 # ---------------------------------------------------------------
 # Summary
