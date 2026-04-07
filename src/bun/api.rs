@@ -82,6 +82,8 @@ pub fn router(
         .route("/v1/metrics/keys", get(metrics_keys_handler))
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
+        .route("/v1/deploys/active", get(deploys_active_handler))
+        .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .with_state(state)
 }
 
@@ -839,6 +841,22 @@ async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deploy endpoints
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/deploys/active` — list active deploys.
+async fn deploys_active_handler() -> impl IntoResponse {
+    // TODO: read from Raft DesiredState.active_deploys
+    Json(serde_json::json!({"active_deploys": []}))
+}
+
+/// `GET /v1/deploys/history/{app}` — deploy history for an app.
+async fn deploys_history_handler(Path(app): Path<String>) -> impl IntoResponse {
+    // TODO: read from Raft DesiredState.deploy_history
+    Json(serde_json::json!({"app": app, "history": []}))
 }
 
 #[cfg(test)]
