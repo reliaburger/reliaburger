@@ -624,6 +624,42 @@ impl<G: Grill> BunAgent<G> {
 
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+
+            // Check if this app already has running instances → rolling deploy
+            let existing: Vec<_> = self
+                .supervisor
+                .list_instances()
+                .iter()
+                .filter(|i| i.app_name == *app_name && i.namespace == namespace)
+                .filter(|i| {
+                    !matches!(
+                        i.state,
+                        crate::grill::state::ContainerState::Stopped
+                            | crate::grill::state::ContainerState::Failed
+                    )
+                })
+                .map(|i| i.id.clone())
+                .collect();
+
+            if !existing.is_empty() {
+                // Redeploy: stop existing instances, then deploy fresh.
+                // The DeployOrchestrator (tested in unit tests) does proper
+                // per-instance rolling replacement — this wiring uses the
+                // simpler recreate strategy for now.
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!(
+                            "redeploying {app_name} ({} existing instance(s) → stop + recreate)",
+                            existing.len()
+                        ),
+                    })
+                    .await;
+
+                // Stop existing instances
+                let _ = self.stop_app(app_name, namespace).await;
+            }
+
+            // Fresh deploy: no existing instances
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("deploying app {app_name} (replicas: {})", spec.replicas),
