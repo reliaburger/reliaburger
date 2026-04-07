@@ -63,13 +63,13 @@ pub struct WorkloadInstance {
 /// mocking frameworks. The compiler monomorphises this struct for each
 /// concrete `G`, so there's no virtual dispatch cost.
 pub struct WorkloadSupervisor<G: Grill> {
-    grill: G,
-    port_allocator: PortAllocator,
-    instances: HashMap<InstanceId, WorkloadInstance>,
+    pub(crate) grill: G,
+    pub(crate) port_allocator: PortAllocator,
+    pub(crate) instances: HashMap<InstanceId, WorkloadInstance>,
     health_checker: HealthChecker,
     /// Secondary index: (app_name, namespace) → instance IDs.
     /// Enables O(1) lookup by app without scanning all instances.
-    app_instances: HashMap<(String, String), Vec<InstanceId>>,
+    pub(crate) app_instances: HashMap<(String, String), Vec<InstanceId>>,
 }
 
 impl<G: Grill> WorkloadSupervisor<G> {
