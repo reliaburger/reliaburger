@@ -31,7 +31,7 @@ BUN="${REPO_DIR}/target/debug/bun"
 
 # Start bun
 echo "--- starting bun ---"
-"${BUN}" &
+"${BUN}" --runtime process &
 BUN_PID=$!
 
 for i in $(seq 1 15); do
@@ -44,10 +44,9 @@ echo "bun is ready (pid ${BUN_PID})"
 # Deploy v1
 echo ""
 echo "--- deploying v1 ---"
-cat > /tmp/reliaburger-demo-app.toml <<'EOF'
+cat > /tmp/reliaburger-demo-app.toml <<EOF
 [app.demo]
-image = "proc-grill:v1"
-command = ["target/debug/testapp", "--mode", "healthy", "--port", "8080"]
+command = ["${REPO_DIR}/target/debug/testapp", "--mode", "healthy", "--port", "8080"]
 port = 8080
 EOF
 
