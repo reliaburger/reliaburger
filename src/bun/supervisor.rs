@@ -226,6 +226,25 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
+    /// Remove all instances of an app from the supervisor tracking.
+    ///
+    /// Kills running processes via the Grill and removes all state.
+    /// Used during redeploy to clear stale instances before creating fresh ones.
+    pub async fn remove_app(&mut self, app_name: &str, namespace: &str) {
+        let key = (app_name.to_string(), namespace.to_string());
+        let ids = match self.app_instances.remove(&key) {
+            Some(ids) => ids,
+            None => return,
+        };
+
+        for id in &ids {
+            // Kill the process
+            let _ = self.grill.stop(id).await;
+            self.health_checker.unregister(id);
+            self.instances.remove(id);
+        }
+    }
+
     /// Get a reference to an instance by ID.
     pub fn get_instance(&self, id: &InstanceId) -> Option<&WorkloadInstance> {
         self.instances.get(id)

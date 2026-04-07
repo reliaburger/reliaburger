@@ -655,8 +655,11 @@ impl<G: Grill> BunAgent<G> {
                     })
                     .await;
 
-                // Stop existing instances
-                let _ = self.stop_app(app_name, namespace).await;
+                // Kill and remove existing instances
+                self.supervisor.remove_app(app_name, namespace).await;
+
+                // Also remove from service map
+                let _ = self.service_map.unregister_app(app_name);
             }
 
             // Fresh deploy: no existing instances
