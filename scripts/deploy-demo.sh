@@ -126,6 +126,11 @@ echo ""
 echo "--- status after broken deploy ---"
 "${RELISH}" status || true
 
+echo ""
+echo "--- v3 broke, but v2 should still be gone (recreate strategy killed it) ---"
+curl -sf http://localhost:8081/health && echo " ← v2 still running (unexpected)" || echo "v2 stopped (old instance was killed before broken v3 started)"
+curl -sf http://localhost:8082/health && echo " ← v3 running (unexpected)" || echo "v3 not running ✓ (broken command exited)"
+
 # ---------------------------------------------------------------
 # Step 4: Recover by redeploying v2
 # ---------------------------------------------------------------
@@ -153,10 +158,14 @@ echo "============================================"
 echo "  Summary"
 echo "============================================"
 echo ""
-echo "  1. Deployed v1 (healthy)        ✓"
-echo "  2. Redeployed v2 (rolling)      ✓ old stopped, new created"
-echo "  3. Deployed broken v3           ✓ failed as expected"
-echo "  4. Recovered with v2            ✓ back to healthy"
+echo "  1. Deployed v1 (healthy on :8080)      ✓"
+echo "  2. Redeployed v2 (v1 killed, v2 on :8081) ✓"
+echo "  3. Broken v3 (v2 killed, v3 crashed)  ✓ downtime (recreate strategy)"
+echo "  4. Recovered with v2 (:8081 again)    ✓"
+echo ""
+echo "  Note: the recreate strategy has brief downtime between steps."
+echo "  The DeployOrchestrator (unit-tested) does proper rolling"
+echo "  replacement where old stays live until new is healthy."
 echo ""
 echo "  Dashboard: http://localhost:9117/"
 echo "  Lint:      ${RELISH} lint /tmp/reliaburger-demo-v2.toml"
