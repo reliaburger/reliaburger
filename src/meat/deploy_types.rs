@@ -15,7 +15,7 @@ use super::types::{AppId, NodeId};
 pub struct DeployId(pub u64);
 
 /// A request to start a deploy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployRequest {
     /// Which app to deploy.
     pub app_id: AppId,
@@ -30,7 +30,7 @@ pub struct DeployRequest {
 }
 
 /// Deploy configuration parsed from `DeploySpec`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployConfig {
     /// Rolling or blue-green (only rolling implemented in Phase 7).
     pub strategy: DeployStrategy,
@@ -167,7 +167,7 @@ pub enum DeployEvent {
 // ---------------------------------------------------------------------------
 
 /// A single step in a rolling deploy (one instance replacement).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RolloutStep {
     /// Which node this step targets.
     pub node_id: NodeId,
@@ -210,7 +210,7 @@ impl StepPhase {
 // ---------------------------------------------------------------------------
 
 /// The full state of a deploy operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployState {
     /// Unique deploy identifier.
     pub id: DeployId,
@@ -331,7 +331,7 @@ pub enum DeployResult {
 }
 
 /// A summary entry for deploy history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployHistoryEntry {
     pub id: DeployId,
     pub app_id: AppId,
