@@ -45,7 +45,7 @@ async fn apply_with_client(
         }
         Err(_) => {
             // Agent unreachable — fall back to dry-run
-            let plan = generate_plan(&config);
+            let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, output)?;
             println!("{formatted}");
             println!("\n(dry run — bun agent not reachable, showing plan only)");
@@ -423,7 +423,7 @@ pub async fn deploy(path: &Path) -> Result<(), RelishError> {
             Ok(())
         }
         Err(_) => {
-            let plan = generate_plan(&config);
+            let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, super::OutputFormat::Human)?;
             println!("{formatted}");
             println!("\n(dry run — bun agent not reachable)");

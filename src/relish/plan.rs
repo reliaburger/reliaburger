@@ -1,8 +1,9 @@
 /// Apply plan generation.
 ///
 /// Takes a parsed `Config` and produces a plan showing what would be deployed.
-/// In Phase 1 everything is `Create` because there's no cluster state to diff
-/// against. Future phases add `Update`, `Destroy`, and `Unchanged`.
+/// When current state is available, the plan diffs against it to show creates,
+/// updates, destroys, and unchanged resources.
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::Serialize;
@@ -13,13 +14,18 @@ use crate::config::Config;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanAction {
     Create,
-    // TODO(Phase 2): Update, Destroy, Unchanged
+    Update,
+    Destroy,
+    Unchanged,
 }
 
 impl fmt::Display for PlanAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PlanAction::Create => write!(f, "+"),
+            PlanAction::Update => write!(f, "~"),
+            PlanAction::Destroy => write!(f, "-"),
+            PlanAction::Unchanged => write!(f, " "),
         }
     }
 }
@@ -28,6 +34,9 @@ impl Serialize for PlanAction {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             PlanAction::Create => serializer.serialize_str("create"),
+            PlanAction::Update => serializer.serialize_str("update"),
+            PlanAction::Destroy => serializer.serialize_str("destroy"),
+            PlanAction::Unchanged => serializer.serialize_str("unchanged"),
         }
     }
 }
@@ -53,14 +62,37 @@ pub struct ApplyPlan {
     pub unchanged: usize,
 }
 
+/// Snapshot of a currently deployed resource for diffing.
+///
+/// The `image` field is used to detect updates (image change).
+#[derive(Debug, Clone)]
+pub struct CurrentResource {
+    /// Resource identifier matching the plan format, e.g. "app.web".
+    pub resource: String,
+    /// Current image, if applicable.
+    pub image: Option<String>,
+}
+
 /// Generate an apply plan from a parsed config.
 ///
-/// In Phase 1 every resource is new, so all entries have `PlanAction::Create`.
-pub fn generate_plan(config: &Config) -> ApplyPlan {
+/// When `current` is `None`, all entries are `Create` (single-node, no prior
+/// state). When `Some`, the plan diffs against the current state.
+pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> ApplyPlan {
     let mut entries = Vec::new();
+    let mut desired_resources = BTreeSet::new();
+
+    // Build a lookup of current resources
+    let current_map: std::collections::HashMap<&str, &CurrentResource> = current
+        .unwrap_or(&[])
+        .iter()
+        .map(|r| (r.resource.as_str(), r))
+        .collect();
 
     // Apps
     for (name, app) in &config.app {
+        let resource_key = format!("app.{name}");
+        desired_resources.insert(resource_key.clone());
+
         let mut summary = Vec::new();
         if let Some(ref image) = app.image {
             summary.push(("image".to_string(), image.clone()));
@@ -82,15 +114,29 @@ pub fn generate_plan(config: &Config) -> ApplyPlan {
             summary.push(("namespace".to_string(), namespace.clone()));
         }
 
+        let action = match current_map.get(resource_key.as_str()) {
+            None => PlanAction::Create,
+            Some(existing) => {
+                if existing.image.as_deref() != app.image.as_deref() {
+                    PlanAction::Update
+                } else {
+                    PlanAction::Unchanged
+                }
+            }
+        };
+
         entries.push(PlanEntry {
-            resource: format!("app.{name}"),
-            action: PlanAction::Create,
+            resource: resource_key,
+            action,
             summary,
         });
     }
 
     // Jobs
     for (name, job) in &config.job {
+        let resource_key = format!("job.{name}");
+        desired_resources.insert(resource_key.clone());
+
         let mut summary = Vec::new();
         if let Some(ref image) = job.image {
             summary.push(("image".to_string(), image.clone()));
@@ -102,38 +148,96 @@ pub fn generate_plan(config: &Config) -> ApplyPlan {
             summary.push(("schedule".to_string(), schedule.clone()));
         }
 
+        let action = match current_map.get(resource_key.as_str()) {
+            None => PlanAction::Create,
+            Some(existing) => {
+                if existing.image.as_deref() != job.image.as_deref() {
+                    PlanAction::Update
+                } else {
+                    PlanAction::Unchanged
+                }
+            }
+        };
+
         entries.push(PlanEntry {
-            resource: format!("job.{name}"),
-            action: PlanAction::Create,
+            resource: resource_key,
+            action,
             summary,
         });
     }
 
     // Namespaces
     for name in config.namespace.keys() {
+        let resource_key = format!("namespace.{name}");
+        desired_resources.insert(resource_key.clone());
+
+        let action = if current_map.contains_key(resource_key.as_str()) {
+            PlanAction::Unchanged
+        } else {
+            PlanAction::Create
+        };
+
         entries.push(PlanEntry {
-            resource: format!("namespace.{name}"),
-            action: PlanAction::Create,
+            resource: resource_key,
+            action,
             summary: Vec::new(),
         });
     }
 
     // Permissions
     for name in config.permission.keys() {
+        let resource_key = format!("permission.{name}");
+        desired_resources.insert(resource_key.clone());
+
+        let action = if current_map.contains_key(resource_key.as_str()) {
+            PlanAction::Unchanged
+        } else {
+            PlanAction::Create
+        };
+
         entries.push(PlanEntry {
-            resource: format!("permission.{name}"),
-            action: PlanAction::Create,
+            resource: resource_key,
+            action,
             summary: Vec::new(),
         });
     }
 
-    let to_create = entries.len();
+    // Resources in current state but not in desired config → Destroy
+    if let Some(current_list) = current {
+        for existing in current_list {
+            if !desired_resources.contains(&existing.resource) {
+                entries.push(PlanEntry {
+                    resource: existing.resource.clone(),
+                    action: PlanAction::Destroy,
+                    summary: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let to_create = entries
+        .iter()
+        .filter(|e| e.action == PlanAction::Create)
+        .count();
+    let to_update = entries
+        .iter()
+        .filter(|e| e.action == PlanAction::Update)
+        .count();
+    let to_destroy = entries
+        .iter()
+        .filter(|e| e.action == PlanAction::Destroy)
+        .count();
+    let unchanged = entries
+        .iter()
+        .filter(|e| e.action == PlanAction::Unchanged)
+        .count();
+
     ApplyPlan {
         entries,
         to_create,
-        to_update: 0,
-        to_destroy: 0,
-        unchanged: 0,
+        to_update,
+        to_destroy,
+        unchanged,
     }
 }
 
@@ -149,6 +253,10 @@ impl fmt::Display for ApplyPlan {
         writeln!(f, "Relish apply plan:")?;
 
         for entry in &self.entries {
+            // Skip unchanged entries in display to reduce noise
+            if entry.action == PlanAction::Unchanged {
+                continue;
+            }
             writeln!(f)?;
             writeln!(f, "  {} {}", entry.action, entry.resource)?;
             for (key, value) in &entry.summary {
@@ -175,7 +283,7 @@ mod tests {
 
     #[test]
     fn empty_config_produces_empty_plan() {
-        let plan = generate_plan(&Config::default());
+        let plan = generate_plan(&Config::default(), None);
         assert!(plan.entries.is_empty());
         assert_eq!(plan.to_create, 0);
         assert_eq!(plan.to_update, 0);
@@ -191,7 +299,7 @@ mod tests {
             image = "myapp:v1"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].resource, "app.web");
         assert_eq!(plan.entries[0].action, PlanAction::Create);
@@ -206,7 +314,7 @@ mod tests {
             image = "myapp:v1.4.2"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let entry = &plan.entries[0];
         assert!(
             entry
@@ -230,7 +338,7 @@ mod tests {
             path = "/healthz"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let summary = &plan.entries[0].summary;
         assert!(summary.contains(&("replicas".to_string(), "3".to_string())));
         assert!(summary.contains(&("port".to_string(), "8080".to_string())));
@@ -247,7 +355,7 @@ mod tests {
             image = "a:v1"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         assert_eq!(plan.entries.len(), 2);
         // BTreeMap orders alphabetically
         assert_eq!(plan.entries[0].resource, "app.alpha");
@@ -267,7 +375,7 @@ mod tests {
             schedule = "0 3 * * *"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         assert_eq!(plan.entries.len(), 2);
 
         let migrate = plan
@@ -301,7 +409,7 @@ mod tests {
             cpu = "8000m"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].resource, "namespace.backend");
         assert_eq!(plan.entries[0].action, PlanAction::Create);
@@ -316,7 +424,7 @@ mod tests {
             apps = ["web"]
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].resource, "permission.deployer");
     }
@@ -354,7 +462,7 @@ mod tests {
             apps = ["web", "api"]
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         // 2 apps + 2 jobs + 1 namespace + 1 permission = 6
         assert_eq!(plan.to_create, 6);
         assert_eq!(plan.entries.len(), 6);
@@ -368,7 +476,7 @@ mod tests {
             image = "myapp:v1"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let output = plan.to_string();
         assert!(output.contains("+ app.web"), "got:\n{output}");
     }
@@ -386,7 +494,7 @@ mod tests {
             path = "/healthz"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let output = plan.to_string();
         assert!(output.contains("image"), "got:\n{output}");
         assert!(output.contains("myapp:v1.4.2"), "got:\n{output}");
@@ -404,7 +512,7 @@ mod tests {
             image = "api:v1"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let output = plan.to_string();
         assert!(
             output.contains("Plan: 2 to create, 0 to update, 0 to destroy."),
@@ -414,7 +522,7 @@ mod tests {
 
     #[test]
     fn empty_plan_display() {
-        let plan = generate_plan(&Config::default());
+        let plan = generate_plan(&Config::default(), None);
         let output = plan.to_string();
         assert!(output.contains("Relish apply plan:"), "got:\n{output}");
         assert!(
@@ -431,7 +539,7 @@ mod tests {
             image = "myapp:v1"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["entries"][0]["action"], "create");
@@ -449,9 +557,159 @@ mod tests {
             cpu = "100m-500m"
         "#,
         );
-        let plan = generate_plan(&config);
+        let plan = generate_plan(&config, None);
         let summary = &plan.entries[0].summary;
         assert!(summary.iter().any(|(k, _)| k == "memory"));
         assert!(summary.iter().any(|(k, _)| k == "cpu"));
+    }
+
+    // -- Diff-based plan tests ------------------------------------------------
+
+    #[test]
+    fn update_detected_when_image_changes() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v2"
+        "#,
+        );
+        let current = vec![CurrentResource {
+            resource: "app.web".to_string(),
+            image: Some("myapp:v1".to_string()),
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        assert_eq!(plan.entries[0].action, PlanAction::Update);
+        assert_eq!(plan.to_update, 1);
+        assert_eq!(plan.to_create, 0);
+    }
+
+    #[test]
+    fn unchanged_when_spec_identical() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+        "#,
+        );
+        let current = vec![CurrentResource {
+            resource: "app.web".to_string(),
+            image: Some("myapp:v1".to_string()),
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        assert_eq!(plan.entries[0].action, PlanAction::Unchanged);
+        assert_eq!(plan.unchanged, 1);
+        assert_eq!(plan.to_create, 0);
+    }
+
+    #[test]
+    fn destroy_detected_when_app_removed() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+        "#,
+        );
+        let current = vec![
+            CurrentResource {
+                resource: "app.web".to_string(),
+                image: Some("myapp:v1".to_string()),
+            },
+            CurrentResource {
+                resource: "app.old-service".to_string(),
+                image: Some("old:v3".to_string()),
+            },
+        ];
+        let plan = generate_plan(&config, Some(&current));
+        let destroy = plan
+            .entries
+            .iter()
+            .find(|e| e.action == PlanAction::Destroy);
+        assert!(destroy.is_some());
+        assert_eq!(destroy.unwrap().resource, "app.old-service");
+        assert_eq!(plan.to_destroy, 1);
+    }
+
+    #[test]
+    fn mixed_plan_with_create_update_destroy_unchanged() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v2"
+            [app.api]
+            image = "api:v1"
+            [app.new-service]
+            image = "new:v1"
+        "#,
+        );
+        let current = vec![
+            CurrentResource {
+                resource: "app.web".to_string(),
+                image: Some("myapp:v1".to_string()),
+            },
+            CurrentResource {
+                resource: "app.api".to_string(),
+                image: Some("api:v1".to_string()),
+            },
+            CurrentResource {
+                resource: "app.removed".to_string(),
+                image: Some("old:v1".to_string()),
+            },
+        ];
+        let plan = generate_plan(&config, Some(&current));
+
+        assert_eq!(plan.to_create, 1); // new-service
+        assert_eq!(plan.to_update, 1); // web (v1→v2)
+        assert_eq!(plan.to_destroy, 1); // removed
+        assert_eq!(plan.unchanged, 1); // api
+    }
+
+    #[test]
+    fn display_uses_tilde_for_update() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v2"
+        "#,
+        );
+        let current = vec![CurrentResource {
+            resource: "app.web".to_string(),
+            image: Some("myapp:v1".to_string()),
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        let output = plan.to_string();
+        assert!(output.contains("~ app.web"), "got:\n{output}");
+    }
+
+    #[test]
+    fn display_uses_minus_for_destroy() {
+        let config = Config::default();
+        let current = vec![CurrentResource {
+            resource: "app.old".to_string(),
+            image: Some("old:v1".to_string()),
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        let output = plan.to_string();
+        assert!(output.contains("- app.old"), "got:\n{output}");
+    }
+
+    #[test]
+    fn display_hides_unchanged_entries() {
+        let config = parse_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+        "#,
+        );
+        let current = vec![CurrentResource {
+            resource: "app.web".to_string(),
+            image: Some("myapp:v1".to_string()),
+        }];
+        let plan = generate_plan(&config, Some(&current));
+        let output = plan.to_string();
+        // Unchanged entries should not appear in the display
+        assert!(
+            !output.contains("app.web"),
+            "unchanged should be hidden, got:\n{output}"
+        );
     }
 }
