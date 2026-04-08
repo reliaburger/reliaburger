@@ -565,17 +565,46 @@ pub async fn top() -> Result<(), RelishError> {
 /// List images in the local Pickle registry.
 pub async fn images() -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    match client.health().await {
-        Ok(()) => {
-            // TODO(Phase 5g): fetch image list from agent Pickle store
-            println!("no images in local registry (Pickle image list requires agent connection)");
-            Ok(())
+    let result = client.images().await?;
+    let images = result["images"].as_array();
+    match images {
+        Some(imgs) if imgs.is_empty() => {
+            println!("no images in local registry");
         }
-        Err(_) => {
-            println!("no images (bun agent not reachable)");
-            Ok(())
+        Some(imgs) => {
+            println!(
+                "{:<30} {:<15} {:>8} {:>12}",
+                "REPOSITORY", "TAG", "LAYERS", "SIZE"
+            );
+            for img in imgs {
+                let repo = img["repository"].as_str().unwrap_or("?");
+                let tags = img["tags"]
+                    .as_array()
+                    .map(|t| {
+                        t.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let tag_display = if tags.is_empty() { "<none>" } else { &tags };
+                let layers = img["layers"].as_u64().unwrap_or(0);
+                let size = img["total_size"].as_u64().unwrap_or(0);
+                let size_display = if size >= 1_000_000 {
+                    format!("{:.1} MB", size as f64 / 1_000_000.0)
+                } else if size >= 1_000 {
+                    format!("{:.1} KB", size as f64 / 1_000.0)
+                } else {
+                    format!("{size} B")
+                };
+                println!("{repo:<30} {tag_display:<15} {layers:>8} {size_display:>12}");
+            }
+        }
+        None => {
+            println!("no images in local registry");
         }
     }
+    Ok(())
 }
 
 /// Create a new API token (local operation — no agent needed).

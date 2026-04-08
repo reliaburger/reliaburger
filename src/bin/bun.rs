@@ -176,11 +176,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
+    let pickle_catalog: Arc<RwLock<ManifestCatalog>> =
+        Arc::new(RwLock::new(ManifestCatalog::default()));
+
     let app = api::router(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
         Some(Arc::clone(&log_store)),
         Some(deploy_history),
+        Some(Arc::clone(&pickle_catalog)),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -213,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
     let blob_store = BlobStore::new(&pickle_dir);
     let pickle_state = PickleState {
         store: Arc::new(blob_store),
-        catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+        catalog: Arc::clone(&pickle_catalog),
     };
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
     let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
