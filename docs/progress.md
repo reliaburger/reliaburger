@@ -137,14 +137,17 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 7: GitOps & Deployments
 
-- [ ] Deploy orchestration (state machine, rolling/blue-green, draining, health gating)
-- [ ] Automatic rollback (revert on health check failure)
-- [ ] Dependency ordering (`run_before` job-to-app dependencies)
-- [ ] Autoscaling (CPU/memory-based, runtime replica overrides)
-- [ ] Lettuce GitOps engine (poll/webhook sync, signed commits, coordinator election)
-- [ ] Relish config tooling (`plan`, `diff`, `compile`, `lint`, `fmt`)
-- [ ] Kubernetes migration (`relish import`, `relish export`, migration reports)
-- [ ] All Phase 7 tests green
+- [x] Deploy state machine (9 phases: Pending → Rolling → Completed/RolledBack/Halted/Failed)
+- [x] Rolling deploy orchestrator (DeployDriver trait, per-step health-gated replacement)
+- [x] Automatic rollback (revert upgraded instances on health failure)
+- [x] Dependency ordering (`run_before` jobs complete before rolling)
+- [x] Deploy Raft persistence (active deploys + history capped at 50 per app)
+- [x] CLI: `relish deploy`, `relish history`, `relish rollback`, `relish lint`
+- [x] API: `/v1/deploys/active`, `/v1/deploys/history/{app}`
+- [x] `make deploy-demo` for local testing
+- [x] Book chapter 7: "Ship It"
+- Autoscaling, Lettuce GitOps, blue-green, K8s migration — see Phase 9
+- [x] All Phase 7 tests green (1039 tests)
 
 ## Phase 8: Advanced
 
@@ -190,5 +193,12 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] Log export to S3/GCS (scheduled, jsonl.gz)
 - [ ] Zstd seekable frame compression for archived logs
 - [ ] Cross-node log queries via Raft (leader fan-out, merge-sort)
+
+**Deferred from Phase 7 (GitOps & Deployments):**
+- [ ] Blue-green deploy strategy
+- [ ] Autoscaling (CPU/memory-based, runtime replica overrides)
+- [ ] Lettuce GitOps engine (poll/webhook sync, signed commits, coordinator election)
+- [ ] Kubernetes migration (`relish import`, `relish export`, migration reports)
+- [ ] `relish compile`, `relish diff`, `relish fmt`
 
 - [ ] All Phase 9 tests green

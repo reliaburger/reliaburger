@@ -49,6 +49,9 @@ bench-large: ## Run large cluster benchmarks (500, 1000 nodes — ~10 min)
 bench-10k: ## Run 10k node convergence test (~1 hour)
 	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
 
+deploy-demo: build ## Deploy an app, show history, lint config
+	./scripts/deploy-demo.sh
+
 observability-demo: build ## Start bun, collect metrics, query them, show dashboard
 	./scripts/observability-demo.sh
 

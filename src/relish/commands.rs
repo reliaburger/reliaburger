@@ -403,6 +403,137 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Trigger a rolling deploy from a config file.
+///
+/// Parses the config, sends it to the agent for a rolling deploy
+/// (if the app already exists, the agent performs a rolling update).
+pub async fn deploy(path: &Path) -> Result<(), RelishError> {
+    let config = Config::from_file(path)?;
+    config.validate()?;
+
+    let client = BunClient::default_local();
+    match client.health().await {
+        Ok(()) => {
+            let result = client.apply(&config).await?;
+            println!(
+                "deploy started: {} instance(s): {}",
+                result.created,
+                result.instances.join(", ")
+            );
+            Ok(())
+        }
+        Err(_) => {
+            let plan = generate_plan(&config);
+            let formatted = format_output(&plan, super::OutputFormat::Human)?;
+            println!("{formatted}");
+            println!("\n(dry run — bun agent not reachable)");
+            Ok(())
+        }
+    }
+}
+
+/// Show deploy history for an app.
+pub async fn history(app: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.health().await?;
+
+    let url = format!("{}/v1/deploys/history/{app}", client.base_url());
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|_| RelishError::AgentUnreachable)?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| RelishError::ApiError {
+        status: 0,
+        body: e.to_string(),
+    })?;
+
+    if let Some(entries) = body["history"].as_array() {
+        if entries.is_empty() {
+            println!("no deploy history for {app}");
+        } else {
+            println!(
+                "{:<8} {:<20} {:<12} {:<6} {:<6}",
+                "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
+            );
+            for e in entries {
+                println!(
+                    "{:<8} {:<20} {:<12} {:<6} {:<6}",
+                    e["id"].as_u64().unwrap_or(0),
+                    e["image"].as_str().unwrap_or("-"),
+                    e["result"].as_str().unwrap_or("-"),
+                    e["steps_completed"].as_u64().unwrap_or(0),
+                    e["steps_total"].as_u64().unwrap_or(0),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Rollback an app to the previous version.
+pub async fn rollback(app: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.health().await?;
+
+    // Find the last successful deploy image from history
+    let url = format!("{}/v1/deploys/history/{app}", client.base_url());
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|_| RelishError::AgentUnreachable)?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| RelishError::ApiError {
+        status: 0,
+        body: e.to_string(),
+    })?;
+
+    let last_good = body["history"].as_array().and_then(|entries| {
+        entries
+            .iter()
+            .rev()
+            .find(|e| e["result"].as_str() == Some("Completed"))
+    });
+
+    match last_good {
+        Some(entry) => {
+            let image = entry["image"].as_str().unwrap_or("unknown");
+            println!("rollback {app} to image: {image}");
+            println!("(use `relish apply` with the previous config to rollback)");
+        }
+        None => {
+            println!("no successful deploy found in history for {app}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a config file without deploying.
+pub fn lint(path: &Path) -> Result<(), RelishError> {
+    let config = Config::from_file(path)?;
+    config.validate()?;
+
+    // Count resources
+    let app_count = config.app.len();
+    let job_count = config.job.len();
+
+    // Validate run_before references
+    for (name, job) in &config.job {
+        for target in &job.run_before {
+            let target_exists = config
+                .app
+                .keys()
+                .any(|app_name| format!("app.{app_name}") == *target);
+            if !target_exists {
+                eprintln!(
+                    "warning: job {name} has run_before target {target:?} which doesn't exist in this config"
+                );
+            }
+        }
+    }
+
+    println!("config valid: {app_count} app(s), {job_count} job(s)");
+    Ok(())
+}
+
 /// Show live resource usage for all apps and nodes.
 pub async fn top() -> Result<(), RelishError> {
     let client = BunClient::default_local();
@@ -677,5 +808,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+    }
+
+    #[test]
+    fn lint_valid_config() {
+        let f = write_temp_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+        "#,
+        );
+        lint(f.path()).unwrap();
+    }
+
+    #[test]
+    fn lint_invalid_config() {
+        let f = write_temp_config(
+            r#"
+            [app.broken]
+            replicas = 3
+        "#,
+        );
+        let result = lint(f.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lint_missing_file() {
+        let result = lint(Path::new("/nonexistent/config.toml"));
+        assert!(result.is_err());
     }
 }

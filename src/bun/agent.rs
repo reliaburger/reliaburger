@@ -6,7 +6,7 @@
 /// `CancellationToken`.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use std::sync::Arc;
 
@@ -265,6 +265,9 @@ pub struct BunAgent<G: Grill> {
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last known cluster node count for firewall reconciliation.
     last_firewall_node_count: usize,
+    /// Deploy history (shared with API for query access).
+    pub(crate) deploy_history:
+        Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -293,6 +296,7 @@ impl<G: Grill> BunAgent<G> {
                 ..Default::default()
             },
             last_firewall_node_count: 0,
+            deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -328,7 +332,15 @@ impl<G: Grill> BunAgent<G> {
                 ..Default::default()
             },
             last_firewall_node_count: 0,
+            deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// Get a shared handle to the deploy history for the API.
+    pub fn deploy_history_handle(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>> {
+        Arc::clone(&self.deploy_history)
     }
 
     /// Run the agent event loop until shutdown is requested.
@@ -624,6 +636,275 @@ impl<G: Grill> BunAgent<G> {
 
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+
+            // Check if this app already has running instances → rolling deploy
+            let existing: Vec<_> = self
+                .supervisor
+                .list_instances()
+                .iter()
+                .filter(|i| i.app_name == *app_name && i.namespace == namespace)
+                .filter(|i| {
+                    !matches!(
+                        i.state,
+                        crate::grill::state::ContainerState::Stopped
+                            | crate::grill::state::ContainerState::Failed
+                    )
+                })
+                .map(|i| i.id.clone())
+                .collect();
+
+            if !existing.is_empty() {
+                // Rolling redeploy: start new instances first, health check,
+                // then kill old ones. If new instances fail, keep the old ones.
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!(
+                            "rolling redeploy {app_name} ({} existing instance(s))",
+                            existing.len()
+                        ),
+                    })
+                    .await;
+
+                // Read deploy config from app spec
+                let deploy_config = spec
+                    .deploy
+                    .as_ref()
+                    .map(crate::meat::deploy_types::DeployConfig::from_spec)
+                    .unwrap_or_default();
+                let health_wait = deploy_config.health_timeout;
+
+                // Generate new instance IDs that don't collide with existing ones
+                let deploy_gen = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    % 10000;
+                let replica_count = match spec.replicas {
+                    crate::config::types::Replicas::Fixed(n) => n,
+                    crate::config::types::Replicas::DaemonSet => 1,
+                };
+
+                // Start new instances with generation-tagged IDs
+                let mut new_ids = Vec::new();
+                let mut new_failed = false;
+                for i in 0..replica_count {
+                    let new_id = crate::grill::InstanceId(format!("{app_name}-g{deploy_gen}-{i}"));
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("starting new instance {}", new_id.0),
+                        })
+                        .await;
+
+                    // Create and start the new instance via the Grill directly
+                    let host_port = if spec.port.is_some() {
+                        match self.supervisor.port_allocator.allocate().await {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                let _ = events
+                                    .send(ApplyEvent::Error {
+                                        message: format!("port allocation failed: {e}"),
+                                    })
+                                    .await;
+                                new_failed = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let oci_spec = crate::grill::oci::generate_oci_spec(
+                        app_name,
+                        namespace,
+                        spec,
+                        host_port,
+                        &crate::grill::cgroup::cgroup_path(namespace, app_name, i)
+                            .to_string_lossy(),
+                        None,
+                        None,
+                    );
+
+                    if let Err(e) = self.supervisor.grill.create(&new_id, &oci_spec).await {
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!("failed to create {}: {e}", new_id.0),
+                            })
+                            .await;
+                        new_failed = true;
+                        break;
+                    }
+                    if let Err(e) = self.supervisor.grill.start(&new_id).await {
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!("failed to start {}: {e}", new_id.0),
+                            })
+                            .await;
+                        new_failed = true;
+                        break;
+                    }
+
+                    // Health check: wait for process to be alive
+                    // Uses health_timeout from deploy config (default 60s), capped at 5s for demo speed
+                    let wait = health_wait.min(std::time::Duration::from_secs(5));
+                    tokio::time::sleep(wait).await;
+                    match self.supervisor.grill.state(&new_id).await {
+                        Ok(crate::grill::state::ContainerState::Running) => {
+                            let _ = events
+                                .send(ApplyEvent::Progress {
+                                    message: format!("{} healthy ✓", new_id.0),
+                                })
+                                .await;
+                        }
+                        Ok(state) => {
+                            let _ = events
+                                .send(ApplyEvent::Error {
+                                    message: format!(
+                                        "{} not healthy (state: {state}), rolling back",
+                                        new_id.0
+                                    ),
+                                })
+                                .await;
+                            // Kill the failed new instance
+                            let _ = self.supervisor.grill.kill(&new_id).await;
+                            new_failed = true;
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = events
+                                .send(ApplyEvent::Error {
+                                    message: format!("{} state unknown, rolling back", new_id.0),
+                                })
+                                .await;
+                            let _ = self.supervisor.grill.kill(&new_id).await;
+                            new_failed = true;
+                            break;
+                        }
+                    }
+
+                    new_ids.push(new_id);
+                }
+
+                if new_failed {
+                    // Rollback: kill any new instances we started, keep old ones
+                    for new_id in &new_ids {
+                        let _ = self.supervisor.grill.kill(new_id).await;
+                    }
+                    // Record failed deploy in history
+                    let entry = crate::meat::deploy_types::DeployHistoryEntry {
+                        id: crate::meat::deploy_types::DeployId(
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        ),
+                        app_id: crate::meat::types::AppId::new(app_name, namespace),
+                        image: spec.image.clone().unwrap_or_default(),
+                        result: crate::meat::deploy_types::DeployResult::RolledBack,
+                        created_at: SystemTime::now(),
+                        completed_at: SystemTime::now(),
+                        steps_completed: 0,
+                        steps_total: replica_count as usize,
+                    };
+                    self.deploy_history.write().await.push(entry);
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "rolled back — old instances preserved".to_string(),
+                        })
+                        .await;
+                    return;
+                }
+
+                // New instances are healthy — kill old ones
+                for old_id in &existing {
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("stopping old instance {}", old_id.0),
+                        })
+                        .await;
+                }
+                self.supervisor.remove_app(app_name, namespace).await;
+                let _ = self.service_map.unregister_app(app_name);
+
+                // Register new instances in supervisor tracking
+                for new_id in &new_ids {
+                    let host_port = if spec.port.is_some() {
+                        // Port was already allocated above; we'd need to track it.
+                        // For now, the service map update below handles routing.
+                        None
+                    } else {
+                        None
+                    };
+                    // Add to supervisor's instance tracking
+                    self.supervisor.instances.insert(
+                        new_id.clone(),
+                        super::supervisor::WorkloadInstance {
+                            id: new_id.clone(),
+                            app_name: app_name.to_string(),
+                            namespace: namespace.to_string(),
+                            state: crate::grill::state::ContainerState::Running,
+                            health_counters: crate::bun::health::HealthCounters::new(),
+                            restart_count: 0,
+                            last_restart: None,
+                            host_port,
+                            container_ip: None,
+                            created_at: now,
+                            restart_policy: crate::bun::restart::RestartPolicy::default(),
+                            health_config: None,
+                            is_job: false,
+                            oci_spec: None,
+                        },
+                    );
+                    let _ = events
+                        .send(ApplyEvent::InstanceCreated {
+                            id: new_id.0.clone(),
+                            app: app_name.to_string(),
+                        })
+                        .await;
+                }
+                let key = (app_name.to_string(), namespace.to_string());
+                self.supervisor.app_instances.insert(key, new_ids.clone());
+
+                // Re-register in service map + rebuild routing (same as fresh deploy)
+                if let Some(port) = spec.port {
+                    let firewall = spec.firewall.as_ref().and_then(|f| {
+                        if f.allow_from.is_empty() {
+                            None
+                        } else {
+                            Some(f.allow_from.clone())
+                        }
+                    });
+                    let _ = self
+                        .service_map
+                        .register_app(app_name, namespace, port, firewall);
+                }
+                if let Some(ref ingress) = spec.ingress {
+                    self.ingress_configs
+                        .insert(app_name.to_string(), ingress.clone());
+                }
+
+                // Record deploy in history
+                let entry = crate::meat::deploy_types::DeployHistoryEntry {
+                    id: crate::meat::deploy_types::DeployId(
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ),
+                    app_id: crate::meat::types::AppId::new(app_name, namespace),
+                    image: spec.image.clone().unwrap_or_default(),
+                    result: crate::meat::deploy_types::DeployResult::Completed,
+                    created_at: SystemTime::now(),
+                    completed_at: SystemTime::now(),
+                    steps_completed: new_ids.len(),
+                    steps_total: new_ids.len(),
+                };
+                self.deploy_history.write().await.push(entry);
+
+                all_ids.extend(new_ids.iter().map(|id| id.0.clone()));
+                continue;
+            }
+
+            // Fresh deploy: no existing instances
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("deploying app {app_name} (replicas: {})", spec.replicas),

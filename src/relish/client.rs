@@ -42,6 +42,11 @@ impl BunClient {
         }
     }
 
+    /// Get the base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Create a client pointing at the default local agent.
     pub fn default_local() -> Self {
         Self::new("http://127.0.0.1:9117")

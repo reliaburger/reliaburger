@@ -56,6 +56,38 @@ impl StateMachineInner {
             RaftRequest::DeleteTag(delete) => {
                 self.state.manifest_catalog.apply_delete_tag(delete);
             }
+            RaftRequest::DeployUpdate { app_id, state } => {
+                let key = app_id.to_string();
+                if let Some((_, existing)) = self
+                    .state
+                    .active_deploys
+                    .iter_mut()
+                    .find(|(k, _)| k == &key)
+                {
+                    *existing = *state.clone();
+                } else {
+                    self.state.active_deploys.push((key, *state.clone()));
+                }
+            }
+            RaftRequest::DeployComplete { app_id, entry } => {
+                let key = app_id.to_string();
+                // Remove from active
+                self.state.active_deploys.retain(|(k, _)| k != &key);
+                // Add to history (cap at 50 per app)
+                if let Some((_, history)) = self
+                    .state
+                    .deploy_history
+                    .iter_mut()
+                    .find(|(k, _)| k == &key)
+                {
+                    history.push(entry.clone());
+                    if history.len() > 50 {
+                        history.remove(0);
+                    }
+                } else {
+                    self.state.deploy_history.push((key, vec![entry.clone()]));
+                }
+            }
             RaftRequest::Noop => {}
         }
     }
@@ -617,5 +649,125 @@ mod tests {
                 .get_manifest_by_tag("myapp", "latest")
                 .is_none()
         );
+    }
+
+    // -- Deploy state machine tests ------------------------------------------
+
+    fn test_deploy_state() -> crate::meat::deploy_types::DeployState {
+        use crate::meat::deploy_types::*;
+        DeployState::new(
+            DeployId(1),
+            DeployRequest {
+                app_id: AppId::new("web", "prod"),
+                new_image: "myapp:v2".to_string(),
+                previous_image: Some("myapp:v1".to_string()),
+                config: DeployConfig::default(),
+                pre_deploy_jobs: Vec::new(),
+            },
+        )
+    }
+
+    fn test_deploy_history_entry() -> crate::meat::deploy_types::DeployHistoryEntry {
+        use crate::meat::deploy_types::*;
+        DeployHistoryEntry {
+            id: DeployId(1),
+            app_id: AppId::new("web", "prod"),
+            image: "myapp:v2".to_string(),
+            result: DeployResult::Completed,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+            steps_completed: 3,
+            steps_total: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_deploy_update_stores_active_deploy() {
+        let mut sm = CouncilStateMachine::new();
+        let deploy = test_deploy_state();
+        let entry = normal_entry(
+            1,
+            1,
+            RaftRequest::DeployUpdate {
+                app_id: AppId::new("web", "prod"),
+                state: Box::new(deploy),
+            },
+        );
+        sm.apply(vec![entry]).await.unwrap();
+
+        let state = sm.desired_state().await;
+        assert_eq!(state.active_deploys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_deploy_complete_moves_to_history() {
+        let mut sm = CouncilStateMachine::new();
+
+        // First: start a deploy
+        let deploy = test_deploy_state();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::DeployUpdate {
+                app_id: AppId::new("web", "prod"),
+                state: Box::new(deploy),
+            },
+        )])
+        .await
+        .unwrap();
+
+        // Then: complete it
+        let entry = test_deploy_history_entry();
+        sm.apply(vec![normal_entry(
+            1,
+            2,
+            RaftRequest::DeployComplete {
+                app_id: AppId::new("web", "prod"),
+                entry,
+            },
+        )])
+        .await
+        .unwrap();
+
+        let state = sm.desired_state().await;
+        assert!(state.active_deploys.is_empty());
+        assert_eq!(state.deploy_history.len(), 1);
+        assert_eq!(state.deploy_history[0].1.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deploy_history_capped_at_50() {
+        let mut sm = CouncilStateMachine::new();
+
+        for i in 0..55 {
+            let mut entry = test_deploy_history_entry();
+            entry.id = crate::meat::deploy_types::DeployId(i);
+            sm.apply(vec![normal_entry(
+                1,
+                i + 1,
+                RaftRequest::DeployComplete {
+                    app_id: AppId::new("web", "prod"),
+                    entry,
+                },
+            )])
+            .await
+            .unwrap();
+        }
+
+        let state = sm.desired_state().await;
+        let history = &state.deploy_history[0].1;
+        assert_eq!(history.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn deploy_raft_serde_round_trip() {
+        let deploy = test_deploy_state();
+        let req = RaftRequest::DeployUpdate {
+            app_id: AppId::new("web", "prod"),
+            state: Box::new(deploy),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
     }
 }

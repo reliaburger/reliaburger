@@ -106,6 +106,26 @@ enum Command {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
     },
+    /// Trigger a rolling deploy for an app.
+    Deploy {
+        /// Path to a TOML config file.
+        path: PathBuf,
+    },
+    /// Show deploy history for an app.
+    History {
+        /// App name.
+        app: String,
+    },
+    /// Rollback an app to the previous version.
+    Rollback {
+        /// App name.
+        app: String,
+    },
+    /// Validate a config file without deploying.
+    Lint {
+        /// Path to a TOML config file.
+        path: PathBuf,
+    },
     /// List images in the local Pickle registry.
     Images,
     /// Manage API tokens.
@@ -242,6 +262,10 @@ async fn main() -> ExitCode {
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Deploy { ref path } => commands::deploy(path).await,
+        Command::History { ref app } => commands::history(app).await,
+        Command::Rollback { ref app } => commands::rollback(app).await,
+        Command::Lint { ref path } => commands::lint(path),
         Command::Images => commands::images().await,
         Command::Token { action } => match &action {
             TokenAction::Create {
@@ -567,5 +591,35 @@ mod tests {
             Command::Logs { since, .. } => assert_eq!(since.as_deref(), Some("1h")),
             _ => panic!("expected Logs command"),
         }
+    }
+
+    #[test]
+    fn parse_deploy_command() {
+        let cli = parse(&["relish", "deploy", "app.toml"]).unwrap();
+        assert!(matches!(cli.command, Command::Deploy { .. }));
+    }
+
+    #[test]
+    fn parse_history_command() {
+        let cli = parse(&["relish", "history", "web"]).unwrap();
+        match cli.command {
+            Command::History { app } => assert_eq!(app, "web"),
+            _ => panic!("expected History"),
+        }
+    }
+
+    #[test]
+    fn parse_rollback_command() {
+        let cli = parse(&["relish", "rollback", "web"]).unwrap();
+        match cli.command {
+            Command::Rollback { app } => assert_eq!(app, "web"),
+            _ => panic!("expected Rollback"),
+        }
+    }
+
+    #[test]
+    fn parse_lint_command() {
+        let cli = parse(&["relish", "lint", "app.toml"]).unwrap();
+        assert!(matches!(cli.command, Command::Lint { .. }));
     }
 }

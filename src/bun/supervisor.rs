@@ -63,13 +63,13 @@ pub struct WorkloadInstance {
 /// mocking frameworks. The compiler monomorphises this struct for each
 /// concrete `G`, so there's no virtual dispatch cost.
 pub struct WorkloadSupervisor<G: Grill> {
-    grill: G,
-    port_allocator: PortAllocator,
-    instances: HashMap<InstanceId, WorkloadInstance>,
+    pub(crate) grill: G,
+    pub(crate) port_allocator: PortAllocator,
+    pub(crate) instances: HashMap<InstanceId, WorkloadInstance>,
     health_checker: HealthChecker,
     /// Secondary index: (app_name, namespace) → instance IDs.
     /// Enables O(1) lookup by app without scanning all instances.
-    app_instances: HashMap<(String, String), Vec<InstanceId>>,
+    pub(crate) app_instances: HashMap<(String, String), Vec<InstanceId>>,
 }
 
 impl<G: Grill> WorkloadSupervisor<G> {
@@ -224,6 +224,25 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
 
         Ok(())
+    }
+
+    /// Remove all instances of an app from the supervisor tracking.
+    ///
+    /// Kills running processes via the Grill and removes all state.
+    /// Used during redeploy to clear stale instances before creating fresh ones.
+    pub async fn remove_app(&mut self, app_name: &str, namespace: &str) {
+        let key = (app_name.to_string(), namespace.to_string());
+        let ids = match self.app_instances.remove(&key) {
+            Some(ids) => ids,
+            None => return,
+        };
+
+        for id in &ids {
+            // Force-kill the process (SIGKILL, immediate, sets state to Stopped)
+            let _ = self.grill.kill(id).await;
+            self.health_checker.unregister(id);
+            self.instances.remove(id);
+        }
     }
 
     /// Get a reference to an instance by ID.
