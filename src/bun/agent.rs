@@ -399,7 +399,7 @@ impl<G: Grill> BunAgent<G> {
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
                         instance_id,
-                        image: String::new(), // TODO(Phase 5): from OCI spec
+                        image: inst.image.clone(),
                         port: inst.host_port,
                         container_state: inst.state,
                         consecutive_unhealthy: inst.health_counters.consecutive_unhealthy,
@@ -851,6 +851,7 @@ impl<G: Grill> BunAgent<G> {
                             restart_policy: crate::bun::restart::RestartPolicy::default(),
                             health_config: None,
                             is_job: false,
+                            image: spec.image.clone().unwrap_or_default(),
                             oci_spec: None,
                         },
                     );
