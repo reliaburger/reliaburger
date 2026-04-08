@@ -152,7 +152,10 @@ pub fn generate_oci_spec(
             args,
             env,
             cwd: "/".to_string(),
-            // TODO(Phase 4): use the `burger` unprivileged user
+            // Using nobody (65534) as the container user. A custom `burger`
+            // user would require creating it inside each container rootfs
+            // before exec, which adds complexity for no security benefit —
+            // 65534 is already unprivileged and widely recognised.
             user: OciUser {
                 uid: 65534,
                 gid: 65534,
