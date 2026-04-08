@@ -436,8 +436,37 @@ pub async fn deploy(path: &Path) -> Result<(), RelishError> {
 pub async fn history(app: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
-    // TODO: fetch from /v1/deploys/history/{app}
-    println!("deploy history for {app}: (requires agent connection)");
+
+    let url = format!("{}/v1/deploys/history/{app}", client.base_url());
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|_| RelishError::AgentUnreachable)?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| RelishError::ApiError {
+        status: 0,
+        body: e.to_string(),
+    })?;
+
+    if let Some(entries) = body["history"].as_array() {
+        if entries.is_empty() {
+            println!("no deploy history for {app}");
+        } else {
+            println!(
+                "{:<8} {:<20} {:<12} {:<6} {:<6}",
+                "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
+            );
+            for e in entries {
+                println!(
+                    "{:<8} {:<20} {:<12} {:<6} {:<6}",
+                    e["id"].as_u64().unwrap_or(0),
+                    e["image"].as_str().unwrap_or("-"),
+                    e["result"].as_str().unwrap_or("-"),
+                    e["steps_completed"].as_u64().unwrap_or(0),
+                    e["steps_total"].as_u64().unwrap_or(0),
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -445,8 +474,35 @@ pub async fn history(app: &str) -> Result<(), RelishError> {
 pub async fn rollback(app: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
-    // TODO: send rollback request to agent
-    println!("rollback requested for {app}: (requires agent connection)");
+
+    // Find the last successful deploy image from history
+    let url = format!("{}/v1/deploys/history/{app}", client.base_url());
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|_| RelishError::AgentUnreachable)?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| RelishError::ApiError {
+        status: 0,
+        body: e.to_string(),
+    })?;
+
+    let last_good = body["history"].as_array().and_then(|entries| {
+        entries
+            .iter()
+            .rev()
+            .find(|e| e["result"].as_str() == Some("Completed"))
+    });
+
+    match last_good {
+        Some(entry) => {
+            let image = entry["image"].as_str().unwrap_or("unknown");
+            println!("rollback {app} to image: {image}");
+            println!("(use `relish apply` with the previous config to rollback)");
+        }
+        None => {
+            println!("no successful deploy found in history for {app}");
+        }
+    }
+
     Ok(())
 }
 

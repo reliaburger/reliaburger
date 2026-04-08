@@ -67,10 +67,11 @@ async fn main() -> anyhow::Result<()> {
     // Create shutdown token
     let shutdown = CancellationToken::new();
 
-    // Spawn the agent
+    // Create the agent (extract deploy history handle before spawning)
     let agent_shutdown = shutdown.clone();
+    let mut agent = BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown);
+    let deploy_history = agent.deploy_history_handle();
     let agent_handle = tokio::spawn(async move {
-        let mut agent = BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown);
         agent.run().await;
     });
 
@@ -179,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
         Some(Arc::clone(&log_store)),
+        Some(deploy_history),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {

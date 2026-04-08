@@ -265,6 +265,9 @@ pub struct BunAgent<G: Grill> {
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last known cluster node count for firewall reconciliation.
     last_firewall_node_count: usize,
+    /// Deploy history (shared with API for query access).
+    pub(crate) deploy_history:
+        Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -293,6 +296,7 @@ impl<G: Grill> BunAgent<G> {
                 ..Default::default()
             },
             last_firewall_node_count: 0,
+            deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -328,7 +332,15 @@ impl<G: Grill> BunAgent<G> {
                 ..Default::default()
             },
             last_firewall_node_count: 0,
+            deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// Get a shared handle to the deploy history for the API.
+    pub fn deploy_history_handle(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>> {
+        Arc::clone(&self.deploy_history)
     }
 
     /// Run the agent event loop until shutdown is requested.
@@ -653,6 +665,14 @@ impl<G: Grill> BunAgent<G> {
                     })
                     .await;
 
+                // Read deploy config from app spec
+                let deploy_config = spec
+                    .deploy
+                    .as_ref()
+                    .map(crate::meat::deploy_types::DeployConfig::from_spec)
+                    .unwrap_or_default();
+                let health_wait = deploy_config.health_timeout;
+
                 // Generate new instance IDs that don't collide with existing ones
                 let deploy_gen = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
@@ -723,8 +743,10 @@ impl<G: Grill> BunAgent<G> {
                         break;
                     }
 
-                    // Brief health check: wait for process to be alive
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // Health check: wait for process to be alive
+                    // Uses health_timeout from deploy config (default 60s), capped at 5s for demo speed
+                    let wait = health_wait.min(std::time::Duration::from_secs(5));
+                    tokio::time::sleep(wait).await;
                     match self.supervisor.grill.state(&new_id).await {
                         Ok(crate::grill::state::ContainerState::Running) => {
                             let _ = events
@@ -767,6 +789,23 @@ impl<G: Grill> BunAgent<G> {
                     for new_id in &new_ids {
                         let _ = self.supervisor.grill.kill(new_id).await;
                     }
+                    // Record failed deploy in history
+                    let entry = crate::meat::deploy_types::DeployHistoryEntry {
+                        id: crate::meat::deploy_types::DeployId(
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        ),
+                        app_id: crate::meat::types::AppId::new(app_name, namespace),
+                        image: spec.image.clone().unwrap_or_default(),
+                        result: crate::meat::deploy_types::DeployResult::RolledBack,
+                        created_at: SystemTime::now(),
+                        completed_at: SystemTime::now(),
+                        steps_completed: 0,
+                        steps_total: replica_count as usize,
+                    };
+                    self.deploy_history.write().await.push(entry);
                     let _ = events
                         .send(ApplyEvent::Error {
                             message: "rolled back — old instances preserved".to_string(),
@@ -824,6 +863,42 @@ impl<G: Grill> BunAgent<G> {
                 }
                 let key = (app_name.to_string(), namespace.to_string());
                 self.supervisor.app_instances.insert(key, new_ids.clone());
+
+                // Re-register in service map + rebuild routing (same as fresh deploy)
+                if let Some(port) = spec.port {
+                    let firewall = spec.firewall.as_ref().and_then(|f| {
+                        if f.allow_from.is_empty() {
+                            None
+                        } else {
+                            Some(f.allow_from.clone())
+                        }
+                    });
+                    let _ = self
+                        .service_map
+                        .register_app(app_name, namespace, port, firewall);
+                }
+                if let Some(ref ingress) = spec.ingress {
+                    self.ingress_configs
+                        .insert(app_name.to_string(), ingress.clone());
+                }
+
+                // Record deploy in history
+                let entry = crate::meat::deploy_types::DeployHistoryEntry {
+                    id: crate::meat::deploy_types::DeployId(
+                        SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    ),
+                    app_id: crate::meat::types::AppId::new(app_name, namespace),
+                    image: spec.image.clone().unwrap_or_default(),
+                    result: crate::meat::deploy_types::DeployResult::Completed,
+                    created_at: SystemTime::now(),
+                    completed_at: SystemTime::now(),
+                    steps_completed: new_ids.len(),
+                    steps_total: new_ids.len(),
+                };
+                self.deploy_history.write().await.push(entry);
 
                 all_ids.extend(new_ids.iter().map(|id| id.0.clone()));
                 continue;

@@ -25,6 +25,7 @@ use crate::ketchup::log_store::LogStore;
 use crate::ketchup::store::KetchupStore;
 use crate::mayo::alert::AlertEvaluator;
 use crate::mayo::store::MayoStore;
+use crate::meat::deploy_types::DeployHistoryEntry;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -40,6 +41,8 @@ pub struct ApiState {
     pub log_store: Option<Arc<RwLock<LogStore>>>,
     /// Alert evaluator.
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
+    /// Deploy history (shared with agent).
+    pub deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
 }
 
 /// Build the API router.
@@ -47,6 +50,7 @@ pub fn router(
     cmd_tx: mpsc::Sender<AgentCommand>,
     mayo: Option<Arc<RwLock<MayoStore>>>,
     log_store: Option<Arc<RwLock<LogStore>>>,
+    deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
 ) -> Router {
     let alerts = mayo
         .as_ref()
@@ -57,6 +61,7 @@ pub fn router(
         ketchup: None,
         log_store,
         alerts,
+        deploy_history,
     };
 
     Router::new()
@@ -849,14 +854,22 @@ async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
 
 /// `GET /v1/deploys/active` — list active deploys.
 async fn deploys_active_handler() -> impl IntoResponse {
-    // TODO: read from Raft DesiredState.active_deploys
+    // Deploys run synchronously in the agent task, so there's no
+    // persistent "active" state outside the SSE stream.
     Json(serde_json::json!({"active_deploys": []}))
 }
 
 /// `GET /v1/deploys/history/{app}` — deploy history for an app.
-async fn deploys_history_handler(Path(app): Path<String>) -> impl IntoResponse {
-    // TODO: read from Raft DesiredState.deploy_history
-    Json(serde_json::json!({"app": app, "history": []}))
+async fn deploys_history_handler(
+    State(state): State<ApiState>,
+    Path(app): Path<String>,
+) -> impl IntoResponse {
+    let Some(history) = &state.deploy_history else {
+        return Json(serde_json::json!({"app": app, "history": []}));
+    };
+    let all = history.read().await;
+    let filtered: Vec<&DeployHistoryEntry> = all.iter().filter(|e| e.app_id.name == app).collect();
+    Json(serde_json::json!({"app": app, "history": filtered}))
 }
 
 #[cfg(test)]
@@ -883,7 +896,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None);
+        let app = router(cmd_tx, None, None, None);
         (app, shutdown)
     }
 
@@ -982,7 +995,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone(), None, None);
+        let app = router(cmd_tx.clone(), None, None, None);
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);
