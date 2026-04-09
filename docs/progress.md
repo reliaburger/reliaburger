@@ -96,7 +96,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Secret encryption (age keypairs, `ENC[AGE:...]` decryption at container startup, namespace-scoped keys)
 - [x] eBPF firewall rules (`allow_from` resolution, cgroup-to-namespace mapping, BPF map wiring)
 - [x] Raft log encryption at rest (AES-256-GCM, HKDF from node cert private key)
-- [x] `relish init` generates full PKI + join token; `relish token create/list/revoke`
+- [x] `relish init` generates full PKI + join token; `relish token create`
+- [ ] `relish token list/revoke` — stubs pending SecurityState in Raft
+- [ ] Join token validation in agent — stubs pending SecurityState in Raft
 - [x] Book chapter 4: "Trust No One"
 - [x] All Phase 4 tests green (795 tests)
 

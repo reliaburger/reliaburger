@@ -95,4 +95,4 @@ Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migra
 
 ## Test count
 
-Phase 7 adds 48 tests, bringing the total to 1039. The new tests cover every state machine transition (valid and invalid), the rolling orchestrator with mock driver (happy path, health failure, rollback, dependencies, start failure), Raft persistence of deploy state and history, CLI parsing, and config validation.
+Phase 7 adds 48 tests, bringing the total to 1047. The new tests cover every state machine transition (valid and invalid), the rolling orchestrator with mock driver (happy path, health failure, rollback, dependencies, start failure), Raft persistence of deploy state and history, CLI parsing, and config validation.
