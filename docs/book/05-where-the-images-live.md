@@ -165,6 +165,96 @@ On Linux, managed volumes with a size limit get a loop-mounted ext4 filesystem. 
 
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
+## Under the hood: key patterns
+
+### Validate at construction, not at use
+
+The `Digest` type is a newtype around `String`, but you can't create one without going through `Digest::new()`, which validates the format. Every function that takes a `Digest` knows it's well-formed without checking again.
+
+```rust
+pub fn write_blob(&self, data: &[u8], expected_digest: &Digest) -> Result<(), PickleError> {
+    let actual = compute_sha256(data);
+    if actual.as_str() != expected_digest.as_str() {
+        return Err(PickleError::DigestMismatch {
+            expected: expected_digest.clone(),
+            actual,
+        });
+    }
+    let path = self.blob_path(expected_digest);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, data)?;
+    Ok(())
+}
+```
+
+Validate the digest *before* writing. The data hits disk only after verification passes. If we wrote first and checked after, a crash between write and check would leave a corrupt blob. Failure-first validation is a pattern worth internalising.
+
+### Upsert with Vec, not HashMap
+
+The `ManifestCatalog` stores manifests as `Vec<(String, ImageManifest)>` instead of `HashMap`. Why? Raft state must serialise deterministically. `HashMap` iterates in an undefined order — serialise it twice and you might get different bytes, which breaks Raft's log comparison. `Vec` preserves insertion order and serialises identically every time.
+
+The trade-off is O(n) lookups instead of O(1). With thousands of images, you'd want a `BTreeMap` (deterministic order). With dozens — which is the realistic case for a single cluster's registry — a linear scan is faster because it avoids the overhead of tree rebalancing and hashing.
+
+```rust
+pub fn apply_manifest_commit(&mut self, commit: &ManifestCommit) {
+    let digest_str = commit.manifest.digest.0.clone();
+    let tag_key = format!("{}:{}", commit.manifest.repository, commit.tag);
+
+    // Remove old tag pointing to a different digest
+    self.tags.retain(|(k, _)| k != &tag_key);
+    self.tags.push((tag_key, digest_str.clone()));
+
+    // Upsert: add tag to existing manifest, or insert new
+    if let Some((_, existing)) = self.manifests.iter_mut().find(|(d, _)| d == &digest_str) {
+        existing.tags.insert(commit.tag.clone());
+    } else {
+        let mut manifest = commit.manifest.clone();
+        manifest.tags.insert(commit.tag.clone());
+        self.manifests.push((digest_str, manifest));
+    }
+}
+```
+
+The `retain` + `push` pattern for updating the tag list is idiomatic Rust for "replace if exists, insert if not" on a `Vec`. It's not the most efficient approach, but it's clear and correct. At registry scale (hundreds of tags, not millions), clarity wins.
+
+### Axum extractors: parse, don't validate
+
+The OCI API handlers show a pattern that axum encourages: let the framework extract and parse, then validate the domain logic yourself.
+
+```rust
+async fn blob_head(
+    State(state): State<PickleState>,
+    Path((_name, digest_str)): Path<(String, String)>,
+) -> Response {
+    let Ok(digest) = Digest::new(&digest_str) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    // ...
+}
+```
+
+Axum handles URL routing and parameter extraction. `Digest::new` handles domain validation. The handler glues them together. This separation means the `Digest` type works the same way whether it came from an HTTP path, a manifest JSON document, or a test fixture.
+
+## What we learned
+
+### Atomic rename is your friend
+
+The upload session design is simple: temp file for in-progress data, atomic rename to the blob store when verified. No journal, no WAL, no transaction log. The filesystem is the state machine.
+
+This works because rename on the same filesystem is atomic on Linux (and macOS). The blob is either fully present or absent, never half-written. A crash during upload leaves an orphan temp file that the next GC sweep cleans up. A crash during rename either completes or doesn't. No corruption either way.
+
+### Don't invent a protocol when HTTP exists
+
+Peer replication uses the same OCI Distribution API that Docker uses. The replicating node is literally a push client. This means: zero new code for the receiving side, the same error codes and retry semantics as a client push, and a protocol that every container tool already understands.
+
+We considered a custom binary protocol (gRPC, or raw TCP with length-prefixed frames). It would have been faster for large layers. But "slightly faster" doesn't beat "zero new code to test" when you're moving blobs between nodes on a local network.
+
+### Sole-copy protection prevents cascading deletion
+
+Without sole-copy protection, GC on two nodes can race: both check the holder set, both see "two holders", both delete. Now nobody holds the layer. The fix is in Raft: after GC, the node proposes a `GcReport` that removes itself from the holder set. Because Raft proposals are serialised, the second node's GC will see only one holder remaining and skip the deletion.
+
 ## Test count
 
 Phase 5 adds 72 tests, bringing the total to 867. The new tests cover digest parsing, manifest serde, Raft state machine extensions (commit, update, GC, delete), blob store operations (write, read, upload sessions, digest verification), OCI API endpoints (full push/pull round-trip), peer selection, image availability checks, GC safety (sole-copy, active reference, retention), and volume management.
