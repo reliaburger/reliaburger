@@ -133,6 +133,24 @@ pub enum AgentCommand {
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
     },
+    /// Inject a fault (Smoker).
+    InjectFault {
+        request: crate::smoker::types::FaultRequest,
+        response: oneshot::Sender<Result<crate::smoker::types::FaultSummary, BunError>>,
+    },
+    /// Clear a specific fault by ID.
+    ClearFault {
+        fault_id: u64,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Clear all active faults.
+    ClearAllFaults {
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// List all active faults.
+    ListFaults {
+        response: oneshot::Sender<Vec<crate::smoker::types::FaultSummary>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -253,8 +271,8 @@ pub struct BunAgent<G: Grill> {
     shutdown: CancellationToken,
     volumes_dir: PathBuf,
     cluster: Option<ClusterHandle>,
-    /// Active chaos partition (peers + expiry).
-    chaos_partition: Option<(Vec<String>, Instant)>,
+    /// Smoker fault registry — active faults on this node.
+    fault_registry: crate::smoker::registry::FaultRegistry,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
@@ -288,7 +306,7 @@ impl<G: Grill> BunAgent<G> {
             shutdown,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
-            chaos_partition: None,
+            fault_registry: crate::smoker::registry::FaultRegistry::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
@@ -319,7 +337,7 @@ impl<G: Grill> BunAgent<G> {
             shutdown,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
-            chaos_partition: None,
+            fault_registry: crate::smoker::registry::FaultRegistry::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
@@ -369,7 +387,7 @@ impl<G: Grill> BunAgent<G> {
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.drive_pending_restarts().await;
-                    self.expire_chaos_partition();
+                    self.expire_faults();
                     self.reconcile_firewall().await;
                 }
             }
@@ -563,8 +581,22 @@ impl<G: Grill> BunAgent<G> {
                 duration_secs,
                 response,
             } => {
-                let expiry = Instant::now() + std::time::Duration::from_secs(duration_secs);
-                self.chaos_partition = Some((peers.clone(), expiry));
+                // Legacy chaos API — create a partition fault in the registry
+                let request = crate::smoker::types::FaultRequest {
+                    fault_type: crate::smoker::types::FaultType::Partition {
+                        source_app: None,
+                        source_cgroup_id: 0,
+                    },
+                    target_service: peers.join(","),
+                    target_instance: None,
+                    target_node: None,
+                    duration: std::time::Duration::from_secs(duration_secs),
+                    injected_by: "relish chaos".into(),
+                    reason: Some("legacy chaos partition".into()),
+                    include_leader: false,
+                    override_safety: false,
+                };
+                self.fault_registry.insert(&request);
                 let msg = format!(
                     "partition injected: blocking {} peer(s) for {duration_secs}s",
                     peers.len()
@@ -572,17 +604,42 @@ impl<G: Grill> BunAgent<G> {
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::HealPartition { response } => {
-                let msg = if self.chaos_partition.is_some() {
-                    self.chaos_partition = None;
-                    "partition healed".to_string()
+                // Legacy chaos API — clear all faults
+                let removed = self.fault_registry.clear();
+                let msg = if removed.is_empty() {
+                    "no active faults".to_string()
                 } else {
-                    "no active partition".to_string()
+                    format!("cleared {} fault(s)", removed.len())
                 };
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::ChaosStatus { response } => {
                 let state = self.get_chaos_state();
                 let _ = response.send(state);
+            }
+            AgentCommand::InjectFault { request, response } => {
+                let rule = self.fault_registry.insert(&request);
+                let summary = crate::smoker::types::FaultSummary::from(&rule);
+                let _ = response.send(Ok(summary));
+            }
+            AgentCommand::ClearFault { fault_id, response } => {
+                let msg = match self
+                    .fault_registry
+                    .remove(crate::smoker::types::FaultId(fault_id))
+                {
+                    Some(rule) => format!("cleared fault {} ({})", rule.id, rule.fault_type),
+                    None => format!("fault {fault_id} not found"),
+                };
+                let _ = response.send(Ok(msg));
+            }
+            AgentCommand::ClearAllFaults { response } => {
+                let removed = self.fault_registry.clear();
+                let msg = format!("cleared {} fault(s)", removed.len());
+                let _ = response.send(Ok(msg));
+            }
+            AgentCommand::ListFaults { response } => {
+                let summaries = self.fault_registry.list();
+                let _ = response.send(summaries);
             }
             AgentCommand::Resolve { app_name, response } => {
                 let result = self
@@ -607,32 +664,42 @@ impl<G: Grill> BunAgent<G> {
         }
     }
 
-    /// Build the current chaos state for the API.
+    /// Build the current chaos state for the API (legacy format).
     fn get_chaos_state(&self) -> ChaosState {
-        let active_partition = self.chaos_partition.as_ref().map(|(peers, expiry)| {
-            let remaining = expiry.saturating_duration_since(Instant::now());
-            let injected_at = std::time::SystemTime::now() - remaining;
-            let epoch = injected_at
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            PartitionInfo {
-                peers: peers.clone(),
-                injected_at_epoch: epoch,
-                duration_secs: (remaining.as_millis() as u64).div_ceil(1000),
-                remaining_secs: remaining.as_secs(),
-            }
-        });
+        // Find the first partition-type fault for backward compatibility
+        let active_partition = self
+            .fault_registry
+            .iter()
+            .find(|f| {
+                matches!(
+                    f.fault_type,
+                    crate::smoker::types::FaultType::Partition { .. }
+                )
+            })
+            .map(|f| {
+                let remaining = f.remaining();
+                let epoch = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                PartitionInfo {
+                    peers: vec![f.target_service.clone()],
+                    injected_at_epoch: epoch.saturating_sub(
+                        (f.duration_ns / 1_000_000_000).saturating_sub(remaining.as_secs()),
+                    ),
+                    duration_secs: f.duration_ns / 1_000_000_000,
+                    remaining_secs: remaining.as_secs(),
+                }
+            });
         ChaosState { active_partition }
     }
 
-    /// Check and auto-expire chaos partitions. Called on every health tick.
-    fn expire_chaos_partition(&mut self) {
-        if let Some((_, expiry)) = &self.chaos_partition
-            && Instant::now() >= *expiry
-        {
-            self.chaos_partition = None;
-        }
+    /// Drain expired faults from the registry. Called on every health tick.
+    fn expire_faults(&mut self) {
+        let now = crate::smoker::types::monotonic_now_ns();
+        let _expired = self.fault_registry.drain_expired(now);
+        // TODO(Phase 8): clean up BPF map entries, kill helper processes
+        // for expired faults once those subsystems are wired in.
     }
 
     /// Deploy all apps and jobs from a config, streaming progress events.

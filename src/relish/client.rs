@@ -437,6 +437,97 @@ impl BunClient {
         Ok(state)
     }
 
+    /// Inject a fault (Smoker API).
+    pub async fn inject_fault(
+        &self,
+        request: &crate::smoker::types::FaultRequest,
+    ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
+        let url = format!("{}/v1/fault", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(request)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })
+    }
+
+    /// Clear a specific fault by ID.
+    pub async fn clear_fault(&self, id: u64) -> Result<String, RelishError> {
+        let url = format!("{}/v1/fault/{id}", self.base_url);
+        let response = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(json["message"].as_str().unwrap_or("ok").to_string())
+    }
+
+    /// Clear all active faults.
+    pub async fn clear_all_faults(&self) -> Result<String, RelishError> {
+        let url = format!("{}/v1/fault", self.base_url);
+        let response = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(json["message"].as_str().unwrap_or("ok").to_string())
+    }
+
+    /// List all active faults.
+    pub async fn list_faults(
+        &self,
+    ) -> Result<Vec<crate::smoker::types::FaultSummary>, RelishError> {
+        let url = format!("{}/v1/fault", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })
+    }
+
     /// Resolve a service name to its VIP and backends.
     pub async fn resolve(
         &self,
