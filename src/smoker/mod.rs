@@ -16,6 +16,8 @@
 /// - **process** — SIGKILL/SIGSTOP/SIGCONT signal injection.
 /// - **resource** — CPU stress, memory pressure, disk I/O throttle (Linux).
 /// - **node** — Node drain and node kill simulation.
+pub mod bpf_maps;
+pub mod bpf_types;
 pub mod node;
 pub mod process;
 pub mod registry;

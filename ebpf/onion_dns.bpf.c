@@ -15,6 +15,7 @@
  * Only UDP DNS is intercepted; TCP DNS bypasses Onion entirely.
  */
 #include "onion_common.h"
+#include "smoker_common.h"
 
 /* ---------- Map definitions --------------------------------------------- */
 
@@ -33,6 +34,15 @@ struct {
     __type(value, struct pending_dns_response);
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } dns_pending_map SEC(".maps");
+
+/* Smoker DNS fault map — checked before normal resolution */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct fault_dns_key);
+    __type(value, struct fault_dns_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} fault_dns_map SEC(".maps");
 
 /* ---------- Helpers ----------------------------------------------------- */
 

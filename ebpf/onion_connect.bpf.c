@@ -12,6 +12,7 @@
  * Non-VIP connections pass through untouched.
  */
 #include "onion_common.h"
+#include "smoker_common.h"
 
 /* ---------- Map definitions --------------------------------------------- */
 
@@ -39,6 +40,23 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } cgroup_namespace_map SEC(".maps");
 
+/* ---------- Smoker fault maps ------------------------------------------- */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct fault_connect_key);
+    __type(value, struct fault_connect_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} fault_connect_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, struct fault_state_key);
+    __type(value, struct fault_state_value);
+} fault_state_map SEC(".maps");
+
 /* ---------- Connect hook ------------------------------------------------ */
 
 SEC("cgroup/connect4")
@@ -49,6 +67,67 @@ int onion_connect(struct bpf_sock_addr *ctx)
     /* Only intercept VIPs in the 127.128.0.0/16 range */
     if ((dst_ip & VIP_MASK) != VIP_PREFIX)
         return 1;  /* not a VIP, pass through */
+
+    /* --- Smoker fault check (before normal path) --- */
+    {
+        __u64 src_cgroup = bpf_get_current_cgroup_id();
+
+        /* Check partition fault: specific source -> destination */
+        struct fault_connect_key fkey = {
+            .virtual_ip       = ctx->user_ip4,
+            .port             = ctx->user_port,
+            .source_cgroup_id = src_cgroup,
+        };
+        struct fault_connect_value *fval =
+            bpf_map_lookup_elem(&fault_connect_map, &fkey);
+
+        if (!fval) {
+            /* Also check wildcard (source_cgroup_id = 0) for
+             * non-partition faults that apply to all callers */
+            fkey.source_cgroup_id = 0;
+            fval = bpf_map_lookup_elem(&fault_connect_map, &fkey);
+        }
+
+        if (fval) {
+            /* Check expiry */
+            __u64 now = bpf_ktime_get_ns();
+            if (fval->expires_ns == 0 || now <= fval->expires_ns) {
+                /* Validate action field */
+                if (fval->action > FAULT_ACTION_PARTITION)
+                    goto no_fault;
+
+                if (fval->action == FAULT_ACTION_PARTITION) {
+                    /* Block this connection entirely */
+                    return 0;  /* -ECONNREFUSED */
+                }
+
+                if (fval->action == FAULT_ACTION_DROP) {
+                    /* Probabilistic drop: generate random via PRNG */
+                    __u32 skey = 0;
+                    struct fault_state_value *state =
+                        bpf_map_lookup_elem(&fault_state_map, &skey);
+                    if (state) {
+                        __u64 x = state->prng_state;
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        state->prng_state = x;
+                        state->lookups++;
+
+                        __u8 roll = x % 100;
+                        if (roll < fval->probability) {
+                            state->faults_injected++;
+                            return 0;  /* -ECONNREFUSED */
+                        }
+                    }
+                }
+
+                /* FAULT_ACTION_DELAY is handled in sock_ops or tc netem,
+                 * not in the connect hook. Fall through to normal path. */
+            }
+        }
+    }
+no_fault:
 
     /* Look up the backend list for this (VIP, port) */
     struct backend_key key = {
