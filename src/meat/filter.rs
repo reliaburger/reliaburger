@@ -52,6 +52,8 @@ mod tests {
             labels,
             ready,
             running_apps: HashSet::new(),
+            uptime_secs: 86400,
+            cached_images: HashSet::new(),
         }
     }
 

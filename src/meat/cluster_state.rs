@@ -23,6 +23,13 @@ pub struct SchedulerNodeState {
     pub ready: bool,
     /// Apps currently running on this node (for spread scoring).
     pub running_apps: HashSet<AppId>,
+    /// How long this node has been alive, in seconds. Used for stability
+    /// scoring — prefer nodes with longer uptime over freshly joined ones.
+    pub uptime_secs: u64,
+    /// Set of image references cached locally (e.g. "myapp:v1").
+    /// Used for image locality scoring — prefer nodes that already have
+    /// the required image layers.
+    pub cached_images: HashSet<String>,
 }
 
 impl SchedulerNodeState {
@@ -132,6 +139,8 @@ mod tests {
             labels: BTreeMap::new(),
             ready: true,
             running_apps: HashSet::new(),
+            uptime_secs: 3600,
+            cached_images: HashSet::new(),
         }
     }
 

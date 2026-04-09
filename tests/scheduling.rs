@@ -24,6 +24,8 @@ fn node(name: &str, cpu: u64, mem: u64, labels: BTreeMap<String, String>) -> Sch
         labels,
         ready: true,
         running_apps: HashSet::new(),
+        uptime_secs: 86400,
+        cached_images: HashSet::new(),
     }
 }
 

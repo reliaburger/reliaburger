@@ -660,6 +660,45 @@ pub fn token_create(
     Ok(())
 }
 
+/// Print the cluster's age public key from the init output directory.
+///
+/// Reads the security state written by `relish init` and extracts the
+/// age public key. This key can be used offline to encrypt secrets for
+/// `ENC[AGE:...]` config values.
+pub fn secret_pubkey(dir: &Path) -> Result<(), RelishError> {
+    let init_output_path = dir.join("sesame-state.json");
+    if !init_output_path.exists() {
+        return Err(RelishError::InitFailed(
+            "sesame-state.json not found — run `relish init` first".to_string(),
+        ));
+    }
+    let data = fs::read_to_string(&init_output_path)?;
+    let state: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| RelishError::InitFailed(format!("failed to parse sesame-state.json: {e}")))?;
+
+    let pubkey = state["age_public_key"]
+        .as_str()
+        .ok_or_else(|| RelishError::InitFailed("age_public_key not found in state".to_string()))?;
+
+    println!("{pubkey}");
+    Ok(())
+}
+
+/// Encrypt a plaintext value using an age public key.
+///
+/// Produces an `ENC[AGE:...]` string suitable for embedding in app
+/// config env vars. No cluster access required — encryption is a
+/// local operation using only the public key.
+pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
+    use crate::sesame::secret::encrypt_secret;
+
+    let encrypted =
+        encrypt_secret(value, pubkey).map_err(|e| RelishError::InitFailed(e.to_string()))?;
+
+    println!("{encrypted}");
+    Ok(())
+}
+
 /// List API tokens (stub — requires agent for Raft-stored tokens).
 pub async fn token_list() -> Result<(), RelishError> {
     let client = BunClient::default_local();
