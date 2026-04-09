@@ -687,3 +687,41 @@ pub fn generate_self_signed_cert()
 Operators can also provide their own cert and key via config (`tls_cert_path`, `tls_key_path`) for environments where a real certificate is available outside of Reliaburger's control.
 
 Phase 4 replaces this with Sesame, our built-in PKI: ACME for public-facing services (Let's Encrypt integration), or cluster CA for air-gapped environments. The self-signed stub is just enough to get the TLS listener working and the handshake tests passing.
+
+## What we learned
+
+### `wrapping_add` is not optional
+
+In C, integer overflow wraps silently. In Go, it wraps silently. In Rust, it panics in debug mode. Our IP calculation code crosses a /24 boundary (that's the whole point of a /23), so the third octet needs to overflow from one block into the next. The first time we ran it, the test panicked. The fix: `wrapping_add`. Two extra characters and a lesson in Rust's "no silent bugs" philosophy.
+
+If you come from C and find this annoying, think about it the other way: every integer operation in your C codebase that doesn't intend to wrap is a latent bug. Rust makes you choose. Explicit is better than implicit, even when it's more typing.
+
+### Shell out to `ip` for one-time setup, eBPF for the hot path
+
+We could have used the `netlink` crate to talk directly to the kernel for veth setup. We chose `ip` commands instead. Not because netlink is hard (it is, but that's not the point), but because debuggability matters more than elegance for one-time setup. When a veth pair isn't working, `ip link show` and `ip netns exec` are your friends. If we'd used netlink, we'd be debugging opaque byte sequences.
+
+The eBPF connect hook is the opposite: it runs on every `connect()` syscall in the hot path. Zero overhead is non-negotiable. Shelling out to anything would be absurd. Match the tool to the frequency.
+
+### Test the logic, gate the I/O
+
+Half of this chapter's code needs root on Linux. But the interesting logic (IP calculation, rule generation, VIP hashing, service map operations, routing table lookups) is pure functions. By splitting them cleanly from the I/O (creating namespaces, loading BPF programs, applying nftables rules), we get fast cross-platform tests for the logic and gated integration tests for the plumbing. `cargo test` on a MacBook runs in 4 seconds. The full suite in a Linux VM takes 30 seconds.
+
+### The BPF hook we wanted didn't exist
+
+We spent two days trying to do DNS in-kernel with `cgroup/sendmsg4` and `cgroup/recvmsg4`. The hooks can modify the destination address but can't read the UDP payload. Can you see the problem? You can redirect a DNS query to your own server, but you can't parse which name was queried or synthesise a response. The BPF helper we'd need only works with `SK_MSG` programs, not cgroup socket address hooks.
+
+50 microseconds in userspace beats two weeks fighting kernel limitations. Pragmatism over purity.
+
+### AtomicU64 for round-robin
+
+The routing table's round-robin counter uses `AtomicU64` with `Ordering::Relaxed`. If you're coming from Go, think `atomic.AddUint64` with no memory barrier. If you're coming from C, think `__atomic_fetch_add` with `__ATOMIC_RELAXED`.
+
+Why relaxed? Because we don't care about precise ordering between threads. If two requests arrive simultaneously and both increment the counter, they'll pick different backends — that's the desired outcome. We're not coordinating anything; we're distributing load. The weaker memory ordering means no cache-line bouncing on most architectures.
+
+### `#[repr(C)]` is your FFI contract
+
+Without `#[repr(C)]`, Rust will reorder struct fields for alignment efficiency. That's great for pure-Rust code and terrible for eBPF maps, where the kernel reads raw bytes at fixed offsets. Every struct shared between Rust and BPF gets `#[repr(C)]` and explicit `_pad` fields. If you forget, the kernel reads garbage from the map — and debugging "why does my BPF program think the port is 0?" is not fun.
+
+## Test count
+
+Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover). The eBPF tests are gated behind `RELIABURGER_EBPF_TESTS=1` and require Linux with cgroup v2.
