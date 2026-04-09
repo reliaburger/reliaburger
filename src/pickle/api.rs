@@ -68,8 +68,14 @@ async fn blob_head(
     if state.store.has_blob(&digest) {
         let size = state.store.blob_size(&digest).unwrap_or(0);
         let mut headers = HeaderMap::new();
-        headers.insert("content-length", size.to_string().parse().unwrap());
-        headers.insert("docker-content-digest", digest.as_str().parse().unwrap());
+        headers.insert(
+            "content-length",
+            size.to_string().parse().expect("ASCII header value"),
+        );
+        headers.insert(
+            "docker-content-digest",
+            digest.as_str().parse().expect("ASCII header value"),
+        );
         (StatusCode::OK, headers).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
@@ -88,9 +94,20 @@ async fn blob_get(
     match state.store.read_blob(&digest) {
         Ok(data) => {
             let mut headers = HeaderMap::new();
-            headers.insert("content-length", data.len().to_string().parse().unwrap());
-            headers.insert("docker-content-digest", digest.as_str().parse().unwrap());
-            headers.insert("content-type", "application/octet-stream".parse().unwrap());
+            headers.insert(
+                "content-length",
+                data.len().to_string().parse().expect("ASCII header value"),
+            );
+            headers.insert(
+                "docker-content-digest",
+                digest.as_str().parse().expect("ASCII header value"),
+            );
+            headers.insert(
+                "content-type",
+                "application/octet-stream"
+                    .parse()
+                    .expect("ASCII header value"),
+            );
             (StatusCode::OK, headers, data).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
@@ -134,9 +151,14 @@ async fn blob_upload_initiate(
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     "location",
-                    format!("/v2/{name}/blobs/{digest_str}").parse().unwrap(),
+                    format!("/v2/{name}/blobs/{digest_str}")
+                        .parse()
+                        .expect("ASCII header value"),
                 );
-                headers.insert("docker-content-digest", digest_str.parse().unwrap());
+                headers.insert(
+                    "docker-content-digest",
+                    digest_str.parse().expect("ASCII header value"),
+                );
                 return (StatusCode::CREATED, headers).into_response();
             }
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -148,9 +170,12 @@ async fn blob_upload_initiate(
         Ok(upload_id) => {
             let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
             let mut headers = HeaderMap::new();
-            headers.insert("location", location.parse().unwrap());
-            headers.insert("range", "0-0".parse().unwrap());
-            headers.insert("docker-upload-uuid", upload_id.parse().unwrap());
+            headers.insert("location", location.parse().expect("ASCII header value"));
+            headers.insert("range", "0-0".parse().expect("ASCII header value"));
+            headers.insert(
+                "docker-upload-uuid",
+                upload_id.parse().expect("ASCII header value"),
+            );
             (StatusCode::ACCEPTED, headers).into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -166,10 +191,15 @@ async fn blob_upload_patch(
     match state.store.write_upload_chunk(&upload_id, &body).await {
         Ok(total) => {
             let mut headers = HeaderMap::new();
-            headers.insert("docker-upload-uuid", upload_id.parse().unwrap());
+            headers.insert(
+                "docker-upload-uuid",
+                upload_id.parse().expect("ASCII header value"),
+            );
             headers.insert(
                 "range",
-                format!("0-{}", total.saturating_sub(1)).parse().unwrap(),
+                format!("0-{}", total.saturating_sub(1))
+                    .parse()
+                    .expect("ASCII header value"),
             );
             (StatusCode::ACCEPTED, headers).into_response()
         }
@@ -211,7 +241,10 @@ async fn blob_upload_complete(
     match state.store.complete_upload(&upload_id, &digest).await {
         Ok(()) => {
             let mut headers = HeaderMap::new();
-            headers.insert("docker-content-digest", digest.as_str().parse().unwrap());
+            headers.insert(
+                "docker-content-digest",
+                digest.as_str().parse().expect("ASCII header value"),
+            );
             (StatusCode::CREATED, headers).into_response()
         }
         Err(super::types::PickleError::DigestMismatch { expected, actual }) => (
@@ -303,7 +336,10 @@ async fn manifest_put(
             let mut headers = HeaderMap::new();
             headers.insert(
                 "docker-content-digest",
-                manifest_digest.as_str().parse().unwrap(),
+                manifest_digest
+                    .as_str()
+                    .parse()
+                    .expect("ASCII header value"),
             );
             return (StatusCode::CREATED, headers).into_response();
         }
@@ -336,7 +372,10 @@ async fn manifest_put(
         let mut headers = HeaderMap::new();
         headers.insert(
             "docker-content-digest",
-            manifest_digest.as_str().parse().unwrap(),
+            manifest_digest
+                .as_str()
+                .parse()
+                .expect("ASCII header value"),
         );
         return (StatusCode::CREATED, headers).into_response();
     }
@@ -349,7 +388,10 @@ async fn manifest_put(
             let mut headers = HeaderMap::new();
             headers.insert(
                 "docker-content-digest",
-                manifest_digest.as_str().parse().unwrap(),
+                manifest_digest
+                    .as_str()
+                    .parse()
+                    .expect("ASCII header value"),
             );
             return (StatusCode::CREATED, headers).into_response();
         }
@@ -361,7 +403,10 @@ async fn manifest_put(
             let mut headers = HeaderMap::new();
             headers.insert(
                 "docker-content-digest",
-                manifest_digest.as_str().parse().unwrap(),
+                manifest_digest
+                    .as_str()
+                    .parse()
+                    .expect("ASCII header value"),
             );
             return (StatusCode::CREATED, headers).into_response();
         }
@@ -412,7 +457,10 @@ async fn manifest_put(
     let mut headers = HeaderMap::new();
     headers.insert(
         "docker-content-digest",
-        manifest_digest.as_str().parse().unwrap(),
+        manifest_digest
+            .as_str()
+            .parse()
+            .expect("ASCII header value"),
     );
     (StatusCode::CREATED, headers).into_response()
 }
@@ -432,8 +480,14 @@ async fn manifest_get(
     {
         let content_type = detect_manifest_content_type(&data);
         let mut headers = HeaderMap::new();
-        headers.insert("content-type", content_type.parse().unwrap());
-        headers.insert("docker-content-digest", reference.parse().unwrap());
+        headers.insert(
+            "content-type",
+            content_type.parse().expect("ASCII header value"),
+        );
+        headers.insert(
+            "docker-content-digest",
+            reference.parse().expect("ASCII header value"),
+        );
         return (StatusCode::OK, headers, data).into_response();
     }
 
@@ -446,8 +500,14 @@ async fn manifest_get(
             Ok(data) => {
                 let content_type = detect_manifest_content_type(&data);
                 let mut headers = HeaderMap::new();
-                headers.insert("content-type", content_type.parse().unwrap());
-                headers.insert("docker-content-digest", m.digest.as_str().parse().unwrap());
+                headers.insert(
+                    "content-type",
+                    content_type.parse().expect("ASCII header value"),
+                );
+                headers.insert(
+                    "docker-content-digest",
+                    m.digest.as_str().parse().expect("ASCII header value"),
+                );
                 (StatusCode::OK, headers, data).into_response()
             }
             Err(_) => StatusCode::NOT_FOUND.into_response(),

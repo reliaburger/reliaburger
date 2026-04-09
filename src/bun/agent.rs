@@ -268,6 +268,10 @@ pub struct BunAgent<G: Grill> {
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
+    /// Pre-created network namespace paths for instances (Linux + runc only).
+    /// When present, the namespace path is passed to `generate_oci_spec` so
+    /// the container joins the pre-created namespace instead of creating one.
+    netns_paths: std::collections::HashMap<InstanceId, std::path::PathBuf>,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -297,6 +301,7 @@ impl<G: Grill> BunAgent<G> {
             },
             last_firewall_node_count: 0,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            netns_paths: std::collections::HashMap::new(),
         }
     }
 
@@ -333,6 +338,7 @@ impl<G: Grill> BunAgent<G> {
             },
             last_firewall_node_count: 0,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            netns_paths: std::collections::HashMap::new(),
         }
     }
 
@@ -399,7 +405,7 @@ impl<G: Grill> BunAgent<G> {
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
                         instance_id,
-                        image: String::new(), // TODO(Phase 5): from OCI spec
+                        image: inst.image.clone(),
                         port: inst.host_port,
                         container_state: inst.state,
                         consecutive_unhealthy: inst.health_counters.consecutive_unhealthy,
@@ -851,6 +857,7 @@ impl<G: Grill> BunAgent<G> {
                             restart_policy: crate::bun::restart::RestartPolicy::default(),
                             health_config: None,
                             is_job: false,
+                            image: spec.image.clone().unwrap_or_default(),
                             oci_spec: None,
                         },
                     );
@@ -1074,8 +1081,13 @@ impl<G: Grill> BunAgent<G> {
             .unwrap_or(0);
         let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, instance_index);
         let cgroup_str = cgroup_path.to_string_lossy();
-        // TODO(Phase 3): pass netns_path from ContainerNetwork when RuncGrill
-        // sets up per-container networking
+        // Pass the pre-created network namespace path if the instance has
+        // one (Linux + runc only). Otherwise each container gets its own
+        // namespace via the OCI spec.
+        let netns_path = self
+            .netns_paths
+            .get(instance_id)
+            .map(|p| p.to_string_lossy().into_owned());
         let oci_spec = generate_oci_spec(
             app_name,
             namespace,
@@ -1083,7 +1095,7 @@ impl<G: Grill> BunAgent<G> {
             host_port,
             &cgroup_str,
             Some(&self.volumes_dir),
-            None,
+            netns_path.as_deref(),
         );
 
         self.supervisor

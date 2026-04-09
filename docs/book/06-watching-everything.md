@@ -151,6 +151,97 @@ The dashboard shows three sections: apps (name, status, instance count), nodes (
 
 Total payload: under 10KB. First paint: instant.
 
+## Under the hood: key patterns
+
+### Arrow RecordBatch construction
+
+Each metrics sample starts as a Rust struct. To get it into DataFusion, we transpose the data into columnar arrays and wrap them in a `RecordBatch`:
+
+```rust
+fn buffer_to_batch(&self) -> Result<Option<RecordBatch>, MayoError> {
+    if self.buffer.is_empty() {
+        return Ok(None);
+    }
+
+    let timestamps: Vec<u64> = self.buffer.iter().map(|s| s.timestamp).collect();
+    let names: Vec<&str> = self.buffer.iter().map(|s| s.metric_name.as_str()).collect();
+    let values: Vec<f64> = self.buffer.iter().map(|s| s.value).collect();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(metrics_schema()),
+        vec![
+            Arc::new(UInt64Array::from(timestamps)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Float64Array::from(values)),
+        ],
+    )?;
+    Ok(Some(batch))
+}
+```
+
+Four iterations over the same buffer, producing four column vectors. If you're coming from Python, think of it as converting a list of dicts into a dict of lists — the same data, rotated 90 degrees. Each column becomes an `Arc<dyn Array>` because DataFusion needs shared ownership (multiple query operators might read the same batch concurrently).
+
+The `?` on `try_new` catches schema mismatches: if you pass three arrays when the schema expects four, you get an error at batch construction time, not somewhere deep in a query plan. Fail fast.
+
+### The alert state machine
+
+The alert evaluator has three states and four transitions, all in a single `match`:
+
+```rust
+let new_state = match (&state, breaching) {
+    (AlertState::Inactive, true) => AlertState::Pending { since: now },
+    (AlertState::Pending { since }, true) => {
+        if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
+            AlertState::Firing { since: *since }
+        } else {
+            state.clone()
+        }
+    }
+    (AlertState::Firing { .. }, true) => state.clone(),
+    (_, false) => AlertState::Inactive,
+};
+```
+
+Four arms cover every case. The `since` field is set when the alert enters Pending and preserved when it moves to Firing — so you know when the breach *started*, not when it was confirmed. The wildcard `(_, false)` handles the recovery case: no matter what state you're in, if the metric is no longer breaching, go back to Inactive. No hysteresis, no debounce. Simple.
+
+If you're used to state machines in Go or Java, this might look too compact. Where are the separate `handleInactive()`, `handlePending()`, `handleFiring()` methods? Rust's pattern matching lets you collapse them into one expression. The compiler ensures you handle every combination — add a fourth state and every `match` in the codebase that doesn't handle it becomes a compilation error.
+
+### Sparse indexing: the write path
+
+The sparse index update on log append is the kind of trick that's easy to get wrong. We only write an index entry when we cross a 4KB boundary:
+
+```rust
+let offset_after = offset_before + record.len() as u64;
+if offset_before / INDEX_INTERVAL != offset_after / INDEX_INTERVAL {
+    index.add(offset_before, timestamp);
+    index.write_to(&idx_path)?;
+}
+```
+
+Integer division does the heavy lifting. If both offsets are in the same 4KB block, the division produces the same result and we skip the index update. If they straddle a boundary, we record the offset. One comparison, no modular arithmetic, no counters to maintain.
+
+The cost: for a 100MB log file, the sparse index has about 25,000 entries (one per 4KB). Binary search finds any timestamp in ~15 comparisons. Sequential scan from there covers at most 4KB of log data. The combination gives us O(log n) time-range queries without maintaining a full index.
+
+## What we learned
+
+### Reuse the query engine, don't build one
+
+DataFusion gives us SQL parsing, query planning, columnar execution, predicate pushdown, and Parquet I/O. That's roughly 200,000 lines of code we didn't write. Our glue layer is about 400 lines. The ratio (500:1) is the best leverage in the entire project.
+
+The temptation was to build something simpler: a custom iterator over Parquet files with hardcoded filters. It would have been "enough" for v1. But then you want time-range queries, then aggregations, then LIKE filters, then JSON field extraction, and suddenly you've built half a query engine badly. Start with DataFusion and you skip the reinvention.
+
+### Five default alerts cover 90% of incidents
+
+We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules are a Phase 9 feature, and nobody has complained about the delay.
+
+The lesson: don't build config for things that have obvious defaults. Ship the defaults, add config later if someone needs it.
+
+### Server-rendered HTML with meta refresh beats React
+
+The Brioche dashboard is a single server-rendered HTML page. No JavaScript framework, no API calls, no state management. The browser refreshes every 5 seconds. Total payload: 10KB. Time to first meaningful paint: zero seconds (it's all in the HTML response).
+
+Could we build a nicer dashboard with React and WebSocket updates? Sure. But that's a separate build pipeline, a node_modules tree, a bundler, and an entire frontend ecosystem to maintain. The server-rendered approach gives us something that works today and costs nothing to maintain.
+
 ## Test count
 
 Phase 6 adds 120 tests, bringing the total to 991. The new tests cover Arrow schema validation, DataFusion SQL queries over both metrics and logs, Parquet persistence, system metrics collection (CPU, memory, disk, network), Prometheus text parsing, alert state machine transitions, log append/query/grep/tail/JSON filtering, LogStore SQL queries (app filter, time range, LIKE grep, LIMIT), sparse index binary search, cross-node log merge, and dashboard HTML rendering.

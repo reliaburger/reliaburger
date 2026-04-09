@@ -53,6 +53,8 @@ pub struct WorkloadInstance {
     pub health_config: Option<HealthCheckConfig>,
     /// Whether this instance is a job (run-to-completion) rather than an app.
     pub is_job: bool,
+    /// OCI image reference, e.g. "docker.io/library/nginx:latest".
+    pub image: String,
     /// Stored OCI spec for restart re-drive. Set during initial startup.
     pub oci_spec: Option<OciSpec>,
 }
@@ -140,6 +142,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 restart_policy: RestartPolicy::default(),
                 health_config,
                 is_job: false,
+                image: spec.image.clone().unwrap_or_default(),
                 oci_spec: None,
             };
 
@@ -163,7 +166,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         &mut self,
         job_name: &str,
         namespace: &str,
-        _spec: &JobSpec,
+        spec: &JobSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
         let instance_id = InstanceId(format!("{job_name}-0"));
@@ -182,6 +185,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             restart_policy: RestartPolicy::for_job(3),
             health_config: None,
             is_job: true,
+            image: spec.image.clone().unwrap_or_default(),
             oci_spec: None,
         };
 

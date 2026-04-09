@@ -123,7 +123,7 @@ Each `.idx` file is a flat array of fixed-size index entries, memory-mapped for 
 └─────────────────────────────────────────────────┘
 ```
 
-One index entry is written for every N log records (default N=64, configurable). This provides a sparse index: to find logs at a given timestamp, binary search the index to find the nearest preceding entry, then scan forward from that file offset. With 64 records per index entry, the index for a file containing 10 million log lines is ~2.4 MB (10M / 64 * 16 bytes), which fits comfortably in memory via `mmap`.
+One index entry is written every 4 KB of log data (configurable via `INDEX_INTERVAL`). This provides a sparse byte-offset index: to find logs at a given timestamp, binary search the index to find the nearest preceding entry, then scan forward from that file offset. With a 4 KB interval, the index for a 100 MB log file has ~25,000 entries (25K * 16 bytes = 400 KB), which fits comfortably in memory. Binary search finds any timestamp in ~15 comparisons, then at most 4 KB of log data needs sequential scanning.
 
 Index entries are always sorted by timestamp (log records are appended in timestamp order because each capture task processes lines sequentially per-workload, and the index is append-only).
 
@@ -391,10 +391,10 @@ pub struct DayLogWriter {
     pub log_file: tokio::fs::File,
     /// File handle for the .idx file, opened in append mode.
     pub idx_file: tokio::fs::File,
-    /// Number of records written since the last index entry.
-    pub records_since_last_index: u32,
-    /// The index interval (write an index entry every N records).
-    pub index_interval: u32,
+    /// Byte offset at last index entry.
+    pub last_index_offset: u64,
+    /// The index interval in bytes (write an index entry every N bytes).
+    pub index_interval: u64,
     /// Current byte offset in the log file (tracked in-memory to avoid seeks).
     pub current_offset: u64,
     /// Mapping from instance name to instance_id for this day.
@@ -548,10 +548,10 @@ compressed_retention_days = 30
 # Default: "20Gi"
 max_storage = "20Gi"
 
-# Sparse index interval: one index entry per N log records.
+# Sparse index interval in bytes: one index entry per N bytes of log data.
 # Lower values = faster time-range lookups, larger index files.
-# Default: 64
-index_interval = 64
+# Default: 4096 (4 KB)
+index_interval = 4096
 
 # Zstd compression level for archived log files (1-22).
 # Level 3 is the default, offering good compression ratio with fast speed.
@@ -601,7 +601,7 @@ interval = "1h"
 | `retention_days` | 7 | Covers a typical on-call rotation. Most debugging happens within hours, but a week of raw logs enables post-incident review. |
 | `compressed_retention_days` | 30 | Compressed logs are ~10x smaller; a month of history is cheap to store. |
 | `max_storage` | 20 Gi | Prevents runaway log growth from consuming disk needed by the container runtime and application volumes. |
-| `index_interval` | 64 | At 64 records per index entry, the index is ~0.025% the size of the log data. A query for a specific second in a 10M-line file requires scanning at most 64 records after the index lookup. |
+| `index_interval` | 4096 | At 4 KB per index entry, the index for a 100 MB file is ~400 KB (~0.4%). A time-range query requires binary search (~15 comparisons) then at most 4 KB of sequential scan. |
 | `compression_level` | 3 | Zstd level 3 compresses log data at ~400 MB/s with a typical ratio of 5-10x. Higher levels offer diminishing returns for log data. |
 
 ---
@@ -701,10 +701,10 @@ On-disk log files are owned by the Bun process user (typically `reliaburger` or 
 
 ### 9.2 Query Latency
 
-**Time-range query:** For a query over a 1-hour window in a file with 10M lines:
+**Time-range query:** For a query over a 1-hour window in a 100 MB log file:
 
-1. Index binary search: O(log(N/64)) = O(log(156250)) ~ 17 comparisons. With memory-mapped index, this completes in < 1 microsecond.
-2. Forward scan from the index entry: at most 64 records to reach the start of the time window, then sequential scan through the matching records.
+1. Index binary search: O(log(N/4096)) = O(log(~25000)) ~ 15 comparisons. This completes in < 1 microsecond.
+2. Forward scan from the index entry: at most 4 KB of data to reach the start of the time window, then sequential scan through the matching records.
 3. Total latency is dominated by disk I/O for the sequential scan, not by CPU. For data in the page cache (recent logs), expect < 10ms for a 1-hour window returning 10,000 matching lines.
 
 **Grep query:** Regex matching via the `regex` crate operates at ~1 GB/s for simple patterns on modern CPUs (the crate uses SIMD-accelerated DFA). A grep over 10M lines (~2 GB of raw data) completes in ~2 seconds from cold cache, or < 500ms from warm cache.

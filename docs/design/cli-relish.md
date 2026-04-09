@@ -178,7 +178,7 @@ Every command supports three output modes via the `--output` flag:
 |------|------|-------------|
 | Human | `--output human` (default) | Coloured, aligned terminal output with Unicode symbols |
 | JSON | `--output json` | Machine-readable JSON, one object per line for streaming commands |
-| Table | `--output table` | ASCII table format using `tabled`, suitable for piping to `column` or `awk` |
+| YAML | `--output yaml` | YAML serialisation via `serde_yaml`, useful for config round-tripping |
 
 Human-readable output uses ANSI colours (auto-detected, disabled when piped). Status indicators use Unicode: checkmarks, crosses, warning triangles, and bullets. Progress bars use `indicatif` for long-running operations (apply, upgrade, bench).
 
@@ -198,7 +198,7 @@ pub struct CliConfig {
     /// Can be overridden by --cluster flag or RELISH_CLUSTER env var.
     pub cluster: String,
 
-    /// Default output format: "human", "json", or "table".
+    /// Default output format: "human", "json", or "yaml".
     pub output: OutputFormat,
 
     /// Path to client TLS certificate for mTLS authentication.
@@ -240,7 +240,7 @@ pub struct TuiConfig {
 pub enum OutputFormat {
     Human,
     Json,
-    Table,
+    Yaml,
 }
 ```
 
@@ -810,7 +810,7 @@ relish export --format kubernetes -f <path> # Export to Kubernetes manifests
 
 # Global flags (available on all commands)
   --cluster <addr>          # Override cluster endpoint
-  --output <format>         # Output format: human, json, table
+  --output <format>         # Output format: human, json, yaml
   --namespace <ns>          # Target namespace
   --token <token>           # API token (overrides config)
   --no-colour                # Disable ANSI colours
@@ -1276,7 +1276,7 @@ Relish looks for configuration in the following order (first found wins):
 # Cluster endpoint. Any node address works; Relish discovers the topology.
 cluster = "10.0.1.5:9443"
 
-# Default output format: "human", "json", or "table"
+# Default output format: "human", "json", or "yaml"
 output = "human"
 
 # Authentication (token-based)
@@ -1657,7 +1657,7 @@ Relish is implemented in Rust. The following crates are used:
 | `reqwest` | 0.12.x | HTTP/2 client with mTLS, connection pooling, streaming |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
 | `tokio-tungstenite` | 0.24.x | WebSocket client for streaming logs, events, and exec sessions |
-| `tabled` | 0.17.x | Table formatting for `--output table` mode |
+| `serde_yaml` | 0.9.x | YAML serialisation for `--output yaml` mode |
 | `indicatif` | 0.17.x | Progress bars and spinners for long-running operations (apply, upgrade, bench) |
 | `dialoguer` | 0.11.x | Interactive prompts for confirmations (apply, chaos test, upgrade) |
 | `serde` | 1.x | Serialisation/deserialisation for config, API responses, output |

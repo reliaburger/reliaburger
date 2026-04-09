@@ -26,6 +26,7 @@ use crate::ketchup::store::KetchupStore;
 use crate::mayo::alert::AlertEvaluator;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
+use crate::pickle::types::ManifestCatalog;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -43,6 +44,8 @@ pub struct ApiState {
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     /// Deploy history (shared with agent).
     pub deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    /// Pickle image catalog (shared with registry).
+    pub pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
 }
 
 /// Build the API router.
@@ -51,6 +54,7 @@ pub fn router(
     mayo: Option<Arc<RwLock<MayoStore>>>,
     log_store: Option<Arc<RwLock<LogStore>>>,
     deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
 ) -> Router {
     let alerts = mayo
         .as_ref()
@@ -62,6 +66,7 @@ pub fn router(
         log_store,
         alerts,
         deploy_history,
+        pickle_catalog,
     };
 
     Router::new()
@@ -89,6 +94,7 @@ pub fn router(
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
+        .route("/v1/images", get(images_handler))
         .with_state(state)
 }
 
@@ -872,6 +878,30 @@ async fn deploys_history_handler(
     Json(serde_json::json!({"app": app, "history": filtered}))
 }
 
+/// `GET /v1/images` — list images in the local Pickle registry.
+async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let Some(catalog) = &state.pickle_catalog else {
+        return Json(serde_json::json!({"images": []}));
+    };
+    let catalog = catalog.read().await;
+    let images: Vec<serde_json::Value> = catalog
+        .manifests
+        .iter()
+        .map(|(digest, m)| {
+            let tags: Vec<&str> = m.tags.iter().map(|t| t.as_str()).collect();
+            let layers = m.layers.len();
+            serde_json::json!({
+                "repository": m.repository,
+                "digest": digest,
+                "tags": tags,
+                "layers": layers,
+                "total_size": m.total_size,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"images": images}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,7 +926,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None, None);
+        let app = router(cmd_tx, None, None, None, None);
         (app, shutdown)
     }
 
@@ -995,7 +1025,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone(), None, None, None);
+        let app = router(cmd_tx.clone(), None, None, None, None);
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);

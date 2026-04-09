@@ -492,4 +492,21 @@ impl BunClient {
             body: format!("failed to parse routes response: {e}"),
         })
     }
+
+    /// List images in the local Pickle registry.
+    pub async fn images(&self) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}/v1/images", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse images response: {e}"),
+        })
+    }
 }

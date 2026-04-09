@@ -152,7 +152,10 @@ pub fn generate_oci_spec(
             args,
             env,
             cwd: "/".to_string(),
-            // TODO(Phase 4): use the `burger` unprivileged user
+            // Using nobody (65534) as the container user. A custom `burger`
+            // user would require creating it inside each container rootfs
+            // before exec, which adds complexity for no security benefit —
+            // 65534 is already unprivileged and widely recognised.
             user: OciUser {
                 uid: 65534,
                 gid: 65534,
@@ -228,12 +231,36 @@ fn build_mounts(
 ) -> Vec<OciMount> {
     let mut mounts = standard_mounts();
 
-    // Config files: read-only bind mounts
+    // Config files: read-only bind mounts.
+    // Inline content is written to a file under volumes_dir so it can be
+    // bind-mounted into the container. Source paths are used directly.
     for cf in &spec.config_file {
+        let source = if let Some(ref source_path) = cf.source {
+            Some(PathBuf::from(source_path))
+        } else if let Some(ref content) = cf.content {
+            // Resolve inline content to a temp file path
+            let base = volumes_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"));
+            let config_dir = base.join(".config").join(namespace).join(app_name);
+            let filename = cf
+                .path
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("config"));
+            let host_path = config_dir.join(filename);
+            if let Err(e) = std::fs::create_dir_all(&config_dir) {
+                eprintln!("failed to create config dir {}: {e}", config_dir.display());
+            } else if let Err(e) = std::fs::write(&host_path, content.as_bytes()) {
+                eprintln!("failed to write inline config {}: {e}", host_path.display());
+            }
+            Some(host_path)
+        } else {
+            None
+        };
+
         mounts.push(OciMount {
             destination: cf.path.clone(),
-            // TODO(Phase 5): resolve inline content to a temp file path
-            source: cf.source.as_ref().map(PathBuf::from),
+            source,
             mount_type: Some("bind".to_string()),
             options: vec!["bind".to_string(), "ro".to_string()],
         });
@@ -612,21 +639,61 @@ mod tests {
     }
 
     #[test]
-    fn generate_with_config_file() {
+    fn generate_with_config_file_source() {
         let mut spec = minimal_app();
         spec.config_file.push(ConfigFileSpec {
             path: PathBuf::from("/etc/app.conf"),
-            content: Some("key = value".to_string()),
-            source: None,
+            content: None,
+            source: Some("/host/configs/app.conf".to_string()),
         });
         let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
 
         let cf_mount = oci
             .mounts
             .iter()
-            .find(|m| m.destination == std::path::Path::new("/etc/app.conf"));
-        assert!(cf_mount.is_some());
-        assert!(cf_mount.unwrap().options.contains(&"ro".to_string()));
+            .find(|m| m.destination == std::path::Path::new("/etc/app.conf"))
+            .expect("config file mount not found");
+        assert_eq!(
+            cf_mount.source,
+            Some(PathBuf::from("/host/configs/app.conf"))
+        );
+        assert!(cf_mount.options.contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn generate_with_config_file_inline_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = minimal_app();
+        spec.config_file.push(ConfigFileSpec {
+            path: PathBuf::from("/etc/app.conf"),
+            content: Some("key = value".to_string()),
+            source: None,
+        });
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            None,
+            "/cgroup/path",
+            Some(tmp.path()),
+            None,
+        );
+
+        let cf_mount = oci
+            .mounts
+            .iter()
+            .find(|m| m.destination == std::path::Path::new("/etc/app.conf"))
+            .expect("config file mount not found");
+        let source = cf_mount
+            .source
+            .as_ref()
+            .expect("inline config should have source");
+        assert!(
+            source.exists(),
+            "inline config file should be written to disk"
+        );
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "key = value");
+        assert!(cf_mount.options.contains(&"ro".to_string()));
     }
 
     #[test]
