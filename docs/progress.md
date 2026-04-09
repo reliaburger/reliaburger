@@ -101,7 +101,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] `relish init` generates full PKI + join token; `relish token create`
 - [ ] `relish token list/revoke` — stubs pending SecurityState in Raft
 - [ ] Join token validation in agent — stubs pending SecurityState in Raft
-- [ ] `relish secret encrypt/pubkey/rotate` CLI commands — crypto works, CLI not wired
+- [x] `relish secret pubkey` and `relish secret encrypt` CLI commands
+- [ ] `relish secret rotate` — requires SecurityState in Raft (same dependency as token list/revoke)
 - [x] Book chapter 4: "Trust No One"
 - [x] All Phase 4 tests green (795 tests)
 

@@ -128,6 +128,11 @@ enum Command {
     },
     /// List images in the local Pickle registry.
     Images,
+    /// Manage secrets (encrypt values for use in app configs).
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// Manage API tokens.
     Token {
         #[command(subcommand)]
@@ -166,6 +171,24 @@ enum TokenAction {
     Revoke {
         /// Token name to revoke.
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Print the cluster's age public key (for encrypting secrets offline).
+    Pubkey {
+        /// Directory containing the cluster config (from relish init).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Encrypt a plaintext value for use in app config ENC[AGE:...] fields.
+    Encrypt {
+        /// The age public key (from `relish secret pubkey`).
+        #[arg(long)]
+        pubkey: String,
+        /// The plaintext value to encrypt.
+        value: String,
     },
 }
 
@@ -267,6 +290,10 @@ async fn main() -> ExitCode {
         Command::Rollback { ref app } => commands::rollback(app).await,
         Command::Lint { ref path } => commands::lint(path),
         Command::Images => commands::images().await,
+        Command::Secret { action } => match &action {
+            SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
+            SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
+        },
         Command::Token { action } => match &action {
             TokenAction::Create {
                 name,
