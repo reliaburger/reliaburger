@@ -107,9 +107,9 @@ Meat uses a four-phase placement pipeline for App scheduling:
 
 - **Bin-packing score (weight 50):** Prefer nodes with the least remaining allocatable resources after placing this workload. This maximizes density.
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
-- **Image locality score (weight 15):** Nodes that already have the required image layers cached in Pickle score higher.
+- **Image locality score (weight 15):** Nodes that already have the required image layers cached in Pickle score higher. *Currently a placeholder (returns 0) — wiring to the Pickle ManifestCatalog layer_locations is a follow-up task.*
 - **Spread score (weight 10):** Penalize nodes that already run other replicas of the same App. This provides failure-domain diversity.
-- **Node stability score (weight 5):** Prefer nodes with longer uptime and no recent restarts.
+- **Node stability score (weight 5):** Prefer nodes with longer uptime and no recent restarts. *Currently a placeholder (returns 50) — wiring to actual node uptime tracking is a follow-up task.*
 
 **Phase 3: Select.** Pick the highest-scoring node. Ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
 

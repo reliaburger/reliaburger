@@ -617,6 +617,8 @@ The rolling deploy process (Section 13) proceeds one instance at a time (configu
 
 ### 5.6 WebSocket Upgrade Handling
 
+> **Status:** Deferred to Phase 9. The `websocket` config flag is parsed but the proxy currently handles HTTP only. The upgrade handshake and bidirectional byte-level proxying described below are not yet implemented.
+
 When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websocket` headers:
 
 1. Wrapper validates the `Sec-WebSocket-Key` header is present.

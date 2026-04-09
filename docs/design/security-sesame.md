@@ -816,6 +816,8 @@ $ relish secret encrypt --pubkey age1qy8m5kz... "my-secret-value"
 ENC[AGE:YWdlLWVuY3J5cHRpb24...]
 ```
 
+> **Status:** The `relish secret encrypt/pubkey/rotate` CLI commands are not yet wired. The underlying age encryption and decryption code works (tested in the crypto module and used during container startup), but there are no CLI subcommands to expose it. Operators currently encrypt secrets using the `age` CLI directly with the public key from `relish init` output. Wiring the CLI commands is a follow-up task.
+
 The `relish` CLI uses the age public key to encrypt. No cluster access required. The ciphertext is embedded in the TOML app configuration and checked into git.
 
 **Decryption (Bun, at workload start):**
