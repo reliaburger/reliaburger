@@ -211,6 +211,136 @@ Bun resolves `"api"` to its cgroup IDs and writes allow rules to the BPF map. Th
 
 The default behaviour (no `allow_from` specified) permits all apps in the same namespace to connect to each other — namespace isolation without any configuration.
 
+## Under the hood: the crypto primitives
+
+The security layer rests on a handful of cryptographic building blocks. Let's walk through them, because understanding what they do (and what they don't do) matters when you're trusting them with your cluster's secrets.
+
+### HKDF: one secret, many keys
+
+HKDF (HMAC-based Key Derivation Function) is how we turn a single master secret into multiple purpose-specific keys without any of them being related to each other. Two phases: extract (compress the input into a pseudorandom key), then expand (stretch it into the output you need).
+
+```rust
+pub fn hkdf_derive_key(ikm: &[u8], salt: &[u8; 32], info: &str) -> Result<[u8; 32], CryptoError> {
+    let salt = Salt::new(HKDF_SHA256, salt);
+    let prk = salt.extract(ikm);
+
+    let info_bytes = [info.as_bytes()];
+    let okm = prk
+        .expand(&info_bytes, HkdfLen)
+        .map_err(|_| CryptoError::HkdfFailed)?;
+
+    let mut key = [0u8; 32];
+    okm.fill(&mut key).map_err(|_| CryptoError::HkdfFailed)?;
+    Ok(key)
+}
+```
+
+The `info` parameter is the magic. Derive a key with `"reliaburger-node-ca-wrap-v1"` and another with `"reliaburger-raft-log-encryption-v1"` from the same master secret and same salt, and you get two completely unrelated 256-bit keys. Even if an attacker recovers one derived key, they learn nothing about the other. The `ring` crate enforces this by requiring a custom type implementing `KeyType` for the output length — another example of Rust's type system preventing mistakes.
+
+### AES-256-GCM: encrypt and authenticate
+
+AES-GCM gives us both confidentiality (the ciphertext is gibberish without the key) and authenticity (any tampering is detected). The `ring` crate expresses this through a two-step API:
+
+```rust
+pub fn aes_256_gcm_encrypt(
+    key: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; 12]), CryptoError> {
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes).map_err(|_| CryptoError::RngFailed)?;
+
+    let unbound_key = UnboundKey::new(&AES_256_GCM, key)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    let sealing_key = LessSafeKey::new(unbound_key);
+
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = plaintext.to_vec();
+    sealing_key
+        .seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+
+    Ok((in_out, nonce_bytes))
+}
+```
+
+Three things worth noticing. First, we generate a fresh random nonce for every encryption. Reusing a nonce with the same key is catastrophic for GCM — it reveals the XOR of two plaintexts. `ring` can't enforce uniqueness at the type level (it would need to track every nonce ever used), but the type is called `Nonce::assume_unique_for_key` to make you think about it.
+
+Second, `seal_in_place_append_tag` modifies the buffer in place — the plaintext becomes ciphertext, and a 16-byte authentication tag is appended. No separate allocation for the ciphertext. This is an optimisation, but it also means the plaintext is gone. You can't accidentally leak it after encryption.
+
+Third, `LessSafeKey` can't be cloned, serialised, or sent across threads. You create it, use it, and it disappears when the function returns. The type system prevents you from accidentally persisting the encryption key alongside the ciphertext.
+
+### Token validation: cheap checks first
+
+The token validation function shows a pattern worth remembering — order your checks from cheapest to most expensive:
+
+```rust
+pub fn validate_token(plaintext: &str, stored: &ApiToken) -> Result<(), TokenError> {
+    // Check expiry first (cheap: compare two timestamps)
+    if let Some(expires_at) = stored.expires_at
+        && SystemTime::now() > expires_at
+    {
+        return Err(TokenError::Expired);
+    }
+
+    // Verify Argon2id hash (expensive: deliberately slow)
+    let hash_str = String::from_utf8(stored.token_hash.clone())
+        .map_err(|_| TokenError::ValidationFailed)?;
+    let parsed_hash = PasswordHash::new(&hash_str)
+        .map_err(|_| TokenError::ValidationFailed)?;
+
+    Argon2::default()
+        .verify_password(plaintext.as_bytes(), &parsed_hash)
+        .map_err(|_| TokenError::ValidationFailed)?;
+
+    Ok(())
+}
+```
+
+Expiry is a nanosecond comparison. Argon2id verification is deliberately slow (tens of milliseconds). By checking expiry first, we reject expired tokens instantly without burning CPU on the hash. This matters under load — an attacker spamming expired tokens costs you almost nothing.
+
+The `if let Some(x) && condition` syntax is relatively new in Rust (stabilised in 1.64). It combines pattern matching with a boolean guard in a single `if` clause. Without it, you'd need a nested `if let` inside an `if`, which is both uglier and harder to read.
+
+### The CA hierarchy generation
+
+The full hierarchy is built in one function, showing how each CA chains to the root:
+
+```rust
+pub fn generate_ca_hierarchy(
+    cluster_name: &str,
+    wrapping_ikm: &[u8],
+) -> Result<CaHierarchy, CaError> {
+    let root = generate_root_ca(cluster_name, SerialNumber(1))?;
+
+    let node = generate_intermediate_ca(
+        CaRole::Node, cluster_name, SerialNumber(2),
+        SerialNumber(1),  // parent = root
+        &root.signing_keypair, &root.certificate_params,
+        wrapping_ikm,
+    )?;
+
+    let workload = generate_intermediate_ca(
+        CaRole::Workload, cluster_name, SerialNumber(3),
+        SerialNumber(1),  // parent = root
+        &root.signing_keypair, &root.certificate_params,
+        wrapping_ikm,
+    )?;
+
+    let ingress = generate_intermediate_ca(
+        CaRole::Ingress, cluster_name, SerialNumber(4),
+        SerialNumber(1),  // parent = root
+        &root.signing_keypair, &root.certificate_params,
+        wrapping_ikm,
+    )?;
+
+    Ok(CaHierarchy { root, node, workload, ingress })
+}
+```
+
+All three intermediates sign directly from the root with `BasicConstraints::Constrained(0)`, meaning they can sign end-entity certificates but can't create further sub-CAs. This prevents hierarchy abuse — a compromised Node CA can forge node certificates, but it can't create a rogue Workload CA.
+
+The root keypair is available during this function (we need it to sign the intermediates) but it's not stored anywhere persistent. After `generate_ca_hierarchy` returns, the caller seals the root key with `age` and then drops it from memory. From that point on, the root key only exists encrypted on disk.
+
 ## What Rust taught us
 
 Phase 4 is where Rust's ownership model really earns its keep. Cryptographic key material is the poster child for "use after free" and "double use" bugs. In C, you'd need to manually track which functions own which keys and when to zero them. In Rust, ownership rules enforce this automatically.
