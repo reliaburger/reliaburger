@@ -58,7 +58,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (979 and counting)
+make test                    # run all tests (1050 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -94,7 +94,7 @@ docs/
   roadmap.md           # 9 implementation phases
   progress.md          # What's done, what's next
   design/              # Detailed design docs per component (14 files)
-  book/                # "Building Reliaburger" chapter drafts (6 chapters)
+  book/                # "Building Reliaburger" chapter drafts (7 chapters + preface)
   _quarto/             # PDF build configuration
 examples/              # Example app and job configs
 scripts/               # Test and demo scripts
@@ -105,7 +105,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**979 tests across 6 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
+**1,050 tests across 7 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -113,19 +113,22 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 2. Cluster Formation | Done | 588 |
 | 3. Networking | Done | 702 |
 | 4. Security | Done | 795 |
-| 5. Storage & Registry | Done | 871 |
-| 6. Observability | Done | 979 |
+| 5. Storage & Registry | Done | 867 |
+| 6. Observability | Done | 991 |
+| 7. Deployments | Done | 1,050 |
 
 ## The book
 
 Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rust and distributed systems through the implementation:
 
+0. [Preface](docs/book/00-preface.md)
 1. [Hello, Container](docs/book/01-hello-container.md)
 2. [Finding Friends](docs/book/02-finding-friends.md)
 3. [Talking to Each Other](docs/book/03-talking-to-each-other.md)
 4. [Trust No One](docs/book/04-trust-no-one.md)
 5. [Where the Images Live](docs/book/05-where-the-images-live.md)
 6. [Watching Everything](docs/book/06-watching-everything.md)
+7. [Ship It](docs/book/07-ship-it.md)
 
 ## Licence
 
