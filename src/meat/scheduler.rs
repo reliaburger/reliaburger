@@ -50,9 +50,12 @@ impl Scheduler {
     ) -> Result<SchedulingDecision, ScheduleError> {
         let resources = self.extract_resources(spec);
         let (required, preferred) = self.parse_labels(spec);
+        let image = spec.image.as_deref();
 
         match spec.replicas {
-            Replicas::Fixed(n) => self.schedule_fixed(app_id, n, &resources, &required, &preferred),
+            Replicas::Fixed(n) => {
+                self.schedule_fixed(app_id, n, &resources, &required, &preferred, image)
+            }
             Replicas::DaemonSet => self.schedule_daemon(app_id, &resources, &required),
         }
     }
@@ -65,6 +68,7 @@ impl Scheduler {
         resources: &Resources,
         required_labels: &BTreeMap<String, String>,
         preferred_labels: &BTreeMap<String, String>,
+        image: Option<&str>,
     ) -> Result<SchedulingDecision, ScheduleError> {
         let mut placements = Vec::with_capacity(replica_count as usize);
 
@@ -84,6 +88,7 @@ impl Scheduler {
                 resources,
                 preferred_labels,
                 &self.cluster,
+                image,
             );
 
             // Phase 3: Select (highest score, deterministic tiebreak)
@@ -210,6 +215,8 @@ mod tests {
             labels,
             ready: true,
             running_apps: HashSet::new(),
+            uptime_secs: 86400,
+            cached_images: HashSet::new(),
         }
     }
 

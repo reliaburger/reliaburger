@@ -47,8 +47,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel
 - [x] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction
 - [x] Meat scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas
-- [ ] Scheduler image locality scoring — placeholder (returns 0), needs wiring to Pickle ManifestCatalog
-- [ ] Scheduler stability scoring — placeholder (returns 50), needs wiring to node uptime data
+- [x] Scheduler image locality scoring — prefers nodes with cached images
+- [x] Scheduler stability scoring — prefers nodes with longer uptime
 - [x] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [x] CLI extensions: `relish join`

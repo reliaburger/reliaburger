@@ -27,12 +27,13 @@ pub fn score_nodes(
     resources: &Resources,
     preferred_labels: &BTreeMap<String, String>,
     cluster: &ClusterStateCache,
+    image: Option<&str>,
 ) -> Vec<(NodeId, u32)> {
     let mut scored: Vec<(NodeId, u32)> = candidates
         .iter()
         .filter_map(|node_id| {
             cluster.get_node(node_id)?;
-            let score = compute_score(node_id, app_id, resources, preferred_labels, cluster);
+            let score = compute_score(node_id, app_id, resources, preferred_labels, cluster, image);
             Some((node_id.clone(), score))
         })
         .collect();
@@ -49,6 +50,7 @@ fn compute_score(
     resources: &Resources,
     preferred_labels: &BTreeMap<String, String>,
     cluster: &ClusterStateCache,
+    image: Option<&str>,
 ) -> u32 {
     let node = match cluster.get_node(node_id) {
         Some(n) => n,
@@ -81,11 +83,22 @@ fn compute_score(
         100
     };
 
-    // Stability: placeholder (no real uptime data in Phase 2).
-    let stability = 50u32;
+    // Stability: prefer nodes with longer uptime. Linear ramp from
+    // 0 (just joined) to 100 (24+ hours). Freshly joined nodes may
+    // still be catching up on state reconstruction or image pulls.
+    let stability = ((node.uptime_secs.min(86400) * 100) / 86400) as u32;
 
-    // Image locality: placeholder (no Pickle until Phase 5).
-    let image_locality = 0u32;
+    // Image locality: 100 if the node already has the image cached,
+    // 0 otherwise. Avoids pulling layers over the network.
+    let image_locality = if let Some(image) = image {
+        if node.cached_images.contains(image) {
+            100
+        } else {
+            0
+        }
+    } else {
+        0
+    };
 
     // Weighted sum
     let total = bin_pack * WEIGHT_BIN_PACK
@@ -121,6 +134,8 @@ mod tests {
             labels,
             ready: true,
             running_apps: HashSet::new(),
+            uptime_secs: 86400, // 24h — full stability score
+            cached_images: HashSet::new(),
         }
     }
 
@@ -143,7 +158,7 @@ mod tests {
         let app = AppId::new("web", "prod");
         let res = Resources::new(100, 100, 0);
 
-        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster);
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
 
         // "full" should score higher due to bin-packing preference
         assert_eq!(scored[0].0, NodeId::new("full"));
@@ -166,7 +181,7 @@ mod tests {
         let res = Resources::new(100, 100, 0);
         let preferred = labels(&[("zone", "us-east")]);
 
-        let scored = score_nodes(&candidates, &app, &res, &preferred, &cluster);
+        let scored = score_nodes(&candidates, &app, &res, &preferred, &cluster, None);
 
         // "match" should score higher
         assert_eq!(scored[0].0, NodeId::new("match"));
@@ -187,7 +202,7 @@ mod tests {
         let candidates = vec![NodeId::new("has-app"), NodeId::new("no-app")];
         let res = Resources::new(100, 100, 0);
 
-        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster);
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
 
         // "no-app" should score higher (spread bonus)
         assert_eq!(scored[0].0, NodeId::new("no-app"));
@@ -209,11 +224,78 @@ mod tests {
         let app = AppId::new("web", "prod");
         let res = Resources::new(100, 100, 0);
 
-        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster);
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
 
         // All same score — should be sorted by node ID ascending
         assert_eq!(scored[0].0, NodeId::new("a-node"));
         assert_eq!(scored[1].0, NodeId::new("b-node"));
         assert_eq!(scored[2].0, NodeId::new("c-node"));
+    }
+
+    #[test]
+    fn stability_prefers_longer_uptime() {
+        let mut cluster = ClusterStateCache::new();
+        let mut fresh = node_state("fresh", 1000, 500, BTreeMap::new());
+        fresh.uptime_secs = 60; // 1 minute
+        cluster.set_node(fresh);
+
+        let mut veteran = node_state("veteran", 1000, 500, BTreeMap::new());
+        veteran.uptime_secs = 86400; // 24 hours
+        cluster.set_node(veteran);
+
+        let candidates = vec![NodeId::new("fresh"), NodeId::new("veteran")];
+        let app = AppId::new("web", "prod");
+        let res = Resources::new(100, 100, 0);
+
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
+
+        assert_eq!(scored[0].0, NodeId::new("veteran"));
+        assert!(scored[0].1 > scored[1].1);
+    }
+
+    #[test]
+    fn image_locality_prefers_cached_node() {
+        let mut cluster = ClusterStateCache::new();
+        let mut has_image = node_state("has-image", 1000, 500, BTreeMap::new());
+        has_image.cached_images.insert("myapp:v1".to_string());
+        cluster.set_node(has_image);
+
+        cluster.set_node(node_state("no-image", 1000, 500, BTreeMap::new()));
+
+        let candidates = vec![NodeId::new("has-image"), NodeId::new("no-image")];
+        let app = AppId::new("web", "prod");
+        let res = Resources::new(100, 100, 0);
+
+        let scored = score_nodes(
+            &candidates,
+            &app,
+            &res,
+            &BTreeMap::new(),
+            &cluster,
+            Some("myapp:v1"),
+        );
+
+        assert_eq!(scored[0].0, NodeId::new("has-image"));
+        assert!(scored[0].1 > scored[1].1);
+    }
+
+    #[test]
+    fn image_locality_no_effect_without_image() {
+        let mut cluster = ClusterStateCache::new();
+        let mut has_image = node_state("has-image", 1000, 500, BTreeMap::new());
+        has_image.cached_images.insert("myapp:v1".to_string());
+        cluster.set_node(has_image);
+
+        cluster.set_node(node_state("no-image", 1000, 500, BTreeMap::new()));
+
+        let candidates = vec![NodeId::new("has-image"), NodeId::new("no-image")];
+        let app = AppId::new("web", "prod");
+        let res = Resources::new(100, 100, 0);
+
+        // No image specified — image locality should not affect score
+        let scored = score_nodes(&candidates, &app, &res, &BTreeMap::new(), &cluster, None);
+
+        // Scores should be equal (tiebreak by node ID)
+        assert_eq!(scored[0].1, scored[1].1);
     }
 }
