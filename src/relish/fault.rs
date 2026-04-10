@@ -13,7 +13,7 @@ use crate::smoker::types::{FaultRequest, FaultType};
 const DEFAULT_DURATION: Duration = Duration::from_secs(600); // 10 minutes
 
 /// Parse a duration string like "5s", "30s", "5m", "1h".
-fn parse_duration(s: &str) -> Result<Duration, RelishError> {
+pub fn parse_duration(s: &str) -> Result<Duration, RelishError> {
     let s = s.trim();
     if let Some(rest) = s.strip_suffix("ms") {
         let ms: u64 = rest.parse().map_err(|_| RelishError::ApiError {
@@ -52,13 +52,13 @@ fn parse_duration(s: &str) -> Result<Duration, RelishError> {
 }
 
 /// Parse a delay string like "200ms", "1s" into nanoseconds.
-fn parse_delay_ns(s: &str) -> Result<u64, RelishError> {
+pub fn parse_delay_ns(s: &str) -> Result<u64, RelishError> {
     let d = parse_duration(s)?;
     Ok(d.as_nanos() as u64)
 }
 
 /// Parse a percentage string like "10%" into a u8.
-fn parse_percentage(s: &str) -> Result<u8, RelishError> {
+pub fn parse_percentage(s: &str) -> Result<u8, RelishError> {
     let s = s.trim().trim_end_matches('%');
     let p: u8 = s.parse().map_err(|_| RelishError::ApiError {
         status: 0,
@@ -74,7 +74,7 @@ fn parse_percentage(s: &str) -> Result<u8, RelishError> {
 }
 
 /// Parse a bandwidth string like "1mbps", "10mbps" into bytes/sec.
-fn parse_bandwidth(s: &str) -> Result<u64, RelishError> {
+pub fn parse_bandwidth(s: &str) -> Result<u64, RelishError> {
     let s = s.trim();
     if let Some(rest) = s.strip_suffix("mbps") {
         let mbps: u64 = rest.parse().map_err(|_| RelishError::ApiError {
@@ -437,6 +437,67 @@ pub async fn clear(id: Option<u64>) -> Result<(), RelishError> {
         None => client.clear_all_faults().await?,
     };
     println!("{msg}");
+    Ok(())
+}
+
+/// Run a scripted chaos scenario from a TOML file.
+pub async fn scenario(
+    path: &std::path::Path,
+    dry_run: bool,
+    speed: f64,
+) -> Result<(), RelishError> {
+    use crate::smoker::scenario;
+
+    let s = scenario::load_scenario(path)?;
+    let timeline = scenario::build_timeline(&s, speed)?;
+
+    if dry_run {
+        scenario::print_dry_run(&s, &timeline);
+        return Ok(());
+    }
+
+    println!("Executing scenario: {}", s.name);
+    let start = std::time::Instant::now();
+    let client = BunClient::default_local();
+
+    for entry in &timeline {
+        // Wait until activation time
+        let elapsed = start.elapsed();
+        if entry.activation > elapsed {
+            let wait = entry.activation - elapsed;
+            println!("  Waiting {:?} for next step...", wait);
+            tokio::time::sleep(wait).await;
+        }
+
+        println!(
+            "  T+{:.0}s: {} -- {} {} {}",
+            start.elapsed().as_secs_f64(),
+            entry.step.description,
+            entry.step.fault,
+            entry.step.target,
+            entry.step.value,
+        );
+
+        let req = scenario::step_to_fault_request(&entry.step, speed)?;
+        match client.inject_fault(&req).await {
+            Ok(summary) => {
+                println!(
+                    "    -> injected (id: {}, expires in {}s)",
+                    summary.id, summary.remaining_secs
+                );
+            }
+            Err(e) => {
+                println!("    -> FAILED: {e}");
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "Scenario complete: {} steps in {:.1}s",
+        timeline.len(),
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 

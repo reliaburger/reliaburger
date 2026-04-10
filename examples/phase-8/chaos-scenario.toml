@@ -1,0 +1,38 @@
+# Example Smoker chaos scenario: payment cascade failure.
+#
+# Run with: relish fault scenario examples/phase-8/chaos-scenario.toml
+# Dry run:  relish fault scenario examples/phase-8/chaos-scenario.toml --dry-run
+# 2x speed: relish fault scenario examples/phase-8/chaos-scenario.toml --speed 2.0
+
+name = "Payment cascade failure"
+
+[[step]]
+description = "Database latency spike"
+fault = "delay"
+target = "pg"
+value = "500ms"
+jitter = "200ms"
+duration = "2m"
+
+[[step]]
+description = "Database starts dropping connections"
+fault = "drop"
+target = "pg"
+value = "25%"
+start_after = "2m"
+duration = "3m"
+
+[[step]]
+description = "Payment service memory pressure from retry storms"
+fault = "memory"
+target = "payment-service"
+value = "95%"
+start_after = "4m"
+duration = "2m"
+
+[[step]]
+description = "Payment service OOM"
+fault = "memory"
+target = "payment-service"
+value = "oom"
+start_after = "6m"

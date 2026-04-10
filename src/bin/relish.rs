@@ -394,6 +394,17 @@ enum FaultAction {
         /// Fault ID to clear (omit to clear all).
         id: Option<u64>,
     },
+    /// Run a scripted chaos scenario from a TOML file.
+    Scenario {
+        /// Path to the scenario TOML file.
+        path: PathBuf,
+        /// Print the scenario plan without executing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Speed multiplier (e.g. 2.0 = double speed).
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
+    },
 }
 
 #[tokio::main]
@@ -505,6 +516,11 @@ async fn main() -> ExitCode {
             }
             FaultAction::List => reliaburger::relish::fault::list().await,
             FaultAction::Clear { id } => reliaburger::relish::fault::clear(*id).await,
+            FaultAction::Scenario {
+                path,
+                dry_run,
+                speed,
+            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed).await,
         },
         Command::Deploy { ref path } => commands::deploy(path).await,
         Command::History { ref app } => commands::history(app).await,
