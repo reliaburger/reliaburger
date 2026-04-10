@@ -193,6 +193,7 @@ pub use inner::*;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "ebpf"))]
     use super::*;
 
     #[cfg(not(feature = "ebpf"))]
