@@ -157,11 +157,11 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 8: Advanced
 
-- [ ] Smoker fault injection (eBPF network faults, resource faults, safety rails, expiry)
+- [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite)
+- [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation)
 - [ ] Process workloads (exec/script apps and jobs, binary allowlist, isolation)
 - [ ] High-throughput batch scheduling (100M jobs/day target)
 - [ ] Build jobs (in-cluster image building, `pickle://`, scoped registry access)
-- [ ] Network security (eBPF inter-app firewall, egress allowlists, namespace isolation)
 - [ ] All Phase 8 tests green
 
 ## Phase 9: Production Hardening
