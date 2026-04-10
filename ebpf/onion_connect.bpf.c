@@ -40,6 +40,26 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } cgroup_namespace_map SEC(".maps");
 
+/* ---------- Egress allowlist map ---------------------------------------- */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct egress_key);
+    __type(value, struct egress_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_map SEC(".maps");
+
+/* Per-cgroup flag: 1 = egress enforcement active for this cgroup.
+ * If a cgroup is not in this map, all egress is allowed (no config). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);         /* cgroup ID */
+    __type(value, __u32);       /* 1 = enforce egress */
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_enabled_map SEC(".maps");
+
 /* ---------- Smoker fault maps ------------------------------------------- */
 
 struct {
@@ -65,8 +85,25 @@ int onion_connect(struct bpf_sock_addr *ctx)
     __u32 dst_ip = bpf_ntohl(ctx->user_ip4);
 
     /* Only intercept VIPs in the 127.128.0.0/16 range */
-    if ((dst_ip & VIP_MASK) != VIP_PREFIX)
-        return 1;  /* not a VIP, pass through */
+    if ((dst_ip & VIP_MASK) != VIP_PREFIX) {
+        /* Not a VIP — check egress allowlist.
+         * If the calling cgroup has egress enforcement enabled and
+         * the destination is not in the egress_map, deny the connection. */
+        __u64 eg_cgroup = bpf_get_current_cgroup_id();
+        __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &eg_cgroup);
+        if (enforced && *enforced == 1) {
+            struct egress_key ek = {
+                .src_cgroup_id = eg_cgroup,
+                .dst_ip        = ctx->user_ip4,
+                .dst_port      = ctx->user_port,
+                ._pad          = 0,
+            };
+            struct egress_value *ev = bpf_map_lookup_elem(&egress_map, &ek);
+            if (!ev || ev->action != 1)
+                return 0;  /* -ECONNREFUSED: egress not allowed */
+        }
+        return 1;  /* pass through (no enforcement or allowed) */
+    }
 
     /* --- Smoker fault check (before normal path) --- */
     {
