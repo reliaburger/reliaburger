@@ -106,6 +106,11 @@ enum Command {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
     },
+    /// Inject faults for chaos testing (Smoker).
+    Fault {
+        #[command(subcommand)]
+        action: FaultAction,
+    },
     /// Trigger a rolling deploy for an app.
     Deploy {
         /// Path to a TOML config file.
@@ -249,6 +254,148 @@ enum DevAction {
     Clean,
 }
 
+#[derive(Subcommand)]
+enum FaultAction {
+    /// Add latency to connections to a service.
+    Delay {
+        /// Target service name.
+        target: String,
+        /// Delay duration (e.g. "200ms", "1s").
+        delay: String,
+        /// Jitter (e.g. "50ms").
+        #[arg(long)]
+        jitter: Option<String>,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Fail a percentage of connections.
+    Drop {
+        /// Target service name.
+        target: String,
+        /// Drop percentage (e.g. "10%").
+        percentage: String,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Return NXDOMAIN for DNS resolution.
+    Dns {
+        /// Target service name.
+        target: String,
+        /// Fault type: "nxdomain".
+        fault_type: String,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Block traffic between services.
+    Partition {
+        /// Target service name.
+        target: String,
+        /// Source service to block traffic from.
+        #[arg(long)]
+        from: Option<String>,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Throttle bandwidth to a service.
+    Bandwidth {
+        /// Target service name.
+        target: String,
+        /// Bandwidth limit (e.g. "1mbps").
+        limit: String,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Consume CPU in a service's cgroup.
+    Cpu {
+        /// Target service name.
+        target: String,
+        /// CPU consumption percentage (e.g. "50%").
+        percentage: String,
+        /// Number of cores to stress.
+        #[arg(long)]
+        cores: Option<u32>,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Push memory usage toward a service's limit.
+    Memory {
+        /// Target service name.
+        target: String,
+        /// Memory fill percentage or "oom" (e.g. "90%", "oom").
+        value: String,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Throttle disk I/O for a service.
+    DiskIo {
+        /// Target service name.
+        target: String,
+        /// I/O bandwidth limit (e.g. "10mbps").
+        limit: String,
+        /// Only throttle writes.
+        #[arg(long)]
+        write_only: bool,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Kill instances of a service (SIGKILL).
+    Kill {
+        /// Target service or instance name.
+        target: String,
+        /// Number of instances to kill (0 = all).
+        #[arg(long, default_value = "1")]
+        count: u32,
+    },
+    /// Freeze instances of a service (SIGSTOP).
+    Pause {
+        /// Target service name.
+        target: String,
+        /// Fault duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+    },
+    /// Simulate graceful node departure.
+    NodeDrain {
+        /// Target node name.
+        target: String,
+        /// Drain duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+        /// Allow targeting the cluster leader.
+        #[arg(long)]
+        include_leader: bool,
+    },
+    /// Simulate abrupt node failure.
+    NodeKill {
+        /// Target node name.
+        target: String,
+        /// Kill duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+        /// Also stop all containers on the node.
+        #[arg(long)]
+        containers: bool,
+        /// Allow targeting the cluster leader.
+        #[arg(long)]
+        include_leader: bool,
+    },
+    /// List all active faults.
+    List,
+    /// Clear all active faults (or a specific one by ID).
+    Clear {
+        /// Fault ID to clear (omit to clear all).
+        id: Option<u64>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -285,6 +432,80 @@ async fn main() -> ExitCode {
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Fault { ref action } => match action {
+            FaultAction::Delay {
+                target,
+                delay,
+                jitter,
+                duration,
+            } => {
+                reliaburger::relish::fault::delay(target, delay, jitter.as_deref(), duration).await
+            }
+            FaultAction::Drop {
+                target,
+                percentage,
+                duration,
+            } => reliaburger::relish::fault::drop_fault(target, percentage, duration).await,
+            FaultAction::Dns {
+                target,
+                fault_type,
+                duration,
+            } => reliaburger::relish::fault::dns(target, fault_type, duration).await,
+            FaultAction::Partition {
+                target,
+                from,
+                duration,
+            } => reliaburger::relish::fault::partition(target, from.as_deref(), duration).await,
+            FaultAction::Bandwidth {
+                target,
+                limit,
+                duration,
+            } => reliaburger::relish::fault::bandwidth(target, limit, duration).await,
+            FaultAction::Cpu {
+                target,
+                percentage,
+                cores,
+                duration,
+            } => reliaburger::relish::fault::cpu(target, percentage, *cores, duration).await,
+            FaultAction::Memory {
+                target,
+                value,
+                duration,
+            } => reliaburger::relish::fault::memory(target, value, duration).await,
+            FaultAction::DiskIo {
+                target,
+                limit,
+                write_only,
+                duration,
+            } => reliaburger::relish::fault::disk_io(target, limit, *write_only, duration).await,
+            FaultAction::Kill { target, count } => {
+                reliaburger::relish::fault::kill(target, *count).await
+            }
+            FaultAction::Pause { target, duration } => {
+                reliaburger::relish::fault::pause(target, duration).await
+            }
+            FaultAction::NodeDrain {
+                target,
+                duration,
+                include_leader,
+            } => reliaburger::relish::fault::node_drain(target, duration, *include_leader).await,
+            FaultAction::NodeKill {
+                target,
+                duration,
+                containers,
+                include_leader,
+            } => {
+                reliaburger::relish::fault::node_kill(
+                    target,
+                    duration,
+                    *containers,
+                    *include_leader,
+                )
+                .await
+            }
+            FaultAction::List => reliaburger::relish::fault::list().await,
+            FaultAction::Clear { id } => reliaburger::relish::fault::clear(*id).await,
+        },
         Command::Deploy { ref path } => commands::deploy(path).await,
         Command::History { ref app } => commands::history(app).await,
         Command::Rollback { ref app } => commands::rollback(app).await,
@@ -648,5 +869,205 @@ mod tests {
     fn parse_lint_command() {
         let cli = parse(&["relish", "lint", "app.toml"]).unwrap();
         assert!(matches!(cli.command, Command::Lint { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Fault subcommand tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_fault_delay() {
+        let cli = parse(&["relish", "fault", "delay", "redis", "200ms"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Delay { target, delay, .. },
+            } => {
+                assert_eq!(target, "redis");
+                assert_eq!(delay, "200ms");
+            }
+            _ => panic!("expected Fault Delay"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_delay_with_jitter_and_duration() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "delay",
+            "redis",
+            "200ms",
+            "--jitter",
+            "50ms",
+            "--duration",
+            "5m",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action:
+                    FaultAction::Delay {
+                        target,
+                        delay,
+                        jitter,
+                        duration,
+                    },
+            } => {
+                assert_eq!(target, "redis");
+                assert_eq!(delay, "200ms");
+                assert_eq!(jitter.as_deref(), Some("50ms"));
+                assert_eq!(duration.as_deref(), Some("5m"));
+            }
+            _ => panic!("expected Fault Delay"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_drop() {
+        let cli = parse(&["relish", "fault", "drop", "api", "10%"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action:
+                    FaultAction::Drop {
+                        target, percentage, ..
+                    },
+            } => {
+                assert_eq!(target, "api");
+                assert_eq!(percentage, "10%");
+            }
+            _ => panic!("expected Fault Drop"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_dns_nxdomain() {
+        let cli = parse(&["relish", "fault", "dns", "redis", "nxdomain"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action:
+                    FaultAction::Dns {
+                        target, fault_type, ..
+                    },
+            } => {
+                assert_eq!(target, "redis");
+                assert_eq!(fault_type, "nxdomain");
+            }
+            _ => panic!("expected Fault Dns"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_partition_with_from() {
+        let cli = parse(&["relish", "fault", "partition", "web", "--from", "payment"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Partition { target, from, .. },
+            } => {
+                assert_eq!(target, "web");
+                assert_eq!(from.as_deref(), Some("payment"));
+            }
+            _ => panic!("expected Fault Partition"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_kill() {
+        let cli = parse(&["relish", "fault", "kill", "web", "--count", "2"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Kill { target, count },
+            } => {
+                assert_eq!(target, "web");
+                assert_eq!(count, 2);
+            }
+            _ => panic!("expected Fault Kill"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_kill_default_count() {
+        let cli = parse(&["relish", "fault", "kill", "web"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Kill { count, .. },
+            } => assert_eq!(count, 1),
+            _ => panic!("expected Fault Kill"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_pause() {
+        let cli = parse(&["relish", "fault", "pause", "web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Fault {
+                action: FaultAction::Pause { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_fault_node_kill_with_flags() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "node-kill",
+            "node-05",
+            "--containers",
+            "--include-leader",
+            "--duration",
+            "30s",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action:
+                    FaultAction::NodeKill {
+                        target,
+                        containers,
+                        include_leader,
+                        duration,
+                    },
+            } => {
+                assert_eq!(target, "node-05");
+                assert!(containers);
+                assert!(include_leader);
+                assert_eq!(duration.as_deref(), Some("30s"));
+            }
+            _ => panic!("expected Fault NodeKill"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_list() {
+        let cli = parse(&["relish", "fault", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Fault {
+                action: FaultAction::List
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_fault_clear_all() {
+        let cli = parse(&["relish", "fault", "clear"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Clear { id },
+            } => assert!(id.is_none()),
+            _ => panic!("expected Fault Clear"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_clear_by_id() {
+        let cli = parse(&["relish", "fault", "clear", "42"]).unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Clear { id },
+            } => assert_eq!(id, Some(42)),
+            _ => panic!("expected Fault Clear"),
+        }
     }
 }

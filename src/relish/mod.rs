@@ -7,6 +7,7 @@ pub mod chaos;
 pub mod client;
 pub mod commands;
 pub mod dev;
+pub mod fault;
 pub mod output;
 pub mod plan;
 
