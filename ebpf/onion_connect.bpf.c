@@ -70,12 +70,9 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } fault_connect_map SEC(".maps");
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, struct fault_state_key);
-    __type(value, struct fault_state_value);
-} fault_state_map SEC(".maps");
+/* fault_state_map is not defined here — we use bpf_get_prandom_u32()
+ * for probabilistic drops instead. The fault_state_key/value types in
+ * smoker_common.h exist for userspace counters if needed later. */
 
 /* ---------- Connect hook ------------------------------------------------ */
 
@@ -139,24 +136,11 @@ int onion_connect(struct bpf_sock_addr *ctx)
                 }
 
                 if (fval->action == FAULT_ACTION_DROP) {
-                    /* Probabilistic drop: generate random via PRNG */
-                    __u32 skey = 0;
-                    struct fault_state_value *state =
-                        bpf_map_lookup_elem(&fault_state_map, &skey);
-                    if (state) {
-                        __u64 x = state->prng_state;
-                        x ^= x << 13;
-                        x ^= x >> 7;
-                        x ^= x << 17;
-                        state->prng_state = x;
-                        state->lookups++;
-
-                        __u8 roll = x % 100;
-                        if (roll < fval->probability) {
-                            state->faults_injected++;
-                            return 0;  /* -ECONNREFUSED */
-                        }
-                    }
+                    /* Probabilistic drop using kernel PRNG */
+                    __u32 rand = bpf_get_prandom_u32();
+                    __u8 roll = rand % 100;
+                    if (roll < fval->probability)
+                        return 0;  /* -ECONNREFUSED */
                 }
 
                 /* FAULT_ACTION_DELAY is handled in sock_ops or tc netem,
