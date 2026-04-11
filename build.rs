@@ -64,6 +64,7 @@ fn compile_ebpf() {
         }
     }
 
-    // Also watch the shared header
+    // Also watch shared headers
     println!("cargo:rerun-if-changed=ebpf/onion_common.h");
+    println!("cargo:rerun-if-changed=ebpf/smoker_common.h");
 }
