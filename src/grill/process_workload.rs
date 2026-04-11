@@ -122,15 +122,15 @@ impl ProcessManager {
     ///
     /// Call after the workload completes (success or failure).
     pub fn cleanup(&self, workload: &PreparedWorkload) -> Result<(), ProcessWorkloadError> {
-        if let Some(ref temp_file) = workload.temp_file {
-            if temp_file.exists() {
-                std::fs::remove_file(temp_file).map_err(|e| {
-                    ProcessWorkloadError::ScriptCleanupFailed {
-                        path: temp_file.clone(),
-                        source: e,
-                    }
-                })?;
-            }
+        if let Some(ref temp_file) = workload.temp_file
+            && temp_file.exists()
+        {
+            std::fs::remove_file(temp_file).map_err(|e| {
+                ProcessWorkloadError::ScriptCleanupFailed {
+                    path: temp_file.clone(),
+                    source: e,
+                }
+            })?;
         }
         Ok(())
     }
