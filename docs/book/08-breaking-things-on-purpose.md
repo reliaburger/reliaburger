@@ -312,3 +312,46 @@ An empty list means all binaries are allowed. This is the default — opt-in res
 ### How it fits together
 
 Process workloads get the same treatment as containers: they appear in the service map, get VIPs and DNS names, receive health checks, and can be targeted by fault injection. The OCI spec generation detects `exec`/`script` and sets the command accordingly. ProcessGrill spawns the process. The supervisor manages its lifecycle. From the cluster's perspective, a process workload is just another app.
+
+## Batch scheduling
+
+The Meat scheduler's Filter→Score→Select→Commit pipeline evaluates every node for every placement. That's the right trade-off for long-running apps where quality of placement matters — you want the best node, not just any node. But for batch jobs (short-lived, many identical instances), you need throughput.
+
+One hundred thousand jobs. One hundred nodes. Under one second.
+
+The batch scheduler takes a different approach. Instead of evaluating each job individually, it groups jobs by resource profile (identical CPU/memory/GPU requirements) and bin-packs each group in bulk:
+
+```rust
+pub fn schedule_batch(
+    jobs: &[BatchJob],
+    nodes: &mut [NodeCapacity],
+) -> BatchAllocation {
+    // Group jobs by resource profile
+    let mut profile_groups: HashMap<ResourceProfile, Vec<&BatchJob>> = HashMap::new();
+    for job in jobs {
+        let profile = ResourceProfile::from(&job.resources);
+        profile_groups.entry(profile).or_default().push(job);
+    }
+    // ...
+}
+```
+
+For each profile group, the scheduler sorts nodes by available capacity (most room first), then greedily assigns as many jobs as will fit on each node before moving to the next. The `jobs_that_fit` function divides available resources by the job's requirements — pure integer arithmetic, no I/O.
+
+The complexity is O(nodes × profiles + total_jobs). If you have 100 nodes and all jobs are identical (1 profile), it's O(100 + 100,000) — essentially linear in the number of jobs. Even with 100 different profiles, it's O(10,000 + 100,000). The per-job pipeline would be O(100 × 100,000) — ten million evaluations.
+
+The `BatchTracker` handles the async side. Submission returns immediately with a `BatchId`. The tracker records which jobs went to which nodes and updates their status as completion reports arrive via the reporting tree. You can poll `summary(batch_id)` to see how many are done:
+
+```rust
+pub struct BatchSummary {
+    pub batch_id: u64,
+    pub total: usize,
+    pub pending: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub done: bool,
+    pub elapsed_secs: u64,
+}
+```
+
+The 100K-in-<1s benchmark runs as a unit test on every build. If someone introduces a regression that makes scheduling slower, the test fails immediately.
