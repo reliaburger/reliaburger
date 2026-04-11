@@ -71,7 +71,7 @@ struct {
 } fault_connect_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, struct fault_state_key);
     __type(value, struct fault_state_value);

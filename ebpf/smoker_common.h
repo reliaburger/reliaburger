@@ -73,7 +73,7 @@ struct fault_bw_value {
 
 /* ---------- fault_state_map ---------------------------------------------- */
 
-/* Key: 4 bytes (PERCPU_ARRAY index, always 0) */
+/* Key: 4 bytes (ARRAY index, always 0) */
 struct fault_state_key {
     __u32 index;
 };

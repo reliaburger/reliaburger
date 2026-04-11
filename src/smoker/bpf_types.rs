@@ -130,8 +130,8 @@ pub struct BpfBandwidthFaultValue {
 
 /// Key for `fault_state_map`.
 ///
-/// BPF map type: `BPF_MAP_TYPE_PERCPU_ARRAY`, max_entries: 1.
-/// Each CPU gets its own copy automatically.
+/// BPF map type: `BPF_MAP_TYPE_ARRAY`, max_entries: 1.
+/// Single shared entry for PRNG state and counters.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct BpfFaultStateKey {
