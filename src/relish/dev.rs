@@ -414,6 +414,15 @@ pub async fn destroy(name: &str) -> Result<(), RelishError> {
     }
     delete_cluster_state(name);
     println!("Dev cluster \"{name}\" destroyed.");
+
+    // Also remove the test VM if it exists
+    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    if list.lines().any(|l| l.trim() == TEST_VM_NAME) {
+        eprintln!("deleting test VM ({TEST_VM_NAME})...");
+        limactl(&["delete", "--force", TEST_VM_NAME]).await?;
+        println!("Test VM deleted.");
+    }
+
     Ok(())
 }
 
