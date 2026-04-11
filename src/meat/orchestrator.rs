@@ -235,7 +235,6 @@ impl<D: DeployDriver> DeployOrchestrator<D> {
 pub mod mock {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::HashMap;
 
     /// A mock driver that records calls and can be configured to fail.
     pub struct MockDriver {

@@ -247,6 +247,9 @@ enum DevAction {
     Test {
         /// Optional test name filter (passed to cargo test).
         filter: Option<String>,
+        /// Delete and recreate the test VM before running tests.
+        #[arg(long)]
+        recreate: bool,
     },
     /// Show disk usage in the test VM.
     Disk,
@@ -560,7 +563,9 @@ async fn main() -> ExitCode {
             DevAction::Stop { name } => reliaburger::relish::dev::stop(name).await,
             DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
             DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
-            DevAction::Test { filter } => reliaburger::relish::dev::test(filter.as_deref()).await,
+            DevAction::Test { filter, recreate } => {
+                reliaburger::relish::dev::test(filter.as_deref(), *recreate).await
+            }
             DevAction::Disk => reliaburger::relish::dev::disk().await,
             DevAction::Clean => reliaburger::relish::dev::clean().await,
         },
