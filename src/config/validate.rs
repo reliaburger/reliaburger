@@ -31,6 +31,33 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    // exec and image are mutually exclusive
+    if app.exec.is_some() && app.image.is_some() {
+        return Err(ConfigError::Validation {
+            field: "exec".to_string(),
+            context: format!("app {name:?}"),
+            reason: "exec and image are mutually exclusive".to_string(),
+        });
+    }
+
+    // script and image are mutually exclusive
+    if app.script.is_some() && app.image.is_some() {
+        return Err(ConfigError::Validation {
+            field: "script".to_string(),
+            context: format!("app {name:?}"),
+            reason: "script and image are mutually exclusive".to_string(),
+        });
+    }
+
+    // exec and script are mutually exclusive
+    if app.exec.is_some() && app.script.is_some() {
+        return Err(ConfigError::Validation {
+            field: "exec/script".to_string(),
+            context: format!("app {name:?}"),
+            reason: "exec and script are mutually exclusive".to_string(),
+        });
+    }
+
     // Port range
     if let Some(port) = app.port
         && port == 0
@@ -81,6 +108,34 @@ fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError
             name: name.to_string(),
         });
     }
+
+    // exec and image are mutually exclusive
+    if job.exec.is_some() && job.image.is_some() {
+        return Err(ConfigError::Validation {
+            field: "exec".to_string(),
+            context: format!("job {name:?}"),
+            reason: "exec and image are mutually exclusive".to_string(),
+        });
+    }
+
+    // script and image are mutually exclusive
+    if job.script.is_some() && job.image.is_some() {
+        return Err(ConfigError::Validation {
+            field: "script".to_string(),
+            context: format!("job {name:?}"),
+            reason: "script and image are mutually exclusive".to_string(),
+        });
+    }
+
+    // exec and script are mutually exclusive
+    if job.exec.is_some() && job.script.is_some() {
+        return Err(ConfigError::Validation {
+            field: "exec/script".to_string(),
+            context: format!("job {name:?}"),
+            reason: "exec and script are mutually exclusive".to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -279,6 +334,102 @@ mod tests {
             size: None,
         });
         let config = config_with_app("test", app);
+        config.validate().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Process workload validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_exec_and_image_mutually_exclusive() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            exec = "/usr/bin/python3"
+        "#,
+        )
+        .unwrap();
+        let config = config_with_app("test", app);
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref reason, .. } if reason.contains("mutually exclusive")),
+            "expected mutual exclusivity error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_script_and_image_mutually_exclusive() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            script = "echo hello"
+        "#,
+        )
+        .unwrap();
+        let config = config_with_app("test", app);
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref reason, .. } if reason.contains("mutually exclusive")),
+            "expected mutual exclusivity error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_exec_and_script_mutually_exclusive() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            exec = "/usr/bin/python3"
+            script = "echo hello"
+        "#,
+        )
+        .unwrap();
+        let config = config_with_app("test", app);
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "exec/script"),
+            "expected exec/script error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_exec_only_passes() {
+        let app: AppSpec = toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
+        let config = config_with_app("test", app);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_script_only_passes() {
+        let app: AppSpec = toml::from_str(r#"script = "echo hello""#).unwrap();
+        let config = config_with_app("test", app);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_job_exec_and_image_mutually_exclusive() {
+        let job: crate::config::job::JobSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            exec = "/usr/bin/python3"
+        "#,
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.job.insert("test-job".to_string(), job);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Validation { ref reason, .. } if reason.contains("mutually exclusive")
+        ));
+    }
+
+    #[test]
+    fn validate_job_exec_only_passes() {
+        let job: crate::config::job::JobSpec =
+            toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
+        let mut config = Config::default();
+        config.job.insert("test-job".to_string(), job);
         config.validate().unwrap();
     }
 }

@@ -14,6 +14,7 @@ pub mod netns;
 pub mod oci;
 pub mod port;
 pub mod process;
+pub mod process_workload;
 #[cfg(target_os = "linux")]
 pub mod rootless;
 #[cfg(target_os = "linux")]

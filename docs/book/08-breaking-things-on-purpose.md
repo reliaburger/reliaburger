@@ -255,3 +255,60 @@ The roadmap defines 8 chaos scenarios. Each tests a different failure mode and v
 8. **Bun restart.** The fault registry is in-memory, so it's empty after restart. Containers keep running (they're OS processes, not Bun children). The agent reconnects and resumes any interrupted deploy.
 
 Each test in `tests/chaos_smoker.rs` exercises the safety rails and registry logic that make these scenarios safe to run. The eBPF-level tests run in the Lima dev cluster via `relish dev test`.
+
+## Process workloads
+
+Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.
+
+Two fields in the app config:
+
+```toml
+[app.metrics-exporter]
+exec = "/usr/local/bin/metrics-exporter"
+command = ["--port", "9090"]
+port = 9090
+```
+
+Or for inline scripts:
+
+```toml
+[job.db-backup]
+script = """
+#!/bin/sh
+pg_dump production > /tmp/backup.sql
+"""
+schedule = "0 3 * * *"
+```
+
+`exec` and `script` are mutually exclusive with `image` — you either run a container or a process, not both. They're also mutually exclusive with each other. The validation logic catches this at config parse time, before anything gets deployed.
+
+### The ProcessManager
+
+The `ProcessManager` wraps `ProcessGrill` with two responsibilities: allowlist validation and script temp file lifecycle.
+
+```rust
+pub fn prepare_exec(&self, binary: &Path) -> Result<PreparedWorkload, ProcessWorkloadError> {
+    if !self.config.is_binary_allowed(binary) {
+        return Err(ProcessWorkloadError::BinaryNotAllowed {
+            path: binary.to_path_buf(),
+        });
+    }
+    Ok(PreparedWorkload { binary: binary.to_path_buf(), args: Vec::new(), temp_file: None })
+}
+```
+
+For scripts, it writes the content to a temp file in a secure directory, makes it executable, and returns a workload that runs it via `/bin/sh -c`. The temp file is cleaned up after execution — success or failure.
+
+The allowlist is configured per node:
+
+```toml
+[process_workloads]
+allowed_binaries = ["/usr/local/bin/metrics-exporter", "/usr/bin/python3"]
+mount_isolation = true
+```
+
+An empty list means all binaries are allowed. This is the default — opt-in restriction rather than opt-out freedom. On Linux, `mount_isolation = true` runs process workloads in a separate mount namespace so they can't see `/var/lib/reliaburger` or other workloads' volumes.
+
+### How it fits together
+
+Process workloads get the same treatment as containers: they appear in the service map, get VIPs and DNS names, receive health checks, and can be targeted by fault injection. The OCI spec generation detects `exec`/`script` and sets the command accordingly. ProcessGrill spawns the process. The supervisor manages its lifecycle. From the cluster's perspective, a process workload is just another app.

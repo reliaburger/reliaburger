@@ -22,8 +22,8 @@ pub struct NodeConfig {
     pub images: ImagesSection,
     pub metrics: MetricsSection,
     pub logs: LogsSection,
+    pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
     // TODO(Phase 3): ingress section
-    // TODO(Phase 8): process_workloads section
     // TODO(Phase 9): upgrades section
 }
 
