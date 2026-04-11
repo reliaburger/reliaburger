@@ -29,6 +29,7 @@ pub enum JobStatus {
 #[derive(Debug, Clone)]
 struct TrackedJob {
     name: String,
+    #[allow(dead_code)] // Used when querying per-node status (Phase 9)
     node: NodeId,
     status: JobStatus,
 }
@@ -99,19 +100,19 @@ impl BatchTracker {
 
     /// Mark a job as completed.
     pub fn mark_completed(&mut self, batch_id: u64, job_name: &str) {
-        if let Some(state) = self.batches.get_mut(&batch_id) {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.name == job_name) {
-                job.status = JobStatus::Completed;
-            }
+        if let Some(state) = self.batches.get_mut(&batch_id)
+            && let Some(job) = state.jobs.iter_mut().find(|j| j.name == job_name)
+        {
+            job.status = JobStatus::Completed;
         }
     }
 
     /// Mark a job as failed.
     pub fn mark_failed(&mut self, batch_id: u64, job_name: &str) {
-        if let Some(state) = self.batches.get_mut(&batch_id) {
-            if let Some(job) = state.jobs.iter_mut().find(|j| j.name == job_name) {
-                job.status = JobStatus::Failed;
-            }
+        if let Some(state) = self.batches.get_mut(&batch_id)
+            && let Some(job) = state.jobs.iter_mut().find(|j| j.name == job_name)
+        {
+            job.status = JobStatus::Failed;
         }
     }
 

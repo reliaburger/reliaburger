@@ -67,7 +67,7 @@ pub fn schedule_batch(jobs: &[BatchJob], nodes: &mut [NodeCapacity]) -> BatchAll
     let mut unschedulable = Vec::new();
 
     // Process each profile group
-    for (_profile, group_jobs) in &profile_groups {
+    for group_jobs in profile_groups.values() {
         let required = &group_jobs[0].resources;
 
         // Sort nodes by allocatable capacity (descending) for this pass.
