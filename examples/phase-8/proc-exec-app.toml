@@ -1,0 +1,18 @@
+# Example: process workload using a host binary.
+#
+# This app runs a host binary directly (no container image needed).
+# The binary must be in the node's process_workloads.allowed_binaries
+# list, or the allowlist must be empty (allow all).
+#
+# Deploy: relish apply examples/phase-8/proc-exec-app.toml
+
+[app.metrics-exporter]
+exec = "/usr/local/bin/metrics-exporter"
+command = ["--port", "9090", "--interval", "10s"]
+port = 9090
+replicas = 1
+
+[app.metrics-exporter.health]
+path = "/healthz"
+interval = "10s"
+timeout = "3s"

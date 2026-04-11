@@ -1,0 +1,18 @@
+# Example: process workload using an inline script.
+#
+# This job runs an inline shell script. The script is written to a temp
+# file, made executable, and cleaned up after completion.
+#
+# Deploy: relish apply examples/phase-8/proc-script-job.toml
+
+[job.db-backup]
+script = """
+#!/bin/sh
+set -e
+echo "Starting database backup..."
+pg_dump -h pg.internal -U backup production > /tmp/backup.sql
+gzip /tmp/backup.sql
+echo "Backup complete: /tmp/backup.sql.gz"
+"""
+schedule = "0 3 * * *"
+namespace = "ops"

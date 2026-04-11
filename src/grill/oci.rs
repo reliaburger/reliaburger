@@ -141,11 +141,16 @@ pub fn generate_oci_spec(
 
     OciSpec {
         root: OciRoot {
-            // Use the image reference directly (Apple Container needs this).
-            // For runc, Phase 5 (Pickle) will resolve the image to a local rootfs.
-            path: spec.image.clone().unwrap_or_else(|| {
-                format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
-            }),
+            // Process workloads (exec/script) use the host root filesystem.
+            // Container workloads use the image reference (Apple Container)
+            // or resolved rootfs path (runc).
+            path: if spec.exec.is_some() || spec.script.is_some() {
+                "proc-grill:host".to_string()
+            } else {
+                spec.image.clone().unwrap_or_else(|| {
+                    format!("/var/lib/reliaburger/images/{namespace}/{app_name}/rootfs")
+                })
+            },
             readonly: false,
         },
         process: OciProcess {
@@ -219,6 +224,17 @@ pub fn build_env_with_decryptor(
 /// use the image's entrypoint instead.
 fn build_args(app_name: &str, spec: &AppSpec) -> Vec<String> {
     let _ = app_name;
+
+    // Process workloads: exec binary or inline script via /bin/sh
+    if let Some(ref exec_path) = spec.exec {
+        let mut args = vec![exec_path.to_string_lossy().to_string()];
+        args.extend(spec.command.iter().cloned());
+        return args;
+    }
+    if let Some(ref script) = spec.script {
+        return vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()];
+    }
+
     spec.command.clone()
 }
 
@@ -397,7 +413,16 @@ pub fn generate_job_oci_spec(
         })
         .collect();
 
-    let args = spec.command.clone().unwrap_or_default();
+    // Process workloads: exec binary or inline script via /bin/sh
+    let args = if let Some(ref exec_path) = spec.exec {
+        let mut a = vec![exec_path.to_string_lossy().to_string()];
+        a.extend(spec.command.clone().unwrap_or_default());
+        a
+    } else if let Some(ref script) = spec.script {
+        vec!["/bin/sh".to_string(), "-c".to_string(), script.clone()]
+    } else {
+        spec.command.clone().unwrap_or_default()
+    };
 
     let cpu = spec.cpu.as_ref().map(|range| OciCpuResources {
         quota: (range.limit * 100_000 / 1000) as i64,
@@ -414,9 +439,13 @@ pub fn generate_job_oci_spec(
 
     OciSpec {
         root: OciRoot {
-            path: spec.image.clone().unwrap_or_else(|| {
-                format!("/var/lib/reliaburger/images/{namespace}/{job_name}/rootfs")
-            }),
+            path: if spec.exec.is_some() || spec.script.is_some() {
+                "proc-grill:host".to_string()
+            } else {
+                spec.image.clone().unwrap_or_else(|| {
+                    format!("/var/lib/reliaburger/images/{namespace}/{job_name}/rootfs")
+                })
+            },
             readonly: false,
         },
         process: OciProcess {

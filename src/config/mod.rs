@@ -12,6 +12,7 @@ pub mod job;
 pub mod namespace;
 pub mod node;
 pub mod permission;
+pub mod process_workloads;
 pub mod types;
 mod validate;
 
