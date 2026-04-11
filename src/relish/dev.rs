@@ -414,6 +414,15 @@ pub async fn destroy(name: &str) -> Result<(), RelishError> {
     }
     delete_cluster_state(name);
     println!("Dev cluster \"{name}\" destroyed.");
+
+    // Also remove the test VM if it exists
+    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    if list.lines().any(|l| l.trim() == TEST_VM_NAME) {
+        eprintln!("deleting test VM ({TEST_VM_NAME})...");
+        limactl(&["delete", "--force", TEST_VM_NAME]).await?;
+        println!("Test VM deleted.");
+    }
+
     Ok(())
 }
 
@@ -436,7 +445,7 @@ fn generate_test_vm_yaml() -> String {
     arch: "x86_64"
 cpus: 4
 memory: "8GiB"
-disk: "40GiB"
+disk: "50GiB"
 mountType: "virtiofs"
 mounts:
   - location: "~"
@@ -464,7 +473,7 @@ provision:
 /// Creates the test VM on first run, reuses it afterwards. The
 /// repo is mounted from the host, so no code copying needed. The
 /// Rust toolchain and cargo cache persist inside the VM.
-pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
+pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishError> {
     if !lima_available() {
         eprintln!("error: limactl not found in PATH");
         eprintln!();
@@ -472,6 +481,13 @@ pub async fn test(filter: Option<&str>) -> Result<(), RelishError> {
         eprintln!("  macOS:  brew install lima");
         eprintln!("  Linux:  https://lima-vm.io/docs/installation/");
         return Err(RelishError::LimaNotFound);
+    }
+
+    // Delete the existing test VM if --recreate was requested
+    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    if recreate && list.lines().any(|l| l.trim() == TEST_VM_NAME) {
+        eprintln!("deleting test VM ({TEST_VM_NAME})...");
+        limactl(&["delete", "--force", TEST_VM_NAME]).await?;
     }
 
     // Create the test VM if it doesn't exist

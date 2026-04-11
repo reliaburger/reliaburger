@@ -76,6 +76,19 @@ struct cgroup_ns_value {
     __u32 namespace_id;
 };
 
+/* ---------- egress_map -------------------------------------------------- */
+
+struct egress_key {
+    __u64 src_cgroup_id;   /* cgroup of the connecting app */
+    __u32 dst_ip;          /* destination IP, network byte order */
+    __u16 dst_port;        /* destination port, network byte order */
+    __u16 _pad;
+};
+
+struct egress_value {
+    __u32 action;          /* 1 = allow */
+};
+
 /* ---------- dns_pending_map (internal, sendmsg -> recvmsg) -------------- */
 
 struct pending_dns_response {

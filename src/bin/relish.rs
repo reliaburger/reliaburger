@@ -247,6 +247,9 @@ enum DevAction {
     Test {
         /// Optional test name filter (passed to cargo test).
         filter: Option<String>,
+        /// Delete and recreate the test VM before running tests.
+        #[arg(long)]
+        recreate: bool,
     },
     /// Show disk usage in the test VM.
     Disk,
@@ -394,6 +397,17 @@ enum FaultAction {
         /// Fault ID to clear (omit to clear all).
         id: Option<u64>,
     },
+    /// Run a scripted chaos scenario from a TOML file.
+    Scenario {
+        /// Path to the scenario TOML file.
+        path: PathBuf,
+        /// Print the scenario plan without executing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Speed multiplier (e.g. 2.0 = double speed).
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
+    },
 }
 
 #[tokio::main]
@@ -505,6 +519,11 @@ async fn main() -> ExitCode {
             }
             FaultAction::List => reliaburger::relish::fault::list().await,
             FaultAction::Clear { id } => reliaburger::relish::fault::clear(*id).await,
+            FaultAction::Scenario {
+                path,
+                dry_run,
+                speed,
+            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed).await,
         },
         Command::Deploy { ref path } => commands::deploy(path).await,
         Command::History { ref app } => commands::history(app).await,
@@ -544,7 +563,9 @@ async fn main() -> ExitCode {
             DevAction::Stop { name } => reliaburger::relish::dev::stop(name).await,
             DevAction::Start { name } => reliaburger::relish::dev::start(name).await,
             DevAction::Destroy { name } => reliaburger::relish::dev::destroy(name).await,
-            DevAction::Test { filter } => reliaburger::relish::dev::test(filter.as_deref()).await,
+            DevAction::Test { filter, recreate } => {
+                reliaburger::relish::dev::test(filter.as_deref(), *recreate).await
+            }
             DevAction::Disk => reliaburger::relish::dev::disk().await,
             DevAction::Clean => reliaburger::relish::dev::clean().await,
         },

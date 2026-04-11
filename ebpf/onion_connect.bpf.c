@@ -12,6 +12,7 @@
  * Non-VIP connections pass through untouched.
  */
 #include "onion_common.h"
+#include "smoker_common.h"
 
 /* ---------- Map definitions --------------------------------------------- */
 
@@ -39,6 +40,40 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } cgroup_namespace_map SEC(".maps");
 
+/* ---------- Egress allowlist map ---------------------------------------- */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct egress_key);
+    __type(value, struct egress_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_map SEC(".maps");
+
+/* Per-cgroup flag: 1 = egress enforcement active for this cgroup.
+ * If a cgroup is not in this map, all egress is allowed (no config). */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);         /* cgroup ID */
+    __type(value, __u32);       /* 1 = enforce egress */
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_enabled_map SEC(".maps");
+
+/* ---------- Smoker fault maps ------------------------------------------- */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct fault_connect_key);
+    __type(value, struct fault_connect_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} fault_connect_map SEC(".maps");
+
+/* fault_state_map is not defined here — we use bpf_get_prandom_u32()
+ * for probabilistic drops instead. The fault_state_key/value types in
+ * smoker_common.h exist for userspace counters if needed later. */
+
 /* ---------- Connect hook ------------------------------------------------ */
 
 SEC("cgroup/connect4")
@@ -47,8 +82,73 @@ int onion_connect(struct bpf_sock_addr *ctx)
     __u32 dst_ip = bpf_ntohl(ctx->user_ip4);
 
     /* Only intercept VIPs in the 127.128.0.0/16 range */
-    if ((dst_ip & VIP_MASK) != VIP_PREFIX)
-        return 1;  /* not a VIP, pass through */
+    if ((dst_ip & VIP_MASK) != VIP_PREFIX) {
+        /* Not a VIP — check egress allowlist.
+         * If the calling cgroup has egress enforcement enabled and
+         * the destination is not in the egress_map, deny the connection. */
+        __u64 eg_cgroup = bpf_get_current_cgroup_id();
+        __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &eg_cgroup);
+        if (enforced && *enforced == 1) {
+            struct egress_key ek = {
+                .src_cgroup_id = eg_cgroup,
+                .dst_ip        = ctx->user_ip4,
+                .dst_port      = ctx->user_port,
+                ._pad          = 0,
+            };
+            struct egress_value *ev = bpf_map_lookup_elem(&egress_map, &ek);
+            if (!ev || ev->action != 1)
+                return 0;  /* -ECONNREFUSED: egress not allowed */
+        }
+        return 1;  /* pass through (no enforcement or allowed) */
+    }
+
+    /* --- Smoker fault check (before normal path) --- */
+    {
+        __u64 src_cgroup = bpf_get_current_cgroup_id();
+
+        /* Check partition fault: specific source -> destination */
+        struct fault_connect_key fkey = {
+            .virtual_ip       = ctx->user_ip4,
+            .port             = ctx->user_port,
+            .source_cgroup_id = src_cgroup,
+        };
+        struct fault_connect_value *fval =
+            bpf_map_lookup_elem(&fault_connect_map, &fkey);
+
+        if (!fval) {
+            /* Also check wildcard (source_cgroup_id = 0) for
+             * non-partition faults that apply to all callers */
+            fkey.source_cgroup_id = 0;
+            fval = bpf_map_lookup_elem(&fault_connect_map, &fkey);
+        }
+
+        if (fval) {
+            /* Check expiry */
+            __u64 now = bpf_ktime_get_ns();
+            if (fval->expires_ns == 0 || now <= fval->expires_ns) {
+                /* Validate action field */
+                if (fval->action > FAULT_ACTION_PARTITION)
+                    goto no_fault;
+
+                if (fval->action == FAULT_ACTION_PARTITION) {
+                    /* Block this connection entirely */
+                    return 0;  /* -ECONNREFUSED */
+                }
+
+                if (fval->action == FAULT_ACTION_DROP) {
+                    /* Probabilistic drop using kernel PRNG */
+                    __u32 rand = bpf_get_prandom_u32();
+                    __u8 roll = rand % 100;
+                    if (roll < fval->probability)
+                        return 0;  /* -ECONNREFUSED */
+                }
+
+                /* FAULT_ACTION_DELAY is handled in sock_ops or tc netem,
+                 * not in the connect hook. Fall through to normal path. */
+            }
+        }
+    }
+no_fault:
 
     /* Look up the backend list for this (VIP, port) */
     struct backend_key key = {

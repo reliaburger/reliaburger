@@ -695,11 +695,27 @@ impl<G: Grill> BunAgent<G> {
     }
 
     /// Drain expired faults from the registry. Called on every health tick.
+    ///
+    /// When a fault expires, its BPF map entry must be deleted so the
+    /// kernel stops applying it. The eBPF programs also check expiry
+    /// independently (defense in depth), but userspace cleanup frees
+    /// map slots and kills resource fault helper processes.
     fn expire_faults(&mut self) {
         let now = crate::smoker::types::monotonic_now_ns();
-        let _expired = self.fault_registry.drain_expired(now);
-        // TODO(Phase 8): clean up BPF map entries, kill helper processes
-        // for expired faults once those subsystems are wired in.
+        let expired = self.fault_registry.drain_expired(now);
+        for rule in &expired {
+            // Log cleanup for observability
+            if !rule.target_service.is_empty() {
+                eprintln!(
+                    "smoker: fault {} expired ({}), cleaning up",
+                    rule.id, rule.fault_type
+                );
+            }
+            // TODO(Phase 8): when OnionEbpf handle is available on the agent,
+            // call smoker::bpf_maps::delete_connect_fault / delete_dns_fault /
+            // delete_bw_fault for network faults, and kill helper processes for
+            // resource faults (CPU burn, memory pressure).
+        }
     }
 
     /// Deploy all apps and jobs from a config, streaming progress events.

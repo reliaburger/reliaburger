@@ -77,6 +77,12 @@ proptest = "1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [[bench]]
 name = "gossip"
 harness = false
