@@ -24,7 +24,7 @@ pub struct NodeConfig {
     pub logs: LogsSection,
     pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
     // TODO(Phase 3): ingress section
-    // TODO(Phase 9): upgrades section
+    // TODO(Phase 14): upgrades section
 }
 
 impl NodeConfig {

@@ -523,7 +523,7 @@ if let Some(build_ns) = &spec.namespace
 }
 ```
 
-No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 9.
+No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 12.
 
 ## Lessons learned
 

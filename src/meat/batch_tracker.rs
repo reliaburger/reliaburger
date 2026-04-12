@@ -29,7 +29,7 @@ pub enum JobStatus {
 #[derive(Debug, Clone)]
 struct TrackedJob {
     name: String,
-    #[allow(dead_code)] // Used when querying per-node status (Phase 9)
+    #[allow(dead_code)] // Used when querying per-node status (Phase 15)
     node: NodeId,
     status: JobStatus,
 }
