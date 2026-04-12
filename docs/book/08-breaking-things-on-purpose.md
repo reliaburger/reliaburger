@@ -448,35 +448,54 @@ We need something that can build OCI images from Dockerfiles without a Docker da
 
 Can you see where this is going? We went with buildah.
 
-### How it works
+### The full flow
 
-A build job is two subprocess calls:
+Here's what happens, step by step, when you submit a build job.
 
-```rust
-pub fn execute_build(spec: &BuildSpec, pickle_port: Option<u16>) -> Result<BuildahJob, BuildError> {
-    let dest = validate_build(spec)?;
-    let local_tag = format!("localhost:{port}/{}:{}", dest.name, dest.tag);
-    let build_cmd = buildah_build_args(spec, &local_tag);
-    let push_cmd = buildah_push_args(&local_tag);
-    Ok(BuildahJob { build_cmd, push_cmd, destination: dest, local_tag })
-}
-```
+**1. The CLI reads your build config** and validates it. The `pickle://` destination is parsed, the context directory is checked, and mutual exclusivity rules are enforced (you can't have both `image` and `context` on the same app). If anything is wrong, you get an error before any work happens.
 
-The first command builds the image:
+**2. The leader picks a node to run the build.** Build jobs are scheduled like any other job — the Meat scheduler picks a node with enough CPU and memory. The build context directory must be accessible on that node (via the shared mount or a volume). In a dev cluster, Lima's `virtiofs` mount handles this. In production, you'd use a shared filesystem or sync the context to the node first.
+
+**3. Bun on the target node runs buildah as a subprocess.** This is where the actual Dockerfile execution happens. Buildah needs to be installed on every node that might run builds — it's a single binary, installed via `apt-get install buildah` (Ubuntu/Debian) or `dnf install buildah` (Fedora/RHEL). The dev cluster provisioning installs it automatically.
+
+The build command:
 
 ```
 buildah bud --storage-driver vfs -f Dockerfile \
-  --build-arg VERSION=1.78 -t localhost:9117/my-api:v1.2.3 .
+  --platform linux/amd64,linux/arm64 \
+  --manifest localhost:9117/my-api:v1.2.3 ./my-api
 ```
 
-The second pushes it to Pickle:
+`--storage-driver vfs` is the key flag. It tells buildah to use plain file copies instead of overlayfs. This means no kernel modules, no FUSE, no privileged access. Slower than overlay, but works anywhere. Buildah reads the Dockerfile, pulls base images (e.g. `python:3.12-slim` from Docker Hub), runs each instruction, and produces an OCI image. With `--platform linux/amd64,linux/arm64`, it builds for both architectures and creates a manifest list (OCI index) so the image works on mixed clusters.
+
+**4. Buildah pushes to Pickle.** The second subprocess call:
 
 ```
 buildah push --storage-driver vfs --tls-verify=false \
   localhost:9117/my-api:v1.2.3 docker://localhost:9117/my-api:v1.2.3
 ```
 
-Pickle already implements the OCI Distribution API (`/v2/{name}/manifests/{reference}`, `/v2/{name}/blobs/uploads/`). Buildah speaks the same protocol. No custom layer manipulation, no tar file parsing, no manifest assembly. Buildah builds, Pickle stores. Two standard tools talking a standard protocol.
+Pickle's OCI Distribution API lives on the same port as the Bun agent (9117). Buildah speaks the standard Docker registry protocol: it uploads layer blobs via `POST /v2/{name}/blobs/uploads/`, then pushes the manifest via `PUT /v2/{name}/manifests/{tag}`. For multi-platform builds, it pushes each per-architecture manifest first, then the manifest list. Pickle handles all of this — we verified it supports both single-platform manifests and manifest lists.
+
+`--tls-verify=false` because Pickle runs on localhost. No point doing TLS to yourself.
+
+**5. The image is now in Pickle.** `relish images` shows it. Other nodes can pull it via Pickle's replication protocol. When you deploy an app with `image = "my-api:v1.2.3"`, the scheduler sees which nodes already have the layers cached (image locality scoring from Phase 2) and prefers them.
+
+### Dependencies
+
+Buildah is the only external dependency for build jobs. It's not bundled into the Bun binary — it's installed on the host, like runc.
+
+On Ubuntu/Debian:
+```
+apt-get install -y buildah
+```
+
+On Fedora/RHEL:
+```
+dnf install -y buildah
+```
+
+The `relish dev create` command installs it automatically when provisioning Lima VMs. If you're setting up a production cluster manually, add it to your node image alongside runc.
 
 ### Namespace-scoped pushes
 

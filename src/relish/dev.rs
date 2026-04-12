@@ -80,7 +80,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap curl
+      apt-get install -y -qq runc uidmap curl buildah
       ARCH=$(uname -m)
       VERSION="latest"
       curl -fsSL -o /usr/local/bin/bun \
@@ -456,7 +456,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap slirp4netns curl build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
+      apt-get install -y -qq runc uidmap slirp4netns curl buildah build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
   - mode: user
     script: |
       #!/bin/bash
