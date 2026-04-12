@@ -8,7 +8,7 @@ A batteries-included container orchestrator written in Rust. One binary that rep
 
 This repo produces two things simultaneously:
 
-1. **A working implementation** — complete, testable, simple, bug-free.
+1. **A working implementation** — complete, testable, simple.
 2. **A book** — *Building Reliaburger* — that walks through how we built all of it, teaching Rust and distributed systems along the way.
 
 The full architectural vision lives in the [whitepaper](docs/whitepaper.md). For installation and usage instructions, see the [documentation](docs/README.md).
