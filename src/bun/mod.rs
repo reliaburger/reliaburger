@@ -48,6 +48,10 @@ pub enum BunError {
     #[error("app {app_name:?} has a health check but no port")]
     NoPortForHealthCheck { app_name: String },
 
+    /// Deploy was rejected (e.g. process workload binary not in allowlist).
+    #[error("deploy failed for {app_name:?}: {reason}")]
+    DeployFailed { app_name: String, reason: String },
+
     /// The workload has exceeded its restart limit.
     #[error(
         "instance {instance_id} exceeded restart limit: {restart_count}/{max_restarts} restarts"
