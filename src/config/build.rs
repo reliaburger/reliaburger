@@ -32,6 +32,18 @@ pub struct BuildSpec {
     /// Namespace this build belongs to. Restricts push to
     /// namespace-scoped repositories.
     pub namespace: Option<String>,
+
+    /// Target platform(s) for the build.
+    ///
+    /// Defaults to `["linux/amd64", "linux/arm64"]` so images work on
+    /// mixed-architecture clusters. Buildah produces a manifest list
+    /// (OCI index) when multiple platforms are specified.
+    #[serde(default = "default_platforms")]
+    pub platform: Vec<String>,
+}
+
+fn default_platforms() -> Vec<String> {
+    vec!["linux/amd64".to_string(), "linux/arm64".to_string()]
 }
 
 fn default_dockerfile() -> String {
@@ -201,6 +213,7 @@ mod tests {
             destination: "docker://myapp:v1".into(),
             args: BTreeMap::new(),
             namespace: None,
+            platform: vec![],
         };
         assert!(validate_build_namespace("test-build", &spec).is_err());
     }
@@ -213,6 +226,7 @@ mod tests {
             destination: "pickle://myapp:v1".into(),
             args: BTreeMap::new(),
             namespace: Some("default".into()),
+            platform: vec![],
         };
         assert!(validate_build_namespace("test-build", &spec).is_ok());
     }

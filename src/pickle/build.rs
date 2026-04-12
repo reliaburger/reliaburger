@@ -1,12 +1,35 @@
-//! Build job execution — in-cluster image building.
+//! Build job execution — in-cluster image building via buildah.
 //!
-//! A build job runs a builder container with the build context mounted,
-//! captures the resulting image layers, and pushes them to the Pickle
-//! registry. For Phase 8 v1, builds use a simple builder (no layer
-//! caching). Layer caching is a Phase 9 optimisation.
+//! Builds OCI images from Dockerfiles using buildah, then pushes them
+//! to the local Pickle registry. Buildah runs daemonless with
+//! `--storage-driver vfs` for fully unprivileged, rootless builds.
+//!
+//! The build runs as a process job: two subprocess calls (`buildah bud`
+//! to build, `buildah push` to push). No client libraries, no daemons.
+
+use std::path::PathBuf;
 
 use crate::config::build::{BuildSpec, PickleDestination, parse_pickle_destination};
 use crate::config::error::ConfigError;
+
+/// Default Pickle registry port (same as the Bun API port).
+const DEFAULT_PICKLE_PORT: u16 = 9117;
+
+/// A prepared buildah build, ready for execution as a process job.
+///
+/// Contains the CLI commands and arguments for both the build and
+/// push steps. The caller runs these as subprocesses.
+#[derive(Debug, Clone)]
+pub struct BuildahJob {
+    /// The buildah bud command and arguments.
+    pub build_cmd: Vec<String>,
+    /// The buildah push command and arguments.
+    pub push_cmd: Vec<String>,
+    /// Destination image reference.
+    pub destination: PickleDestination,
+    /// Local image tag (used between build and push).
+    pub local_tag: String,
+}
 
 /// Result of a build job.
 #[derive(Debug, Clone)]
@@ -23,7 +46,7 @@ pub struct BuildResult {
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     #[error("build context {path:?} does not exist")]
-    ContextNotFound { path: std::path::PathBuf },
+    ContextNotFound { path: PathBuf },
 
     #[error("dockerfile {path:?} not found in context")]
     DockerfileNotFound { path: String },
@@ -44,9 +67,6 @@ pub enum BuildError {
 }
 
 /// Validate a build spec before execution.
-///
-/// Checks that the context directory and dockerfile exist, and that
-/// the destination uses `pickle://` protocol.
 pub fn validate_build(spec: &BuildSpec) -> Result<PickleDestination, BuildError> {
     let dest = parse_pickle_destination(&spec.destination)?;
 
@@ -56,7 +76,6 @@ pub fn validate_build(spec: &BuildSpec) -> Result<PickleDestination, BuildError>
         });
     }
 
-    // Check dockerfile exists if context is absolute and exists
     if spec.context.is_absolute() && spec.context.exists() {
         let dockerfile_path = spec.context.join(&spec.dockerfile);
         if !dockerfile_path.exists() {
@@ -69,19 +88,101 @@ pub fn validate_build(spec: &BuildSpec) -> Result<PickleDestination, BuildError>
     Ok(dest)
 }
 
-/// Check that a build's namespace is allowed to push to the destination.
+/// Prepare a buildah build job from a BuildSpec.
 ///
-/// If the build has a namespace, the destination image name must not
-/// conflict with another namespace's scope. For v1, we simply check
-/// that the build declares a namespace (builds without a namespace
-/// can push anywhere).
+/// Returns a `BuildahJob` containing the CLI commands for both the
+/// build (`buildah bud`) and push (`buildah push`) steps. The caller
+/// runs these as subprocesses via ProcessGrill or `tokio::process::Command`.
+///
+/// The `pickle_port` argument specifies the Pickle registry port
+/// (default 9117). Buildah pushes to `localhost:{port}/{name}:{tag}`.
+pub fn execute_build(spec: &BuildSpec, pickle_port: Option<u16>) -> Result<BuildahJob, BuildError> {
+    let dest = validate_build(spec)?;
+    let port = pickle_port.unwrap_or(DEFAULT_PICKLE_PORT);
+
+    let local_tag = format!("localhost:{port}/{}:{}", dest.name, dest.tag);
+    let build_cmd = buildah_build_args(spec, &local_tag);
+    let push_cmd = buildah_push_args(&local_tag);
+
+    Ok(BuildahJob {
+        build_cmd,
+        push_cmd,
+        destination: dest,
+        local_tag,
+    })
+}
+
+/// Generate the `buildah bud` command arguments.
+///
+/// Produces a command like:
+/// ```text
+/// buildah bud --storage-driver vfs -f Dockerfile \
+///   --platform linux/amd64,linux/arm64 --manifest localhost:9117/myapp:v1 .
+/// ```
+///
+/// When multiple platforms are specified, buildah produces a manifest
+/// list (OCI index) so the image works on mixed-architecture clusters.
+fn buildah_build_args(spec: &BuildSpec, local_tag: &str) -> Vec<String> {
+    let mut args = vec![
+        "buildah".to_string(),
+        "bud".to_string(),
+        "--storage-driver".to_string(),
+        "vfs".to_string(),
+        "-f".to_string(),
+        spec.dockerfile.clone(),
+    ];
+
+    // Platform targeting: single platform uses -t, multiple uses --manifest
+    if spec.platform.len() > 1 {
+        args.push("--platform".to_string());
+        args.push(spec.platform.join(","));
+        args.push("--manifest".to_string());
+        args.push(local_tag.to_string());
+    } else {
+        if let Some(platform) = spec.platform.first() {
+            args.push("--platform".to_string());
+            args.push(platform.clone());
+        }
+        args.push("-t".to_string());
+        args.push(local_tag.to_string());
+    }
+
+    for (key, value) in &spec.args {
+        args.push("--build-arg".to_string());
+        args.push(format!("{key}={value}"));
+    }
+
+    args.push(spec.context.to_string_lossy().to_string());
+
+    args
+}
+
+/// Generate the `buildah push` command arguments.
+///
+/// Produces a command like:
+/// ```text
+/// buildah push --storage-driver vfs --tls-verify=false \
+///   localhost:9117/myapp:v1 docker://localhost:9117/myapp:v1
+/// ```
+fn buildah_push_args(local_tag: &str) -> Vec<String> {
+    vec![
+        "buildah".to_string(),
+        "push".to_string(),
+        "--storage-driver".to_string(),
+        "vfs".to_string(),
+        "--tls-verify=false".to_string(),
+        local_tag.to_string(),
+        format!("docker://{local_tag}"),
+    ]
+}
+
+/// Check that a build's namespace is allowed to push to the destination.
 pub fn check_namespace_scope(
     spec: &BuildSpec,
     existing_namespaces: &[String],
 ) -> Result<(), BuildError> {
     let dest = parse_pickle_destination(&spec.destination)?;
 
-    // If the image name contains a slash, treat the prefix as a namespace scope
     if let Some((ns_prefix, _)) = dest.name.split_once('/') {
         if let Some(build_ns) = &spec.namespace
             && ns_prefix != build_ns
@@ -91,7 +192,6 @@ pub fn check_namespace_scope(
                 dest_ns: ns_prefix.to_string(),
             });
         }
-        // Verify the namespace exists
         if !existing_namespaces.iter().any(|n| n == ns_prefix) {
             return Err(BuildError::NamespaceMismatch {
                 build_ns: spec.namespace.clone().unwrap_or_default(),
@@ -112,23 +212,8 @@ pub fn build_args_to_env(spec: &BuildSpec) -> Vec<String> {
 }
 
 /// Resolve the full Dockerfile path from the build spec.
-pub fn resolve_dockerfile(spec: &BuildSpec) -> std::path::PathBuf {
+pub fn resolve_dockerfile(spec: &BuildSpec) -> PathBuf {
     spec.context.join(&spec.dockerfile)
-}
-
-/// Placeholder for the actual build execution.
-///
-/// In Phase 8 v1, this validates the spec and returns a placeholder
-/// result. Full builder container integration (kaniko or custom)
-/// is wired when the build CLI command triggers a deploy.
-pub fn prepare_build(spec: &BuildSpec, _builder_image: &str) -> Result<BuildResult, BuildError> {
-    let dest = validate_build(spec)?;
-
-    Ok(BuildResult {
-        destination: dest,
-        layers: 0,
-        size_bytes: 0,
-    })
 }
 
 #[cfg(test)]
@@ -145,8 +230,22 @@ mod tests {
             destination: dest.into(),
             args: BTreeMap::new(),
             namespace: None,
+            platform: vec!["linux/amd64".into(), "linux/arm64".into()],
         }
     }
+
+    fn spec_with_args(args: BTreeMap<String, String>) -> BuildSpec {
+        BuildSpec {
+            context: PathBuf::from("./src"),
+            dockerfile: "Dockerfile.prod".into(),
+            destination: "pickle://myapp:v1".into(),
+            args,
+            namespace: None,
+            platform: vec!["linux/amd64".into(), "linux/arm64".into()],
+        }
+    }
+
+    // --- validate_build ---
 
     #[test]
     fn validate_build_accepts_pickle_destination() {
@@ -162,6 +261,128 @@ mod tests {
         assert!(validate_build(&spec).is_err());
     }
 
+    // --- execute_build ---
+
+    #[test]
+    fn execute_build_produces_valid_job() {
+        let spec = spec_with_destination("pickle://myapp:v2");
+        let job = execute_build(&spec, Some(9117)).unwrap();
+        assert_eq!(job.destination.name, "myapp");
+        assert_eq!(job.destination.tag, "v2");
+        assert_eq!(job.local_tag, "localhost:9117/myapp:v2");
+    }
+
+    #[test]
+    fn execute_build_uses_default_port() {
+        let spec = spec_with_destination("pickle://app:latest");
+        let job = execute_build(&spec, None).unwrap();
+        assert!(job.local_tag.contains("9117"));
+    }
+
+    #[test]
+    fn execute_build_rejects_missing_context() {
+        let spec = BuildSpec {
+            context: PathBuf::from("/nonexistent/path/that/does/not/exist"),
+            dockerfile: "Dockerfile".into(),
+            destination: "pickle://app:v1".into(),
+            args: BTreeMap::new(),
+            namespace: None,
+            platform: vec!["linux/amd64".into()],
+        };
+        let err = execute_build(&spec, None).unwrap_err();
+        assert!(matches!(err, BuildError::ContextNotFound { .. }));
+    }
+
+    // --- buildah_build_args ---
+
+    #[test]
+    fn buildah_build_cmd_uses_vfs_storage() {
+        let spec = spec_with_destination("pickle://app:v1");
+        let job = execute_build(&spec, None).unwrap();
+        assert!(job.build_cmd.contains(&"--storage-driver".to_string()));
+        assert!(job.build_cmd.contains(&"vfs".to_string()));
+    }
+
+    #[test]
+    fn buildah_build_cmd_includes_dockerfile() {
+        let spec = BuildSpec {
+            context: PathBuf::from("."),
+            dockerfile: "Dockerfile.prod".into(),
+            destination: "pickle://app:v1".into(),
+            args: BTreeMap::new(),
+            namespace: None,
+            platform: vec!["linux/amd64".into()],
+        };
+        let job = execute_build(&spec, None).unwrap();
+        let f_idx = job.build_cmd.iter().position(|a| a == "-f").unwrap();
+        assert_eq!(job.build_cmd[f_idx + 1], "Dockerfile.prod");
+    }
+
+    #[test]
+    fn buildah_build_cmd_includes_build_args() {
+        let mut args = BTreeMap::new();
+        args.insert("VERSION".to_string(), "1.78".to_string());
+        args.insert("FEATURES".to_string(), "ebpf".to_string());
+        let spec = spec_with_args(args);
+        let job = execute_build(&spec, None).unwrap();
+
+        let build_arg_count = job
+            .build_cmd
+            .iter()
+            .filter(|a| a.as_str() == "--build-arg")
+            .count();
+        assert_eq!(build_arg_count, 2);
+        assert!(job.build_cmd.iter().any(|a| a == "VERSION=1.78"));
+        assert!(job.build_cmd.iter().any(|a| a == "FEATURES=ebpf"));
+    }
+
+    #[test]
+    fn buildah_build_cmd_ends_with_context() {
+        let spec = BuildSpec {
+            context: PathBuf::from("./myproject"),
+            dockerfile: "Dockerfile".into(),
+            destination: "pickle://app:v1".into(),
+            args: BTreeMap::new(),
+            namespace: None,
+            platform: vec!["linux/amd64".into()],
+        };
+        let job = execute_build(&spec, None).unwrap();
+        assert_eq!(job.build_cmd.last().unwrap(), "./myproject");
+    }
+
+    // --- buildah_push_args ---
+
+    #[test]
+    fn buildah_push_cmd_targets_pickle() {
+        let spec = spec_with_destination("pickle://myapp:v3");
+        let job = execute_build(&spec, Some(5000)).unwrap();
+        assert!(
+            job.push_cmd
+                .contains(&"localhost:5000/myapp:v3".to_string())
+        );
+        assert!(
+            job.push_cmd
+                .contains(&"docker://localhost:5000/myapp:v3".to_string())
+        );
+    }
+
+    #[test]
+    fn buildah_push_cmd_uses_vfs_storage() {
+        let spec = spec_with_destination("pickle://app:v1");
+        let job = execute_build(&spec, None).unwrap();
+        assert!(job.push_cmd.contains(&"--storage-driver".to_string()));
+        assert!(job.push_cmd.contains(&"vfs".to_string()));
+    }
+
+    #[test]
+    fn buildah_push_cmd_disables_tls() {
+        let spec = spec_with_destination("pickle://app:v1");
+        let job = execute_build(&spec, None).unwrap();
+        assert!(job.push_cmd.contains(&"--tls-verify=false".to_string()));
+    }
+
+    // --- namespace scoping ---
+
     #[test]
     fn namespace_scope_allows_matching_prefix() {
         let spec = BuildSpec {
@@ -170,6 +391,7 @@ mod tests {
             destination: "pickle://production/myapp:v1".into(),
             args: BTreeMap::new(),
             namespace: Some("production".into()),
+            platform: vec![],
         };
         let namespaces = vec!["production".to_string(), "staging".to_string()];
         assert!(check_namespace_scope(&spec, &namespaces).is_ok());
@@ -183,24 +405,23 @@ mod tests {
             destination: "pickle://staging/myapp:v1".into(),
             args: BTreeMap::new(),
             namespace: Some("production".into()),
+            platform: vec![],
         };
         let namespaces = vec!["production".to_string(), "staging".to_string()];
-        let err = check_namespace_scope(&spec, &namespaces).unwrap_err();
-        assert!(matches!(err, BuildError::NamespaceMismatch { .. }));
+        assert!(matches!(
+            check_namespace_scope(&spec, &namespaces),
+            Err(BuildError::NamespaceMismatch { .. })
+        ));
     }
+
+    // --- helpers ---
 
     #[test]
     fn build_args_to_env_formats_correctly() {
         let mut args = BTreeMap::new();
         args.insert("VERSION".to_string(), "1.78".to_string());
         args.insert("FEATURES".to_string(), "ebpf".to_string());
-        let spec = BuildSpec {
-            context: PathBuf::from("."),
-            dockerfile: "Dockerfile".into(),
-            destination: "pickle://app:v1".into(),
-            args,
-            namespace: None,
-        };
+        let spec = spec_with_args(args);
         let env = build_args_to_env(&spec);
         assert_eq!(env.len(), 2);
         assert!(env.contains(&"BUILD_ARG_FEATURES=ebpf".to_string()));
@@ -215,6 +436,7 @@ mod tests {
             destination: "pickle://app:v1".into(),
             args: BTreeMap::new(),
             namespace: None,
+            platform: vec![],
         };
         assert_eq!(
             resolve_dockerfile(&spec),
@@ -222,11 +444,35 @@ mod tests {
         );
     }
 
+    // --- multi-platform ---
+
     #[test]
-    fn prepare_build_returns_result_for_valid_spec() {
-        let spec = spec_with_destination("pickle://myapp:v2");
-        let result = prepare_build(&spec, "builder:latest").unwrap();
-        assert_eq!(result.destination.name, "myapp");
-        assert_eq!(result.destination.tag, "v2");
+    fn buildah_multi_platform_uses_manifest_flag() {
+        let spec = spec_with_destination("pickle://app:v1");
+        // Default spec_with_destination uses both amd64 + arm64
+        let job = execute_build(&spec, None).unwrap();
+        assert!(job.build_cmd.contains(&"--manifest".to_string()));
+        assert!(job.build_cmd.contains(&"--platform".to_string()));
+        assert!(job.build_cmd.iter().any(|a| a == "linux/amd64,linux/arm64"));
+        // Multi-platform should NOT use -t
+        assert!(!job.build_cmd.contains(&"-t".to_string()));
+    }
+
+    #[test]
+    fn buildah_single_platform_uses_tag_flag() {
+        let spec = BuildSpec {
+            context: PathBuf::from("."),
+            dockerfile: "Dockerfile".into(),
+            destination: "pickle://app:v1".into(),
+            args: BTreeMap::new(),
+            namespace: None,
+            platform: vec!["linux/amd64".into()],
+        };
+        let job = execute_build(&spec, None).unwrap();
+        assert!(job.build_cmd.contains(&"-t".to_string()));
+        assert!(job.build_cmd.contains(&"--platform".to_string()));
+        assert!(job.build_cmd.iter().any(|a| a == "linux/amd64"));
+        // Single platform should NOT use --manifest
+        assert!(!job.build_cmd.contains(&"--manifest".to_string()));
     }
 }

@@ -360,8 +360,6 @@ The 100K-in-<1s benchmark runs as a unit test on every build. If someone introdu
 
 The final piece of the infrastructure puzzle: building images inside the cluster. No more pushing from your laptop to a remote registry, then pulling from the registry to the cluster. Build where the images will run.
 
-A build job takes a Dockerfile and a context, produces an OCI image, and pushes it to the local Pickle registry:
-
 ```toml
 [build.my-api]
 context = "./src/api"
@@ -372,29 +370,66 @@ namespace = "production"
 RUST_VERSION = "1.78"
 ```
 
-The `pickle://` protocol means "push to the local registry". This is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
+The `pickle://` protocol means "push to the local Pickle registry". This is enforced at config validation time — you can't accidentally push to Docker Hub from a build job.
 
-### Namespace-scoped pushes
+### Choosing a builder
 
-If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`. This prevents one team from overwriting another team's images.
+We need something that can build OCI images from Dockerfiles without a Docker daemon. We looked at six options:
 
-The validation logic checks two things: that the destination uses `pickle://`, and that the namespace prefix (if present) matches the build's declared namespace. No prefix means the build can push anywhere — fine for shared infrastructure images.
+**kaniko** (Google) was the obvious choice two years ago. Every Kubernetes CI tutorial recommended it. Then Google archived it in mid-2025. The repo is frozen, no more releases, no security patches. If you're still using it, you're running on borrowed time.
+
+**BuildKit** (Docker/Moby) is the most powerful option. It parallelises layer builds, supports build secrets, SSH forwarding, multi-platform builds. But it's a client-server architecture: you run `buildkitd` as a daemon and talk to it via `buildctl`. For in-cluster builds, you either manage buildkitd as a long-lived service (another stateful component to babysit) or use the "daemonless" wrapper where buildkitd starts, builds, and exits in a single container. Either way, more moving parts than we want.
+
+**img** (Jessie Frazelle) was a thin wrapper around BuildKit for unprivileged builds. Abandoned in 2020. Superseded by BuildKit's own rootless mode.
+
+**ko** (Google) is excellent if your workload is exclusively Go. It compiles Go binaries and assembles OCI images in pure userspace. But it doesn't process Dockerfiles. Not general-purpose.
+
+**Cloud Native Buildpacks** auto-detect your language and build without a Dockerfile. Different paradigm entirely. Good for PaaS-style "push your code" workflows, but we want Dockerfile support.
+
+**buildah** (Red Hat/Podman ecosystem) is a single binary that runs, builds, and exits. No daemon. No background process. No client-server split. `buildah bud` builds from a Dockerfile, `buildah push` pushes to any OCI-compliant registry. With `--storage-driver vfs`, it works in a completely unprivileged container — no FUSE, no special kernel modules. VFS is slower than overlayfs (it copies instead of overlaying), but for a build job that completes and exits, speed matters less than simplicity.
+
+Can you see where this is going? We went with buildah.
+
+### How it works
+
+A build job is two subprocess calls:
 
 ```rust
-pub fn check_namespace_scope(
-    spec: &BuildSpec,
-    existing_namespaces: &[String],
-) -> Result<(), BuildError> {
-    let dest = parse_pickle_destination(&spec.destination)?;
-    if let Some((ns_prefix, _)) = dest.name.split_once('/') {
-        if let Some(build_ns) = &spec.namespace {
-            if ns_prefix != build_ns {
-                return Err(BuildError::NamespaceMismatch { ... });
-            }
-        }
-    }
-    Ok(())
+pub fn execute_build(spec: &BuildSpec, pickle_port: Option<u16>) -> Result<BuildahJob, BuildError> {
+    let dest = validate_build(spec)?;
+    let local_tag = format!("localhost:{port}/{}:{}", dest.name, dest.tag);
+    let build_cmd = buildah_build_args(spec, &local_tag);
+    let push_cmd = buildah_push_args(&local_tag);
+    Ok(BuildahJob { build_cmd, push_cmd, destination: dest, local_tag })
 }
 ```
 
-Phase 8 implements the config parsing, destination validation, and namespace scoping. The actual builder container integration (running kaniko or a custom builder inside the cluster) is wired when the `relish build` command triggers a deploy. Layer caching is deferred to Phase 9.
+The first command builds the image:
+
+```
+buildah bud --storage-driver vfs -f Dockerfile \
+  --build-arg VERSION=1.78 -t localhost:9117/my-api:v1.2.3 .
+```
+
+The second pushes it to Pickle:
+
+```
+buildah push --storage-driver vfs --tls-verify=false \
+  localhost:9117/my-api:v1.2.3 docker://localhost:9117/my-api:v1.2.3
+```
+
+Pickle already implements the OCI Distribution API (`/v2/{name}/manifests/{reference}`, `/v2/{name}/blobs/uploads/`). Buildah speaks the same protocol. No custom layer manipulation, no tar file parsing, no manifest assembly. Buildah builds, Pickle stores. Two standard tools talking a standard protocol.
+
+### Namespace-scoped pushes
+
+If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`:
+
+```rust
+if let Some(build_ns) = &spec.namespace
+    && ns_prefix != build_ns
+{
+    return Err(BuildError::NamespaceMismatch { ... });
+}
+```
+
+No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 9.
