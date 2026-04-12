@@ -360,41 +360,167 @@ The 100K-in-<1s benchmark runs as a unit test on every build. If someone introdu
 
 The final piece of the infrastructure puzzle: building images inside the cluster. No more pushing from your laptop to a remote registry, then pulling from the registry to the cluster. Build where the images will run.
 
-A build job takes a Dockerfile and a context, produces an OCI image, and pushes it to the local Pickle registry:
+### A complete example
+
+Say you have a Python API. The source tree looks like this:
+
+```
+my-api/
+  Dockerfile
+  requirements.txt
+  app.py
+  tests/
+    test_app.py
+```
+
+The Dockerfile is standard:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 8080
+CMD ["python", "app.py"]
+```
+
+To build this inside the cluster and push it to Pickle, you write a build config:
 
 ```toml
 [build.my-api]
-context = "./src/api"
+context = "./my-api"
+dockerfile = "Dockerfile"
 destination = "pickle://my-api:v1.2.3"
 namespace = "production"
-
-[build.my-api.args]
-RUST_VERSION = "1.78"
+platform = ["linux/amd64", "linux/arm64"]
 ```
 
-The `pickle://` protocol means "push to the local registry". This is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
+That's it. `context` is the directory containing your source. Everything inside it gets sent to the builder. `dockerfile` defaults to `"Dockerfile"` if you leave it out. `destination` uses the `pickle://` protocol, which means "push to the local Pickle registry on this cluster". `platform` defaults to both amd64 and arm64, so the image works on mixed-architecture clusters.
 
-### Namespace-scoped pushes
+You can pass build arguments too:
 
-If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`. This prevents one team from overwriting another team's images.
+```toml
+[build.my-api.args]
+PIP_INDEX_URL = "https://internal-pypi.corp.example.com/simple"
+APP_VERSION = "1.2.3"
+```
 
-The validation logic checks two things: that the destination uses `pickle://`, and that the namespace prefix (if present) matches the build's declared namespace. No prefix means the build can push anywhere — fine for shared infrastructure images.
+These become `--build-arg` flags, which your Dockerfile picks up with `ARG`:
+
+```dockerfile
+ARG PIP_INDEX_URL
+ARG APP_VERSION
+RUN pip install --index-url ${PIP_INDEX_URL} -r requirements.txt
+```
+
+Once the build completes, deploy the image like any other app:
+
+```toml
+[app.my-api]
+image = "my-api:v1.2.3"
+port = 8080
+replicas = 3
+
+[app.my-api.health]
+path = "/healthz"
+```
+
+Pickle resolves `my-api:v1.2.3` locally — no Docker Hub round-trip. The scheduler pulls the image from whichever Pickle node has it cached (or replicates it if needed).
+
+The `pickle://` protocol is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
+
+### Choosing a builder
+
+We need something that can build OCI images from Dockerfiles without a Docker daemon. We looked at six options:
+
+**kaniko** (Google) was the obvious choice two years ago. Every Kubernetes CI tutorial recommended it. Then Google archived it in mid-2025. The repo is frozen, no more releases, no security patches. If you're still using it, you're running on borrowed time.
+
+**BuildKit** (Docker/Moby) is the most powerful option. It parallelises layer builds, supports build secrets, SSH forwarding, multi-platform builds. But it's a client-server architecture: you run `buildkitd` as a daemon and talk to it via `buildctl`. For in-cluster builds, you either manage buildkitd as a long-lived service (another stateful component to babysit) or use the "daemonless" wrapper where buildkitd starts, builds, and exits in a single container. Either way, more moving parts than we want.
+
+**img** (Jessie Frazelle) was a thin wrapper around BuildKit for unprivileged builds. Abandoned in 2020. Superseded by BuildKit's own rootless mode.
+
+**ko** (Google) is excellent if your workload is exclusively Go. It compiles Go binaries and assembles OCI images in pure userspace. But it doesn't process Dockerfiles. Not general-purpose.
+
+**Cloud Native Buildpacks** auto-detect your language and build without a Dockerfile. Different paradigm entirely. Good for PaaS-style "push your code" workflows, but we want Dockerfile support.
+
+**buildah** (Red Hat/Podman ecosystem) is a single binary that runs, builds, and exits. No daemon. No background process. No client-server split. `buildah bud` builds from a Dockerfile, `buildah push` pushes to any OCI-compliant registry. With `--storage-driver vfs`, it works in a completely unprivileged container — no FUSE, no special kernel modules. VFS is slower than overlayfs (it copies instead of overlaying), but for a build job that completes and exits, speed matters less than simplicity.
+
+Can you see where this is going? We went with buildah.
+
+### The full flow
+
+Here's what happens, step by step, when you submit a build job.
+
+**1. The CLI tars the build context and uploads it to Pickle.** The context directory (containing your Dockerfile, source, requirements.txt, etc.) is packed into a tar archive, hashed, and uploaded to Pickle's blob store as a regular blob. This is the key insight: Pickle is already a content-addressed blob store that every node in the cluster can talk to. We don't need a shared filesystem or a separate file transfer mechanism.
 
 ```rust
-pub fn check_namespace_scope(
-    spec: &BuildSpec,
-    existing_namespaces: &[String],
-) -> Result<(), BuildError> {
-    let dest = parse_pickle_destination(&spec.destination)?;
-    if let Some((ns_prefix, _)) = dest.name.split_once('/') {
-        if let Some(build_ns) = &spec.namespace {
-            if ns_prefix != build_ns {
-                return Err(BuildError::NamespaceMismatch { ... });
-            }
-        }
-    }
-    Ok(())
+pub fn tar_context(context_dir: &Path) -> Result<Vec<u8>, BuildError> {
+    let mut archive = Vec::new();
+    let mut tar = tar::Builder::new(&mut archive);
+    tar.append_dir_all(".", context_dir)?;
+    tar.finish()?;
+    Ok(archive)
 }
 ```
 
-Phase 8 implements the config parsing, destination validation, and namespace scoping. The actual builder container integration (running kaniko or a custom builder inside the cluster) is wired when the `relish build` command triggers a deploy. Layer caching is deferred to Phase 9.
+The digest of the tar becomes the context's identity. If two builds use the same context, the blob is already there — no re-upload needed.
+
+**2. The CLI submits a build job with the context digest.** The leader schedules it to a node like any other job. The build node doesn't need access to your local filesystem. It just needs to reach Pickle, which it already does.
+
+**3. The build node downloads the context blob from Pickle.** It fetches the tar from Pickle's OCI blob endpoint (`GET /v2/_buildcontext/blobs/sha256:...`), extracts it to a temp directory, and now has everything buildah needs.
+
+**4. Buildah builds the image.** The build node runs buildah as a subprocess:
+
+```
+buildah bud --storage-driver vfs -f Dockerfile \
+  --platform linux/amd64,linux/arm64 \
+  --manifest localhost:9117/my-api:v1.2.3 .
+```
+
+`--storage-driver vfs` tells buildah to use plain file copies instead of overlayfs. No kernel modules, no FUSE, no privileged access. Slower than overlay, but works anywhere without special permissions. Buildah reads the Dockerfile, pulls base images (e.g. `python:3.12-slim` from Docker Hub), runs each instruction, and produces an OCI image. With `--platform linux/amd64,linux/arm64`, it builds for both architectures and creates a manifest list (OCI index) so the image works on mixed clusters.
+
+**5. Buildah pushes the image back to Pickle.**
+
+```
+buildah push --storage-driver vfs --tls-verify=false \
+  localhost:9117/my-api:v1.2.3 docker://localhost:9117/my-api:v1.2.3
+```
+
+Pickle's OCI Distribution API lives on the same port as the Bun agent (9117). Buildah speaks the standard Docker registry protocol: it uploads layer blobs via `POST /v2/{name}/blobs/uploads/`, then pushes the manifest via `PUT /v2/{name}/manifests/{tag}`. For multi-platform builds, it pushes each per-architecture manifest first, then the manifest list. Pickle already handles both.
+
+`--tls-verify=false` because Pickle runs on localhost. No point doing TLS to yourself.
+
+**6. The image is ready.** `relish images` shows it. Other nodes pull it via Pickle's replication protocol. When you deploy with `image = "my-api:v1.2.3"`, the scheduler sees which nodes already have the layers cached (image locality scoring from Phase 2) and prefers them.
+
+The entire flow uses two existing pieces of infrastructure: Pickle for blob storage and transfer, buildah for Dockerfile execution. No new daemons, no shared filesystems, no scp.
+
+### Dependencies
+
+Buildah is the only external dependency for build jobs. It's not bundled into the Bun binary — it's installed on the host, like runc.
+
+On Ubuntu/Debian:
+```
+apt-get install -y buildah
+```
+
+On Fedora/RHEL:
+```
+dnf install -y buildah
+```
+
+The `relish dev create` command installs it automatically when provisioning Lima VMs. If you're setting up a production cluster manually, add it to your node image alongside runc.
+
+### Namespace-scoped pushes
+
+If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`:
+
+```rust
+if let Some(build_ns) = &spec.namespace
+    && ns_prefix != build_ns
+{
+    return Err(BuildError::NamespaceMismatch { ... });
+}
+```
+
+No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 9.

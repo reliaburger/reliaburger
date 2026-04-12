@@ -230,6 +230,27 @@ Commands:
 | `council` | Show council (Raft) composition and status |
 | `join --token <token> <addr>` | Join an existing cluster |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
+| `resolve <name>` | Resolve a service name to its VIP and backends |
+| `routes` | Show ingress routing table |
+| `top` | Show live resource usage (CPU, memory) for all apps |
+| `deploy <path>` | Trigger a rolling deploy for an app |
+| `history <app>` | Show deploy history for an app |
+| `rollback <app>` | Rollback an app to the previous version |
+| `lint <path>` | Validate a config file without deploying |
+| `images` | List images in the local Pickle registry |
+| `secret pubkey [dir]` | Print the cluster's age public key |
+| `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
+| `fault delay <target> <delay>` | Add latency to connections to a service |
+| `fault drop <target> <pct>` | Fail a percentage of connections (ECONNREFUSED) |
+| `fault dns <target> nxdomain` | Return NXDOMAIN for DNS resolution |
+| `fault partition <target>` | Block traffic between services |
+| `fault kill <target>` | Kill instances of a service (SIGKILL) |
+| `fault pause <target>` | Freeze instances of a service (SIGSTOP) |
+| `fault node-drain <node>` | Simulate graceful node departure |
+| `fault node-kill <node>` | Simulate abrupt node failure |
+| `fault list` | List all active faults |
+| `fault clear [id]` | Clear all faults (or a specific one by ID) |
+| `fault scenario <file>` | Run a scripted chaos scenario from a TOML file |
 | `dev create` | Create a local dev cluster (Lima VMs with rootless runc) |
 | `dev status` | Show dev cluster status |
 | `dev shell <node>` | Open a shell on a dev cluster node |
