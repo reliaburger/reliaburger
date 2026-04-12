@@ -66,7 +66,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 ## Phase 3: Networking
 
 - [x] Per-container network namespaces (veth pairs, port mapping)
-  - [ ] Switch port mapping from individual nftables rules to nftables maps for O(1) lookup at scale
+  - Switch port mapping from individual nftables rules to nftables maps for O(1) lookup at scale — Phase 12
 - [x] Onion eBPF service discovery (DNS interception, connect() rewrite, service map)
   - [x] Userspace ServiceMap, VirtualIP allocation, `relish resolve` command
   - [x] Agent lifecycle wiring (deploy/health/stop → service map)
@@ -82,7 +82,7 @@ Single source of truth for what's done and what's next. Check off an item only w
   - [x] Connection draining protocol (zero-downtime deploys)
   - [x] Agent wiring (routing table rebuilds on deploy/stop/health, `relish routes` command)
   - [x] TLS termination with self-signed certs (rcgen + rustls, Phase 4 adds ACME + Sesame)
-  - [ ] WebSocket upgrade proxying
+  - WebSocket upgrade proxying — Phase 9
 - [x] nftables perimeter firewall (cluster boundary rules, management access)
   - [x] Ruleset generation (targeted blocking of Reliaburger ports, policy accept)
   - [x] `apply_ruleset()` via `nft -f` (Linux), no-op on macOS
@@ -93,16 +93,16 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 - [x] Sesame CA hierarchy (Root, Node, Workload, Ingress CAs — ECDSA P-256, HKDF key wrapping)
 - [x] Node mTLS (join tokens, certificate issuance, mTLS config builders, gossip HMAC)
-- [ ] Workload identity — deferred to Phase 9
+- Workload identity — deferred to Phase 10
 - [x] API authentication (tokens, Argon2id hashing, roles: Admin/Deployer/ReadOnly, axum middleware)
 - [x] Secret encryption (age keypairs, `ENC[AGE:...]` decryption at container startup, namespace-scoped keys)
 - [x] eBPF firewall rules (`allow_from` resolution, cgroup-to-namespace mapping, BPF map wiring)
 - [x] Raft log encryption at rest (AES-256-GCM, HKDF from node cert private key)
 - [x] `relish init` generates full PKI + join token; `relish token create`
-- [ ] `relish token list/revoke` — stubs pending SecurityState in Raft
-- [ ] Join token validation in agent — stubs pending SecurityState in Raft
+- `relish token list/revoke` — moved to Phase 10 (requires SecurityState in Raft)
+- Join token validation in agent — moved to Phase 10 (requires SecurityState in Raft)
 - [x] `relish secret pubkey` and `relish secret encrypt` CLI commands
-- [ ] `relish secret rotate` — requires SecurityState in Raft (same dependency as token list/revoke)
+- `relish secret rotate` — moved to Phase 10 (requires SecurityState in Raft)
 - [x] Book chapter 4: "Trust No One"
 - [x] All Phase 4 tests green (795 tests)
 
@@ -116,7 +116,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Garbage collection (sole-copy protection, active reference safety, retention window, GcReport)
 - [x] Volume size enforcement (loop mount on Linux, soft warning on macOS)
 - [x] `relish images` CLI command, `[images]` config section
-- [ ] Pull-through cache, P2P downloads, image signing, volume snapshots — deferred to Phase 9
+- Pull-through cache (Phase 12), P2P downloads (Phase 12), image signing (Phase 10), volume snapshots (Phase 12)
 - [x] Book chapter 5: "Where the Images Live"
 - [x] All Phase 5 tests green (867 tests)
 
@@ -132,7 +132,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Brioche dashboard (server-rendered HTML, dark theme, auto-refresh)
 - [x] `relish top` command, `relish logs --grep/--since/--json-field`
 - [x] Config: `[metrics]` and `[logs]` sections with object_store_url
-- [ ] Hierarchical aggregation, full Brioche UI, alert webhooks, PromQL — deferred to Phase 9
+- Hierarchical aggregation, full Brioche UI, alert webhooks, PromQL — deferred to Phase 11
 - [x] Cross-node log queries (fan-out to nodes, merge by timestamp, dedup)
 - [x] Agent wiring (Mayo collection task, Ketchup store, AlertEvaluator, `/v1/alerts`)
 - [x] `make observability-demo` for local testing
@@ -164,47 +164,73 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Build jobs (BuildSpec config, pickle:// destination parsing, namespace-scoped push, buildah integration)
 - [x] All Phase 8 tests green (1263 tests)
 
-## Phase 9: Production Hardening
+## Phase 9: User Experience
 
-**Core Phase 9:**
-- [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
-- [ ] `relish test --chaos` (integration tests + Smoker fault injection)
-- [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
-- [ ] `relish wtf` (automated cluster health diagnosis)
-- [ ] `relish trace` (end-to-end connectivity debugging)
-- [ ] Relish TUI (apps, nodes, jobs, events, logs, routes, search views)
-- [ ] Self-upgrade mechanism (rolling binary replacement, dual-signature, auto-rollback)
-
-**Deferred from Phase 3 (Networking):**
-- [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
-- [ ] WebSocket upgrade proxying in Wrapper ingress
-
-**Deferred from Phase 4 (Security):**
-- [ ] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
-- [ ] TPM sealing, CRL distribution, egress DNS resolution
-
-**Deferred from Phase 5 (Storage & Registry):**
-- [ ] P2P multi-source image downloads (parallel fan-out)
-- [ ] Image signing (keyless via workload identity, cosign-compatible)
-- [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
-- [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
-- [ ] Btrfs subvolume quotas (alternative to loop mount)
-
-**Deferred from Phase 6 (Observability):**
-- [ ] Parquet bloom filters on log `line` column (skip row groups in LIKE queries)
-- [ ] PromQL-to-SQL compatibility layer (rate, sum by, avg by, histogram_quantile)
-- [ ] Hierarchical metrics aggregation via council (cluster-wide queries)
-- [ ] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts)
-- [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
-- [ ] Log export to S3/GCS (scheduled, jsonl.gz)
-- [ ] Zstd seekable frame compression for archived logs
-- [ ] Cross-node log queries via Raft (leader fan-out, merge-sort)
-
-**Deferred from Phase 7 (GitOps & Deployments):**
 - [ ] Blue-green deploy strategy
 - [ ] Autoscaling (CPU/memory-based, runtime replica overrides)
 - [ ] Lettuce GitOps engine (poll/webhook sync, signed commits, coordinator election)
 - [ ] Kubernetes migration (`relish import`, `relish export`, migration reports)
 - [ ] `relish compile`, `relish diff`, `relish fmt`
-
+- [ ] WebSocket upgrade proxying in Wrapper ingress
+- [ ] Book chapter 9: "The Full Package"
 - [ ] All Phase 9 tests green
+
+## Phase 10: Advanced Security
+
+- [ ] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
+- [ ] Image signing (keyless via workload identity, cosign-compatible)
+- [ ] TPM sealing, CRL distribution, egress DNS resolution
+- [ ] `relish token list/revoke` (SecurityState in Raft)
+- [ ] Join token validation in agent (SecurityState in Raft)
+- [ ] `relish secret rotate` (SecurityState in Raft)
+- [ ] Book chapter 10: "Locking It Down"
+- [ ] All Phase 10 tests green
+
+## Phase 11: Advanced Observability
+
+- [ ] PromQL-to-SQL compatibility layer (rate, sum by, avg by, histogram_quantile)
+- [ ] Hierarchical metrics aggregation via council (cluster-wide queries)
+- [ ] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts)
+- [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
+- [ ] Log export to S3/GCS (scheduled, jsonl.gz)
+- [ ] Cross-node log queries via Raft (leader fan-out, merge-sort)
+- [ ] Book chapter 11: "Eyes Everywhere"
+- [ ] All Phase 11 tests green
+
+## Phase 12: Optimisations
+
+- [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
+- [ ] P2P multi-source image downloads (parallel fan-out)
+- [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
+- [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
+- [ ] Btrfs subvolume quotas (alternative to loop mount)
+- [ ] Parquet bloom filters on log `line` column (skip row groups in LIKE queries)
+- [ ] Zstd seekable frame compression for archived logs
+- [ ] Book chapter 12: "Squeezing Every Drop"
+- [ ] All Phase 12 tests green
+
+## Phase 13: Relish TUI
+
+- [ ] Full interactive terminal UI (ratatui + crossterm)
+- [ ] Dashboard, apps, nodes, jobs, events, logs, routes, search, help views
+- [ ] Book chapter 13: "A Room with a View"
+- [ ] All Phase 13 tests green
+
+## Phase 14: Self-Upgrade
+
+- [ ] Rolling binary replacement
+- [ ] Dual-signature verification
+- [ ] Automatic rollback on failure
+- [ ] Version retention and GC
+- [ ] Book chapter 14: "Changing the Tyres at Full Speed"
+- [ ] All Phase 14 tests green
+
+## Phase 15: Testing, Benchmarking & Diagnostics
+
+- [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
+- [ ] `relish test --chaos` (integration tests + Smoker fault injection)
+- [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
+- [ ] `relish wtf` (automated cluster health diagnosis)
+- [ ] `relish trace` (end-to-end connectivity debugging)
+- [ ] Book chapter 15: "Ready for Production"
+- [ ] All Phase 15 tests green

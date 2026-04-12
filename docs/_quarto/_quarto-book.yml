@@ -20,7 +20,13 @@ book:
     - book/06-watching-everything.md
     - book/07-ship-it.md
     - book/08-breaking-things-on-purpose.md
-    - book/09-ready-for-production.md
+    - book/09-the-full-package.md
+    - book/10-locking-it-down.md
+    - book/11-eyes-everywhere.md
+    - book/12-squeezing-every-drop.md
+    - book/13-a-room-with-a-view.md
+    - book/14-changing-the-tyres.md
+    - book/15-ready-for-production.md
 
 format:
   pdf:

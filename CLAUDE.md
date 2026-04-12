@@ -46,7 +46,13 @@ docs/
     06-watching-everything.md    # Phase 6: Observability
     07-ship-it.md                # Phase 7: GitOps & Deployments
     08-breaking-things-on-purpose.md  # Phase 8: Advanced
-    09-ready-for-production.md   # Phase 9: Production Hardening
+    09-the-full-package.md       # Phase 9: User Experience
+    10-locking-it-down.md        # Phase 10: Advanced Security
+    11-eyes-everywhere.md        # Phase 11: Advanced Observability
+    12-squeezing-every-drop.md   # Phase 12: Optimisations
+    13-a-room-with-a-view.md     # Phase 13: Relish TUI
+    14-changing-the-tyres.md     # Phase 14: Self-Upgrade
+    15-ready-for-production.md   # Phase 15: Testing & Diagnostics
   _quarto/             # PDF build configuration (Quarto profiles)
 src/                   # Rust source (created as we go)
 ```
@@ -63,9 +69,15 @@ We implement Reliaburger sequentially, one ROADMAP phase at a time. Each phase b
 4. Security (PKI, mTLS, secrets)
 5. Storage & Registry (Pickle, volumes)
 6. Observability (metrics, logs, dashboards)
-7. GitOps & Deployments (Lettuce, rolling deploys, K8s migration)
+7. GitOps & Deployments (rolling deploys, dependency ordering)
 8. Advanced (chaos testing, process workloads, batch)
-9. Production Hardening (test runner, TUI, benchmarks, self-upgrade)
+9. User Experience (blue-green, autoscaling, GitOps, K8s migration)
+10. Advanced Security (workload identity, image signing, token management)
+11. Advanced Observability (PromQL, hierarchical aggregation, full Brioche UI)
+12. Optimisations (nftables maps, P2P downloads, compression, caching)
+13. Relish TUI (interactive terminal interface)
+14. Self-Upgrade (rolling binary replacement)
+15. Testing & Diagnostics (test runner, benchmarks, wtf, trace)
 
 ### 2. Tests First
 
@@ -107,7 +119,13 @@ The book chapters live in `docs/book/` and are written in Markdown. Chapter mapp
 | 6 | Chapter 6 | "Watching Everything" |
 | 7 | Chapter 7 | "Ship It" |
 | 8 | Chapter 8 | "Breaking Things on Purpose" |
-| 9 | Chapter 9 | "Ready for Production" |
+| 9 | Chapter 9 | "The Full Package" |
+| 10 | Chapter 10 | "Locking It Down" |
+| 11 | Chapter 11 | "Eyes Everywhere" |
+| 12 | Chapter 12 | "Squeezing Every Drop" |
+| 13 | Chapter 13 | "A Room with a View" |
+| 14 | Chapter 14 | "Changing the Tyres at Full Speed" |
+| 15 | Chapter 15 | "Ready for Production" |
 
 ## Quality Standards
 

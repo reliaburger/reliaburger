@@ -420,11 +420,192 @@ Design docs: [chaos-smoker.md](design/chaos-smoker.md), [agent-bun.md](design/ag
 
 ---
 
-## Phase 9: Production Hardening, Tooling, Performance, Polish
+## Phase 9: User Experience, Complete Deployment Workflows
 
-Build the self-validation tooling and polish the operator experience. By this phase, all subsystem tests already exist and pass. This phase wraps them into the built-in test runner, adds the benchmark harness, and builds the remaining operator tools.
+Complete the deployment and operations story with the features deferred from Phase 7.
 
-Book: **Chapter 9, "Ready for Production"** (TUI development, performance tuning, self-upgrading binaries)
+Book: **Chapter 9, "The Full Package"** (blue-green deploys, autoscaling, GitOps, Kubernetes migration)
+
+### Tests (write first)
+
+Unit tests:
+
+- Lettuce sync loop: noop, new commit, partial parse error, git fetch failure backoff, Raft write retry
+- Signature verification: GPG valid/untrusted, SSH valid, unsigned with `require_signed_commits`
+- Autoscaler interaction: replicas preserved when other fields change, overridden when changed in git
+- Config tooling: `compile` resolves `_defaults.toml` merging, `lint` catches errors, `fmt` is idempotent
+- K8s import: resource correlation (Deployment + Service + Ingress → single App), field mapping, migration report
+- WebSocket frame parsing, upgrade handshake validation
+
+Integration tests:
+
+- Blue-green deploy: version header shows atomic cutover, zero dropped requests
+- Autoscaling: CPU load triggers scale-up within evaluation window. Scale-down on relief, stays within bounds
+- GitOps end-to-end: commit to local bare repo. Lettuce syncs within poll interval, app deployed
+- GitOps webhook: push triggers deploy within 5 seconds
+- GitOps rollback: git revert triggers rollback
+- GitOps coordinator failover: new coordinator resumes from `last_applied_commit`
+- Config tooling: `relish plan` shows correct diff. `relish lint` catches invalid config
+- K8s import: `relish import -f deployment.yaml -f service.yaml` produces correct TOML
+- K8s export: `relish export --format kubernetes` produces valid K8s YAML
+- WebSocket: upgrade handshake through Wrapper, bidirectional data flow
+
+### Implementation
+
+1. **Blue-green deploy strategy.** Atomic version cutover via Wrapper routing, zero dropped requests during switchover.
+2. **Autoscaling.** CPU/memory-based, runtime replica overrides preserved across GitOps syncs.
+3. **Lettuce GitOps engine.** Poll/webhook sync, signed commit verification, coordinator election, autoscaler interaction.
+4. **Kubernetes migration.** `relish import` (K8s YAML → TOML) and `relish export` (TOML → K8s manifests) with migration reports.
+5. **Relish config tooling.** `compile`, `diff`, `fmt`.
+6. **WebSocket upgrade proxying.** Upgrade detection in Wrapper, bidirectional frame forwarding, health-check bypass for long-lived connections.
+7. **Run all tests green.**
+
+Design docs: [gitops-lettuce.md](design/gitops-lettuce.md), [deployments.md](design/deployments.md), [cli-relish.md](design/cli-relish.md), [ingress-wrapper.md](design/ingress-wrapper.md)
+
+**Milestone:** `git push` triggers a validated rolling or blue-green deploy that automatically rolls back on failure. `relish import -f k8s-manifests/` converts an existing Kubernetes project. All Phase 9 tests pass.
+
+---
+
+## Phase 10: Advanced Security, Identity and Signing
+
+Complete the security story with workload identity, image signing, and token management.
+
+Book: **Chapter 10, "Locking It Down"** (SPIFFE identity, image signing, TPM, secret rotation)
+
+### Tests (write first)
+
+Unit tests:
+
+- SPIFFE certificate generation, CSR validation, SAN encoding
+- Image signature creation, verification, rejection of unsigned images
+- Token list pagination, revocation propagation, SecurityState Raft serialisation
+- Secret key rotation: dual-key decryption window, finalise drops old key
+
+Integration tests:
+
+- Workload identity: SPIFFE certificate issued, automatic rotation, OIDC JWT validation
+- Image signing: signed image verified, unsigned image rejected when signing is required
+- Join token: expiry enforced, single-use enforced, validation rejects expired/revoked tokens
+- Secret rotation: rotate key. Old and new ciphertexts accepted during transition; finalize drops old
+- Token list/revoke: `relish token list` shows active tokens, `relish token revoke` invalidates immediately
+- TPM sealing: sealed key survives reboot, fails on different hardware (where TPM is available)
+- CRL distribution: revoked certificate rejected within one gossip cycle
+
+### Implementation
+
+1. **Workload identity.** SPIFFE-compatible certs, CSR model, automatic rotation, OIDC JWTs.
+2. **Image signing.** Keyless signing via workload identity, cosign-compatible verification.
+3. **SecurityState in Raft.** Token registry, revocation list, secret key metadata.
+4. **Token management.** `relish token list` and `relish token revoke`, join token validation in agent.
+5. **Secret rotation.** `relish secret rotate` with dual-key transition window.
+6. **TPM sealing and CRL distribution.** Hardware-bound key sealing, certificate revocation propagation.
+7. **Run all tests green.**
+
+Design docs: [security-sesame.md](design/security-sesame.md), [registry-pickle.md](design/registry-pickle.md)
+
+**Milestone:** Workloads have SPIFFE identities, images are signed and verified, tokens are manageable via CLI, and secrets support key rotation. All Phase 10 tests pass.
+
+---
+
+## Phase 11: Advanced Observability, Full Monitoring Stack
+
+Complete the observability story with PromQL, hierarchical aggregation, and production-grade dashboards.
+
+Book: **Chapter 11, "Eyes Everywhere"** (PromQL, cluster-wide metrics, alert integrations, log pipelines)
+
+### Tests (write first)
+
+Unit tests:
+
+- PromQL-to-SQL translation: `rate()`, `sum by()`, `avg by()`, `histogram_quantile()` produce correct SQL
+- Hierarchical aggregation: node-level partial aggregates combine correctly at council level
+- Alert webhook payload: JSON schema correctness for Slack, PagerDuty, generic HTTP
+- Log export: jsonl.gz serialisation round-trip, scheduled job trigger timing
+
+Integration tests:
+
+- PromQL: 5-node cluster with deterministic metrics. Verify hierarchical aggregation correctness
+- PromQL: partial results returned when one aggregator is down
+- PromQL: Prometheus remote-read API round-trip, PromQL function correctness
+- Brioche UI: cluster overview renders with correct data. App detail shows instance count
+- Brioche UI: streaming logs appear within 2 seconds
+- Brioche UI: encrypted env vars aren't exposed in API responses
+- Alert webhooks: memory pressure triggers alert, webhook payload delivered to mock endpoint
+- Log export: scheduled export produces valid jsonl.gz in object store
+- Cross-node log queries: 3 nodes, 3 replicas, all lines in merge-sorted timestamp order via Raft
+
+### Implementation
+
+1. **PromQL-to-SQL compatibility layer.** Translate `rate`, `sum by`, `avg by`, `histogram_quantile` to DataFusion SQL.
+2. **Hierarchical metrics aggregation.** Council member rollups for cluster-wide queries.
+3. **Full Brioche UI.** App detail, node detail, ingress overview pages (axum + Askama + htmx + uPlot charts).
+4. **Alert webhooks.** Slack, PagerDuty, and generic HTTP webhook delivery with retry.
+5. **Log export.** Scheduled export to S3/GCS as jsonl.gz.
+6. **Cross-node log queries via Raft.** Leader fan-out, merge-sort by timestamp, dedup.
+7. **Run all tests green.**
+
+Design docs: [metrics-mayo.md](design/metrics-mayo.md), [logs-ketchup.md](design/logs-ketchup.md), [ui-brioche.md](design/ui-brioche.md)
+
+**Milestone:** PromQL queries work against the cluster, Brioche dashboards show full detail views, alerts fire webhooks, and logs export to object storage. All Phase 11 tests pass.
+
+---
+
+## Phase 12: Optimisations, Performance Across Subsystems
+
+Performance improvements and storage enhancements that span multiple subsystems.
+
+Book: **Chapter 12, "Squeezing Every Drop"** (nftables maps, P2P distribution, compression, caching)
+
+### Tests (write first)
+
+Unit tests:
+
+- nftables map generation: correct syntax, incremental updates, rollback on failure
+- P2P chunk selection: rarest-first, parallel source balancing, dedup across sources
+- Pull-through cache: upstream manifest resolution, cache hit/miss/stale paths
+- Btrfs subvolume quota: creation, enforcement, resize
+- Parquet bloom filter: construction, lookup true/false positive rates
+- Zstd seekable frame: compression round-trip, random-access seek correctness
+
+Integration tests:
+
+- nftables maps: port mapping via maps matches iptables-rules behaviour, 1000-port stress test
+- P2P downloads: push multi-layer image, pull from different node via P2P (< 5s for 100MB)
+- P2P downloads: under-replicated image auto-heals when a new node joins
+- Pull-through cache: first pull from Docker Hub is cached, second pull served locally
+- Volume snapshots: create snapshot, corrupt data, restore from snapshot, verify data intact
+- Volume snapshots: scheduled snapshot job runs on cron, uploads to object store
+- Btrfs quotas: write beyond quota fails (where Btrfs is available)
+- Parquet bloom filters: log query with bloom filter skips irrelevant row groups (verified via metrics)
+- Zstd compression: archived logs readable after compression, space reduction > 5x
+
+Property-based tests:
+
+- P2P chunk selection: arbitrary topologies produce complete downloads
+- Bloom filter: false positive rate stays below 1% for expected cardinalities
+
+### Implementation
+
+1. **nftables maps.** Replace per-rule port mapping with nftables named maps for O(1) lookup.
+2. **P2P multi-source image downloads.** Parallel fan-out to peers, rarest-chunk-first selection, dedup.
+3. **Pull-through cache.** Transparent caching for Docker Hub, GHCR, ECR via Pickle.
+4. **Volume snapshots.** CoW snapshots, scheduled snapshot jobs, upload to S3/GCS.
+5. **Btrfs subvolume quotas.** Alternative to loop mount for volume size enforcement.
+6. **Parquet bloom filters.** Bloom filter on log `line` column to skip row groups in LIKE queries.
+7. **Zstd seekable frame compression.** Compress archived log files with random-access seek support.
+8. **Run all tests green.**
+
+Design docs: [discovery-onion.md](design/discovery-onion.md), [registry-pickle.md](design/registry-pickle.md), [logs-ketchup.md](design/logs-ketchup.md)
+
+**Milestone:** Port mapping uses O(1) nftables maps, images download from multiple peers in parallel, logs compress 5x with random-access reads. All Phase 12 tests pass.
+
+---
+
+## Phase 13: Relish TUI, Interactive Terminal Interface
+
+Build the full interactive terminal UI for cluster management.
+
+Book: **Chapter 13, "A Room with a View"** (TUI development with ratatui, event-driven rendering)
 
 ### Tests (write first)
 
@@ -432,38 +613,106 @@ Unit tests:
 
 - TUI snapshot tests: ratatui TestBackend + insta for all views (dashboard, apps, nodes, jobs, events, logs, routes, search, help)
 - TUI navigation tests: key sequences produce correct view stack transitions
-- UpgradeManager: signature verification, symlink management, version retention/GC
-- `wtf` correlation engine: known patterns produce correct diagnoses
+- TUI data fetching: mock API responses render correctly in each view
 
 Integration tests:
 
-- `relish test` runs all 39 integration tests and reports results
-- `relish test --chaos` runs chaos suite and reports results
-- `relish test --filter scheduling` runs only scheduling tests
-- `relish bench` produces valid benchmark report with all metrics
-- `relish bench --compare` detects regression (> 10% metric degradation)
+- TUI launches, renders dashboard, keyboard navigation works
+- TUI: app detail view shows correct instance count and health status
+- TUI: log view streams new lines in real time
+- TUI: search filters results across all views
+- TUI: help view lists all keybindings
+
+### Implementation
+
+1. **TUI framework.** ratatui + crossterm setup, event loop, view stack navigation.
+2. **Dashboard view.** Cluster overview: node count, app count, alerts, resource usage.
+3. **Apps view.** App list with health, replicas, version. Drill into app detail.
+4. **Nodes view.** Node list with capacity, load, state. Drill into node detail.
+5. **Jobs view.** Active and completed jobs, batch status.
+6. **Events and logs views.** Real-time event stream, log tailing with grep.
+7. **Routes and search views.** Ingress routing table, cross-view search.
+8. **Run all tests green.**
+
+Design docs: [cli-relish.md](design/cli-relish.md)
+
+**Milestone:** `relish tui` launches a full interactive terminal UI for managing the cluster. All Phase 13 tests pass.
+
+---
+
+## Phase 14: Self-Upgrade, Rolling Binary Replacement
+
+Enable zero-downtime binary upgrades across the cluster.
+
+Book: **Chapter 14, "Changing the Tyres at Full Speed"** (rolling upgrades, signature verification, rollback)
+
+### Tests (write first)
+
+Unit tests:
+
+- UpgradeManager: signature verification, symlink management, version retention/GC
+- Version comparison: semver ordering, pre-release handling
+- Rollback state machine: upgrade → verify → commit, upgrade → verify → rollback
+
+Integration tests:
+
 - Self-upgrade: upgrade a single node. Containers survive.
 - Self-upgrade: roll back a single node. Revert succeeds.
 - Self-upgrade: full rolling upgrade across the cluster (workers first, council, leader last).
 - Self-upgrade: upgrade failure triggers automatic rollback.
+- Self-upgrade: version retention GC keeps last 3 versions, deletes older.
+
+### Implementation
+
+1. **UpgradeManager.** Binary download, dual-signature verification (release key + build reproducibility), staging directory.
+2. **Symlink swap.** Atomic binary replacement via symlink, old version retained for rollback.
+3. **Rolling upgrade orchestration.** Workers first, then council members, leader last. Health check between each step.
+4. **Automatic rollback.** Health check failure after upgrade triggers revert to previous binary.
+5. **Version retention and GC.** Keep last N versions, garbage collect older binaries.
+6. **Run all tests green.**
+
+Design docs: [agent-bun.md](design/agent-bun.md)
+
+**Milestone:** `relish upgrade --version v0.2.0` performs a rolling binary upgrade across the cluster with automatic rollback on failure. All Phase 14 tests pass.
+
+---
+
+## Phase 15: Testing, Benchmarking & Diagnostics
+
+Build the self-validation tooling. By this phase, all subsystem tests already exist and pass. This phase wraps them into the built-in test runner, adds the benchmark harness, and builds the diagnostic tools.
+
+Book: **Chapter 15, "Ready for Production"** (built-in testing, performance measurement, cluster diagnosis)
+
+### Tests (write first)
+
+Unit tests:
+
+- `wtf` correlation engine: known patterns produce correct diagnoses
+- Benchmark result parsing, regression detection threshold logic
+- Test runner: filter matching, parallel execution coordination, JSON report schema
+
+Integration tests:
+
+- `relish test` runs all integration tests and reports results
+- `relish test --chaos` runs chaos suite and reports results
+- `relish test --filter scheduling` runs only scheduling tests
+- `relish bench` produces valid benchmark report with all metrics
+- `relish bench --compare` detects regression (> 10% metric degradation)
 - `relish wtf` detects and diagnoses known failure patterns
 - `relish trace <app> --to <app>` traces connectivity through eBPF, firewall, and network layers
-- TUI launches, renders dashboard, keyboard navigation works
 
 ### Implementation
 
 1. **`relish test` command.** Test runner that executes all subsystem integration tests (compiled into binary), parallel execution, filtering, JSON output for CI.
 2. **`relish test --chaos`.** Combines integration tests with Smoker fault injection, confirmation prompt, production safety check.
 3. **`relish bench`.** Benchmark harness (scheduler throughput, eBPF latency, network throughput, deploy speed, state reconstruction), regression detection via `--compare`.
-4. **Self-upgrade mechanism.** Rolling binary replacement, dual-signature verification, automatic rollback.
-5. **Relish TUI.** Full interactive terminal UI (ratatui + crossterm): apps, nodes, jobs, events, logs, routes, search views.
-6. **`relish wtf`.** Automated cluster health diagnosis with root cause correlation.
-7. **`relish trace`.** End-to-end connectivity debugging through eBPF, firewall, and network layers.
-8. **Run all tests green.**
+4. **`relish wtf`.** Automated cluster health diagnosis with root cause correlation.
+5. **`relish trace`.** End-to-end connectivity debugging through eBPF, firewall, and network layers.
+6. **Run all tests green.**
 
-Design docs: [cli-relish.md](design/cli-relish.md), [agent-bun.md](design/agent-bun.md)
+Design docs: [cli-relish.md](design/cli-relish.md), [agent-bun.md](design/agent-bun.md), [chaos-smoker.md](design/chaos-smoker.md)
 
-**Milestone:** All design goal targets met, full test suite passes, self-upgrade works end-to-end. `relish test` reports all green. All Phase 9 tests pass.
+**Milestone:** `relish test` runs the full suite and reports all green. `relish bench` measures performance across all subsystems. `relish wtf` diagnoses common failure patterns. All Phase 15 tests pass.
 
 ---
 
