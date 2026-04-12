@@ -7,6 +7,7 @@
 ///
 /// Both parse from TOML and validate in a separate pass.
 pub mod app;
+pub mod build;
 pub mod error;
 pub mod job;
 pub mod namespace;
@@ -48,6 +49,9 @@ pub struct Config {
     /// Permission definitions keyed by name.
     #[serde(default)]
     pub permission: BTreeMap<String, PermissionSpec>,
+    /// Build job definitions keyed by name.
+    #[serde(default)]
+    pub build: BTreeMap<String, build::BuildSpec>,
 }
 
 impl Config {

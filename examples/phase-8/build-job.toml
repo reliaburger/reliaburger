@@ -1,0 +1,16 @@
+# Example: in-cluster image build.
+#
+# Builds an OCI image from a Dockerfile and pushes it to the
+# local Pickle registry. Uses the pickle:// destination protocol.
+#
+# Build: relish build examples/phase-8/build-job.toml
+
+[build.my-api]
+context = "./src/api"
+dockerfile = "Dockerfile"
+destination = "pickle://my-api:v1.2.3"
+namespace = "production"
+
+[build.my-api.args]
+RUST_VERSION = "1.78"
+FEATURES = "default"
