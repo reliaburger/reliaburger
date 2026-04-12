@@ -360,17 +360,75 @@ The 100K-in-<1s benchmark runs as a unit test on every build. If someone introdu
 
 The final piece of the infrastructure puzzle: building images inside the cluster. No more pushing from your laptop to a remote registry, then pulling from the registry to the cluster. Build where the images will run.
 
-```toml
-[build.my-api]
-context = "./src/api"
-destination = "pickle://my-api:v1.2.3"
-namespace = "production"
+### A complete example
 
-[build.my-api.args]
-RUST_VERSION = "1.78"
+Say you have a Python API. The source tree looks like this:
+
+```
+my-api/
+  Dockerfile
+  requirements.txt
+  app.py
+  tests/
+    test_app.py
 ```
 
-The `pickle://` protocol means "push to the local Pickle registry". This is enforced at config validation time — you can't accidentally push to Docker Hub from a build job.
+The Dockerfile is standard:
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 8080
+CMD ["python", "app.py"]
+```
+
+To build this inside the cluster and push it to Pickle, you write a build config:
+
+```toml
+[build.my-api]
+context = "./my-api"
+dockerfile = "Dockerfile"
+destination = "pickle://my-api:v1.2.3"
+namespace = "production"
+platform = ["linux/amd64", "linux/arm64"]
+```
+
+That's it. `context` is the directory containing your source. Everything inside it gets sent to the builder. `dockerfile` defaults to `"Dockerfile"` if you leave it out. `destination` uses the `pickle://` protocol, which means "push to the local Pickle registry on this cluster". `platform` defaults to both amd64 and arm64, so the image works on mixed-architecture clusters.
+
+You can pass build arguments too:
+
+```toml
+[build.my-api.args]
+PIP_INDEX_URL = "https://internal-pypi.corp.example.com/simple"
+APP_VERSION = "1.2.3"
+```
+
+These become `--build-arg` flags, which your Dockerfile picks up with `ARG`:
+
+```dockerfile
+ARG PIP_INDEX_URL
+ARG APP_VERSION
+RUN pip install --index-url ${PIP_INDEX_URL} -r requirements.txt
+```
+
+Once the build completes, deploy the image like any other app:
+
+```toml
+[app.my-api]
+image = "my-api:v1.2.3"
+port = 8080
+replicas = 3
+
+[app.my-api.health]
+path = "/healthz"
+```
+
+Pickle resolves `my-api:v1.2.3` locally — no Docker Hub round-trip. The scheduler pulls the image from whichever Pickle node has it cached (or replicates it if needed).
+
+The `pickle://` protocol is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
 
 ### Choosing a builder
 
