@@ -600,4 +600,67 @@ impl BunClient {
             body: format!("failed to parse images response: {e}"),
         })
     }
+
+    /// Submit a build job to the agent.
+    pub async fn submit_build(
+        &self,
+        name: &str,
+        context_digest: &str,
+        destination: &str,
+    ) -> Result<String, RelishError> {
+        let url = format!("{}/v1/build", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "name": name,
+                "context_digest": context_digest,
+                "destination": destination,
+            }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(json["message"]
+            .as_str()
+            .unwrap_or("build submitted")
+            .to_string())
+    }
+
+    /// Submit a batch of jobs for high-throughput scheduling.
+    pub async fn submit_batch(&self, job_names: &[String]) -> Result<String, RelishError> {
+        let url = format!("{}/v1/batch", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "jobs": job_names }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        Ok(json["message"]
+            .as_str()
+            .unwrap_or("batch submitted")
+            .to_string())
+    }
 }

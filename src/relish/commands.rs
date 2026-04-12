@@ -607,6 +607,105 @@ pub async fn images() -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Build OCI images and push to Pickle.
+///
+/// Reads `[build.*]` sections from the config, tars each context,
+/// uploads it to Pickle, and submits a build job.
+pub async fn build(path: &std::path::Path) -> Result<(), RelishError> {
+    use crate::config::Config;
+    use crate::pickle::build::{digest_of, execute_build, tar_context};
+
+    let config = Config::from_file(path)?;
+    if config.build.is_empty() {
+        eprintln!("no [build.*] sections found in {}", path.display());
+        return Ok(());
+    }
+
+    let client = BunClient::default_local();
+
+    for (name, spec) in &config.build {
+        println!("Building {name}...");
+
+        // Tar the context
+        let context_path = if spec.context.is_relative() {
+            path.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(&spec.context)
+        } else {
+            spec.context.clone()
+        };
+        let tar_bytes = tar_context(&context_path).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to tar context: {e}"),
+        })?;
+        let digest = digest_of(&tar_bytes);
+        println!(
+            "  context: {} ({} bytes, {digest})",
+            context_path.display(),
+            tar_bytes.len()
+        );
+
+        // Upload context blob to Pickle
+        let upload_url = crate::pickle::build::context_upload_url(9117, &digest);
+        let resp = reqwest::Client::new()
+            .post(&upload_url)
+            .body(tar_bytes)
+            .send()
+            .await
+            .map_err(|e| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to upload context: {e}"),
+            })?;
+        let upload_status = resp.status();
+        if !upload_status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError {
+                status: upload_status.as_u16(),
+                body: format!("context upload failed: {body}"),
+            });
+        }
+        println!("  context uploaded to Pickle");
+
+        // Prepare the build job
+        let job = execute_build(spec, &digest, None).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("build preparation failed: {e}"),
+        })?;
+
+        println!(
+            "  destination: pickle://{}:{}",
+            job.destination.name, job.destination.tag
+        );
+        println!("  build:  {}", job.build_cmd.join(" "));
+        println!("  push:   {}", job.push_cmd.join(" "));
+
+        // Submit build job to agent
+        let result = client
+            .submit_build(name, &digest, &spec.destination)
+            .await?;
+        println!("  {result}");
+    }
+
+    Ok(())
+}
+
+/// Submit a batch of jobs for high-throughput scheduling.
+pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
+    use crate::config::Config;
+
+    let config = Config::from_file(path)?;
+    if config.job.is_empty() {
+        eprintln!("no [job.*] sections found in {}", path.display());
+        return Ok(());
+    }
+
+    let client = BunClient::default_local();
+    let job_names: Vec<String> = config.job.keys().cloned().collect();
+    let result = client.submit_batch(&job_names).await?;
+    println!("{result}");
+    Ok(())
+}
+
 /// Create a new API token (local operation — no agent needed).
 ///
 /// Generates a token, hashes it with Argon2id, and prints the plaintext

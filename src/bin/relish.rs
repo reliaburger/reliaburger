@@ -133,6 +133,16 @@ enum Command {
     },
     /// List images in the local Pickle registry.
     Images,
+    /// Build an OCI image and push to Pickle.
+    Build {
+        /// Path to a TOML config file with [build.*] sections.
+        path: PathBuf,
+    },
+    /// Submit a batch of jobs for high-throughput scheduling.
+    Batch {
+        /// Path to a TOML config file with [job.*] sections.
+        path: PathBuf,
+    },
     /// Manage secrets (encrypt values for use in app configs).
     Secret {
         #[command(subcommand)]
@@ -530,6 +540,8 @@ async fn main() -> ExitCode {
         Command::Rollback { ref app } => commands::rollback(app).await,
         Command::Lint { ref path } => commands::lint(path),
         Command::Images => commands::images().await,
+        Command::Build { ref path } => commands::build(path).await,
+        Command::Batch { ref path } => commands::batch(path).await,
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
@@ -1090,5 +1102,17 @@ mod tests {
             } => assert_eq!(id, Some(42)),
             _ => panic!("expected Fault Clear"),
         }
+    }
+
+    #[test]
+    fn parse_build_command() {
+        let cli = parse(&["relish", "build", "build.toml"]).unwrap();
+        assert!(matches!(cli.command, Command::Build { .. }));
+    }
+
+    #[test]
+    fn parse_batch_command() {
+        let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
+        assert!(matches!(cli.command, Command::Batch { .. }));
     }
 }
