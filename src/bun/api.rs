@@ -99,6 +99,8 @@ pub fn router(
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/images", get(images_handler))
+        .route("/v1/batch", post(batch_submit_handler))
+        .route("/v1/build", post(build_submit_handler))
         .with_state(state)
 }
 
@@ -1032,6 +1034,95 @@ async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
         })
         .collect();
     Json(serde_json::json!({"images": images}))
+}
+
+/// Submit a batch of jobs.
+async fn batch_submit_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let job_names: Vec<String> = body["jobs"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SubmitBatch {
+            job_names,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Submit a build job.
+async fn build_submit_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let name = body["name"].as_str().unwrap_or("").to_string();
+    let context_digest = body["context_digest"].as_str().unwrap_or("").to_string();
+    let destination = body["destination"].as_str().unwrap_or("").to_string();
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SubmitBuild {
+            name,
+            context_digest,
+            destination,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+
+    match resp_rx.await {
+        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

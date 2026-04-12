@@ -72,6 +72,9 @@ pub struct WorkloadSupervisor<G: Grill> {
     /// Secondary index: (app_name, namespace) → instance IDs.
     /// Enables O(1) lookup by app without scanning all instances.
     pub(crate) app_instances: HashMap<(String, String), Vec<InstanceId>>,
+    /// Process workload manager — validates exec binaries against the
+    /// allowlist and manages script temp file lifecycle.
+    process_manager: crate::grill::process_workload::ProcessManager,
 }
 
 impl<G: Grill> WorkloadSupervisor<G> {
@@ -83,6 +86,25 @@ impl<G: Grill> WorkloadSupervisor<G> {
             instances: HashMap::new(),
             health_checker: HealthChecker::new(),
             app_instances: HashMap::new(),
+            process_manager: crate::grill::process_workload::ProcessManager::new(
+                crate::config::process_workloads::ProcessWorkloadsConfig::default(),
+            ),
+        }
+    }
+
+    /// Create a supervisor with a custom process workloads config.
+    pub fn with_process_config(
+        grill: G,
+        port_allocator: PortAllocator,
+        process_config: crate::config::process_workloads::ProcessWorkloadsConfig,
+    ) -> Self {
+        Self {
+            grill,
+            port_allocator,
+            instances: HashMap::new(),
+            health_checker: HealthChecker::new(),
+            app_instances: HashMap::new(),
+            process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
         }
     }
 
@@ -97,6 +119,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &AppSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
+        // Validate process workloads against the binary allowlist
+        if let Some(ref exec_path) = spec.exec {
+            self.process_manager
+                .prepare_exec(exec_path)
+                .map_err(|e| BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!("process workload rejected: {e}"),
+                })?;
+        }
+
         let replica_count = match spec.replicas {
             Replicas::Fixed(n) => n,
             Replicas::DaemonSet => 1,
@@ -169,6 +201,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &JobSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
+        // Validate process workloads against the binary allowlist
+        if let Some(ref exec_path) = spec.exec {
+            self.process_manager
+                .prepare_exec(exec_path)
+                .map_err(|e| BunError::DeployFailed {
+                    app_name: job_name.to_string(),
+                    reason: format!("process workload rejected: {e}"),
+                })?;
+        }
+
         let instance_id = InstanceId(format!("{job_name}-0"));
 
         let instance = WorkloadInstance {
