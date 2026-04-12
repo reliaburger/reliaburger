@@ -1,13 +1,16 @@
 //! Build job execution — in-cluster image building via buildah.
 //!
-//! Builds OCI images from Dockerfiles using buildah, then pushes them
-//! to the local Pickle registry. Buildah runs daemonless with
-//! `--storage-driver vfs` for fully unprivileged, rootless builds.
+//! The build flow:
+//! 1. CLI tars the build context and uploads it to Pickle as a blob
+//! 2. Build job is scheduled to a node (like any other job)
+//! 3. Target node downloads the context blob from Pickle, extracts it
+//! 4. Buildah builds the image and pushes it back to Pickle
 //!
-//! The build runs as a process job: two subprocess calls (`buildah bud`
-//! to build, `buildah push` to push). No client libraries, no daemons.
+//! This design means the build context doesn't need to be on a shared
+//! filesystem — Pickle (which every node already talks to) handles
+//! the transfer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::build::{BuildSpec, PickleDestination, parse_pickle_destination};
 use crate::config::error::ConfigError;
@@ -29,6 +32,8 @@ pub struct BuildahJob {
     pub destination: PickleDestination,
     /// Local image tag (used between build and push).
     pub local_tag: String,
+    /// Digest of the context blob in Pickle (for the build node to download).
+    pub context_blob_digest: String,
 }
 
 /// Result of a build job.
@@ -59,11 +64,17 @@ pub enum BuildError {
     )]
     NamespaceMismatch { build_ns: String, dest_ns: String },
 
+    #[error("failed to tar build context: {reason}")]
+    TarFailed { reason: String },
+
     #[error("builder failed: {reason}")]
     BuilderFailed { reason: String },
 
     #[error("push to pickle failed: {reason}")]
     PushFailed { reason: String },
+
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Validate a build spec before execution.
@@ -88,15 +99,49 @@ pub fn validate_build(spec: &BuildSpec) -> Result<PickleDestination, BuildError>
     Ok(dest)
 }
 
+/// Tar a build context directory into bytes.
+///
+/// Creates a tar archive of the context directory. The Dockerfile and
+/// all source files are included. The archive is what gets uploaded
+/// to Pickle as a blob and downloaded by the build node.
+pub fn tar_context(context_dir: &Path) -> Result<Vec<u8>, BuildError> {
+    if !context_dir.exists() {
+        return Err(BuildError::ContextNotFound {
+            path: context_dir.to_path_buf(),
+        });
+    }
+
+    let mut archive = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut archive);
+        tar.append_dir_all(".", context_dir)
+            .map_err(|e| BuildError::TarFailed {
+                reason: format!("failed to add {}: {e}", context_dir.display()),
+            })?;
+        tar.finish().map_err(|e| BuildError::TarFailed {
+            reason: format!("failed to finalise tar: {e}"),
+        })?;
+    }
+    Ok(archive)
+}
+
+/// Compute the SHA-256 digest of data, in the format Pickle expects.
+pub fn digest_of(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(data);
+    format!("sha256:{hash:x}")
+}
+
 /// Prepare a buildah build job from a BuildSpec.
 ///
-/// Returns a `BuildahJob` containing the CLI commands for both the
-/// build (`buildah bud`) and push (`buildah push`) steps. The caller
-/// runs these as subprocesses via ProcessGrill or `tokio::process::Command`.
-///
-/// The `pickle_port` argument specifies the Pickle registry port
-/// (default 9117). Buildah pushes to `localhost:{port}/{name}:{tag}`.
-pub fn execute_build(spec: &BuildSpec, pickle_port: Option<u16>) -> Result<BuildahJob, BuildError> {
+/// The `context_digest` is the Pickle blob digest of the tarred build
+/// context (uploaded by the CLI before scheduling the job). The build
+/// node downloads this blob, extracts it, and runs buildah.
+pub fn execute_build(
+    spec: &BuildSpec,
+    context_digest: &str,
+    pickle_port: Option<u16>,
+) -> Result<BuildahJob, BuildError> {
     let dest = validate_build(spec)?;
     let port = pickle_port.unwrap_or(DEFAULT_PICKLE_PORT);
 
@@ -109,19 +154,14 @@ pub fn execute_build(spec: &BuildSpec, pickle_port: Option<u16>) -> Result<Build
         push_cmd,
         destination: dest,
         local_tag,
+        context_blob_digest: context_digest.to_string(),
     })
 }
 
 /// Generate the `buildah bud` command arguments.
 ///
-/// Produces a command like:
-/// ```text
-/// buildah bud --storage-driver vfs -f Dockerfile \
-///   --platform linux/amd64,linux/arm64 --manifest localhost:9117/myapp:v1 .
-/// ```
-///
-/// When multiple platforms are specified, buildah produces a manifest
-/// list (OCI index) so the image works on mixed-architecture clusters.
+/// The context path is `/tmp/reliaburger-build/{digest}/` — the build
+/// node extracts the context blob there before running buildah.
 fn buildah_build_args(spec: &BuildSpec, local_tag: &str) -> Vec<String> {
     let mut args = vec![
         "buildah".to_string(),
@@ -152,18 +192,13 @@ fn buildah_build_args(spec: &BuildSpec, local_tag: &str) -> Vec<String> {
         args.push(format!("{key}={value}"));
     }
 
-    args.push(spec.context.to_string_lossy().to_string());
+    // Context directory — the extracted blob on the build node
+    args.push(".".to_string());
 
     args
 }
 
 /// Generate the `buildah push` command arguments.
-///
-/// Produces a command like:
-/// ```text
-/// buildah push --storage-driver vfs --tls-verify=false \
-///   localhost:9117/myapp:v1 docker://localhost:9117/myapp:v1
-/// ```
 fn buildah_push_args(local_tag: &str) -> Vec<String> {
     vec![
         "buildah".to_string(),
@@ -174,6 +209,22 @@ fn buildah_push_args(local_tag: &str) -> Vec<String> {
         local_tag.to_string(),
         format!("docker://{local_tag}"),
     ]
+}
+
+/// Build the URL to download a context blob from Pickle.
+///
+/// The build node fetches this before running buildah.
+pub fn context_download_url(pickle_port: u16, digest: &str) -> String {
+    // Uses the OCI blob GET endpoint. The "name" is _buildcontext
+    // (a reserved namespace that doesn't clash with real images).
+    format!("http://localhost:{pickle_port}/v2/_buildcontext/blobs/{digest}")
+}
+
+/// Build the URL to upload a context blob to Pickle.
+///
+/// The CLI uploads the tarred context here before scheduling the build.
+pub fn context_upload_url(pickle_port: u16, digest: &str) -> String {
+    format!("http://localhost:{pickle_port}/v2/_buildcontext/blobs/uploads/?digest={digest}")
 }
 
 /// Check that a build's namespace is allowed to push to the destination.
@@ -261,21 +312,66 @@ mod tests {
         assert!(validate_build(&spec).is_err());
     }
 
+    // --- tar_context ---
+
+    #[test]
+    fn tar_context_creates_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        std::fs::write(dir.path().join("app.py"), "print('hello')\n").unwrap();
+
+        let archive = tar_context(dir.path()).unwrap();
+        assert!(!archive.is_empty());
+
+        // Verify we can list entries
+        let mut tar = tar::Archive::new(archive.as_slice());
+        let names: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.path().ok().map(|p| p.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.iter().any(|n| n.contains("Dockerfile")));
+        assert!(names.iter().any(|n| n.contains("app.py")));
+    }
+
+    #[test]
+    fn tar_context_rejects_missing_dir() {
+        let result = tar_context(Path::new("/nonexistent/build/context"));
+        assert!(matches!(result, Err(BuildError::ContextNotFound { .. })));
+    }
+
+    // --- digest_of ---
+
+    #[test]
+    fn digest_of_is_deterministic() {
+        let d1 = digest_of(b"hello world");
+        let d2 = digest_of(b"hello world");
+        assert_eq!(d1, d2);
+        assert!(d1.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn digest_of_different_data_differs() {
+        assert_ne!(digest_of(b"hello"), digest_of(b"world"));
+    }
+
     // --- execute_build ---
 
     #[test]
     fn execute_build_produces_valid_job() {
         let spec = spec_with_destination("pickle://myapp:v2");
-        let job = execute_build(&spec, Some(9117)).unwrap();
+        let job = execute_build(&spec, "sha256:abc123", Some(9117)).unwrap();
         assert_eq!(job.destination.name, "myapp");
         assert_eq!(job.destination.tag, "v2");
         assert_eq!(job.local_tag, "localhost:9117/myapp:v2");
+        assert_eq!(job.context_blob_digest, "sha256:abc123");
     }
 
     #[test]
     fn execute_build_uses_default_port() {
         let spec = spec_with_destination("pickle://app:latest");
-        let job = execute_build(&spec, None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.local_tag.contains("9117"));
     }
 
@@ -289,7 +385,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let err = execute_build(&spec, None).unwrap_err();
+        let err = execute_build(&spec, "sha256:abc", None).unwrap_err();
         assert!(matches!(err, BuildError::ContextNotFound { .. }));
     }
 
@@ -298,7 +394,7 @@ mod tests {
     #[test]
     fn buildah_build_cmd_uses_vfs_storage() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.build_cmd.contains(&"--storage-driver".to_string()));
         assert!(job.build_cmd.contains(&"vfs".to_string()));
     }
@@ -313,7 +409,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let job = execute_build(&spec, None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         let f_idx = job.build_cmd.iter().position(|a| a == "-f").unwrap();
         assert_eq!(job.build_cmd[f_idx + 1], "Dockerfile.prod");
     }
@@ -324,7 +420,7 @@ mod tests {
         args.insert("VERSION".to_string(), "1.78".to_string());
         args.insert("FEATURES".to_string(), "ebpf".to_string());
         let spec = spec_with_args(args);
-        let job = execute_build(&spec, None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
 
         let build_arg_count = job
             .build_cmd
@@ -337,17 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn buildah_build_cmd_ends_with_context() {
-        let spec = BuildSpec {
-            context: PathBuf::from("./myproject"),
-            dockerfile: "Dockerfile".into(),
-            destination: "pickle://app:v1".into(),
-            args: BTreeMap::new(),
-            namespace: None,
-            platform: vec!["linux/amd64".into()],
-        };
-        let job = execute_build(&spec, None).unwrap();
-        assert_eq!(job.build_cmd.last().unwrap(), "./myproject");
+    fn buildah_build_cmd_ends_with_context_dot() {
+        let spec = spec_with_destination("pickle://app:v1");
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        assert_eq!(job.build_cmd.last().unwrap(), ".");
     }
 
     // --- buildah_push_args ---
@@ -355,7 +444,7 @@ mod tests {
     #[test]
     fn buildah_push_cmd_targets_pickle() {
         let spec = spec_with_destination("pickle://myapp:v3");
-        let job = execute_build(&spec, Some(5000)).unwrap();
+        let job = execute_build(&spec, "sha256:abc", Some(5000)).unwrap();
         assert!(
             job.push_cmd
                 .contains(&"localhost:5000/myapp:v3".to_string())
@@ -369,7 +458,7 @@ mod tests {
     #[test]
     fn buildah_push_cmd_uses_vfs_storage() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.push_cmd.contains(&"--storage-driver".to_string()));
         assert!(job.push_cmd.contains(&"vfs".to_string()));
     }
@@ -377,8 +466,28 @@ mod tests {
     #[test]
     fn buildah_push_cmd_disables_tls() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
         assert!(job.push_cmd.contains(&"--tls-verify=false".to_string()));
+    }
+
+    // --- context URLs ---
+
+    #[test]
+    fn context_download_url_format() {
+        let url = context_download_url(9117, "sha256:abc123");
+        assert_eq!(
+            url,
+            "http://localhost:9117/v2/_buildcontext/blobs/sha256:abc123"
+        );
+    }
+
+    #[test]
+    fn context_upload_url_format() {
+        let url = context_upload_url(9117, "sha256:abc123");
+        assert_eq!(
+            url,
+            "http://localhost:9117/v2/_buildcontext/blobs/uploads/?digest=sha256:abc123"
+        );
     }
 
     // --- namespace scoping ---
@@ -414,6 +523,35 @@ mod tests {
         ));
     }
 
+    // --- multi-platform ---
+
+    #[test]
+    fn buildah_multi_platform_uses_manifest_flag() {
+        let spec = spec_with_destination("pickle://app:v1");
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        assert!(job.build_cmd.contains(&"--manifest".to_string()));
+        assert!(job.build_cmd.contains(&"--platform".to_string()));
+        assert!(job.build_cmd.iter().any(|a| a == "linux/amd64,linux/arm64"));
+        assert!(!job.build_cmd.contains(&"-t".to_string()));
+    }
+
+    #[test]
+    fn buildah_single_platform_uses_tag_flag() {
+        let spec = BuildSpec {
+            context: PathBuf::from("."),
+            dockerfile: "Dockerfile".into(),
+            destination: "pickle://app:v1".into(),
+            args: BTreeMap::new(),
+            namespace: None,
+            platform: vec!["linux/amd64".into()],
+        };
+        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        assert!(job.build_cmd.contains(&"-t".to_string()));
+        assert!(job.build_cmd.contains(&"--platform".to_string()));
+        assert!(job.build_cmd.iter().any(|a| a == "linux/amd64"));
+        assert!(!job.build_cmd.contains(&"--manifest".to_string()));
+    }
+
     // --- helpers ---
 
     #[test]
@@ -442,37 +580,5 @@ mod tests {
             resolve_dockerfile(&spec),
             Path::new("/src/myapp/Dockerfile.prod")
         );
-    }
-
-    // --- multi-platform ---
-
-    #[test]
-    fn buildah_multi_platform_uses_manifest_flag() {
-        let spec = spec_with_destination("pickle://app:v1");
-        // Default spec_with_destination uses both amd64 + arm64
-        let job = execute_build(&spec, None).unwrap();
-        assert!(job.build_cmd.contains(&"--manifest".to_string()));
-        assert!(job.build_cmd.contains(&"--platform".to_string()));
-        assert!(job.build_cmd.iter().any(|a| a == "linux/amd64,linux/arm64"));
-        // Multi-platform should NOT use -t
-        assert!(!job.build_cmd.contains(&"-t".to_string()));
-    }
-
-    #[test]
-    fn buildah_single_platform_uses_tag_flag() {
-        let spec = BuildSpec {
-            context: PathBuf::from("."),
-            dockerfile: "Dockerfile".into(),
-            destination: "pickle://app:v1".into(),
-            args: BTreeMap::new(),
-            namespace: None,
-            platform: vec!["linux/amd64".into()],
-        };
-        let job = execute_build(&spec, None).unwrap();
-        assert!(job.build_cmd.contains(&"-t".to_string()));
-        assert!(job.build_cmd.contains(&"--platform".to_string()));
-        assert!(job.build_cmd.iter().any(|a| a == "linux/amd64"));
-        // Single platform should NOT use --manifest
-        assert!(!job.build_cmd.contains(&"--manifest".to_string()));
     }
 }

@@ -452,34 +452,48 @@ Can you see where this is going? We went with buildah.
 
 Here's what happens, step by step, when you submit a build job.
 
-**1. The CLI reads your build config** and validates it. The `pickle://` destination is parsed, the context directory is checked, and mutual exclusivity rules are enforced (you can't have both `image` and `context` on the same app). If anything is wrong, you get an error before any work happens.
+**1. The CLI tars the build context and uploads it to Pickle.** The context directory (containing your Dockerfile, source, requirements.txt, etc.) is packed into a tar archive, hashed, and uploaded to Pickle's blob store as a regular blob. This is the key insight: Pickle is already a content-addressed blob store that every node in the cluster can talk to. We don't need a shared filesystem or a separate file transfer mechanism.
 
-**2. The leader picks a node to run the build.** Build jobs are scheduled like any other job — the Meat scheduler picks a node with enough CPU and memory. The build context directory must be accessible on that node (via the shared mount or a volume). In a dev cluster, Lima's `virtiofs` mount handles this. In production, you'd use a shared filesystem or sync the context to the node first.
+```rust
+pub fn tar_context(context_dir: &Path) -> Result<Vec<u8>, BuildError> {
+    let mut archive = Vec::new();
+    let mut tar = tar::Builder::new(&mut archive);
+    tar.append_dir_all(".", context_dir)?;
+    tar.finish()?;
+    Ok(archive)
+}
+```
 
-**3. Bun on the target node runs buildah as a subprocess.** This is where the actual Dockerfile execution happens. Buildah needs to be installed on every node that might run builds — it's a single binary, installed via `apt-get install buildah` (Ubuntu/Debian) or `dnf install buildah` (Fedora/RHEL). The dev cluster provisioning installs it automatically.
+The digest of the tar becomes the context's identity. If two builds use the same context, the blob is already there — no re-upload needed.
 
-The build command:
+**2. The CLI submits a build job with the context digest.** The leader schedules it to a node like any other job. The build node doesn't need access to your local filesystem. It just needs to reach Pickle, which it already does.
+
+**3. The build node downloads the context blob from Pickle.** It fetches the tar from Pickle's OCI blob endpoint (`GET /v2/_buildcontext/blobs/sha256:...`), extracts it to a temp directory, and now has everything buildah needs.
+
+**4. Buildah builds the image.** The build node runs buildah as a subprocess:
 
 ```
 buildah bud --storage-driver vfs -f Dockerfile \
   --platform linux/amd64,linux/arm64 \
-  --manifest localhost:9117/my-api:v1.2.3 ./my-api
+  --manifest localhost:9117/my-api:v1.2.3 .
 ```
 
-`--storage-driver vfs` is the key flag. It tells buildah to use plain file copies instead of overlayfs. This means no kernel modules, no FUSE, no privileged access. Slower than overlay, but works anywhere. Buildah reads the Dockerfile, pulls base images (e.g. `python:3.12-slim` from Docker Hub), runs each instruction, and produces an OCI image. With `--platform linux/amd64,linux/arm64`, it builds for both architectures and creates a manifest list (OCI index) so the image works on mixed clusters.
+`--storage-driver vfs` tells buildah to use plain file copies instead of overlayfs. No kernel modules, no FUSE, no privileged access. Slower than overlay, but works anywhere without special permissions. Buildah reads the Dockerfile, pulls base images (e.g. `python:3.12-slim` from Docker Hub), runs each instruction, and produces an OCI image. With `--platform linux/amd64,linux/arm64`, it builds for both architectures and creates a manifest list (OCI index) so the image works on mixed clusters.
 
-**4. Buildah pushes to Pickle.** The second subprocess call:
+**5. Buildah pushes the image back to Pickle.**
 
 ```
 buildah push --storage-driver vfs --tls-verify=false \
   localhost:9117/my-api:v1.2.3 docker://localhost:9117/my-api:v1.2.3
 ```
 
-Pickle's OCI Distribution API lives on the same port as the Bun agent (9117). Buildah speaks the standard Docker registry protocol: it uploads layer blobs via `POST /v2/{name}/blobs/uploads/`, then pushes the manifest via `PUT /v2/{name}/manifests/{tag}`. For multi-platform builds, it pushes each per-architecture manifest first, then the manifest list. Pickle handles all of this — we verified it supports both single-platform manifests and manifest lists.
+Pickle's OCI Distribution API lives on the same port as the Bun agent (9117). Buildah speaks the standard Docker registry protocol: it uploads layer blobs via `POST /v2/{name}/blobs/uploads/`, then pushes the manifest via `PUT /v2/{name}/manifests/{tag}`. For multi-platform builds, it pushes each per-architecture manifest first, then the manifest list. Pickle already handles both.
 
 `--tls-verify=false` because Pickle runs on localhost. No point doing TLS to yourself.
 
-**5. The image is now in Pickle.** `relish images` shows it. Other nodes can pull it via Pickle's replication protocol. When you deploy an app with `image = "my-api:v1.2.3"`, the scheduler sees which nodes already have the layers cached (image locality scoring from Phase 2) and prefers them.
+**6. The image is ready.** `relish images` shows it. Other nodes pull it via Pickle's replication protocol. When you deploy with `image = "my-api:v1.2.3"`, the scheduler sees which nodes already have the layers cached (image locality scoring from Phase 2) and prefers them.
+
+The entire flow uses two existing pieces of infrastructure: Pickle for blob storage and transfer, buildah for Dockerfile execution. No new daemons, no shared filesystems, no scp.
 
 ### Dependencies
 

@@ -107,7 +107,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,257 tests across 8 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
+**1,263 tests across 8 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -118,7 +118,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 5. Storage & Registry | Done | 867 |
 | 6. Observability | Done | 991 |
 | 7. Deployments | Done | 1,050 |
-| 8. Advanced | Done | 1,257 |
+| 8. Advanced | Done | 1,263 |
 
 ## The book
 
