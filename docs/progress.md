@@ -160,7 +160,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite)
 - [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation)
 - [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation)
-- [ ] High-throughput batch scheduling (100M jobs/day target)
+- [x] High-throughput batch scheduling (BatchScheduler greedy bin-packing, BatchTracker, 100K jobs in <1s)
 - [ ] Build jobs (in-cluster image building, `pickle://`, scoped registry access)
 - [ ] All Phase 8 tests green
 

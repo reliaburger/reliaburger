@@ -1,0 +1,28 @@
+# Example: batch job submission.
+#
+# Batch jobs are short-lived tasks submitted in bulk. The batch
+# scheduler uses greedy bin-packing for high throughput rather than
+# the per-job Filter→Score→Select→Commit pipeline.
+#
+# Submit: relish batch examples/phase-8/batch-jobs.toml
+
+[job.etl-chunk-0]
+image = "etl-worker:v3"
+command = ["process", "--chunk", "0", "--total", "100"]
+cpu = "100m-200m"
+memory = "128Mi-256Mi"
+namespace = "batch"
+
+[job.etl-chunk-1]
+image = "etl-worker:v3"
+command = ["process", "--chunk", "1", "--total", "100"]
+cpu = "100m-200m"
+memory = "128Mi-256Mi"
+namespace = "batch"
+
+[job.etl-chunk-2]
+image = "etl-worker:v3"
+command = ["process", "--chunk", "2", "--total", "100"]
+cpu = "100m-200m"
+memory = "128Mi-256Mi"
+namespace = "batch"
