@@ -161,7 +161,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation)
 - [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation)
 - [x] High-throughput batch scheduling (BatchScheduler greedy bin-packing, BatchTracker, 100K jobs in <1s)
-- [ ] Build jobs (in-cluster image building, `pickle://`, scoped registry access)
+- [x] Build jobs (BuildSpec config, pickle:// destination parsing, namespace-scoped push, builder validation)
 - [ ] All Phase 8 tests green
 
 ## Phase 9: Production Hardening

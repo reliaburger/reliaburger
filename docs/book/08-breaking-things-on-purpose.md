@@ -355,3 +355,46 @@ pub struct BatchSummary {
 ```
 
 The 100K-in-<1s benchmark runs as a unit test on every build. If someone introduces a regression that makes scheduling slower, the test fails immediately.
+
+## Build jobs
+
+The final piece of the infrastructure puzzle: building images inside the cluster. No more pushing from your laptop to a remote registry, then pulling from the registry to the cluster. Build where the images will run.
+
+A build job takes a Dockerfile and a context, produces an OCI image, and pushes it to the local Pickle registry:
+
+```toml
+[build.my-api]
+context = "./src/api"
+destination = "pickle://my-api:v1.2.3"
+namespace = "production"
+
+[build.my-api.args]
+RUST_VERSION = "1.78"
+```
+
+The `pickle://` protocol means "push to the local registry". This is enforced at config validation time — you can't accidentally push to Docker Hub or a remote registry from a build job.
+
+### Namespace-scoped pushes
+
+If the image name contains a slash (`pickle://production/myapp:v1`), the prefix is treated as a namespace scope. A build in namespace "staging" can't push to `production/myapp`. This prevents one team from overwriting another team's images.
+
+The validation logic checks two things: that the destination uses `pickle://`, and that the namespace prefix (if present) matches the build's declared namespace. No prefix means the build can push anywhere — fine for shared infrastructure images.
+
+```rust
+pub fn check_namespace_scope(
+    spec: &BuildSpec,
+    existing_namespaces: &[String],
+) -> Result<(), BuildError> {
+    let dest = parse_pickle_destination(&spec.destination)?;
+    if let Some((ns_prefix, _)) = dest.name.split_once('/') {
+        if let Some(build_ns) = &spec.namespace {
+            if ns_prefix != build_ns {
+                return Err(BuildError::NamespaceMismatch { ... });
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+Phase 8 implements the config parsing, destination validation, and namespace scoping. The actual builder container integration (running kaniko or a custom builder inside the cluster) is wired when the `relish build` command triggers a deploy. Layer caching is deferred to Phase 9.
