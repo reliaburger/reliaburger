@@ -524,3 +524,17 @@ if let Some(build_ns) = &spec.namespace
 ```
 
 No prefix means the build can push anywhere — fine for shared infrastructure images. Layer caching is deferred to Phase 9.
+
+## Lessons learned
+
+Every chapter is supposed to end with what was tricky, what clicked, and what we'd do differently. This chapter had more of those moments than most.
+
+**Safety rails must be non-overridable.** We initially considered making all four rails overridable with `--force`. Then we thought about what happens when someone runs `relish fault kill web --count 0 --force` at 3am and takes down every replica of the payments service. Quorum protection and replica minimum are now hard limits. No flag, no escape hatch, no "but I really need to". If you want to test total failure, use the in-memory test harness where there's nothing real to break.
+
+**`#[repr(C)]` alignment is invisible until it isn't.** We wrote the BPF map structs, ran the size assertions, and three of them failed. The issue: a `u8` field followed by a `u64` field gets 7 bytes of implicit padding that the C compiler inserts for alignment. The Rust compiler does the same thing with `#[repr(C)]`, but if you don't add explicit `_pad` fields, the size assertion catches the mismatch. We reorganised the structs to pack small fields together (action + probability as two adjacent `u8`s, followed by `_pad: [u8; 6]`, then the `u64`s). The size assertion pattern — test it on every platform, catch it before any BPF code runs — saved us from a class of bugs that would have been hellish to debug at runtime.
+
+**`BPF_MAP_TYPE_PERCPU_ARRAY` isn't universal.** Our first attempt used a per-CPU array for the PRNG state. It failed to create on the Lima test VM's kernel. We replaced it with `bpf_get_prandom_u32()`, a BPF helper available since Linux 4.1. Simpler, more portable, and equally suitable for probabilistic fault injection. The lesson: don't reach for the fancier BPF map type when a helper function does the same job.
+
+**kaniko died while we were designing.** We spent time evaluating kaniko as the build backend. Then Google archived it. The software industry doesn't owe you backward compatibility. We switched to buildah — daemonless, rootless, actively maintained, and it speaks the same OCI registry protocol. The transition was painless because we'd already designed the build system around a clean subprocess interface: prepare args, spawn, done. If buildah dies too, we swap the binary. The lesson: minimise your coupling surface to external tools. Two subprocess calls and a standard protocol are better than a deep SDK integration.
+
+**Pickle is a better transport than you'd think.** The build context upload problem seemed like it needed a file transfer mechanism — scp, NFS, a custom sync protocol. Then we realised we already had a content-addressed blob store that every node in the cluster can talk to. Tar the context, upload it as a blob, let the build node download it. No shared filesystems, no new infrastructure. Sometimes the best solution is the one you've already built for a different purpose.
