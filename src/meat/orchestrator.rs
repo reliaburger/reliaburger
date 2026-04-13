@@ -62,8 +62,16 @@ impl<D: DeployDriver> DeployOrchestrator<D> {
     }
 
     /// Execute the full deploy sequence.
+    ///
+    /// Dispatches to the blue-green orchestrator if the strategy is
+    /// `BlueGreen`, otherwise runs the rolling deploy path.
     pub fn execute(&mut self) -> Result<DeployResult, DeployError> {
-        // Start
+        // Blue-green: delegate to the parallel-start orchestrator
+        if self.state.request.config.strategy == DeployStrategy::BlueGreen {
+            return super::blue_green::execute_blue_green(&mut self.state, &self.driver);
+        }
+
+        // Rolling: start
         self.state.transition(DeployEvent::Start)?;
 
         // Run pre-deploy dependencies

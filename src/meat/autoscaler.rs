@@ -196,6 +196,60 @@ impl AutoscaleTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async task runner
+// ---------------------------------------------------------------------------
+
+/// Run the autoscaler evaluation loop.
+///
+/// Spawned as a tokio task on the Raft leader. Evaluates all apps
+/// with `AutoscaleSpec` at the configured interval, queries Mayo for
+/// metrics, and produces `AutoscaleDecision`s that the caller can
+/// write to Raft.
+///
+/// The `app_provider` closure is called each tick to get the current
+/// set of apps with autoscaling. The `metric_provider` closure queries
+/// Mayo for the average metric value.
+pub async fn run_autoscale_loop<F, M>(
+    mut tracker: AutoscaleTracker,
+    app_provider: F,
+    metric_provider: M,
+    decision_tx: tokio::sync::mpsc::Sender<AutoscaleDecision>,
+    cancel: tokio_util::sync::CancellationToken,
+) where
+    F: Fn() -> Vec<(AppId, AutoscaleConfig, u32)> + Send + 'static,
+    M: Fn(&str, &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<f64>> + Send>>
+        + Send
+        + 'static,
+{
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = cancel.cancelled() => break,
+        }
+
+        let now = Instant::now();
+        let apps = app_provider();
+
+        for (app_id, config, baseline) in &apps {
+            let state = tracker.get_or_insert(app_id, *baseline);
+
+            // Query the metric
+            let metric_value = metric_provider(&config.metric, &app_id.name).await;
+            let Some(current_metric) = metric_value else {
+                continue; // no data yet
+            };
+
+            if let Some(decision) = evaluate(app_id, config, state, current_metric, now) {
+                tracker.apply_decision(&decision, now);
+                let _ = decision_tx.send(decision).await;
+            }
+        }
+    }
+}
+
 /// Parse a percentage string like "70%" into a fraction (0.70).
 fn parse_percentage(s: &str) -> Option<f64> {
     let s = s.trim();
