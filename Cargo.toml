@@ -60,13 +60,15 @@ datafusion = "45"
 object_store = { version = "0.12", features = ["fs"] }
 sysinfo = "0.33"
 prometheus-parse = "0.2"
+k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }
 
 [features]
-default = []
+default = ["kubernetes"]
+kubernetes = ["dep:k8s-openapi"]
 ebpf = ["aya", "aya-log"]
 
 [dev-dependencies]
