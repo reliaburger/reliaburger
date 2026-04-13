@@ -235,7 +235,7 @@ mod tests {
         let working = dir.path().join("working");
 
         Command::new("git")
-            .args(["init", "--bare"])
+            .args(["init", "--bare", "--initial-branch=main"])
             .arg(&repo_path)
             .output()
             .unwrap();
@@ -248,13 +248,17 @@ mod tests {
             .unwrap();
 
         // Configure git user for commits
+        for (key, val) in [("user.email", "test@test.com"), ("user.name", "Test")] {
+            Command::new("git")
+                .args(["config", key, val])
+                .current_dir(&working)
+                .output()
+                .unwrap();
+        }
+
+        // Ensure we're on the 'main' branch (git may default to 'master')
         Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&working)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
+            .args(["checkout", "-B", "main"])
             .current_dir(&working)
             .output()
             .unwrap();
@@ -279,7 +283,7 @@ mod tests {
             .unwrap();
 
         Command::new("git")
-            .args(["push", "origin", "main"])
+            .args(["push", "origin", "HEAD:main"])
             .current_dir(&working)
             .output()
             .unwrap();
