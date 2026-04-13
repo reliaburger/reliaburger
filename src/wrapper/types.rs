@@ -13,6 +13,9 @@ pub enum WrapperError {
     #[error("proxy request failed: {0}")]
     ProxyFailed(String),
 
+    #[error("WebSocket upgrade failed: {0}")]
+    WebSocketUpgradeFailed(String),
+
     #[error("wrapper not running")]
     NotRunning,
 }

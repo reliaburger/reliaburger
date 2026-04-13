@@ -85,6 +85,9 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request<Body>)
 
 /// Route and proxy a single request.
 async fn do_proxy(state: &ProxyState, req: Request<Body>) -> Response {
+    // Check for WebSocket upgrade before anything else
+    let is_ws = super::websocket::is_websocket_upgrade(&req);
+
     // Extract host from the Host header
     let host = req
         .headers()
@@ -101,6 +104,12 @@ async fn do_proxy(state: &ProxyState, req: Request<Body>) -> Response {
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
+    // WebSocket upgrade: check if route allows it
+    if is_ws && !route.websocket {
+        drop(table);
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     // Select a backend
     let backend = match route.select_backend() {
         Some(b) => b.addr,
@@ -109,6 +118,11 @@ async fn do_proxy(state: &ProxyState, req: Request<Body>) -> Response {
 
     // Drop the read lock before making the HTTP call
     drop(table);
+
+    // WebSocket: delegate to the upgrade handler (no body buffering)
+    if is_ws {
+        return super::websocket::handle_websocket_upgrade(req, backend).await;
+    }
 
     // Build the upstream URL
     let upstream_uri = match build_upstream_uri(&backend, req.uri()) {
