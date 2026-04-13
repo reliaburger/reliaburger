@@ -237,13 +237,22 @@ pub mod mock {
     use std::cell::RefCell;
 
     /// A mock driver that records calls and can be configured to fail.
+    ///
+    /// Uses separate counters for start and health check calls so it
+    /// works with both rolling (interleaved) and blue-green (batched)
+    /// deploy strategies.
     pub struct MockDriver {
         placements: Vec<(NodeId, String)>,
         next_instance_id: RefCell<u32>,
-        fail_health_at_step: Option<usize>,
-        fail_start_at_step: Option<usize>,
+        fail_health_at_call: Option<usize>,
+        fail_start_at_call: Option<usize>,
         fail_dep_job: Option<String>,
+        /// Counts stop_instance calls (legacy, used by rolling step tracking).
         step_counter: RefCell<usize>,
+        /// Counts start_instance calls independently.
+        start_counter: RefCell<usize>,
+        /// Counts await_healthy calls independently.
+        health_counter: RefCell<usize>,
     }
 
     impl MockDriver {
@@ -251,20 +260,24 @@ pub mod mock {
             Self {
                 placements,
                 next_instance_id: RefCell::new(100),
-                fail_health_at_step: None,
-                fail_start_at_step: None,
+                fail_health_at_call: None,
+                fail_start_at_call: None,
                 fail_dep_job: None,
                 step_counter: RefCell::new(0),
+                start_counter: RefCell::new(0),
+                health_counter: RefCell::new(0),
             }
         }
 
-        pub fn fail_health_at(mut self, step: usize) -> Self {
-            self.fail_health_at_step = Some(step);
+        /// Fail the Nth health check call (0-indexed).
+        pub fn fail_health_at(mut self, call: usize) -> Self {
+            self.fail_health_at_call = Some(call);
             self
         }
 
-        pub fn fail_start_at(mut self, step: usize) -> Self {
-            self.fail_start_at_step = Some(step);
+        /// Fail the Nth start_instance call (0-indexed).
+        pub fn fail_start_at(mut self, call: usize) -> Self {
+            self.fail_start_at_call = Some(call);
             self
         }
 
@@ -281,8 +294,13 @@ pub mod mock {
             _node_id: &NodeId,
             _image: &str,
         ) -> Result<(String, Option<u16>), DeployError> {
-            let step = *self.step_counter.borrow();
-            if self.fail_start_at_step == Some(step) {
+            let call = {
+                let mut c = self.start_counter.borrow_mut();
+                let v = *c;
+                *c += 1;
+                v
+            };
+            if self.fail_start_at_call == Some(call) {
                 return Err(DeployError::StartFailed("mock start failure".into()));
             }
             let mut id = self.next_instance_id.borrow_mut();
@@ -292,8 +310,13 @@ pub mod mock {
         }
 
         fn await_healthy(&self, _instance_id: &str, _timeout: Duration) -> Result<(), DeployError> {
-            let step = *self.step_counter.borrow();
-            if self.fail_health_at_step == Some(step) {
+            let call = {
+                let mut c = self.health_counter.borrow_mut();
+                let v = *c;
+                *c += 1;
+                v
+            };
+            if self.fail_health_at_call == Some(call) {
                 return Err(DeployError::HealthTimeout("mock health timeout".into()));
             }
             Ok(())

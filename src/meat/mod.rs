@@ -5,6 +5,7 @@
 /// Select → Commit) to place replicas across the cluster.
 pub mod batch;
 pub mod batch_tracker;
+pub mod blue_green;
 pub mod cluster_state;
 pub mod deploy_types;
 pub mod filter;
