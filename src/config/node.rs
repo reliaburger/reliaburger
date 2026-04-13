@@ -23,6 +23,9 @@ pub struct NodeConfig {
     pub metrics: MetricsSection,
     pub logs: LogsSection,
     pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
+    /// GitOps configuration (optional — only needed if GitOps is enabled).
+    #[serde(default)]
+    pub gitops: Option<crate::lettuce::types::GitOpsConfig>,
     // TODO(Phase 3): ingress section
     // TODO(Phase 14): upgrades section
 }

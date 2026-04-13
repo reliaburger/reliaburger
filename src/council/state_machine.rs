@@ -105,6 +105,12 @@ impl StateMachineInner {
                     self.state.autoscale_overrides.push((key, *replicas));
                 }
             }
+            RaftRequest::GitOpsCoordinatorElection(election) => {
+                self.state.gitops_coordinator = Some(election.clone());
+            }
+            RaftRequest::GitOpsSyncUpdate(sync_state) => {
+                self.state.gitops_sync_state = Some(*sync_state.clone());
+            }
             RaftRequest::Noop => {}
         }
     }
