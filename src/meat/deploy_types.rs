@@ -111,6 +111,12 @@ pub enum DeployPhase {
     RunningPreDeps,
     /// Rolling out new instances one at a time.
     Rolling,
+    /// Blue-green: starting all green instances.
+    StartingGreen,
+    /// Blue-green: health checking all green instances.
+    HealthCheckingGreen,
+    /// Blue-green: performing atomic routing swap.
+    RoutingSwitching,
     /// Stopped due to failure (auto_rollback=false).
     Halted,
     /// Actively reverting upgraded instances.
@@ -142,7 +148,7 @@ impl DeployPhase {
 /// Events that drive deploy phase transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployEvent {
-    /// Start the deploy.
+    /// Start the deploy (rolling strategy).
     Start,
     /// All pre-deploy jobs completed successfully.
     PreDepsComplete,
@@ -160,6 +166,14 @@ pub enum DeployEvent {
     RollbackFailed,
     /// Deploy was cancelled.
     Cancel,
+    /// Blue-green: begin starting green instances.
+    GreenStarting,
+    /// Blue-green: all green instances started successfully.
+    GreenAllStarted,
+    /// Blue-green: all green instances passed health checks.
+    GreenAllHealthy,
+    /// Blue-green: a green instance failed (health or start).
+    GreenHealthFailed,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +284,7 @@ impl DeployState {
     /// Transition the deploy phase based on an event.
     pub fn transition(&mut self, event: DeployEvent) -> Result<(), DeployError> {
         let new_phase = match (&self.phase, &event) {
-            // Pending → start
+            // Pending → start (rolling)
             (DeployPhase::Pending, DeployEvent::Start) => {
                 if self.request.pre_deploy_jobs.is_empty() {
                     DeployPhase::Rolling
@@ -278,6 +292,8 @@ impl DeployState {
                     DeployPhase::RunningPreDeps
                 }
             }
+            // Pending → blue-green start
+            (DeployPhase::Pending, DeployEvent::GreenStarting) => DeployPhase::StartingGreen,
             (DeployPhase::Pending, DeployEvent::Cancel) => DeployPhase::Cancelled,
 
             // RunningPreDeps → deps done or failed
@@ -296,6 +312,38 @@ impl DeployState {
                 }
             }
             (DeployPhase::Rolling, DeployEvent::Cancel) => DeployPhase::Cancelled,
+
+            // Blue-green: StartingGreen → health check or failure
+            (DeployPhase::StartingGreen, DeployEvent::GreenAllStarted) => {
+                DeployPhase::HealthCheckingGreen
+            }
+            (DeployPhase::StartingGreen, DeployEvent::GreenHealthFailed) => {
+                if self.request.config.auto_rollback {
+                    DeployPhase::Reverting
+                } else {
+                    DeployPhase::Halted
+                }
+            }
+            (DeployPhase::StartingGreen, DeployEvent::Cancel) => DeployPhase::Cancelled,
+
+            // Blue-green: HealthCheckingGreen → routing swap or failure
+            (DeployPhase::HealthCheckingGreen, DeployEvent::GreenAllHealthy) => {
+                DeployPhase::RoutingSwitching
+            }
+            (DeployPhase::HealthCheckingGreen, DeployEvent::GreenHealthFailed) => {
+                if self.request.config.auto_rollback {
+                    DeployPhase::Reverting
+                } else {
+                    DeployPhase::Halted
+                }
+            }
+            (DeployPhase::HealthCheckingGreen, DeployEvent::Cancel) => DeployPhase::Cancelled,
+
+            // Blue-green: RoutingSwitching → completed
+            (DeployPhase::RoutingSwitching, DeployEvent::AllStepsComplete) => {
+                DeployPhase::Completed
+            }
+            (DeployPhase::RoutingSwitching, DeployEvent::Cancel) => DeployPhase::Cancelled,
 
             // Reverting → done
             (DeployPhase::Reverting, DeployEvent::RollbackComplete) => DeployPhase::RolledBack,
@@ -524,6 +572,68 @@ mod tests {
         s.transition(DeployEvent::Start).unwrap();
         s.transition(DeployEvent::Cancel).unwrap();
         assert_eq!(s.phase, DeployPhase::Cancelled);
+    }
+
+    // -- Blue-green phase transitions ---
+
+    #[test]
+    fn pending_green_starting_goes_to_starting_green() {
+        let mut s = test_state();
+        s.transition(DeployEvent::GreenStarting).unwrap();
+        assert_eq!(s.phase, DeployPhase::StartingGreen);
+    }
+
+    #[test]
+    fn starting_green_all_started_goes_to_health_checking() {
+        let mut s = test_state();
+        s.transition(DeployEvent::GreenStarting).unwrap();
+        s.transition(DeployEvent::GreenAllStarted).unwrap();
+        assert_eq!(s.phase, DeployPhase::HealthCheckingGreen);
+    }
+
+    #[test]
+    fn health_checking_green_all_healthy_goes_to_routing() {
+        let mut s = test_state();
+        s.transition(DeployEvent::GreenStarting).unwrap();
+        s.transition(DeployEvent::GreenAllStarted).unwrap();
+        s.transition(DeployEvent::GreenAllHealthy).unwrap();
+        assert_eq!(s.phase, DeployPhase::RoutingSwitching);
+    }
+
+    #[test]
+    fn routing_switching_all_steps_complete_goes_to_completed() {
+        let mut s = test_state();
+        s.transition(DeployEvent::GreenStarting).unwrap();
+        s.transition(DeployEvent::GreenAllStarted).unwrap();
+        s.transition(DeployEvent::GreenAllHealthy).unwrap();
+        s.transition(DeployEvent::AllStepsComplete).unwrap();
+        assert_eq!(s.phase, DeployPhase::Completed);
+    }
+
+    #[test]
+    fn starting_green_failure_with_auto_rollback_goes_to_reverting() {
+        let mut s = test_state();
+        s.transition(DeployEvent::GreenStarting).unwrap();
+        s.transition(DeployEvent::GreenHealthFailed).unwrap();
+        assert_eq!(s.phase, DeployPhase::Reverting);
+    }
+
+    #[test]
+    fn health_checking_green_failure_without_auto_rollback_goes_to_halted() {
+        let mut req = test_request();
+        req.config.auto_rollback = false;
+        let mut s = DeployState::new(DeployId(1), req);
+        s.transition(DeployEvent::GreenStarting).unwrap();
+        s.transition(DeployEvent::GreenAllStarted).unwrap();
+        s.transition(DeployEvent::GreenHealthFailed).unwrap();
+        assert_eq!(s.phase, DeployPhase::Halted);
+    }
+
+    #[test]
+    fn blue_green_phases_not_terminal() {
+        assert!(!DeployPhase::StartingGreen.is_terminal());
+        assert!(!DeployPhase::HealthCheckingGreen.is_terminal());
+        assert!(!DeployPhase::RoutingSwitching.is_terminal());
     }
 
     // -- Invalid transitions ---
