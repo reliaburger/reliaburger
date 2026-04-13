@@ -13,6 +13,7 @@ pub mod council;
 pub mod firewall;
 pub mod grill;
 pub mod ketchup;
+pub mod lettuce;
 pub mod mayo;
 pub mod meat;
 pub mod mustard;

@@ -207,7 +207,7 @@ pub struct EgressSpec {
 }
 
 /// Autoscaling configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoscaleSpec {
     /// Metric to scale on, e.g. "cpu" or "memory".
     pub metric: String,
@@ -217,6 +217,16 @@ pub struct AutoscaleSpec {
     pub min: u32,
     /// Maximum replica count.
     pub max: u32,
+    /// Window over which to average the metric (default "5m").
+    #[serde(default)]
+    pub evaluation_window: Option<String>,
+    /// Minimum time between scale events (default "3m").
+    #[serde(default)]
+    pub cooldown: Option<String>,
+    /// Scale-down hysteresis factor (default 0.8).
+    /// Only scale down when metric < target * this value.
+    #[serde(default)]
+    pub scale_down_threshold: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

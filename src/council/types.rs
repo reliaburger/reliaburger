@@ -120,6 +120,16 @@ pub enum RaftRequest {
         app_id: AppId,
         entry: DeployHistoryEntry,
     },
+    /// Set an autoscale replica override for an app.
+    AutoscaleOverride {
+        app_id: AppId,
+        replicas: u32,
+        reason: String,
+    },
+    /// Elect a GitOps coordinator.
+    GitOpsCoordinatorElection(crate::lettuce::types::CoordinatorElection),
+    /// Update GitOps sync state.
+    GitOpsSyncUpdate(Box<crate::lettuce::types::SyncState>),
     /// No-op entry (used for leader commit on election).
     Noop,
 }
@@ -170,6 +180,15 @@ pub struct DesiredState {
     /// Deploy history (last 50 per app).
     #[serde(default)]
     pub deploy_history: Vec<(String, Vec<DeployHistoryEntry>)>,
+    /// Autoscale replica overrides (runtime adjustments above/below baseline).
+    #[serde(default)]
+    pub autoscale_overrides: Vec<(String, u32)>,
+    /// GitOps sync state.
+    #[serde(default)]
+    pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
+    /// GitOps coordinator election.
+    #[serde(default)]
+    pub gitops_coordinator: Option<crate::lettuce::types::CoordinatorElection>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

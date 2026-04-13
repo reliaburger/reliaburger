@@ -88,6 +88,29 @@ impl StateMachineInner {
                     self.state.deploy_history.push((key, vec![entry.clone()]));
                 }
             }
+            RaftRequest::AutoscaleOverride {
+                app_id,
+                replicas,
+                reason: _,
+            } => {
+                let key = app_id.to_string();
+                if let Some((_, existing)) = self
+                    .state
+                    .autoscale_overrides
+                    .iter_mut()
+                    .find(|(k, _)| k == &key)
+                {
+                    *existing = *replicas;
+                } else {
+                    self.state.autoscale_overrides.push((key, *replicas));
+                }
+            }
+            RaftRequest::GitOpsCoordinatorElection(election) => {
+                self.state.gitops_coordinator = Some(election.clone());
+            }
+            RaftRequest::GitOpsSyncUpdate(sync_state) => {
+                self.state.gitops_sync_state = Some(*sync_state.clone());
+            }
             RaftRequest::Noop => {}
         }
     }
