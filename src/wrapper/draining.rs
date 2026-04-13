@@ -46,6 +46,8 @@ struct DrainEntry {
     deadline: Instant,
     /// Number of in-flight connections to this backend.
     active_connections: u32,
+    /// Number of WebSocket connections (subset of active_connections).
+    websocket_connections: u32,
 }
 
 impl DrainTracker {
@@ -70,6 +72,7 @@ impl DrainTracker {
                 app_name: cmd.app_name.clone(),
                 deadline: Instant::now() + cmd.timeout,
                 active_connections: 0,
+                websocket_connections: 0,
             },
         );
         true
@@ -89,6 +92,28 @@ impl DrainTracker {
         if let Some(entry) = self.draining.get_mut(instance_id) {
             entry.active_connections = entry.active_connections.saturating_sub(1);
         }
+    }
+
+    /// Record that a WebSocket connection was established to a draining backend.
+    pub fn increment_websocket(&mut self, instance_id: &str) {
+        if let Some(entry) = self.draining.get_mut(instance_id) {
+            entry.websocket_connections += 1;
+        }
+    }
+
+    /// Record that a WebSocket connection to a draining backend closed.
+    pub fn decrement_websocket(&mut self, instance_id: &str) {
+        if let Some(entry) = self.draining.get_mut(instance_id) {
+            entry.websocket_connections = entry.websocket_connections.saturating_sub(1);
+        }
+    }
+
+    /// Get the WebSocket Close frame bytes to send during draining.
+    ///
+    /// Returns a Close frame with status 1001 (Going Away) for each
+    /// draining backend that has active WebSocket connections.
+    pub fn websocket_close_frame() -> Vec<u8> {
+        super::websocket::build_close_frame(1001)
     }
 
     /// Check whether a backend is currently draining.

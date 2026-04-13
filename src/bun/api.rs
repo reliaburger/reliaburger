@@ -46,6 +46,8 @@ pub struct ApiState {
     pub deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
     /// Pickle image catalog (shared with registry).
     pub pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
+    /// GitOps webhook signal channel (signals the Lettuce sync loop).
+    pub gitops_webhook_tx: Option<mpsc::Sender<()>>,
 }
 
 /// Build the API router.
@@ -67,6 +69,7 @@ pub fn router(
         alerts,
         deploy_history,
         pickle_catalog,
+        gitops_webhook_tx: None,
     };
 
     Router::new()
@@ -101,6 +104,7 @@ pub fn router(
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(batch_submit_handler))
         .route("/v1/build", post(build_submit_handler))
+        .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .with_state(state)
 }
 
@@ -1120,6 +1124,29 @@ async fn build_submit_handler(
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+/// GitOps webhook handler.
+///
+/// Accepts POST from git hosting providers (GitHub, GitLab, Gitea).
+/// Signals the Lettuce sync loop to trigger an immediate sync.
+/// Returns 202 Accepted on success, 503 if GitOps is not configured.
+async fn gitops_webhook_handler(State(state): State<ApiState>) -> Response {
+    match &state.gitops_webhook_tx {
+        Some(tx) => {
+            let _ = tx.send(()).await;
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "message": "sync triggered" })),
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "gitops not configured" })),
         )
             .into_response(),
     }

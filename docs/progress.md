@@ -166,14 +166,14 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 9: User Experience
 
-- [ ] Blue-green deploy strategy
-- [ ] Autoscaling (CPU/memory-based, runtime replica overrides)
-- [ ] Lettuce GitOps engine (poll/webhook sync, signed commits, coordinator election)
-- [ ] Kubernetes migration (`relish import`, `relish export`, migration reports)
-- [ ] `relish compile`, `relish diff`, `relish fmt`
-- [ ] WebSocket upgrade proxying in Wrapper ingress
-- [ ] Book chapter 9: "The Full Package"
-- [ ] All Phase 9 tests green
+- [x] Blue-green deploy strategy (parallel start, atomic routing swap, orchestrator dispatch)
+- [x] Autoscaling (evaluation logic, hysteresis, cooldown, Mayo query_avg, async task runner, Raft persistence)
+- [x] Lettuce GitOps engine (sync loop, git ops, signature verification, diff engine, webhook endpoint, coordinator election, Raft integration, node config)
+- [ ] Kubernetes migration (`relish import`, `relish export`, migration reports) — deferred, may use official K8s types library
+- [x] `relish compile`, `relish diff`, `relish fmt`
+- [x] WebSocket upgrade proxying in Wrapper ingress (detection, dispatch, close frame, draining)
+- [x] Book chapter 9: "The Full Package"
+- [x] All Phase 9 tests green (1255 tests)
 
 ## Phase 10: Advanced Security
 

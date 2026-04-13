@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (1255 and counting)
+make test                    # run all tests (1364 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -107,7 +107,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,263 tests across 8 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
+**1,364 tests across 9 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -119,6 +119,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 6. Observability | Done | 991 |
 | 7. Deployments | Done | 1,050 |
 | 8. Advanced | Done | 1,263 |
+| 9. User Experience | Done | 1,364 |
 
 ## The book
 
@@ -133,6 +134,7 @@ Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rus
 6. [Watching Everything](docs/book/06-watching-everything.md)
 7. [Ship It](docs/book/07-ship-it.md)
 8. [Breaking Things on Purpose](docs/book/08-breaking-things-on-purpose.md)
+9. [The Full Package](docs/book/09-the-full-package.md)
 
 ## Licence
 

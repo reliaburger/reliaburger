@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use datafusion::arrow::array::{Float64Array, StringArray, UInt64Array};
+use datafusion::arrow::array::{Array, Float64Array, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
@@ -228,6 +228,55 @@ impl MayoStore {
              ORDER BY timestamp"
         );
         self.query_sql(&sql).await
+    }
+
+    /// Query the average value of a metric over a time window.
+    ///
+    /// Used by the autoscaler to compute average CPU/memory utilisation.
+    /// The `app_label` filters by the `app` label in the metrics labels JSON.
+    /// Returns `None` if no data points exist in the window.
+    pub async fn query_avg(
+        &self,
+        metric_name: &str,
+        app_label: &str,
+        window_secs: u64,
+    ) -> Result<Option<f64>, MayoError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let start = now.saturating_sub(window_secs);
+
+        let sql = format!(
+            "SELECT AVG(value) as avg_val FROM metrics \
+             WHERE metric_name = '{metric_name}' \
+             AND labels LIKE '%\"{app_label}\"%' \
+             AND timestamp >= {start} AND timestamp <= {now}"
+        );
+
+        let ctx = self.session().await?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+        for batch in &batches {
+            if batch.num_rows() == 0 || batch.num_columns() == 0 {
+                continue;
+            }
+            if let Some(col) = batch.column(0).as_any().downcast_ref::<Float64Array>()
+                && !col.is_null(0)
+            {
+                return Ok(Some(col.value(0)));
+            }
+        }
+
+        Ok(None)
     }
 
     /// List all distinct metric names.
