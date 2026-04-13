@@ -131,6 +131,30 @@ enum Command {
         /// Path to a TOML config file.
         path: PathBuf,
     },
+    /// Compile configs into a single resolved output.
+    ///
+    /// Merges all .toml files, applies _defaults.toml fields to apps
+    /// missing them, and derives namespaces from subdirectory names.
+    /// Recurses into subdirectories.
+    Compile {
+        /// Path to a TOML file or directory of TOML files.
+        path: PathBuf,
+    },
+    /// Show structural diff between two configs.
+    Diff {
+        /// First config path (old).
+        path_a: PathBuf,
+        /// Second config path (new). If omitted, diffs against empty.
+        path_b: Option<PathBuf>,
+    },
+    /// Format a TOML config file with canonical ordering.
+    Fmt {
+        /// Path to a TOML config file.
+        path: PathBuf,
+        /// Check formatting without modifying the file.
+        #[arg(long)]
+        check: bool,
+    },
     /// List images in the local Pickle registry.
     Images,
     /// Build an OCI image and push to Pickle.
@@ -539,6 +563,12 @@ async fn main() -> ExitCode {
         Command::History { ref app } => commands::history(app).await,
         Command::Rollback { ref app } => commands::rollback(app).await,
         Command::Lint { ref path } => commands::lint(path),
+        Command::Compile { ref path } => commands::compile(path),
+        Command::Diff {
+            ref path_a,
+            ref path_b,
+        } => commands::diff(path_a, path_b.as_deref()),
+        Command::Fmt { ref path, check } => commands::fmt(path, check),
         Command::Images => commands::images().await,
         Command::Build { ref path } => commands::build(path).await,
         Command::Batch { ref path } => commands::batch(path).await,
@@ -902,6 +932,51 @@ mod tests {
     fn parse_lint_command() {
         let cli = parse(&["relish", "lint", "app.toml"]).unwrap();
         assert!(matches!(cli.command, Command::Lint { .. }));
+    }
+
+    #[test]
+    fn parse_compile_command() {
+        let cli = parse(&["relish", "compile", "configs/"]).unwrap();
+        assert!(matches!(cli.command, Command::Compile { .. }));
+    }
+
+    #[test]
+    fn parse_diff_command_two_paths() {
+        let cli = parse(&["relish", "diff", "old.toml", "new.toml"]).unwrap();
+        match cli.command {
+            Command::Diff { path_a, path_b } => {
+                assert_eq!(path_a.to_str().unwrap(), "old.toml");
+                assert_eq!(path_b.unwrap().to_str().unwrap(), "new.toml");
+            }
+            _ => panic!("expected Diff command"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_command_one_path() {
+        let cli = parse(&["relish", "diff", "old.toml"]).unwrap();
+        match cli.command {
+            Command::Diff { path_b, .. } => assert!(path_b.is_none()),
+            _ => panic!("expected Diff command"),
+        }
+    }
+
+    #[test]
+    fn parse_fmt_command() {
+        let cli = parse(&["relish", "fmt", "app.toml"]).unwrap();
+        match cli.command {
+            Command::Fmt { check, .. } => assert!(!check),
+            _ => panic!("expected Fmt command"),
+        }
+    }
+
+    #[test]
+    fn parse_fmt_check_flag() {
+        let cli = parse(&["relish", "fmt", "app.toml", "--check"]).unwrap();
+        match cli.command {
+            Command::Fmt { check, .. } => assert!(check),
+            _ => panic!("expected Fmt command"),
+        }
     }
 
     // -----------------------------------------------------------------------

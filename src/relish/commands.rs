@@ -534,6 +534,69 @@ pub fn lint(path: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Compile a config file or directory into a single resolved config.
+pub fn compile(path: &Path) -> Result<(), RelishError> {
+    let result = super::compile::compile(path)?;
+
+    if !result.warnings.is_empty() {
+        for w in &result.warnings {
+            eprintln!("warning: {w}");
+        }
+    }
+
+    let app_count = result.config.app.len();
+    let job_count = result.config.job.len();
+    let file_count = result.merged_from.len();
+
+    // Serialise the merged config as TOML
+    let toml = toml::to_string_pretty(&result.config)
+        .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
+    print!("{toml}");
+
+    eprintln!("compiled {file_count} file(s): {app_count} app(s), {job_count} job(s)");
+    Ok(())
+}
+
+/// Show structural diff between two configs.
+pub fn diff(path_a: &Path, path_b: Option<&Path>) -> Result<(), RelishError> {
+    let old = Config::from_file(path_a)?;
+    let new = match path_b {
+        Some(p) => Config::from_file(p)?,
+        None => Config::default(),
+    };
+    let diff = super::diff::diff_configs(&old, &new);
+
+    if diff.is_empty() {
+        println!("no changes");
+    } else {
+        print!("{diff}");
+    }
+    Ok(())
+}
+
+/// Format a TOML config file with canonical ordering.
+pub fn fmt(path: &Path, check: bool) -> Result<(), RelishError> {
+    let content = fs::read_to_string(path)?;
+
+    if check {
+        if super::fmt::is_formatted(&content)? {
+            println!("{}: ok", path.display());
+        } else {
+            eprintln!("{}: not formatted", path.display());
+            return Err(RelishError::FormatFailed(format!(
+                "{} needs formatting (run without --check to fix)",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+
+    let formatted = super::fmt::format_toml(&content)?;
+    fs::write(path, &formatted)?;
+    println!("formatted {}", path.display());
+    Ok(())
+}
+
 /// Show live resource usage for all apps and nodes.
 pub async fn top() -> Result<(), RelishError> {
     let client = BunClient::default_local();

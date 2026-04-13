@@ -6,8 +6,11 @@
 pub mod chaos;
 pub mod client;
 pub mod commands;
+pub mod compile;
 pub mod dev;
+pub mod diff;
 pub mod fault;
+pub mod fmt;
 pub mod output;
 pub mod plan;
 
@@ -72,6 +75,10 @@ pub enum RelishError {
     /// Cluster init (PKI generation) failed.
     #[error("cluster initialisation failed: {0}")]
     InitFailed(String),
+
+    /// TOML formatting failed.
+    #[error("format failed: {0}")]
+    FormatFailed(String),
 
     /// IO error.
     #[error("{0}")]
