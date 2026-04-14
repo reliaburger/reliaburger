@@ -4,7 +4,7 @@ Chapter 7 gave us rolling deploys. One instance at a time, health-checked, auto-
 
 But "good enough for most" leaves gaps. What about the deploy where you *can't* afford even a single bad request during the transition? What about the team that scales from 3 replicas to 30 during peak hours and back to 3 overnight? What about the org that wants git to be the single source of truth, not a human running `relish apply`?
 
-This chapter fills those gaps. Five features, each addressing a real operational need. Together they turn Reliaburger from a container orchestrator into a platform.
+This chapter fills those gaps. Six features, each addressing a real operational need. Together they turn Reliaburger from a container orchestrator into a platform.
 
 ## Blue-green deploys
 
@@ -338,6 +338,108 @@ pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
 }
 ```
 
+## Kubernetes migration
+
+Most teams don't start from scratch. They have existing Kubernetes manifests -- dozens of them, spread across namespaces, wired together with Services, Ingresses, HPAs, ConfigMaps. Asking those teams to rewrite everything in TOML by hand is a non-starter.
+
+`relish import` and `relish export` solve this. Import reads K8s YAML and produces Reliaburger TOML. Export goes the other way. Together they make migration a mechanical process, not a rewrite.
+
+### The correlation problem
+
+In Kubernetes, a single application is split across multiple resource types. A web app might be: a Deployment (the containers), a Service (the network endpoint), an Ingress (the external routing), an HPA (the autoscaler), a ConfigMap (the configuration), and a Secret (the credentials). Six YAML files, each referencing the others by name.
+
+In Reliaburger, that same application is one `[app.web]` section with sub-sections for ingress, autoscale, env, and health. The importer needs to figure out which K8s resources belong together and merge them.
+
+The correlation rules use the same matching logic Kubernetes itself uses:
+
+1. Service → Deployment by label selector
+2. Ingress → Service by backend service name
+3. HPA → workload by `scaleTargetRef.name`
+
+```rust
+fn find_ingress_for_service(
+    ingresses: &BTreeMap<String, Ingress>,
+    service_name: &str,
+) -> Option<String> {
+    for (ing_name, ing) in ingresses {
+        if let Some(spec) = &ing.spec {
+            if let Some(rules) = &spec.rules {
+                for rule in rules {
+                    if let Some(http) = &rule.http {
+                        for path in &http.paths {
+                            if let Some(backend) = &path.backend.service {
+                                if backend.name == service_name {
+                                    return Some(ing_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+```
+
+Five levels of `if let Some`. That's what happens when you navigate the K8s API's deeply nested Option types. Each level is a field that might not be set. The k8s-openapi crate mirrors the Go API faithfully, including the optionality of everything.
+
+### Using k8s-openapi
+
+We debated hand-rolling lightweight K8s structs vs pulling in the official types. The official types won for one reason: correctness. The K8s API has hundreds of fields with subtle serialisation rules (camelCase JSON keys, integer-or-string unions, multiple API versions). Getting all of that right by hand is a maintenance burden. Getting it right once via `k8s-openapi` is free.
+
+The dependency is optional. A `kubernetes` Cargo feature (default-on) gates the import/export modules. Users who don't need K8s migration compile with `--no-default-features` and skip the dependency entirely.
+
+```toml
+[features]
+default = ["kubernetes"]
+kubernetes = ["dep:k8s-openapi"]
+
+[dependencies]
+k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
+```
+
+We disable `default-features` on k8s-openapi because we only need the type definitions, not the API client operations. That shaves off a chunk of compile time.
+
+### The field mapping
+
+A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but it's close enough that the output is usable without manual editing for most cases:
+
+- `spec.replicas` → `replicas`
+- `spec.template.spec.containers[0].image` → `image`
+- `spec.template.spec.containers[0].ports[0].containerPort` → `port`
+- `readinessProbe.httpGet.path` → `health.path`
+- `strategy.rollingUpdate.maxSurge` → `deploy.max_surge`
+- `terminationGracePeriodSeconds` → `deploy.drain_timeout`
+- `nodeSelector` → `placement.required`
+- `initContainers` → `init`
+
+DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly.
+
+### The migration report
+
+Every import produces a report on stderr: what was converted, what was approximated, and what was dropped.
+
+```
+Converted:
+  + Deployment/web → [app.web]
+
+Approximated (review recommended):
+  ~ StatefulSet/redis — ordering guarantees and stable network IDs lost
+
+Dropped (no Reliaburger equivalent):
+  - MyCustomResource/foo — no Reliaburger equivalent
+  - ServiceAccount/worker-sa — no Reliaburger equivalent
+```
+
+CRDs, ServiceAccounts, PodDisruptionBudgets, RBAC — these either have no equivalent or are handled automatically by Reliaburger (SPIFFE replaces ServiceAccounts, deploy config replaces PDBs). The report tells you exactly what to review.
+
+### Export: the reverse direction
+
+`relish export` reads a TOML config and produces multi-document K8s YAML. Each app becomes a Deployment + Service (or DaemonSet). Ingress, HPA, ConfigMap, and Secret resources are added when the relevant config sections exist.
+
+Features with no K8s equivalent show up in the export report: `auto_rollback`, Smoker fault rules, process workloads, build jobs, `run_before` dependency ordering. The report suggests K8s alternatives where they exist (Argo Workflows for dependency ordering, NetworkPolicy for firewall rules).
+
 ## Lessons learned
 
 **The mock driver refactor was worth it.** When we added blue-green deploys, the existing `MockDriver` broke. It tracked steps by counting `stop_instance` calls, which worked for rolling (one stop per step). In blue-green, all starts happen before any stops. The fix: separate counters for start and health check calls. A small change, but it highlighted why the mock should model *operation counts*, not *lifecycle phases*.
@@ -350,6 +452,12 @@ pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
 
 **Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the git remote. We replaced it with "first non-leader alphabetically." It's deterministic, requires no measurement, and produces the same result on every node without communication. The scoring approach might produce slightly better placement, but the added complexity wasn't worth it for a role that does one git fetch every 30 seconds.
 
+**`skip_serializing_if` is not optional for config output.** The first version of `relish compile` and `relish import` produced TOML with dozens of empty sections: `[app.web.env]` with nothing in it, `command = []`, `config_file = []`, `[job]`, `[namespace]`, `[permission]`, `[build]`. Every `#[serde(default)]` field got serialised to its default value. The fix was adding `#[serde(skip_serializing_if = "Vec::is_empty")]` and friends to every collection and Option field on `AppSpec`, `JobSpec`, and `Config`. One attribute per field, mechanical work, but the output went from 30 lines of noise per app to just the fields that matter.
+
+**Defaults must cascade.** The first `relish compile` applied `_defaults.toml` only to files in the same directory. A config structure with `configs/_defaults.toml` and `configs/backend/api.toml` wouldn't inherit the defaults into the subdirectory. The fix was passing the parent's defaults into the recursive call, with the child's own `_defaults.toml` taking priority if present. The bug was invisible in unit tests (which tested flat directories) and only showed up in the demo script, which was the first time anyone tried a nested directory structure. Write your demo scripts early.
+
+**Five levels of `if let Some` is the price of K8s correctness.** The k8s-openapi crate is faithful to the Go API, where every field is a pointer and might be nil. In Rust, that becomes deeply nested `Option` chains. You can flatten them with helper functions, but the navigation code still reads like an archaeological dig through layers of optionality. The alternative -- hand-rolled structs with `#[serde(default)]` on everything -- trades correctness for readability. We picked correctness and accepted the nesting.
+
 ## Test count
 
-Phase 9 adds 101 tests, bringing the total to 1364. The new tests cover: config compilation and defaults merging (7), TOML formatting idempotency and section ordering (4), structural diffing (8), CLI parse for new commands (7), blue-green orchestrator with mock driver (6), deploy state machine blue-green transitions (7), autoscaler scaling logic with hysteresis and cooldown (12), autoscale config parsing and tracker state (6), WebSocket header detection and close frame construction (8), Lettuce types serde round-trips (4), git clone/fetch/list operations (4), webhook HMAC validation, replay detection, and rate limiting (7), GitOps diff with autoscaler awareness (7), sync loop TOML parsing (3), coordinator election (5), and commit signature verification (1).
+Phase 9 adds 117 tests, bringing the total to 1380. The new tests cover: config compilation and defaults merging (7), TOML formatting idempotency and section ordering (4), structural diffing (8), CLI parse for new commands (7), blue-green orchestrator with mock driver (6), deploy state machine blue-green transitions (7), autoscaler scaling logic with hysteresis and cooldown (12), autoscale config parsing and tracker state (6), WebSocket header detection and close frame construction (8), Lettuce types serde round-trips (4), git clone/fetch/list operations (4), webhook HMAC validation, replay detection, and rate limiting (7), GitOps diff with autoscaler awareness (7), sync loop TOML parsing (3), coordinator election (5), commit signature verification (1), K8s import (10), and K8s export (6).
