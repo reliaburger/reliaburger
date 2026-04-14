@@ -123,7 +123,8 @@ spec:
     - myapp.example.com
 YAML
 
-note "Input: Deployment + Service + Ingress (3 K8s resources)"
+note "Input YAML:"
+cat "${TMPDIR}/web-app.yaml"
 echo ""
 cmd "relish import -f web-app.yaml"
 "${RELISH}" import -f "${TMPDIR}/web-app.yaml" > "${TMPDIR}/web-app.toml" 2>"${TMPDIR}/web-report.txt" || true
@@ -161,7 +162,8 @@ spec:
         - containerPort: 9100
 YAML
 
-note "Input: DaemonSet (runs on every node)"
+note "Input YAML (DaemonSet — runs on every node):"
+cat "${TMPDIR}/monitoring.yaml"
 echo ""
 cmd "relish import -f monitoring.yaml"
 "${RELISH}" import -f "${TMPDIR}/monitoring.yaml" > "${TMPDIR}/monitoring.toml" 2>/dev/null || true
@@ -207,7 +209,8 @@ spec:
           restartPolicy: Never
 YAML
 
-note "Input: Job + CronJob (2 resources)"
+note "Input YAML (Job + CronJob):"
+cat "${TMPDIR}/jobs.yaml"
 echo ""
 cmd "relish import -f jobs.yaml"
 "${RELISH}" import -f "${TMPDIR}/jobs.yaml" > "${TMPDIR}/jobs.toml" 2>/dev/null || true
@@ -262,7 +265,8 @@ spec:
         averageUtilization: 70
 YAML
 
-note "Input: Deployment + HPA (autoscaled to 2-20 replicas)"
+note "Input YAML (Deployment + HPA):"
+cat "${TMPDIR}/api.yaml"
 echo ""
 cmd "relish import -f api.yaml"
 "${RELISH}" import -f "${TMPDIR}/api.yaml" > "${TMPDIR}/api.toml" 2>/dev/null || true
@@ -320,7 +324,8 @@ metadata:
   name: worker-sa
 YAML
 
-note "Input: Deployment + CRD + ServiceAccount"
+note "Input YAML (Deployment + CRD + ServiceAccount):"
+cat "${TMPDIR}/mixed.yaml"
 echo ""
 cmd "relish import -f mixed.yaml"
 "${RELISH}" import -f "${TMPDIR}/mixed.yaml" 2>&1 || true
