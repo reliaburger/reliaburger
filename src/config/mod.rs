@@ -38,19 +38,19 @@ pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 #[serde(default)]
 pub struct Config {
     /// App definitions keyed by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub app: BTreeMap<String, AppSpec>,
     /// Job definitions keyed by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub job: BTreeMap<String, JobSpec>,
     /// Namespace definitions keyed by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub namespace: BTreeMap<String, NamespaceSpec>,
     /// Permission definitions keyed by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permission: BTreeMap<String, PermissionSpec>,
     /// Build job definitions keyed by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, build::BuildSpec>,
 }
 

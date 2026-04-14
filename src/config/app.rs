@@ -15,54 +15,69 @@ use super::types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec
 pub struct AppSpec {
     /// OCI image reference. Required for container workloads.
     /// Ignored by ProcessGrill (which runs `command` as an OS process).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// Command and arguments to run inside the container.
     /// For ProcessGrill, this is the process that gets spawned.
     /// For runc/Apple Container, this overrides the image entrypoint.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     /// Host binary path (Phase 8: process workloads).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<PathBuf>,
     /// Inline script content (Phase 8: process workloads).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
     /// Replica count or daemon mode.
     #[serde(default)]
     pub replicas: Replicas,
     /// Container-internal port.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// Health check configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthSpec>,
     /// Memory request-limit range, e.g. "128Mi-512Mi".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<ResourceRange>,
     /// CPU request-limit range, e.g. "100m-500m".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<ResourceRange>,
     /// Number of GPUs required.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<u32>,
     /// Environment variables (plain or encrypted).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
     /// Configuration files injected into the container.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_file: Vec<ConfigFileSpec>,
     /// Persistent volumes mounted into the container.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeSpec>,
     /// Init containers run before the main container starts.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub init: Vec<InitContainerSpec>,
     /// Ingress configuration for external traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ingress: Option<IngressSpec>,
     /// Placement constraints.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub placement: Option<PlacementSpec>,
     /// Deploy strategy configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deploy: Option<DeploySpec>,
     /// Ingress firewall rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub firewall: Option<FirewallSpec>,
     /// Egress allowlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressSpec>,
     /// Autoscaling configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub autoscale: Option<AutoscaleSpec>,
     /// Namespace this app belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 }
 
