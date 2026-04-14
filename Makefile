@@ -1,4 +1,4 @@
-.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo
+.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 
@@ -54,6 +54,12 @@ deploy-demo: build ## Deploy an app, show history, lint config
 
 observability-demo: build ## Start bun, collect metrics, query them, show dashboard
 	./scripts/observability-demo.sh
+
+kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
+	./scripts/kubernetes-yamls-demo.sh
+
+toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
+	./scripts/relish-toml-demo.sh
 
 pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
 	./scripts/pickle-push-test.sh
