@@ -597,6 +597,48 @@ pub fn fmt(path: &Path, check: bool) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Import Kubernetes YAML manifests to Reliaburger TOML.
+#[cfg(feature = "kubernetes")]
+pub fn import_k8s(files: &[std::path::PathBuf], strict: bool) -> Result<(), RelishError> {
+    let result = super::k8s_import::import_kubernetes(files)?;
+
+    // Print the converted config as TOML
+    let toml = toml::to_string_pretty(&result.config)
+        .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
+    print!("{toml}");
+
+    // Print migration report to stderr
+    if !result.report.converted.is_empty()
+        || !result.report.warnings.is_empty()
+        || !result.report.dropped.is_empty()
+    {
+        eprint!("{}", result.report);
+    }
+
+    if strict && !result.report.warnings.is_empty() {
+        return Err(RelishError::FormatFailed(
+            "import produced warnings (--strict mode)".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Export Reliaburger TOML to Kubernetes YAML manifests.
+#[cfg(feature = "kubernetes")]
+pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
+    let config = Config::from_file(file)?;
+    let result = super::k8s_export::export_kubernetes(&config)?;
+
+    print!("{}", result.yaml);
+
+    if !result.report.resources_created.is_empty() || !result.report.unsupported.is_empty() {
+        eprint!("{}", result.report);
+    }
+
+    Ok(())
+}
+
 /// Show live resource usage for all apps and nodes.
 pub async fn top() -> Result<(), RelishError> {
     let client = BunClient::default_local();

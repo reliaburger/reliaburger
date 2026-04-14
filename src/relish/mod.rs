@@ -11,6 +11,20 @@ pub mod dev;
 pub mod diff;
 pub mod fault;
 pub mod fmt;
+#[cfg(feature = "kubernetes")]
+#[allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::single_match
+)]
+pub mod k8s_export;
+#[cfg(feature = "kubernetes")]
+#[allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::single_match
+)]
+pub mod k8s_import;
 pub mod output;
 pub mod plan;
 

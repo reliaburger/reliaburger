@@ -13,26 +13,34 @@ use super::types::{EnvValue, ResourceRange};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSpec {
     /// OCI image reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     /// Command and arguments to run inside the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
     /// Cron schedule (UTC), e.g. "0 3 * * *".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
     /// Dependencies — job/app names that must complete before this runs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub run_before: Vec<String>,
     /// Memory request-limit range.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<ResourceRange>,
     /// CPU request-limit range.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<ResourceRange>,
     /// Environment variables (plain or encrypted).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, EnvValue>,
     /// Namespace this job belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     /// Host binary path (Phase 8: process workloads).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<PathBuf>,
     /// Inline script content (Phase 8: process workloads).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
 }
 

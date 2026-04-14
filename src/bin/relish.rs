@@ -155,6 +155,23 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Convert Kubernetes YAML manifests to Reliaburger TOML.
+    #[cfg(feature = "kubernetes")]
+    Import {
+        /// Kubernetes YAML files to import.
+        #[arg(short = 'f', long = "file", required = true)]
+        files: Vec<PathBuf>,
+        /// Exit non-zero if any warnings are generated.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Export Reliaburger TOML to Kubernetes YAML manifests.
+    #[cfg(feature = "kubernetes")]
+    Export {
+        /// Path to a Reliaburger TOML config file.
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
+    },
     /// List images in the local Pickle registry.
     Images,
     /// Build an OCI image and push to Pickle.
@@ -569,6 +586,10 @@ async fn main() -> ExitCode {
             ref path_b,
         } => commands::diff(path_a, path_b.as_deref()),
         Command::Fmt { ref path, check } => commands::fmt(path, check),
+        #[cfg(feature = "kubernetes")]
+        Command::Import { ref files, strict } => commands::import_k8s(files, strict),
+        #[cfg(feature = "kubernetes")]
+        Command::Export { ref file } => commands::export_k8s(file),
         Command::Images => commands::images().await,
         Command::Build { ref path } => commands::build(path).await,
         Command::Batch { ref path } => commands::batch(path).await,

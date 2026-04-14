@@ -53,12 +53,22 @@ fn compile_single_file(path: &Path) -> Result<CompileResult, RelishError> {
 
 /// Compile a directory of TOML files.
 fn compile_directory(dir: &Path) -> Result<CompileResult, RelishError> {
+    compile_directory_with_defaults(dir, None)
+}
+
+/// Compile a directory, inheriting defaults from the parent if the
+/// directory doesn't have its own `_defaults.toml`.
+fn compile_directory_with_defaults(
+    dir: &Path,
+    parent_defaults: Option<&BTreeMap<String, toml::Value>>,
+) -> Result<CompileResult, RelishError> {
     let mut merged = Config::default();
     let mut merged_from = Vec::new();
     let mut warnings = Vec::new();
 
-    // Load defaults if present
-    let defaults = load_defaults(dir);
+    // Load defaults: own file takes priority, fall back to parent's
+    let own_defaults = load_defaults(dir);
+    let defaults = own_defaults.as_ref().or(parent_defaults);
 
     // Process all .toml files in this directory (except _defaults.toml)
     let entries = collect_toml_files(dir)?;
@@ -76,7 +86,7 @@ fn compile_directory(dir: &Path) -> Result<CompileResult, RelishError> {
             Ok(mut file_config) => {
                 // Apply defaults: merge default fields into apps/jobs
                 // that don't have them set
-                if let Some(ref defaults_toml) = defaults {
+                if let Some(defaults_toml) = defaults {
                     apply_defaults(&mut file_config, defaults_toml);
                 }
 
@@ -105,7 +115,7 @@ fn compile_directory(dir: &Path) -> Result<CompileResult, RelishError> {
         subdirs.sort();
 
         for subdir in subdirs {
-            match compile_directory(&subdir) {
+            match compile_directory_with_defaults(&subdir, defaults) {
                 Ok(mut sub_result) => {
                     // Apply the subdirectory name as namespace
                     if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
