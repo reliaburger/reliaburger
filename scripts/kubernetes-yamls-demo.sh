@@ -14,26 +14,40 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TMPDIR="$(mktemp -d)"
 
+# Colours (disabled when piped)
+if [[ -t 1 ]]; then
+    BOLD='\033[1m'
+    CYAN='\033[36m'
+    GREEN='\033[32m'
+    YELLOW='\033[33m'
+    DIM='\033[2m'
+    RESET='\033[0m'
+else
+    BOLD='' CYAN='' GREEN='' YELLOW='' DIM='' RESET=''
+fi
+
+section() { echo -e "\n${BOLD}${CYAN}=== $1 ===${RESET}\n"; }
+cmd()     { echo -e "${GREEN}--- $1 ---${RESET}"; }
+note()    { echo -e "${DIM}$1${RESET}"; }
+warn()    { echo -e "${YELLOW}$1${RESET}"; }
+
 cleanup() {
     rm -rf "${TMPDIR}"
 }
 trap cleanup EXIT
 
-echo "=== Reliaburger Kubernetes Migration Demo ==="
-echo ""
+section "Reliaburger Kubernetes Migration Demo"
 
 # Build
-echo "--- building relish ---"
+cmd "building relish"
 cargo build --bin relish --manifest-path "${REPO_DIR}/Cargo.toml" --quiet
 RELISH="${REPO_DIR}/target/debug/relish"
-echo ""
 
 # -----------------------------------------------------------------------
 # Example 1: Web app with Service and Ingress
 # -----------------------------------------------------------------------
 
-echo "=== 1. Web App: Deployment + Service + Ingress ==="
-echo ""
+section "1. Web App: Deployment + Service + Ingress"
 
 cat > "${TMPDIR}/web-app.yaml" << 'YAML'
 apiVersion: apps/v1
@@ -109,24 +123,22 @@ spec:
     - myapp.example.com
 YAML
 
-echo "Input: Deployment + Service + Ingress (3 K8s resources)"
+note "Input: Deployment + Service + Ingress (3 K8s resources)"
 echo ""
-echo "--- relish import -f web-app.yaml ---"
+cmd "relish import -f web-app.yaml"
 "${RELISH}" import -f "${TMPDIR}/web-app.yaml" > "${TMPDIR}/web-app.toml" 2>"${TMPDIR}/web-report.txt" || true
 echo ""
-echo "Generated TOML:"
+note "Generated TOML:"
 cat "${TMPDIR}/web-app.toml"
 echo ""
-echo "Migration report:"
+warn "Migration report:"
 cat "${TMPDIR}/web-report.txt"
-echo ""
 
 # -----------------------------------------------------------------------
 # Example 2: DaemonSet (monitoring agent)
 # -----------------------------------------------------------------------
 
-echo "=== 2. DaemonSet: Monitoring Agent ==="
-echo ""
+section "2. DaemonSet: Monitoring Agent"
 
 cat > "${TMPDIR}/monitoring.yaml" << 'YAML'
 apiVersion: apps/v1
@@ -149,21 +161,19 @@ spec:
         - containerPort: 9100
 YAML
 
-echo "Input: DaemonSet (runs on every node)"
+note "Input: DaemonSet (runs on every node)"
 echo ""
-echo "--- relish import -f monitoring.yaml ---"
+cmd "relish import -f monitoring.yaml"
 "${RELISH}" import -f "${TMPDIR}/monitoring.yaml" > "${TMPDIR}/monitoring.toml" 2>/dev/null || true
 echo ""
-echo "Generated TOML (note: replicas = \"*\"):"
+note "Generated TOML (note: replicas = \"*\"):"
 cat "${TMPDIR}/monitoring.toml"
-echo ""
 
 # -----------------------------------------------------------------------
 # Example 3: Job + CronJob
 # -----------------------------------------------------------------------
 
-echo "=== 3. Jobs: Database Migration + Scheduled Cleanup ==="
-echo ""
+section "3. Jobs: Database Migration + Scheduled Cleanup"
 
 cat > "${TMPDIR}/jobs.yaml" << 'YAML'
 apiVersion: batch/v1
@@ -197,21 +207,19 @@ spec:
           restartPolicy: Never
 YAML
 
-echo "Input: Job + CronJob (2 resources)"
+note "Input: Job + CronJob (2 resources)"
 echo ""
-echo "--- relish import -f jobs.yaml ---"
+cmd "relish import -f jobs.yaml"
 "${RELISH}" import -f "${TMPDIR}/jobs.yaml" > "${TMPDIR}/jobs.toml" 2>/dev/null || true
 echo ""
-echo "Generated TOML:"
+note "Generated TOML:"
 cat "${TMPDIR}/jobs.toml"
-echo ""
 
 # -----------------------------------------------------------------------
 # Example 4: Deployment with HPA (autoscaling)
 # -----------------------------------------------------------------------
 
-echo "=== 4. Autoscaled API: Deployment + HPA ==="
-echo ""
+section "4. Autoscaled API: Deployment + HPA"
 
 cat > "${TMPDIR}/api.yaml" << 'YAML'
 apiVersion: apps/v1
@@ -254,36 +262,31 @@ spec:
         averageUtilization: 70
 YAML
 
-echo "Input: Deployment + HPA (autoscaled to 2-20 replicas)"
+note "Input: Deployment + HPA (autoscaled to 2-20 replicas)"
 echo ""
-echo "--- relish import -f api.yaml ---"
+cmd "relish import -f api.yaml"
 "${RELISH}" import -f "${TMPDIR}/api.yaml" > "${TMPDIR}/api.toml" 2>/dev/null || true
 echo ""
-echo "Generated TOML (note: [autoscale] section):"
+note "Generated TOML (note: [autoscale] section):"
 cat "${TMPDIR}/api.toml"
-echo ""
 
 # -----------------------------------------------------------------------
 # Example 5: Round-trip — export back to K8s YAML
 # -----------------------------------------------------------------------
 
-echo "=== 5. Round Trip: TOML → K8s YAML ==="
-echo ""
+section "5. Round Trip: TOML → K8s YAML"
 
-# Use the web app TOML we just generated
-echo "--- relish export -f web-app.toml ---"
+cmd "relish export -f web-app.toml"
 "${RELISH}" export -f "${TMPDIR}/web-app.toml" > "${TMPDIR}/web-app-exported.yaml" 2>/dev/null || true
 echo ""
-echo "Exported K8s YAML:"
+note "Exported K8s YAML:"
 cat "${TMPDIR}/web-app-exported.yaml"
-echo ""
 
 # -----------------------------------------------------------------------
 # Example 6: Unknown resources are reported
 # -----------------------------------------------------------------------
 
-echo "=== 6. Unknown Resources: Handled Gracefully ==="
-echo ""
+section "6. Unknown Resources: Handled Gracefully"
 
 cat > "${TMPDIR}/mixed.yaml" << 'YAML'
 apiVersion: apps/v1
@@ -317,17 +320,16 @@ metadata:
   name: worker-sa
 YAML
 
-echo "Input: Deployment + CRD + ServiceAccount"
+note "Input: Deployment + CRD + ServiceAccount"
 echo ""
-echo "--- relish import -f mixed.yaml ---"
+cmd "relish import -f mixed.yaml"
 "${RELISH}" import -f "${TMPDIR}/mixed.yaml" 2>&1 || true
-echo ""
 
-echo "=== Demo Complete ==="
-echo ""
-echo "Summary:"
+section "Demo Complete"
+
 echo "  - Deployments, DaemonSets, Services, Ingress → [app.*] sections"
 echo "  - Jobs, CronJobs → [job.*] sections"
 echo "  - HPAs → [app.*.autoscale] sections"
 echo "  - Unknown resources reported in migration report"
 echo "  - Round-trip: TOML → K8s YAML preserves key fields"
+echo ""
