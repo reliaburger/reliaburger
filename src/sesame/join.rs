@@ -206,6 +206,7 @@ mod tests {
             api_tokens: vec![],
             join_tokens: vec![join_token],
             next_serial: 6,
+            oidc_signing_config: None,
         };
 
         (state, token_plaintext, master_secret)
