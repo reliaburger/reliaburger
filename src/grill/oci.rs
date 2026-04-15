@@ -305,6 +305,23 @@ fn build_mounts(
         });
     }
 
+    // Workload identity mount — populated by Bun after CSR signing.
+    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, and token
+    // appear once the council signs the workload's CSR.
+    let identity_host_dir = volumes_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"))
+        .join(".identity")
+        .join(namespace)
+        .join(app_name);
+    let _ = std::fs::create_dir_all(&identity_host_dir);
+    mounts.push(OciMount {
+        destination: PathBuf::from("/run/reliaburger/identity"),
+        source: Some(identity_host_dir),
+        mount_type: Some("bind".to_string()),
+        options: vec!["bind".to_string(), "ro".to_string()],
+    });
+
     mounts
 }
 

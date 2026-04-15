@@ -57,6 +57,12 @@ pub struct WorkloadInstance {
     pub image: String,
     /// Stored OCI spec for restart re-drive. Set during initial startup.
     pub oci_spec: Option<OciSpec>,
+    /// Workload identity (SPIFFE cert + OIDC JWT), if issued.
+    /// `None` until the first CSR is signed by the council.
+    pub identity: Option<crate::sesame::types::WorkloadIdentity>,
+    /// Path to the host directory where identity files are written.
+    /// Bind-mounted into the container at `/run/reliaburger/identity/`.
+    pub identity_mount: Option<std::path::PathBuf>,
 }
 
 /// Manages all workload instances on this node.
@@ -176,6 +182,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 is_job: false,
                 image: spec.image.clone().unwrap_or_default(),
                 oci_spec: None,
+                identity: None,
+                identity_mount: None,
             };
 
             self.instances.insert(instance_id.clone(), instance);
@@ -229,6 +237,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
             is_job: true,
             image: spec.image.clone().unwrap_or_default(),
             oci_spec: None,
+            identity: None,
+            identity_mount: None,
         };
 
         self.instances.insert(instance_id.clone(), instance);

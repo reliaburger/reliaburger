@@ -1046,6 +1046,8 @@ impl<G: Grill> BunAgent<G> {
                             is_job: false,
                             image: spec.image.clone().unwrap_or_default(),
                             oci_spec: None,
+                            identity: None,
+                            identity_mount: None,
                         },
                     );
                     let _ = events

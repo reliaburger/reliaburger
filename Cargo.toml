@@ -48,7 +48,7 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["x509-parser"] }
 ring = "0.17"
 rustls-pemfile = "2"
 x509-parser = { version = "0.16", features = ["verify"] }

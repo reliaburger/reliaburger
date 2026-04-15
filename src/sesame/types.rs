@@ -152,6 +152,86 @@ pub enum WorkloadType {
 }
 
 // ---------------------------------------------------------------------------
+// Workload identity
+// ---------------------------------------------------------------------------
+
+/// The full identity bundle for a running workload instance.
+///
+/// Lives in worker memory and on the workload's tmpfs mount — never
+/// serialised to Raft. The private key must not leave the worker node.
+#[derive(Debug, Clone)]
+pub struct WorkloadIdentity {
+    /// The SPIFFE URI for this workload.
+    pub spiffe_uri: SpiffeUri,
+    /// DER-encoded X.509 certificate, signed by the Workload CA.
+    pub certificate_der: Vec<u8>,
+    /// DER-encoded private key (generated per-instance, never leaves tmpfs).
+    pub private_key_der: Vec<u8>,
+    /// PEM-encoded CA trust chain (Workload CA cert + Root CA cert).
+    pub ca_chain_pem: String,
+    /// OIDC JWT token, signed by the cluster's Ed25519 OIDC signing key.
+    pub jwt_token: String,
+    /// When this identity was issued.
+    pub issued_at: SystemTime,
+    /// When the certificate expires (default: 1 hour from issuance).
+    pub expires_at: SystemTime,
+    /// When the next rotation should occur (default: 30 min from issuance).
+    pub next_rotation: SystemTime,
+    /// Whether this certificate is operating under a grace period extension.
+    pub grace_extended: bool,
+}
+
+// ---------------------------------------------------------------------------
+// OIDC signing configuration
+// ---------------------------------------------------------------------------
+
+/// OIDC signing configuration for workload identity JWTs.
+///
+/// Stored in Raft as part of `SecurityState`. The Ed25519 private key
+/// is wrapped with the same HKDF mechanism used for CA private keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcSigningConfig {
+    /// Ed25519 private key for signing JWTs, wrapped with AES-256-GCM.
+    pub signing_key_wrapped: WrappedKey,
+    /// Ed25519 public key bytes (published via JWKS endpoint).
+    pub public_key_der: Vec<u8>,
+    /// Key ID for the JWKS entry.
+    pub key_id: String,
+    /// The issuer URL (e.g., "https://prod.reliaburger.dev").
+    pub issuer: String,
+}
+
+/// Claims embedded in a workload identity JWT.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkloadJwtClaims {
+    /// Issuer: the cluster's OIDC endpoint URL.
+    pub iss: String,
+    /// Subject: the workload's SPIFFE URI.
+    pub sub: String,
+    /// Audience: always includes "spiffe://CLUSTER", plus any per-app audiences.
+    pub aud: Vec<String>,
+    /// Expiration time (Unix timestamp).
+    pub exp: u64,
+    /// Issued-at time (Unix timestamp).
+    pub iat: u64,
+    /// Workload namespace.
+    #[serde(rename = "reliaburger.dev/namespace")]
+    pub namespace: String,
+    /// Workload app or job name.
+    #[serde(rename = "reliaburger.dev/app")]
+    pub app: String,
+    /// Cluster name (trust domain).
+    #[serde(rename = "reliaburger.dev/cluster")]
+    pub cluster: String,
+    /// Node ID where the workload runs.
+    #[serde(rename = "reliaburger.dev/node")]
+    pub node: String,
+    /// Instance ID within the app.
+    #[serde(rename = "reliaburger.dev/instance")]
+    pub instance: String,
+}
+
+// ---------------------------------------------------------------------------
 // API tokens
 // ---------------------------------------------------------------------------
 
@@ -290,6 +370,9 @@ pub struct SecurityState {
     pub join_tokens: Vec<JoinToken>,
     /// Next serial number to assign.
     pub next_serial: u64,
+    /// OIDC signing configuration for workload identity JWTs.
+    #[serde(default)]
+    pub oidc_signing_config: Option<OidcSigningConfig>,
 }
 
 impl SecurityState {
@@ -393,5 +476,37 @@ mod tests {
         assert_eq!(state.next_serial(), SerialNumber(0));
         assert_eq!(state.next_serial(), SerialNumber(1));
         assert_eq!(state.next_serial(), SerialNumber(2));
+    }
+
+    #[test]
+    fn jwt_claims_serde_custom_field_names() {
+        let claims = WorkloadJwtClaims {
+            iss: "https://prod.reliaburger.dev".to_string(),
+            sub: "spiffe://prod/ns/default/app/api".to_string(),
+            aud: vec!["spiffe://prod".to_string()],
+            exp: 1700000000,
+            iat: 1699996400,
+            namespace: "default".to_string(),
+            app: "api".to_string(),
+            cluster: "prod".to_string(),
+            node: "node-01".to_string(),
+            instance: "api-g1234-0".to_string(),
+        };
+        let json = serde_json::to_string(&claims).unwrap();
+        assert!(json.contains("\"reliaburger.dev/namespace\":\"default\""));
+        assert!(json.contains("\"reliaburger.dev/app\":\"api\""));
+        assert!(json.contains("\"reliaburger.dev/cluster\":\"prod\""));
+        assert!(json.contains("\"reliaburger.dev/node\":\"node-01\""));
+        assert!(json.contains("\"reliaburger.dev/instance\":\"api-g1234-0\""));
+
+        // Round-trip
+        let decoded: WorkloadJwtClaims = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, claims);
+    }
+
+    #[test]
+    fn security_state_default_has_no_oidc_config() {
+        let state = SecurityState::default();
+        assert!(state.oidc_signing_config.is_none());
     }
 }
