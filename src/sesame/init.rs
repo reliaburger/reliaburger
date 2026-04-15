@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use super::ca::{self, CaHierarchy};
 use super::crypto;
+use super::oidc;
 use super::secret;
 use super::types::{
     AgeKeyScope, AttestationMode, CertificateAuthority, JoinToken, NodeCertificate, SecurityState,
@@ -25,6 +26,8 @@ pub enum InitError {
     CryptoFailed(#[from] crypto::CryptoError),
     #[error("failed to write sealed root CA backup: {0}")]
     IoFailed(#[from] std::io::Error),
+    #[error("OIDC keypair generation failed: {0}")]
+    OidcFailed(#[from] oidc::OidcError),
 }
 
 /// The result of initialising a new cluster.
@@ -41,6 +44,8 @@ pub struct InitResult {
     pub cluster_name: String,
     /// Path to the sealed root CA backup file.
     pub sealed_root_ca_path: String,
+    /// OIDC signing key ID (for JWKS endpoint).
+    pub oidc_key_id: String,
 }
 
 /// Default join token TTL: 15 minutes.
@@ -66,6 +71,11 @@ pub fn initialize_cluster(
     let (age_keypair, _age_identity) =
         secret::generate_age_keypair(AgeKeyScope::ClusterWide, &master_secret, 0)?;
     let age_public_key = age_keypair.public_key.clone();
+
+    // Step 3b: Generate OIDC Ed25519 signing keypair
+    let oidc_issuer = format!("https://{cluster_name}.reliaburger.dev");
+    let oidc_config = oidc::generate_oidc_keypair(&oidc_issuer, &master_secret)?;
+    let oidc_key_id = oidc_config.key_id.clone();
 
     // Step 4: Seal the root CA private key with age
     let sealed_root =
@@ -121,6 +131,7 @@ pub fn initialize_cluster(
         api_tokens: vec![],
         join_tokens: vec![join_token],
         next_serial: 6, // Next available serial after root(1), node(2), workload(3), ingress(4), first-node(5)
+        oidc_signing_config: Some(oidc_config),
     };
 
     Ok(InitResult {
@@ -130,6 +141,7 @@ pub fn initialize_cluster(
         age_public_key,
         cluster_name: cluster_name.to_string(),
         sealed_root_ca_path: sealed_path.display().to_string(),
+        oidc_key_id,
     })
 }
 
@@ -156,6 +168,8 @@ pub fn format_init_output(result: &InitResult) -> String {
          \n\
          \x20 Losing this file means a full PKI re-bootstrap.\n\
          \n\
+         \x20 OIDC key ID:     {oidc_kid}\n\
+         \n\
          \x20 Join token (valid 15 minutes, single use):\n\
          \x20   {join_token}\n",
         cluster = result.cluster_name,
@@ -164,6 +178,7 @@ pub fn format_init_output(result: &InitResult) -> String {
         workload_serial = workload_ca.serial,
         ingress_serial = ingress_ca.serial,
         sealed_path = result.sealed_root_ca_path,
+        oidc_kid = result.oidc_key_id,
         join_token = result.join_token_plaintext,
     )
 }
@@ -269,5 +284,21 @@ mod tests {
         assert!(output.contains("prod"));
         assert!(output.contains("rbrg_join_1_"));
         assert!(output.contains("root-ca.age"));
+        assert!(output.contains("OIDC key ID:"));
+    }
+
+    #[test]
+    fn initialize_cluster_generates_oidc_keypair() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = initialize_cluster("oidc-test", "node-01", dir.path()).unwrap();
+
+        let oidc = result.security_state.oidc_signing_config.as_ref();
+        assert!(oidc.is_some(), "OIDC signing config should be present");
+        let oidc = oidc.unwrap();
+        assert!(!oidc.key_id.is_empty());
+        assert_eq!(oidc.key_id.len(), 16); // 8 bytes = 16 hex chars
+        assert!(oidc.issuer.contains("oidc-test"));
+        assert_eq!(oidc.public_key_der.len(), 32); // Ed25519 public key
+        assert_eq!(result.oidc_key_id, oidc.key_id);
     }
 }
