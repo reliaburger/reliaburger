@@ -160,6 +160,7 @@ mod tests {
             total_size: 2048,
             pushed_at,
             pushed_by: 1,
+            signature: None,
         }
     }
 
