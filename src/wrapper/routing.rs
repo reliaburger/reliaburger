@@ -103,7 +103,7 @@ impl RoutingTable {
 
         // Sort each host's routes by path length descending (longest prefix match)
         for routes in self.routes.values_mut() {
-            routes.sort_by(|a, b| b.path_prefix.len().cmp(&a.path_prefix.len()));
+            routes.sort_by_key(|r| std::cmp::Reverse(r.path_prefix.len()));
         }
     }
 

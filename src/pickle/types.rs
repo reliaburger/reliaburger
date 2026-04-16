@@ -122,6 +122,9 @@ pub struct ImageManifest {
     pub pushed_at: SystemTime,
     /// Raft node ID of the node that pushed this manifest.
     pub pushed_by: u64,
+    /// Image signature, if signed. Attached after push via `AttachSignature`.
+    #[serde(default)]
+    pub signature: Option<ImageSignature>,
 }
 
 impl ImageManifest {
@@ -292,6 +295,17 @@ impl ManifestCatalog {
         }
     }
 
+    /// Apply an AttachSignature (set the signature on an existing manifest).
+    pub fn apply_attach_signature(&mut self, attach: &AttachSignature) {
+        if let Some((_, manifest)) = self
+            .manifests
+            .iter_mut()
+            .find(|(d, _)| d == &attach.manifest_digest.0)
+        {
+            manifest.signature = Some(attach.signature.clone());
+        }
+    }
+
     /// Apply a DeleteTag.
     pub fn apply_delete_tag(&mut self, delete: &DeleteTag) {
         let tag_key = format!("{}:{}", delete.repository, delete.tag);
@@ -323,6 +337,59 @@ impl ManifestCatalog {
 }
 
 // ---------------------------------------------------------------------------
+// Image signing
+// ---------------------------------------------------------------------------
+
+/// A cryptographic signature over an image manifest digest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageSignature {
+    /// How the image was signed.
+    pub method: SigningMethod,
+    /// Base64-encoded ECDSA P-256 signature over the manifest digest string.
+    pub signature: String,
+    /// Material needed to verify the signature.
+    pub verification_material: VerificationMaterial,
+    /// When the signature was created.
+    pub signed_at: SystemTime,
+}
+
+/// How an image was signed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SigningMethod {
+    /// Keyless signing via workload identity OIDC token.
+    /// The build job's SPIFFE identity serves as the signing credential.
+    Keyless {
+        /// OIDC issuer URL (e.g. "https://prod.reliaburger.dev").
+        issuer: String,
+        /// SPIFFE URI of the signing workload.
+        identity: String,
+    },
+    /// External key-based signing (cosign-compatible).
+    ExternalKey {
+        /// Identifier for the signing key (matches trust policy).
+        key_id: String,
+    },
+}
+
+/// Material needed to verify an image signature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum VerificationMaterial {
+    /// DER-encoded X.509 certificate chain (leaf, intermediate, root).
+    CertificateChain(Vec<Vec<u8>>),
+    /// DER-encoded ECDSA P-256 public key.
+    PublicKey(Vec<u8>),
+}
+
+/// Attach a signature to an existing manifest in Raft.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachSignature {
+    /// Digest of the manifest to sign.
+    pub manifest_digest: Digest,
+    /// The signature to attach.
+    pub signature: ImageSignature,
+}
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
@@ -343,6 +410,8 @@ pub enum PickleError {
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("replication failed: {0}")]
     ReplicationFailed(String),
+    #[error("signature verification failed: {0}")]
+    SignatureError(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -449,6 +518,7 @@ mod tests {
             total_size: 31744,
             pushed_at: SystemTime::UNIX_EPOCH,
             pushed_by: 1,
+            signature: None,
         }
     }
 
@@ -644,5 +714,110 @@ mod tests {
         let json = serde_json::to_string(&commit).unwrap();
         let decoded: ManifestCommit = serde_json::from_str(&json).unwrap();
         assert_eq!(commit, decoded);
+    }
+
+    fn test_signature() -> ImageSignature {
+        ImageSignature {
+            method: SigningMethod::Keyless {
+                issuer: "https://test.reliaburger.dev".to_string(),
+                identity: "spiffe://test/ns/default/job/build".to_string(),
+            },
+            signature: "MEUCIQD...".to_string(),
+            verification_material: VerificationMaterial::CertificateChain(vec![
+                vec![1, 2, 3],
+                vec![4, 5, 6],
+            ]),
+            signed_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn image_signature_serde_round_trip() {
+        let sig = test_signature();
+        let json = serde_json::to_string(&sig).unwrap();
+        let decoded: ImageSignature = serde_json::from_str(&json).unwrap();
+        assert_eq!(sig, decoded);
+    }
+
+    #[test]
+    fn signing_method_keyless_serde() {
+        let method = SigningMethod::Keyless {
+            issuer: "https://prod.reliaburger.dev".to_string(),
+            identity: "spiffe://prod/ns/ci/job/build-api".to_string(),
+        };
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: SigningMethod = serde_json::from_str(&json).unwrap();
+        assert_eq!(method, decoded);
+        assert!(json.contains("Keyless"));
+    }
+
+    #[test]
+    fn signing_method_external_key_serde() {
+        let method = SigningMethod::ExternalKey {
+            key_id: "cosign-key-abc123".to_string(),
+        };
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: SigningMethod = serde_json::from_str(&json).unwrap();
+        assert_eq!(method, decoded);
+        assert!(json.contains("ExternalKey"));
+    }
+
+    #[test]
+    fn manifest_with_signature_serde() {
+        let mut m = test_manifest("myapp", "mfst1");
+        m.signature = Some(test_signature());
+        let json = serde_json::to_string(&m).unwrap();
+        let decoded: ImageManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, decoded);
+        assert!(decoded.signature.is_some());
+    }
+
+    #[test]
+    fn manifest_catalog_attach_signature() {
+        let mut catalog = ManifestCatalog::default();
+        let m = test_manifest("myapp", "mfst1");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest: m.clone(),
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        assert!(
+            catalog
+                .get_manifest(m.digest.as_str())
+                .unwrap()
+                .signature
+                .is_none()
+        );
+
+        catalog.apply_attach_signature(&AttachSignature {
+            manifest_digest: m.digest.clone(),
+            signature: test_signature(),
+        });
+
+        let updated = catalog.get_manifest(m.digest.as_str()).unwrap();
+        assert!(updated.signature.is_some());
+    }
+
+    #[test]
+    fn manifest_catalog_attach_signature_missing_manifest_is_noop() {
+        let mut catalog = ManifestCatalog::default();
+        // No manifest committed — attach should be a no-op
+        catalog.apply_attach_signature(&AttachSignature {
+            manifest_digest: test_digest("nonexistent"),
+            signature: test_signature(),
+        });
+        assert!(catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn attach_signature_serde_round_trip() {
+        let attach = AttachSignature {
+            manifest_digest: test_digest("mfst1"),
+            signature: test_signature(),
+        };
+        let json = serde_json::to_string(&attach).unwrap();
+        let decoded: AttachSignature = serde_json::from_str(&json).unwrap();
+        assert_eq!(attach, decoded);
     }
 }

@@ -17,7 +17,7 @@ use crate::config::app::AppSpec;
 use crate::meat::deploy_types::{DeployHistoryEntry, DeployState};
 use crate::meat::types::{AppId, Placement, SchedulingDecision};
 use crate::pickle::types::{
-    DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
+    AttachSignature, DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +130,8 @@ pub enum RaftRequest {
     GitOpsCoordinatorElection(crate::lettuce::types::CoordinatorElection),
     /// Update GitOps sync state.
     GitOpsSyncUpdate(Box<crate::lettuce::types::SyncState>),
+    /// Attach a cryptographic signature to an image manifest.
+    AttachSignature(AttachSignature),
     /// No-op entry (used for leader commit on election).
     Noop,
 }
@@ -324,6 +326,7 @@ mod tests {
                     total_size: 1024,
                     pushed_at: std::time::SystemTime::UNIX_EPOCH,
                     pushed_by: 1,
+                    signature: None,
                 },
                 tag: "latest".to_string(),
                 holder_nodes: std::collections::BTreeSet::from([1, 2]),
@@ -345,6 +348,23 @@ mod tests {
             RaftRequest::DeleteTag(DeleteTag {
                 repository: "myapp".to_string(),
                 tag: "old".to_string(),
+            }),
+            RaftRequest::AttachSignature(AttachSignature {
+                manifest_digest: crate::pickle::types::Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000005",
+                ),
+                signature: crate::pickle::types::ImageSignature {
+                    method: crate::pickle::types::SigningMethod::Keyless {
+                        issuer: "https://test.reliaburger.dev".to_string(),
+                        identity: "spiffe://test/ns/ci/job/build".to_string(),
+                    },
+                    signature: "MEUCIQD...".to_string(),
+                    verification_material:
+                        crate::pickle::types::VerificationMaterial::CertificateChain(vec![vec![
+                            1, 2, 3,
+                        ]]),
+                    signed_at: std::time::SystemTime::UNIX_EPOCH,
+                },
             }),
         ];
 

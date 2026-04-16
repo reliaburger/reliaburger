@@ -111,6 +111,9 @@ impl StateMachineInner {
             RaftRequest::GitOpsSyncUpdate(sync_state) => {
                 self.state.gitops_sync_state = Some(*sync_state.clone());
             }
+            RaftRequest::AttachSignature(attach) => {
+                self.state.manifest_catalog.apply_attach_signature(attach);
+            }
             RaftRequest::Noop => {}
         }
     }
@@ -573,6 +576,7 @@ mod tests {
                 total_size: 4608,
                 pushed_at: std::time::SystemTime::UNIX_EPOCH,
                 pushed_by: 1,
+                signature: None,
             },
             tag: "latest".to_string(),
             holder_nodes: std::collections::BTreeSet::from([1, 2]),

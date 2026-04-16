@@ -178,7 +178,12 @@ Single source of truth for what's done and what's next. Check off an item only w
 ## Phase 10: Advanced Security
 
 - [x] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
-- [ ] Image signing (keyless via workload identity, cosign-compatible)
+- [x] Image signing (keyless via workload identity, cosign-compatible)
+- [ ] SecurityState in Raft (prerequisite for the wiring items below)
+- [ ] Wire agent-to-council CSR flow during deploy (needs SecurityState in Raft)
+- [ ] Wire automatic keyless signing after build job push (needs SecurityState in Raft)
+- [ ] `relish sign` CLI command + cosign OCI artifact interception
+- [ ] `/v1/identity/csr` and `/v1/identity/jwks` API endpoints
 - [ ] TPM sealing, CRL distribution, egress DNS resolution
 - [ ] `relish token list/revoke` (SecurityState in Raft)
 - [ ] Join token validation in agent (SecurityState in Raft)

@@ -25,6 +25,9 @@ pub enum ScheduleError {
 
     #[error("invalid spec: {reason}")]
     InvalidSpec { reason: String },
+
+    #[error("image {image} requires a signature (require_signatures is enabled)")]
+    UnsignedImage { image: String },
 }
 
 /// The Meat scheduler.
@@ -182,6 +185,52 @@ fn parse_label_list(labels: &[String]) -> BTreeMap<String, String> {
             Some((k.to_string(), v.to_string()))
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Image signature enforcement
+// ---------------------------------------------------------------------------
+
+/// Check whether an image is schedulable under the trust policy.
+///
+/// If `require_signatures` is `true` and the image is in the Pickle
+/// manifest catalog without a signature, returns `UnsignedImage`.
+/// External images (not in catalog) are allowed regardless.
+pub fn check_image_schedulable(
+    image: Option<&str>,
+    catalog: &crate::pickle::types::ManifestCatalog,
+    require_signatures: bool,
+) -> Result<(), ScheduleError> {
+    if !require_signatures {
+        return Ok(());
+    }
+
+    let Some(image_ref) = image else {
+        return Ok(()); // process workloads have no image
+    };
+
+    // Parse "repository:tag" from the image reference
+    // Simple split — full ImageReference parsing isn't needed here
+    let (repo, tag) = if let Some((r, t)) = image_ref.rsplit_once(':') {
+        (r, t)
+    } else {
+        (image_ref, "latest")
+    };
+
+    // Strip any registry prefix for local Pickle images
+    // e.g. "localhost:5050/myapp:v1" → "myapp"
+    let repo = repo.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo);
+
+    // Look up in catalog — if not found, it's an external image (allow it)
+    if let Some(manifest) = catalog.get_manifest_by_tag(repo, tag)
+        && manifest.signature.is_none()
+    {
+        return Err(ScheduleError::UnsignedImage {
+            image: image_ref.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -459,5 +508,101 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert_eq!(map.get("zone").unwrap(), "us-east");
         assert_eq!(map.get("ssd").unwrap(), "true");
+    }
+
+    // --- Image signature enforcement ---
+
+    #[test]
+    fn check_image_schedulable_allows_unsigned_when_disabled() {
+        let catalog = crate::pickle::types::ManifestCatalog::default();
+        let result = super::check_image_schedulable(Some("myapp:v1"), &catalog, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_image_schedulable_rejects_unsigned_when_required() {
+        use crate::pickle::types::*;
+        use std::collections::BTreeSet;
+
+        let mut catalog = ManifestCatalog::default();
+        let manifest = ImageManifest {
+            digest: Digest::from_sha256_hex(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            ),
+            config: LayerDescriptor {
+                digest: Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                size: 100,
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            },
+            layers: vec![],
+            repository: "myapp".to_string(),
+            tags: BTreeSet::new(),
+            total_size: 100,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: None, // unsigned!
+        };
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "v1".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        let result = super::check_image_schedulable(Some("myapp:v1"), &catalog, true);
+        assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
+    }
+
+    #[test]
+    fn check_image_schedulable_allows_signed_when_required() {
+        use crate::pickle::types::*;
+        use std::collections::BTreeSet;
+
+        let mut catalog = ManifestCatalog::default();
+        let manifest = ImageManifest {
+            digest: Digest::from_sha256_hex(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            ),
+            config: LayerDescriptor {
+                digest: Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                size: 100,
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            },
+            layers: vec![],
+            repository: "myapp".to_string(),
+            tags: BTreeSet::new(),
+            total_size: 100,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: Some(ImageSignature {
+                method: SigningMethod::Keyless {
+                    issuer: "https://test.reliaburger.dev".to_string(),
+                    identity: "spiffe://test/ns/ci/job/build".to_string(),
+                },
+                signature: "MEUCIQD...".to_string(),
+                verification_material: VerificationMaterial::CertificateChain(vec![vec![1, 2, 3]]),
+                signed_at: std::time::SystemTime::UNIX_EPOCH,
+            }),
+        };
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "v1".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        let result = super::check_image_schedulable(Some("myapp:v1"), &catalog, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_image_schedulable_allows_external_image() {
+        // Image not in catalog = external registry, always allowed
+        let catalog = crate::pickle::types::ManifestCatalog::default();
+        let result =
+            super::check_image_schedulable(Some("docker.io/library/nginx:latest"), &catalog, true);
+        assert!(result.is_ok());
     }
 }

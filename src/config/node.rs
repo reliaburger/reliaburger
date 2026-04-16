@@ -224,6 +224,22 @@ pub struct ImagesSection {
     pub gc_interval_hours: u32,
     /// Port for the OCI Distribution API (Pickle registry).
     pub registry_port: u16,
+    /// Image trust policy (signature requirements).
+    pub trust_policy: TrustPolicySection,
+}
+
+/// Image trust policy controlling signature requirements.
+///
+/// When `require_signatures` is `true`, the scheduler refuses to
+/// schedule Pickle-hosted images that have no attached signature.
+/// Images from external registries are not checked.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrustPolicySection {
+    /// Require all Pickle-hosted images to be signed before scheduling.
+    pub require_signatures: bool,
+    /// Base64-encoded ECDSA P-256 public keys trusted for external signing.
+    pub keys: Vec<String>,
 }
 
 impl Default for ImagesSection {
@@ -234,6 +250,7 @@ impl Default for ImagesSection {
             gc_retain_days: 7,
             gc_interval_hours: 1,
             registry_port: 5050,
+            trust_policy: TrustPolicySection::default(),
         }
     }
 }
@@ -430,5 +447,24 @@ mod tests {
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.logs.retention_days, 14);
         assert_eq!(nc.logs.max_file_size_mb, 500);
+    }
+
+    #[test]
+    fn parse_trust_policy_defaults() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(!nc.images.trust_policy.require_signatures);
+        assert!(nc.images.trust_policy.keys.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_policy_enabled_with_keys() {
+        let toml_str = r#"
+            [images.trust_policy]
+            require_signatures = true
+            keys = ["MFkwEwYHKoZIzj0CAQ...", "MFkwEwYHKoZIzj0CAR..."]
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert!(nc.images.trust_policy.require_signatures);
+        assert_eq!(nc.images.trust_policy.keys.len(), 2);
     }
 }

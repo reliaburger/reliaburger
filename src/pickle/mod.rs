@@ -9,5 +9,6 @@ pub mod build;
 pub mod gc;
 pub mod pull;
 pub mod replication;
+pub mod signing;
 pub mod store;
 pub mod types;

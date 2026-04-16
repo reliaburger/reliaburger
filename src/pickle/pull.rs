@@ -153,6 +153,7 @@ mod tests {
             total_size: 3072,
             pushed_at: SystemTime::UNIX_EPOCH,
             pushed_by: 1,
+            signature: None,
         }
     }
 

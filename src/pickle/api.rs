@@ -325,6 +325,7 @@ async fn manifest_put(
                 total_size: body.len() as u64,
                 pushed_at: std::time::SystemTime::now(),
                 pushed_by: 0,
+                signature: None,
             };
             let commit = ManifestCommit {
                 manifest,
@@ -361,6 +362,7 @@ async fn manifest_put(
             total_size: body.len() as u64,
             pushed_at: std::time::SystemTime::now(),
             pushed_by: 0,
+            signature: None,
         };
         let commit = ManifestCommit {
             manifest,
@@ -445,6 +447,7 @@ async fn manifest_put(
         total_size,
         pushed_at: std::time::SystemTime::now(),
         pushed_by: 0,
+        signature: None,
     };
 
     let commit = ManifestCommit {

@@ -123,23 +123,20 @@ fn jobs_that_fit(available: &Resources, required: &Resources) -> usize {
         return 10_000;
     }
 
-    let by_cpu = if required.cpu_millicores > 0 {
-        available.cpu_millicores / required.cpu_millicores
-    } else {
-        u64::MAX
-    };
+    let by_cpu = available
+        .cpu_millicores
+        .checked_div(required.cpu_millicores)
+        .unwrap_or(u64::MAX);
 
-    let by_mem = if required.memory_bytes > 0 {
-        available.memory_bytes / required.memory_bytes
-    } else {
-        u64::MAX
-    };
+    let by_mem = available
+        .memory_bytes
+        .checked_div(required.memory_bytes)
+        .unwrap_or(u64::MAX);
 
-    let by_gpu = if required.gpus > 0 {
-        (available.gpus / required.gpus) as u64
-    } else {
-        u64::MAX
-    };
+    let by_gpu = (available.gpus)
+        .checked_div(required.gpus)
+        .map(|v| v as u64)
+        .unwrap_or(u64::MAX);
 
     by_cpu.min(by_mem).min(by_gpu) as usize
 }
