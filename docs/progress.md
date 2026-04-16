@@ -178,7 +178,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 ## Phase 10: Advanced Security
 
 - [x] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
-- [ ] Image signing (keyless via workload identity, cosign-compatible)
+- [x] Image signing (keyless via workload identity, cosign-compatible)
 - [ ] TPM sealing, CRL distribution, egress DNS resolution
 - [ ] `relish token list/revoke` (SecurityState in Raft)
 - [ ] Join token validation in agent (SecurityState in Raft)
