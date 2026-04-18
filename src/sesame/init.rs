@@ -46,6 +46,9 @@ pub struct InitResult {
     pub sealed_root_ca_path: String,
     /// OIDC signing key ID (for JWKS endpoint).
     pub oidc_key_id: String,
+    /// Master secret (HKDF IKM) used to wrap CA and OIDC private keys.
+    /// Must be persisted to a secure file. NEVER store in Raft.
+    pub master_secret: [u8; 32],
 }
 
 /// Default join token TTL: 15 minutes.
@@ -142,6 +145,7 @@ pub fn initialize_cluster(
         cluster_name: cluster_name.to_string(),
         sealed_root_ca_path: sealed_path.display().to_string(),
         oidc_key_id,
+        master_secret,
     })
 }
 
@@ -300,5 +304,14 @@ mod tests {
         assert!(oidc.issuer.contains("oidc-test"));
         assert_eq!(oidc.public_key_der.len(), 32); // Ed25519 public key
         assert_eq!(result.oidc_key_id, oidc.key_id);
+    }
+
+    #[test]
+    fn initialize_cluster_returns_nonzero_master_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = initialize_cluster("secret-test", "node-01", dir.path()).unwrap();
+
+        assert_ne!(result.master_secret, [0u8; 32]);
+        assert_eq!(result.master_secret.len(), 32);
     }
 }
