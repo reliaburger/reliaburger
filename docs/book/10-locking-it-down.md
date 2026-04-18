@@ -285,3 +285,60 @@ RaftRequest::AttachSignature(attach) => {
 ```
 
 Once written to Raft, the signature is replicated to all council nodes. The scheduler reads it directly from `DesiredState` without re-verifying -- first-write wins.
+
+## SecurityState in Raft
+
+The CA hierarchy, API tokens, join tokens, age keypairs, and OIDC signing config all live in a single `SecurityState` struct. During `relish init`, this struct is generated alongside a 32-byte master secret. The master secret wraps all private keys using HKDF + AES-256-GCM. The struct itself (with its wrapped keys) is safe to replicate, but the master secret must stay off the wire.
+
+### Two files from init
+
+When you run `relish init`, two sensitive files appear alongside the node config:
+
+```
+mycluster-master.key              # hex-encoded 32-byte master secret (0o600)
+mycluster-security-bootstrap.json # full SecurityState as JSON
+```
+
+The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file.
+
+The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON, writes a `SecurityStateInit` command to Raft, and deletes the file. After that, SecurityState lives in Raft and replicates to every council node automatically.
+
+### How it fits into Raft
+
+`SecurityState` is a field on `DesiredState`, the struct that the Raft state machine maintains:
+
+```rust
+pub struct DesiredState {
+    pub apps: HashMap<AppId, AppSpec>,
+    pub scheduling: HashMap<AppId, Vec<Placement>>,
+    pub manifest_catalog: ManifestCatalog,
+    // ... other fields ...
+    #[serde(default)]
+    pub security_state: SecurityState,
+}
+```
+
+The `#[serde(default)]` annotation means old Raft snapshots (from before this field existed) deserialise cleanly with an empty `SecurityState`. No migration needed.
+
+Six new `RaftRequest` variants handle security state mutations:
+
+- `SecurityStateInit` -- initial bootstrap from the JSON file
+- `CreateJoinToken` / `ConsumeJoinToken` -- join token lifecycle
+- `CreateApiToken` / `RevokeApiToken` -- API token management
+- `AllocateSerial` -- monotonically incrementing certificate serial counter
+
+Every mutation goes through Raft consensus, so all council nodes see the same sequence of token creations, revocations, and serial allocations. No two nodes can accidentally issue the same serial number.
+
+### The master secret stays in memory
+
+Council nodes load the master secret from the key file at startup and hold it in memory:
+
+```rust
+pub struct CouncilNode {
+    raft: Raft<TypeConfig>,
+    state_machine: CouncilStateMachine,
+    wrapping_ikm: Option<[u8; 32]>,  // in-memory only
+}
+```
+
+When a node needs to sign a workload CSR or issue a join certificate, it reads the wrapped CA private key from `SecurityState` (in Raft), unwraps it with the in-memory master secret, performs the cryptographic operation, and discards the unwrapped key. The master secret never appears in Raft, never crosses the network, and never touches disk except in the original key file.

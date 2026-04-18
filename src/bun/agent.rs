@@ -274,6 +274,8 @@ pub struct ClusterHandle {
     pub council: Option<Arc<CouncilNode>>,
     /// Channel for receiving snapshot requests from the reporting worker.
     pub snapshot_rx: mpsc::Receiver<CollectSnapshotRequest>,
+    /// Master secret for unwrapping CA private keys during join/CSR operations.
+    pub wrapping_ikm: Option<[u8; 32]>,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
