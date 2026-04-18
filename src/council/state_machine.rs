@@ -114,6 +114,35 @@ impl StateMachineInner {
             RaftRequest::AttachSignature(attach) => {
                 self.state.manifest_catalog.apply_attach_signature(attach);
             }
+            RaftRequest::SecurityStateInit(ss) => {
+                self.state.security_state = *ss.clone();
+            }
+            RaftRequest::CreateJoinToken(jt) => {
+                self.state.security_state.join_tokens.push(jt.clone());
+            }
+            RaftRequest::ConsumeJoinToken { token_hash } => {
+                if let Some(jt) = self
+                    .state
+                    .security_state
+                    .join_tokens
+                    .iter_mut()
+                    .find(|jt| jt.token_hash == *token_hash)
+                {
+                    jt.consumed = true;
+                }
+            }
+            RaftRequest::CreateApiToken(token) => {
+                self.state.security_state.api_tokens.push(token.clone());
+            }
+            RaftRequest::RevokeApiToken { name } => {
+                self.state
+                    .security_state
+                    .api_tokens
+                    .retain(|t| t.name != *name);
+            }
+            RaftRequest::AllocateSerial => {
+                self.state.security_state.next_serial += 1;
+            }
             RaftRequest::Noop => {}
         }
     }
@@ -796,5 +825,97 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, decoded);
+    }
+
+    // --- SecurityState Raft tests ---
+
+    #[test]
+    fn apply_security_state_init_sets_cas() {
+        let mut inner = StateMachineInner::default();
+        let mut ss = crate::sesame::types::SecurityState::default();
+        ss.next_serial = 42;
+        inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(ss)));
+
+        assert_eq!(inner.state.security_state.next_serial, 42);
+    }
+
+    #[test]
+    fn apply_create_join_token() {
+        let mut inner = StateMachineInner::default();
+        let jt = crate::sesame::types::JoinToken {
+            token_hash: [0xAB; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: crate::sesame::types::AttestationMode::None,
+        };
+        inner.apply_request(&RaftRequest::CreateJoinToken(jt));
+        assert_eq!(inner.state.security_state.join_tokens.len(), 1);
+        assert!(!inner.state.security_state.join_tokens[0].consumed);
+    }
+
+    #[test]
+    fn apply_consume_join_token() {
+        let mut inner = StateMachineInner::default();
+        let jt = crate::sesame::types::JoinToken {
+            token_hash: [0xAB; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: crate::sesame::types::AttestationMode::None,
+        };
+        inner.apply_request(&RaftRequest::CreateJoinToken(jt));
+        inner.apply_request(&RaftRequest::ConsumeJoinToken {
+            token_hash: [0xAB; 32],
+        });
+        assert!(inner.state.security_state.join_tokens[0].consumed);
+    }
+
+    #[test]
+    fn apply_create_api_token() {
+        let mut inner = StateMachineInner::default();
+        let token = crate::sesame::types::ApiToken {
+            name: "ci".to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role: crate::sesame::types::ApiRole::Deployer,
+            scope: crate::sesame::types::TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        inner.apply_request(&RaftRequest::CreateApiToken(token));
+        assert_eq!(inner.state.security_state.api_tokens.len(), 1);
+        assert_eq!(inner.state.security_state.api_tokens[0].name, "ci");
+    }
+
+    #[test]
+    fn apply_revoke_api_token() {
+        let mut inner = StateMachineInner::default();
+        let token = crate::sesame::types::ApiToken {
+            name: "ci".to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role: crate::sesame::types::ApiRole::Deployer,
+            scope: crate::sesame::types::TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::now(),
+        };
+        inner.apply_request(&RaftRequest::CreateApiToken(token));
+        assert_eq!(inner.state.security_state.api_tokens.len(), 1);
+
+        inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: "ci".to_string(),
+        });
+        assert!(inner.state.security_state.api_tokens.is_empty());
+    }
+
+    #[test]
+    fn apply_allocate_serial_increments() {
+        let mut inner = StateMachineInner::default();
+        assert_eq!(inner.state.security_state.next_serial, 0);
+
+        inner.apply_request(&RaftRequest::AllocateSerial);
+        assert_eq!(inner.state.security_state.next_serial, 1);
+
+        inner.apply_request(&RaftRequest::AllocateSerial);
+        assert_eq!(inner.state.security_state.next_serial, 2);
     }
 }

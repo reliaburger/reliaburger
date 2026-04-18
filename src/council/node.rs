@@ -31,6 +31,8 @@ pub struct CouncilNode {
     #[allow(dead_code)]
     raft_id: u64,
     state_machine: CouncilStateMachine,
+    /// Master secret for unwrapping CA private keys (in-memory only).
+    wrapping_ikm: Option<[u8; 32]>,
 }
 
 impl CouncilNode {
@@ -46,6 +48,7 @@ impl CouncilNode {
         network: N,
         log_store: MemLogStore,
         state_machine: CouncilStateMachine,
+        wrapping_ikm: Option<[u8; 32]>,
     ) -> Result<Self, CouncilError> {
         let raft_config = Arc::new(
             config
@@ -68,6 +71,7 @@ impl CouncilNode {
             raft,
             raft_id,
             state_machine,
+            wrapping_ikm,
         })
     }
 
@@ -162,6 +166,16 @@ impl CouncilNode {
     pub fn raft(&self) -> &Raft<TypeConfig> {
         &self.raft
     }
+
+    /// Returns the wrapping IKM for unwrapping CA private keys.
+    pub fn wrapping_ikm(&self) -> Option<&[u8; 32]> {
+        self.wrapping_ikm.as_ref()
+    }
+
+    /// Read the current security state from the state machine.
+    pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
+        self.state_machine.desired_state().await.security_state
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +222,7 @@ mod tests {
             let network = InMemoryRaftNetworkFactory::new(id, router.clone());
             let log_store = MemLogStore::new();
             let sm = CouncilStateMachine::new();
-            let node = CouncilNode::new(id, fast_config(), network, log_store, sm)
+            let node = CouncilNode::new(id, fast_config(), network, log_store, sm, None)
                 .await
                 .unwrap();
             router.register(id, node.raft().clone()).await;
@@ -317,6 +331,7 @@ mod tests {
                 network,
                 MemLogStore::new(),
                 CouncilStateMachine::new(),
+                None,
             )
             .await
             .unwrap();
@@ -370,6 +385,7 @@ mod tests {
                 network,
                 MemLogStore::new(),
                 CouncilStateMachine::new(),
+                None,
             )
             .await
             .unwrap();

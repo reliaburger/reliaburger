@@ -39,6 +39,7 @@ async fn create_cluster(n: u64) -> (Vec<CouncilNode>, InMemoryRaftRouter) {
             network,
             MemLogStore::new(),
             CouncilStateMachine::new(),
+            None,
         )
         .await
         .unwrap();

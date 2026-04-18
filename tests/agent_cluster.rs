@@ -83,6 +83,7 @@ async fn agent_nodes_returns_membership() {
         raft_metrics_rx: None,
         council: None,
         snapshot_rx,
+        wrapping_ikm: None,
     };
 
     let grill = ProcessGrill::new();
@@ -126,6 +127,7 @@ async fn agent_council_returns_raft_state() {
         network,
         MemLogStore::new(),
         CouncilStateMachine::new(),
+        None,
     )
     .await
     .unwrap();
@@ -160,6 +162,7 @@ async fn agent_council_returns_raft_state() {
         raft_metrics_rx: Some(raft_metrics_rx),
         council: Some(council.clone()),
         snapshot_rx,
+        wrapping_ikm: None,
     };
 
     let grill = ProcessGrill::new();
@@ -302,6 +305,7 @@ async fn agent_snapshot_request_returns_instances() {
         raft_metrics_rx: None,
         council: None,
         snapshot_rx,
+        wrapping_ikm: None,
     };
 
     let grill = ProcessGrill::new();
