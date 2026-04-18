@@ -185,9 +185,32 @@ pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishE
     let init_result = crate::sesame::init::initialize_cluster(cluster_name, node_id, dir)
         .map_err(|e| RelishError::InitFailed(e.to_string()))?;
 
+    // Persist the master secret to a secure file
+    let secret_path = dir.join(format!("{cluster_name}-master.key"));
+    let secret_hex = hex::encode(init_result.master_secret);
+    fs::write(&secret_path, &secret_hex)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Write security state to a bootstrap file for bun to load on first startup
+    let bootstrap_path = dir.join(format!("{cluster_name}-security-bootstrap.json"));
+    let bootstrap_json = serde_json::to_string_pretty(&init_result.security_state)
+        .map_err(|e| RelishError::InitFailed(format!("failed to serialise security state: {e}")))?;
+    fs::write(&bootstrap_path, &bootstrap_json)?;
+
     // Output the init summary to stderr (join token is sensitive)
     let output = crate::sesame::init::format_init_output(&init_result);
     eprint!("{output}");
+    eprintln!("  Master secret:   {}", secret_path.display());
+    eprintln!("  Security state:  {}", bootstrap_path.display());
+    eprintln!();
+    eprintln!(
+        "  Back up {}-master.key alongside the sealed root CA key.",
+        cluster_name
+    );
 
     let node_config = crate::config::node::NodeConfig::default();
     let node_toml = format!(

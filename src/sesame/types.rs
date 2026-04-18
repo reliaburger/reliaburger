@@ -48,7 +48,7 @@ impl fmt::Display for CaRole {
 }
 
 /// A private key encrypted with an HKDF-derived wrapping key (AES-256-GCM).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WrappedKey {
     /// AES-256-GCM ciphertext of the private key DER.
     pub ciphertext: Vec<u8>,
@@ -61,7 +61,7 @@ pub struct WrappedKey {
 }
 
 /// One CA in the hierarchy (root, node, workload, or ingress).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CertificateAuthority {
     /// Which CA this is.
     pub role: CaRole,
@@ -87,7 +87,7 @@ pub struct CertificateAuthority {
 // ---------------------------------------------------------------------------
 
 /// A certificate issued to a cluster node for inter-node mTLS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeCertificate {
     /// The node's unique identifier (used as CN in the certificate).
     pub node_id: String,
@@ -189,7 +189,7 @@ pub struct WorkloadIdentity {
 ///
 /// Stored in Raft as part of `SecurityState`. The Ed25519 private key
 /// is wrapped with the same HKDF mechanism used for CA private keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OidcSigningConfig {
     /// Ed25519 private key for signing JWTs, wrapped with AES-256-GCM.
     pub signing_key_wrapped: WrappedKey,
@@ -257,7 +257,7 @@ impl fmt::Display for ApiRole {
 }
 
 /// Scope restrictions on an API token.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TokenScope {
     /// If set, token can only act on these app names.
     pub apps: Option<Vec<String>>,
@@ -281,7 +281,7 @@ impl TokenScope {
 }
 
 /// An API token for human or CI access to the cluster.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiToken {
     /// Human-readable name for the token.
     pub name: String,
@@ -313,7 +313,7 @@ pub enum AgeKeyScope {
 }
 
 /// An age keypair used for encrypting/decrypting secrets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgeKeypair {
     /// The scope of this keypair.
     pub scope: AgeKeyScope,
@@ -341,7 +341,7 @@ pub enum AttestationMode {
 }
 
 /// A one-time-use join token for adding a node to the cluster.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JoinToken {
     /// SHA-256 hash of the token value (plaintext is never stored).
     pub token_hash: [u8; 32],
@@ -358,7 +358,7 @@ pub struct JoinToken {
 // ---------------------------------------------------------------------------
 
 /// The full security state stored in Raft.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SecurityState {
     /// The CA hierarchy (root + intermediates).
     pub certificate_authorities: Vec<CertificateAuthority>,

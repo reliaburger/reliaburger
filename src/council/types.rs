@@ -19,6 +19,7 @@ use crate::meat::types::{AppId, Placement, SchedulingDecision};
 use crate::pickle::types::{
     AttachSignature, DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
 };
+use crate::sesame::types::SecurityState;
 
 // ---------------------------------------------------------------------------
 // openraft type configuration
@@ -132,6 +133,18 @@ pub enum RaftRequest {
     GitOpsSyncUpdate(Box<crate::lettuce::types::SyncState>),
     /// Attach a cryptographic signature to an image manifest.
     AttachSignature(AttachSignature),
+    /// Set the initial SecurityState during cluster bootstrap.
+    SecurityStateInit(Box<SecurityState>),
+    /// Add a new join token to the security state.
+    CreateJoinToken(crate::sesame::types::JoinToken),
+    /// Mark a join token as consumed (identified by hash).
+    ConsumeJoinToken { token_hash: [u8; 32] },
+    /// Add a new API token.
+    CreateApiToken(crate::sesame::types::ApiToken),
+    /// Revoke (remove) an API token by name.
+    RevokeApiToken { name: String },
+    /// Allocate the next certificate serial number.
+    AllocateSerial,
     /// No-op entry (used for leader commit on election).
     Noop,
 }
@@ -191,6 +204,10 @@ pub struct DesiredState {
     /// GitOps coordinator election.
     #[serde(default)]
     pub gitops_coordinator: Option<crate::lettuce::types::CoordinatorElection>,
+    /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
+    /// Contains wrapped (encrypted) private keys — safe to replicate.
+    #[serde(default)]
+    pub security_state: SecurityState,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -366,6 +383,29 @@ mod tests {
                     signed_at: std::time::SystemTime::UNIX_EPOCH,
                 },
             }),
+            RaftRequest::SecurityStateInit(Box::new(SecurityState::default())),
+            RaftRequest::CreateJoinToken(crate::sesame::types::JoinToken {
+                token_hash: [0xAB; 32],
+                expires_at: std::time::SystemTime::UNIX_EPOCH,
+                consumed: false,
+                attestation_mode: crate::sesame::types::AttestationMode::None,
+            }),
+            RaftRequest::ConsumeJoinToken {
+                token_hash: [0xAB; 32],
+            },
+            RaftRequest::CreateApiToken(crate::sesame::types::ApiToken {
+                name: "ci-deploy".to_string(),
+                token_hash: vec![1, 2, 3],
+                token_salt: vec![4, 5, 6],
+                role: crate::sesame::types::ApiRole::Deployer,
+                scope: crate::sesame::types::TokenScope::default(),
+                expires_at: None,
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+            }),
+            RaftRequest::RevokeApiToken {
+                name: "ci-deploy".to_string(),
+            },
+            RaftRequest::AllocateSerial,
         ];
 
         for req in &requests {
