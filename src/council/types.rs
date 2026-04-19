@@ -145,6 +145,16 @@ pub enum RaftRequest {
     RevokeApiToken { name: String },
     /// Allocate the next certificate serial number.
     AllocateSerial,
+    /// Start a secret key rotation: add a new age keypair, mark the
+    /// current one as read-only.
+    RotateSecretKey {
+        scope: crate::sesame::types::AgeKeyScope,
+        new_keypair: crate::sesame::types::AgeKeypair,
+    },
+    /// Finalise a secret key rotation: remove old read-only keypairs.
+    FinalizeSecretRotation {
+        scope: crate::sesame::types::AgeKeyScope,
+    },
     /// No-op entry (used for leader commit on election).
     Noop,
 }

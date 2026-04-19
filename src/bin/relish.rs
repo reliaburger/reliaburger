@@ -251,6 +251,12 @@ enum SecretAction {
         /// The plaintext value to encrypt.
         value: String,
     },
+    /// Rotate the secret encryption key (start or finalise).
+    Rotate {
+        /// Finalise rotation: remove old read-only keypair.
+        #[arg(long)]
+        finalize: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -601,6 +607,7 @@ async fn main() -> ExitCode {
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
+            SecretAction::Rotate { finalize } => commands::secret_rotate(*finalize).await,
         },
         Command::Token { action } => match &action {
             TokenAction::Create {

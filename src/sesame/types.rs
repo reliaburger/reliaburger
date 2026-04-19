@@ -323,6 +323,10 @@ pub struct AgeKeypair {
     pub private_key_wrapped: WrappedKey,
     /// Generation counter, incremented on `relish secret rotate`.
     pub generation: u64,
+    /// Whether this key is read-only (old generation, kept for decryption
+    /// of not-yet-re-encrypted secrets during rotation).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 // ---------------------------------------------------------------------------
