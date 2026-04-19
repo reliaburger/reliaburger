@@ -184,13 +184,13 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Wire automatic keyless signing after build job push
 - [x] `relish sign` CLI command
 - [x] `/v1/identity/jwks` and `/v1/identity/sign` API endpoints
-- [ ] CRL distribution, egress DNS resolution
+- [x] CRL distribution, egress DNS resolution
 - TPM sealing — deferred to v2 (requires hardware)
 - [x] `relish token list/revoke` (SecurityState in Raft)
 - [x] Join token validation in agent (SecurityState in Raft)
 - [x] `relish secret rotate` (dual-key transition window)
-- [ ] Book chapter 10: "Locking It Down"
-- [ ] All Phase 10 tests green
+- [x] Book chapter 10: "Locking It Down"
+- [x] All Phase 10 tests green (1448 tests)
 
 ## Phase 11: Advanced Observability
 

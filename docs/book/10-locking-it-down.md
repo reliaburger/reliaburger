@@ -378,3 +378,66 @@ FinalizeSecretRotation { scope }          // delete read-only keypairs
 ```
 
 This dual-key window means rotation is never a cliff. You start it, re-encrypt your secrets at your own pace, then finalise when ready.
+
+## Certificate revocation
+
+Sometimes you need to revoke a certificate before it expires. A node gets compromised, a workload's key leaks, or you rotate a CA. The Certificate Revocation List (CRL) tracks which serial numbers are no longer trusted.
+
+The CRL lives in `SecurityState`, replicated through Raft:
+
+```rust
+pub struct Crl {
+    pub entries: Vec<CrlEntry>,
+    pub version: u64,
+    pub updated_at: SystemTime,
+}
+
+pub struct CrlEntry {
+    pub serial: SerialNumber,
+    pub issuer: CaRole,
+    pub revoked_at: SystemTime,
+    pub reason: String,
+}
+```
+
+When the council leader processes a `RevokeCertificate` command, it appends an entry and bumps the version. Any node can read the CRL from `council.security_state()` and check whether a peer's certificate serial appears in the list.
+
+The check itself is simple:
+
+```rust
+pub fn check_crl(serial: SerialNumber, crl: &Crl) -> Result<(), CertError> {
+    if let Some(entry) = crl.entries.iter().find(|e| e.serial == serial) {
+        return Err(CertError::Revoked { serial, reason: entry.reason.clone() });
+    }
+    Ok(())
+}
+```
+
+CRLs are small (one entry per revoked cert, most clusters have few revocations). They propagate through Raft replication, so all council members have the same CRL. Worker nodes read it from their assigned council parent.
+
+## Egress DNS resolution
+
+Apps can restrict outbound connections to specific destinations via `[egress] allow = ["api.stripe.com:443"]`. The initial resolution happens at deploy time using synchronous DNS. But hostnames can change IPs.
+
+We added an async re-resolution function that uses `tokio::net::lookup_host()` instead of blocking `ToSocketAddrs`. The agent can call this periodically (e.g. every 5 minutes in the health tick) to detect IP changes and update the BPF egress maps.
+
+The key difference from the sync version: it doesn't block the tokio runtime, so it can run alongside health checks and identity rotation without stalling the event loop.
+
+## What we deferred
+
+**TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.
+
+## What we built
+
+Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
+
+- Every workload gets a SPIFFE X.509 certificate and OIDC JWT automatically
+- Images are signed (keyless or cosign-compatible) and verified by the scheduler
+- SecurityState (CAs, tokens, keypairs, CRL) is replicated through Raft
+- The agent provisions identity during deploy and rotates certificates every 30 minutes
+- API tokens are managed via `relish token list/revoke`
+- Secret keys rotate with a dual-key transition window
+- The CRL tracks revoked certificates
+- Egress DNS re-resolves asynchronously
+
+The next chapter tackles advanced observability.
