@@ -185,9 +185,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] `relish sign` CLI command
 - [x] `/v1/identity/jwks` and `/v1/identity/sign` API endpoints
 - [ ] TPM sealing, CRL distribution, egress DNS resolution
-- [ ] `relish token list/revoke` (SecurityState in Raft)
-- [ ] Join token validation in agent (SecurityState in Raft)
-- [ ] `relish secret rotate` (SecurityState in Raft)
+- [x] `relish token list/revoke` (SecurityState in Raft)
+- [x] Join token validation in agent (SecurityState in Raft)
+- [x] `relish secret rotate` (dual-key transition window)
 - [ ] Book chapter 10: "Locking It Down"
 - [ ] All Phase 10 tests green
 
