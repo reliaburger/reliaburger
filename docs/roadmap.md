@@ -488,7 +488,7 @@ Integration tests:
 - Join token: expiry enforced, single-use enforced, validation rejects expired/revoked tokens
 - Secret rotation: rotate key. Old and new ciphertexts accepted during transition; finalize drops old
 - Token list/revoke: `relish token list` shows active tokens, `relish token revoke` invalidates immediately
-- TPM sealing: sealed key survives reboot, fails on different hardware (where TPM is available)
+- TPM sealing: deferred to v2 (requires hardware)
 - CRL distribution: revoked certificate rejected within one gossip cycle
 
 ### Implementation
@@ -498,7 +498,7 @@ Integration tests:
 3. **SecurityState in Raft.** Token registry, revocation list, secret key metadata.
 4. **Token management.** `relish token list` and `relish token revoke`, join token validation in agent.
 5. **Secret rotation.** `relish secret rotate` with dual-key transition window.
-6. **TPM sealing and CRL distribution.** Hardware-bound key sealing, certificate revocation propagation.
+6. **CRL distribution.** Certificate revocation propagation. (TPM sealing deferred to v2 — requires hardware.)
 7. **Run all tests green.**
 
 Design docs: [security-sesame.md](design/security-sesame.md), [registry-pickle.md](design/registry-pickle.md)
@@ -720,6 +720,7 @@ Design docs: [cli-relish.md](design/cli-relish.md), [agent-bun.md](design/agent-
 
 Features explicitly deferred to v2 (see whitepaper §22 for rationale):
 
+- **TPM sealing.** Bind the master secret to TPM 2.0 PCRs so stolen disks can't unwrap CA keys on different hardware. Requires `tss-esapi` crate and physical TPM (Linux only).
 - **External secret manager integration.** Vault, AWS Secrets Manager, GCP Secret Manager.
 - **Multi-cluster federation (Franchise).** The design is in whitepaper §21; implementation deferred to v2.
   - WAN gossip ring (Mustard extension) for cluster-level metadata exchange
