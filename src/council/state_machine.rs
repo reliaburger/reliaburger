@@ -163,6 +163,11 @@ impl StateMachineInner {
                     .age_keypairs
                     .retain(|kp| kp.scope != *scope || !kp.read_only);
             }
+            RaftRequest::RevokeCertificate(entry) => {
+                self.state.security_state.crl.entries.push(entry.clone());
+                self.state.security_state.crl.version += 1;
+                self.state.security_state.crl.updated_at = std::time::SystemTime::now();
+            }
             RaftRequest::Noop => {}
         }
     }

@@ -155,6 +155,8 @@ pub enum RaftRequest {
     FinalizeSecretRotation {
         scope: crate::sesame::types::AgeKeyScope,
     },
+    /// Revoke a certificate by adding it to the CRL.
+    RevokeCertificate(crate::sesame::types::CrlEntry),
     /// No-op entry (used for leader commit on election).
     Noop,
 }

@@ -151,6 +151,67 @@ pub fn egress_to_bpf_entries(
     entries
 }
 
+/// Asynchronously re-resolve DNS-based egress entries.
+///
+/// Uses `tokio::net::lookup_host` instead of blocking `ToSocketAddrs`.
+/// Returns the new set of resolved (IP, port) pairs. The caller can
+/// compare with the previous set to detect IP changes.
+pub async fn re_resolve_egress_async(
+    allow_list: &[String],
+) -> Result<Vec<(Ipv4Addr, u16)>, EgressError> {
+    let mut resolved = Vec::new();
+    for entry in allow_list {
+        let entry = entry.trim();
+        let (host, port_str) =
+            entry
+                .rsplit_once(':')
+                .ok_or_else(|| EgressError::InvalidFormat {
+                    entry: entry.to_string(),
+                    reason: "expected host:port format".into(),
+                })?;
+
+        let port: u16 = port_str.parse().map_err(|_| EgressError::InvalidFormat {
+            entry: entry.to_string(),
+            reason: format!("invalid port: {port_str}"),
+        })?;
+
+        // IP address — no DNS needed
+        if let Ok(ip) = host.parse::<Ipv4Addr>() {
+            resolved.push((ip, port));
+            continue;
+        }
+
+        // Async DNS resolution
+        let addrs: Vec<(Ipv4Addr, u16)> = tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
+            .map_err(|e| EgressError::DnsResolutionFailed {
+                hostname: host.to_string(),
+                source: e,
+            })?
+            .filter_map(|addr| {
+                if let std::net::SocketAddr::V4(v4) = addr {
+                    Some((*v4.ip(), v4.port()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(EgressError::DnsResolutionFailed {
+                hostname: host.to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no IPv4 addresses found",
+                ),
+            });
+        }
+
+        resolved.extend(addrs);
+    }
+    Ok(resolved)
+}
+
 /// Errors from egress allowlist resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {

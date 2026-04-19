@@ -893,6 +893,7 @@ mod tests {
             join_tokens: vec![],
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
+            crl: crate::sesame::types::Crl::default(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await
