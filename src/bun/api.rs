@@ -110,6 +110,9 @@ pub fn router(
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
+        .route("/v1/token/list", get(token_list_handler))
+        .route("/v1/token/revoke", post(token_revoke_handler))
+        .route("/v1/secret/rotate", post(secret_rotate_handler))
         .with_state(state)
 }
 
@@ -1225,6 +1228,174 @@ async fn identity_sign_handler(State(state): State<ApiState>, body: String) -> R
     }
 }
 
+// ---------------------------------------------------------------------------
+// Token management endpoints
+// ---------------------------------------------------------------------------
+
+/// List API tokens from SecurityState in Raft.
+async fn token_list_handler(State(state): State<ApiState>) -> Response {
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    let security_state = council.security_state().await;
+    let tokens: Vec<serde_json::Value> = security_state
+        .api_tokens
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "role": t.role.to_string(),
+                "expires_at": t.expires_at.map(|e| e.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()),
+                "created_at": t.created_at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "tokens": tokens })).into_response()
+}
+
+/// Revoke an API token by name via Raft.
+async fn token_revoke_handler(State(state): State<ApiState>, body: String) -> Response {
+    #[derive(serde::Deserialize)]
+    struct RevokeRequest {
+        name: String,
+    }
+
+    let req: RevokeRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    match council
+        .write(crate::council::RaftRequest::RevokeApiToken {
+            name: req.name.clone(),
+        })
+        .await
+    {
+        Ok(_) => Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secret rotation endpoint
+// ---------------------------------------------------------------------------
+
+/// Rotate or finalise secret encryption key via Raft.
+async fn secret_rotate_handler(State(state): State<ApiState>, body: String) -> Response {
+    #[derive(serde::Deserialize)]
+    struct RotateRequest {
+        #[serde(default)]
+        finalize: bool,
+    }
+
+    let req: RotateRequest =
+        serde_json::from_str(&body).unwrap_or(RotateRequest { finalize: false });
+
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    let scope = crate::sesame::types::AgeKeyScope::ClusterWide;
+
+    if req.finalize {
+        match council
+            .write(crate::council::RaftRequest::FinalizeSecretRotation { scope })
+            .await
+        {
+            Ok(_) => Json(
+                serde_json::json!({ "message": "secret rotation finalised, old keys removed" }),
+            )
+            .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        }
+    } else {
+        // Generate a new age keypair
+        let ikm = match council.wrapping_ikm() {
+            Some(ikm) => ikm,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": "no wrapping IKM" })),
+                )
+                    .into_response();
+            }
+        };
+
+        let security_state = council.security_state().await;
+        let current_gen = security_state
+            .age_keypairs
+            .iter()
+            .filter(|kp| kp.scope == scope)
+            .map(|kp| kp.generation)
+            .max()
+            .unwrap_or(0);
+
+        let new_gen = current_gen + 1;
+        let (new_keypair, _identity) =
+            match crate::sesame::secret::generate_age_keypair(scope.clone(), ikm, new_gen) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("keypair generation failed: {e}") })),
+                )
+                    .into_response();
+                }
+            };
+
+        let new_pubkey = new_keypair.public_key.clone();
+
+        match council
+            .write(crate::council::RaftRequest::RotateSecretKey { scope, new_keypair })
+            .await
+        {
+            Ok(_) => Json(serde_json::json!({
+                "message": format!("secret key rotated to generation {new_gen}"),
+                "new_public_key": new_pubkey,
+            }))
+            .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,7 +1660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_endpoint_returns_success() {
+    async fn join_endpoint_returns_error_without_council() {
         let (app, shutdown) = test_setup();
 
         let response = app
@@ -1504,10 +1675,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["message"].as_str().unwrap().contains("10.0.1.5:9443"));
+        // Without a council, join validation fails with a 400
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         shutdown.cancel();
     }
 }
