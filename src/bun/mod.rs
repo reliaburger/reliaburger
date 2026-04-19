@@ -68,4 +68,8 @@ pub enum BunError {
         instance_id: InstanceId,
         init_index: usize,
     },
+
+    /// A security or identity operation failed.
+    #[error("security error: {reason}")]
+    SecurityError { reason: String },
 }
