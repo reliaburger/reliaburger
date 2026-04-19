@@ -691,6 +691,14 @@ pub async fn top() -> Result<(), RelishError> {
 }
 
 /// List images in the local Pickle registry.
+/// Rotate or finalise the cluster's secret encryption key.
+pub async fn secret_rotate(finalize: bool) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let result = client.secret_rotate(finalize).await?;
+    println!("{result}");
+    Ok(())
+}
+
 /// Sign an image in the Pickle registry and attach the signature via Raft.
 pub async fn sign(image: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
@@ -934,21 +942,36 @@ pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// List API tokens (stub — requires agent for Raft-stored tokens).
+/// List API tokens from SecurityState via the agent.
 pub async fn token_list() -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.health().await?;
-    // TODO(Phase 4): fetch token list from agent
-    println!("no tokens configured (token list requires agent connection)");
+    let result = client.token_list().await?;
+    let tokens = result["tokens"].as_array();
+    match tokens {
+        Some(toks) if toks.is_empty() => {
+            println!("no tokens");
+        }
+        Some(toks) => {
+            println!("{:<20} {:<12} {:<20}", "NAME", "ROLE", "CREATED");
+            for t in toks {
+                let name = t["name"].as_str().unwrap_or("?");
+                let role = t["role"].as_str().unwrap_or("?");
+                let created = t["created_at"].as_u64().unwrap_or(0);
+                println!("{:<20} {:<12} {:<20}", name, role, created);
+            }
+        }
+        None => {
+            println!("no tokens");
+        }
+    }
     Ok(())
 }
 
-/// Revoke an API token by name (stub — requires agent for Raft write).
+/// Revoke an API token by name via the agent.
 pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.health().await?;
-    // TODO(Phase 4): send revoke to agent
-    println!("token revocation requires agent connection (token: {name})");
+    let result = client.token_revoke(name).await?;
+    println!("{result}");
     Ok(())
 }
 

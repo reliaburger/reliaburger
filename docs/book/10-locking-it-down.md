@@ -342,3 +342,39 @@ pub struct CouncilNode {
 ```
 
 When a node needs to sign a workload CSR or issue a join certificate, it reads the wrapped CA private key from `SecurityState` (in Raft), unwraps it with the in-memory master secret, performs the cryptographic operation, and discards the unwrapped key. The master secret never appears in Raft, never crosses the network, and never touches disk except in the original key file.
+
+## Token management
+
+API tokens live in `SecurityState.api_tokens` and are managed through Raft. `relish token create` generates a token (Argon2id-hashed before storage), `relish token list` shows active tokens via the `/v1/token/list` endpoint, and `relish token revoke` removes a token via `/v1/token/revoke`.
+
+Both list and revoke endpoints read from or write to the council's security state directly. The list endpoint formats each token's name, role, and creation timestamp. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
+
+## Join token validation
+
+When a new node runs `relish join --token <token> <addr>`, the join handler on the receiving agent now validates the token against SecurityState. The flow:
+
+1. Agent reads SecurityState from the council
+2. Calls `sesame::join::validate_and_issue()` — checks the token hash, verifies it's not expired or consumed, issues a node certificate signed by the Node CA
+3. Writes `ConsumeJoinToken` to Raft to mark the token as used (preventing replay)
+4. Returns the new node's certificate and CA chain
+
+This closes the loop from Phase 4's PKI infrastructure — join tokens now actually work end-to-end.
+
+## Secret key rotation
+
+Secret encryption uses age keypairs stored in SecurityState. Each keypair has a `scope` (cluster-wide or namespace), a `generation` counter, and a `read_only` flag.
+
+Rotation happens in two steps:
+
+**Step 1: `relish secret rotate`** generates a new age keypair (generation N+1) and marks the current keypair (generation N) as `read_only = true`. Both keys now exist in SecurityState. The cluster encrypts new secrets with generation N+1 but can still decrypt old secrets encrypted with generation N.
+
+**Step 2: `relish secret rotate --finalize`** removes all `read_only` keypairs. After this, only generation N+1 exists. Old secrets encrypted with generation N become undecryptable, so the operator must re-encrypt them first.
+
+The Raft commands:
+
+```rust
+RotateSecretKey { scope, new_keypair }   // mark old as read-only, add new
+FinalizeSecretRotation { scope }          // delete read-only keypairs
+```
+
+This dual-key window means rotation is never a cliff. You start it, re-encrypt your secrets at your own pace, then finalise when ready.

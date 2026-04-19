@@ -60,6 +60,7 @@ pub fn generate_age_keypair(
             public_key,
             private_key_wrapped: wrapped,
             generation,
+            read_only: false,
         },
         identity,
     ))

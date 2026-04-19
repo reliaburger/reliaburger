@@ -596,13 +596,12 @@ impl<G: Grill> BunAgent<G> {
                 let _ = response.send(status);
             }
             AgentCommand::Join {
-                token: _,
+                token,
                 addr,
                 response,
             } => {
-                // TODO(Phase 4): validate join token via Sesame
-                let msg = format!("join request accepted for seed {addr}");
-                let _ = response.send(Ok(msg));
+                let result = self.handle_join(&token, &addr).await;
+                let _ = response.send(result);
             }
             AgentCommand::InjectPartition {
                 peers,
@@ -1878,6 +1877,61 @@ impl<G: Grill> BunAgent<G> {
                     .await;
             }
         }
+    }
+
+    /// Handle a join request: validate the token, issue a node certificate.
+    async fn handle_join(&self, token: &str, addr: &str) -> Result<String, BunError> {
+        let cluster = self
+            .cluster
+            .as_ref()
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "no cluster available for join validation".to_string(),
+            })?;
+        let council = cluster
+            .council
+            .as_ref()
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "no council available for join validation".to_string(),
+            })?;
+        let ikm = cluster
+            .wrapping_ikm
+            .as_ref()
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "no wrapping IKM available".to_string(),
+            })?;
+
+        // Read security state and validate token
+        let mut security_state = council.security_state().await;
+        let node_id = format!("node-{addr}");
+
+        let join_result =
+            crate::sesame::join::validate_and_issue(token, &node_id, &mut security_state, ikm)
+                .map_err(|e| BunError::SecurityError {
+                    reason: format!("join validation failed: {e}"),
+                })?;
+
+        // Find the consumed token's hash for the Raft write
+        let token_hash = security_state
+            .join_tokens
+            .iter()
+            .find(|jt| jt.consumed && crate::sesame::ca::verify_join_token(token, &jt.token_hash))
+            .map(|jt| jt.token_hash)
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "could not find consumed token hash".to_string(),
+            })?;
+
+        // Persist token consumption to Raft
+        council
+            .write(crate::council::RaftRequest::ConsumeJoinToken { token_hash })
+            .await
+            .map_err(|e| BunError::SecurityError {
+                reason: format!("failed to persist token consumption: {e}"),
+            })?;
+
+        Ok(format!(
+            "join accepted: node {} issued cert serial {}",
+            join_result.node_certificate.node_id, join_result.node_certificate.serial
+        ))
     }
 
     /// Handle a SignImage command: sign a manifest digest and attach via Raft.

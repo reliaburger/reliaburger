@@ -143,6 +143,26 @@ impl StateMachineInner {
             RaftRequest::AllocateSerial => {
                 self.state.security_state.next_serial += 1;
             }
+            RaftRequest::RotateSecretKey { scope, new_keypair } => {
+                // Mark existing keypairs with the same scope as read-only
+                for kp in &mut self.state.security_state.age_keypairs {
+                    if kp.scope == *scope {
+                        kp.read_only = true;
+                    }
+                }
+                // Add the new keypair
+                self.state
+                    .security_state
+                    .age_keypairs
+                    .push(new_keypair.clone());
+            }
+            RaftRequest::FinalizeSecretRotation { scope } => {
+                // Remove read-only keypairs with the same scope
+                self.state
+                    .security_state
+                    .age_keypairs
+                    .retain(|kp| kp.scope != *scope || !kp.read_only);
+            }
             RaftRequest::Noop => {}
         }
     }
