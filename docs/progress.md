@@ -184,7 +184,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Wire automatic keyless signing after build job push
 - [x] `relish sign` CLI command
 - [x] `/v1/identity/jwks` and `/v1/identity/sign` API endpoints
-- [ ] TPM sealing, CRL distribution, egress DNS resolution
+- [ ] CRL distribution, egress DNS resolution
+- TPM sealing — deferred to v2 (requires hardware)
 - [x] `relish token list/revoke` (SecurityState in Raft)
 - [x] Join token validation in agent (SecurityState in Raft)
 - [x] `relish secret rotate` (dual-key transition window)
