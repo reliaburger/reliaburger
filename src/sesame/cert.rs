@@ -20,6 +20,11 @@ pub enum CertError {
     Expired,
     #[error("certificate is not yet valid")]
     NotYetValid,
+    #[error("certificate serial {serial} revoked: {reason}")]
+    Revoked {
+        serial: SerialNumber,
+        reason: String,
+    },
 }
 
 /// Parse a DER-encoded X.509 certificate and extract basic fields.
@@ -149,6 +154,22 @@ pub fn build_node_certificate(
         not_after: now + one_year,
         ca_generation,
     }
+}
+
+/// Check whether a certificate serial number has been revoked.
+///
+/// Returns `Ok(())` if the serial is not in the CRL, or `Err` if revoked.
+pub fn check_crl(
+    serial: super::types::SerialNumber,
+    crl: &super::types::Crl,
+) -> Result<(), CertError> {
+    if let Some(entry) = crl.entries.iter().find(|e| e.serial == serial) {
+        return Err(CertError::Revoked {
+            serial,
+            reason: entry.reason.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Encode a DER certificate to PEM format.

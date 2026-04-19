@@ -207,6 +207,7 @@ mod tests {
             join_tokens: vec![join_token],
             next_serial: 6,
             oidc_signing_config: None,
+            crl: super::super::types::Crl::default(),
         };
 
         (state, token_plaintext, master_secret)

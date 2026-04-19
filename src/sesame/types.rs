@@ -358,6 +358,44 @@ pub struct JoinToken {
 }
 
 // ---------------------------------------------------------------------------
+// Certificate revocation list
+// ---------------------------------------------------------------------------
+
+/// The cluster's certificate revocation list, distributed via gossip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Crl {
+    /// Revoked certificate entries.
+    pub entries: Vec<CrlEntry>,
+    /// Monotonically increasing version, incremented on every update.
+    pub version: u64,
+    /// When this CRL was last updated.
+    pub updated_at: SystemTime,
+}
+
+impl Default for Crl {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            version: 0,
+            updated_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+}
+
+/// A single revoked certificate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CrlEntry {
+    /// Serial number of the revoked certificate.
+    pub serial: SerialNumber,
+    /// Which CA issued the revoked certificate.
+    pub issuer: CaRole,
+    /// When the certificate was revoked.
+    pub revoked_at: SystemTime,
+    /// Human-readable reason (e.g. "node-07 compromised").
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
 // Cluster security state
 // ---------------------------------------------------------------------------
 
@@ -377,6 +415,9 @@ pub struct SecurityState {
     /// OIDC signing configuration for workload identity JWTs.
     #[serde(default)]
     pub oidc_signing_config: Option<OidcSigningConfig>,
+    /// Certificate revocation list.
+    #[serde(default)]
+    pub crl: Crl,
 }
 
 impl SecurityState {
