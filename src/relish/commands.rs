@@ -691,6 +691,14 @@ pub async fn top() -> Result<(), RelishError> {
 }
 
 /// List images in the local Pickle registry.
+/// Sign an image in the Pickle registry and attach the signature via Raft.
+pub async fn sign(image: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let result = client.sign_image(image).await?;
+    println!("{result}");
+    Ok(())
+}
+
 pub async fn images() -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.images().await?;
