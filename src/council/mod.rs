@@ -36,4 +36,6 @@ pub enum CouncilError {
     WriteFailed(String),
     #[error("network error: {0}")]
     Network(String),
+    #[error("security operation failed: {0}")]
+    SecurityError(String),
 }

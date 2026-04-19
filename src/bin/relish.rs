@@ -194,6 +194,11 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Sign an image in the Pickle registry and attach the signature.
+    Sign {
+        /// Image reference or manifest digest (e.g. "myapp:v1" or "sha256:abc...").
+        image: String,
+    },
     /// Manage a local dev cluster (Lima VMs).
     Dev {
         #[command(subcommand)]
@@ -614,6 +619,7 @@ async fn main() -> ExitCode {
             TokenAction::List => commands::token_list().await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },
+        Command::Sign { ref image } => commands::sign(image).await,
         Command::Dev { action } => match &action {
             DevAction::Create {
                 nodes,

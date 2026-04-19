@@ -17,6 +17,22 @@ use super::state_machine::CouncilStateMachine;
 use super::types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,
 };
+use crate::sesame::types::{CaRole, SerialNumber, SpiffeUri};
+
+/// Result of signing a workload CSR.
+#[derive(Debug, Clone)]
+pub struct CsrSignResult {
+    /// DER-encoded signed workload certificate.
+    pub cert_der: Vec<u8>,
+    /// DER-encoded Workload CA certificate.
+    pub workload_ca_cert_der: Vec<u8>,
+    /// DER-encoded Root CA certificate.
+    pub root_ca_cert_der: Vec<u8>,
+    /// OIDC JWT token (if OIDC config is present).
+    pub jwt_token: Option<String>,
+    /// Allocated serial number.
+    pub serial: SerialNumber,
+}
 
 // ---------------------------------------------------------------------------
 // CouncilNode
@@ -175,6 +191,111 @@ impl CouncilNode {
     /// Read the current security state from the state machine.
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
         self.state_machine.desired_state().await.security_state
+    }
+
+    /// Sign a workload CSR with the Workload CA.
+    ///
+    /// This is a synchronous crypto operation — only `AllocateSerial`
+    /// goes through Raft. The council unwraps the CA key in memory,
+    /// validates the CSR, signs it, and optionally mints an OIDC JWT.
+    pub async fn sign_workload_csr(
+        &self,
+        csr_der: &[u8],
+        spiffe_uri: &SpiffeUri,
+        cluster_name: &str,
+        node_id: &str,
+        instance_id: &str,
+    ) -> Result<CsrSignResult, CouncilError> {
+        let ikm = self
+            .wrapping_ikm
+            .as_ref()
+            .ok_or_else(|| CouncilError::SecurityError("no wrapping IKM available".to_string()))?;
+
+        let security_state = self.security_state().await;
+
+        // Get Workload CA
+        let workload_ca = security_state
+            .get_ca(CaRole::Workload)
+            .ok_or_else(|| CouncilError::SecurityError("no Workload CA in state".to_string()))?;
+        let root_ca = security_state
+            .get_ca(CaRole::Root)
+            .ok_or_else(|| CouncilError::SecurityError("no Root CA in state".to_string()))?;
+
+        let workload_ca_cert_der = workload_ca.certificate_der.clone();
+        let root_ca_cert_der = root_ca.certificate_der.clone();
+
+        // Unwrap CA private key
+        let wrapped = workload_ca.private_key_wrapped.as_ref().ok_or_else(|| {
+            CouncilError::SecurityError("Workload CA has no private key".to_string())
+        })?;
+        let ca_key_der = crate::sesame::crypto::unwrap_key(ikm, wrapped)
+            .map_err(|e| CouncilError::SecurityError(format!("failed to unwrap CA key: {e}")))?;
+
+        // Reconstruct CA keypair
+        let ca_key_pki = rustls::pki_types::PrivateKeyDer::try_from(ca_key_der)
+            .map_err(|e| CouncilError::SecurityError(format!("invalid CA key DER: {e}")))?;
+        let ca_keypair =
+            rcgen::KeyPair::from_der_and_sign_algo(&ca_key_pki, &rcgen::PKCS_ECDSA_P256_SHA256)
+                .map_err(|e| CouncilError::SecurityError(format!("invalid CA keypair: {e}")))?;
+
+        // Minimal CA params for signing (DN used as issuer in signed cert)
+        let mut ca_params = rcgen::CertificateParams::default();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(
+            rcgen::DnType::CommonName,
+            format!("Reliaburger Workload CA - {cluster_name}"),
+        );
+        dn.push(rcgen::DnType::OrganizationName, "Reliaburger");
+        ca_params.distinguished_name = dn;
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+
+        // Allocate serial via Raft
+        self.write(RaftRequest::AllocateSerial).await?;
+        let state_after = self.security_state().await;
+        let serial = SerialNumber(state_after.next_serial.saturating_sub(1));
+
+        // Sign the CSR
+        let cert_der = crate::sesame::identity::validate_and_sign_csr(
+            csr_der,
+            spiffe_uri,
+            serial,
+            &ca_keypair,
+            &ca_params,
+        )
+        .map_err(|e| CouncilError::SecurityError(format!("CSR signing failed: {e}")))?;
+
+        // Mint OIDC JWT if config is present
+        let jwt_token = if let Some(ref oidc_config) = state_after.oidc_signing_config {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let claims = crate::sesame::types::WorkloadJwtClaims {
+                iss: oidc_config.issuer.clone(),
+                sub: spiffe_uri.to_uri(),
+                aud: vec![format!("spiffe://{cluster_name}")],
+                exp: now + 3600,
+                iat: now,
+                namespace: spiffe_uri.namespace.clone(),
+                app: spiffe_uri.name.clone(),
+                cluster: cluster_name.to_string(),
+                node: node_id.to_string(),
+                instance: instance_id.to_string(),
+            };
+            let token = crate::sesame::oidc::mint_jwt(&claims, oidc_config, ikm)
+                .map_err(|e| CouncilError::SecurityError(format!("JWT minting failed: {e}")))?;
+            Some(token)
+        } else {
+            None
+        };
+
+        Ok(CsrSignResult {
+            cert_der,
+            workload_ca_cert_der,
+            root_ca_cert_der,
+            jwt_token,
+            serial,
+        })
     }
 }
 
@@ -717,5 +838,96 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CSR signing test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sign_workload_csr_on_leader() {
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::sesame::types::{SpiffeUri, WorkloadType};
+
+        // Create a single-node council WITH a wrapping IKM
+        let wrapping_ikm = b"test-wrapping-material-32bytes!!";
+        let router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+        let node = CouncilNode::new(
+            1,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            Some(*wrapping_ikm),
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+
+        let members = BTreeMap::from([(1, node_info(1))]);
+        node.initialize(members).await.unwrap();
+        // Wait for leader (single-node cluster)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Bootstrap SecurityState with a CA hierarchy
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("test-cluster", wrapping_ikm).unwrap();
+        let oidc_config = crate::sesame::oidc::generate_oidc_keypair(
+            "https://test.reliaburger.dev",
+            wrapping_ikm,
+        )
+        .unwrap();
+        let security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![
+                crate::sesame::types::CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca
+                },
+                hierarchy.node.ca,
+                hierarchy.workload.ca,
+                hierarchy.ingress.ca,
+            ],
+            age_keypairs: vec![],
+            api_tokens: vec![],
+            join_tokens: vec![],
+            next_serial: 10,
+            oidc_signing_config: Some(oidc_config),
+        };
+        node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
+            .await
+            .unwrap();
+
+        // Generate a CSR
+        let spiffe_uri = SpiffeUri {
+            trust_domain: "test-cluster".to_string(),
+            namespace: "default".to_string(),
+            workload_type: WorkloadType::App,
+            name: "api".to_string(),
+        };
+        let (csr_der, _private_key) =
+            crate::sesame::identity::create_workload_csr(&spiffe_uri).unwrap();
+
+        // Sign it
+        let result = node
+            .sign_workload_csr(&csr_der, &spiffe_uri, "test-cluster", "node-01", "api-0")
+            .await
+            .unwrap();
+
+        assert!(!result.cert_der.is_empty());
+        assert!(!result.workload_ca_cert_der.is_empty());
+        assert!(!result.root_ca_cert_der.is_empty());
+        assert!(result.jwt_token.is_some());
+
+        // Verify the signed cert chains to the Workload CA
+        crate::sesame::cert::verify_signature(&result.cert_der, &result.workload_ca_cert_der)
+            .unwrap();
+
+        // Verify the JWT is valid
+        let state = node.security_state().await;
+        let oidc = state.oidc_signing_config.as_ref().unwrap();
+        let claims =
+            crate::sesame::oidc::verify_jwt(result.jwt_token.as_ref().unwrap(), oidc).unwrap();
+        assert_eq!(claims.sub, "spiffe://test-cluster/ns/default/app/api");
     }
 }

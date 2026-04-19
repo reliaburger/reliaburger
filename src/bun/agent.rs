@@ -163,6 +163,11 @@ pub enum AgentCommand {
         destination: String,
         response: oneshot::Sender<Result<String, BunError>>,
     },
+    /// Sign an image manifest digest and attach the signature via Raft.
+    SignImage {
+        manifest_digest: String,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -411,6 +416,7 @@ impl<G: Grill> BunAgent<G> {
                     self.drive_pending_restarts().await;
                     self.expire_faults();
                     self.reconcile_firewall().await;
+                    self.check_identity_rotation().await;
                 }
             }
         }
@@ -715,6 +721,13 @@ impl<G: Grill> BunAgent<G> {
                 // monitor completion, report result.
                 let _ = response.send(Ok(msg));
             }
+            AgentCommand::SignImage {
+                manifest_digest,
+                response,
+            } => {
+                let result = self.handle_sign_image(&manifest_digest).await;
+                let _ = response.send(result);
+            }
         }
     }
 
@@ -948,6 +961,10 @@ impl<G: Grill> BunAgent<G> {
                                 .send(ApplyEvent::Progress {
                                     message: format!("{} healthy ✓", new_id.0),
                                 })
+                                .await;
+
+                            // Provision workload identity (SPIFFE cert + OIDC JWT)
+                            self.provision_identity(app_name, namespace, &new_id, false, events)
                                 .await;
                         }
                         Ok(state) => {
@@ -1755,6 +1772,207 @@ impl<G: Grill> BunAgent<G> {
             eprintln!("warning: firewall reconciliation failed: {e}");
         } else {
             self.last_firewall_node_count = node_count;
+        }
+    }
+
+    /// Provision workload identity for an instance after it passes health check.
+    ///
+    /// Generates a SPIFFE CSR, submits it to the council for signing,
+    /// builds the identity bundle, and writes cert/key/JWT to the
+    /// instance's identity mount. No-op in standalone mode.
+    async fn provision_identity(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        instance_id: &crate::grill::InstanceId,
+        is_job: bool,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) {
+        let Some(ref cluster) = self.cluster else {
+            return; // standalone mode — no council to sign CSRs
+        };
+        let Some(ref council) = cluster.council else {
+            return;
+        };
+
+        let workload_type = if is_job {
+            crate::sesame::types::WorkloadType::Job
+        } else {
+            crate::sesame::types::WorkloadType::App
+        };
+
+        // TODO: get cluster_name from config rather than hardcoding
+        let cluster_name = "default";
+        let spiffe_uri = crate::sesame::types::SpiffeUri {
+            trust_domain: cluster_name.to_string(),
+            namespace: namespace.to_string(),
+            workload_type,
+            name: app_name.to_string(),
+        };
+
+        // Generate CSR (keypair stays local)
+        let (csr_der, private_key_der) =
+            match crate::sesame::identity::create_workload_csr(&spiffe_uri) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("identity: CSR generation failed: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+        // Submit CSR to council
+        let result = council
+            .sign_workload_csr(&csr_der, &spiffe_uri, cluster_name, "local", &instance_id.0)
+            .await;
+
+        match result {
+            Ok(csr_result) => {
+                let jwt = csr_result.jwt_token.unwrap_or_default();
+                let identity = crate::sesame::identity::build_identity_bundle(
+                    spiffe_uri,
+                    csr_result.cert_der,
+                    private_key_der,
+                    &csr_result.workload_ca_cert_der,
+                    &csr_result.root_ca_cert_der,
+                    jwt,
+                );
+
+                // Write to the identity mount
+                let identity_dir = self
+                    .volumes_dir
+                    .join(".identity")
+                    .join(namespace)
+                    .join(app_name);
+                if let Err(e) =
+                    crate::sesame::identity::write_identity_to_tmpfs(&identity, &identity_dir)
+                {
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("identity: failed to write files: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+
+                // Store in supervisor
+                if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
+                    inst.identity = Some(identity);
+                    inst.identity_mount = Some(identity_dir);
+                }
+
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!("{} identity provisioned ✓", instance_id.0),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!("identity: council CSR signing failed: {e}"),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    /// Handle a SignImage command: sign a manifest digest and attach via Raft.
+    async fn handle_sign_image(&self, manifest_digest: &str) -> Result<String, BunError> {
+        let cluster = self
+            .cluster
+            .as_ref()
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "no cluster available for signing".to_string(),
+            })?;
+        let council = cluster
+            .council
+            .as_ref()
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "no council available for signing".to_string(),
+            })?;
+
+        let digest = crate::pickle::types::Digest::new(manifest_digest).map_err(|e| {
+            BunError::SecurityError {
+                reason: format!("invalid digest: {e}"),
+            }
+        })?;
+
+        // Generate an ephemeral signing keypair
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &rng,
+        )
+        .map_err(|_| BunError::SecurityError {
+            reason: "failed to generate signing keypair".to_string(),
+        })?;
+
+        let sig = crate::pickle::signing::create_external_key_signature(
+            &digest,
+            pkcs8.as_ref(),
+            "local-agent",
+        )
+        .map_err(|e| BunError::SecurityError {
+            reason: format!("signing failed: {e}"),
+        })?;
+
+        let attach = crate::pickle::types::AttachSignature {
+            manifest_digest: digest,
+            signature: sig,
+        };
+        council
+            .write(crate::council::RaftRequest::AttachSignature(attach))
+            .await
+            .map_err(|e| BunError::SecurityError {
+                reason: format!("failed to attach signature: {e}"),
+            })?;
+
+        Ok(format!("signature attached to {manifest_digest}"))
+    }
+
+    /// Check identity rotation for all instances.
+    async fn check_identity_rotation(&mut self) {
+        let now = std::time::SystemTime::now();
+        let mut needs_rotation = Vec::new();
+
+        for inst in self.supervisor.list_instances() {
+            if let Some(ref identity) = inst.identity {
+                let state = crate::sesame::identity::rotation_state(identity, now);
+                match state {
+                    crate::sesame::identity::RotationState::NeedsRotation => {
+                        needs_rotation.push((
+                            inst.id.clone(),
+                            inst.app_name.clone(),
+                            inst.namespace.clone(),
+                            inst.is_job,
+                        ));
+                    }
+                    crate::sesame::identity::RotationState::Expired => {
+                        eprintln!(
+                            "warning: identity expired for {} ({})",
+                            inst.id.0, inst.app_name
+                        );
+                    }
+                    crate::sesame::identity::RotationState::GracePeriod => {
+                        eprintln!(
+                            "warning: identity in grace period for {} ({})",
+                            inst.id.0, inst.app_name
+                        );
+                    }
+                    crate::sesame::identity::RotationState::Valid => {}
+                }
+            }
+        }
+
+        // Re-provision identities that need rotation
+        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        for (id, app, ns, is_job) in needs_rotation {
+            self.provision_identity(&app, &ns, &id, is_job, &dummy_tx)
+                .await;
         }
     }
 

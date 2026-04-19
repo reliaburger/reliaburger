@@ -48,6 +48,8 @@ pub struct ApiState {
     pub pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     /// GitOps webhook signal channel (signals the Lettuce sync loop).
     pub gitops_webhook_tx: Option<mpsc::Sender<()>>,
+    /// Council node reference (for JWKS and signing endpoints).
+    pub council: Option<Arc<crate::council::CouncilNode>>,
 }
 
 /// Build the API router.
@@ -70,6 +72,7 @@ pub fn router(
         deploy_history,
         pickle_catalog,
         gitops_webhook_tx: None,
+        council: None,
     };
 
     Router::new()
@@ -105,6 +108,8 @@ pub fn router(
         .route("/v1/batch", post(batch_submit_handler))
         .route("/v1/build", post(build_submit_handler))
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
+        .route("/v1/identity/jwks", get(identity_jwks_handler))
+        .route("/v1/identity/sign", post(identity_sign_handler))
         .with_state(state)
 }
 
@@ -1147,6 +1152,74 @@ async fn gitops_webhook_handler(State(state): State<ApiState>) -> Response {
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": "gitops not configured" })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identity endpoints
+// ---------------------------------------------------------------------------
+
+/// JWKS endpoint — publishes the OIDC Ed25519 public key for JWT verification.
+async fn identity_jwks_handler(State(state): State<ApiState>) -> Response {
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    let security_state = council.security_state().await;
+    let Some(ref oidc_config) = security_state.oidc_signing_config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no OIDC signing config" })),
+        )
+            .into_response();
+    };
+
+    Json(crate::sesame::oidc::jwks_response(oidc_config)).into_response()
+}
+
+/// Sign an image manifest digest and attach the signature via Raft.
+async fn identity_sign_handler(State(state): State<ApiState>, body: String) -> Response {
+    #[derive(serde::Deserialize)]
+    struct SignRequest {
+        digest: String,
+    }
+
+    let req: SignRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let (tx, rx) = oneshot::channel();
+    let _ = state
+        .cmd_tx
+        .send(AgentCommand::SignImage {
+            manifest_digest: req.digest,
+            response: tx,
+        })
+        .await;
+
+    match rx.await {
+        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent channel closed" })),
         )
             .into_response(),
     }
