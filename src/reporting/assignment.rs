@@ -34,6 +34,22 @@ pub fn assign_parent(worker_id: &NodeId, council_members: &[NodeId]) -> Option<N
     Some(sorted[index].clone())
 }
 
+/// Assign a worker to its parent council member and return the address.
+///
+/// Convenience wrapper around `assign_parent` that also resolves the
+/// parent's `SocketAddr` from a `(NodeId, SocketAddr)` list.
+pub fn assign_parent_address(
+    worker_id: &NodeId,
+    council: &[(NodeId, std::net::SocketAddr)],
+) -> Option<std::net::SocketAddr> {
+    let council_ids: Vec<NodeId> = council.iter().map(|(id, _)| id.clone()).collect();
+    let parent_id = assign_parent(worker_id, &council_ids)?;
+    council
+        .iter()
+        .find(|(id, _)| *id == parent_id)
+        .map(|(_, addr)| *addr)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

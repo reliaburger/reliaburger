@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use crate::config::app::AppSpec;
+use crate::mayo::rollup::NodeRollup;
 use crate::meat::NodeId;
 
 /// Sent by each worker node to its assigned council member at the
@@ -130,6 +131,8 @@ pub enum ReportingMessage {
     AggregatedReport {
         reports: HashMap<NodeId, StateReport>,
     },
+    /// Pre-aggregated metrics rollup from worker to council aggregator.
+    MetricsRollup(NodeRollup),
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +239,38 @@ mod tests {
         match decoded {
             ReportingMessage::Report(r) => assert_eq!(r.node_id, NodeId::new("w1")),
             _ => panic!("expected Report variant"),
+        }
+    }
+
+    #[test]
+    fn metrics_rollup_message_round_trip() {
+        use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+        use std::collections::BTreeMap;
+
+        let rollup = NodeRollup {
+            node_id: NodeId::new("w1"),
+            timestamp: 1000,
+            entries: vec![RollupEntry {
+                metric_name: "cpu_usage".to_string(),
+                labels: BTreeMap::new(),
+                aggregate: RollupAggregate {
+                    min: 10.0,
+                    max: 90.0,
+                    sum: 300.0,
+                    count: 6,
+                },
+            }],
+        };
+        let msg = ReportingMessage::MetricsRollup(rollup);
+        let encoded = bincode::serialize(&msg).unwrap();
+        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        match decoded {
+            ReportingMessage::MetricsRollup(r) => {
+                assert_eq!(r.node_id, NodeId::new("w1"));
+                assert_eq!(r.entries.len(), 1);
+                assert_eq!(r.entries[0].aggregate.count, 6);
+            }
+            _ => panic!("expected MetricsRollup variant"),
         }
     }
 }

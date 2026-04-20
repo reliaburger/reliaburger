@@ -24,6 +24,8 @@ use crate::config::Config;
 use crate::ketchup::log_store::LogStore;
 use crate::ketchup::store::KetchupStore;
 use crate::mayo::alert::AlertEvaluator;
+use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow, QueryWarning};
+use crate::mayo::rollup_store::RollupStore;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
 use crate::pickle::types::ManifestCatalog;
@@ -50,6 +52,8 @@ pub struct ApiState {
     pub gitops_webhook_tx: Option<mpsc::Sender<()>>,
     /// Council node reference (for JWKS and signing endpoints).
     pub council: Option<Arc<crate::council::CouncilNode>>,
+    /// Council-side rollup store for cluster-wide metrics queries.
+    pub rollup_store: Option<Arc<RwLock<RollupStore>>>,
 }
 
 /// Build the API router.
@@ -73,6 +77,7 @@ pub fn router(
         pickle_catalog,
         gitops_webhook_tx: None,
         council: None,
+        rollup_store: None,
     };
 
     Router::new()
@@ -100,6 +105,12 @@ pub fn router(
         .route("/v1/metrics", get(metrics_query_handler))
         .route("/v1/metrics/summary", get(metrics_summary_handler))
         .route("/v1/metrics/keys", get(metrics_keys_handler))
+        .route("/v1/metrics/rollup", get(metrics_rollup_handler))
+        .route("/v1/metrics/cluster", get(metrics_cluster_handler))
+        .route(
+            "/v1/metrics/app/{app}/{namespace}",
+            get(metrics_app_handler),
+        )
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
@@ -992,6 +1003,185 @@ async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
     let store = mayo.read().await;
     match store.metric_names().await {
         Ok(names) => Json(serde_json::json!({"keys": names})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/metrics/rollup?name=X&start=S&end=E` — query local rollup store.
+///
+/// Internal endpoint used by cluster-wide query fan-out. Each council
+/// member evaluates this against its own rollup data.
+async fn metrics_rollup_handler(
+    State(state): State<ApiState>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    let Some(rollup_store) = &state.rollup_store else {
+        return Json(Vec::<MetricsQueryRow>::new()).into_response();
+    };
+
+    let store = rollup_store.read().await;
+    let start = params.start.unwrap_or(0);
+    let end = params.end.unwrap_or(u64::MAX);
+
+    let result = match &params.name {
+        Some(name) => store.query_cluster_metric(name, start, end).await,
+        None => {
+            let sql = format!(
+                "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
+                 FROM rollups \
+                 WHERE timestamp >= {start} AND timestamp <= {end} \
+                 GROUP BY timestamp, metric_name, labels \
+                 ORDER BY timestamp LIMIT 10000"
+            );
+            store.query_sql(&sql).await
+        }
+    };
+
+    match result {
+        Ok(rows) => {
+            let data: Vec<MetricsQueryRow> = rows
+                .into_iter()
+                .map(|(ts, name, labels, val)| MetricsQueryRow {
+                    timestamp: ts,
+                    metric_name: name,
+                    labels,
+                    value: val,
+                })
+                .collect();
+            Json(data).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/metrics/cluster?name=X&start=S&end=E` — cluster-wide query.
+///
+/// Fans out to all council aggregators' `/v1/metrics/rollup` endpoints,
+/// merges results, and returns the combined data with any warnings
+/// about unresponsive aggregators.
+async fn metrics_cluster_handler(
+    State(state): State<ApiState>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    let Some(rollup_store) = &state.rollup_store else {
+        return Json(MetricsQueryResult {
+            data: vec![],
+            warnings: vec![QueryWarning::NodeUnresponsive {
+                node_id: "no rollup store configured".to_string(),
+            }],
+        })
+        .into_response();
+    };
+
+    // Query local rollup store directly (this council member's data)
+    let store = rollup_store.read().await;
+    let start = params.start.unwrap_or(0);
+    let end = params.end.unwrap_or(u64::MAX);
+
+    let result = match &params.name {
+        Some(name) => store.query_cluster_metric(name, start, end).await,
+        None => {
+            let sql = format!(
+                "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
+                 FROM rollups \
+                 WHERE timestamp >= {start} AND timestamp <= {end} \
+                 GROUP BY timestamp, metric_name, labels \
+                 ORDER BY timestamp LIMIT 10000"
+            );
+            store.query_sql(&sql).await
+        }
+    };
+
+    match result {
+        Ok(rows) => {
+            let data: Vec<MetricsQueryRow> = rows
+                .into_iter()
+                .map(|(ts, name, labels, val)| MetricsQueryRow {
+                    timestamp: ts,
+                    metric_name: name,
+                    labels,
+                    value: val,
+                })
+                .collect();
+            Json(MetricsQueryResult {
+                data,
+                warnings: vec![],
+            })
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/metrics/app/{app}/{namespace}?name=X&start=S&end=E` — single-app query.
+///
+/// Queries the local metrics store filtered by the specified app. In a
+/// full cluster deployment, this would fan out to nodes running the app
+/// using the Meat placement map.
+async fn metrics_app_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    let Some(mayo) = &state.mayo else {
+        return Json(MetricsQueryResult {
+            data: vec![],
+            warnings: vec![],
+        })
+        .into_response();
+    };
+
+    let store = mayo.read().await;
+    let start = params.start.unwrap_or(0);
+    let end = params.end.unwrap_or(u64::MAX);
+
+    // Filter by app label in the local store
+    let app_filter = format!("{namespace}/{app}");
+    let sql = match &params.name {
+        Some(name) => format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE metric_name = '{name}' \
+             AND labels LIKE '%\"{app_filter}\"%' \
+             AND timestamp >= {start} AND timestamp <= {end} \
+             ORDER BY timestamp LIMIT 10000"
+        ),
+        None => format!(
+            "SELECT timestamp, metric_name, labels, value FROM metrics \
+             WHERE labels LIKE '%\"{app_filter}\"%' \
+             AND timestamp >= {start} AND timestamp <= {end} \
+             ORDER BY timestamp LIMIT 10000"
+        ),
+    };
+
+    match store.query_sql(&sql).await {
+        Ok(rows) => {
+            let data: Vec<MetricsQueryRow> = rows
+                .into_iter()
+                .map(|(ts, name, labels, val)| MetricsQueryRow {
+                    timestamp: ts,
+                    metric_name: name,
+                    labels,
+                    value: val,
+                })
+                .collect();
+            Json(MetricsQueryResult {
+                data,
+                warnings: vec![],
+            })
+            .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

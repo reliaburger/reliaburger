@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (1364 and counting)
+make test                    # run all tests (1498 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -87,7 +87,7 @@ src/
   firewall/            # nftables perimeter firewall
   sesame/              # PKI, mTLS, secrets, API auth, Raft encryption
   pickle/              # OCI image registry (blob store, API, replication, GC)
-  mayo/                # Time-series metrics (Arrow, DataFusion, Parquet)
+  mayo/                # Time-series metrics (Arrow, DataFusion, Parquet, hierarchical rollups)
   ketchup/             # Log collection (append-only, indexed, queries)
   brioche/             # Web dashboard
 docs/

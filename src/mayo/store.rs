@@ -307,6 +307,86 @@ impl MayoStore {
         Ok(names)
     }
 
+    /// Query aggregated statistics for all metrics in a time window.
+    ///
+    /// Returns (metric_name, labels_json, min, max, sum, count) tuples,
+    /// one per distinct (metric_name, labels) combination. Used by the
+    /// rollup generator to build `NodeRollup` entries.
+    pub async fn query_window_aggregates(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<(String, String, f64, f64, f64, u32)>, MayoError> {
+        let sql = format!(
+            "SELECT metric_name, labels, \
+             MIN(value) as min_val, MAX(value) as max_val, \
+             SUM(value) as sum_val, COUNT(*) as count_val \
+             FROM metrics \
+             WHERE timestamp >= {start} AND timestamp < {end} \
+             GROUP BY metric_name, labels \
+             ORDER BY metric_name, labels"
+        );
+
+        let ctx = self.session().await?;
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let names = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
+            let labels = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
+            let mins = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("min column type mismatch".into()))?;
+            let maxs = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("max column type mismatch".into()))?;
+            let sums = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("sum column type mismatch".into()))?;
+            // COUNT(*) returns i64 in DataFusion
+            let counts = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .ok_or_else(|| MayoError::Arrow("count column type mismatch".into()))?;
+
+            for i in 0..batch.num_rows() {
+                results.push((
+                    names.value(i).to_string(),
+                    labels.value(i).to_string(),
+                    mins.value(i),
+                    maxs.value(i),
+                    sums.value(i),
+                    counts.value(i) as u32,
+                ));
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Prune Parquet files older than `before` timestamp.
     pub fn prune(&self, before: u64) -> Result<usize, MayoError> {
         let mut deleted = 0;

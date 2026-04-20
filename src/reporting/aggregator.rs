@@ -4,12 +4,14 @@
 /// messages from assigned workers, stores the latest per-node, and
 /// publishes the aggregated view via a `tokio::sync::watch` channel.
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tokio::sync::watch;
+use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::node::ReportingTreeSection;
+use crate::mayo::rollup_store::RollupStore;
 use crate::meat::NodeId;
 
 use super::transport::ReportingTransport;
@@ -33,6 +35,7 @@ pub struct ReportAggregator<T: ReportingTransport> {
     transport: T,
     reports: HashMap<NodeId, StateReport>,
     watch_tx: watch::Sender<AggregatedState>,
+    rollup_store: Option<Arc<RwLock<RollupStore>>>,
     config: ReportingTreeSection,
     shutdown: CancellationToken,
 }
@@ -45,12 +48,14 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         transport: T,
         config: ReportingTreeSection,
         shutdown: CancellationToken,
+        rollup_store: Option<Arc<RwLock<RollupStore>>>,
     ) -> (Self, watch::Receiver<AggregatedState>) {
         let (watch_tx, watch_rx) = watch::channel(AggregatedState::default());
         let aggregator = Self {
             transport,
             reports: HashMap::new(),
             watch_tx,
+            rollup_store,
             config,
             shutdown,
         };
@@ -84,6 +89,11 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                         }
                         Some((_, ReportingMessage::Ack { .. })) => {
                             // Workers don't send Acks to the aggregator
+                        }
+                        Some((_, ReportingMessage::MetricsRollup(rollup))) => {
+                            if let Some(ref store) = self.rollup_store {
+                                store.write().await.ingest(&rollup);
+                            }
                         }
                         None => break, // transport shut down
                     }
@@ -188,7 +198,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let (mut aggregator, mut watch_rx) =
-            ReportAggregator::new(council_transport, test_config(), shutdown.clone());
+            ReportAggregator::new(council_transport, test_config(), shutdown.clone(), None);
 
         // Send two reports from the same worker
         let msg1 = ReportingMessage::Report(report("w1"));
@@ -222,7 +232,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let (mut aggregator, mut watch_rx) =
-            ReportAggregator::new(council_transport, test_config(), shutdown.clone());
+            ReportAggregator::new(council_transport, test_config(), shutdown.clone(), None);
 
         let handle = tokio::spawn(async move { aggregator.run().await });
 
@@ -253,7 +263,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let (mut aggregator, _watch_rx) =
-            ReportAggregator::new(council_transport, test_config(), shutdown.clone());
+            ReportAggregator::new(council_transport, test_config(), shutdown.clone(), None);
 
         // Insert a report with a timestamp 60s in the past
         aggregator.insert_local_report(stale_report("old-node"));
@@ -275,7 +285,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let (mut aggregator, mut watch_rx) =
-            ReportAggregator::new(council_transport, test_config(), shutdown.clone());
+            ReportAggregator::new(council_transport, test_config(), shutdown.clone(), None);
 
         // Send reports from 5 workers
         for (i, w) in [&w1, &w2, &w3, &w4, &w5].iter().enumerate() {
