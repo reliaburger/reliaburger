@@ -43,7 +43,7 @@ pub async fn fan_out_query(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
-            let mut req_url = format!("{base}/v1/logs/{app}/{namespace}");
+            let mut req_url = format!("{base}/v1/logs/entries/{app}/{namespace}");
             let mut params = Vec::new();
             if let Some(t) = tail {
                 params.push(format!("tail={t}"));

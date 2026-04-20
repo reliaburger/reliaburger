@@ -198,7 +198,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts)
 - [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
 - [ ] Log export to S3/GCS (scheduled, jsonl.gz)
-- [ ] Cross-node log queries via Raft (leader fan-out, merge-sort)
+- [x] Cross-node log queries via Raft (leader fan-out, merge-sort)
 - [ ] Book chapter 11: "Eyes Everywhere"
 - [ ] All Phase 11 tests green
 

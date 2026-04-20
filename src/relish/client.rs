@@ -212,19 +212,72 @@ impl BunClient {
         tail: Option<usize>,
         follow: bool,
     ) -> Result<String, RelishError> {
-        let mut url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+        if follow {
+            // Follow mode uses the SSE endpoint (local only)
+            return self.logs_follow(app, namespace, tail).await;
+        }
 
-        // Build query string
+        // Non-follow: try the cross-node query endpoint first.
+        // In cluster mode this fans out to all nodes running the app.
+        // In single-node mode it queries the local LogStore.
+        let mut url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
         let mut params = Vec::new();
         if let Some(n) = tail {
             params.push(format!("tail={n}"));
         }
-        if follow {
-            params.push("follow=true".to_string());
-        }
         if !params.is_empty() {
             url.push('?');
             url.push_str(&params.join("&"));
+        }
+
+        if let Ok(response) = self.client.get(&url).send().await
+            && response.status().is_success()
+            && let Ok(result) = response.json::<serde_json::Value>().await
+        {
+            let mut output = String::new();
+            if let Some(entries) = result["entries"].as_array() {
+                for entry in entries {
+                    let line = entry["line"].as_str().unwrap_or("");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+
+            // Show warnings if any nodes were unreachable
+            if let Some(warnings) = result["warnings"].as_array() {
+                for w in warnings {
+                    if let Some(node_id) = w.get("NodeUnresponsive") {
+                        let id = node_id["node_id"].as_str().unwrap_or("unknown");
+                        eprintln!("warning: node {id} did not respond");
+                    }
+                }
+            }
+
+            if output.ends_with('\n') {
+                output.pop();
+            }
+
+            // If we got entries, return them
+            if !output.is_empty() {
+                return Ok(output);
+            }
+        }
+
+        // Fall back to the local agent endpoint (process logs that
+        // haven't been ingested into the LogStore yet)
+        self.logs_local(app, namespace, tail).await
+    }
+
+    /// Query local agent logs (process stdout/stderr).
+    async fn logs_local(
+        &self,
+        app: &str,
+        namespace: &str,
+        tail: Option<usize>,
+    ) -> Result<String, RelishError> {
+        let mut url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+        if let Some(n) = tail {
+            url.push_str(&format!("?tail={n}"));
         }
 
         let response = self.client.get(&url).send().await.map_err(classify_error)?;
@@ -235,44 +288,63 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        if follow {
-            // Read SSE stream, printing each data: line to stdout
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
 
-            while let Some(chunk) = stream.next().await {
-                let bytes = chunk.map_err(classify_error)?;
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
+        Ok(json["logs"].as_str().unwrap_or("").to_string())
+    }
 
-                while let Some(event_end) = buffer.find("\n\n") {
-                    let event_text = buffer[..event_end].to_string();
-                    buffer = buffer[event_end + 2..].to_string();
+    /// Follow logs via SSE stream (local node only).
+    async fn logs_follow(
+        &self,
+        app: &str,
+        namespace: &str,
+        tail: Option<usize>,
+    ) -> Result<String, RelishError> {
+        let mut url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+        let mut params = vec!["follow=true".to_string()];
+        if let Some(n) = tail {
+            params.push(format!("tail={n}"));
+        }
+        url.push('?');
+        url.push_str(&params.join("&"));
 
-                    for line in event_text.lines() {
-                        if let Some(data) = line.strip_prefix("data:") {
-                            println!("{}", data.trim());
-                        }
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(classify_error)?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            while let Some(event_end) = buffer.find("\n\n") {
+                let event_text = buffer[..event_end].to_string();
+                buffer = buffer[event_end + 2..].to_string();
+
+                for line in event_text.lines() {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        println!("{}", data.trim());
                     }
                 }
             }
-
-            // Flush remaining buffer
-            for line in buffer.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    println!("{}", data.trim());
-                }
-            }
-
-            Ok(String::new())
-        } else {
-            let json: serde_json::Value =
-                response.json().await.map_err(|e| RelishError::ApiError {
-                    status: 0,
-                    body: format!("failed to parse response: {e}"),
-                })?;
-
-            Ok(json["logs"].as_str().unwrap_or("").to_string())
         }
+
+        for line in buffer.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                println!("{}", data.trim());
+            }
+        }
+
+        Ok(String::new())
     }
 
     /// Execute a command inside a running instance.
