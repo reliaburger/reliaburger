@@ -1,3 +1,269 @@
 # Eyes Everywhere
 
-TODO: Phase 11 — Advanced Observability. PromQL, hierarchical aggregation, full Brioche UI, alert webhooks, log export.
+In Chapter 6, we built a per-node metrics database. Arrow for columnar storage, DataFusion for SQL queries, Parquet for persistence. Every node collects system metrics, scrapes Prometheus endpoints, and stores everything locally. That works brilliantly for a single node. You query `localhost:9117/v1/metrics` and get exactly what you need.
+
+But what happens when you have 500 nodes? Or 5,000? "Show me total CPU usage across the cluster" means hitting every single node's API, waiting for every response, and merging the results. That's O(N) fan-out. At scale, it's slow, fragile, and creates thundering-herd problems when someone refreshes the dashboard.
+
+We need a way to answer cluster-wide questions without talking to every node. That's hierarchical metrics aggregation.
+
+## The insight: partial aggregates
+
+The trick is that most cluster-wide queries don't need raw data points. "Total CPU usage" needs a sum. "Peak memory" needs a max. "Average request latency" needs a sum and a count (to compute the average). You can pre-compute these aggregates on each node and ship the summaries instead of the raw samples.
+
+A 1-minute window of CPU measurements might contain 6 samples (one every 10 seconds). Instead of shipping all 6 values, you ship one rollup: min=23.5, max=67.2, sum=285.3, count=6. From that rollup, the receiver can compute any standard aggregate without seeing the original data. The sum of sums is the total sum. The min of mins is the global min. The max of maxes is the global max. And the sum of sums divided by the sum of counts is the global average.
+
+This is the same idea behind pre-aggregation in Prometheus recording rules and in Thanos/Cortex downsampling. We just bake it into the architecture.
+
+## The two-tier tree
+
+Here's the architecture. It mirrors the reporting tree from Chapter 7:
+
+```
+Worker nodes (hundreds or thousands)
+    │
+    │  Push 1-minute rollups every 60 seconds
+    │  (deterministic assignment: hash(node_id) % council_size)
+    ▼
+Council members (3-7 nodes)
+    │
+    │  Store rollups in a separate RollupStore
+    │  Answer cluster-wide queries from rollup data
+    ▼
+Query client (Brioche UI, relish CLI, API consumer)
+    Fans out to council members only (3-7 requests, not 5,000)
+```
+
+The fan-out for a cluster-wide query is bounded by the council size, regardless of how many worker nodes exist. A 5-node council serves a 50-node cluster and a 5,000-node cluster with the same query latency.
+
+## Rollup types
+
+Let's start with the data model. A rollup captures the statistical summary of a metric over one time window:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RollupAggregate {
+    pub min: f64,
+    pub max: f64,
+    pub sum: f64,
+    pub count: u32,
+}
+```
+
+`Copy` is the right derive here. This is a 28-byte value type (three `f64`s and one `u32`). Passing it by value is cheaper than passing a reference. Rust's `Copy` trait marks types that can be duplicated by just copying bytes, no `clone()` needed. Numbers, booleans, and small structs of copyable fields qualify.
+
+Each rollup entry preserves the metric identity, so the aggregator can answer label-filtered queries:
+
+```rust
+pub struct RollupEntry {
+    pub metric_name: String,
+    pub labels: BTreeMap<String, String>,
+    pub aggregate: RollupAggregate,
+}
+```
+
+And a `NodeRollup` bundles all entries from one node for one time window:
+
+```rust
+pub struct NodeRollup {
+    pub node_id: NodeId,
+    pub timestamp: u64,        // start of the 1-minute window
+    pub entries: Vec<RollupEntry>,
+}
+```
+
+A typical node running 10 apps produces roughly 20-30 rollup entries per minute (system metrics plus per-app metrics). The serialised `NodeRollup` fits comfortably under 5 KB. Even with 2,000 nodes pushing to a single council member, that's about 10 MB per minute. Easily manageable.
+
+## Generating rollups
+
+The `RollupGenerator` sits on each node. Every 60 seconds, it queries the local `MayoStore` for the previous minute's data using a GROUP BY query:
+
+```rust
+pub async fn generate(
+    &self,
+    store: &MayoStore,
+    now: u64,
+    extended: bool,
+) -> Result<NodeRollup, MayoError> {
+    let window = if extended {
+        EXTENDED_ROLLUP_WINDOW_SECS  // 300 seconds
+    } else {
+        DEFAULT_ROLLUP_WINDOW_SECS   // 60 seconds
+    };
+    let start = now.saturating_sub(window);
+
+    let aggregates = store.query_window_aggregates(start, now).await?;
+    // ... map to RollupEntry structs
+}
+```
+
+The `extended` flag matters during reassignment. More on that shortly.
+
+Under the hood, `query_window_aggregates` runs this SQL through DataFusion:
+
+```sql
+SELECT metric_name, labels,
+       MIN(value), MAX(value), SUM(value), COUNT(*)
+FROM metrics
+WHERE timestamp >= {start} AND timestamp < {end}
+GROUP BY metric_name, labels
+```
+
+DataFusion handles the columnar aggregation efficiently. We're leveraging the same query engine from Chapter 6, just with a GROUP BY instead of a raw SELECT.
+
+### A Rust pattern: `saturating_sub`
+
+Notice `now.saturating_sub(window)` instead of `now - window`. In Rust, unsigned integer subtraction panics on underflow in debug builds and wraps in release builds. Neither is what you want. `saturating_sub` clamps the result to zero, which is the correct behaviour when `now` is smaller than the window size (for instance, just after the node started). This is one of those Rust habits that prevents subtle bugs: use saturating arithmetic for any subtraction on unsigned integers where the result might logically be negative.
+
+## Storing rollups on the council
+
+When a council member receives a `NodeRollup` (via the reporting transport), it ingests the data into a `RollupStore`. This is a separate store from the node's local `MayoStore`, with a different Arrow schema:
+
+```
+timestamp (u64) | node_id (utf8) | metric_name (utf8) | labels (utf8)
+| min_val (f64) | max_val (f64) | sum_val (f64) | count_val (u32)
+```
+
+Eight columns instead of four. The extra columns capture the originating node and the aggregate statistics. The `RollupStore` follows the same buffer-flush-query pattern as `MayoStore`: insert into an in-memory buffer, periodically flush to a Parquet-backed RecordBatch, query via DataFusion SQL.
+
+We could have reused `MayoStore` with synthetic metric names like `rollup_cpu_min`. But that would pollute the local metric namespace and make queries awkward. A separate store with its own schema keeps things clean. The Arrow/DataFusion infrastructure is cheap to instantiate -- the real cost is in the data, not the bookkeeping.
+
+## Wiring into the reporting tree
+
+The reporting tree already sends `StateReport` messages from workers to council members. We extend the `ReportingMessage` enum with one new variant:
+
+```rust
+pub enum ReportingMessage {
+    Report(StateReport),
+    Ack { node_id: NodeId },
+    AggregatedReport { reports: HashMap<NodeId, StateReport> },
+    MetricsRollup(NodeRollup),   // new
+}
+```
+
+The `ReportAggregator` on each council member already handles `Report` and `AggregatedReport`. We add a case for `MetricsRollup`:
+
+```rust
+Some((_, ReportingMessage::MetricsRollup(rollup))) => {
+    if let Some(ref store) = self.rollup_store {
+        store.write().await.ingest(&rollup);
+    }
+}
+```
+
+That's it. One match arm. The existing transport handles framing, serialisation, and delivery. The existing assignment logic routes rollups to the right council member. No new transport layer needed.
+
+## The RollupWorker
+
+On each node, a `RollupWorker` runs as a separate spawned task with its own 60-second interval. It's separate from the `ReportWorker` (which sends `StateReport` every 1-5 seconds) because the data source, interval, and message type are all different. Combining them in one event loop would just add complexity.
+
+The worker watches for council membership changes via a `watch` channel. When the assignment changes (because a council member joined or left), it sets a flag to send an extended rollup on the next tick, covering the previous 5 minutes instead of 1 minute. This backfills the new aggregator with enough historical data to answer queries immediately, rather than having a 5-minute gap.
+
+```rust
+fn update_parent(&mut self) {
+    let council = self.council_rx.borrow().clone();
+    let new_parent = assign_parent_address(&self.node_id, &council);
+
+    if new_parent != self.parent_address {
+        self.send_extended = true;
+    }
+    self.parent_address = new_parent;
+}
+```
+
+## Two merge strategies
+
+When results come back from multiple sources, how you combine them depends on the query type.
+
+**Single-app queries** fan out to the 3-10 nodes running that app. Each node returns its own local data points. These might overlap (if a metric was reported by multiple sources), so we deduplicate by (timestamp, metric_name, labels):
+
+```rust
+pub fn merge_metrics_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<MetricsQueryRow> {
+    let mut all: Vec<MetricsQueryRow> = sources.drain(..).flatten().collect();
+    all.sort_by_key(|r| r.timestamp);
+    all.dedup_by(|a, b| {
+        a.timestamp == b.timestamp
+        && a.metric_name == b.metric_name
+        && a.labels == b.labels
+    });
+    all
+}
+```
+
+**Cluster-wide queries** fan out to the 3-7 council aggregators. Each returns a partial aggregate covering its subset of nodes. These must be *summed*, not deduplicated. If council member c1 reports `cpu_sum=30` (from workers w1 and w2) and c2 reports `cpu_sum=70` (from workers w3 and w4), the cluster total is 100, not 30 or 70.
+
+```rust
+pub fn merge_cluster_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<MetricsQueryRow> {
+    let mut sums: BTreeMap<(u64, String, String), f64> = BTreeMap::new();
+    for source in sources.drain(..) {
+        for row in source {
+            let key = (row.timestamp, row.metric_name, row.labels);
+            *sums.entry(key).or_default() += row.value;
+        }
+    }
+    // ... convert back to rows
+}
+```
+
+This distinction is easy to miss and causes subtle bugs if you get it wrong. The dedup merge produces correct results for single-app queries but silently drops data for cluster-wide queries. We discovered this during testing, which is exactly why you write tests first.
+
+### `BTreeMap` for deterministic output
+
+You might wonder why `merge_cluster_results` uses `BTreeMap` instead of `HashMap`. The `BTreeMap` keeps keys sorted, which means the output rows come out in a deterministic order (by timestamp, then metric name, then labels). A `HashMap` would produce correct sums but in an unpredictable order, making tests flaky and API responses inconsistent. When you need consistent ordering and your keys are comparable, `BTreeMap` is the right choice.
+
+## The API endpoints
+
+Three new endpoints expose the aggregation:
+
+- `GET /v1/metrics/rollup` -- internal. Queried by other council members during fan-out. Returns raw rollup data from the local `RollupStore`.
+- `GET /v1/metrics/cluster` -- cluster-wide query. Fans out to all council aggregators, sums partial results.
+- `GET /v1/metrics/app/{app}/{namespace}` -- single-app query. Queries local metrics filtered by app labels.
+
+The cluster endpoint returns a `MetricsQueryResult` with both data and warnings:
+
+```rust
+pub struct MetricsQueryResult {
+    pub data: Vec<MetricsQueryRow>,
+    pub warnings: Vec<QueryWarning>,
+}
+
+pub enum QueryWarning {
+    NodeUnresponsive { node_id: String },
+    DataUnavailable { node_id: String, from: u64, to: u64 },
+}
+```
+
+Graceful degradation is the goal. If one council member is down, you get partial results plus a warning telling you which data is missing. No 500 error, no empty response, no silent data loss. The caller can decide whether partial data is good enough for their use case.
+
+## Testing hierarchical aggregation
+
+The roadmap requires a specific test: "node-level partial aggregates combine correctly at council level." Here's the key test:
+
+```rust
+async fn hierarchical_aggregation_correctness() {
+    // Simulate 3 nodes with known CPU values
+    let values = [10.0, 20.0, 30.0];
+
+    // Generate rollups from each node's local MayoStore
+    // Ingest all into a single council RollupStore
+    // Query the RollupStore
+
+    assert_eq!(agg.min, 10.0);   // min of mins
+    assert_eq!(agg.max, 30.0);   // max of maxes
+    assert_eq!(agg.sum, 60.0);   // sum of sums
+    assert_eq!(agg.count, 3);    // sum of counts
+    assert_eq!(agg.avg(), Some(20.0));  // sum / count
+}
+```
+
+The integration test scales this up: 5 workers assigned to 3 council members, deterministic CPU values, verify the total across all council stores is exactly 150.0 (10+20+30+40+50). A second test simulates a downed aggregator and verifies that the partial sum from the remaining two council members is correct and consistent.
+
+## What's next
+
+We have cluster-wide metrics. But there's more to build before Phase 11 is complete:
+
+- **Full Brioche UI** -- app detail, node detail, and ingress overview pages with real-time charts
+- **Alert webhooks** -- deliver Slack, PagerDuty, and generic HTTP notifications when alerts fire
+- **Log export** -- scheduled export of logs to S3/GCS as compressed jsonl.gz
+- **Cross-node log queries** -- fan out log queries via the council, merge by timestamp
+
+And PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.
