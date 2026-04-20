@@ -270,6 +270,10 @@ pub struct MetricsSection {
     /// Object store URL for metric persistence. Empty = local filesystem.
     /// Set to `s3://bucket/prefix` for S3-backed storage.
     pub object_store_url: String,
+    /// How often to push rollup aggregates to the council (seconds).
+    pub rollup_interval_secs: u64,
+    /// How long to retain rollup data on council members (hours).
+    pub rollup_retention_hours: u32,
 }
 
 impl Default for MetricsSection {
@@ -280,6 +284,8 @@ impl Default for MetricsSection {
             scrape_interval_secs: 30,
             alerts_enabled: true,
             object_store_url: String::new(),
+            rollup_interval_secs: 60,
+            rollup_retention_hours: 24,
         }
     }
 }

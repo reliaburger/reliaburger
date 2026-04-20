@@ -194,8 +194,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 11: Advanced Observability
 
-- [ ] PromQL-to-SQL compatibility layer (rate, sum by, avg by, histogram_quantile)
-- [ ] Hierarchical metrics aggregation via council (cluster-wide queries)
+- [x] Hierarchical metrics aggregation via council (cluster-wide queries)
 - [ ] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts)
 - [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
 - [ ] Log export to S3/GCS (scheduled, jsonl.gz)

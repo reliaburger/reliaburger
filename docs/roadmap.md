@@ -509,24 +509,22 @@ Design docs: [security-sesame.md](design/security-sesame.md), [registry-pickle.m
 
 ## Phase 11: Advanced Observability, Full Monitoring Stack
 
-Complete the observability story with PromQL, hierarchical aggregation, and production-grade dashboards.
+Complete the observability story with hierarchical aggregation, production-grade dashboards, and alert integrations.
 
-Book: **Chapter 11, "Eyes Everywhere"** (PromQL, cluster-wide metrics, alert integrations, log pipelines)
+Book: **Chapter 11, "Eyes Everywhere"** (cluster-wide metrics, alert integrations, log pipelines)
 
 ### Tests (write first)
 
 Unit tests:
 
-- PromQL-to-SQL translation: `rate()`, `sum by()`, `avg by()`, `histogram_quantile()` produce correct SQL
 - Hierarchical aggregation: node-level partial aggregates combine correctly at council level
 - Alert webhook payload: JSON schema correctness for Slack, PagerDuty, generic HTTP
 - Log export: jsonl.gz serialisation round-trip, scheduled job trigger timing
 
 Integration tests:
 
-- PromQL: 5-node cluster with deterministic metrics. Verify hierarchical aggregation correctness
-- PromQL: partial results returned when one aggregator is down
-- PromQL: Prometheus remote-read API round-trip, PromQL function correctness
+- Hierarchical aggregation: 5-node cluster with deterministic metrics. Verify aggregation correctness
+- Hierarchical aggregation: partial results returned when one aggregator is down
 - Brioche UI: cluster overview renders with correct data. App detail shows instance count
 - Brioche UI: streaming logs appear within 2 seconds
 - Brioche UI: encrypted env vars aren't exposed in API responses
@@ -536,8 +534,7 @@ Integration tests:
 
 ### Implementation
 
-1. **PromQL-to-SQL compatibility layer.** Translate `rate`, `sum by`, `avg by`, `histogram_quantile` to DataFusion SQL.
-2. **Hierarchical metrics aggregation.** Council member rollups for cluster-wide queries.
+1. **Hierarchical metrics aggregation.** Council member rollups for cluster-wide queries.
 3. **Full Brioche UI.** App detail, node detail, ingress overview pages (axum + Askama + htmx + uPlot charts).
 4. **Alert webhooks.** Slack, PagerDuty, and generic HTTP webhook delivery with retry.
 5. **Log export.** Scheduled export to S3/GCS as jsonl.gz.
@@ -546,7 +543,7 @@ Integration tests:
 
 Design docs: [metrics-mayo.md](design/metrics-mayo.md), [logs-ketchup.md](design/logs-ketchup.md), [ui-brioche.md](design/ui-brioche.md)
 
-**Milestone:** PromQL queries work against the cluster, Brioche dashboards show full detail views, alerts fire webhooks, and logs export to object storage. All Phase 11 tests pass.
+**Milestone:** Cluster-wide metrics queries work via hierarchical aggregation, Brioche dashboards show full detail views, alerts fire webhooks, and logs export to object storage. All Phase 11 tests pass.
 
 ---
 
@@ -733,3 +730,4 @@ Features explicitly deferred to v2 (see whitepaper §22 for rationale):
 - **IPv6 support.** Dual-stack networking, IPv6 virtual IPs.
 - **Sidecars.** Co-located containers sharing a parent's network namespace and lifecycle.
 - **Fractional GPU scheduling.** MIG partitions on NVIDIA A100/H100, time-slicing.
+- **PromQL-to-SQL compatibility layer.** Translate `rate`, `sum by`, `avg by`, `histogram_quantile` to DataFusion SQL. Includes Prometheus remote-read API.
