@@ -22,7 +22,9 @@ use tokio::sync::RwLock;
 use crate::brioche::dashboard::{DashboardApp, DashboardData, render_dashboard};
 use crate::config::Config;
 use crate::ketchup::log_store::LogStore;
+use crate::ketchup::query::fan_out_query;
 use crate::ketchup::store::KetchupStore;
+use crate::ketchup::types::{LogEntry, LogQuery, LogQueryResult, LogQueryWarning};
 use crate::mayo::alert::AlertEvaluator;
 use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow, QueryWarning};
 use crate::mayo::rollup_store::RollupStore;
@@ -31,6 +33,16 @@ use crate::meat::deploy_types::DeployHistoryEntry;
 use crate::pickle::types::ManifestCatalog;
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
+
+/// Lightweight node membership info for cross-node queries.
+///
+/// Extracted from gossip `NodeMembership` to avoid pulling in
+/// `Instant` fields which are not Clone-friendly across API state.
+#[derive(Debug, Clone)]
+pub struct NodeMembershipInfo {
+    pub node_id: crate::meat::NodeId,
+    pub address: std::net::SocketAddr,
+}
 
 /// Shared state for API handlers.
 #[derive(Clone)]
@@ -54,6 +66,10 @@ pub struct ApiState {
     pub council: Option<Arc<crate::council::CouncilNode>>,
     /// Council-side rollup store for cluster-wide metrics queries.
     pub rollup_store: Option<Arc<RwLock<RollupStore>>>,
+    /// Cluster membership for cross-node queries (populated from gossip).
+    pub membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
+    /// HTTP client for cross-node fan-out queries.
+    pub http_client: reqwest::Client,
 }
 
 /// Build the API router.
@@ -78,6 +94,8 @@ pub fn router(
         gitops_webhook_tx: None,
         council: None,
         rollup_store: None,
+        membership: None,
+        http_client: reqwest::Client::new(),
     };
 
     Router::new()
@@ -88,6 +106,14 @@ pub fn router(
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
+        .route(
+            "/v1/logs/entries/{app}/{namespace}",
+            get(logs_entries_handler),
+        )
+        .route(
+            "/v1/logs/query/{app}/{namespace}",
+            get(logs_cross_node_handler),
+        )
         .route("/v1/exec/{app}/{namespace}", post(exec_handler))
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
@@ -294,6 +320,9 @@ async fn stop_handler(
 struct LogsQuery {
     tail: Option<usize>,
     follow: Option<bool>,
+    start: Option<u64>,
+    end: Option<u64>,
+    grep: Option<String>,
 }
 
 /// Get logs for an app.
@@ -363,6 +392,163 @@ async fn logs_handler(
             Json(serde_json::json!({ "error": "agent dropped response" })),
         )
             .into_response(),
+    }
+}
+
+/// `GET /v1/logs/entries/{app}/{namespace}?start=S&end=E&grep=G&tail=N`
+///
+/// Internal structured log query endpoint. Returns `Vec<LogEntry>` as
+/// JSON. Called by `fan_out_query` on each node during cross-node queries.
+async fn logs_entries_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<LogsQuery>,
+) -> Response {
+    let Some(log_store) = &state.log_store else {
+        return Json(Vec::<LogEntry>::new()).into_response();
+    };
+
+    let store = log_store.read().await;
+    match store
+        .query(
+            &app,
+            &namespace,
+            query.start,
+            query.end,
+            query.grep.as_deref(),
+            query.tail,
+        )
+        .await
+    {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/logs/query/{app}/{namespace}?start=S&end=E&grep=G&tail=N`
+///
+/// Cross-node log query. Looks up which nodes run the app from the
+/// council placement state, fans out the query to those nodes, and
+/// merge-sorts results by timestamp.
+async fn logs_cross_node_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<LogsQuery>,
+) -> Response {
+    use crate::meat::types::AppId;
+
+    // Build a LogQuery from request params
+    let log_query = LogQuery {
+        app: app.clone(),
+        namespace: namespace.clone(),
+        start: query.start,
+        end: query.end,
+        grep: query.grep.clone(),
+        json_field: None,
+        tail: None, // apply tail after merge
+    };
+
+    // If we have council + membership, do cross-node fan-out
+    if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
+        let desired = council.desired_state().await;
+        let app_id = AppId::new(&app, &namespace);
+
+        // Find which nodes run this app
+        let node_ids: Vec<crate::meat::NodeId> = desired
+            .scheduling
+            .get(&app_id)
+            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+            .unwrap_or_default();
+
+        if node_ids.is_empty() {
+            return Json(LogQueryResult {
+                entries: vec![],
+                node_count: 0,
+                warnings: vec![],
+            })
+            .into_response();
+        }
+
+        // Resolve NodeIds to HTTP URLs via membership table
+        let members = membership.read().await;
+        let mut node_urls = Vec::new();
+        let mut warnings = Vec::new();
+
+        for node_id in &node_ids {
+            if let Some(info) = members.iter().find(|m| m.node_id == *node_id) {
+                node_urls.push(format!("http://{}", info.address));
+            } else {
+                warnings.push(LogQueryWarning::NodeUnresponsive {
+                    node_id: node_id.0.clone(),
+                });
+            }
+        }
+        drop(members);
+
+        let node_count = node_urls.len() + warnings.len();
+
+        // Fan out to all nodes
+        let timeout = std::time::Duration::from_secs(10);
+        match fan_out_query(&log_query, &node_urls, &state.http_client, timeout).await {
+            Ok(mut entries) => {
+                // Apply tail after merge (fan_out already merge-sorted)
+                if let Some(tail) = query.tail
+                    && entries.len() > tail
+                {
+                    entries = entries.split_off(entries.len() - tail);
+                }
+                Json(LogQueryResult {
+                    entries,
+                    node_count,
+                    warnings,
+                })
+                .into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        // Single-node mode: query local log store
+        let Some(log_store) = &state.log_store else {
+            return Json(LogQueryResult {
+                entries: vec![],
+                node_count: 1,
+                warnings: vec![],
+            })
+            .into_response();
+        };
+
+        let store = log_store.read().await;
+        match store
+            .query(
+                &app,
+                &namespace,
+                query.start,
+                query.end,
+                query.grep.as_deref(),
+                query.tail,
+            )
+            .await
+        {
+            Ok(entries) => Json(LogQueryResult {
+                entries,
+                node_count: 1,
+                warnings: vec![],
+            })
+            .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
     }
 }
 
