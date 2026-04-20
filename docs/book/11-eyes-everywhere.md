@@ -257,13 +257,104 @@ async fn hierarchical_aggregation_correctness() {
 
 The integration test scales this up: 5 workers assigned to 3 council members, deterministic CPU values, verify the total across all council stores is exactly 150.0 (10+20+30+40+50). A second test simulates a downed aggregator and verifies that the partial sum from the remaining two council members is correct and consistent.
 
+## Cross-node log queries
+
+Metrics aggregate naturally -- a sum of sums is still a sum. Logs don't. You can't "aggregate" log lines; you can only collect them from everywhere and interleave them in the right order. That's what cross-node log queries do.
+
+### The problem
+
+When `relish logs web` runs, it needs to show logs from every instance of the "web" app across every node in the cluster. If web has 3 replicas on nodes 1, 3, and 7, we need to query all three and present a unified timeline.
+
+### The approach
+
+The leader (or any council member) receives the query and:
+
+1. Looks up which nodes run the app from the Raft placement state
+2. Fans out the query to those nodes in parallel
+3. Each node queries its local LogStore and returns `Vec<LogEntry>` as JSON
+4. The leader merge-sorts the results by timestamp
+5. Returns the combined stream to the caller
+
+This is simpler than the metrics case because there's no aggregation involved -- just concatenation and sorting. We already built `fan_out_query()` and `merge_log_entries()` back in Phase 6 and never wired them in. Now we do.
+
+### Two endpoints, two purposes
+
+We add two endpoints that work together:
+
+`GET /v1/logs/entries/{app}/{namespace}` is the **internal** endpoint. It queries the local LogStore via DataFusion SQL and returns a JSON array of `LogEntry` objects. This is what `fan_out_query` calls on each node. It supports `start`, `end`, `grep`, and `tail` query parameters.
+
+`GET /v1/logs/query/{app}/{namespace}` is the **cross-node** endpoint. It performs the full fan-out:
+
+```rust
+async fn logs_cross_node_handler(...) -> Response {
+    // Look up placement from council
+    let desired = council.desired_state().await;
+    let app_id = AppId::new(&app, &namespace);
+    let node_ids = desired.scheduling.get(&app_id)
+        .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+        .unwrap_or_default();
+
+    // Resolve NodeIds to HTTP URLs via membership table
+    let mut node_urls = Vec::new();
+    for node_id in &node_ids {
+        if let Some(info) = members.iter().find(|m| m.node_id == *node_id) {
+            node_urls.push(format!("http://{}", info.address));
+        }
+    }
+
+    // Fan out and merge
+    let entries = fan_out_query(&log_query, &node_urls, &client, timeout).await?;
+
+    // Apply tail after merge (important: each node applies its own tail,
+    // but we want the global last-N after merging)
+    if let Some(tail) = query.tail {
+        if entries.len() > tail {
+            entries = entries.split_off(entries.len() - tail);
+        }
+    }
+}
+```
+
+### Why separate the existing endpoint
+
+The original `/v1/logs/{app}/{namespace}` returns `{"logs": "multiline string"}`, which the CLI already depends on. The fan-out mechanism needs `Vec<LogEntry>` as JSON. Rather than breaking backward compatibility, we add `/v1/logs/entries/...` as the structured variant. Clean separation, no migration needed.
+
+### Tail after merge
+
+There's a subtle detail with `tail`. If you ask for `?tail=10` and the app runs on 3 nodes, each node returns its last 10 lines. After merge-sort, you have up to 30 lines. The cross-node handler applies `tail` again on the merged result, so the caller gets exactly the 10 most recent lines from the global timeline. The per-node tail is still useful -- it prevents each node from sending its entire log history when you only want the end.
+
+### Graceful degradation
+
+If a node is unreachable, the fan-out returns empty for that node. The response includes a `warnings` array listing which nodes didn't respond:
+
+```json
+{
+  "entries": [...],
+  "node_count": 3,
+  "warnings": [{"NodeUnresponsive": {"node_id": "node-7"}}]
+}
+```
+
+You get partial results rather than a hard failure. The caller decides whether that's acceptable.
+
+### Testing cross-node queries
+
+The integration tests spin up lightweight axum servers (one per simulated node), each backed by a LogStore with known entries at specific timestamps. Then they call `fan_out_query` and verify:
+
+- Entries from all nodes appear in the result
+- Results are sorted by timestamp
+- Duplicate entries (same timestamp + line) are deduplicated
+- Grep filtering works per-node before merge
+- Unreachable nodes produce partial results, not errors
+
+No Raft setup needed for these tests. The fan-out mechanism is the same regardless of whether the caller found the node URLs via Raft or a hardcoded list. We test the coordination layer in isolation.
+
 ## What's next
 
-We have cluster-wide metrics. But there's more to build before Phase 11 is complete:
+We have cluster-wide metrics and cross-node log queries. But there's more to build before Phase 11 is complete:
 
 - **Full Brioche UI** -- app detail, node detail, and ingress overview pages with real-time charts
 - **Alert webhooks** -- deliver Slack, PagerDuty, and generic HTTP notifications when alerts fire
 - **Log export** -- scheduled export of logs to S3/GCS as compressed jsonl.gz
-- **Cross-node log queries** -- fan out log queries via the council, merge by timestamp
 
 And PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.
