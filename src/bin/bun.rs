@@ -172,6 +172,49 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Spawn log export task (if configured)
+    if let Some(ref export_path) = config.logs.export_path {
+        let export_store = Arc::clone(&log_store);
+        let export_shutdown = shutdown.clone();
+        let export_dest = export_path.clone();
+        let export_interval = std::time::Duration::from_secs(config.logs.export_interval_secs);
+        let node_id = config
+            .node
+            .name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+        println!(
+            "bun: log export enabled → {export_dest} (every {}s)",
+            config.logs.export_interval_secs
+        );
+        tokio::spawn(async move {
+            use reliaburger::ketchup::export::{ExportCheckpoint, export_logs};
+            let mut tick = tokio::time::interval(export_interval);
+            // Skip first tick (fires immediately)
+            tick.tick().await;
+            let store_guard = export_store.read().await;
+            let checkpoint_path = store_guard.data_dir().join("_export_checkpoint.json");
+            let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
+            drop(store_guard);
+            loop {
+                tokio::select! {
+                    _ = export_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let store = export_store.read().await;
+                        match export_logs(store.data_dir(), &export_dest, &node_id, &mut checkpoint) {
+                            Ok(result) if result.files_exported > 0 => {
+                                println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
+                                checkpoint.save(&checkpoint_path).ok();
+                            }
+                            Err(e) => eprintln!("bun: log export error: {e}"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Start the API server
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
