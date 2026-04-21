@@ -399,9 +399,52 @@ The `ListingTableUrl` abstraction is what makes this work with both local paths 
 
 `relish logs-search /tmp/backup/node-1/ "SELECT app, COUNT(*) FROM logs GROUP BY app"` runs SQL directly against the exported files. No running agent needed. DataFusion reads Parquet, executes the query, and prints JSON results. Aggregations, joins, window functions, LIKE patterns -- the full SQL dialect.
 
+## Disk pressure: export before you delete
+
+There's a subtle problem with scheduled export. The export runs every hour. Pruning runs separately based on retention days or storage limits. What if the disk fills up between exports? You lose data that was never backed up.
+
+The solution is to tie these two operations together. Before deleting anything, make sure it's been exported first.
+
+The `check_and_relieve` function runs every 5 minutes and does exactly this:
+
+```rust
+pub fn check_and_relieve(
+    source_dir: &Path,
+    export_dest: Option<&str>,
+    node_id: &str,
+    checkpoint: &mut ExportCheckpoint,
+    max_bytes: u64,
+    retention_days: u32,
+) -> PressureResult
+```
+
+When the Parquet directory exceeds `max_bytes`, it:
+
+1. Exports any un-exported files to the configured destination
+2. Collects all Parquet files sorted oldest-first
+3. For each file that's past retention OR over the size limit, checks whether it's been exported
+4. Only deletes files that have been safely exported (or that have no export destination configured)
+5. Stops once usage is under the threshold
+
+The key invariant: **files are never deleted locally until they've been successfully exported.** If the export destination is unreachable, the disk fills up — which is the correct behaviour. You'd rather run out of disk space (which triggers alerts) than silently lose data.
+
+This applies to both logs and metrics. The `bun` binary spawns one disk pressure task that checks both directories. Configuration is per-section:
+
+```toml
+[logs]
+max_storage_mb = 500    # prune exported log files when exceeding 500 MB
+export_path = "/mnt/backup/logs/"
+
+[metrics]
+max_storage_mb = 200    # prune exported metrics files when exceeding 200 MB
+export_path = "/mnt/backup/metrics/"
+```
+
+Setting `max_storage_mb = 0` (the default) disables size-based pruning. Retention-based pruning (via `retention_days`) still applies. You can use both: retention handles the steady state, max_storage handles spikes.
+
 ## What's next
 
-We have cluster-wide metrics, cross-node log queries, and Parquet log export with remote search. But there's more to build before Phase 11 is complete:
+We have cluster-wide metrics, cross-node log queries, Parquet log export with remote search, and disk pressure management. But there's more to build before Phase 11 is complete:
 
 - **Full Brioche UI** -- app detail, node detail, and ingress overview pages with real-time charts
 - **Alert webhooks** -- deliver Slack, PagerDuty, and generic HTTP notifications when alerts fire
