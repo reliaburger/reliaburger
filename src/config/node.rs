@@ -274,6 +274,11 @@ pub struct MetricsSection {
     pub rollup_interval_secs: u64,
     /// How long to retain rollup data on council members (hours).
     pub rollup_retention_hours: u32,
+    /// Maximum local Parquet storage for metrics (MB). 0 means unlimited.
+    /// When exceeded, exported files are pruned oldest-first.
+    pub max_storage_mb: u64,
+    /// Optional export destination for metrics Parquet files.
+    pub export_path: Option<String>,
 }
 
 impl Default for MetricsSection {
@@ -286,6 +291,8 @@ impl Default for MetricsSection {
             object_store_url: String::new(),
             rollup_interval_secs: 60,
             rollup_retention_hours: 24,
+            max_storage_mb: 0,
+            export_path: None,
         }
     }
 }
@@ -305,6 +312,9 @@ pub struct LogsSection {
     pub export_path: Option<String>,
     /// How often to export logs (seconds). Default: 3600 (1 hour).
     pub export_interval_secs: u64,
+    /// Maximum local Parquet storage for logs (MB). 0 means unlimited.
+    /// When exceeded, exported files are pruned oldest-first.
+    pub max_storage_mb: u64,
 }
 
 impl Default for LogsSection {
@@ -314,6 +324,7 @@ impl Default for LogsSection {
             max_file_size_mb: 100,
             export_path: None,
             export_interval_secs: 3600,
+            max_storage_mb: 0,
         }
     }
 }
