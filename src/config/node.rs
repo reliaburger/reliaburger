@@ -298,6 +298,13 @@ pub struct LogsSection {
     pub retention_days: u32,
     /// Maximum size of a single log file in MB before rotation.
     pub max_file_size_mb: u64,
+    /// Optional destination for Parquet log export. When set, log
+    /// files are periodically copied to this path. Can be a local
+    /// path (`/mnt/backup/logs/`) or an object store URL
+    /// (`s3://bucket/logs/`).
+    pub export_path: Option<String>,
+    /// How often to export logs (seconds). Default: 3600 (1 hour).
+    pub export_interval_secs: u64,
 }
 
 impl Default for LogsSection {
@@ -305,6 +312,8 @@ impl Default for LogsSection {
         Self {
             retention_days: 7,
             max_file_size_mb: 100,
+            export_path: None,
+            export_interval_secs: 3600,
         }
     }
 }
