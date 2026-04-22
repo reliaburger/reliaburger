@@ -102,6 +102,93 @@ async fn logs_with_client(
     Ok(())
 }
 
+/// Export Parquet log files to a destination directory.
+///
+/// Triggers an immediate export from the running Bun agent's LogStore
+/// to the specified destination. Falls back to direct file copy if the
+/// agent is unreachable.
+pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> {
+    // Try to find the local log store directory
+    let log_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reliaburger"))
+        .join("reliaburger")
+        .join("logs")
+        .join("parquet");
+
+    if !log_dir.exists() {
+        // Try the default config path
+        let alt_dir = std::path::PathBuf::from("/var/lib/reliaburger/logs/parquet");
+        if !alt_dir.exists() {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: format!(
+                    "no log store found at {} or {}",
+                    log_dir.display(),
+                    alt_dir.display()
+                ),
+            });
+        }
+        return logs_export_from(&alt_dir, dest, node_id);
+    }
+
+    logs_export_from(&log_dir, dest, node_id)
+}
+
+fn logs_export_from(source: &Path, dest: &Path, node_id: &str) -> Result<(), RelishError> {
+    use crate::ketchup::export::{ExportCheckpoint, export_logs};
+
+    let checkpoint_path = source.join("_export_checkpoint.json");
+    let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
+
+    let dest_str = dest.to_str().unwrap_or(".");
+    match export_logs(source, dest_str, node_id, &mut checkpoint) {
+        Ok(result) => {
+            if result.files_exported == 0 {
+                println!("no new files to export");
+            } else {
+                println!(
+                    "exported {} file(s) ({} bytes) to {}/{}",
+                    result.files_exported, result.bytes_written, dest_str, node_id,
+                );
+                checkpoint.save(&checkpoint_path).ok();
+            }
+            Ok(())
+        }
+        Err(e) => Err(RelishError::ApiError {
+            status: 0,
+            body: format!("export failed: {e}"),
+        }),
+    }
+}
+
+/// Search exported Parquet log archives with SQL.
+///
+/// Runs a DataFusion SQL query against Parquet files at the given
+/// source path. No running agent needed — reads files directly.
+pub async fn logs_search(source: &str, sql: &str) -> Result<(), RelishError> {
+    use crate::ketchup::remote_query::query_remote_json;
+
+    match query_remote_json(source, sql).await {
+        Ok(rows) => {
+            if rows.is_empty() {
+                println!("(no results)");
+            } else {
+                for row in &rows {
+                    println!(
+                        "{}",
+                        serde_json::to_string(row).unwrap_or_else(|_| format!("{row:?}"))
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(RelishError::ApiError {
+            status: 0,
+            body: format!("search failed: {e}"),
+        }),
+    }
+}
+
 /// Execute a command inside a running container.
 pub async fn exec(app: &str, command: &[String]) -> Result<(), RelishError> {
     exec_with_client(app, command, &BunClient::default_local()).await

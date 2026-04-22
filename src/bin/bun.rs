@@ -172,6 +172,127 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Spawn log export task (if configured)
+    if let Some(ref export_path) = config.logs.export_path {
+        let export_store = Arc::clone(&log_store);
+        let export_shutdown = shutdown.clone();
+        let export_dest = export_path.clone();
+        let export_interval = std::time::Duration::from_secs(config.logs.export_interval_secs);
+        let node_id = config
+            .node
+            .name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+        println!(
+            "bun: log export enabled → {export_dest} (every {}s)",
+            config.logs.export_interval_secs
+        );
+        tokio::spawn(async move {
+            use reliaburger::ketchup::export::{ExportCheckpoint, export_logs};
+            let mut tick = tokio::time::interval(export_interval);
+            // Skip first tick (fires immediately)
+            tick.tick().await;
+            let store_guard = export_store.read().await;
+            let checkpoint_path = store_guard.data_dir().join("_export_checkpoint.json");
+            let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
+            drop(store_guard);
+            loop {
+                tokio::select! {
+                    _ = export_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let store = export_store.read().await;
+                        match export_logs(store.data_dir(), &export_dest, &node_id, &mut checkpoint) {
+                            Ok(result) if result.files_exported > 0 => {
+                                println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
+                                checkpoint.save(&checkpoint_path).ok();
+                            }
+                            Err(e) => eprintln!("bun: log export error: {e}"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn disk pressure check task (every 5 minutes)
+    // Exports un-exported files before pruning, so data is never lost.
+    {
+        let dp_log_store = Arc::clone(&log_store);
+        let dp_mayo_store = Arc::clone(&mayo_store);
+        let dp_shutdown = shutdown.clone();
+        let log_export_path = config.logs.export_path.clone();
+        let log_max_bytes = config.logs.max_storage_mb * 1024 * 1024;
+        let log_retention_days = config.logs.retention_days;
+        let metrics_export_path = config.metrics.export_path.clone();
+        let metrics_max_bytes = config.metrics.max_storage_mb * 1024 * 1024;
+        let metrics_retention_days = config.metrics.retention_days;
+        let dp_node_id = config
+            .node
+            .name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+        tokio::spawn(async move {
+            use reliaburger::bun::disk_pressure::check_and_relieve;
+            use reliaburger::ketchup::export::ExportCheckpoint;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await; // skip first immediate tick
+
+            let log_store_guard = dp_log_store.read().await;
+            let log_checkpoint_path = log_store_guard.data_dir().join("_export_checkpoint.json");
+            let log_data_dir = log_store_guard.data_dir().to_path_buf();
+            drop(log_store_guard);
+            let mut log_checkpoint = ExportCheckpoint::load(&log_checkpoint_path);
+
+            let mayo_store_guard = dp_mayo_store.read().await;
+            let mayo_checkpoint_path = mayo_store_guard.data_dir().join("_export_checkpoint.json");
+            let mayo_data_dir = mayo_store_guard.data_dir().to_path_buf();
+            drop(mayo_store_guard);
+            let mut mayo_checkpoint = ExportCheckpoint::load(&mayo_checkpoint_path);
+
+            loop {
+                tokio::select! {
+                    _ = dp_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        // Check log disk pressure
+                        let log_result = check_and_relieve(
+                            &log_data_dir,
+                            log_export_path.as_deref(),
+                            &dp_node_id,
+                            &mut log_checkpoint,
+                            log_max_bytes,
+                            log_retention_days,
+                        );
+                        if log_result.files_pruned > 0 {
+                            println!(
+                                "bun: disk pressure — pruned {} log file(s), reclaimed {} bytes",
+                                log_result.files_pruned, log_result.bytes_reclaimed
+                            );
+                            log_checkpoint.save(&log_checkpoint_path).ok();
+                        }
+
+                        // Check metrics disk pressure
+                        let metrics_result = check_and_relieve(
+                            &mayo_data_dir,
+                            metrics_export_path.as_deref(),
+                            &dp_node_id,
+                            &mut mayo_checkpoint,
+                            metrics_max_bytes,
+                            metrics_retention_days,
+                        );
+                        if metrics_result.files_pruned > 0 {
+                            println!(
+                                "bun: disk pressure — pruned {} metrics file(s), reclaimed {} bytes",
+                                metrics_result.files_pruned, metrics_result.bytes_reclaimed
+                            );
+                            mayo_checkpoint.save(&mayo_checkpoint_path).ok();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Start the API server
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);

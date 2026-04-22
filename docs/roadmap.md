@@ -519,7 +519,7 @@ Unit tests:
 
 - Hierarchical aggregation: node-level partial aggregates combine correctly at council level
 - Alert webhook payload: JSON schema correctness for Slack, PagerDuty, generic HTTP
-- Log export: jsonl.gz serialisation round-trip, scheduled job trigger timing
+- Log export: Parquet export round-trip, scheduled job trigger timing
 
 Integration tests:
 
@@ -529,7 +529,7 @@ Integration tests:
 - Brioche UI: streaming logs appear within 2 seconds
 - Brioche UI: encrypted env vars aren't exposed in API responses
 - Alert webhooks: memory pressure triggers alert, webhook payload delivered to mock endpoint
-- Log export: scheduled export produces valid jsonl.gz in object store
+- Log export: scheduled export produces valid Parquet in object store, queryable via DataFusion SQL
 - Cross-node log queries: 3 nodes, 3 replicas, all lines in merge-sorted timestamp order via Raft
 
 ### Implementation
@@ -537,7 +537,7 @@ Integration tests:
 1. **Hierarchical metrics aggregation.** Council member rollups for cluster-wide queries.
 3. **Full Brioche UI.** App detail, node detail, ingress overview pages (axum + Askama + htmx + uPlot charts).
 4. **Alert webhooks.** Slack, PagerDuty, and generic HTTP webhook delivery with retry.
-5. **Log export.** Scheduled export to S3/GCS as jsonl.gz.
+5. **Log export.** Scheduled Parquet export to S3/GCS with `relish logs-search` for remote SQL queries.
 6. **Cross-node log queries via Raft.** Leader fan-out, merge-sort by timestamp, dedup.
 7. **Run all tests green.**
 

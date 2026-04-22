@@ -349,12 +349,104 @@ The integration tests spin up lightweight axum servers (one per simulated node),
 
 No Raft setup needed for these tests. The fan-out mechanism is the same regardless of whether the caller found the node URLs via Raft or a hardcoded list. We test the coordination layer in isolation.
 
+## Log export and remote search
+
+Logs stored on local disk eventually need to go somewhere more durable. A node might die, disks fill up, compliance requires retention. The original design said "export as jsonl.gz." We went a different direction: export as Parquet.
+
+Why? Because we already produce Parquet files. The LogStore flushes its Arrow RecordBatches to Parquet every 60 seconds. Exporting means copying those files to a destination directory (local path, S3, GCS). No format conversion, no serialisation step, no gzip compression pipeline. Copy the bytes.
+
+But the real payoff is on the read side. DataFusion can query Parquet files directly from any `object_store` backend. So `relish logs-search /tmp/backup/ "SELECT * FROM logs WHERE app='web'"` runs a full SQL query against exported archives, with predicate pushdown, without downloading the files first.
+
+### The export engine
+
+The exporter is deliberately simple:
+
+```rust
+pub fn export_logs(
+    source_dir: &Path,
+    destination: &str,
+    node_id: &str,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<ExportResult, KetchupError>
+```
+
+It lists Parquet files in the source directory, skips any that have already been exported (tracked by an `ExportCheckpoint`), and copies the rest to `{destination}/{node_id}/`. The checkpoint is a JSON file persisted to disk, so export is incremental across restarts.
+
+In the `bun` binary, the export runs as a spawned task on a configurable interval (default: 1 hour). The pattern is identical to the metrics collection and log flush tasks we've seen before.
+
+### Remote search via DataFusion ListingTable
+
+The search command creates a DataFusion `ListingTable` backed by the exported Parquet files:
+
+```rust
+let table_url = ListingTableUrl::parse(source_path)?;
+let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+    .with_file_extension(".parquet");
+let config = ListingTableConfig::new(table_url)
+    .with_listing_options(listing_options)
+    .with_schema(Arc::new(log_schema()));
+let table = ListingTable::try_new(config)?;
+ctx.register_table("logs", Arc::new(table))?;
+```
+
+`ListingTable` tells DataFusion "there's a directory of Parquet files, treat them all as one table." DataFusion handles the rest: listing files, reading row groups, applying predicate pushdown, columnar filtering. You get the full SQL engine over your log archives for free.
+
+The `ListingTableUrl` abstraction is what makes this work with both local paths and remote URLs. With the `fs` feature of `object_store`, local paths work out of the box. Adding `aws` or `gcp` features would enable `s3://` and `gs://` URLs with no code changes.
+
+### Two CLI commands
+
+`relish logs-export --dest /tmp/backup/` copies local Parquet files to a destination. It finds the LogStore directory, loads (or creates) a checkpoint, exports new files, and reports results.
+
+`relish logs-search /tmp/backup/node-1/ "SELECT app, COUNT(*) FROM logs GROUP BY app"` runs SQL directly against the exported files. No running agent needed. DataFusion reads Parquet, executes the query, and prints JSON results. Aggregations, joins, window functions, LIKE patterns -- the full SQL dialect.
+
+## Disk pressure: export before you delete
+
+There's a subtle problem with scheduled export. The export runs every hour. Pruning runs separately based on retention days or storage limits. What if the disk fills up between exports? You lose data that was never backed up.
+
+The solution is to tie these two operations together. Before deleting anything, make sure it's been exported first.
+
+The `check_and_relieve` function runs every 5 minutes and does exactly this:
+
+```rust
+pub fn check_and_relieve(
+    source_dir: &Path,
+    export_dest: Option<&str>,
+    node_id: &str,
+    checkpoint: &mut ExportCheckpoint,
+    max_bytes: u64,
+    retention_days: u32,
+) -> PressureResult
+```
+
+When the Parquet directory exceeds `max_bytes`, it:
+
+1. Exports any un-exported files to the configured destination
+2. Collects all Parquet files sorted oldest-first
+3. For each file that's past retention OR over the size limit, checks whether it's been exported
+4. Only deletes files that have been safely exported (or that have no export destination configured)
+5. Stops once usage is under the threshold
+
+The key invariant: **files are never deleted locally until they've been successfully exported.** If the export destination is unreachable, the disk fills up — which is the correct behaviour. You'd rather run out of disk space (which triggers alerts) than silently lose data.
+
+This applies to both logs and metrics. The `bun` binary spawns one disk pressure task that checks both directories. Configuration is per-section:
+
+```toml
+[logs]
+max_storage_mb = 500    # prune exported log files when exceeding 500 MB
+export_path = "/mnt/backup/logs/"
+
+[metrics]
+max_storage_mb = 200    # prune exported metrics files when exceeding 200 MB
+export_path = "/mnt/backup/metrics/"
+```
+
+Setting `max_storage_mb = 0` (the default) disables size-based pruning. Retention-based pruning (via `retention_days`) still applies. You can use both: retention handles the steady state, max_storage handles spikes.
+
 ## What's next
 
-We have cluster-wide metrics and cross-node log queries. But there's more to build before Phase 11 is complete:
+We have cluster-wide metrics, cross-node log queries, Parquet log export with remote search, and disk pressure management. But there's more to build before Phase 11 is complete:
 
 - **Full Brioche UI** -- app detail, node detail, and ingress overview pages with real-time charts
 - **Alert webhooks** -- deliver Slack, PagerDuty, and generic HTTP notifications when alerts fire
-- **Log export** -- scheduled export of logs to S3/GCS as compressed jsonl.gz
 
 And PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.

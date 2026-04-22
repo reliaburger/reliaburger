@@ -63,6 +63,11 @@ impl MayoStore {
         }
     }
 
+    /// The directory where Parquet files are stored.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// Insert a metric sample into the buffer.
     pub fn insert(&mut self, key: &MetricKey, sample: Sample) {
         self.buffer.push(BufferedSample {

@@ -50,6 +50,24 @@ enum Command {
         #[arg(long)]
         json_field: Option<String>,
     },
+    /// Export Parquet log files to a destination directory.
+    #[command(name = "logs-export")]
+    LogsExport {
+        /// Destination directory path.
+        #[arg(long)]
+        dest: PathBuf,
+        /// Node ID to use in export path. Default: "local".
+        #[arg(long, default_value = "local")]
+        node_id: String,
+    },
+    /// Search exported Parquet log archives with SQL.
+    #[command(name = "logs-search")]
+    LogsSearch {
+        /// Path to exported Parquet directory.
+        source: String,
+        /// SQL query against the `logs` table.
+        sql: String,
+    },
     /// Show live resource usage (CPU, memory) for all apps.
     Top,
     /// Execute a command inside a running container.
@@ -487,6 +505,14 @@ async fn main() -> ExitCode {
             since: ref _since,
             json_field: ref _json_field,
         } => commands::logs(name, tail, follow).await,
+        Command::LogsExport {
+            ref dest,
+            ref node_id,
+        } => commands::logs_export(dest, node_id).await,
+        Command::LogsSearch {
+            ref source,
+            ref sql,
+        } => commands::logs_search(source, sql).await,
         Command::Top => commands::top().await,
         Command::Exec {
             ref app,
