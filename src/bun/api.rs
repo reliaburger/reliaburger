@@ -19,7 +19,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::brioche::dashboard::{DashboardApp, DashboardData, render_dashboard};
+use crate::brioche::app_detail::render_app_detail;
+use crate::brioche::assets::static_asset_handler;
+use crate::brioche::dashboard::{DashboardApp, DashboardData, DashboardNode, render_dashboard};
+use crate::brioche::fragments;
+use crate::brioche::node_detail::render_node_detail;
+use crate::brioche::types::{AppDetailData, ChartConfig, NodeDetailData, safe_env};
 use crate::config::Config;
 use crate::ketchup::log_store::LogStore;
 use crate::ketchup::query::fan_out_query;
@@ -150,6 +155,18 @@ pub fn router(
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
+        // Brioche UI pages and fragments
+        .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
+        .route("/ui/node/{name}", get(node_detail_handler))
+        .route("/ui/fragment/apps", get(fragment_apps_handler))
+        .route("/ui/fragment/nodes", get(fragment_nodes_handler))
+        .route("/ui/fragment/alerts", get(fragment_alerts_handler))
+        .route(
+            "/ui/fragment/app/{app}/{namespace}/instances",
+            get(fragment_instances_handler),
+        )
+        .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
+        .route("/ui/static/{*path}", get(static_asset_handler))
         .with_state(state)
 }
 
@@ -1099,47 +1116,270 @@ async fn metrics_summary_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
-/// `GET /` — serve the Brioche cluster overview dashboard.
-async fn dashboard_handler(State(state): State<ApiState>) -> Response {
-    // Gather app statuses
+/// Gather instance statuses from the agent.
+async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
     let (tx, rx) = oneshot::channel();
     let _ = state
         .cmd_tx
         .send(AgentCommand::Status { response: tx })
         .await;
-    let statuses = rx.await.unwrap_or_default();
+    rx.await.unwrap_or_default()
+}
 
-    let apps: Vec<DashboardApp> = statuses
-        .iter()
-        .map(|s| DashboardApp {
-            name: s.app_name.clone(),
-            namespace: s.namespace.clone(),
-            instances_running: 1,
-            instances_desired: 1,
-            state: s.state.clone(),
+/// Build dashboard app rows from instance statuses.
+fn statuses_to_dashboard_apps(statuses: &[InstanceStatus]) -> Vec<DashboardApp> {
+    // Group by (app_name, namespace) to get correct instance counts.
+    let mut app_map: std::collections::HashMap<(String, String), (usize, String)> =
+        std::collections::HashMap::new();
+    for s in statuses {
+        let key = (s.app_name.clone(), s.namespace.clone());
+        let entry = app_map.entry(key).or_insert((0, s.state.clone()));
+        entry.0 += 1;
+        // If any instance is not running, show the worst state.
+        if s.state != "running" {
+            entry.1 = s.state.clone();
+        }
+    }
+    app_map
+        .into_iter()
+        .map(|((name, namespace), (count, state))| DashboardApp {
+            name,
+            namespace,
+            instances_running: count,
+            instances_desired: count,
+            state,
         })
-        .collect();
+        .collect()
+}
 
-    let alert_count = if let Some(ref alerts) = state.alerts {
-        alerts.read().await.firing_alerts().len()
+/// Build the dashboard data from current agent state.
+async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
+    let statuses = gather_statuses(state).await;
+    let apps = statuses_to_dashboard_apps(&statuses);
+
+    let (alert_count, alerts) = if let Some(ref evaluator) = state.alerts {
+        let eval = evaluator.read().await;
+        let firing = eval.firing_alerts();
+        let count = firing.len();
+        let alert_rows = firing
+            .iter()
+            .map(|a| crate::brioche::dashboard::DashboardAlert {
+                name: a.rule_name.clone(),
+                severity: format!("{:?}", a.severity),
+                description: a.description.clone(),
+            })
+            .collect();
+        (count, alert_rows)
     } else {
-        0
+        (0, vec![])
     };
 
-    let data = DashboardData {
+    DashboardData {
         cluster_name: String::new(),
         node_count: 1,
         app_count: apps.len(),
         alert_count,
         apps,
         nodes: vec![],
-        alerts: vec![],
-    };
+        alerts,
+    }
+}
 
-    let html = render_dashboard(&data);
+/// Return an HTML response.
+fn html_response(html: String) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
     (StatusCode::OK, headers, html).into_response()
+}
+
+/// `GET /` — serve the Brioche cluster overview dashboard.
+async fn dashboard_handler(State(state): State<ApiState>) -> Response {
+    let data = gather_dashboard_data(&state).await;
+    html_response(render_dashboard(&data))
+}
+
+/// `GET /ui/app/{app}/{namespace}` — app detail page.
+async fn app_detail_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    let statuses = gather_statuses(&state).await;
+    let instances: Vec<InstanceStatus> = statuses
+        .into_iter()
+        .filter(|s| s.app_name == app && s.namespace == namespace)
+        .collect();
+
+    let overall_state = if instances.is_empty() {
+        "unknown".to_string()
+    } else if instances.iter().all(|i| i.state == "running") {
+        "running".to_string()
+    } else {
+        instances
+            .iter()
+            .find(|i| i.state != "running")
+            .map(|i| i.state.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
+    // Get env vars from deployed spec
+    let (env_tx, env_rx) = oneshot::channel();
+    let _ = state
+        .cmd_tx
+        .send(AgentCommand::AppConfig {
+            app_name: app.clone(),
+            namespace: namespace.clone(),
+            response: env_tx,
+        })
+        .await;
+    let env = match env_rx.await {
+        Ok(Some(spec)) => safe_env(&spec.env),
+        _ => vec![],
+    };
+
+    // Get deploy history
+    let deploy_history = if let Some(ref history) = state.deploy_history {
+        let h = history.read().await;
+        h.iter().filter(|e| e.app_id.name == app).cloned().collect()
+    } else {
+        vec![]
+    };
+
+    let charts = vec![
+        ChartConfig {
+            endpoint: format!("/v1/metrics/app/{app}/{namespace}?name=process_cpu_percent"),
+            title: "CPU Usage".to_string(),
+            y_label: "%".to_string(),
+            refresh_secs: 10,
+            range_secs: 3600,
+        },
+        ChartConfig {
+            endpoint: format!("/v1/metrics/app/{app}/{namespace}?name=process_memory_bytes"),
+            title: "Memory Usage".to_string(),
+            y_label: "bytes".to_string(),
+            refresh_secs: 10,
+            range_secs: 3600,
+        },
+    ];
+
+    let data = AppDetailData {
+        app_name: app,
+        namespace,
+        state: overall_state,
+        instances,
+        env,
+        deploy_history,
+        charts,
+    };
+
+    html_response(render_app_detail(&data))
+}
+
+/// `GET /ui/node/{name}` — node detail page.
+async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
+    let statuses = gather_statuses(&state).await;
+
+    let data = NodeDetailData {
+        name,
+        state: "alive".to_string(),
+        app_count: statuses.len(),
+        apps: statuses,
+        charts: vec![
+            ChartConfig {
+                endpoint: "/v1/metrics?name=node_cpu_usage_percent".to_string(),
+                title: "CPU Usage".to_string(),
+                y_label: "%".to_string(),
+                refresh_secs: 10,
+                range_secs: 3600,
+            },
+            ChartConfig {
+                endpoint: "/v1/metrics?name=node_memory_used_bytes".to_string(),
+                title: "Memory Usage".to_string(),
+                y_label: "bytes".to_string(),
+                refresh_secs: 10,
+                range_secs: 3600,
+            },
+        ],
+    };
+
+    html_response(render_node_detail(&data))
+}
+
+/// `GET /ui/fragment/apps` — apps table HTML fragment for HTMX swap.
+async fn fragment_apps_handler(State(state): State<ApiState>) -> Response {
+    let statuses = gather_statuses(&state).await;
+    let apps = statuses_to_dashboard_apps(&statuses);
+    html_response(fragments::render_apps_table_fragment(&apps))
+}
+
+/// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.
+async fn fragment_nodes_handler(State(_state): State<ApiState>) -> Response {
+    // In single-node mode, the nodes list is empty.
+    let nodes: Vec<DashboardNode> = vec![];
+    html_response(fragments::render_nodes_table_fragment(&nodes))
+}
+
+/// `GET /ui/fragment/alerts` — alerts table HTML fragment for HTMX swap.
+async fn fragment_alerts_handler(State(state): State<ApiState>) -> Response {
+    let alerts = if let Some(ref evaluator) = state.alerts {
+        let eval = evaluator.read().await;
+        eval.firing_alerts()
+            .iter()
+            .map(|a| crate::brioche::dashboard::DashboardAlert {
+                name: a.rule_name.clone(),
+                severity: format!("{:?}", a.severity),
+                description: a.description.clone(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    html_response(fragments::render_alerts_table_fragment(&alerts))
+}
+
+/// `GET /ui/fragment/app/{app}/{namespace}/instances` — instance table fragment.
+async fn fragment_instances_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    let statuses = gather_statuses(&state).await;
+    let instances: Vec<InstanceStatus> = statuses
+        .into_iter()
+        .filter(|s| s.app_name == app && s.namespace == namespace)
+        .collect();
+    html_response(fragments::render_instance_table_fragment(&instances))
+}
+
+/// `GET /ui/app/{app}/{namespace}/env` — safe environment variables (JSON).
+///
+/// Encrypted values are replaced with `"[encrypted]"`. The raw
+/// ciphertext never reaches the browser.
+async fn app_env_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    let (tx, rx) = oneshot::channel();
+    let _ = state
+        .cmd_tx
+        .send(AgentCommand::AppConfig {
+            app_name: app,
+            namespace,
+            response: tx,
+        })
+        .await;
+
+    match rx.await {
+        Ok(Some(spec)) => Json(safe_env(&spec.env)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "agent unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /v1/logs/sql?q=SELECT...` — query logs via DataFusion SQL.

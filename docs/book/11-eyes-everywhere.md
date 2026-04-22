@@ -442,11 +442,106 @@ export_path = "/mnt/backup/metrics/"
 
 Setting `max_storage_mb = 0` (the default) disables size-based pruning. Retention-based pruning (via `retention_days`) still applies. You can use both: retention handles the steady state, max_storage handles spikes.
 
+## Upgrading Brioche: from meta-refresh to HTMX
+
+Back in Chapter 6, we built the Brioche dashboard as a single page. Format strings, inline CSS, and a `<meta http-equiv="refresh" content="5">` tag that reloaded the entire page every five seconds. It worked, but it was blunt. Every reload flashed the screen, reset scroll position, and re-fetched everything whether it changed or not.
+
+Now we need more pages — app detail, node detail — and the old approach doesn't scale. So we're introducing two small libraries: HTMX for partial page updates and uPlot for time-series charts. No React, no Vue, no build pipeline. `cargo build` still produces everything.
+
+### Why not Askama?
+
+The design doc specifies Askama templates — compile-time type-checked HTML rendering. It's a good idea when you have 10+ pages. We have three. Format strings got us this far and they'll keep working. Each page is a self-contained render function in its own file under `src/brioche/`. If the page count grows, we can migrate to Askama without touching anything outside `src/brioche/`.
+
+### HTMX for partial updates
+
+The key insight is that you don't need a JavaScript framework to update part of a page. HTMX adds a few HTML attributes and the browser does the rest:
+
+```html
+<div hx-get="/ui/fragment/apps"
+     hx-trigger="every 5s"
+     hx-swap="innerHTML">
+  <!-- Server-rendered table goes here -->
+</div>
+```
+
+Every 5 seconds, HTMX fires a GET request to `/ui/fragment/apps`, receives a bare `<table>` fragment (no `<html>` wrapper), and swaps it into the `<div>`. The rest of the page stays put. No flashing, no scroll reset, no wasted bandwidth.
+
+We split rendering into two layers:
+
+1. **Full page renders** (`render_dashboard`, `render_app_detail`, `render_node_detail`) produce complete HTML documents with `<head>`, `<body>`, and all the script/CSS links.
+2. **Fragment renders** (`render_apps_table_fragment`, `render_instance_table_fragment`, etc.) produce bare HTML that HTMX can swap in. The full-page renders call these internally, so the initial page load and subsequent HTMX updates use the same rendering code.
+
+### uPlot for charts
+
+uPlot is a 10KB JavaScript library that renders time-series charts on a canvas element. It handles millions of data points at 60fps — massively overkill for our use case, but that means it'll never be the bottleneck.
+
+The server doesn't know about uPlot. It renders a `<div>` with a JSON `data-chart-config` attribute:
+
+```html
+<div data-chart-config='{"endpoint":"/v1/metrics/app/web/default?name=process_cpu_percent",
+                          "title":"CPU Usage","y_label":"%",
+                          "refresh_secs":10,"range_secs":3600}'>
+</div>
+```
+
+A small custom script (`brioche.js`, about 100 lines) finds these elements on page load, creates uPlot instances, and periodically fetches data from the existing metrics API. The metrics endpoints already return JSON arrays of `{timestamp, value}` objects — no new backend work needed.
+
+### Vendored assets, no build pipeline
+
+HTMX and uPlot ship as single minified JS files. We vendor them into `brioche/dist/` and embed them into the binary via `rust-embed`:
+
+```rust
+#[derive(rust_embed::Embed)]
+#[folder = "brioche/dist/"]
+struct BriocheAssets;
+```
+
+At runtime, `GET /ui/static/htmx.min.js` serves the file from the binary's memory. No filesystem reads, no CDN dependency, no separate install step. Total JS payload: ~50KB (HTMX) + ~50KB (uPlot) + ~3KB (custom) — about 103KB uncompressed. For comparison, Grafana loads 2-5MB of JavaScript.
+
+### App detail page
+
+Navigate to `/ui/app/web/default` and you get a page with:
+
+- **Header**: app name, namespace, state, instance count
+- **Charts**: CPU and memory usage over the last hour, auto-refreshing every 10 seconds
+- **Instance table**: each running instance with state, restarts, port, PID — auto-refreshing via HTMX
+- **Streaming logs**: an SSE connection to the existing log follow endpoint, appending lines in real time
+- **Deploy history**: past deployments with image, result, and step counts
+- **Environment variables**: every env var from the app spec, with encrypted values displayed as `[encrypted]`
+
+That last point is important. The `EnvValue` type has `Plain` and `Encrypted` variants, and the `Serialize` impl outputs the raw ciphertext. We can't use that — it would send `ENC[AGE:longbase64...]` to the browser.
+
+Instead, we define a `SafeEnvValue` type that replaces encrypted values before serialisation:
+
+```rust
+pub fn safe_env(env: &BTreeMap<String, EnvValue>) -> Vec<SafeEnvValue> {
+    env.iter()
+        .map(|(k, v)| SafeEnvValue {
+            key: k.clone(),
+            value: match v {
+                EnvValue::Plain(s) => s.clone(),
+                EnvValue::Encrypted(_) => "[encrypted]".to_string(),
+            },
+            encrypted: v.is_encrypted(),
+        })
+        .collect()
+}
+```
+
+A test verifies the invariant: serialise the output to JSON and assert it never contains `ENC[AGE:`. The masking happens at the API layer, not the UI layer — even a direct `curl` to the env endpoint gets masked values.
+
+### Node detail page
+
+Navigate to `/ui/node/node-01` for per-node resource charts (system CPU and memory from Mayo) and a table of all running instances on that node. App names link back to their detail pages.
+
+### Storing deployed specs
+
+To serve environment variables, the API needs the original `AppSpec` after deployment. The agent previously discarded configs once instances were running. We added a `deployed_specs: HashMap<(String, String), AppSpec>` field to `BunAgent` and populate it during deploy. A new `AgentCommand::AppConfig` variant retrieves it for the env endpoint.
+
 ## What's next
 
-We have cluster-wide metrics, cross-node log queries, Parquet log export with remote search, and disk pressure management. But there's more to build before Phase 11 is complete:
+We have cluster-wide metrics, cross-node log queries, Parquet log export with remote search, disk pressure management, and a multi-page Brioche UI with HTMX and uPlot charts. But there's more to build before Phase 11 is complete:
 
-- **Full Brioche UI** -- app detail, node detail, and ingress overview pages with real-time charts
 - **Alert webhooks** -- deliver Slack, PagerDuty, and generic HTTP notifications when alerts fire
 
 And PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.
