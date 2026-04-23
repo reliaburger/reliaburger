@@ -1,10 +1,15 @@
 //! Dashboard rendering.
 //!
 //! Produces a complete HTML page showing cluster overview: apps, nodes,
-//! and alerts. No templates — just format strings. Total output is
-//! under 10KB including embedded CSS.
+//! and alerts. Uses HTMX for automatic partial-page refreshes instead
+//! of full-page reloads. Charts are initialised client-side by uPlot
+//! via `data-chart-config` attributes.
 
 use serde::{Deserialize, Serialize};
+
+use super::fragments::{
+    render_alerts_table_fragment, render_apps_table_fragment, render_nodes_table_fragment,
+};
 
 /// Data backing the dashboard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -45,6 +50,11 @@ pub struct DashboardAlert {
 }
 
 /// Render the dashboard as a complete HTML page.
+///
+/// Uses HTMX for automatic polling of each section independently.
+/// The apps, nodes, and alerts sections refresh every 5s / 3s via
+/// `hx-get` attributes, replacing the old `<meta http-equiv="refresh">`
+/// approach that reloaded the entire page.
 pub fn render_dashboard(data: &DashboardData) -> String {
     let mut html = String::with_capacity(8192);
 
@@ -54,18 +64,17 @@ pub fn render_dashboard(data: &DashboardData) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="5">
 <title>Reliaburger</title>
-<style>
-"#,
-    );
-    html.push_str(DASHBOARD_CSS);
-    html.push_str(
-        r#"</style>
+<link rel="stylesheet" href="/ui/static/uplot.min.css">
+<link rel="stylesheet" href="/ui/static/brioche.css">
+<script src="/ui/static/htmx.min.js"></script>
+<script src="/ui/static/uplot.min.js"></script>
+<script src="/ui/static/brioche.js"></script>
 </head>
 <body>
-<header>
-<h1>Reliaburger Dashboard</h1>
+<nav>
+<span class="brand">Reliaburger Dashboard</span>
+</nav>
 "#,
     );
 
@@ -76,7 +85,7 @@ pub fn render_dashboard(data: &DashboardData) -> String {
         ));
     }
 
-    html.push_str("</header>\n<div class=\"summary\">\n");
+    html.push_str("<div class=\"summary\">\n");
     html.push_str(&format!(
         "<div class=\"stat\"><span class=\"num\">{}</span><span class=\"label\">Nodes</span></div>\n",
         data.node_count
@@ -97,100 +106,36 @@ pub fn render_dashboard(data: &DashboardData) -> String {
     ));
     html.push_str("</div>\n");
 
-    // Apps table
+    // Apps table (HTMX-polled)
     html.push_str("<section>\n<h2>Apps</h2>\n");
-    if data.apps.is_empty() {
-        html.push_str("<p class=\"empty\">no workloads running</p>\n");
-    } else {
-        html.push_str(
-            "<table>\n<tr><th>Name</th><th>Namespace</th><th>Status</th><th>Instances</th></tr>\n",
-        );
-        for app in &data.apps {
-            let dot = status_dot(&app.state);
-            html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{dot} {}</td><td>{}/{}</td></tr>\n",
-                escape_html(&app.name),
-                escape_html(&app.namespace),
-                escape_html(&app.state),
-                app.instances_running,
-                app.instances_desired,
-            ));
-        }
-        html.push_str("</table>\n");
-    }
-    html.push_str("</section>\n");
+    html.push_str(
+        "<div hx-get=\"/ui/fragment/apps\" hx-trigger=\"every 5s\" hx-swap=\"innerHTML\">\n",
+    );
+    html.push_str(&render_apps_table_fragment(&data.apps));
+    html.push_str("</div>\n</section>\n");
 
-    // Nodes table
+    // Nodes table (HTMX-polled)
     html.push_str("<section>\n<h2>Nodes</h2>\n");
-    if data.nodes.is_empty() {
-        html.push_str("<p class=\"empty\">single-node mode</p>\n");
-    } else {
-        html.push_str("<table>\n<tr><th>Name</th><th>State</th><th>Apps</th></tr>\n");
-        for node in &data.nodes {
-            let dot = status_dot(&node.state);
-            html.push_str(&format!(
-                "<tr><td>{}</td><td>{dot} {}</td><td>{}</td></tr>\n",
-                escape_html(&node.name),
-                escape_html(&node.state),
-                node.app_count,
-            ));
-        }
-        html.push_str("</table>\n");
-    }
-    html.push_str("</section>\n");
+    html.push_str(
+        "<div hx-get=\"/ui/fragment/nodes\" hx-trigger=\"every 5s\" hx-swap=\"innerHTML\">\n",
+    );
+    html.push_str(&render_nodes_table_fragment(&data.nodes));
+    html.push_str("</div>\n</section>\n");
 
-    // Alerts section
+    // Alerts section (HTMX-polled, more frequently)
     html.push_str("<section>\n<h2>Alerts</h2>\n");
-    if data.alerts.is_empty() {
-        html.push_str("<p class=\"empty\">none active</p>\n");
-    } else {
-        html.push_str("<table>\n<tr><th>Name</th><th>Severity</th><th>Description</th></tr>\n");
-        for alert in &data.alerts {
-            html.push_str(&format!(
-                "<tr class=\"alert-{}\"><td>{}</td><td>{}</td><td>{}</td></tr>\n",
-                escape_html(&alert.severity.to_lowercase()),
-                escape_html(&alert.name),
-                escape_html(&alert.severity),
-                escape_html(&alert.description),
-            ));
-        }
-        html.push_str("</table>\n");
-    }
-    html.push_str("</section>\n");
+    html.push_str(
+        "<div hx-get=\"/ui/fragment/alerts\" hx-trigger=\"every 3s\" hx-swap=\"innerHTML\">\n",
+    );
+    html.push_str(&render_alerts_table_fragment(&data.alerts));
+    html.push_str("</div>\n</section>\n");
 
     html.push_str("</body>\n</html>\n");
     html
 }
 
-/// Minimal CSS for the dashboard (dark theme).
-const DASHBOARD_CSS: &str = r#"
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, 'Segoe UI', Roboto, monospace; padding: 1rem; }
-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }
-h1 { font-size: 1.4rem; color: #fff; }
-.cluster { background: #16213e; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.85rem; }
-.summary { display: flex; gap: 2rem; margin-bottom: 1.5rem; }
-.stat { text-align: center; }
-.num { display: block; font-size: 2rem; font-weight: bold; color: #4ecca3; }
-.num.alert { color: #e74c3c; }
-.label { font-size: 0.8rem; color: #888; text-transform: uppercase; }
-section { margin-bottom: 1.5rem; }
-h2 { font-size: 1.1rem; color: #ccc; margin-bottom: 0.5rem; border-bottom: 1px solid #333; padding-bottom: 0.3rem; }
-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
-th { text-align: left; padding: 0.4rem 0.6rem; color: #888; font-weight: normal; text-transform: uppercase; font-size: 0.75rem; }
-td { padding: 0.4rem 0.6rem; border-top: 1px solid #2a2a3e; }
-tr:hover td { background: #16213e; }
-.empty { color: #666; font-style: italic; padding: 0.5rem 0; }
-.dot-green { color: #4ecca3; }
-.dot-amber { color: #f39c12; }
-.dot-red { color: #e74c3c; }
-.dot-grey { color: #666; }
-.alert-critical td { color: #e74c3c; }
-.alert-warning td { color: #f39c12; }
-"#;
-
 /// Return a coloured dot span based on state.
-fn status_dot(state: &str) -> &'static str {
+pub fn status_dot(state: &str) -> &'static str {
     match state.to_lowercase().as_str() {
         "running" | "alive" | "healthy" => "<span class=\"dot-green\">●</span>",
         "pending" | "preparing" => "<span class=\"dot-amber\">●</span>",
@@ -200,7 +145,7 @@ fn status_dot(state: &str) -> &'static str {
 }
 
 /// Escape HTML special characters.
-fn escape_html(s: &str) -> String {
+pub fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -283,17 +228,52 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_has_auto_refresh() {
+    fn dashboard_has_htmx_polling() {
         let html = render_dashboard(&DashboardData::default());
-        assert!(html.contains("http-equiv=\"refresh\""));
-        assert!(html.contains("content=\"5\""));
+        assert!(html.contains("hx-get="));
+        assert!(html.contains("hx-trigger=\"every 5s\""));
+        assert!(html.contains("hx-trigger=\"every 3s\""));
     }
 
     #[test]
-    fn dashboard_has_css() {
+    fn dashboard_includes_scripts() {
         let html = render_dashboard(&DashboardData::default());
-        assert!(html.contains("<style>"));
-        assert!(html.contains("background:"));
+        assert!(html.contains("/ui/static/htmx.min.js"));
+        assert!(html.contains("/ui/static/uplot.min.js"));
+        assert!(html.contains("/ui/static/brioche.js"));
+        assert!(html.contains("/ui/static/brioche.css"));
+    }
+
+    #[test]
+    fn dashboard_apps_link_to_detail() {
+        let data = DashboardData {
+            app_count: 1,
+            apps: vec![DashboardApp {
+                name: "web".to_string(),
+                namespace: "default".to_string(),
+                instances_running: 1,
+                instances_desired: 1,
+                state: "running".to_string(),
+            }],
+            ..Default::default()
+        };
+        let html = render_dashboard(&data);
+        assert!(html.contains("/ui/app/web/default"));
+    }
+
+    #[test]
+    fn dashboard_nodes_link_to_detail() {
+        let data = DashboardData {
+            node_count: 1,
+            nodes: vec![DashboardNode {
+                name: "node-01".to_string(),
+                state: "alive".to_string(),
+                app_count: 3,
+            }],
+            ..Default::default()
+        };
+        let html = render_dashboard(&data);
+        assert!(html.contains("/ui/node/node-01"));
     }
 
     #[test]

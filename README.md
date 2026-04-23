@@ -30,7 +30,7 @@ Everything runs inside a single `bun` binary. No sidecars, no separate databases
 | **Mayo** | Time-series metrics (Arrow + DataFusion + Parquet) |
 | **Ketchup** | Log collection (append-only, indexed, JSON-aware) |
 | **Smoker** | Built-in fault injection (safety rails, eBPF network faults, scenarios) |
-| **Brioche** | Web dashboard (server-rendered, auto-refresh) |
+| **Brioche** | Web dashboard (HTMX auto-refresh, uPlot charts, app/node detail pages) |
 
 ## Quick start
 
@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (1522 and counting)
+make test                    # run all tests (1556 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -107,7 +107,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,364 tests across 9 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
+**1,556 tests across 11 phases (10 complete, 11 in progress).** See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -119,7 +119,9 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 6. Observability | Done | 991 |
 | 7. Deployments | Done | 1,050 |
 | 8. Advanced | Done | 1,263 |
-| 9. User Experience | Done | 1,364 |
+| 9. User Experience | Done | 1,271 |
+| 10. Advanced Security | Done | 1,448 |
+| 11. Advanced Observability | In progress | 1,556 |
 
 ## The book
 

@@ -1,0 +1,170 @@
+/* Brioche dashboard styles — dark theme. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: -apple-system, 'Segoe UI', Roboto, monospace;
+    padding: 1rem;
+}
+
+/* Navigation */
+nav {
+    display: flex;
+    gap: 1.5rem;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    border-bottom: 1px solid #333;
+    padding-bottom: 0.75rem;
+}
+nav a {
+    color: #4ecca3;
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+nav a:hover { text-decoration: underline; }
+nav .brand {
+    font-size: 1.2rem;
+    font-weight: bold;
+    color: #fff;
+    margin-right: auto;
+}
+
+/* Header */
+header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+h1 { font-size: 1.4rem; color: #fff; }
+.cluster {
+    background: #16213e;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+/* Summary cards */
+.summary { display: flex; gap: 2rem; margin-bottom: 1.5rem; }
+.stat { text-align: center; }
+.num { display: block; font-size: 2rem; font-weight: bold; color: #4ecca3; }
+.num.alert { color: #e74c3c; }
+.label { font-size: 0.8rem; color: #888; text-transform: uppercase; }
+
+/* Sections */
+section { margin-bottom: 1.5rem; }
+h2 {
+    font-size: 1.1rem;
+    color: #ccc;
+    margin-bottom: 0.5rem;
+    border-bottom: 1px solid #333;
+    padding-bottom: 0.3rem;
+}
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    color: #888;
+    font-weight: normal;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+}
+td { padding: 0.4rem 0.6rem; border-top: 1px solid #2a2a3e; }
+tr:hover td { background: #16213e; }
+a.row-link { color: #4ecca3; text-decoration: none; }
+a.row-link:hover { text-decoration: underline; }
+
+/* Empty state */
+.empty { color: #666; font-style: italic; padding: 0.5rem 0; }
+
+/* Status dots */
+.dot-green { color: #4ecca3; }
+.dot-amber { color: #f39c12; }
+.dot-red { color: #e74c3c; }
+.dot-grey { color: #666; }
+
+/* Alert rows */
+.alert-critical td { color: #e74c3c; }
+.alert-warning td { color: #f39c12; }
+
+/* Badges */
+.badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    font-weight: bold;
+}
+.badge-green { background: #1a3a2a; color: #4ecca3; }
+.badge-amber { background: #3a2a1a; color: #f39c12; }
+.badge-red { background: #3a1a1a; color: #e74c3c; }
+.badge-grey { background: #2a2a2e; color: #888; }
+
+/* Charts */
+.chart-container {
+    background: #16213e;
+    border-radius: 6px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+.chart-container h3 {
+    font-size: 0.9rem;
+    color: #aaa;
+    margin-bottom: 0.5rem;
+}
+.chart-placeholder {
+    height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #555;
+    font-style: italic;
+}
+.charts-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+/* Log viewer */
+.log-viewer {
+    background: #0d0d1a;
+    border: 1px solid #2a2a3e;
+    border-radius: 4px;
+    padding: 0.5rem;
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 0.8rem;
+    line-height: 1.4;
+}
+.log-line { white-space: pre-wrap; word-break: break-all; }
+.log-line:hover { background: #16213e; }
+
+/* Environment table */
+.env-encrypted { color: #888; font-style: italic; }
+
+/* Detail page header */
+.detail-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+}
+.detail-header h1 { margin: 0; }
+.detail-meta {
+    font-size: 0.85rem;
+    color: #888;
+}
+.detail-meta span { margin-right: 1rem; }
+
+/* Responsive: horizontal scroll for tables on narrow viewports */
+@media (max-width: 768px) {
+    .charts-row { grid-template-columns: 1fr; }
+    table { display: block; overflow-x: auto; }
+}

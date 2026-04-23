@@ -60,6 +60,8 @@ datafusion = "45"
 object_store = { version = "0.12", features = ["fs"] }
 sysinfo = "0.33"
 prometheus-parse = "0.2"
+rust-embed = "8"
+mime_guess = "2"
 k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -168,6 +168,12 @@ pub enum AgentCommand {
         manifest_digest: String,
         response: oneshot::Sender<Result<String, BunError>>,
     },
+    /// Get the deployed AppSpec for a specific app (for safe env display).
+    AppConfig {
+        app_name: String,
+        namespace: String,
+        response: oneshot::Sender<Option<AppSpec>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -313,6 +319,10 @@ pub struct BunAgent<G: Grill> {
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
     netns_paths: std::collections::HashMap<InstanceId, std::path::PathBuf>,
+    /// Deployed app specs, keyed by (app_name, namespace). Stored so the
+    /// Brioche UI can display environment variables with encrypted values
+    /// masked as `[encrypted]`.
+    deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
 }
 
 impl<G: Grill> BunAgent<G> {
@@ -345,6 +355,7 @@ impl<G: Grill> BunAgent<G> {
             last_firewall_node_count: 0,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
+            deployed_specs: std::collections::HashMap::new(),
         }
     }
 
@@ -384,6 +395,7 @@ impl<G: Grill> BunAgent<G> {
             last_firewall_node_count: 0,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
+            deployed_specs: std::collections::HashMap::new(),
         }
     }
 
@@ -727,6 +739,14 @@ impl<G: Grill> BunAgent<G> {
                 let result = self.handle_sign_image(&manifest_digest).await;
                 let _ = response.send(result);
             }
+            AgentCommand::AppConfig {
+                app_name,
+                namespace,
+                response,
+            } => {
+                let spec = self.deployed_specs.get(&(app_name, namespace)).cloned();
+                let _ = response.send(spec);
+            }
         }
     }
 
@@ -843,6 +863,10 @@ impl<G: Grill> BunAgent<G> {
 
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+
+            // Store the spec so the Brioche UI can display env vars safely.
+            self.deployed_specs
+                .insert((app_name.clone(), namespace.to_string()), spec.clone());
 
             // Check if this app already has running instances → rolling deploy
             let existing: Vec<_> = self
