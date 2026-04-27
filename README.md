@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (1556 and counting)
+make test                    # run all tests (1595 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -107,7 +107,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,556 tests across 11 phases (10 complete, 11 in progress).** See [progress.md](docs/progress.md) for the full checklist.
+**1,595 tests across 11 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -121,7 +121,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 8. Advanced | Done | 1,263 |
 | 9. User Experience | Done | 1,271 |
 | 10. Advanced Security | Done | 1,448 |
-| 11. Advanced Observability | In progress | 1,556 |
+| 11. Advanced Observability | Done | 1,595 |
 
 ## The book
 

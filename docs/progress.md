@@ -196,11 +196,11 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 - [x] Hierarchical metrics aggregation via council (cluster-wide queries)
 - [x] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts)
-- [ ] Alert webhooks (Slack, PagerDuty, generic HTTP)
+- [x] Alert webhooks (Slack, PagerDuty, generic HTTP)
 - [x] Log export to S3/GCS (scheduled Parquet, `relish logs-search` for remote SQL)
 - [x] Cross-node log queries via Raft (leader fan-out, merge-sort)
-- [ ] Book chapter 11: "Eyes Everywhere"
-- [ ] All Phase 11 tests green
+- [x] Book chapter 11: "Eyes Everywhere"
+- [x] All Phase 11 tests green (1595 tests)
 
 ## Phase 12: Optimisations
 

@@ -17,8 +17,10 @@ use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::store::KetchupStore;
+use reliaburger::mayo::alert::AlertEvaluator;
 use reliaburger::mayo::collector::SystemCollector;
 use reliaburger::mayo::store::MayoStore;
+use reliaburger::mayo::webhook::{WebhookDispatcher, gather_latest_values};
 use reliaburger::pickle::api::PickleState;
 use reliaburger::pickle::store::BlobStore;
 use reliaburger::pickle::types::ManifestCatalog;
@@ -300,12 +302,21 @@ async fn main() -> anyhow::Result<()> {
     let pickle_catalog: Arc<RwLock<ManifestCatalog>> =
         Arc::new(RwLock::new(ManifestCatalog::default()));
 
+    // Create the alert evaluator (shared between the API and the
+    // evaluation loop so /v1/alerts always reflects current state).
+    let alerts: Option<Arc<RwLock<AlertEvaluator>>> = if config.metrics.alerts_enabled {
+        Some(Arc::new(RwLock::new(AlertEvaluator::with_defaults())))
+    } else {
+        None
+    };
+
     let app = api::router(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
         Some(Arc::clone(&log_store)),
         Some(deploy_history),
         Some(Arc::clone(&pickle_catalog)),
+        alerts.clone(),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -316,6 +327,63 @@ async fn main() -> anyhow::Result<()> {
             .await
             .ok();
     });
+
+    // Spawn alert evaluation + webhook dispatch task
+    if let Some(ref alert_evaluator) = alerts {
+        let eval_mayo = Arc::clone(&mayo_store);
+        let eval_alerts = Arc::clone(alert_evaluator);
+        let eval_shutdown = shutdown.clone();
+        let eval_interval = config.alerts.evaluation_interval_secs;
+        let cluster_name = config
+            .node
+            .name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+
+        let webhook_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let dispatcher = WebhookDispatcher::new(
+            webhook_client,
+            config.alerts.destinations.clone(),
+            cluster_name,
+        );
+
+        if !config.alerts.destinations.is_empty() {
+            println!(
+                "bun: alert webhooks enabled ({} destination(s), every {}s)",
+                config.alerts.destinations.len(),
+                eval_interval,
+            );
+        }
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(eval_interval));
+            loop {
+                tokio::select! {
+                    _ = eval_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let store = eval_mayo.read().await;
+                        let latest = gather_latest_values(&store).await;
+                        drop(store);
+
+                        let transitions = {
+                            let mut eval = eval_alerts.write().await;
+                            eval.evaluate(&latest)
+                        };
+
+                        for t in transitions {
+                            let d = dispatcher.clone();
+                            tokio::spawn(async move {
+                                d.dispatch(&t).await;
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Start the Pickle OCI registry server
     let registry_addr = format!("0.0.0.0:{}", config.images.registry_port);
