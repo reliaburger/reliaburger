@@ -84,10 +84,8 @@ pub fn router(
     log_store: Option<Arc<RwLock<LogStore>>>,
     deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
     pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
+    alerts: Option<Arc<RwLock<AlertEvaluator>>>,
 ) -> Router {
-    let alerts = mayo
-        .as_ref()
-        .map(|_| Arc::new(RwLock::new(AlertEvaluator::with_defaults())));
     let state = ApiState {
         cmd_tx,
         mayo,
@@ -2036,7 +2034,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None, None, None);
+        let app = router(cmd_tx, None, None, None, None, None);
         (app, shutdown)
     }
 
@@ -2135,7 +2133,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone(), None, None, None, None);
+        let app = router(cmd_tx.clone(), None, None, None, None, None);
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);

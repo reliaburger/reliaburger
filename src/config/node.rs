@@ -22,6 +22,7 @@ pub struct NodeConfig {
     pub images: ImagesSection,
     pub metrics: MetricsSection,
     pub logs: LogsSection,
+    pub alerts: AlertsSection,
     pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
     /// GitOps configuration (optional — only needed if GitOps is enabled).
     #[serde(default)]
@@ -330,6 +331,45 @@ impl Default for LogsSection {
 }
 
 // ---------------------------------------------------------------------------
+// Alert notification configuration
+// ---------------------------------------------------------------------------
+
+/// Alert evaluation and notification configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertsSection {
+    /// How often to evaluate alert rules (seconds).
+    pub evaluation_interval_secs: u64,
+    /// Webhook destinations for alert notifications.
+    pub destinations: Vec<AlertDestination>,
+}
+
+impl Default for AlertsSection {
+    fn default() -> Self {
+        Self {
+            evaluation_interval_secs: 30,
+            destinations: vec![],
+        }
+    }
+}
+
+/// A single webhook destination for alert notifications.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AlertDestination {
+    /// Destination type (currently only `"webhook"`).
+    #[serde(rename = "type")]
+    pub dest_type: String,
+    /// Webhook URL.
+    pub url: String,
+    /// Which severities to send. Empty means all severities.
+    #[serde(default)]
+    pub severity: Vec<String>,
+    /// Optional HMAC-SHA256 shared secret for payload signing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -492,5 +532,60 @@ mod tests {
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert!(nc.images.trust_policy.require_signatures);
         assert_eq!(nc.images.trust_policy.keys.len(), 2);
+    }
+
+    #[test]
+    fn parse_alerts_section_defaults() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.alerts.evaluation_interval_secs, 30);
+        assert!(nc.alerts.destinations.is_empty());
+    }
+
+    #[test]
+    fn parse_alerts_section_with_destinations() {
+        let toml_str = r#"
+            [[alerts.destinations]]
+            type = "webhook"
+            url = "https://hooks.slack.com/services/T/B/xxx"
+            severity = ["critical", "warning"]
+
+            [[alerts.destinations]]
+            type = "webhook"
+            url = "https://events.pagerduty.com/v2/enqueue"
+            severity = ["critical"]
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.alerts.destinations.len(), 2);
+        assert_eq!(nc.alerts.destinations[0].dest_type, "webhook");
+        assert_eq!(
+            nc.alerts.destinations[0].url,
+            "https://hooks.slack.com/services/T/B/xxx"
+        );
+        assert_eq!(
+            nc.alerts.destinations[0].severity,
+            vec!["critical", "warning"]
+        );
+        assert!(nc.alerts.destinations[0].secret.is_none());
+        assert_eq!(nc.alerts.destinations[1].severity, vec!["critical"]);
+    }
+
+    #[test]
+    fn parse_alerts_section_with_secret() {
+        let toml_str = r#"
+            [alerts]
+            evaluation_interval_secs = 15
+
+            [[alerts.destinations]]
+            type = "webhook"
+            url = "https://example.com/hook"
+            secret = "my-shared-secret"
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.alerts.evaluation_interval_secs, 15);
+        assert_eq!(nc.alerts.destinations.len(), 1);
+        assert_eq!(
+            nc.alerts.destinations[0].secret.as_deref(),
+            Some("my-shared-secret")
+        );
     }
 }

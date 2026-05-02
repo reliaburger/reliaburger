@@ -538,10 +538,98 @@ Navigate to `/ui/node/node-01` for per-node resource charts (system CPU and memo
 
 To serve environment variables, the API needs the original `AppSpec` after deployment. The agent previously discarded configs once instances were running. We added a `deployed_specs: HashMap<(String, String), AppSpec>` field to `BunAgent` and populate it during deploy. A new `AgentCommand::AppConfig` variant retrieves it for the env endpoint.
 
+## Alert webhooks
+
+In Chapter 6, we built the alert state machine: five rules, three states (Inactive → Pending → Firing), and a `firing_alerts()` method for the API. But we never actually drove it. The evaluator sat there, idle, waiting for someone to call `evaluate()`. Now we wire it up and add webhook delivery.
+
+### The evaluation loop
+
+A new background task in `bun.rs` runs every 30 seconds (configurable via `alerts.evaluation_interval_secs`). It:
+
+1. Reads the latest metric values from MayoStore (last 120 seconds, DESC by timestamp, first value per metric wins)
+2. Computes derived percentage metrics (`node_memory_usage_percent`, `node_disk_usage_percent`) from the raw byte values the collector produces
+3. Calls `evaluator.evaluate(latest_values)`, which now returns a `Vec<AlertTransition>`
+4. For each transition, spawns a fire-and-forget webhook delivery task
+
+That last point matters. If a webhook endpoint is slow or down, the retry loop (1s → 5s → 25s) takes 31 seconds total. We can't block the next evaluation tick waiting for that. So each dispatch runs in its own `tokio::spawn`. The evaluation loop moves on immediately.
+
+### Detecting transitions
+
+The original `evaluate()` updated state in-place and returned nothing. We needed to know *what changed*: which alerts just started firing, which just resolved. So we modified `evaluate()` to snapshot the previous states, compare after the update, and return a `Vec<AlertTransition>`:
+
+```rust
+let was_firing = matches!(prev_state, AlertState::Firing { .. });
+let now_firing = matches!(new_state, AlertState::Firing { .. });
+
+if now_firing && !was_firing {
+    transitions.push(AlertTransition { kind: TransitionKind::Firing, .. });
+} else if was_firing && !now_firing {
+    transitions.push(AlertTransition { kind: TransitionKind::Resolved, .. });
+}
+```
+
+Resolved notifications are just as important as firing ones. An operator who gets paged about high memory usage wants to know when it recovers, without having to check the dashboard.
+
+### The webhook payload
+
+Every destination receives the same JSON structure:
+
+```json
+{
+  "version": "1",
+  "alert": {
+    "name": "cpu_throttle",
+    "severity": "critical",
+    "status": "firing",
+    "message": "CPU usage above 90% for 5 minutes",
+    "value": 95.3,
+    "fired_at": 1700000000
+  },
+  "cluster": "prod",
+  "timestamp": 1700000030
+}
+```
+
+We deliberately don't format this for Slack or PagerDuty specifically. A generic webhook endpoint can parse this JSON and do whatever it needs. Slack's incoming webhooks expect a `text` field -- the receiver can transform the generic payload into that format. This keeps the Reliaburger side simple and lets operators adapt the integration to their workflow.
+
+### HMAC signing
+
+When a destination has a `secret` configured, we sign the payload body with HMAC-SHA256 and include the signature in the `X-Mayo-Signature-256` header:
+
+```rust
+let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+let tag = hmac::sign(&key, body);
+format!("sha256={}", hex::encode(tag.as_ref()))
+```
+
+This is the same pattern we use in `lettuce/webhook.rs` for verifying incoming Git webhooks, just running in the opposite direction. The receiver computes the same HMAC over the request body with the shared secret and compares. If the signatures match, the payload is authentic.
+
+### Retry with backoff
+
+Failed deliveries get three attempts: 1 second, 5 seconds, 25 seconds. After three failures, the notification is dropped and logged. We considered a queue with persistent retries, but that adds complexity for diminishing returns. If your webhook endpoint is down for 31 seconds, you probably have bigger problems -- and the next evaluation cycle will fire the same alert again if it's still active.
+
+### Configuration
+
+```toml
+[alerts]
+evaluation_interval_secs = 15
+
+[[alerts.destinations]]
+type = "webhook"
+url = "https://hooks.slack.com/services/T/B/xxx"
+severity = ["critical", "warning"]
+
+[[alerts.destinations]]
+type = "webhook"
+url = "https://events.pagerduty.com/v2/enqueue"
+severity = ["critical"]
+secret = "my-shared-secret"
+```
+
+Empty `severity` means all alerts. Each destination can filter independently. PagerDuty gets only critical alerts; Slack gets everything.
+
 ## What's next
 
-We have cluster-wide metrics, cross-node log queries, Parquet log export with remote search, disk pressure management, and a multi-page Brioche UI with HTMX and uPlot charts. But there's more to build before Phase 11 is complete:
+Phase 11 is complete. We have cluster-wide metrics via hierarchical aggregation, cross-node log queries, Parquet log export with remote search, disk pressure management, a multi-page Brioche UI with HTMX and uPlot charts, and alert webhooks with HMAC signing and retry.
 
-- **Alert webhooks** -- deliver Slack, PagerDuty, and generic HTTP notifications when alerts fire
-
-And PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.
+PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.

@@ -63,6 +63,32 @@ pub enum AlertState {
     Firing { since: SystemTime },
 }
 
+/// A state transition detected during evaluation.
+///
+/// Returned by `evaluate()` when an alert changes from non-firing to
+/// firing, or from firing to resolved. Used to trigger webhook
+/// notifications.
+#[derive(Debug, Clone)]
+pub struct AlertTransition {
+    pub rule_name: String,
+    pub severity: AlertSeverity,
+    pub description: String,
+    pub kind: TransitionKind,
+    /// The metric value that triggered the transition.
+    pub value: Option<f64>,
+    /// When the alert started firing (for firing transitions).
+    pub fired_at: Option<SystemTime>,
+}
+
+/// The kind of state transition.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransitionKind {
+    /// Alert became active (transitioned to Firing).
+    Firing,
+    /// Alert was resolved (transitioned from Firing to Inactive).
+    Resolved,
+}
+
 /// A snapshot of an alert for API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertStatus {
@@ -97,12 +123,14 @@ impl AlertEvaluator {
     /// Evaluate all rules against the provided metric values.
     ///
     /// `latest_values` maps metric names to their latest value.
-    /// Call this on a timer (e.g. every 30s).
-    pub fn evaluate(&mut self, latest_values: &HashMap<String, f64>) {
+    /// Call this on a timer (e.g. every 30s). Returns any state
+    /// transitions (Firing or Resolved) for webhook dispatch.
+    pub fn evaluate(&mut self, latest_values: &HashMap<String, f64>) -> Vec<AlertTransition> {
         let now = SystemTime::now();
+        let mut transitions = Vec::new();
 
         for rule in &self.rules {
-            let state = self
+            let prev_state = self
                 .states
                 .get(&rule.name)
                 .cloned()
@@ -113,21 +141,50 @@ impl AlertEvaluator {
                 .map(|v| rule.operator.eval(v, rule.threshold))
                 .unwrap_or(false);
 
-            let new_state = match (&state, breaching) {
+            let new_state = match (&prev_state, breaching) {
                 (AlertState::Inactive, true) => AlertState::Pending { since: now },
                 (AlertState::Pending { since }, true) => {
                     if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
                         AlertState::Firing { since: *since }
                     } else {
-                        state.clone()
+                        prev_state.clone()
                     }
                 }
-                (AlertState::Firing { .. }, true) => state.clone(),
+                (AlertState::Firing { .. }, true) => prev_state.clone(),
                 (_, false) => AlertState::Inactive,
             };
 
+            // Detect transitions for webhook dispatch.
+            let was_firing = matches!(prev_state, AlertState::Firing { .. });
+            let now_firing = matches!(new_state, AlertState::Firing { .. });
+
+            if now_firing && !was_firing {
+                transitions.push(AlertTransition {
+                    rule_name: rule.name.clone(),
+                    severity: rule.severity,
+                    description: rule.description.clone(),
+                    kind: TransitionKind::Firing,
+                    value,
+                    fired_at: match &new_state {
+                        AlertState::Firing { since } => Some(*since),
+                        _ => None,
+                    },
+                });
+            } else if was_firing && !now_firing {
+                transitions.push(AlertTransition {
+                    rule_name: rule.name.clone(),
+                    severity: rule.severity,
+                    description: rule.description.clone(),
+                    kind: TransitionKind::Resolved,
+                    value,
+                    fired_at: None,
+                });
+            }
+
             self.states.insert(rule.name.clone(), new_state);
         }
+
+        transitions
     }
 
     /// Get all active (firing) alerts.
@@ -404,5 +461,55 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("firing"));
         assert!(json.contains("Critical"));
+    }
+
+    #[test]
+    fn evaluate_returns_firing_transition() {
+        let rule = simple_rule("test", "cpu", 80.0, AlertOperator::GreaterThan);
+        let mut eval = AlertEvaluator::new(vec![rule]);
+
+        let t1 = eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
+        assert!(t1.is_empty()); // no transition yet
+
+        let t2 = eval.evaluate(&make_values(&[("cpu", 95.0)])); // firing
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].rule_name, "test");
+        assert_eq!(t2[0].kind, TransitionKind::Firing);
+        assert_eq!(t2[0].value, Some(95.0));
+        assert!(t2[0].fired_at.is_some());
+    }
+
+    #[test]
+    fn evaluate_returns_resolved_transition() {
+        let rule = simple_rule("test", "cpu", 80.0, AlertOperator::GreaterThan);
+        let mut eval = AlertEvaluator::new(vec![rule]);
+
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // firing
+
+        let t = eval.evaluate(&make_values(&[("cpu", 50.0)])); // resolved
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].rule_name, "test");
+        assert_eq!(t[0].kind, TransitionKind::Resolved);
+    }
+
+    #[test]
+    fn evaluate_no_transition_when_stable() {
+        let rule = simple_rule("test", "cpu", 80.0, AlertOperator::GreaterThan);
+        let mut eval = AlertEvaluator::new(vec![rule]);
+
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // firing
+
+        // Stays firing — no transition
+        let t = eval.evaluate(&make_values(&[("cpu", 95.0)]));
+        assert!(t.is_empty());
+
+        // Resolved
+        eval.evaluate(&make_values(&[("cpu", 50.0)]));
+
+        // Stays inactive — no transition
+        let t = eval.evaluate(&make_values(&[("cpu", 50.0)]));
+        assert!(t.is_empty());
     }
 }

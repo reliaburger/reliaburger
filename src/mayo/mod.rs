@@ -15,3 +15,4 @@ pub mod rollup_worker;
 pub mod scrape;
 pub mod store;
 pub mod types;
+pub mod webhook;
