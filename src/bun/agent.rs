@@ -151,18 +151,6 @@ pub enum AgentCommand {
     ListFaults {
         response: oneshot::Sender<Vec<crate::smoker::types::FaultSummary>>,
     },
-    /// Submit a batch of jobs.
-    SubmitBatch {
-        job_names: Vec<String>,
-        response: oneshot::Sender<Result<String, BunError>>,
-    },
-    /// Submit a build job.
-    SubmitBuild {
-        name: String,
-        context_digest: String,
-        destination: String,
-        response: oneshot::Sender<Result<String, BunError>>,
-    },
     /// Sign an image manifest digest and attach the signature via Raft.
     SignImage {
         manifest_digest: String,
@@ -706,31 +694,6 @@ impl<G: Grill> BunAgent<G> {
             AgentCommand::Routes { response } => {
                 let table = self.routing_table.read().await;
                 let _ = response.send(table.list_routes());
-            }
-            AgentCommand::SubmitBatch {
-                job_names,
-                response,
-            } => {
-                let msg = format!(
-                    "batch accepted: {} job(s) queued for scheduling",
-                    job_names.len()
-                );
-                // TODO(Phase 8): wire into BatchScheduler + BatchTracker
-                // once the scheduler has access to NodeCapacity state.
-                let _ = response.send(Ok(msg));
-            }
-            AgentCommand::SubmitBuild {
-                name,
-                context_digest,
-                destination,
-                response,
-            } => {
-                let msg = format!(
-                    "build {name:?} accepted: context={context_digest}, dest={destination}"
-                );
-                // TODO(Phase 8): spawn buildah subprocess via ProcessGrill,
-                // monitor completion, report result.
-                let _ = response.send(Ok(msg));
             }
             AgentCommand::SignImage {
                 manifest_digest,

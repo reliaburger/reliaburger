@@ -1663,92 +1663,35 @@ async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 /// Submit a batch of jobs.
-async fn batch_submit_handler(
-    State(state): State<ApiState>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let job_names: Vec<String> = body["jobs"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SubmitBatch {
-            job_names,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
-    }
+///
+/// Not yet wired into the live agent. The batch scheduler (`schedule_batch`)
+/// and `BatchTracker` exist and are unit-tested, but resolving job specs,
+/// dispatching across the cluster, and tracking completion via the reporting
+/// tree are deferred to Phase 12. Returns 501 rather than pretending to accept.
+async fn batch_submit_handler() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "batch dispatch is not yet wired into the agent (deferred to Phase 12)"
+        })),
+    )
+        .into_response()
 }
 
 /// Submit a build job.
-async fn build_submit_handler(
-    State(state): State<ApiState>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let name = body["name"].as_str().unwrap_or("").to_string();
-    let context_digest = body["context_digest"].as_str().unwrap_or("").to_string();
-    let destination = body["destination"].as_str().unwrap_or("").to_string();
-
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::SubmitBuild {
-            name,
-            context_digest,
-            destination,
-            response: resp_tx,
-        })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
-
-    match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
-        )
-            .into_response(),
-    }
+///
+/// Not yet wired into the live agent. `execute_build` constructs the buildah
+/// commands (and is unit-tested), but downloading the context blob, spawning
+/// buildah, and pushing the result are deferred to Phase 12. Returns 501
+/// rather than pretending to accept.
+async fn build_submit_handler() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "build execution is not yet wired into the agent (deferred to Phase 12)"
+        })),
+    )
+        .into_response()
 }
 
 /// GitOps webhook handler.
