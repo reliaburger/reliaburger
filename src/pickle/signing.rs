@@ -280,7 +280,7 @@ mod tests {
             &digest,
             &cert_der,
             &key_der,
-            &[hierarchy.workload.ca.certificate_der.clone()],
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
             "https://test.reliaburger.dev",
             "spiffe://test/ns/ci/job/build",
         )
@@ -331,7 +331,7 @@ mod tests {
             &digest,
             &cert_der,
             &key_der,
-            &[hierarchy.workload.ca.certificate_der.clone()],
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
             "https://test.reliaburger.dev",
             "spiffe://test/ns/ci/job/build",
         )
@@ -363,7 +363,7 @@ mod tests {
             &digest,
             &cert_der,
             &key_der,
-            &[hierarchy.workload.ca.certificate_der.clone()],
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
             "https://test.reliaburger.dev",
             "spiffe://test/ns/ci/job/build",
         )
@@ -427,7 +427,7 @@ mod tests {
             &digest,
             &cert_der,
             &key_der,
-            &[hierarchy.workload.ca.certificate_der.clone()],
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
             "https://test.reliaburger.dev",
             "spiffe://test/ns/ci/job/build",
         )

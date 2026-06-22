@@ -457,6 +457,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_rollup_with_labels(
         node: &str,
         timestamp: u64,

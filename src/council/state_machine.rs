@@ -857,8 +857,10 @@ mod tests {
     #[test]
     fn apply_security_state_init_sets_cas() {
         let mut inner = StateMachineInner::default();
-        let mut ss = crate::sesame::types::SecurityState::default();
-        ss.next_serial = 42;
+        let ss = crate::sesame::types::SecurityState {
+            next_serial: 42,
+            ..Default::default()
+        };
         inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(ss)));
 
         assert_eq!(inner.state.security_state.next_serial, 42);
