@@ -45,23 +45,17 @@ mod tests {
 
     #[test]
     fn detect_json_valid_lines() {
-        let lines = [r#"{"level":"info","msg":"starting"}"#,
-            r#"{"level":"debug","msg":"loaded config"}"#];
-        assert!(detect_json(
-            &lines,
-            10,
-            0.8
-        ));
+        let lines = [
+            r#"{"level":"info","msg":"starting"}"#,
+            r#"{"level":"debug","msg":"loaded config"}"#,
+        ];
+        assert!(detect_json(&lines, 10, 0.8));
     }
 
     #[test]
     fn detect_json_plain_text() {
         let lines = ["2024-01-01 INFO starting up", "2024-01-01 DEBUG loading"];
-        assert!(!detect_json(
-            &lines,
-            10,
-            0.8
-        ));
+        assert!(!detect_json(&lines, 10, 0.8));
     }
 
     #[test]
@@ -72,9 +66,11 @@ mod tests {
 
     #[test]
     fn detect_json_mixed_lines() {
-        let lines = [r#"{"level":"info"}"#,
+        let lines = [
+            r#"{"level":"info"}"#,
             "plain text line",
-            r#"{"level":"debug"}"#];
+            r#"{"level":"debug"}"#,
+        ];
         let refs: Vec<&str> = lines.iter().map(|s| s.as_ref()).collect();
         // 2/3 = 0.67 < 0.8 threshold
         assert!(!detect_json(&refs, 10, 0.8));

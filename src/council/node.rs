@@ -391,9 +391,10 @@ mod tests {
         loop {
             for node in nodes {
                 if let Some(leader) = node.current_leader().await
-                    && exclude.is_none_or(|ex| leader != ex) {
-                        return Some(leader);
-                    }
+                    && exclude.is_none_or(|ex| leader != ex)
+                {
+                    return Some(leader);
+                }
             }
             if start.elapsed() > timeout {
                 return None;
