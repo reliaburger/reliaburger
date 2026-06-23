@@ -4,11 +4,17 @@ Up to now, deploying a new version of an app meant stopping the old one and star
 
 This chapter adds rolling deploys: replace instances one at a time, health-check each new instance before moving on, and automatically revert if anything goes wrong.
 
+Reliaburger is meant to be batteries-included. In a Kubernetes world you'd reach for a Deployment controller, maybe Argo Rollouts, maybe a service mesh to handle the traffic shifting. That's three add-ons and a lot of YAML to do one thing: swap a running version for a new one without dropping requests. We want that in the box. So the whole machinery lives in one subsystem, `meat`, alongside the scheduler that already knows where instances run.
+
 ## Why deploys need a state machine
 
 A deploy is not a single action. It's a sequence of coordinated steps, each of which can succeed, fail, or time out. The system needs to know exactly where it is in that sequence at all times, especially if the leader node crashes halfway through and a new leader has to pick up where it left off.
 
-This is the textbook case for a state machine. An enum with a `transition` method that takes an event and produces the next state — or rejects the transition.
+Picture the alternative. You write a function that starts the new version, waits, flips the routing, and stops the old one — top to bottom, no explicit state. It works on your laptop. Then in production the leader crashes between "flip routing" and "stop old version". The new leader has no idea what the old one was doing. Did the routing flip happen? Are there now two versions both serving traffic, or none? You can't tell, because the progress lived in a stack frame that died with the process.
+
+The fix is to make the progress data, not control flow. Write down the current phase, commit it somewhere durable, and let any node read it back and continue. That's a state machine: an enum with a `transition` method that takes an event and produces the next state, or rejects the transition. The enum is the written-down progress; Raft (from Chapter 2) is the durable somewhere.
+
+We also rejected shelling out to an external tool. A deploy needs to know the cluster's current placements, talk to the health checker, and rewrite the ingress routing table — all things the orchestrator already has in-process. Spawning `kubectl`-equivalent would mean re-plumbing all of that across a process boundary. Keeping it in `meat` is both simpler and faster.
 
 ## The deploy state machine
 
@@ -35,6 +41,51 @@ The interesting paths are the failure ones. If a health check fails during rolli
 - With `auto_rollback = false`: `Rolling → Halted` (stop and let the operator decide)
 
 If a pre-deploy dependency job fails: `RunningPreDeps → Failed` (no instances were touched, nothing to revert).
+
+## Configuring a deploy
+
+Before any of that runs, we turn the user's config into a `DeployConfig`. The app's TOML can set a few knobs — how long to wait for health, how long to drain, whether to auto-rollback — and anything it leaves out falls back to a sensible default:
+
+```rust
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            strategy: DeployStrategy::Rolling,
+            max_surge: 1,
+            max_unavailable: 0,
+            drain_timeout: Duration::from_secs(30),
+            health_timeout: Duration::from_secs(60),
+            auto_rollback: true,
+        }
+    }
+}
+```
+
+`Default` is a trait the standard library defines, and `#[derive(Default)]` or a hand-written `impl` gives a type its "empty" value. Python has no real equivalent — you'd scatter `None` defaults across a constructor's keyword arguments. Go has zero values, but you can't change what they are; a `bool` is always `false` by default. Here we say plainly: a deploy with nothing specified rolls one instance at a time, waits 60 seconds for health, and rolls back on failure.
+
+Merging the user's overrides on top of those defaults shows off a Rust feature that landed recently, the *let-chain*:
+
+```rust
+pub fn from_spec(spec: &crate::config::app::DeploySpec) -> Self {
+    let mut cfg = Self::default();
+    if let Some(ref s) = spec.strategy
+        && s == "blue-green"
+    {
+        cfg.strategy = DeployStrategy::BlueGreen;
+    }
+    if let Some(ref s) = spec.drain_timeout
+        && let Some(d) = parse_duration(s)
+    {
+        cfg.drain_timeout = d;
+    }
+    // ... the rest of the fields, same shape ...
+    cfg
+}
+```
+
+Read `if let Some(ref s) = spec.strategy && s == "blue-green"` as: "if the strategy field is set (it's an `Option`, so it might be absent), bind its contents to `s`, *and* if `s` equals the string, then run the block." Both conditions in one `if`. Before let-chains you'd have nested two `if`s or written a `match`, drifting rightward with every optional field. A C programmer reads this like `if (spec->strategy && strcmp(s, "blue-green") == 0)`, except the compiler guarantees you can't touch `s` unless the value was actually present. There's no null to dereference.
+
+`parse_duration` is a small helper that turns `"30s"` or `"5m"` into a `Duration`. It returns `Option<Duration>` rather than erroring, so a malformed string simply leaves the default in place — the second half of the let-chain (`&& let Some(d) = parse_duration(s)`) only assigns when parsing succeeds.
 
 ## The rolling sequence
 
@@ -68,6 +119,20 @@ Why a trait instead of calling the supervisor directly? Testability. The state m
 
 This trait was earned, not speculative. We have exactly two implementations: `MockDriver` (for tests) and eventually `LocalDeployDriver` (for production). The abstraction exists because we need it, not because we might need it.
 
+The orchestrator takes the driver as a *generic type parameter*, not a trait object:
+
+```rust
+pub struct DeployOrchestrator<D: DeployDriver> {
+    state: DeployState,
+    request: DeployRequest,
+    driver: D,
+}
+```
+
+`<D: DeployDriver>` reads "for any type `D` that implements `DeployDriver`". When you build a `DeployOrchestrator<MockDriver>`, the compiler stamps out a dedicated copy of the orchestrator with every `self.driver.start_instance(...)` call wired straight to `MockDriver::start_instance`. No vtable, no runtime indirection. This is *monomorphisation*: one generic written once, compiled into N concrete versions, one per type you actually use. C++ templates do the same thing; Java generics do not (they erase to `Object` and dispatch dynamically); Go only grew generics in 1.18 and still often reaches for interfaces.
+
+The alternative would be `driver: Box<dyn DeployDriver>` — a trait object, where the concrete type is erased and each call goes through a pointer table at runtime. We use those elsewhere (the secret decryptor in Chapter 5 is one). Here, the orchestrator owns exactly one driver for its whole life and we know the type at construction, so the generic is both faster and simpler. Reach for `dyn` when you need a *collection* of mixed types behind one interface; reach for a generic when each instance is one known type.
+
 ## Automatic rollback
 
 When `auto_rollback = true` (the default) and a step fails, the orchestrator reverses direction. For each step that already completed, it:
@@ -87,7 +152,20 @@ The orchestrator runs all pre-deploy jobs first. If any fail, the deploy fails i
 
 ## Raft persistence
 
-Deploy state is committed to Raft at every phase transition. If the leader dies mid-deploy, the new leader reads the last known state and can resume. The deploy history (last 50 per app) is also in Raft, queryable via `relish history` or the API.
+Deploy state is committed to Raft at every phase transition. If the leader dies mid-deploy, the new leader reads the last known state and can resume. This is why the phase is an enum we write down rather than a position in the code: a value survives a process death, a stack frame doesn't.
+
+Finished deploys move into a per-app history so `relish history` and the API can show what shipped when. We don't keep it forever — an app that deploys fifty times a day would grow the Raft log without bound. The state machine caps it:
+
+```rust
+// Add to history (cap at 50 per app)
+let history = self.deploy_history.entry(app_key).or_default();
+history.push(DeployHistoryEntry::from_state(&state));
+if history.len() > 50 {
+    history.remove(0);
+}
+```
+
+`entry(app_key).or_default()` is the Rust idiom for "get the vector for this app, creating an empty one if it's the first deploy". It's `HashMap`'s answer to Python's `dict.setdefault([])` or Go's check-then-insert dance, in one call. `remove(0)` drops the oldest entry once we pass fifty, so history is a sliding window of the last fifty deploys per app. A unit test (`deploy_history_capped_at_50`) deploys fifty-one times and asserts the length stays at fifty.
 
 ## Under the hood: key patterns
 
@@ -133,6 +211,63 @@ pub fn transition(&mut self, event: DeployEvent) -> Result<(), DeployError> {
 The wildcard `_` catches every `(phase, event)` combination not explicitly listed. In Go or Java, that would be a `default:` case that's easy to forget. In Rust, the compiler enforces exhaustiveness. Add a tenth state and every `match` that doesn't handle it becomes a compile error. You can't ship a deploy that forgets what to do when a new phase is reached.
 
 The conditional logic within arms (checking `pre_deploy_jobs.is_empty()`, `config.auto_rollback`) keeps the state machine compact. Each arm is a function from (state, event, context) to next state. No separate transition table, no matrix to maintain.
+
+### The drive loop
+
+`transition` only moves the phase marker. Something has to actually *do* the work and feed events back in. That's `execute`:
+
+```rust
+pub fn execute(&mut self) -> Result<DeployResult, DeployError> {
+    self.state.transition(DeployEvent::Start)?;
+
+    if self.state.phase == DeployPhase::RunningPreDeps {
+        match self.execute_pre_deps() {
+            Ok(()) => self.state.transition(DeployEvent::PreDepsComplete)?,
+            Err(e) => {
+                let _ = self.state.transition(DeployEvent::PreDepsFailed);
+                return Err(e);
+            }
+        }
+    }
+
+    let total = self.state.steps.len();
+    for i in 0..total {
+        self.state.current_step = i;
+        match self.execute_step(i) {
+            Ok(()) => {
+                self.state.steps[i].phase = StepPhase::Completed;
+                self.state.transition(DeployEvent::StepCompleted(i))?;
+            }
+            Err(_e) => {
+                self.state.steps[i].phase = StepPhase::Failed;
+                let _ = self.state.transition(DeployEvent::StepFailed(i));
+                if self.state.phase == DeployPhase::Reverting {
+                    match self.execute_rollback(i) {
+                        Ok(()) => {
+                            let _ = self.state.transition(DeployEvent::RollbackComplete);
+                        }
+                        Err(_) => {
+                            let _ = self.state.transition(DeployEvent::RollbackFailed);
+                        }
+                    }
+                }
+                return self.terminal_result();
+            }
+        }
+    }
+
+    self.state.transition(DeployEvent::AllStepsComplete)?;
+    self.terminal_result()
+}
+```
+
+The shape is: do an operation, then feed the result back as an event. A successful step emits `StepCompleted`; a failed one emits `StepFailed`, and the *state machine* decides whether that means `Reverting` or `Halted` based on the config. The drive loop doesn't encode that policy — it just asks the state machine where it is now (`if self.state.phase == DeployPhase::Reverting`) and acts accordingly. Notice how the two responsibilities stay separate: `transition` knows the *rules*, `execute` knows the *actions*. That split is what makes the rules testable without doing any actual I/O, which we'll lean on heavily in the tests.
+
+One subtlety in the failure arm: when we transition into a terminal failure state we use `let _ = self.state.transition(...)` rather than `?`. We're already returning an error result; if recording the failure transition itself failed, propagating *that* error would mask the real one. So we deliberately discard it.
+
+### `relish deploy`, `history`, and `rollback`
+
+The CLI is a thin client over the agent's HTTP API. `relish deploy` streams rollout progress to your terminal as each step changes phase, so you watch the deploy march through `Starting → HealthChecking → RoutingUpdate → Draining` per instance. `relish history <app>` prints the sliding window of past deploys. `relish rollback <app>` is sugar for "deploy the previous image again" — it reads the last successful entry from history and submits it as a fresh deploy. And `relish lint` validates an app's config (including the deploy section) before you ever ship it, catching a bad `drain_timeout` string or an unknown strategy at author time rather than mid-rollout.
 
 ### Mock driver with failure injection
 
@@ -214,10 +349,68 @@ Making drain non-fatal was a one-character change (`?` to `let _ =`). It fixed t
 
 We considered a separate `RollbackDriver` trait. Then we realised rollback is just: stop the new instance, start the old one, update routing. The exact same operations, in reverse order. Adding a second trait would have doubled the interface surface for zero benefit.
 
+### A generic beat a trait object here
+
+The first sketch stored the driver as `Box<dyn DeployDriver>`. It worked. But the orchestrator only ever holds one driver of one known type, so the dynamic dispatch bought us nothing — just a pointer indirection on every call and a heap allocation we didn't need. Switching to `DeployOrchestrator<D: DeployDriver>` made the tests read identically and the production path a hair faster. The lesson isn't "generics good, `dyn` bad". It's: match the tool to the shape. One known type for the lifetime of the struct wants a generic; a runtime-varying mix wants `dyn`.
+
+## Tests
+
+We wrote the tests before the orchestrator, as the roadmap demands, and they fall into three layers.
+
+### Transition tests — the rules in isolation
+
+The state machine is pure: feed it an event, check the resulting phase. No I/O, no async, no mocks. So `src/meat/deploy_types.rs` holds one tiny test per edge of the graph, named as sentences:
+
+```rust
+#[test]
+fn step_failed_with_auto_rollback_goes_to_reverting() { ... }
+
+#[test]
+fn step_failed_without_auto_rollback_goes_to_halted() { ... }
+```
+
+Every valid transition gets a test, and so do the forks that depend on config (`auto_rollback` on versus off). Because the `match` is exhaustive, we don't need a test for "what happens on an undefined transition" beyond one check that it returns `DeployError::InvalidTransition` — the compiler already proved every `(phase, event)` pair is handled. There's also `deploy_history_capped_at_50`, which deploys fifty-one times and asserts the window holds at fifty.
+
+### Orchestrator tests — the actions, with a mock driver
+
+`src/meat/orchestrator.rs` tests the drive loop against `MockDriver`, configured to fail at a chosen step:
+
+```rust
+#[test]
+fn health_failure_with_auto_rollback() {
+    let driver = MockDriver::new(placements(1)).fail_health_at(1);
+    let mut orch = DeployOrchestrator::new(id, request("v2"), driver);
+    let result = orch.execute().unwrap();
+    assert_eq!(result, DeployResult::RolledBack);
+}
+```
+
+The roster covers `happy_path_single_replica`, `no_existing_instances_creates_one`, `health_failure_with_auto_rollback`, `health_failure_without_auto_rollback`, `start_failure_at_step`, `dependency_job_success`, `dependency_job_failure`, and `rollback_restores_previous_instances` (which checks the old instance IDs come back after a revert). Each runs in microseconds because no container is ever started — that's the whole reason the `DeployDriver` trait exists.
+
+### Integration tests — the real agent
+
+`tests/integration.rs` exercises the agent end to end with a real (process-backed) runtime: `deploy_app_reaches_running`, `health_check_failing_app_marked_unhealthy`, `job_runs_to_completion`, `job_failed_retries_then_fails`, `init_container_success_allows_app_start`, and `init_container_failure_prevents_start`. These are slower (they spin up the agent and poll real state) but they prove the wiring the mocks can't.
+
+### Running them
+
+Everything in this chapter runs under a plain:
+
+```sh
+cargo test
+```
+
+There are no gated tests here — no eBPF, no root, no network, no platform-specific runtime. (Those arrive in the networking, registry, and chaos chapters.) To run just this chapter's suites:
+
+```sh
+cargo test --lib meat::deploy_types     # transition tests
+cargo test --lib meat::orchestrator     # orchestrator + mock driver
+cargo test --test integration           # full agent lifecycle
+```
+
+Read the output bottom-up: cargo prints `test result: ok. N passed` per binary. A failing transition test names the exact edge that broke (`step_failed_without_auto_rollback_goes_to_halted`), which tells you which `match` arm regressed without reading a stack trace.
+
 ## What we deferred
 
-Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs.
+Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.
 
-## Test count
-
-Phase 7 adds 48 tests, bringing the total to 1047. The new tests cover every state machine transition (valid and invalid), the rolling orchestrator with mock driver (happy path, health failure, rollback, dependencies, start failure), Raft persistence of deploy state and history, CLI parsing, and config validation.
+Phase 7 adds 48 tests, bringing the total to 1047.
