@@ -458,6 +458,56 @@ Features with no K8s equivalent show up in the export report: `auto_rollback`, S
 
 **Five levels of `if let Some` is the price of K8s correctness.** The k8s-openapi crate is faithful to the Go API, where every field is a pointer and might be nil. In Rust, that becomes deeply nested `Option` chains. You can flatten them with helper functions, but the navigation code still reads like an archaeological dig through layers of optionality. The alternative -- hand-rolled structs with `#[serde(default)]` on everything -- trades correctness for readability. We picked correctness and accepted the nesting.
 
-## Test count
+## Tests
 
-Phase 9 adds 117 tests, bringing the total to 1380. The new tests cover: config compilation and defaults merging (7), TOML formatting idempotency and section ordering (4), structural diffing (8), CLI parse for new commands (7), blue-green orchestrator with mock driver (6), deploy state machine blue-green transitions (7), autoscaler scaling logic with hysteresis and cooldown (12), autoscale config parsing and tracker state (6), WebSocket header detection and close frame construction (8), Lettuce types serde round-trips (4), git clone/fetch/list operations (4), webhook HMAC validation, replay detection, and rate limiting (7), GitOps diff with autoscaler awareness (7), sync loop TOML parsing (3), coordinator election (5), commit signature verification (1), K8s import (10), and K8s export (6).
+Six features, and nearly all of them turn out to be pure functions hiding inside an operational story. `compute_desired` is arithmetic. `is_websocket_upgrade` reads headers. `select_coordinator` sorts a list. The blue-green orchestrator runs against the same `MockDriver` from Chapter 7. So Phase 9 is, once again, mostly unit tests — 117 of them.
+
+### Unit tests by feature
+
+- **Blue-green** — the orchestrator against `MockDriver` (6), plus the new state-machine transitions (`StartingGreen`, `HealthCheckingGreen`, `RoutingSwitching` and their failure paths, 7). The mock had to be refactored to count operations rather than lifecycle phases — see the lessons below.
+- **Autoscaling** — `compute_desired` with hysteresis and cooldown is the heart of it (12 tests covering scale-up, scale-down-only-below-threshold, clamping to min/max, oscillation), plus config parsing and the `AutoscaleTracker` baseline/override logic (6).
+- **WebSocket** — header detection edge cases (case-insensitive, multi-value `Connection`, opt-in routes) and the 4-byte close frame (8).
+- **Config tooling** — compilation and defaults merging (7), `fmt` idempotency and section ordering (4), structural `diff` (8).
+- **Lettuce** — types serde (4), git clone/fetch/list (4), webhook HMAC/replay/rate-limit (7), autoscaler-aware diff (7), sync-loop TOML parsing (3), coordinator election (5), signature verification (1).
+- **Kubernetes** — import (10) and export (6).
+
+### Feature-gated: Kubernetes import/export
+
+The one gated path in this chapter isn't an environment variable — it's a Cargo feature. K8s import/export pulls in `k8s-openapi`, a heavy dependency most users don't need, so it sits behind a `kubernetes` feature that's *on by default*:
+
+```toml
+[features]
+default = ["kubernetes"]
+kubernetes = ["dep:k8s-openapi"]
+```
+
+A plain `cargo test` therefore compiles and runs the K8s tests. If you want to prove the rest of the binary builds and tests *without* that dependency — smaller, faster, no `k8s-openapi` — drop the default features:
+
+```sh
+cargo test --no-default-features    # everything except K8s import/export
+```
+
+The import/export modules themselves are `#[cfg(feature = "kubernetes")]`, so they simply vanish from the build when the feature is off, and so do their tests.
+
+### Demos: the end-to-end round-trips
+
+Two of this chapter's features are best seen as round-trips, so there's a script for each:
+
+```sh
+make toml-demo          # compile -> fmt -> diff -> lint over a sample config tree
+make kubernetes-demo    # import K8s YAML to TOML and export it back
+```
+
+`kubernetes-demo` is the honest test of the migration story: take real Kubernetes YAML, import it, look at the TOML and the migration report, export it again, and check the round-trip is sane. The correlation logic (Service → Deployment → Ingress → HPA) is exactly what unit tests struggle to cover convincingly, because the interesting bugs are in how resources *fit together*, not in any one conversion.
+
+### Running them
+
+```sh
+cargo test --lib meat::blue_green meat::autoscaler   # deploy + scaling
+cargo test --lib lettuce                             # GitOps engine
+cargo test --lib wrapper                             # WebSocket proxying
+cargo test --no-default-features                      # prove it builds without K8s
+make toml-demo && make kubernetes-demo                # end-to-end round-trips
+```
+
+Phase 9 adds 117 tests, bringing the total to 1380.
