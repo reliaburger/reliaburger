@@ -24,14 +24,27 @@ let b = a;            // ownership MOVES from a to b
 
 In Python or Go, `b = a` gives you two names for the same object (or a copy for value types), and both keep working. In Rust, after `let b = a`, the variable `a` is *dead*. The string wasn't copied (that would mean allocating and duplicating the heap buffer), and it isn't shared, because shared ownership of mutable data is exactly the bug Rust is trying to prevent. So `a` simply hands the value to `b` and stops being usable. Try to use `a` afterwards and the compiler stops you.
 
-This is why, all through the book, you see things cloned before they're sent down a channel:
+This is why, all through the book, you see things cloned right before they're handed to a spawned task. Here's the accept loop in the reporting transport, spawning a handler for each incoming connection:
 
 ```rust
-// the value is moved into the channel; clone first if you still need it
-self.driver.start_instance(app_id, &node, image)?;
+loop {
+    tokio::select! {
+        _ = shutdown.cancelled() => break,
+        result = listener.accept() => {
+            if let Ok((stream, peer)) = result {
+                let tx = tx.clone();                                   // 1
+                tokio::spawn(Self::handle_connection(stream, peer, tx)); // 2
+            }
+        }
+    }
+}
 ```
 
-Cloning across a channel boundary or a `tokio::spawn` isn't a code smell in Rust — it's the explicit acknowledgement that two parts of the program now each need their own copy. Reliaburger's coding guide says exactly this: "Clone across channel boundaries. This is expected, not a code smell."
+(from `src/reporting/transport.rs`)
+
+Line 2 *moves* `tx` into the spawned task — `tokio::spawn` takes ownership of everything the task captures, because the task outlives this loop iteration and the borrow checker won't let it hold a reference to something the loop owns. If we moved the original `tx`, the next iteration would have nothing left to send with: `tx` would be dead, exactly like `a` after `let b = a`. So line 1 makes a fresh clone for *this* connection's task and leaves the original `tx` intact for the next accept. An `mpsc` sender is cheap to clone (it's a handle to the channel, not the channel itself), which is the whole point of the design.
+
+Cloning across a `tokio::spawn` or a channel boundary isn't a code smell in Rust — it's the explicit acknowledgement that two parts of the program now each need their own handle. Reliaburger's coding guide says exactly this: "Clone across channel boundaries. This is expected, not a code smell."
 
 Small types that are cheap to duplicate opt out of move semantics with the `Copy` trait — integers, booleans, `char`, and small structs of copyable fields. A `Copy` type is duplicated bit-for-bit on assignment, so the original stays alive. Reliaburger marks its rollup aggregate `Copy` because it's just three `f64`s and a `u32`:
 
