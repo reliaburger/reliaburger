@@ -395,7 +395,7 @@ mod tests {
                     signed_at: std::time::SystemTime::UNIX_EPOCH,
                 },
             }),
-            RaftRequest::SecurityStateInit(Box::new(SecurityState::default())),
+            RaftRequest::SecurityStateInit(Box::default()),
             RaftRequest::CreateJoinToken(crate::sesame::types::JoinToken {
                 token_hash: [0xAB; 32],
                 expires_at: std::time::SystemTime::UNIX_EPOCH,

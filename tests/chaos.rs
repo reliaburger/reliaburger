@@ -115,11 +115,11 @@ async fn chaos_council_partition_majority_continues() {
     // Majority should have a leader
     let mut majority_leader = None;
     for node in &majority_nodes {
-        if let Some(lid) = node.current_leader().await {
-            if majority.contains(&lid) {
-                majority_leader = Some(lid);
-                break;
-            }
+        if let Some(lid) = node.current_leader().await
+            && majority.contains(&lid)
+        {
+            majority_leader = Some(lid);
+            break;
         }
     }
     assert!(majority_leader.is_some(), "majority should have a leader");

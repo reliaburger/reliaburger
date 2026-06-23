@@ -319,10 +319,12 @@ mod tests {
 
     #[test]
     fn sync_state_serde_round_trip() {
-        let mut state = SyncState::default();
-        state.phase = SyncPhase::Applying;
-        state.consecutive_failures = 3;
-        state.last_error = Some("connection refused".to_string());
+        let state = SyncState {
+            phase: SyncPhase::Applying,
+            consecutive_failures: 3,
+            last_error: Some("connection refused".to_string()),
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&state).unwrap();
         let decoded: SyncState = serde_json::from_str(&json).unwrap();

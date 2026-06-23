@@ -160,8 +160,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite)
 - [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation)
 - [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation)
-- [x] High-throughput batch scheduling (BatchScheduler greedy bin-packing, BatchTracker, 100K jobs in <1s)
-- [x] Build jobs (BuildSpec config, pickle:// destination parsing, namespace-scoped push, buildah integration)
+- [x] High-throughput batch scheduling (greedy bin-packing `schedule_batch`, `BatchTracker`, 100K jobs in <1s)
+- [x] Build jobs (BuildSpec config, pickle:// destination parsing, namespace-scoped push, buildah command construction)
+- Live agent wiring for batch dispatch and build execution — deferred to Phase 12 (the `/v1/batch` and `/v1/build` endpoints return 501 until then)
 - [x] All Phase 8 tests green (1263 tests)
 
 ## Phase 9: User Experience
@@ -204,6 +205,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 12: Optimisations
 
+- [ ] Wire `SubmitBatch` into the agent (resolve job specs → `schedule_batch` over cluster capacity → dispatch → track completion via `BatchTracker`, `/v1/batch/{id}` status)
+- [ ] Wire `SubmitBuild` into the agent (download context blob from Pickle → spawn buildah build/push → report `BuildResult`)
 - [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
 - [ ] P2P multi-source image downloads (parallel fan-out)
 - [ ] Pull-through cache full wiring (upstream → Pickle → Raft)

@@ -109,8 +109,8 @@ async fn three_nodes_merge_sorted() {
 
     // All 9 entries should be present, sorted by timestamp
     assert_eq!(result.len(), 9);
-    for i in 0..9 {
-        assert_eq!(result[i].timestamp, (i + 1) as u64);
+    for (i, entry) in result.iter().enumerate() {
+        assert_eq!(entry.timestamp, (i + 1) as u64);
     }
 }
 

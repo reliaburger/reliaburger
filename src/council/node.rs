@@ -390,10 +390,10 @@ mod tests {
         let start = tokio::time::Instant::now();
         loop {
             for node in nodes {
-                if let Some(leader) = node.current_leader().await {
-                    if exclude.is_none_or(|ex| leader != ex) {
-                        return Some(leader);
-                    }
+                if let Some(leader) = node.current_leader().await
+                    && exclude.is_none_or(|ex| leader != ex)
+                {
+                    return Some(leader);
                 }
             }
             if start.elapsed() > timeout {
