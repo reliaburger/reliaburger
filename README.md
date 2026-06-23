@@ -96,7 +96,7 @@ docs/
   roadmap.md           # 9 implementation phases
   progress.md          # What's done, what's next
   design/              # Detailed design docs per component (14 files)
-  book/                # "Building Reliaburger" chapter drafts (8 chapters + preface)
+  book/                # "Building Reliaburger" chapters (preface, 1-11, Rust appendix)
   _quarto/             # PDF build configuration
 examples/              # Example app and job configs
 scripts/               # Test and demo scripts
@@ -137,6 +137,9 @@ Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rus
 7. [Ship It](docs/book/07-ship-it.md)
 8. [Breaking Things on Purpose](docs/book/08-breaking-things-on-purpose.md)
 9. [The Full Package](docs/book/09-the-full-package.md)
+10. [Locking It Down](docs/book/10-locking-it-down.md)
+11. [Eyes Everywhere](docs/book/11-eyes-everywhere.md)
+- [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
 
 ## Licence
 
