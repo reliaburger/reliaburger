@@ -212,9 +212,9 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
 - [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
 - [ ] Btrfs subvolume quotas (alternative to loop mount)
-- [ ] Parquet bloom filters on log `line` column (skip row groups in LIKE queries)
-- [ ] Zstd seekable frame compression for archived logs
-- [ ] Book chapter 12: "Squeezing Every Drop"
+- [x] Parquet bloom filters for archive equality pruning — on `app`/`namespace` (1% FPP), not `line` (bloom filters answer equality, not substring LIKE; `bloom_filter_on_read` enabled in remote_query)
+- [x] Zstd compression for archived logs — via Parquet's native per-row-group ZSTD codec (random access preserved; >5x vs flat text), not a separate seekable-frame container
+- [~] Book chapter 12: "Squeezing Every Drop" — logs section written; remaining sections land with later slices
 - [ ] All Phase 12 tests green
 
 ## Phase 13: Relish TUI

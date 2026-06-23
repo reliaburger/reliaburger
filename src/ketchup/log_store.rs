@@ -14,9 +14,54 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::basic::{Compression, ZstdLevel};
+use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::prelude::*;
 
 use super::types::{KetchupError, LogEntry, LogStream};
+
+/// Rows per Parquet row group for flushed log files.
+///
+/// Logs are written in small row groups so that row-group statistics and
+/// bloom filters can skip irrelevant groups during archive queries. A
+/// flush of a few thousand lines then spans several groups rather than one
+/// monolithic block.
+const LOG_ROW_GROUP_SIZE: usize = 8192;
+
+/// Parquet writer properties for flushed log files.
+///
+/// Two optimisations, both of which only matter for the *archive* read
+/// path (`relish logs-search` over exported Parquet), never the in-memory
+/// hot path:
+///
+/// - **ZSTD compression** on every column chunk. Repetitive log lines
+///   compress hard, and because Parquet compresses per row group the file
+///   stays randomly accessible — any group decompresses on its own.
+/// - **Bloom filters on `app` and `namespace`.** These are the columns
+///   archive queries filter on with equality (`WHERE app = 'web'`), and a
+///   bloom filter lets the reader skip a row group that definitely holds
+///   no matching rows. We deliberately do *not* put one on `line`: a bloom
+///   filter answers "is value X present", which does nothing for a
+///   substring `LIKE '%error%'`. Substring scans rely on columnar pruning
+///   and min/max statistics instead.
+fn log_writer_properties() -> WriterProperties {
+    // 1% target false-positive rate (Parquet's default is 5%), sized for up
+    // to ~10k distinct values — generous for app/namespace names, and small
+    // enough that the filter itself costs almost nothing.
+    const BLOOM_FPP: f64 = 0.01;
+    const BLOOM_NDV: u64 = 10_000;
+
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .set_max_row_group_size(LOG_ROW_GROUP_SIZE);
+    for column in ["app", "namespace"] {
+        builder = builder
+            .set_column_bloom_filter_enabled(column.into(), true)
+            .set_column_bloom_filter_fpp(column.into(), BLOOM_FPP)
+            .set_column_bloom_filter_ndv(column.into(), BLOOM_NDV);
+    }
+    builder.build()
+}
 
 /// Arrow schema for the logs table.
 pub fn log_schema() -> Schema {
@@ -141,8 +186,9 @@ impl LogStore {
         let path = self.data_dir.join(filename);
 
         let file = std::fs::File::create(&path)?;
-        let mut writer = ArrowWriter::try_new(file, Arc::new(log_schema()), None)
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::new(log_schema()), Some(log_writer_properties()))
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         writer
             .write(&batch)
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
@@ -504,5 +550,206 @@ mod tests {
         assert_eq!(schema.field(2).name(), "namespace");
         assert_eq!(schema.field(3).name(), "stream");
         assert_eq!(schema.field(4).name(), "line");
+    }
+
+    // --- Phase 12: ZSTD compression + bloom filters (archive path) ---
+
+    use datafusion::parquet::file::properties::ReaderProperties;
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+    use datafusion::parquet::file::serialized_reader::ReadOptionsBuilder;
+
+    /// Write one Parquet file from `batch` with `props`; return (tempdir, path).
+    fn write_parquet(
+        batch: &RecordBatch,
+        props: WriterProperties,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs_000000.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::new(log_schema()), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+        (dir, path)
+    }
+
+    /// A batch of semi-realistic, semi-repetitive log lines.
+    fn log_batch(rows: usize) -> (RecordBatch, usize) {
+        let timestamps: Vec<u64> = (0..rows as u64).collect();
+        let apps: Vec<&str> = (0..rows)
+            .map(|i| if i % 2 == 0 { "web" } else { "api" })
+            .collect();
+        let namespaces: Vec<&str> = vec!["default"; rows];
+        let streams: Vec<&str> = vec!["stdout"; rows];
+        let lines: Vec<String> = (0..rows)
+            .map(|i| format!("GET /api/v1/users/{} 200 OK in {}ms", i % 100, i % 50))
+            .collect();
+        // Raw-text size: roughly what the flat .log file would hold.
+        let raw_text_bytes: usize = lines
+            .iter()
+            .zip(&timestamps)
+            .map(|(l, ts)| l.len() + ts.to_string().len() + 3) // "{ts} O {line}\n"
+            .sum();
+        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(log_schema()),
+            vec![
+                Arc::new(UInt64Array::from(timestamps)),
+                Arc::new(StringArray::from(apps)),
+                Arc::new(StringArray::from(namespaces)),
+                Arc::new(StringArray::from(streams)),
+                Arc::new(StringArray::from(line_refs)),
+            ],
+        )
+        .unwrap();
+        (batch, raw_text_bytes)
+    }
+
+    #[test]
+    fn zstd_parquet_is_over_5x_smaller_than_raw_text() {
+        let (batch, raw_text_bytes) = log_batch(20_000);
+        let (_dir, path) = write_parquet(&batch, log_writer_properties());
+        let compressed = std::fs::metadata(&path).unwrap().len() as usize;
+        assert!(
+            raw_text_bytes > compressed * 5,
+            "expected >5x vs raw text: raw={raw_text_bytes} compressed={compressed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zstd_archive_round_trips_through_remote_query() {
+        let (mut store, dir) = test_store();
+        for i in 0..1000 {
+            store.append_at(i, "web", "default", LogStream::Stdout, "round trip line");
+        }
+        store.flush().await.unwrap();
+
+        let rows = crate::ketchup::remote_query::query_remote(
+            dir.path().to_str().unwrap(),
+            "SELECT timestamp, app, namespace, stream, line FROM logs ORDER BY timestamp",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1000);
+        assert_eq!(rows[0].line, "round trip line");
+        assert_eq!(rows[999].timestamp, 999);
+    }
+
+    #[tokio::test]
+    async fn bloom_filters_written_on_app_and_namespace_only() {
+        let (mut store, dir) = test_store();
+        store.append_at(1, "web", "default", LogStream::Stdout, "x");
+        store.flush().await.unwrap();
+
+        let path = dir.path().join("logs_000000.parquet");
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let rg = reader.metadata().row_group(0);
+        // columns: 0=timestamp 1=app 2=namespace 3=stream 4=line
+        assert!(
+            rg.column(1).bloom_filter_offset().is_some(),
+            "app needs a bloom filter"
+        );
+        assert!(
+            rg.column(2).bloom_filter_offset().is_some(),
+            "namespace needs a bloom filter"
+        );
+        assert!(
+            rg.column(4).bloom_filter_offset().is_none(),
+            "line must NOT have one"
+        );
+        assert!(
+            rg.column(0).bloom_filter_offset().is_none(),
+            "timestamp must NOT have one"
+        );
+    }
+
+    #[tokio::test]
+    async fn equality_query_on_archive_returns_correct_app() {
+        let (mut store, dir) = test_store();
+        store.append_at(1, "web", "default", LogStream::Stdout, "web line");
+        store.append_at(2, "api", "default", LogStream::Stdout, "api line");
+        store.flush().await.unwrap();
+
+        let rows = crate::ketchup::remote_query::query_remote(
+            dir.path().to_str().unwrap(),
+            "SELECT timestamp, app, namespace, stream, line FROM logs WHERE app = 'web'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].line, "web line");
+    }
+
+    #[tokio::test]
+    async fn time_range_random_access_across_row_groups() {
+        // More than LOG_ROW_GROUP_SIZE rows, so the file spans several row
+        // groups; a time-range query must still read just the right slice.
+        let (mut store, dir) = test_store();
+        let total = (LOG_ROW_GROUP_SIZE as u64) * 3;
+        for i in 0..total {
+            store.append_at(i, "web", "default", LogStream::Stdout, "line");
+        }
+        store.flush().await.unwrap();
+
+        let rows = crate::ketchup::remote_query::query_remote(
+            dir.path().to_str().unwrap(),
+            "SELECT timestamp, app, namespace, stream, line FROM logs \
+             WHERE timestamp >= 10000 AND timestamp < 10010",
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 10);
+    }
+
+    #[test]
+    fn bloom_filter_false_positive_rate_under_one_percent() {
+        // Write 2000 distinct app values, then probe 10k absent values and
+        // measure the observed false-positive rate against our 1% target.
+        let n = 2000usize;
+        let apps: Vec<String> = (0..n).map(|i| format!("app-{i}")).collect();
+        let app_refs: Vec<&str> = apps.iter().map(|s| s.as_str()).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(log_schema()),
+            vec![
+                Arc::new(UInt64Array::from((0..n as u64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(app_refs)),
+                Arc::new(StringArray::from(vec!["default"; n])),
+                Arc::new(StringArray::from(vec!["stdout"; n])),
+                Arc::new(StringArray::from(vec!["x"; n])),
+            ],
+        )
+        .unwrap();
+        let (_dir, path) = write_parquet(&batch, log_writer_properties());
+
+        let props = ReaderProperties::builder()
+            .set_read_bloom_filter(true)
+            .build();
+        let opts = ReadOptionsBuilder::new()
+            .with_reader_properties(props)
+            .build();
+        let reader =
+            SerializedFileReader::new_with_options(std::fs::File::open(&path).unwrap(), opts)
+                .unwrap();
+        let rg = reader.get_row_group(0).unwrap();
+        let sbbf = rg
+            .get_column_bloom_filter(1)
+            .expect("app bloom filter present");
+
+        // Bloom filters never report a false negative: present values must hit.
+        for a in &apps[..100] {
+            assert!(sbbf.check(&a.as_str()), "present value {a} not found");
+        }
+
+        let probes = 10_000usize;
+        let fp = (0..probes)
+            .filter(|i| {
+                let absent = format!("absent-{i}");
+                sbbf.check(&absent.as_str())
+            })
+            .count();
+        let rate = fp as f64 / probes as f64;
+        assert!(
+            rate < 0.01,
+            "false-positive rate {rate} exceeds 1% ({fp}/{probes})"
+        );
     }
 }
