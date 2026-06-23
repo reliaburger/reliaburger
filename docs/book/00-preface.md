@@ -37,7 +37,13 @@ Two things, simultaneously:
 
 ## How to read this book
 
-Start at Chapter 1 and go forwards. Each chapter builds on the previous one. The code compiles and passes tests at the end of every chapter — you can stop anywhere and have a working (if incomplete) system.
+There are two ways to read it, and both work.
+
+The first is front to back. Start at Chapter 1 and go forwards. Each chapter builds on the previous one, and Rust concepts are introduced inline, the first time they appear — ownership when we first move a value, traits when we first need one, async when the agent first has to juggle several things at once. You learn the language in the order the code needs it. This is the path most readers take.
+
+The second is for people who hate surprises. Start at the end. There's a back-of-book appendix, *Rust for C, Python, and Go Programmers*, that lays out the whole language in one go: the memory model, types, traits, error handling, async, the lot. Read it first and the scattered "here's a new bit of Rust" explanations in the chapters become reinforcement — a second look at something you've already met — rather than first contact. If you'd rather have the full picture before you start, or you already know you learn languages better as a system than in fragments, begin there and then come back to Chapter 1.
+
+Either way: the code compiles and passes tests at the end of every chapter, so you can stop anywhere and have a working (if incomplete) system.
 
 The chapters follow a pattern:
 
