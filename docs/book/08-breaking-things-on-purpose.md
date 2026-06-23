@@ -538,3 +538,51 @@ Every chapter is supposed to end with what was tricky, what clicked, and what we
 **kaniko died while we were designing.** We spent time evaluating kaniko as the build backend. Then Google archived it. The software industry doesn't owe you backward compatibility. We switched to buildah — daemonless, rootless, actively maintained, and it speaks the same OCI registry protocol. The transition was painless because we'd already designed the build system around a clean subprocess interface: prepare args, spawn, done. If buildah dies too, we swap the binary. The lesson: minimise your coupling surface to external tools. Two subprocess calls and a standard protocol are better than a deep SDK integration.
 
 **Pickle is a better transport than you'd think.** The build context upload problem seemed like it needed a file transfer mechanism — scp, NFS, a custom sync protocol. Then we realised we already had a content-addressed blob store that every node in the cluster can talk to. Tar the context, upload it as a blob, let the build node download it. No shared filesystems, no new infrastructure. Sometimes the best solution is the one you've already built for a different purpose.
+
+## Tests
+
+A chaos tool poses an awkward testing question: how do you test something whose job is to break things, without breaking your test runner? The answer runs right through this chapter's design. The *logic* — safety rails, the registry, scheduling — is pure and tested in-memory, so it runs anywhere. The *kernel enforcement* — eBPF actually dropping a `connect()` — is gated behind the same eBPF machinery as Chapter 3.
+
+### Unit tests — the logic
+
+The 91 tests in `src/smoker/` cover the parts that must never be wrong:
+
+- **Safety rails** — one test per `SafetyViolation` variant, plus the evaluation-order test (quorum reported before leader when both trip). These are the tests that let us promise quorum protection can't be bypassed.
+- **The registry** — expiry via the min-heap, and the property that a `bun` restart leaves it empty.
+- **`#[repr(C)]` size assertions** — `connect_fault_key_size` and friends, which run on *every* platform and catch a padding mistake before any BPF code loads.
+
+The batch scheduler and build pieces add their own: the 100K-jobs-in-under-a-second benchmark runs *as a unit test* (a regression that slows scheduling fails the build), and the build tests cover `pickle://` enforcement, namespace-scope rejection, and buildah argument construction.
+
+### Integration tests — the scenarios, in memory
+
+The eight chaos scenarios live in `tests/chaos_smoker.rs`, and they're deliberately built on in-memory infrastructure so they run on a laptop with no eBPF host:
+
+```
+kill_leader_blocked_without_flag      rapid_elections_quorum_protection
+kill_leader_allowed_with_flag         oom_kill_blocked_for_all_replicas
+kill_non_leader_node_approved         cpu_stress_allowed_no_replica_check
+drain_node_tracked_in_registry        registry_cleared_on_restart
+```
+
+`tests/chaos.rs` complements them with cluster-recovery-from-partition tests (carried over from Chapter 2), also in-memory and deterministic. Neither needs eBPF, because what they're testing is the decision-making — "would this fault be allowed, and is it tracked correctly?" — not the kernel mechanism.
+
+### Gated tests — the kernel actually dropping packets
+
+Proving that an eBPF connect fault *really* returns `ECONNREFUSED` needs a real kernel. Those tests ride along with Chapter 3's eBPF suite, behind both the `ebpf` feature and the env var:
+
+```sh
+RELIABURGER_EBPF_TESTS=1 cargo test --features ebpf --test ebpf
+```
+
+On a Mac, `relish dev test` runs them inside Lima. Process faults (signals) run on any Unix including macOS; resource faults (cgroups) are Linux-only and their config logic is unit-tested everywhere, returning `UnsupportedPlatform` off Linux.
+
+### Running them
+
+```sh
+cargo test --lib smoker meat::batch         # safety rails, registry, batch
+cargo test --test chaos_smoker               # the 8 scenarios (in-memory)
+cargo test --test chaos                       # partition recovery
+relish dev test onion                         # eBPF fault enforcement (Lima)
+```
+
+Phase 8 adds 222 tests, bringing the total to 1263.
