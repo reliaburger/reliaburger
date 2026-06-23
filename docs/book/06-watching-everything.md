@@ -242,6 +242,39 @@ The Brioche dashboard is a single server-rendered HTML page. No JavaScript frame
 
 Could we build a nicer dashboard with React and WebSocket updates? Sure. But that's a separate build pipeline, a node_modules tree, a bundler, and an entire frontend ecosystem to maintain. The server-rendered approach gives us something that works today and costs nothing to maintain.
 
-## Test count
+## Tests
 
-Phase 6 adds 120 tests, bringing the total to 991. The new tests cover Arrow schema validation, DataFusion SQL queries over both metrics and logs, Parquet persistence, system metrics collection (CPU, memory, disk, network), Prometheus text parsing, alert state machine transitions, log append/query/grep/tail/JSON filtering, LogStore SQL queries (app filter, time range, LIKE grep, LIMIT), sparse index binary search, cross-node log merge, and dashboard HTML rendering.
+Almost everything in this chapter is a pure data transform: a sample becomes a `RecordBatch`, a SQL string becomes rows, a threshold-and-duration becomes an alert state. Pure transforms are the easy case for testing — no I/O, no async, no cluster. So Phase 6 leans almost entirely on unit tests, and there's a lot of them.
+
+### Unit tests — the bulk of the work
+
+The three subsystems carry their own tests at the bottom of each source file:
+
+- **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state.
+- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, JSON field filtering, the sparse-index binary search, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`).
+- **Brioche (dashboard):** HTML rendering, and two security-flavoured tests worth calling out — `render_app_detail_escapes_html` (no stored-XSS through an app name) and `render_app_detail_masks_encrypted_env` (a secret never reaches the page). These are unit tests because the renderer is a pure function from data to a string; you assert on the string.
+
+### End-to-end: the demo script
+
+Unit tests prove each transform. To watch the whole pipeline breathe — collect, store, query, render — there's a script:
+
+```sh
+make observability-demo
+```
+
+It builds and starts `bun`, waits about twenty seconds (two ten-second collection cycles) so real CPU and memory samples accumulate, then queries the metric names, the summary, and the alert list over the HTTP API, and finally prints the dashboard URL. It's the fastest way to confirm the chapter's code actually works on your machine, not just in the test harness.
+
+### Running them
+
+Everything here runs under a plain `cargo test`. No gated tests in this chapter — no root, no eBPF, no network, no platform-specific runtime. To run a single subsystem:
+
+```sh
+cargo test --lib mayo        # metrics
+cargo test --lib ketchup     # logs
+cargo test --lib brioche     # dashboard
+make observability-demo      # live, end-to-end
+```
+
+The cross-node and aggregation pieces — querying logs across the whole cluster, hierarchical metric rollups, exporting to S3 — are *advanced* observability, and their integration tests (`tests/metrics_aggregation.rs`, `tests/logs_cross_node.rs`, `tests/log_export.rs`) belong to Chapter 11. This chapter is the single-node foundation they build on.
+
+Phase 6 adds 120 tests, bringing the total to 991.
