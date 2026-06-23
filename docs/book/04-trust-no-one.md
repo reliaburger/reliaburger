@@ -127,6 +127,8 @@ $ relish token create --name join-batch --role admin
 
 The council writes a new join token to Raft via `generate_new_join_token()`, which takes an explicit TTL. The function is the same one `relish init` uses internally — the only difference is that `init` calls it once automatically, while subsequent tokens are created on demand. Each token is independent: its own 256-bit random value, its own hash, its own expiry. Consume one and the others are unaffected.
 
+Phase 4 builds the token machinery: generation, hashing, and storage in Raft. The full lifecycle around it — enforcing single-use and expiry inside the agent, plus `relish token list` and `relish token revoke` — needs `SecurityState` to live in the Raft state machine, which doesn't arrive until Chapter 10. So treat this section as the foundation; we close the loop on token validation and revocation there.
+
 After that, every connection between cluster nodes uses mutual TLS. Both sides present their certificates, both sides verify against the Root CA trust anchor. A plain TCP connection to a cluster port gets rejected immediately.
 
 ## Gossip HMAC
@@ -349,19 +351,32 @@ When we clone a CA's wrapped key for unwrapping, the original stays untouched in
 
 The `ring` crate makes this even stricter. An `aead::LessSafeKey` can't be cloned or serialised. You create it, use it, and it's gone. The type system prevents you from accidentally persisting encryption keys to disk.
 
-## Test count
+## Tests
 
-Phase 4 adds 85 tests to the suite, bringing the total to 795. The new tests cover:
+Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested — 119 tests living next to the code in `src/sesame/`.
 
-- CA generation and chain validation
-- HKDF key derivation determinism
-- AES-256-GCM encrypt/decrypt round trips (including tamper detection)
-- Key wrapping and unwrapping
-- Age secret encryption (including namespace isolation)
-- Argon2id token hashing and role checking
-- Join token lifecycle (valid, expired, consumed, single-use)
-- mTLS config building
-- Gossip HMAC authentication
-- Secret decryption callback wiring
-- Raft log entry encryption
-- eBPF firewall rule resolution
+### What the unit tests prove
+
+The roster maps directly onto the primitives in this chapter:
+
+- **CA hierarchy** — generation and chain validation: a node cert verifies against the Node CA, which verifies against the Root, and a Workload-CA-signed cert does *not* validate as a node cert.
+- **HKDF** — determinism (same `ikm`/salt/info gives the same key) and separation (different `info` gives unrelated keys).
+- **AES-256-GCM** — encrypt/decrypt round-trips, and the one that matters most: flip a byte of ciphertext and decryption returns an error, never plaintext.
+- **Key wrapping** — wrap an intermediate CA key, unwrap it, get the original back; unwrap with the wrong purpose string and it fails.
+- **`age` secrets** — encrypt/decrypt, plus namespace isolation (team B's key can't read team A's secret).
+- **Argon2id** — hashing and verification, and that the three roles (`Admin`/`Deployer`/`ReadOnly`) gate the right operations.
+- **Gossip HMAC**, **mTLS config building**, **Raft log entry encryption**, **eBPF firewall rule resolution** — each gets its own test.
+
+A nice property of testing crypto this way: the tamper-detection and namespace-isolation tests are *negative* tests. They assert that the wrong key fails. Those are the tests that actually tell you the security property holds, not just that the happy path works.
+
+### Running them
+
+No gating here. Crypto needs nothing but a CPU, so the whole chapter runs under a plain:
+
+```sh
+cargo test --lib sesame
+```
+
+The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
+
+Phase 4 adds 85 tests to the suite, bringing the total to 795.

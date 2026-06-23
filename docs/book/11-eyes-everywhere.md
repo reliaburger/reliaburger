@@ -628,6 +628,43 @@ secret = "my-shared-secret"
 
 Empty `severity` means all alerts. Each destination can filter independently. PagerDuty gets only critical alerts; Slack gets everything.
 
+## What we learned
+
+**Two merge functions that look interchangeable aren't.** `merge_metrics_results` deduplicates; `merge_cluster_results` sums. Swap them and single-app queries still pass while cluster totals silently halve. We caught it because the tests came first and one of them asserted a known total of 150. A reminder that the most dangerous bugs aren't crashes — they're plausible-looking wrong numbers.
+
+**Export as the format you already have.** The original plan was `jsonl.gz`. But the LogStore already flushes Parquet every 60 seconds, so exporting became "copy the bytes" instead of "build a serialise-and-gzip pipeline", and DataFusion queries the archives in place. When you find yourself about to convert data, check whether you can just move it.
+
+**Fire-and-forget, or the loop stalls.** A webhook retry chain runs up to 31 seconds. The alert evaluator ticks every 30. Block on delivery and the next evaluation is already late. Each dispatch gets its own `tokio::spawn`, and the loop moves on. Anything slow and external belongs off the critical path.
+
+**The whole design exists to bound fan-out.** Hierarchical aggregation isn't there because partial aggregates are elegant. It's there so a cluster-wide query costs council-size requests (3–7) instead of N (thousands). When a feature's shape looks elaborate, check whether it's buying you a complexity bound — here it turns O(N) into O(1).
+
+## Tests
+
+This chapter is about combining data from many nodes, so the interesting tests simulate *several nodes inside one process*. None of it needs eBPF, root, or a real cluster — a council member is a struct, a worker's rollup is a value, and a "remote" node is a lightweight axum server on localhost. Everything here runs under a plain `cargo test`.
+
+### Unit tests
+
+The merge strategies get tested head to head, because their difference is the whole ballgame: `merge_metrics_results` must deduplicate and `merge_cluster_results` must sum. The alert path adds transition detection (firing-vs-resolved edges) and webhook HMAC signing. And the Brioche UI carries the security-critical `safe_env` test — serialise the env endpoint's output and assert it *never* contains `ENC[AGE:`, so a secret can't leak to the dashboard or a `curl`.
+
+### Integration tests — many nodes in one process
+
+- **`tests/metrics_aggregation.rs`** is the roadmap's headline test. `five_node_cluster_hierarchical_aggregation` builds five workers' rollups, ingests them into three council `RollupStore`s, and asserts the cluster total is exactly 150.0 (10+20+30+40+50). `partial_results_when_aggregator_down` proves graceful degradation, and `multi_metric_aggregation_with_labels` checks label-scoped sums.
+- **`tests/logs_cross_node.rs`** spins up one axum server per simulated node, each backed by a `LogStore` with known entries, then drives `fan_out_query`: `three_nodes_merge_sorted`, `deduplicates_overlapping_entries`, `grep_filter_across_nodes`, `time_range_filter_across_nodes`, and `partial_results_when_node_unreachable`. No Raft — the coordination layer is tested in isolation.
+- **`tests/log_export.rs`** covers the export round-trip: `export_and_query_round_trip`, `incremental_export` (the checkpoint skips already-exported files), and `query_exported_with_filter` / `query_exported_aggregation` (full SQL over the archives via DataFusion).
+
+### Running them
+
+No gating — all in-memory or local-disk Parquet:
+
+```sh
+cargo test --lib mayo::rollup mayo::query brioche   # merges, masking, charts
+cargo test --test metrics_aggregation                # hierarchical correctness
+cargo test --test logs_cross_node                     # cross-node log fan-out
+cargo test --test log_export                          # Parquet export + remote SQL
+```
+
+Phase 11 adds 147 tests, bringing the total to 1595.
+
 ## What's next
 
 Phase 11 is complete. We have cluster-wide metrics via hierarchical aggregation, cross-node log queries, Parquet log export with remote search, disk pressure management, a multi-page Brioche UI with HTMX and uPlot charts, and alert webhooks with HMAC signing and retry.

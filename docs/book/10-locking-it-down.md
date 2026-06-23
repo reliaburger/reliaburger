@@ -423,6 +423,43 @@ We added an async re-resolution function that uses `tokio::net::lookup_host()` i
 
 The key difference from the sync version: it doesn't block the tokio runtime, so it can run alongside health checks and identity rotation without stalling the event loop.
 
+## What we learned
+
+**A JWT is three base64url segments, not a dependency.** We minted OIDC tokens in about 30 lines using `ring` (which we already had for Ed25519) and `base64`. Pulling in a JWT crate would have added a dependency and its transitive tree to encode `header.claims.signature`. When the format is this simple and you already own the crypto, write the 30 lines.
+
+**Short-lived certificates need a grace period, or availability suffers.** One-hour workload certs keep the blast radius of a stolen key tiny. But a strict one-hour expiry means a council outage at the wrong moment kills every workload. The four-hour grace period is the release valve: security from the short lifetime, availability from the grace window. You usually can't have one property for free; here we paid for it with a few lines of rotation-state logic.
+
+**Keyless signing fell out of a format coincidence.** The workload identity keypair `rcgen` generates is PKCS#8 DER, which is exactly what `ring::signature::EcdsaKeyPair::from_pkcs8` wants. No conversion, no glue. We didn't design that — we noticed it, wrote a test to prove it (`sign_with_workload_identity_keypair`), and got keyless image signing almost for free.
+
+**The registry accepts everything; the scheduler enforces trust.** Putting signature enforcement at *schedule* time rather than *push* time means a missing signature never breaks your CI pipeline. Unsigned images land in Pickle and simply sit there, visible but unschedulable. Pushing the policy check to the latest possible moment kept two concerns from tangling.
+
+## Tests
+
+Like Chapter 4, this is crypto, so it's almost all pure functions and almost all unit tests — nothing here needs root, a network, or a second node. But Phase 10 is also where the *lifecycle* tests live, the ones that drive a feature end to end through the `sesame` library.
+
+### Unit tests
+
+Image signing (`src/pickle/signing.rs`) is the clearest example of testing a security property through its negatives. Alongside `sign_and_verify_round_trip`, the suite asserts the *failures*: `verify_keyless_wrong_digest_fails`, `verify_keyless_wrong_ca_fails`, `verify_external_key_untrusted_fails`, `verify_external_key_wrong_digest_fails`. A signature scheme that only proves "a valid signature verifies" proves nothing; the value is in "a tampered digest, a foreign CA, or an untrusted key all fail". There's also `sign_with_workload_identity_keypair`, the test that nails down the PKCS#8 coincidence above. The identity and OIDC modules (`sesame/identity.rs`, `sesame/oidc.rs`) carry their own unit tests for CSR creation, SAN validation, JWT minting and verification, and the rotation state machine.
+
+### Integration tests — the lifecycles
+
+Two integration files drive whole features through the library, no running agent required:
+
+- **`tests/security_integration.rs`** is the lifecycle suite: `join_token_single_use_enforced` and `join_token_expiry_enforced` (the loop we left open in Chapter 4), `secret_rotation_dual_key_window` and `secret_rotation_finalize_drops_old_key` (the dual-key window), and `crl_revoked_cert_rejected` / `crl_valid_cert_allowed` / `crl_empty_allows_all` (revocation).
+- **`tests/identity_demo.rs`** doubles as a runnable walkthrough. Each test is a stage of the SPIFFE story — `demo_cluster_init_and_ca_hierarchy`, `demo_csr_generation_and_signing`, `demo_oidc_jwt`, `demo_identity_bundle_and_tmpfs`, `demo_rotation_state_machine` — and they print as they go.
+
+### Running them
+
+No gating — crypto needs only a CPU:
+
+```sh
+cargo test --lib sesame pickle::signing      # unit tests
+cargo test --test security_integration        # token / rotation / CRL lifecycle
+cargo test --test identity_demo -- --nocapture # the SPIFFE walkthrough, printed
+```
+
+The `--nocapture` on the last one is the point: it turns the test into a guided tour of cluster init, CSR signing, JWT minting, and rotation, printed to your terminal.
+
 ## What we deferred
 
 **TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.

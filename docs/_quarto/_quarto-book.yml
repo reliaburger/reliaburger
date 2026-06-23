@@ -27,6 +27,7 @@ book:
     - book/13-a-room-with-a-view.md
     - book/14-changing-the-tyres.md
     - book/15-ready-for-production.md
+    - book/16-appendix-rust.md
 
 format:
   pdf:

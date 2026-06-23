@@ -115,9 +115,11 @@ Disk space isn't infinite. Pickle runs a periodic GC sweep that deletes unrefere
 
 After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete.
 
-## Pull-through cache
+## Peer pull, and a note on the pull-through cache
 
-Not every image is pushed explicitly. Your apps might reference `alpine:latest` or `nginx:1.25`. The first time any node needs an image that's not in Pickle, it pulls from Docker Hub (using the existing `oci-distribution` client from Phase 1), stores the layers locally, and commits the manifest to Raft. The next node to need the same image gets it from a peer — Docker Hub is never contacted again.
+Once an image is in the catalog, a worker that doesn't hold it locally fetches the layers from a peer that does. `pull.rs` reads the Raft layer-holder set, picks a peer, and downloads each missing blob over the same `GET /v2/{repository}/blobs/{digest}` endpoint, verifying the digest before storing. That's live in Phase 5 — push once, and every other node pulls internally.
+
+The tempting next step is a *pull-through cache*: your apps reference `alpine:latest` or `nginx:1.25`, and the first node to need one transparently pulls it from Docker Hub (via the `oci-distribution` client from Phase 1), stores the layers, and commits the manifest to Raft so the next node gets it from a peer. The plumbing is sketched in `pull.rs`, but wiring it end to end — intercepting the miss, caching upstream, committing to Raft — is deferred to Phase 12. For now, public base images are still pulled from Docker Hub per node; only images you've explicitly pushed to Pickle replicate across the cluster. We'll come back to it in Chapter 12.
 
 ## How it compares to Docker Hub
 
@@ -151,11 +153,9 @@ It's happened before. In November 2020, Docker Hub had a major outage that broke
 
 When your registry is external, your deploy pipeline inherits its uptime. Docker Hub goes down? You can't deploy. Your cloud provider's container registry has a bad day? Same story. You're at the mercy of someone else's infrastructure.
 
-With Pickle, the cluster *is* the registry. If the cluster is up, the registry is up. There's no separate SLA to track, no status page to monitor, no fallback to configure.
+With Pickle, the cluster *is* the registry. If the cluster is up, the registry is up. There's no separate SLA to track, no status page to monitor, no fallback to configure — for the images you've pushed. Build and push your own apps to Pickle and a Docker Hub outage can't stop you redeploying them; they live on cluster nodes and replicate between peers.
 
-And the pull-through cache makes this even better. The first time you deploy `nginx:1.25`, Pickle pulls it from Docker Hub and caches it. Every subsequent deploy of that image, on any node, comes from a cluster peer. Docker Hub could vanish entirely and your existing deployments wouldn't notice.
-
-Can you deploy a *brand new* Docker Hub image during an outage? No. But how often do you deploy something you've never deployed before versus something you've deployed a hundred times? In production, most deploys are updates to images you already have. Pickle keeps them all.
+Public base images are the caveat until Phase 12. Today a node still pulls `nginx:1.25` from Docker Hub the first time it needs it. Once the pull-through cache lands, that first pull caches into Pickle and every subsequent deploy on any node comes from a peer — at which point Docker Hub could vanish and your existing deployments wouldn't notice. For now, the honest story is: your own images are outage-proof, public base images aren't yet.
 
 ## Volume size enforcement
 
@@ -235,6 +235,8 @@ async fn blob_head(
 }
 ```
 
+That `let Ok(digest) = Digest::new(&digest_str) else { ... }` is a *let-else*, a fairly recent Rust addition. It reads "bind `digest` if construction succeeded, otherwise run the `else` block — which must diverge" (here, by returning early). It's the clean way to peel a value out of a `Result` or `Option` and bail on failure without nesting the happy path inside an `if let`. A Go programmer would write `if err != nil { return ... }`; let-else gives you the same early-return shape while keeping `digest` in scope for the rest of the function.
+
 Axum handles URL routing and parameter extraction. `Digest::new` handles domain validation. The handler glues them together. This separation means the `Digest` type works the same way whether it came from an HTTP path, a manifest JSON document, or a test fixture.
 
 ## What we learned
@@ -255,6 +257,45 @@ We considered a custom binary protocol (gRPC, or raw TCP with length-prefixed fr
 
 Without sole-copy protection, GC on two nodes can race: both check the holder set, both see "two holders", both delete. Now nobody holds the layer. The fix is in Raft: after GC, the node proposes a `GcReport` that removes itself from the holder set. Because Raft proposals are serialised, the second node's GC will see only one holder remaining and skip the deletion.
 
-## Test count
+## Tests
 
-Phase 5 adds 72 tests, bringing the total to 867. The new tests cover digest parsing, manifest serde, Raft state machine extensions (commit, update, GC, delete), blob store operations (write, read, upload sessions, digest verification), OCI API endpoints (full push/pull round-trip), peer selection, image availability checks, GC safety (sole-copy, active reference, retention), and volume management.
+Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.
+
+### Unit tests — the registry without the network
+
+The 104 tests in `src/pickle/` cover:
+
+- **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
+- **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
+- **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes.
+- **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer.
+
+### Gated tests — anything that touches a real image or runtime
+
+Pulling a real image, or running one under a real container runtime, can't go in the default suite: Docker Hub rate-limits and flakes, runc needs Linux and root, Apple Container needs macOS. So those are gated behind environment variables and only run when you ask:
+
+```sh
+RELIABURGER_IMAGE_PULL_TESTS=1 cargo test     # pull a real image from Docker Hub (needs network)
+RELIABURGER_RUNC_TESTS=1 cargo test           # run under runc (Linux only)
+RELIABURGER_APPLE_CONTAINER_TESTS=1 cargo test # run under Apple Container (macOS only)
+```
+
+The gating lives in `src/grill/{image,runc,apple}.rs`: each gated test reads its variable with `std::env::var(...)` at the top and returns early if it's unset. That keeps `cargo test` fast and hermetic for everyone, while the people who *can* run the heavy paths (a Linux CI box, a macOS laptop with Docker Desktop) get full coverage by flipping one switch.
+
+For an end-to-end smoke test of a real push and pull through Pickle on macOS:
+
+```sh
+make pickle-test-macos    # push/pull a real Docker image through Pickle (needs Docker Desktop)
+```
+
+### Running them
+
+The default path needs nothing special:
+
+```sh
+cargo test --lib pickle       # the whole registry, in-process
+```
+
+Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
+
+Phase 5 adds 72 tests, bringing the total to 867.

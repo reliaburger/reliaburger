@@ -473,7 +473,13 @@ async fn deploy_app_with_port_registers_in_service_map() {
 
 The `stop_app_removes_from_service_map` test verifies the other end: deploy, resolve succeeds, stop, resolve returns 404. And `vip_is_deterministic_across_agents` deploys the same app on two independent agents and verifies they assign identical VIPs — proving the deterministic hash works without any coordination.
 
-**eBPF program tests** (Linux only, gated behind `RELIABURGER_EBPF_TESTS=1`) load real eBPF programs into a real kernel and verify the connect rewrite actually happens. This is the test that matters most:
+**eBPF program tests** load real eBPF programs into a real kernel and verify the connect rewrite actually happens. This is the test that matters most. They're gated two ways at once: the BPF loader code only compiles under the `ebpf` Cargo feature (it pulls in the `aya` crate), and the tests only run when `RELIABURGER_EBPF_TESTS=1` is set. So the full incantation on a Linux box with cgroup v2 is:
+
+```sh
+RELIABURGER_EBPF_TESTS=1 cargo test --features ebpf --test ebpf
+```
+
+Forget the feature flag and the tests don't even compile in; forget the env var and they compile but skip. Both switches, on purpose — eBPF needs root and a recent kernel, so it must never be part of the default `cargo test`.
 
 ```rust
 #[tokio::test]
@@ -724,4 +730,6 @@ Without `#[repr(C)]`, Rust will reorder struct fields for alignment efficiency. 
 
 ## Test count
 
-Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover). The eBPF tests are gated behind `RELIABURGER_EBPF_TESTS=1` and require Linux with cgroup v2.
+Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
+
+Most of these run under a plain `cargo test` on any machine. The privileged ones split by gate: `RELIABURGER_NETNS_TESTS=1` (network namespaces, needs root on Linux), `RELIABURGER_RUNC_TESTS=1` (runc containers), and `RELIABURGER_EBPF_TESTS=1` together with `--features ebpf` (the connect-rewrite tests, needs Linux and cgroup v2). On a Mac, `relish dev test` sets all three env vars and the feature flag inside the Lima VM, so one command runs the lot — no need to remember the matrix.
