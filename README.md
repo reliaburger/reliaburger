@@ -139,6 +139,7 @@ Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rus
 9. [The Full Package](docs/book/09-the-full-package.md)
 10. [Locking It Down](docs/book/10-locking-it-down.md)
 11. [Eyes Everywhere](docs/book/11-eyes-everywhere.md)
+12. [Squeezing Every Drop](docs/book/12-squeezing-every-drop.md) *(in progress)*
 - [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
 
 ## Licence

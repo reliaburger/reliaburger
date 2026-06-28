@@ -27,7 +27,14 @@ use super::types::{KetchupError, LogEntry, LogStream};
 /// `timestamp (u64)`, `app (utf8)`, `namespace (utf8)`,
 /// `stream (utf8)`, `line (utf8)`.
 pub async fn query_remote(source_path: &str, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
-    let ctx = SessionContext::new();
+    // Turn on Parquet bloom-filter pruning for the read path. We write
+    // bloom filters on the `app` and `namespace` columns at flush time, so
+    // an equality filter like `WHERE app = 'web'` can skip whole row groups
+    // that hold no matching rows. (It's on by default in DataFusion, but we
+    // set it explicitly so the behaviour can't silently regress.)
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.parquet.bloom_filter_on_read = true;
+    let ctx = SessionContext::new_with_config(config);
 
     // Parse the source path as a ListingTableUrl
     let table_url = ListingTableUrl::parse(source_path).map_err(|e| {
