@@ -39,6 +39,52 @@ struct Cli {
     /// Runtime to use: auto, process, runc, apple.
     #[arg(long, default_value = "auto")]
     runtime: String,
+
+    /// Join/form a cluster using the `[cluster]` config (gossip membership).
+    /// Without this flag, bun runs as a single node, as before.
+    #[arg(long)]
+    cluster: bool,
+}
+
+/// Build cluster startup parameters from node config.
+///
+/// Gossip binds/advertises on `advertise_address` (falling back to
+/// loopback for single-host testing) at `cluster.gossip_port`; seeds are the
+/// parseable `cluster.join` addresses. An empty seed list means this is the
+/// first/bootstrap node.
+fn cluster_params_from_config(config: &NodeConfig) -> reliaburger::cluster::runtime::ClusterParams {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let ip = config
+        .network
+        .advertise_address
+        .as_deref()
+        .and_then(|s| {
+            s.parse::<IpAddr>()
+                .ok()
+                .or_else(|| s.parse::<SocketAddr>().ok().map(|sa| sa.ip()))
+        })
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let gossip_addr = SocketAddr::new(ip, config.cluster.gossip_port);
+
+    let seeds: Vec<SocketAddr> = config
+        .cluster
+        .join
+        .iter()
+        .filter_map(|s| s.parse::<SocketAddr>().ok())
+        .collect();
+
+    let node_name = config
+        .node
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
+
+    reliaburger::cluster::runtime::ClusterParams {
+        node_name,
+        gossip_addr,
+        seeds,
+    }
 }
 
 #[tokio::main]
@@ -69,9 +115,29 @@ async fn main() -> anyhow::Result<()> {
     // Create shutdown token
     let shutdown = CancellationToken::new();
 
-    // Create the agent (extract deploy history handle before spawning)
+    // Create the agent (extract deploy history handle before spawning).
+    // In cluster mode, start the cluster runtime (gossip, …) and build the
+    // agent with a real ClusterHandle. `_cluster_runtime` holds resources
+    // that must outlive the agent; it drops at the end of main.
     let agent_shutdown = shutdown.clone();
-    let mut agent = BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown);
+    let _cluster_runtime;
+    let mut agent = if cli.cluster {
+        let params = cluster_params_from_config(&config);
+        println!(
+            "bun: cluster mode — gossip on {}, {} seed(s)",
+            params.gossip_addr,
+            params.seeds.len()
+        );
+        let (handle, cluster_runtime) =
+            reliaburger::cluster::runtime::start(params, agent_shutdown.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
+        _cluster_runtime = Some(cluster_runtime);
+        BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
+    } else {
+        _cluster_runtime = None;
+        BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
+    };
     let deploy_history = agent.deploy_history_handle();
     let agent_handle = tokio::spawn(async move {
         agent.run().await;
