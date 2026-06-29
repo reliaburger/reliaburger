@@ -55,6 +55,16 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8)
 - [x] Book chapter + docs: `02-finding-friends.md`, update README and progress (588 tests)
 
+### Cluster runtime wiring (the subsystems above were library-only until here)
+
+Phases 2–11 built the cluster subsystems but the `bun` binary always ran single-node (`BunAgent::new`, never `with_cluster`); they were exercised only by in-memory harnesses. Now wired into the binary behind `bun --cluster`:
+
+- [x] Gossip: `cluster::runtime` binds a real `UdpMustardTransport`, joins by address (no phantom members), membership converges (`tests/cluster_gossip.rs`)
+- [x] Raft council: real `serve_raft_rpc` over TCP, bootstrap, a leader-only selection loop grows the council from gossip membership (per-peer Raft address derived from each node's gossip port + offset)
+- [x] Reporting tree (flat-star MVP): every node reports state to the leader; the leader's aggregator collects the cluster view
+- Canonical consistent-hash reporting tree (workers → council → leader, multi-level aggregation) — follow-up
+- `relish dev` (Lima) multi-VM end-to-end verification + durable Raft log + `wrapping_ikm` loading — follow-up
+
 ## Phase 2.1: Dev Cluster
 
 - [x] Lima wrapper: VM lifecycle (create, start, stop, delete), platform detection, YAML generation
