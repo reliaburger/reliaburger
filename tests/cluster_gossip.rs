@@ -10,37 +10,85 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use reliaburger::bun::agent::ClusterHandle;
 use reliaburger::cluster::identity::raft_id_from_name;
 use reliaburger::cluster::runtime::{self, ClusterParams, ClusterRuntime};
+use reliaburger::config::node::ReportingTreeSection;
+use reliaburger::grill::state::ContainerState;
 use reliaburger::mustard::state::NodeState;
+use reliaburger::reporting::worker::{AgentSnapshot, CollectSnapshotRequest, InstanceSnapshot};
 
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// Start a node. Gossip and raft ports are adjacent (offset 1), so each node
-/// on the shared loopback IP gets a distinct raft address.
+/// Stand in for the BunAgent: answer the reporting worker's snapshot requests
+/// with a fixed snapshot. (The real agent does this from its supervisor; here
+/// we isolate the cluster reporting wiring.)
+fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                req = rx.recv() => {
+                    let Some(req) = req else { break };
+                    let _ = req.response.send(AgentSnapshot {
+                        instances: vec![InstanceSnapshot {
+                            app_name: "web".to_string(),
+                            namespace: "default".to_string(),
+                            instance_id: 0,
+                            image: "nginx:latest".to_string(),
+                            port: Some(8080),
+                            container_state: ContainerState::Running,
+                            consecutive_unhealthy: 0,
+                            uptime: Duration::from_secs(1),
+                        }],
+                        allocated_ports: vec![8080],
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Start a node. Gossip/raft/reporting ports are adjacent (gossip, +1, +2),
+/// so each node on the shared loopback IP gets distinct raft/reporting
+/// addresses.
 async fn start_node(
     name: &str,
     gossip_port: u16,
     seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
 ) -> (ClusterHandle, ClusterRuntime) {
-    runtime::start(
+    let (mut handle, runtime) = runtime::start(
         ClusterParams {
             node_name: name.into(),
             gossip_addr: local(gossip_port),
             raft_port: gossip_port + 1,
+            reporting_port: gossip_port + 2,
+            reporting_config: ReportingTreeSection {
+                report_interval_secs: 1,
+                max_events_per_report: 100,
+                stale_report_timeout_secs: 30,
+            },
             seeds,
             wrapping_ikm: None,
         },
         shutdown.clone(),
     )
     .await
-    .unwrap()
+    .unwrap();
+
+    // Take the snapshot receiver the agent would normally own and answer it
+    // with a fake agent, so the reporting worker can build reports.
+    let (_dummy_tx, dummy_rx) = mpsc::channel(1);
+    let snapshot_rx = std::mem::replace(&mut handle.snapshot_rx, dummy_rx);
+    spawn_fake_agent(snapshot_rx, shutdown.clone());
+
+    (handle, runtime)
 }
 
 /// Distinct alive node names in a membership snapshot.
@@ -153,6 +201,31 @@ async fn three_node_council_elects_leader_and_grows() {
     for h in handles {
         assert_eq!(voter_ids(h), expected);
     }
+
+    // Flat-star reporting tree: every node reports its state to the leader,
+    // so the leader's aggregator ends up holding a report from all three.
+    let leader_agg = [&h1, &h2, &h3]
+        .into_iter()
+        .find(|n| thinks_it_is_leader(&n.0))
+        .map(|n| n.1.aggregated_rx.clone())
+        .expect("a leader exists");
+    let expected_reporters: BTreeSet<String> =
+        ["c1", "c2", "c3"].iter().map(|s| s.to_string()).collect();
+    let reported = wait_until(Duration::from_secs(15), || {
+        let names: BTreeSet<String> = leader_agg
+            .borrow()
+            .reports
+            .keys()
+            .map(|n| n.0.clone())
+            .collect();
+        names == expected_reporters
+    })
+    .await;
+    assert!(
+        reported,
+        "leader did not receive reports from all nodes; have: {:?}",
+        leader_agg.borrow().reports.keys().collect::<Vec<_>>()
+    );
 
     shutdown.cancel();
     for h in handles {

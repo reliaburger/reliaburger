@@ -84,6 +84,8 @@ fn cluster_params_from_config(config: &NodeConfig) -> reliaburger::cluster::runt
         node_name,
         gossip_addr,
         raft_port: config.cluster.raft_port,
+        reporting_port: config.cluster.reporting_port,
+        reporting_config: config.reporting_tree.clone(),
         seeds,
         // TODO(cluster): load the master secret from the security bootstrap
         // so council CA operations work; None still forms the cluster.

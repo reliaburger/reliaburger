@@ -1,10 +1,16 @@
 //! Start the cluster runtime and assemble a [`ClusterHandle`].
 //!
-//! Wires the gossip layer (real UDP, join-by-address) and the Raft council
-//! (real TCP RPC, bootstrap, and a selection loop that grows the council from
-//! gossip membership). The reporting tree is layered on in a follow-up. A
-//! node started this way gossips, runs Raft, and — once it's the leader —
+//! Wires the gossip layer (real UDP, join-by-address), the Raft council (real
+//! TCP RPC, bootstrap, and a selection loop that grows the council from gossip
+//! membership), and the reporting tree (flat star: every node reports its
+//! state to the current leader, whose aggregator collects the cluster view).
+//! A node started this way gossips, runs Raft, and — once it's the leader —
 //! admits other gossiped nodes to the council up to the size cap.
+//!
+//! The reporting topology is a deliberate MVP: a flat star to the leader. The
+//! canonical consistent-hash tree (workers → council member → leader, with
+//! multi-level aggregation) is a follow-up; it can replace the star without
+//! changing this interface.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -16,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bun::agent::ClusterHandle;
 use crate::cluster::identity;
+use crate::config::node::ReportingTreeSection;
 use crate::council::log_store::MemLogStore;
 use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc};
 use crate::council::node::CouncilNode;
@@ -27,7 +34,9 @@ use crate::mustard::membership::MembershipSnapshot;
 use crate::mustard::protocol::MustardNode;
 use crate::mustard::state::NodeState;
 use crate::mustard::transport::UdpMustardTransport;
-use crate::reporting::worker::CollectSnapshotRequest;
+use crate::reporting::aggregator::{AggregatedState, ReportAggregator};
+use crate::reporting::transport::TcpReportingTransport;
+use crate::reporting::worker::ReportWorker;
 
 /// Upper bound on council (Raft voter) size. Beyond this, alive nodes stay
 /// workers. Matches `CouncilSelectionConfig`'s default `max_council_size`.
@@ -37,14 +46,13 @@ const MAX_COUNCIL_SIZE: usize = 7;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Owns resources that must outlive `start()` for the cluster to keep
-/// working. Drop it to release them (the spawned tasks also stop when the
-/// shared `CancellationToken` is cancelled).
+/// working, and exposes the local reporting aggregator's view. The spawned
+/// tasks stop when the shared `CancellationToken` is cancelled.
 pub struct ClusterRuntime {
-    /// Held so the agent's snapshot channel never closes. Until the
-    /// reporting worker is wired, nothing sends on it; keeping the sender
-    /// alive stops `snapshot_rx.recv()` from returning `None` in a tight
-    /// loop inside the agent.
-    _snapshot_tx: mpsc::Sender<CollectSnapshotRequest>,
+    /// This node's reporting aggregator view. Only meaningful on the leader
+    /// (the flat-star topology has every node report to the leader), where it
+    /// holds the latest state report from every node.
+    pub aggregated_rx: watch::Receiver<AggregatedState>,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -55,6 +63,10 @@ pub struct ClusterParams {
     pub gossip_addr: SocketAddr,
     /// Port for the Raft RPC server (same IP as gossip).
     pub raft_port: u16,
+    /// Port for the reporting-tree transport (same IP as gossip).
+    pub reporting_port: u16,
+    /// Reporting-tree timing config.
+    pub reporting_config: ReportingTreeSection,
     /// Seed addresses to join (other nodes' gossip endpoints). Empty for the
     /// first/bootstrap node.
     pub seeds: Vec<SocketAddr>,
@@ -143,7 +155,52 @@ pub async fn start(
         shutdown.clone(),
     );
 
+    // --- Reporting tree (flat star: every node reports to the leader) ---
+    let reporting_offset = params.reporting_port as i32 - params.raft_port as i32;
+    let reporting_addr = SocketAddr::new(params.gossip_addr.ip(), params.reporting_port);
+
+    // Aggregator: every node listens, but only the leader actually receives
+    // reports (workers target the leader), so a leadership change needs no
+    // start/stop dance — the new leader's aggregator is already running.
+    let agg_transport = TcpReportingTransport::bind(reporting_addr, shutdown.clone())
+        .await
+        .map_err(|e| std::io::Error::other(format!("reporting bind failed: {e}")))?;
+    let (mut aggregator, aggregated_rx) = ReportAggregator::new(
+        agg_transport,
+        params.reporting_config.clone(),
+        shutdown.clone(),
+        None,
+    );
+    tokio::spawn(async move { aggregator.run().await });
+
+    // A maintainer keeps `council_rx` pointing at the current leader's
+    // reporting address; the worker reports there.
+    let (council_tx, council_rx) = watch::channel::<Vec<(NodeId, SocketAddr)>>(Vec::new());
+    spawn_leader_target_maintainer(
+        raft_metrics_rx.clone(),
+        council_tx,
+        reporting_offset,
+        shutdown.clone(),
+    );
+
+    // Worker: snapshots this node's state (via the agent) and sends it to the
+    // leader. Binds an ephemeral port — it only sends; replies are ignored.
     let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
+    let worker_transport = TcpReportingTransport::bind(
+        SocketAddr::new(params.gossip_addr.ip(), 0),
+        shutdown.clone(),
+    )
+    .await
+    .map_err(|e| std::io::Error::other(format!("reporting worker bind failed: {e}")))?;
+    let mut worker = ReportWorker::new(
+        NodeId::new(&params.node_name),
+        worker_transport,
+        params.reporting_config.clone(),
+        snapshot_tx,
+        council_rx,
+        shutdown.clone(),
+    );
+    tokio::spawn(async move { worker.run().await });
 
     let handle = ClusterHandle {
         membership_rx,
@@ -153,12 +210,49 @@ pub async fn start(
         wrapping_ikm: params.wrapping_ikm,
     };
 
-    Ok((
-        handle,
-        ClusterRuntime {
-            _snapshot_tx: snapshot_tx,
-        },
-    ))
+    Ok((handle, ClusterRuntime { aggregated_rx }))
+}
+
+/// Keep `council_tx` pointing at the current Raft leader's reporting address
+/// (a single-element council list), so the flat-star worker always reports to
+/// the leader. Recomputes on every metrics change.
+fn spawn_leader_target_maintainer(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    council_tx: watch::Sender<Vec<(NodeId, SocketAddr)>>,
+    reporting_offset: i32,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            let target = {
+                let m = metrics_rx.borrow();
+                m.current_leader.and_then(|leader_id| {
+                    m.membership_config
+                        .membership()
+                        .get_node(&leader_id)
+                        .map(|info| {
+                            let raft = info.addr;
+                            let reporting = SocketAddr::new(
+                                raft.ip(),
+                                (raft.port() as i32 + reporting_offset) as u16,
+                            );
+                            vec![(NodeId::new(&info.name), reporting)]
+                        })
+                })
+            };
+            if let Some(target) = target {
+                let _ = council_tx.send(target);
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = metrics_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Spawn the council reconciler: on the leader, periodically bring the Raft
