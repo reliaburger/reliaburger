@@ -8,6 +8,7 @@
 
 pub mod brioche;
 pub mod bun;
+pub mod cluster;
 pub mod config;
 pub mod council;
 pub mod firewall;

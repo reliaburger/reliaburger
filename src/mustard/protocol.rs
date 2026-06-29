@@ -56,6 +56,10 @@ pub struct MustardNode<T: MustardTransport> {
     /// Membership size at last publish. Used to avoid redundant publishes
     /// when nothing changed.
     last_published_member_count: usize,
+    /// Seed addresses to (re-)contact while this node has no live peers.
+    /// Used to bootstrap a join by address without inserting a placeholder
+    /// member: we ping the seed, and learn its real identity from the reply.
+    seeds: Vec<SocketAddr>,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -79,6 +83,34 @@ impl<T: MustardTransport> MustardNode<T> {
             lamport: 0,
             membership_watch: None,
             last_published_member_count: 0,
+            seeds: Vec::new(),
+        }
+    }
+
+    /// Set seed addresses used to bootstrap a join.
+    ///
+    /// While this node knows no live peers, each probe cycle pings these
+    /// addresses directly. We never insert a placeholder member for a seed:
+    /// the seed's reply carries its real `NodeId`, so membership stays free
+    /// of phantom entries even though we joined knowing only an address.
+    pub fn set_seeds(&mut self, seeds: Vec<SocketAddr>) {
+        self.seeds = seeds;
+    }
+
+    /// Ping every seed address with an empty Ping. The reply registers the
+    /// seed by its real identity and carries piggybacked membership, so one
+    /// successful round bootstraps the whole view; lost UDP datagrams are
+    /// retried on the next probe cycle while still isolated.
+    async fn ping_seeds(&self) {
+        for &addr in &self.seeds {
+            let ping = GossipMessage::new(
+                self.node_id.clone(),
+                self.incarnation,
+                GossipPayload::Ping {
+                    updates: Vec::new(),
+                },
+            );
+            let _ = self.transport.send(addr, &ping).await;
         }
     }
 
@@ -193,7 +225,12 @@ impl<T: MustardTransport> MustardNode<T> {
 
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
-            return; // No peers to probe
+            // No live peers — we're isolated. If we have seed addresses,
+            // ping them directly to (re)join. Their replies register them
+            // by their real NodeId via handle_message, so no placeholder
+            // member is ever created.
+            self.ping_seeds().await;
+            return;
         };
 
         // Send PING
