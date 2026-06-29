@@ -83,7 +83,11 @@ fn cluster_params_from_config(config: &NodeConfig) -> reliaburger::cluster::runt
     reliaburger::cluster::runtime::ClusterParams {
         node_name,
         gossip_addr,
+        raft_port: config.cluster.raft_port,
         seeds,
+        // TODO(cluster): load the master secret from the security bootstrap
+        // so council CA operations work; None still forms the cluster.
+        wrapping_ikm: None,
     }
 }
 

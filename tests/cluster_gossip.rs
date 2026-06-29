@@ -1,24 +1,49 @@
-//! Multi-node gossip integration test over REAL UDP transports.
+//! Multi-node cluster integration tests over REAL UDP + TCP transports.
 //!
-//! Unlike the in-memory mustard tests, this exercises the binary's wiring
-//! path: `cluster::runtime::start` binds real UDP sockets, a node joins by
-//! address (seeds), and membership converges across all three nodes. This
-//! is the proof that the cluster runtime forms gossip membership for real,
-//! not just in a harness.
+//! Unlike the in-memory mustard/council tests, these exercise the binary's
+//! wiring path: `cluster::runtime::start` binds real sockets, nodes join by
+//! address, gossip converges, a Raft leader is elected, and the council grows
+//! from gossip membership. This is the proof that the cluster runtime forms a
+//! real cluster, not just in a harness.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use reliaburger::cluster::runtime::{self, ClusterParams};
+use reliaburger::bun::agent::ClusterHandle;
+use reliaburger::cluster::identity::raft_id_from_name;
+use reliaburger::cluster::runtime::{self, ClusterParams, ClusterRuntime};
 use reliaburger::mustard::state::NodeState;
 
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// Count distinct alive node names in a membership snapshot.
+/// Start a node. Gossip and raft ports are adjacent (offset 1), so each node
+/// on the shared loopback IP gets a distinct raft address.
+async fn start_node(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+) -> (ClusterHandle, ClusterRuntime) {
+    runtime::start(
+        ClusterParams {
+            node_name: name.into(),
+            gossip_addr: local(gossip_port),
+            raft_port: gossip_port + 1,
+            seeds,
+            wrapping_ikm: None,
+        },
+        shutdown.clone(),
+    )
+    .await
+    .unwrap()
+}
+
+/// Distinct alive node names in a membership snapshot.
 fn alive_names(snap: &[reliaburger::mustard::membership::MembershipSnapshot]) -> Vec<String> {
     let mut names: Vec<String> = snap
         .iter()
@@ -30,75 +55,109 @@ fn alive_names(snap: &[reliaburger::mustard::membership::MembershipSnapshot]) ->
     names
 }
 
-#[tokio::test]
+/// Current Raft voter id set as seen by this node.
+fn voter_ids(h: &ClusterHandle) -> BTreeSet<u64> {
+    let Some(rx) = &h.raft_metrics_rx else {
+        return BTreeSet::new();
+    };
+    rx.borrow()
+        .membership_config
+        .membership()
+        .voter_ids()
+        .collect()
+}
+
+fn thinks_it_is_leader(h: &ClusterHandle) -> bool {
+    let Some(rx) = &h.raft_metrics_rx else {
+        return false;
+    };
+    let m = rx.borrow();
+    m.current_leader == Some(m.id)
+}
+
+/// Poll `cond` every 200ms until it returns true or the timeout elapses.
+async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_nodes_join_by_address_and_converge() {
     let shutdown = CancellationToken::new();
 
-    // Pick three gossip ports. node-1 is the bootstrap node (no seeds);
-    // node-2 and node-3 join by node-1's address only.
-    let (p1, p2, p3) = (17441, 17442, 17443);
+    // node-1 is the bootstrap node (no seeds); node-2/3 join by its address.
+    let h1 = start_node("node-1", 17441, vec![], &shutdown).await;
+    let h2 = start_node("node-2", 17443, vec![local(17441)], &shutdown).await;
+    let h3 = start_node("node-3", 17445, vec![local(17441)], &shutdown).await;
+    let handles = [&h1.0, &h2.0, &h3.0];
 
-    let (h1, _rt1) = runtime::start(
-        ClusterParams {
-            node_name: "node-1".into(),
-            gossip_addr: local(p1),
-            seeds: vec![],
-        },
-        shutdown.clone(),
-    )
-    .await
-    .unwrap();
-
-    let (h2, _rt2) = runtime::start(
-        ClusterParams {
-            node_name: "node-2".into(),
-            gossip_addr: local(p2),
-            seeds: vec![local(p1)],
-        },
-        shutdown.clone(),
-    )
-    .await
-    .unwrap();
-
-    let (h3, _rt3) = runtime::start(
-        ClusterParams {
-            node_name: "node-3".into(),
-            gossip_addr: local(p3),
-            seeds: vec![local(p1)],
-        },
-        shutdown.clone(),
-    )
-    .await
-    .unwrap();
-
-    // Poll until every node sees all three by name, or time out.
     let expected = vec!["node-1".to_string(), "node-2".into(), "node-3".into()];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let converged = loop {
-        let all = [&h1, &h2, &h3]
+    let converged = wait_until(Duration::from_secs(15), || {
+        handles
             .iter()
-            .all(|h| alive_names(&h.membership_rx.borrow()) == expected);
-        if all {
-            break true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break false;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+            .all(|h| alive_names(&h.membership_rx.borrow()) == expected)
+    })
+    .await;
 
     if !converged {
-        let views: Vec<_> = [&h1, &h2, &h3]
+        let views: Vec<_> = handles
             .iter()
             .map(|h| alive_names(&h.membership_rx.borrow()))
             .collect();
         panic!("gossip did not converge to 3 nodes; views: {views:?}");
     }
-
-    // No phantom members: exactly three on each node.
-    for h in [&h1, &h2, &h3] {
+    for h in handles {
         assert_eq!(alive_names(&h.membership_rx.borrow()).len(), 3);
     }
 
     shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_council_elects_leader_and_grows() {
+    let shutdown = CancellationToken::new();
+
+    let h1 = start_node("c1", 17541, vec![], &shutdown).await;
+    let h2 = start_node("c2", 17543, vec![local(17541)], &shutdown).await;
+    let h3 = start_node("c3", 17545, vec![local(17541)], &shutdown).await;
+    let handles = [&h1.0, &h2.0, &h3.0];
+
+    let expected: BTreeSet<u64> = ["c1", "c2", "c3"]
+        .iter()
+        .map(|n| raft_id_from_name(n))
+        .collect();
+
+    // Gossip converges, a leader emerges, and the council grows to all three.
+    let grown = wait_until(Duration::from_secs(25), || {
+        handles
+            .iter()
+            .any(|h| voter_ids(h) == expected && thinks_it_is_leader(h))
+    })
+    .await;
+
+    if !grown {
+        let sets: Vec<_> = handles.iter().map(|h| voter_ids(h)).collect();
+        panic!("council did not grow to 3 voters; voter sets: {sets:?}");
+    }
+
+    // Exactly one leader, and every node agrees on the 3-voter set.
+    assert_eq!(handles.iter().filter(|h| thinks_it_is_leader(h)).count(), 1);
+    for h in handles {
+        assert_eq!(voter_ids(h), expected);
+    }
+
+    shutdown.cancel();
+    for h in handles {
+        if let Some(c) = &h.council {
+            c.shutdown().await.ok();
+        }
+    }
 }
