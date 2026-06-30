@@ -293,6 +293,12 @@ enum DevAction {
         /// Cluster name.
         #[arg(long, default_value = "default")]
         name: String,
+        /// Pre-built Linux `bun` binary to install (skips the in-VM build).
+        #[arg(long)]
+        bun: Option<std::path::PathBuf>,
+        /// Pre-built Linux `relish` binary to install (skips the in-VM build).
+        #[arg(long)]
+        relish: Option<std::path::PathBuf>,
     },
     /// Show dev cluster status.
     Status {
@@ -659,7 +665,19 @@ async fn main() -> ExitCode {
                 cpus,
                 memory,
                 name,
-            } => reliaburger::relish::dev::create(name, *nodes, *cpus, memory).await,
+                bun,
+                relish,
+            } => {
+                reliaburger::relish::dev::create(
+                    name,
+                    *nodes,
+                    *cpus,
+                    memory,
+                    bun.clone(),
+                    relish.clone(),
+                )
+                .await
+            }
             DevAction::Status { name } => reliaburger::relish::dev::status(name).await,
             DevAction::Shell { node } => reliaburger::relish::dev::shell(node).await,
             DevAction::Stop { name } => reliaburger::relish::dev::stop(name).await,
@@ -875,6 +893,7 @@ mod tests {
                         cpus,
                         memory,
                         name,
+                        ..
                     },
             } => {
                 assert_eq!(nodes, 3);
@@ -901,6 +920,7 @@ mod tests {
                         cpus,
                         memory,
                         name,
+                        ..
                     },
             } => {
                 assert_eq!(nodes, 5);

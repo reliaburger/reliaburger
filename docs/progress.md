@@ -62,8 +62,9 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Gossip: `cluster::runtime` binds a real `UdpMustardTransport`, joins by address (no phantom members), membership converges (`tests/cluster_gossip.rs`)
 - [x] Raft council: real `serve_raft_rpc` over TCP, bootstrap, a leader-only selection loop grows the council from gossip membership (per-peer Raft address derived from each node's gossip port + offset)
 - [x] Reporting tree (flat-star MVP): every node reports state to the leader; the leader's aggregator collects the cluster view
+- [x] `relish dev create` forms a real cluster: launches `bun --cluster`, advertises each VM's shared-network IP, and builds the binaries from the current tree in the build VM (no GitHub download). The Phase 2.1 dev-cluster commands were single-node until here.
 - Canonical consistent-hash reporting tree (workers → council → leader, multi-level aggregation) — follow-up
-- `relish dev` (Lima) multi-VM end-to-end verification + durable Raft log + `wrapping_ikm` loading — follow-up
+- Durable Raft log + `wrapping_ikm` loading — follow-up
 
 ## Phase 2.1: Dev Cluster
 
