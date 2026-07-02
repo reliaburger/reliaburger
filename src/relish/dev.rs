@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::RelishError;
-use super::client::BunClient;
 
 /// Command to launch the bun agent in a cluster VM. `--cluster` is essential:
 /// without it the agent ignores the `[cluster]` config and runs single-node.
+/// Launched via `sudo bash -c` so bun gets root (runc/netns) and can write the
+/// log file under `/var/log`.
 const AGENT_LAUNCH_CMD: &str = "nohup bun --cluster --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117 --runtime runc > /var/log/bun.log 2>&1 &";
 
 // ---------------------------------------------------------------------------
@@ -49,14 +50,14 @@ async fn limactl(args: &[&str]) -> Result<String, RelishError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Get the shared-network IP address of a Lima VM.
+/// Get the inter-VM IP address of a Lima VM.
 ///
-/// Prefers the `lima0` interface (Lima's `lima: shared` network), whose
-/// `192.168.105.x` address is reachable *between* VMs. Falls back to the
-/// first `hostname -I` address that isn't loopback or Lima's user-mode
-/// network (`192.168.5.x`, identical across VMs and not inter-reachable).
+/// Prefers the `lima0` interface (Lima's `user-v2` network), whose address is
+/// reachable *between* VMs. Falls back to the first `hostname -I` address that
+/// isn't loopback or Lima's default user-mode network (`192.168.5.x`,
+/// identical across VMs and not inter-reachable).
 async fn get_vm_ip(name: &str) -> Result<String, RelishError> {
-    // `ip -4 -o addr show lima0` → "2: lima0    inet 192.168.105.3/24 brd ..."
+    // `ip -4 -o addr show lima0` → "2: lima0    inet 192.168.104.3/24 brd ..."
     if let Ok(out) = limactl(&["shell", name, "ip", "-4", "-o", "addr", "show", "lima0"]).await
         && let Some(ip) = out
             .split_whitespace()
@@ -138,9 +139,13 @@ async fn build_binaries_in_vm() -> Result<(PathBuf, PathBuf), RelishError> {
     let vm_target = vm_target_dir(&repo_path);
 
     println!("  building bun + relish for Linux in the build VM (first run is slow)...");
+    // Debug build — much faster than release, and fine for a dev cluster.
+    // Run with `sudo -E` to match `dev test`, so the shared cargo cache in the
+    // VM has consistent (root) ownership and isn't half root / half user.
     let build_cmd = format!(
         "cd {repo_path} && source $HOME/.cargo/env && mkdir -p {vm_target} && \
-         CARGO_TARGET_DIR={vm_target} cargo build --release --bin bun --bin relish -j 2"
+         sudo -E env PATH=\"$PATH\" CARGO_TARGET_DIR={vm_target} \
+         cargo build --bin bun --bin relish -j 2"
     );
     // Stream build output so the user sees progress.
     let status = std::process::Command::new("limactl")
@@ -165,13 +170,13 @@ async fn build_binaries_in_vm() -> Result<(PathBuf, PathBuf), RelishError> {
     let relish_path = tmp.join("reliaburger-dev-relish");
     limactl(&[
         "copy",
-        &format!("{TEST_VM_NAME}:{vm_target}/release/bun"),
+        &format!("{TEST_VM_NAME}:{vm_target}/debug/bun"),
         bun_path.to_str().unwrap(),
     ])
     .await?;
     limactl(&[
         "copy",
-        &format!("{TEST_VM_NAME}:{vm_target}/release/relish"),
+        &format!("{TEST_VM_NAME}:{vm_target}/debug/relish"),
         relish_path.to_str().unwrap(),
     ])
     .await?;
@@ -226,14 +231,14 @@ cpus: {cpus}
 memory: "{memory}"
 disk: "10GiB"
 networks:
-  - lima: shared
+  - lima: user-v2
 provision:
   - mode: system
     script: |
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap curl buildah
+      apt-get install -y -qq runc uidmap
       mkdir -p /etc/reliaburger
 "#
     )
@@ -361,26 +366,31 @@ pub async fn create(
         nodes: Vec::new(),
     };
 
-    // Create and start each VM
+    // Create and start each VM. Idempotent: an existing VM (e.g. from an
+    // interrupted create) is reused and just (re)started, so re-running
+    // `create` resumes rather than erroring on "instance already exists".
+    let existing = limactl(&["list", "--format", "{{.Name}}"]).await?;
     for i in 1..=nodes {
         let node_name = format!("reliaburger-{i}");
-        println!("  creating {node_name} ({cpus} CPUs, {memory} RAM)...");
 
-        // Write Lima YAML to a temp file
-        let yaml_path = std::env::temp_dir().join(format!("{node_name}.yaml"));
-        std::fs::write(&yaml_path, &yaml)?;
-
-        limactl(&[
-            "create",
-            &node_name,
-            yaml_path.to_str().unwrap(),
-            "--tty=false",
-        ])
-        .await?;
-        limactl(&["start", &node_name]).await?;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&yaml_path);
+        if existing.lines().any(|l| l.trim() == node_name) {
+            println!("  {node_name} already exists — reusing");
+            limactl(&["start", &node_name]).await?;
+        } else {
+            println!("  creating {node_name} ({cpus} CPUs, {memory} RAM)...");
+            let yaml_path = std::env::temp_dir().join(format!("{node_name}.yaml"));
+            std::fs::write(&yaml_path, &yaml)?;
+            limactl(&[
+                "create",
+                "--name",
+                &node_name,
+                yaml_path.to_str().unwrap(),
+                "--tty=false",
+            ])
+            .await?;
+            limactl(&["start", &node_name]).await?;
+            let _ = std::fs::remove_file(&yaml_path);
+        }
 
         cluster.nodes.push(DevNode {
             name: node_name,
@@ -405,13 +415,27 @@ pub async fn create(
         let node_ip = node.ip.as_deref().unwrap_or("127.0.0.1");
         let config = generate_node_config(&node.name, node_ip, join_ip);
 
-        // Write config to temp file and copy into VM
+        // Write config to a temp file, copy to a user-writable path in the VM
+        // (limactl copy runs as the unprivileged lima user), then install it
+        // into /etc/reliaburger with sudo.
         let config_path = std::env::temp_dir().join(format!("{}-node.toml", node.name));
         std::fs::write(&config_path, &config)?;
         limactl(&[
             "copy",
             config_path.to_str().unwrap(),
-            &format!("{}:/etc/reliaburger/node.toml", node.name),
+            &format!("{}:/tmp/node.toml", node.name),
+        ])
+        .await?;
+        limactl(&[
+            "shell",
+            &node.name,
+            "sudo",
+            "install",
+            "-D",
+            "-m",
+            "644",
+            "/tmp/node.toml",
+            "/etc/reliaburger/node.toml",
         ])
         .await?;
         let _ = std::fs::remove_file(&config_path);
@@ -436,7 +460,7 @@ pub async fn create(
     // Start bun agents
     println!("  starting bun agents...");
     for node in &cluster.nodes {
-        limactl(&["shell", &node.name, "bash", "-c", AGENT_LAUNCH_CMD]).await?;
+        limactl(&["shell", &node.name, "sudo", "bash", "-c", AGENT_LAUNCH_CMD]).await?;
     }
 
     save_cluster(&cluster)?;
@@ -447,25 +471,17 @@ pub async fn create(
     println!("  waiting for the cluster to converge...");
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
-    let api = format!("http://{first_ip}:9117");
+    // The nodes sit on Lima's user-v2 network, which the host can't route to,
+    // so query the council from *inside* node 1 (where `relish` talks to the
+    // local agent on 127.0.0.1). Best-effort — don't fail create if it's slow.
+    let first = &cluster.nodes[0].name;
     println!();
-    match BunClient::new(&api).council().await {
-        Ok(c) => {
-            let leader = c.leader.as_deref().unwrap_or("(electing)");
-            println!(
-                "Dev cluster \"{name}\" ready — {} council member(s), leader: {leader}",
-                c.members.len()
-            );
-            for m in &c.members {
-                let tag = if Some(&m.name) == c.leader.as_ref() {
-                    " (leader)"
-                } else {
-                    ""
-                };
-                println!("  {}{tag}", m.name);
-            }
+    match limactl(&["shell", first, "relish", "council"]).await {
+        Ok(out) if !out.trim().is_empty() => {
+            println!("Dev cluster \"{name}\" ready:");
+            print!("{out}");
         }
-        Err(_) => {
+        _ => {
             println!("Dev cluster \"{name}\" created ({nodes} nodes) — still converging.");
             for node in &cluster.nodes {
                 println!(
@@ -478,7 +494,7 @@ pub async fn create(
     }
 
     println!();
-    println!("Check: relish --agent {api} nodes   (also: council)");
+    println!("Check: limactl shell {first} relish nodes   (also: council)");
 
     Ok(())
 }
@@ -567,7 +583,7 @@ pub async fn start(name: &str) -> Result<(), RelishError> {
 
     // Restart bun agents
     for node in &cluster.nodes {
-        limactl(&["shell", &node.name, "bash", "-c", AGENT_LAUNCH_CMD]).await?;
+        limactl(&["shell", &node.name, "sudo", "bash", "-c", AGENT_LAUNCH_CMD]).await?;
     }
 
     println!("Dev cluster \"{name}\" started.");
@@ -814,7 +830,8 @@ mod tests {
         assert!(yaml.contains("cpus: 4"));
         assert!(yaml.contains(r#"memory: "4GiB""#));
         assert!(yaml.contains("noble-server-cloudimg"));
-        assert!(yaml.contains("lima: shared"));
+        // user-v2 gives VM-to-VM networking with no socket_vmnet / sudo.
+        assert!(yaml.contains("lima: user-v2"));
         assert!(yaml.contains("runc"));
         // Binaries are now built locally and copied in — not downloaded.
         assert!(!yaml.contains("github.com/reliaburger"));

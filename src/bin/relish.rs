@@ -291,7 +291,7 @@ enum DevAction {
         #[arg(long, default_value = "2GiB")]
         memory: String,
         /// Cluster name.
-        #[arg(long, default_value = "default")]
+        #[arg(default_value = "default")]
         name: String,
         /// Pre-built Linux `bun` binary to install (skips the in-VM build).
         #[arg(long)]
@@ -908,8 +908,7 @@ mod tests {
     #[test]
     fn parse_dev_create_custom() {
         let cli = parse(&[
-            "relish", "dev", "create", "--nodes", "5", "--cpus", "4", "--memory", "4GiB", "--name",
-            "big",
+            "relish", "dev", "create", "big", "--nodes", "5", "--cpus", "4", "--memory", "4GiB",
         ])
         .unwrap();
         match cli.command {

@@ -264,14 +264,14 @@ Commands:
 
 ```sh
 relish dev create mycluster --nodes 3
-relish --agent http://<node-1-ip>:9117 nodes     # all three nodes
-relish --agent http://<node-1-ip>:9117 council   # council members + leader
+limactl shell reliaburger-1 relish nodes     # all three nodes
+limactl shell reliaburger-1 relish council   # council members + leader
 relish dev destroy mycluster
 ```
 
 Notes:
 
-- **Lima required** (`brew install lima`). VMs use `lima: shared` networking so they can reach each other; each node advertises its shared-network IP.
+- **Lima required** (`brew install lima`). VMs use Lima's `user-v2` network so they can reach each other with no `socket_vmnet`/sudo setup; each node advertises its inter-VM IP. That network isn't routable from the host, so run `relish nodes`/`council` *inside* a node (`limactl shell reliaburger-1 …`), where the CLI reaches the local agent on `127.0.0.1:9117`.
 - **Binaries are built from your current tree, not downloaded.** `dev create` builds `bun`/`relish` for Linux inside the persistent build VM (the same one `relish dev test` uses), so the **first `create` is slow** (a full build); later runs are incremental.
 - `--bun <path>` / `--relish <path>` install a pre-built Linux binary instead, skipping the build.
 
