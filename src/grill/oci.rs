@@ -120,8 +120,9 @@ pub struct OciMemoryResources {
 /// Generate an OCI runtime spec from a config AppSpec.
 ///
 /// Environment variables with `EnvValue::Encrypted` are passed through
-/// as the literal encrypted string. Decryption requires Sesame PKI
-/// (Phase 4).
+/// as the literal encrypted string. To decrypt them, use
+/// [`generate_oci_spec_with_decryptor`] with a `SecretDecryptor`.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_oci_spec(
     app_name: &str,
     namespace: &str,
@@ -131,7 +132,37 @@ pub fn generate_oci_spec(
     volumes_dir: Option<&Path>,
     netns_path: Option<&str>,
 ) -> OciSpec {
-    let env = build_env(spec);
+    generate_oci_spec_with_decryptor(
+        app_name,
+        namespace,
+        spec,
+        host_port,
+        cgroup_path,
+        volumes_dir,
+        netns_path,
+        None,
+    )
+}
+
+/// Generate an OCI runtime spec, decrypting `ENC[AGE:...]` env values with the
+/// supplied `decryptor` (see [`SecretDecryptor`]).
+///
+/// When `decryptor` is `None`, encrypted values are passed through unchanged —
+/// the caller is responsible for refusing to start a workload whose secrets it
+/// cannot decrypt (the agent fails such deploys closed rather than leaking
+/// ciphertext into the container environment).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_oci_spec_with_decryptor(
+    app_name: &str,
+    namespace: &str,
+    spec: &AppSpec,
+    host_port: Option<u16>,
+    cgroup_path: &str,
+    volumes_dir: Option<&Path>,
+    netns_path: Option<&str>,
+    decryptor: Option<&SecretDecryptor>,
+) -> OciSpec {
+    let env = build_env_with_decryptor(spec, decryptor);
     let args = build_args(app_name, spec);
     let mounts = build_mounts(spec, host_port, app_name, namespace, volumes_dir);
 
@@ -175,10 +206,6 @@ pub fn generate_oci_spec(
             gid_mappings: None,
         },
     }
-}
-
-fn build_env(spec: &AppSpec) -> Vec<String> {
-    build_env_with_decryptor(spec, None)
 }
 
 /// A callback for decrypting `ENC[AGE:...]` values.
@@ -589,6 +616,37 @@ mod tests {
             oci.process
                 .env
                 .contains(&"SECRET=ENC[AGE:abc123]".to_string())
+        );
+    }
+
+    #[test]
+    fn generate_with_decryptor_decrypts_env() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            [env]
+            SECRET = "ENC[AGE:abc123]"
+            PLAIN = "visible"
+            "#,
+        )
+        .unwrap();
+        let decryptor: SecretDecryptor = Box::new(|_enc: &str| Ok("plaintext".to_string()));
+        let oci = generate_oci_spec_with_decryptor(
+            "web",
+            "default",
+            &spec,
+            None,
+            "/cgroup/path",
+            None,
+            None,
+            Some(&decryptor),
+        );
+
+        assert!(oci.process.env.contains(&"SECRET=plaintext".to_string()));
+        assert!(oci.process.env.contains(&"PLAIN=visible".to_string()));
+        assert!(
+            !oci.process.env.iter().any(|e| e.contains("ENC[AGE:")),
+            "ciphertext leaked into container env"
         );
     }
 

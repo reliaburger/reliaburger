@@ -19,7 +19,7 @@ use crate::config::app::AppSpec;
 use crate::config::job::JobSpec;
 use crate::council::node::CouncilNode;
 use crate::council::types::CouncilNodeInfo;
-use crate::grill::oci::{generate_job_oci_spec, generate_oci_spec};
+use crate::grill::oci::generate_job_oci_spec;
 use crate::grill::port::PortAllocator;
 use crate::grill::state::ContainerState;
 use crate::grill::{Grill, InstanceId};
@@ -940,7 +940,22 @@ impl<G: Grill> BunAgent<G> {
                         None
                     };
 
-                    let oci_spec = crate::grill::oci::generate_oci_spec(
+                    // Fail closed on encrypted secrets we can't decrypt (see
+                    // drive_instance_startup).
+                    let identity = self.decrypt_identity(namespace).await;
+                    if identity.is_none() && spec.env.values().any(|v| v.is_encrypted()) {
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "cannot start {}: encrypted secrets require cluster security state",
+                                    new_id.0
+                                ),
+                            })
+                            .await;
+                        new_failed = true;
+                        break;
+                    }
+                    let oci_spec = Self::oci_spec_with_secrets(
                         app_name,
                         namespace,
                         spec,
@@ -949,6 +964,7 @@ impl<G: Grill> BunAgent<G> {
                             .to_string_lossy(),
                         None,
                         None,
+                        identity,
                     );
 
                     if let Err(e) = self.supervisor.grill.create(&new_id, &oci_spec).await {
@@ -1275,6 +1291,57 @@ impl<G: Grill> BunAgent<G> {
     }
 
     /// Drive a newly created instance through the startup state machine.
+    /// Resolve the age identity that decrypts `namespace`'s secrets, if the
+    /// cluster has the key material to unwrap it.
+    ///
+    /// Returns `None` in single-node mode, or before the wrapping IKM and age
+    /// keypair are loaded into the council security state. Callers must then
+    /// refuse to start any workload carrying encrypted secrets rather than leak
+    /// the ciphertext into the container environment.
+    async fn decrypt_identity(&self, namespace: &str) -> Option<age::x25519::Identity> {
+        let cluster = self.cluster.as_ref()?;
+        let ikm = cluster.wrapping_ikm?;
+        let council = cluster.council.as_ref()?;
+        let security_state = council.security_state().await;
+        let keypair = security_state
+            .namespace_age_keypair(namespace)
+            .or_else(|| security_state.cluster_age_keypair())?;
+        crate::sesame::secret::unwrap_age_identity(keypair, &ikm).ok()
+    }
+
+    /// Build an OCI spec, decrypting `ENC[AGE:...]` env values with `identity`.
+    ///
+    /// This is synchronous on purpose: the `SecretDecryptor` closure is `!Send`
+    /// and must never be held across an `.await` in the (spawned) agent task, so
+    /// it is created and consumed entirely within this call.
+    #[allow(clippy::too_many_arguments)]
+    fn oci_spec_with_secrets(
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        host_port: Option<u16>,
+        cgroup_str: &str,
+        volumes_dir: Option<&std::path::Path>,
+        netns_path: Option<&str>,
+        identity: Option<age::x25519::Identity>,
+    ) -> crate::grill::oci::OciSpec {
+        let decryptor: Option<crate::grill::oci::SecretDecryptor> = identity.map(|id| {
+            Box::new(move |encrypted: &str| {
+                crate::sesame::secret::decrypt_secret(encrypted, &id).map_err(|e| e.to_string())
+            }) as crate::grill::oci::SecretDecryptor
+        });
+        crate::grill::oci::generate_oci_spec_with_decryptor(
+            app_name,
+            namespace,
+            spec,
+            host_port,
+            cgroup_str,
+            volumes_dir,
+            netns_path,
+            decryptor.as_ref(),
+        )
+    }
+
     async fn drive_instance_startup(
         &mut self,
         instance_id: &InstanceId,
@@ -1315,7 +1382,18 @@ impl<G: Grill> BunAgent<G> {
             .netns_paths
             .get(instance_id)
             .map(|p| p.to_string_lossy().into_owned());
-        let oci_spec = generate_oci_spec(
+        // Decrypt `ENC[AGE:...]` secrets if we have the key material. If the
+        // spec carries encrypted secrets but we can't decrypt them, fail closed
+        // rather than pass ciphertext into the container environment.
+        let identity = self.decrypt_identity(namespace).await;
+        if identity.is_none() && spec.env.values().any(|v| v.is_encrypted()) {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: "encrypted secrets require cluster security state (unavailable here)"
+                    .to_string(),
+            });
+        }
+        let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
             spec,
@@ -1323,6 +1401,7 @@ impl<G: Grill> BunAgent<G> {
             &cgroup_str,
             Some(&self.volumes_dir),
             netns_path.as_deref(),
+            identity,
         );
 
         self.supervisor
@@ -2327,6 +2406,41 @@ mod tests {
         let (created, instances) = expect_complete(&events);
         assert_eq!(created, 1);
         assert_eq!(instances, &["web-0"]);
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_fails_closed_on_encrypted_secret_without_key() {
+        // Single-node agent has no cluster security state, so it cannot decrypt
+        // ENC[AGE:...] secrets. It must refuse to start the workload rather than
+        // pass ciphertext into the container environment.
+        let (mut agent, tx, shutdown) = test_agent();
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let config = Config::parse(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            [app.web.env]
+            SECRET = "ENC[AGE:abc123]"
+        "#,
+        )
+        .unwrap();
+        let events = send_deploy(&tx, config).await;
+
+        match events.last().expect("no events received") {
+            ApplyEvent::Error { message } => {
+                assert!(
+                    message.contains("encrypted secrets"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected fail-closed Error, got {other:?}"),
+        }
 
         shutdown.cancel();
         agent_handle.await.unwrap();
