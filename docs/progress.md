@@ -62,7 +62,9 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Gossip: `cluster::runtime` binds a real `UdpMustardTransport`, joins by address (no phantom members), membership converges (`tests/cluster_gossip.rs`)
 - [x] Raft council: real `serve_raft_rpc` over TCP, bootstrap, a leader-only selection loop grows the council from gossip membership (per-peer Raft address derived from each node's gossip port + offset)
 - [x] Reporting tree (flat-star MVP): every node reports state to the leader; the leader's aggregator collects the cluster view
-- [x] `relish dev create` forms a real cluster: launches `bun --cluster`, advertises each VM's shared-network IP, and builds the binaries from the current tree in the build VM (no GitHub download). The Phase 2.1 dev-cluster commands were single-node until here.
+- [x] `relish dev create` forms a real, verified cluster: launches `bun --cluster` under sudo (root for runc/netns and the log file), advertises each VM's inter-VM IP over Lima's `user-v2` network, and builds the binaries from the current tree in the build VM under `sudo -E` (no GitHub download; `--bun`/`--relish` skip the build). Verified end-to-end on a cold 3-node Lima cluster: the council elects a leader and `relish nodes`/`council` show all three members. The Phase 2.1 dev-cluster commands were single-node until here.
+- [x] Perimeter firewall fixes (both blocked any multi-node cluster, not just dev): accept loopback before the port drops — local `relish` talks to `127.0.0.1:9117` and its SYN was being dropped, which looked like an API hang; and flush the table before re-applying — `nft -f` appends, so reconciling on every membership change stacked stale boot-time rules ahead of the fresh allow-members rule
+- [x] `relish nodes` shows real council membership + leader, derived from the Raft metrics (the gossip-level `is_council`/`is_leader` flags are never set by the runtime), falling back to gossip when Raft isn't wired
 - Canonical consistent-hash reporting tree (workers → council → leader, multi-level aggregation) — follow-up
 - Durable Raft log + `wrapping_ikm` loading — follow-up
 
