@@ -203,6 +203,9 @@ async fn blob_upload_patch(
             );
             (StatusCode::ACCEPTED, headers).into_response()
         }
+        Err(super::types::PickleError::InvalidUploadId(_)) => {
+            StatusCode::BAD_REQUEST.into_response()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -228,14 +231,14 @@ async fn blob_upload_complete(
     };
 
     // If there's a body with the PUT, write it first
-    if !body.is_empty()
-        && state
-            .store
-            .write_upload_chunk(&upload_id, &body)
-            .await
-            .is_err()
-    {
-        return StatusCode::NOT_FOUND.into_response();
+    if !body.is_empty() {
+        match state.store.write_upload_chunk(&upload_id, &body).await {
+            Ok(_) => {}
+            Err(super::types::PickleError::InvalidUploadId(_)) => {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
     }
 
     match state.store.complete_upload(&upload_id, &digest).await {
@@ -254,6 +257,9 @@ async fn blob_upload_complete(
             })),
         )
             .into_response(),
+        Err(super::types::PickleError::InvalidUploadId(_)) => {
+            StatusCode::BAD_REQUEST.into_response()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
