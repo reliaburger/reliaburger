@@ -89,6 +89,13 @@ pub fn generate_ruleset(config: &PerimeterConfig, cluster_nodes: &ClusterNodes) 
     rules.push_str("    type filter hook input priority 0; policy accept;\n");
     rules.push('\n');
 
+    // Always allow loopback. Without this, the `tcp dport … drop` rules below
+    // also drop traffic to 127.0.0.1 — so `relish` on the node (which talks to
+    // the local agent on 127.0.0.1:9117) and any local health check would hang.
+    rules.push_str("    # Always allow loopback (local relish, health checks)\n");
+    rules.push_str("    iif \"lo\" accept\n");
+    rules.push('\n');
+
     // Allow cluster node IPs to reach everything (inter-node traffic)
     if !cluster_nodes.is_empty() {
         let ips: Vec<String> = cluster_nodes.iter().map(|ip| ip.to_string()).collect();
@@ -193,6 +200,20 @@ mod tests {
 
     fn cluster_with_nodes(ips: &[&str]) -> ClusterNodes {
         ips.iter().map(|s| s.parse::<IpAddr>().unwrap()).collect()
+    }
+
+    #[test]
+    fn loopback_accepted_before_port_drops() {
+        let config = default_config();
+        let nodes = ClusterNodes::new();
+        let rules = generate_ruleset(&config, &nodes);
+
+        // Loopback must be accepted, and before the management-port drop, or
+        // `relish` on the node (talking to 127.0.0.1:9117) would be dropped.
+        assert!(rules.contains("iif \"lo\" accept"));
+        let lo_pos = rules.find("iif \"lo\" accept").unwrap();
+        let drop_pos = rules.find("tcp dport 9117 drop").unwrap();
+        assert!(lo_pos < drop_pos);
     }
 
     #[test]
