@@ -228,6 +228,72 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Book chapter 11: "Eyes Everywhere"
 - [x] All Phase 11 tests green (1595 tests)
 
+## Phase 11b: Review & Tying the Loose Ends
+
+The July 2026 verification pass ([review-2026-07.md](review-2026-07.md)) found that the build
+is clean, clippy is silent, and 1590 tests pass — but a large share of the "done" items above
+are **library-only** (unit-tested, never wired into the `bun`/`relish` binaries), plus five
+critical bugs and a long tail of correctness issues in the wired paths. This phase closes them.
+IDs (`C1`, `H2`, `L7`, …) reference the finding table in the review doc. Same tests-first rule:
+each wiring item lands with an integration test that drives the **binary**, not the library.
+
+### Stage 0 — Security & data-loss stop-the-bleed
+
+- [ ] `C1` Reject `..` components in OCI whiteout unpacking (host-file deletion via malicious layer)
+- [ ] `C2` Sanitise the pickle `upload_id` path segment (arbitrary file append/exfiltration)
+- [ ] `C4` Give the perimeter firewall its own nft table (or reconcile without flushing the container table)
+- [ ] `C5(d)` Decrypt `ENC[AGE:...]` secrets in the wired container-startup path
+- [ ] Bind the Pickle registry to loopback / require auth (it listens unauthenticated on `0.0.0.0`)
+
+### Stage 1 — Correct the wired single-node path
+
+- [ ] `H1` Fix restart re-drive: stop the old container before re-create, drive all runtimes (not just ProcessGrill jobs)
+- [ ] `H2` Rolling redeploy: track new backends/health/host-port so the service isn't left with 0 backends
+- [ ] `H3` Move `FollowLogs` + per-replica deploy sleeps off the agent event loop; add an init-container timeout
+- [ ] `H13` Exit-code / `logs` / `follow_logs` / `exec` on RuncGrill and AppleContainerGrill
+- [ ] `H9` Reload Parquet on startup, stop clobbering flush files, bound in-memory batches
+- [ ] `H10` Pipe container stdout/stderr into the log store (Ketchup/LogStore currently only holds two seed lines)
+- [ ] `M9`–`M13` Crash detection for non-job apps, port release, real probe target, SIGTERM shutdown, runc `delete`/netns cleanup
+
+### Stage 2 — Cluster safety
+
+- [ ] `C3` Durable Raft log + vote; don't `initialize()` a previously-bootstrapped/non-empty node (split-brain)
+- [ ] `H4`–`H7` SWIM: correct suspect incarnation, refute `Dead`, time suspicion from state change, publish watch on state (not count)
+- [ ] `L5` / `M15` Council reconciler that can't demote the leader and can't wedge on an unreachable peer; wire the real selection algorithm
+- [ ] `M14` Return the allocated cert serial from Raft (fix the read-back race)
+
+### Stage 3 — Enforce the security that's claimed done
+
+- [ ] `C5(a)` Attach the auth middleware to the routers (and fix fail-open on empty token store)
+- [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners
+- [ ] `C5(c)` Sign + verify the gossip HMAC
+- [ ] `L18` Load SecurityState + `wrapping_ikm` from the bootstrap `relish init` writes; populate the `ApiState` `None` fields
+- [ ] `L17` Enforce CRL checks and image-signature verification (`require_signatures`)
+- [ ] `X2` / `X7` Persist `relish token create` to Raft; fix `relish secret pubkey` filename
+
+### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
+
+- [ ] `L1` Scheduler → placement → remote dispatch (deploys currently always run on the local agent); fix `H8` spread weighting
+- [ ] `L2` Production `DeployDriver` + orchestrator for rolling/blue-green
+- [ ] `L3` Spawn the autoscale loop
+- [ ] `L4` Invoke state reconstruction after leader election; consume `Correction`s
+- [ ] `L6` / `L11` Consistent-hash reporting tree + rollups (worker → council → leader, `/v1/metrics/cluster`)
+- [ ] `L7` Bind the Wrapper ingress listener (proxy, rate-limit, draining, TLS, WebSocket)
+- [ ] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility)
+- [ ] `L10` / `M2` Schedule replication + GC; share the Pickle catalog via Raft/disk
+- [ ] `L13` Spawn the Lettuce GitOps sync loop; enable the webhook endpoint; fix `H12` trusted-key check
+- [ ] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists (currently faults are only recorded)
+- [ ] `L16` Program egress allowlists
+- [ ] `M17` K8s import fidelity (`command`/`args`, `env.valueFrom`, namespace)
+- [ ] `H11` Fix `relish fmt` for nested-table configs (currently writes invalid TOML back over the file)
+- [ ] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `relish build` target/501, `rollback` no-op, `logs --grep` discarded, dry-run exit 0, no-args TUI claim
+
+### Throughout
+
+- [ ] Fix the misleading tests (`H1` restart only checks `restart_count > 0`; `L15` chaos "worker isolation" injects no fault)
+- [ ] Remove dead config or wire it (`[resources]`, `[reconstruction]`, `[gitops]`, `[process_workloads]`, node `labels`, `[storage] volumes`, most of `[images]`/`[metrics]`)
+- [ ] Clear each `[lib-only]` tag from the phases above as its subsystem is genuinely wired
+
 ## Phase 12: Optimisations
 
 - [ ] Wire `SubmitBatch` into the agent (resolve job specs → `schedule_batch` over cluster capacity → dispatch → track completion via `BatchTracker`, `/v1/batch/{id}` status)
