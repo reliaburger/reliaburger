@@ -367,7 +367,7 @@ Reliaburger gives you a real multi-node cluster with a single command:
 $ relish dev create --nodes 3
 ```
 
-This spins up 3 Ubuntu VMs (via Lima), installs rootless runc and the Reliaburger binaries, configures gossip networking and Raft consensus, and hands you a working cluster. Real VMs, real networking, real containers. You can immediately deploy apps, run chaos tests, and benchmark the scheduler.
+This spins up 3 Ubuntu VMs (via Lima), installs rootless runc, builds the Reliaburger binaries from your current source tree, configures gossip networking and Raft consensus, and hands you a working cluster. Real VMs, real networking, real containers — running the exact binary you built, so what you test locally is literally what you'd deploy. You can immediately deploy apps, run chaos tests, and benchmark the scheduler.
 
 ```bash
 $ relish --agent http://192.168.105.2:9117 nodes

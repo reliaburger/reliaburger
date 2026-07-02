@@ -213,6 +213,38 @@ Bun resolves `"api"` to its cgroup IDs and writes allow rules to the BPF map. Th
 
 The default behaviour (no `allow_from` specified) permits all apps in the same namespace to connect to each other — namespace isolation without any configuration.
 
+## The perimeter firewall
+
+The eBPF firewall polices app-to-app traffic. The *perimeter* firewall polices the host itself: it keeps the outside world away from ports that only cluster members have any business touching — the gossip/Raft/reporting ports (9443–9445), the management API (9117), and the container host-port range. It's plain nftables, no eBPF, and it's reconciled straight from gossip membership. Every known cluster node gets a blanket `accept`; those ports are `drop`ped for everyone else. Policy stays `accept`, so SSH and whatever else you run on the box is untouched.
+
+```
+table ip reliaburger {
+  chain input {
+    type filter hook input priority 0; policy accept;
+    iif "lo" accept
+    ip saddr { 10.0.1.1, 10.0.1.2 } accept   # cluster members
+    tcp dport 9443 drop
+    tcp dport 9444 drop
+    tcp dport 9117 drop
+    # ...
+  }
+}
+```
+
+That ruleset looks obvious. It took two genuinely nasty bugs to get right, and both are worth your time because they'll bite you in any firewall you ever write.
+
+**Always accept loopback first.** The first version had no `iif "lo" accept`. Everything worked in tests. Then on a real node, every `relish` command hung — `relish nodes`, `relish council`, the lot. No error, just a hang. The reason: `relish` talks to the local agent on `127.0.0.1:9117`, and the `tcp dport 9117 drop` rule doesn't care that the packet came from loopback. The source address is `127.0.0.1`, which isn't a cluster member, so the SYN was dropped on the floor. No RST, no refusal, just silence — which is exactly what a dropped packet looks like from the other end. The fix is one line, and it's the first rule in every sane firewall: accept loopback before you drop anything.
+
+**`nft -f` appends; it doesn't replace.** We reconcile the firewall every time gossip membership changes. The first cut just fed the table definition to `nft -f` each time — and discovered the hard way that feeding `table ip reliaburger { ... }` to `nft -f` *adds* those rules to the existing chain rather than replacing them. So each reconcile stacked another full copy. That would be harmless, except the very first copy was generated at boot, before gossip had found anyone, when the only "member" was the node itself. Its `drop` rules sat at the front of the chain and shadowed the later copy that actually allowed the peers. Result: a node that gossiped happily but refused every peer's Raft connection. The fix is to make the ruleset idempotent — ensure the table exists, delete it, then recreate it, all in one atomic transaction:
+
+```
+table ip reliaburger {}
+delete table ip reliaburger
+table ip reliaburger { chain input { ... } }
+```
+
+Now every reconcile leaves exactly one clean copy, no matter how many times it runs.
+
 ## Under the hood: the crypto primitives
 
 The security layer rests on a handful of cryptographic building blocks. Let's walk through them, because understanding what they do (and what they don't do) matters when you're trusting them with your cluster's secrets.

@@ -258,6 +258,23 @@ Commands:
 | `dev start` | Start a stopped dev cluster |
 | `dev destroy` | Destroy a dev cluster (delete all VMs) |
 
+### Dev cluster
+
+`relish dev create` spins up a real multi-node Reliaburger cluster in Lima VMs — gossip membership, a Raft council that elects a leader, and live state reporting — not isolated single nodes. The same `bun` binary as production runs in each VM (started with `--cluster`).
+
+```sh
+relish dev create mycluster --nodes 3
+limactl shell reliaburger-1 relish nodes     # all three nodes
+limactl shell reliaburger-1 relish council   # council members + leader
+relish dev destroy mycluster
+```
+
+Notes:
+
+- **Lima required** (`brew install lima`). VMs use Lima's `user-v2` network so they can reach each other with no `socket_vmnet`/sudo setup; each node advertises its inter-VM IP. That network isn't routable from the host, so run `relish nodes`/`council` *inside* a node (`limactl shell reliaburger-1 …`), where the CLI reaches the local agent on `127.0.0.1:9117`.
+- **Binaries are built from your current tree, not downloaded.** `dev create` builds `bun`/`relish` for Linux inside the persistent build VM (the same one `relish dev test` uses), so the **first `create` is slow** (a full build); later runs are incremental.
+- `--bun <path>` / `--relish <path>` install a pre-built Linux binary instead, skipping the build.
+
 Global flags:
 
 | Flag | Default | Description |

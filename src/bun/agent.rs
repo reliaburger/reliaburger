@@ -466,24 +466,57 @@ impl<G: Grill> BunAgent<G> {
 
     /// Get cluster node membership from gossip, or empty if single-node.
     fn get_cluster_nodes(&self) -> Vec<NodeStatus> {
-        match &self.cluster {
-            Some(handle) => {
-                let membership = handle.membership_rx.borrow();
-                membership
-                    .iter()
-                    .map(|m| NodeStatus {
-                        node_id: m.node_id.to_string(),
-                        address: m.address.to_string(),
-                        state: m.state.to_string(),
-                        incarnation: m.incarnation,
-                        is_council: m.is_council,
-                        is_leader: m.is_leader,
-                        labels: m.labels.clone(),
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
+        let Some(handle) = &self.cluster else {
+            return Vec::new();
+        };
+
+        // Cross-reference the Raft council so the COUNCIL / LEADER columns
+        // reflect actual consensus state. The gossip-level `is_council` /
+        // `is_leader` flags on the membership snapshot are never set by this
+        // runtime — council membership and leadership live in the Raft metrics.
+        // A node is a council member if it's a current voter, and the leader if
+        // it's the current Raft leader.
+        let mut council_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut leader_name: Option<String> = None;
+        if let Some(metrics_rx) = &handle.raft_metrics_rx {
+            let metrics = metrics_rx.borrow();
+            let membership = metrics.membership_config.membership();
+            council_names = membership
+                .voter_ids()
+                .filter_map(|id| membership.get_node(&id).map(|n| n.name.clone()))
+                .collect();
+            leader_name = metrics
+                .current_leader
+                .and_then(|id| membership.get_node(&id).map(|n| n.name.clone()));
         }
+
+        let have_metrics = handle.raft_metrics_rx.is_some();
+        let membership = handle.membership_rx.borrow();
+        membership
+            .iter()
+            .map(|m| {
+                let name = m.node_id.to_string();
+                // Raft metrics are authoritative when the council is wired;
+                // otherwise fall back to whatever the gossip snapshot reports.
+                let (is_council, is_leader) = if have_metrics {
+                    (
+                        council_names.contains(&name),
+                        leader_name.as_deref() == Some(name.as_str()),
+                    )
+                } else {
+                    (m.is_council, m.is_leader)
+                };
+                NodeStatus {
+                    node_id: name,
+                    address: m.address.to_string(),
+                    state: m.state.to_string(),
+                    incarnation: m.incarnation,
+                    is_council,
+                    is_leader,
+                    labels: m.labels.clone(),
+                }
+            })
+            .collect()
     }
 
     /// Get Raft council status, or default if single-node/non-council.

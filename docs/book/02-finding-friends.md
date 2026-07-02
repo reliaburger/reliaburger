@@ -1638,6 +1638,39 @@ Once promoted, Nodes 2 and 3 start their own `ReportAggregator` instances. Worke
 
 You now have a proper 3-node council. If the leader dies, Raft elects a new one within 1–2 seconds. If a council member dies, the leader promotes a replacement from the worker pool.
 
+### Trying it yourself: `relish dev create`
+
+You don't need three machines, or even three terminals, to watch this happen. On a Mac, `relish dev create` spins up a real multi-node cluster in [Lima](https://lima-vm.io) VMs:
+
+```
+$ relish dev create mycluster --nodes 3
+```
+
+It builds `bun` and `relish` for Linux from your *current* source tree (in a reusable build VM, so the first run is slow and later ones are incremental — no cross-toolchain on your Mac needed), installs them on each node, and starts every agent with `--cluster`. What you test locally is the exact binary that runs in the VMs. There's a `--bun <path>` / `--relish <path>` escape hatch if you'd rather supply a prebuilt Linux binary and skip the build.
+
+The VMs sit on Lima's `user-v2` network, which gives them VM-to-VM connectivity with no `socket_vmnet` or `sudo` dance, and each node advertises its own address on that network. That network isn't routable from the host, though, so you check on the cluster from *inside* a node, where `relish` reaches the local agent on `127.0.0.1:9117`:
+
+```
+$ limactl shell reliaburger-1 relish council
+Leader: reliaburger-1
+Term:   1
+
+RAFT_ID              NAME            ADDRESS
+2169132481472150103  reliaburger-1   192.168.104.1:9444
+2169132481472150104  reliaburger-2   192.168.104.3:9444
+2169132481472150105  reliaburger-3   192.168.104.4:9444
+
+$ limactl shell reliaburger-1 relish nodes
+NODE           ADDRESS               STATE   COUNCIL  LEADER
+reliaburger-1  192.168.104.1:9443    alive   yes      yes
+reliaburger-2  192.168.104.3:9443    alive   yes      -
+reliaburger-3  192.168.104.4:9443    alive   yes      -
+```
+
+One thing you'll notice: the council forms in seconds, not the ten minutes the eligibility walk-through above would suggest. That ten-minute `min_node_age` gate belongs to the Meat scheduler's `select_council_candidates()` — the careful, age-and-zone-aware selection meant for a production cluster that's already humming. The cluster *runtime* that `bun --cluster` actually runs uses a simpler reconciler: the leader admits every alive gossiped node, up to the council size cap, on a two-second loop. For a dev cluster you want to see form now, that's the right trade-off. Swapping in the age-gated selection is a drop-in change to the same reconcile step.
+
+When you're done, `relish dev destroy mycluster` deletes the VMs.
+
 ## Council membership changes
 
 The council isn't static. Nodes join, nodes leave, nodes crash. The council adapts.

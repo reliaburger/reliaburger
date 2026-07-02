@@ -73,9 +73,27 @@ pub type ClusterNodes = BTreeSet<IpAddr>;
 pub fn generate_ruleset(config: &PerimeterConfig, cluster_nodes: &ClusterNodes) -> String {
     let mut rules = String::new();
 
+    // Make re-application idempotent. `nft -f` *appends* to an existing table,
+    // so reconciling on every membership change would stack fresh rules behind
+    // stale ones — and the earliest copy (generated before gossip discovered
+    // the peers, when only this node's own IP was known) would drop peer
+    // traffic on the cluster ports before it ever reached the current
+    // allow-members rule. Ensure the table exists, then delete it, so each
+    // apply recreates the whole ruleset from a clean slate in one atomic
+    // transaction.
+    rules.push_str("table ip reliaburger {}\n");
+    rules.push_str("delete table ip reliaburger\n");
+
     rules.push_str("table ip reliaburger {\n");
     rules.push_str("  chain input {\n");
     rules.push_str("    type filter hook input priority 0; policy accept;\n");
+    rules.push('\n');
+
+    // Always allow loopback. Without this, the `tcp dport … drop` rules below
+    // also drop traffic to 127.0.0.1 — so `relish` on the node (which talks to
+    // the local agent on 127.0.0.1:9117) and any local health check would hang.
+    rules.push_str("    # Always allow loopback (local relish, health checks)\n");
+    rules.push_str("    iif \"lo\" accept\n");
     rules.push('\n');
 
     // Allow cluster node IPs to reach everything (inter-node traffic)
@@ -182,6 +200,36 @@ mod tests {
 
     fn cluster_with_nodes(ips: &[&str]) -> ClusterNodes {
         ips.iter().map(|s| s.parse::<IpAddr>().unwrap()).collect()
+    }
+
+    #[test]
+    fn loopback_accepted_before_port_drops() {
+        let config = default_config();
+        let nodes = ClusterNodes::new();
+        let rules = generate_ruleset(&config, &nodes);
+
+        // Loopback must be accepted, and before the management-port drop, or
+        // `relish` on the node (talking to 127.0.0.1:9117) would be dropped.
+        assert!(rules.contains("iif \"lo\" accept"));
+        let lo_pos = rules.find("iif \"lo\" accept").unwrap();
+        let drop_pos = rules.find("tcp dport 9117 drop").unwrap();
+        assert!(lo_pos < drop_pos);
+    }
+
+    #[test]
+    fn ruleset_flushes_table_before_redefining() {
+        let config = default_config();
+        let nodes = cluster_with_nodes(&["10.0.1.1"]);
+        let rules = generate_ruleset(&config, &nodes);
+
+        // The ruleset must delete the table before recreating it, so that
+        // re-applying on a membership change (nft -f appends) doesn't stack
+        // stale rules ahead of the fresh ones. The delete must come before
+        // the real chain definition.
+        assert!(rules.contains("delete table ip reliaburger"));
+        let delete_pos = rules.find("delete table ip reliaburger").unwrap();
+        let chain_pos = rules.find("chain input").unwrap();
+        assert!(delete_pos < chain_pos);
     }
 
     #[test]
