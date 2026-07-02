@@ -73,6 +73,17 @@ pub type ClusterNodes = BTreeSet<IpAddr>;
 pub fn generate_ruleset(config: &PerimeterConfig, cluster_nodes: &ClusterNodes) -> String {
     let mut rules = String::new();
 
+    // Make re-application idempotent. `nft -f` *appends* to an existing table,
+    // so reconciling on every membership change would stack fresh rules behind
+    // stale ones — and the earliest copy (generated before gossip discovered
+    // the peers, when only this node's own IP was known) would drop peer
+    // traffic on the cluster ports before it ever reached the current
+    // allow-members rule. Ensure the table exists, then delete it, so each
+    // apply recreates the whole ruleset from a clean slate in one atomic
+    // transaction.
+    rules.push_str("table ip reliaburger {}\n");
+    rules.push_str("delete table ip reliaburger\n");
+
     rules.push_str("table ip reliaburger {\n");
     rules.push_str("  chain input {\n");
     rules.push_str("    type filter hook input priority 0; policy accept;\n");
@@ -182,6 +193,22 @@ mod tests {
 
     fn cluster_with_nodes(ips: &[&str]) -> ClusterNodes {
         ips.iter().map(|s| s.parse::<IpAddr>().unwrap()).collect()
+    }
+
+    #[test]
+    fn ruleset_flushes_table_before_redefining() {
+        let config = default_config();
+        let nodes = cluster_with_nodes(&["10.0.1.1"]);
+        let rules = generate_ruleset(&config, &nodes);
+
+        // The ruleset must delete the table before recreating it, so that
+        // re-applying on a membership change (nft -f appends) doesn't stack
+        // stale rules ahead of the fresh ones. The delete must come before
+        // the real chain definition.
+        assert!(rules.contains("delete table ip reliaburger"));
+        let delete_pos = rules.find("delete table ip reliaburger").unwrap();
+        let chain_pos = rules.find("chain input").unwrap();
+        assert!(delete_pos < chain_pos);
     }
 
     #[test]
