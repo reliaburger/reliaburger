@@ -281,10 +281,15 @@ impl<T: MustardTransport> MustardNode<T> {
             self.tick_lamport();
             self.dissemination.enqueue(
                 MembershipUpdate {
-                    node_id: target_id,
+                    node_id: target_id.clone(),
                     address: target_addr,
                     state: NodeState::Suspect,
-                    incarnation: self.membership_incarnation_of(&ping.sender),
+                    // The suspicion is about `target_id`, so it must carry the
+                    // target's incarnation — not the prober's (`ping.sender` is
+                    // this node). A wrong incarnation is either discarded by
+                    // peers (detection stops propagating) or wrongly overrides
+                    // fresher Alive state.
+                    incarnation: self.membership_incarnation_of(&target_id),
                     lamport: self.lamport,
                 },
                 self.membership.len(),
@@ -644,6 +649,34 @@ mod tests {
 
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
         assert_eq!(n2_state, NodeState::Suspect);
+    }
+
+    #[tokio::test]
+    async fn disseminated_suspect_carries_target_incarnation() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        // n2 unreachable.
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        // Add n2 with a distinctive incarnation of 5.
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            5,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        node1.run_one_cycle().await;
+
+        // The disseminated Suspect update must carry n2's incarnation (5), not
+        // the prober's — otherwise peers discard it or it overrides fresh state.
+        let updates = node1.dissemination.select_updates();
+        let suspect = updates
+            .iter()
+            .find(|u| u.node_id == NodeId::new("n2") && u.state == NodeState::Suspect)
+            .expect("no Suspect update enqueued for n2");
+        assert_eq!(suspect.incarnation, 5);
     }
 
     #[tokio::test]
