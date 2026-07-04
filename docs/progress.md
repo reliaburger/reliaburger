@@ -247,13 +247,17 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 1 — Correct the wired single-node path
 
-- [ ] `H1` Fix restart re-drive: stop the old container before re-create, drive all runtimes (not just ProcessGrill jobs)
-- [ ] `H2` Rolling redeploy: track new backends/health/host-port so the service isn't left with 0 backends
-- [ ] `H3` Move `FollowLogs` + per-replica deploy sleeps off the agent event loop; add an init-container timeout
-- [ ] `H13` Exit-code / `logs` / `follow_logs` / `exec` on RuncGrill and AppleContainerGrill
-- [ ] `H9` Reload Parquet on startup, stop clobbering flush files, bound in-memory batches
-- [ ] `H10` Pipe container stdout/stderr into the log store (Ketchup/LogStore currently only holds two seed lines)
-- [ ] `M9`–`M13` Crash detection for non-job apps, port release, real probe target, SIGTERM shutdown, runc `delete`/netns cleanup
+- [x] `H1` Fix restart re-drive: stop the old container before re-create, drive all runtimes (not just ProcessGrill jobs)
+- [x] `H2` Rolling redeploy: track new backends/health/host-port so the service isn't left with 0 backends
+- [x] `H3` Move `FollowLogs` off the event loop (spawned) + init-container timeout; deploy health-gate now early-exits (full async deploy is a follow-up)
+- [x] `H13` Exit-code / `logs` / `follow_logs` / `exec` on RuncGrill (run-and-capture model) and AppleContainerGrill (`exit_code`) — runc behaviour is Linux-verified via `relish dev`
+- [x] `H9` Reload Parquet on startup, stop clobbering flush files, bound in-memory batches (Mayo + Ketchup)
+- [x] `H10` Pipe container stdout/stderr into the log store (per-instance forwarders → LogRecord channel → LogStore)
+- [x] `M9` Crash detection for non-job apps + bounded HealthWait (`HealthWait → Failed` after a startup grace)
+- [x] `M10` Release host ports on `remove_app` and redeploy rollback
+- [x] `M11` Probe the instance's `container_ip` (loopback fallback) instead of hardcoded `127.0.0.1`
+- [x] `M12` Handle SIGTERM; `shutdown_all` escalates SIGTERM → grace → SIGKILL
+- [x] `M13` runc `delete --force` + netns/veth teardown on kill and natural exit (in the `H13` commit)
 
 ### Stage 2 — Cluster safety
 
