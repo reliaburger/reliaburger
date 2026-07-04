@@ -23,7 +23,6 @@ use tokio_util::sync::CancellationToken;
 use crate::bun::agent::ClusterHandle;
 use crate::cluster::identity;
 use crate::config::node::ReportingTreeSection;
-use crate::council::log_store::MemLogStore;
 use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc};
 use crate::council::node::CouncilNode;
 use crate::council::selection::{CouncilSelectionConfig, select_council_candidates};
@@ -78,6 +77,8 @@ pub struct ClusterParams {
     pub seeds: Vec<SocketAddr>,
     /// Master secret for unwrapping CA keys during council operations.
     pub wrapping_ikm: Option<[u8; 32]>,
+    /// Node data directory; the durable Raft log/snapshot live under `{data_dir}/raft/`.
+    pub data_dir: std::path::PathBuf,
 }
 
 /// Start gossip + the Raft council and return a `ClusterHandle` plus a
@@ -122,13 +123,32 @@ pub async fn start(
     // address from its advertised gossip address (see identity::council_info).
     let port_offset = params.raft_port as i32 - params.gossip_addr.port() as i32;
 
+    // Durable Raft storage: the log/vote (log.redb) and the state-machine
+    // snapshot (snapshot.redb) live under {data_dir}/raft/ so the node
+    // remembers its vote/log across restarts (Raft safety) instead of forming a
+    // fresh cluster.
+    let raft_dir = params.data_dir.join("raft");
+    std::fs::create_dir_all(&raft_dir)?;
+    let log_store =
+        crate::council::durable_log::DurableLogStore::open(raft_dir.join("log.redb"))
+            .map_err(|e| std::io::Error::other(format!("raft log store open failed: {e}")))?;
+    // Whether this node has never persisted any Raft state — drives the
+    // bootstrap guard below.
+    let store_fresh = log_store.is_fresh().await;
+    let snapshot_db = Arc::new(
+        redb::Database::create(raft_dir.join("snapshot.redb"))
+            .map_err(|e| std::io::Error::other(format!("raft snapshot store open failed: {e}")))?,
+    );
+    let state_machine = CouncilStateMachine::with_store(snapshot_db)
+        .map_err(|e| std::io::Error::other(format!("raft snapshot store load failed: {e}")))?;
+
     let factory = TcpRaftNetworkFactory::new(raft_id);
     let council = CouncilNode::new(
         raft_id,
         CouncilConfig::default(),
         factory,
-        MemLogStore::new(),
-        CouncilStateMachine::new(),
+        log_store,
+        state_machine,
         params.wrapping_ikm,
     )
     .await
@@ -142,9 +162,12 @@ pub async fn start(
         serve_raft_rpc(raft_listener, raft, rpc_shutdown).await;
     });
 
-    // Bootstrap: the first node initialises a single-member cluster and wins
-    // the election immediately. Best-effort — if already initialised, ignore.
-    if params.seeds.is_empty() {
+    // Bootstrap ONLY a genuinely new cluster: no seeds AND a fresh durable
+    // store. A restarted seed node has a populated store, so it resumes its
+    // existing cluster from durable state instead of re-initialising into a
+    // fresh single-node cluster (which would elect itself a second leader —
+    // the split-brain bug this stage fixes).
+    if params.seeds.is_empty() && store_fresh {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
         let _ = council.initialize(members).await;

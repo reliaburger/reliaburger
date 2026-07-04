@@ -90,6 +90,7 @@ fn cluster_params_from_config(config: &NodeConfig) -> reliaburger::cluster::runt
         // TODO(cluster): load the master secret from the security bootstrap
         // so council CA operations work; None still forms the cluster.
         wrapping_ikm: None,
+        data_dir: config.storage.data.clone(),
     }
 }
 

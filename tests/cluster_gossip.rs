@@ -63,6 +63,11 @@ async fn start_node(
     seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
 ) -> (ClusterHandle, ClusterRuntime) {
+    // A fresh, unique data dir per node so the durable Raft store starts empty
+    // (stale state from a prior run would suppress the bootstrap).
+    let data_dir = std::env::temp_dir().join(format!("rb-cluster-test-{name}-{gossip_port}"));
+    let _ = std::fs::remove_dir_all(&data_dir);
+
     let (mut handle, runtime) = runtime::start(
         ClusterParams {
             node_name: name.into(),
@@ -76,6 +81,7 @@ async fn start_node(
             },
             seeds,
             wrapping_ikm: None,
+            data_dir,
         },
         shutdown.clone(),
     )
