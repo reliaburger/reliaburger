@@ -21,11 +21,19 @@ use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
 /// Entry for a runc-managed container.
+///
+/// We drive containers with `runc run` (foreground: create + start + wait +
+/// delete) rather than detached `runc create`/`start`, so the child process's
+/// exit status *is* the container's exit code — the only way to get it from the
+/// runc CLI. stdout/stderr are redirected to `log_path` for `logs`/`follow_logs`.
 struct RuncEntry {
-    #[allow(dead_code)]
     bundle_dir: PathBuf,
-    #[allow(dead_code)]
-    spec: OciSpec,
+    /// File the container's stdout+stderr are redirected to.
+    log_path: PathBuf,
+    /// The `runc run` child, once started.
+    child: Option<tokio::process::Child>,
+    state: ContainerState,
+    exit_code: Option<i32>,
 }
 
 /// Runc-based Grill implementation.
@@ -104,6 +112,40 @@ impl RuncGrill {
 
         Ok(output)
     }
+
+    /// Release a container's resources: force-delete any lingering runc state
+    /// and tear down its network namespace + veth pair. Best-effort — safe to
+    /// call more than once. `runc run` auto-deletes on exit, so the delete is a
+    /// backstop; the netns teardown is the part that actually prevents leaks.
+    async fn cleanup(&self, instance: &InstanceId) {
+        let _ = self
+            .runc_command(&["delete", "--force", &instance.0], instance)
+            .await;
+        if let Some(network) = self.networks.lock().await.remove(instance)
+            && let Err(e) = netns::teardown_container_network(&network).await
+        {
+            eprintln!("warning: network teardown failed for {instance}: {e}");
+        }
+    }
+}
+
+/// Read the bytes of `path` from `offset` to end. Returns an empty vec if the
+/// file is shorter than `offset` or doesn't exist yet.
+async fn read_from_offset(path: &std::path::Path, offset: u64) -> std::io::Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata().await?.len();
+    if offset >= len {
+        return Ok(Vec::new());
+    }
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut buf = Vec::with_capacity((len - offset) as usize);
+    file.read_to_end(&mut buf).await?;
+    Ok(buf)
 }
 
 impl super::Grill for RuncGrill {
@@ -209,26 +251,18 @@ impl super::Grill for RuncGrill {
                 reason: format!("failed to write config.json: {e}"),
             })?;
 
-        // Call runc create
-        let bundle_str = bundle_dir.to_string_lossy().to_string();
-        let output = self
-            .runc_command(&["create", "--bundle", &bundle_str, &instance.0], instance)
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("runc create failed: {stderr}"),
-            });
-        }
-
+        // Bundle is prepared; the container is created and started together by
+        // `runc run` in `start()`. Record the entry as Pending.
+        let log_path = bundle_dir.join("output.log");
         let mut entries = self.entries.lock().await;
         entries.insert(
             instance.clone(),
             RuncEntry {
                 bundle_dir,
-                spec: spec.clone(),
+                log_path,
+                child: None,
+                state: ContainerState::Pending,
+                exit_code: None,
             },
         );
 
@@ -236,83 +270,236 @@ impl super::Grill for RuncGrill {
     }
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = self.runc_command(&["start", &instance.0], instance).await?;
+        let mut entries = self.entries.lock().await;
+        let entry = entries
+            .get_mut(instance)
+            .ok_or_else(|| GrillError::NotFound {
+                instance: instance.clone(),
+            })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if entry.child.is_some() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
-                reason: format!("runc start failed: {stderr}"),
+                reason: "already started".to_string(),
             });
         }
 
+        // Redirect the container's stdout+stderr to the per-instance log file.
+        let log_file =
+            std::fs::File::create(&entry.log_path).map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to create log file: {e}"),
+            })?;
+        let log_file_err = log_file.try_clone().map_err(|e| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("failed to clone log file handle: {e}"),
+        })?;
+
+        // `runc run` = create + start + wait; its exit status is the
+        // container's exit code.
+        let state_dir_str = self.state_dir.to_string_lossy().to_string();
+        let bundle_str = entry.bundle_dir.to_string_lossy().to_string();
+        let child = tokio::process::Command::new("runc")
+            .args([
+                "--root",
+                &state_dir_str,
+                "run",
+                "--bundle",
+                &bundle_str,
+                &instance.0,
+            ])
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(log_file_err))
+            .spawn()
+            .map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to spawn runc run: {e}"),
+            })?;
+
+        entry.child = Some(child);
+        entry.state = ContainerState::Running;
         Ok(())
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = self
+        // Best-effort graceful signal; the container exits and `runc run`
+        // returns, which `state()` observes.
+        let _ = self
             .runc_command(&["kill", &instance.0, "SIGTERM"], instance)
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("runc kill SIGTERM failed: {stderr}"),
-            });
+            .await;
+        if let Some(entry) = self.entries.lock().await.get_mut(instance) {
+            entry.state = ContainerState::Stopping;
         }
-
         Ok(())
     }
 
     async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = self
+        let _ = self
             .runc_command(&["kill", &instance.0, "SIGKILL"], instance)
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("runc kill SIGKILL failed: {stderr}"),
-            });
-        }
-
-        // Tear down per-container networking
-        if let Some(network) = self.networks.lock().await.remove(instance)
-            && let Err(e) = netns::teardown_container_network(&network).await
+            .await;
+        // Also kill the `runc run` process in case the container is unresponsive.
+        if let Some(entry) = self.entries.lock().await.get_mut(instance)
+            && let Some(ref mut child) = entry.child
         {
-            eprintln!("warning: network teardown failed for {instance}: {e}");
+            let _ = child.kill().await;
         }
-
+        self.cleanup(instance).await;
+        if let Some(entry) = self.entries.lock().await.get_mut(instance) {
+            entry.state = ContainerState::Stopped;
+        }
         Ok(())
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
-        let output = self.runc_command(&["state", &instance.0], instance).await?;
+        let (result_state, just_exited) = {
+            let mut entries = self.entries.lock().await;
+            let entry = entries
+                .get_mut(instance)
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
 
-        if !output.status.success() {
-            return Err(GrillError::NotFound {
+            let mut just_exited = false;
+            if let Some(ref mut child) = entry.child {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        just_exited = entry.state != ContainerState::Stopped;
+                        entry.state = ContainerState::Stopped;
+                        entry.exit_code = status.code();
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        just_exited = entry.state != ContainerState::Stopped;
+                        entry.state = ContainerState::Stopped;
+                    }
+                }
+            }
+            (entry.state, just_exited)
+        };
+
+        // Tear down the netns for a naturally-exited container (lock released).
+        if just_exited
+            && let Some(network) = self.networks.lock().await.remove(instance)
+            && let Err(e) = netns::teardown_container_network(&network).await
+        {
+            eprintln!("warning: network teardown failed for {instance}: {e}");
+        }
+        Ok(result_state)
+    }
+
+    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        let mut entries = self.entries.lock().await;
+        let entry = entries.get_mut(instance)?;
+        // Reap the child so the exit code is captured even if state() wasn't
+        // polled since exit.
+        if let Some(ref mut child) = entry.child
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            entry.state = ContainerState::Stopped;
+            entry.exit_code = status.code();
+        }
+        entry.exit_code
+    }
+
+    async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        let log_path = {
+            let entries = self.entries.lock().await;
+            entries
+                .get(instance)
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?
+                .log_path
+                .clone()
+        };
+        match tokio::fs::read(&log_path).await {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            // No output yet is not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(GrillError::StartFailed {
                 instance: instance.clone(),
+                reason: format!("failed to read logs: {e}"),
+            }),
+        }
+    }
+
+    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        if command.is_empty() {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "no command specified".to_string(),
             });
         }
+        let mut args = vec!["exec", &instance.0, "--"];
+        for part in command {
+            args.push(part.as_str());
+        }
+        let output = self.runc_command(&args, instance).await?;
+        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+        Ok(result)
+    }
 
-        let state_json: serde_json::Value =
-            serde_json::from_slice(&output.stdout).map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to parse runc state: {e}"),
-            })?;
+    async fn follow_logs(
+        &self,
+        instance: &InstanceId,
+        lines_tx: tokio::sync::mpsc::Sender<String>,
+    ) {
+        let log_path = {
+            let entries = self.entries.lock().await;
+            match entries.get(instance) {
+                Some(entry) => entry.log_path.clone(),
+                None => return,
+            }
+        };
 
-        let status = state_json["status"].as_str().unwrap_or("unknown");
+        let mut offset = 0u64;
+        let mut partial_line = String::new();
+        loop {
+            if let Ok(bytes) = read_from_offset(&log_path, offset).await
+                && !bytes.is_empty()
+            {
+                offset += bytes.len() as u64;
+                partial_line.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(pos) = partial_line.find('\n') {
+                    let line = partial_line[..pos].to_string();
+                    partial_line = partial_line[pos + 1..].to_string();
+                    if lines_tx.send(line).await.is_err() {
+                        return;
+                    }
+                }
+            }
 
-        match status {
-            "created" => Ok(ContainerState::Pending),
-            "running" => Ok(ContainerState::Running),
-            "stopped" => Ok(ContainerState::Stopped),
-            other => Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("unknown runc state: {other}"),
-            }),
+            // Stop once the container has exited and the file is fully read.
+            let exited = {
+                let entries = self.entries.lock().await;
+                match entries.get(instance) {
+                    Some(entry) => matches!(
+                        entry.state,
+                        ContainerState::Stopped | ContainerState::Stopping
+                    ),
+                    None => return,
+                }
+            };
+            if exited
+                && read_from_offset(&log_path, offset)
+                    .await
+                    .map(|b| b.is_empty())
+                    .unwrap_or(true)
+            {
+                if !partial_line.is_empty() {
+                    let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
+                }
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 }
@@ -334,6 +521,29 @@ mod tests {
 
     fn runc_tests_enabled() -> bool {
         std::env::var("RELIABURGER_RUNC_TESTS").is_ok()
+    }
+
+    // Runtime-agnostic: exercises the log-tailing primitive used by
+    // `logs`/`follow_logs` without needing runc.
+    #[tokio::test]
+    async fn read_from_offset_tails_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("output.log");
+
+        // Missing file reads as empty, not an error.
+        assert!(read_from_offset(&path, 0).await.unwrap().is_empty());
+
+        std::fs::write(&path, b"line one\n").unwrap();
+        let first = read_from_offset(&path, 0).await.unwrap();
+        assert_eq!(first, b"line one\n");
+
+        // Reading from the end yields nothing until more is appended.
+        let offset = first.len() as u64;
+        assert!(read_from_offset(&path, offset).await.unwrap().is_empty());
+
+        std::fs::write(&path, b"line one\nline two\n").unwrap();
+        let second = read_from_offset(&path, offset).await.unwrap();
+        assert_eq!(second, b"line two\n");
     }
 
     #[tokio::test]

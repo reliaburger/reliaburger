@@ -317,6 +317,22 @@ impl super::Grill for AppleContainerGrill {
             }),
         }
     }
+
+    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        let output = Self::container_command(&["inspect", &instance.0], instance)
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        // Try the common inspect JSON paths for the exit code.
+        inspect["State"]["ExitCode"]
+            .as_i64()
+            .or_else(|| inspect["state"]["exitCode"].as_i64())
+            .or_else(|| inspect["ExitCode"].as_i64())
+            .map(|code| code as i32)
+    }
 }
 
 #[cfg(test)]
