@@ -53,9 +53,9 @@ pub struct MustardNode<T: MustardTransport> {
     /// Optional watch channel for publishing membership snapshots.
     /// Set when running inside the agent, None in standalone tests.
     membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
-    /// Membership size at last publish. Used to avoid redundant publishes
-    /// when nothing changed.
-    last_published_member_count: usize,
+    /// Digest of the last-published membership. Used to publish on any content
+    /// change (state/incarnation/council/leader), not just a count change.
+    last_published_digest: Vec<(NodeId, NodeState, u64, bool, bool)>,
     /// Seed addresses to (re-)contact while this node has no live peers.
     /// Used to bootstrap a join by address without inserting a placeholder
     /// member: we ping the seed, and learn its real identity from the reply.
@@ -82,7 +82,7 @@ impl<T: MustardTransport> MustardNode<T> {
             transport,
             lamport: 0,
             membership_watch: None,
-            last_published_member_count: 0,
+            last_published_digest: Vec::new(),
             seeds: Vec::new(),
         }
     }
@@ -119,14 +119,29 @@ impl<T: MustardTransport> MustardNode<T> {
         self.membership_watch = Some(tx);
     }
 
-    /// Publish the current membership to the watch channel if it changed.
+    /// Publish the current membership to the watch channel if its *content*
+    /// changed. Comparing a digest (not just the member count) means state
+    /// transitions like Alive→Suspect — which keep the count constant until the
+    /// reap — are published promptly to the council reconciler and `relish nodes`.
     fn publish_membership(&mut self) {
-        let current_count = self.membership.len();
-        if current_count != self.last_published_member_count {
+        let snapshot = self.membership.snapshot();
+        let digest: Vec<(NodeId, NodeState, u64, bool, bool)> = snapshot
+            .iter()
+            .map(|m| {
+                (
+                    m.node_id.clone(),
+                    m.state,
+                    m.incarnation,
+                    m.is_council,
+                    m.is_leader,
+                )
+            })
+            .collect();
+        if digest != self.last_published_digest {
             if let Some(tx) = &self.membership_watch {
-                let _ = tx.send(self.membership.snapshot());
+                let _ = tx.send(snapshot);
             }
-            self.last_published_member_count = current_count;
+            self.last_published_digest = digest;
         }
     }
 
@@ -281,10 +296,15 @@ impl<T: MustardTransport> MustardNode<T> {
             self.tick_lamport();
             self.dissemination.enqueue(
                 MembershipUpdate {
-                    node_id: target_id,
+                    node_id: target_id.clone(),
                     address: target_addr,
                     state: NodeState::Suspect,
-                    incarnation: self.membership_incarnation_of(&ping.sender),
+                    // The suspicion is about `target_id`, so it must carry the
+                    // target's incarnation — not the prober's (`ping.sender` is
+                    // this node). A wrong incarnation is either discarded by
+                    // peers (detection stops propagating) or wrongly overrides
+                    // fresher Alive state.
+                    incarnation: self.membership_incarnation_of(&target_id),
                     lamport: self.lamport,
                 },
                 self.membership.len(),
@@ -329,8 +349,14 @@ impl<T: MustardTransport> MustardNode<T> {
                     .enqueue(update.clone(), self.membership.len());
             }
 
-            // If we're being suspected, refute it
-            if update.node_id == self.node_id && update.state == NodeState::Suspect {
+            // If we're being suspected *or* declared dead, refute it. Refuting
+            // Dead matters as much as Suspect: without it a false Dead about us
+            // is unrecoverable until the 60s reap (we'd be invisible to
+            // scheduling and the council the whole time). A higher incarnation
+            // resurrects us — see `resolve_conflict`.
+            if update.node_id == self.node_id
+                && matches!(update.state, NodeState::Suspect | NodeState::Dead)
+            {
                 self.refute();
             }
         }
@@ -426,9 +452,13 @@ impl<T: MustardTransport> MustardNode<T> {
         let mut newly_dead = Vec::new();
 
         for member in self.membership.iter() {
+            // Measure from when suspicion *started* (`state_changed`), not from
+            // the last ACK. For a gossip-learned peer `last_ack` can be
+            // arbitrarily stale, which would promote it to Dead on the first
+            // failed probe — skipping the refutation window entirely.
             if member.state == NodeState::Suspect
                 && member.node_id != self.node_id
-                && now.duration_since(member.last_ack) > timeout
+                && now.duration_since(member.state_changed) > timeout
             {
                 newly_dead.push((member.node_id.clone(), member.address));
             }
@@ -647,6 +677,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disseminated_suspect_carries_target_incarnation() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        // n2 unreachable.
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        // Add n2 with a distinctive incarnation of 5.
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            5,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        node1.run_one_cycle().await;
+
+        // The disseminated Suspect update must carry n2's incarnation (5), not
+        // the prober's — otherwise peers discard it or it overrides fresh state.
+        let updates = node1.dissemination.select_updates();
+        let suspect = updates
+            .iter()
+            .find(|u| u.node_id == NodeId::new("n2") && u.state == NodeState::Suspect)
+            .expect("no Suspect update enqueued for n2");
+        assert_eq!(suspect.incarnation, 5);
+    }
+
+    #[tokio::test]
+    async fn membership_watch_publishes_state_transitions() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+
+        let (tx, rx) = tokio::sync::watch::channel(Vec::new());
+        node1.set_membership_watch(tx);
+
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node1.publish_membership();
+        assert!(
+            rx.borrow()
+                .iter()
+                .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Alive)
+        );
+
+        // Suspect n2 — the active-member count is unchanged, but the watch must
+        // still see the transition (the whole point of H7).
+        node1.membership.suspect(&NodeId::new("n2"));
+        node1.publish_membership();
+        assert!(
+            rx.borrow()
+                .iter()
+                .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Suspect),
+            "state transition not published without a count change"
+        );
+    }
+
+    #[tokio::test]
     async fn suspect_node_promoted_to_dead_after_timeout() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
@@ -656,18 +749,17 @@ mod tests {
 
         let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), config, t1);
 
-        // Add n2 and immediately suspect it
+        // Add n2 and suspect it (suspect() sets state_changed to now).
         node1.membership.add_node(
             NodeId::new("n2"),
             addr(2),
             1,
             BTreeMap::new(),
-            // last_ack far in the past
-            Instant::now() - Duration::from_secs(10),
+            Instant::now(),
         );
         node1.membership.suspect(&NodeId::new("n2"));
 
-        // Wait for suspicion timeout to elapse
+        // Wait for the suspicion timeout (measured from state_changed) to elapse.
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         // Run a cycle — should promote n2 to Dead
@@ -675,6 +767,33 @@ mod tests {
 
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
         assert_eq!(n2_state, NodeState::Dead);
+    }
+
+    #[tokio::test]
+    async fn fresh_suspect_not_promoted_despite_stale_ack() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+
+        let mut config = fast_config();
+        config.suspicion_timeout = Duration::from_millis(50);
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), config, t1);
+
+        // n2's last ACK is ancient, but it was only *just* suspected. The
+        // suspicion timer must run from suspicion start, not last_ack — so it
+        // stays Suspect (gets its refutation window), not immediately Dead.
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now() - Duration::from_secs(10),
+        );
+        node1.membership.suspect(&NodeId::new("n2"));
+
+        node1.run_one_cycle().await;
+
+        let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
+        assert_eq!(n2_state, NodeState::Suspect);
     }
 
     #[tokio::test]
@@ -713,6 +832,38 @@ mod tests {
         // Alive update was already sent in the ACK.
 
         drop(t1); // suppress unused warning
+    }
+
+    #[tokio::test]
+    async fn dead_refutation_bumps_incarnation() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        assert_eq!(node2.incarnation, 1);
+
+        // A gossip message that falsely declares us Dead.
+        let dead_msg = GossipMessage::new(
+            NodeId::new("n1"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n2"),
+                    address: addr(2),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                    lamport: 1,
+                }],
+            },
+        );
+
+        node2.handle_message(addr(1), dead_msg).await;
+
+        // We must refute a false Dead (not just Suspect) by bumping incarnation.
+        assert_eq!(node2.incarnation, 2);
+
+        drop(t1);
     }
 
     #[tokio::test]

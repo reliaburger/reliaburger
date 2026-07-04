@@ -12,10 +12,10 @@
 //! multi-level aggregation) is a follow-up; it can replace the star without
 //! changing this interface.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +26,7 @@ use crate::config::node::ReportingTreeSection;
 use crate::council::log_store::MemLogStore;
 use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc};
 use crate::council::node::CouncilNode;
+use crate::council::selection::{CouncilSelectionConfig, select_council_candidates};
 use crate::council::state_machine::CouncilStateMachine;
 use crate::council::types::{CouncilConfig, CouncilNodeInfo};
 use crate::meat::types::NodeId;
@@ -44,6 +45,11 @@ const MAX_COUNCIL_SIZE: usize = 7;
 
 /// How often the leader reconciles the council against gossip membership.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Upper bound on a single reconciler membership operation. A peer whose Raft
+/// port is unreachable must not block the reconciler forever — on timeout we
+/// log and retry on the next tick.
+const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Owns resources that must outlive `start()` for the cluster to keep
 /// working, and exposes the local reporting aggregator's view. The spawned
@@ -259,6 +265,59 @@ fn spawn_leader_target_maintainer(
 /// voter set in line with gossip membership (self + alive nodes, capped).
 /// No-ops on followers and when nothing has changed, so it's safe to run on
 /// every node.
+/// Compute the desired council voter set from the current voters and gossip
+/// membership.
+///
+/// Current voters are ALWAYS retained (the leader is never demoted — the L5
+/// bug), and `select_council_candidates` grows the set toward the cap by zone
+/// diversity and node age. Returns the desired voter ids and the members that
+/// still need to be added as learners.
+#[allow(clippy::too_many_arguments)]
+fn compute_desired_council(
+    current: &BTreeSet<u64>,
+    snapshot: &[MembershipSnapshot],
+    self_id: u64,
+    self_info: &CouncilNodeInfo,
+    port_offset: i32,
+    config: &CouncilSelectionConfig,
+    now: Instant,
+) -> (BTreeSet<u64>, Vec<(u64, CouncilNodeInfo)>) {
+    // Map each raft id to its gossip node id + derived raft info.
+    let mut by_raft: HashMap<u64, (NodeId, CouncilNodeInfo)> = HashMap::new();
+    by_raft.insert(
+        self_id,
+        (NodeId::new(self_info.name.clone()), self_info.clone()),
+    );
+    for member in snapshot {
+        if member.state != NodeState::Alive {
+            continue;
+        }
+        let (rid, info) = identity::council_info(member, port_offset);
+        by_raft
+            .entry(rid)
+            .or_insert_with(|| (member.node_id.clone(), info));
+    }
+
+    let current_nodeids: Vec<NodeId> = current
+        .iter()
+        .filter_map(|rid| by_raft.get(rid).map(|(nid, _)| nid.clone()))
+        .collect();
+    let selected =
+        select_council_candidates(snapshot, &current_nodeids, MAX_COUNCIL_SIZE, config, now);
+
+    let mut desired_ids = current.clone();
+    let mut to_add: Vec<(u64, CouncilNodeInfo)> = Vec::new();
+    for nid in &selected {
+        let rid = identity::raft_id_from_name(&nid.0);
+        if let Some((_, info)) = by_raft.get(&rid)
+            && desired_ids.insert(rid)
+        {
+            to_add.push((rid, info.clone()));
+        }
+    }
+    (desired_ids, to_add)
+}
+
 fn spawn_council_reconciler(
     council: Arc<CouncilNode>,
     membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
@@ -267,6 +326,13 @@ fn spawn_council_reconciler(
     self_info: CouncilNodeInfo,
     shutdown: CancellationToken,
 ) {
+    // Council selection config for the reconciler. min_node_age is 0 so a fresh
+    // cluster can form a council immediately; age still affects *ordering*
+    // (older nodes preferred), just not eligibility.
+    let selection_config = CouncilSelectionConfig {
+        min_node_age: Duration::from_secs(0),
+        ..Default::default()
+    };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
@@ -277,24 +343,7 @@ fn spawn_council_reconciler(
                         continue;
                     }
 
-                    // Desired voters: self plus every alive gossiped node,
-                    // each at its OWN derived Raft address, ordered by raft
-                    // id and capped.
                     let snapshot = membership_rx.borrow().clone();
-                    let mut desired: Vec<(u64, CouncilNodeInfo)> = vec![(self_id, self_info.clone())];
-                    for member in &snapshot {
-                        if member.state != NodeState::Alive {
-                            continue;
-                        }
-                        let (id, info) = identity::council_info(member, port_offset);
-                        if id != self_id && !desired.iter().any(|(d, _)| *d == id) {
-                            desired.push((id, info));
-                        }
-                    }
-                    desired.sort_by_key(|(id, _)| *id);
-                    desired.truncate(MAX_COUNCIL_SIZE);
-                    let desired_ids: BTreeSet<u64> =
-                        desired.iter().map(|(id, _)| *id).collect();
 
                     let current: BTreeSet<u64> = council
                         .metrics()
@@ -304,20 +353,149 @@ fn spawn_council_reconciler(
                         .voter_ids()
                         .collect();
 
+                    let (desired_ids, desired) = compute_desired_council(
+                        &current,
+                        &snapshot,
+                        self_id,
+                        &self_info,
+                        port_offset,
+                        &selection_config,
+                        Instant::now(),
+                    );
+
                     if desired_ids == current {
                         continue;
                     }
 
-                    // Add any new members as learners (blocking until they
-                    // catch up), then promote the whole set to voters.
+                    // Add any new members as learners, then promote the whole
+                    // set to voters. Each op is bounded by a timeout and its
+                    // error is logged (not discarded) so an unreachable peer
+                    // can't wedge the reconciler — it simply retries next tick.
                     for (id, info) in &desired {
                         if !current.contains(id) {
-                            let _ = council.add_learner(*id, info.clone()).await;
+                            match tokio::time::timeout(
+                                RECONCILE_OP_TIMEOUT,
+                                council.add_learner(*id, info.clone()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    eprintln!("council reconciler: add_learner({id}) failed: {e}");
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "council reconciler: add_learner({id}) timed out; will retry"
+                                    );
+                                }
+                            }
                         }
                     }
-                    let _ = council.change_membership(desired_ids).await;
+                    match tokio::time::timeout(
+                        RECONCILE_OP_TIMEOUT,
+                        council.change_membership(desired_ids),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            eprintln!("council reconciler: change_membership failed: {e}");
+                        }
+                        Err(_) => {
+                            eprintln!("council reconciler: change_membership timed out; will retry");
+                        }
+                    }
                 }
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::cluster::identity::raft_id_from_name;
+    use crate::mustard::state::NodeState;
+
+    fn snap(name: &str, port: u16, now: Instant) -> MembershipSnapshot {
+        MembershipSnapshot {
+            node_id: NodeId::new(name),
+            address: format!("127.0.0.1:{port}").parse().unwrap(),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: BTreeMap::new(),
+            first_seen: now,
+            resources: None,
+        }
+    }
+
+    fn info(name: &str, port: u16) -> CouncilNodeInfo {
+        CouncilNodeInfo {
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn compute_desired_retains_leader_and_grows() {
+        let now = Instant::now();
+        let self_info = info("leader", 9444);
+        let self_id = raft_id_from_name("leader");
+        // The leader is the only current voter.
+        let current = BTreeSet::from([self_id]);
+
+        // Gossip: leader + two alive peers.
+        let snapshot = vec![
+            snap("leader", 9443, now),
+            snap("peer-a", 9445, now),
+            snap("peer-b", 9447, now),
+        ];
+        let config = CouncilSelectionConfig {
+            min_node_age: Duration::from_secs(0),
+            ..Default::default()
+        };
+
+        let (desired, to_add) =
+            compute_desired_council(&current, &snapshot, self_id, &self_info, 1, &config, now);
+
+        // Leader-safety invariant: every current voter is still desired.
+        assert!(
+            current.is_subset(&desired),
+            "the leader must never be demoted"
+        );
+        // And the council grew to the minimum size using the peers.
+        assert_eq!(desired.len(), 3);
+        assert!(to_add.iter().all(|(rid, _)| *rid != self_id));
+    }
+
+    #[test]
+    fn compute_desired_noop_when_already_at_target() {
+        let now = Instant::now();
+        let self_info = info("leader", 9444);
+        let self_id = raft_id_from_name("leader");
+        let a = raft_id_from_name("peer-a");
+        let b = raft_id_from_name("peer-b");
+        let current = BTreeSet::from([self_id, a, b]);
+
+        let snapshot = vec![
+            snap("leader", 9443, now),
+            snap("peer-a", 9445, now),
+            snap("peer-b", 9447, now),
+        ];
+        let config = CouncilSelectionConfig {
+            min_node_age: Duration::from_secs(0),
+            ..Default::default()
+        };
+
+        let (desired, to_add) =
+            compute_desired_council(&current, &snapshot, self_id, &self_info, 1, &config, now);
+
+        // Already at the minimum council size with these three — nothing to add.
+        assert_eq!(desired, current);
+        assert!(to_add.is_empty());
+    }
 }

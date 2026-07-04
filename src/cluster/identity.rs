@@ -67,6 +67,8 @@ mod tests {
             is_council: false,
             is_leader: false,
             labels: BTreeMap::new(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
         };
         // Offset of 1 (gossip 9443 -> raft 9444), derived from the peer's
         // own gossip port.
@@ -92,6 +94,8 @@ mod tests {
             is_council: false,
             is_leader: false,
             labels: BTreeMap::new(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
         };
         let (_, a) = council_info(&mk(17541, "c1"), 1);
         let (_, b) = council_info(&mk(17543, "c2"), 1);

@@ -261,10 +261,14 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 2 — Cluster safety
 
-- [ ] `C3` Durable Raft log + vote; don't `initialize()` a previously-bootstrapped/non-empty node (split-brain)
-- [ ] `H4`–`H7` SWIM: correct suspect incarnation, refute `Dead`, time suspicion from state change, publish watch on state (not count)
-- [ ] `L5` / `M15` Council reconciler that can't demote the leader and can't wedge on an unreachable peer; wire the real selection algorithm
-- [ ] `M14` Return the allocated cert serial from Raft (fix the read-back race)
+- [ ] `C3` Durable Raft log + vote; don't `initialize()` a previously-bootstrapped/non-empty node (split-brain) — **its own next stage (redb-backed, needs Lima restart-testing)**
+- [x] `H4` SWIM: disseminate Suspect with the target's incarnation (not the prober's)
+- [x] `H5` SWIM: refute being declared `Dead`, not just `Suspect`
+- [x] `H6` SWIM: time suspicion from `state_changed`, not `last_ack`
+- [x] `H7` SWIM: publish the membership watch on content change, not just member count
+- [x] `M14` Return the allocated cert serial via `CouncilResponse::SerialAllocated` (fixes the read-back race)
+- [x] `M15` Council reconciler can't wedge — non-blocking membership ops with timeouts + logged errors
+- [x] `L5` Leader-safe, zone/age-aware council selection — reconciler retains current voters (never demotes the leader) and grows via `select_council_candidates`. **Live cluster-formation behaviour needs Lima verification**; resource-aware filtering awaits the reporting tree carrying real usage.
 
 ### Stage 3 — Enforce the security that's claimed done
 

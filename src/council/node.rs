@@ -249,10 +249,19 @@ impl CouncilNode {
         ca_params.distinguished_name = dn;
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
 
-        // Allocate serial via Raft
-        self.write(RaftRequest::AllocateSerial).await?;
+        // Allocate serial via Raft, reading the assigned value straight from the
+        // write response so concurrent signings never derive the same serial.
+        let serial = match self.write(RaftRequest::AllocateSerial).await? {
+            crate::council::types::CouncilResponse::SerialAllocated { serial } => {
+                SerialNumber(serial)
+            }
+            other => {
+                return Err(CouncilError::SecurityError(format!(
+                    "AllocateSerial returned unexpected response: {other:?}"
+                )));
+            }
+        };
         let state_after = self.security_state().await;
-        let serial = SerialNumber(state_after.next_serial.saturating_sub(1));
 
         // Sign the CSR
         let cert_der = crate::sesame::identity::validate_and_sign_csr(

@@ -311,6 +311,13 @@ pub struct MembershipSnapshot {
     pub is_council: bool,
     pub is_leader: bool,
     pub labels: BTreeMap<String, String>,
+    /// This node's local view of when it first saw the member (for the council
+    /// selection algorithm's age scoring).
+    pub first_seen: Instant,
+    /// Latest reported resource usage, if any. Currently unpopulated for
+    /// remote peers (gossip carries no resources yet), so selection treats
+    /// `None` as eligible.
+    pub resources: Option<ResourceSummary>,
 }
 
 impl MembershipTable {
@@ -326,6 +333,8 @@ impl MembershipTable {
                 is_council: m.is_council,
                 is_leader: m.is_leader,
                 labels: m.labels.clone(),
+                first_seen: m.first_seen,
+                resources: m.resources.clone(),
             })
             .collect()
     }

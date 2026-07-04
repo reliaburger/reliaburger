@@ -27,7 +27,9 @@ struct StateMachineInner {
 }
 
 impl StateMachineInner {
-    fn apply_request(&mut self, request: &RaftRequest) {
+    /// Apply a request. Returns the allocated serial for `AllocateSerial`
+    /// (so the caller gets *its* value, not a racy read-back), `None` otherwise.
+    fn apply_request(&mut self, request: &RaftRequest) -> Option<u64> {
         match request {
             RaftRequest::AppSpec { app_id, spec } => {
                 self.state.apps.insert(app_id.clone(), *spec.clone());
@@ -141,7 +143,10 @@ impl StateMachineInner {
                     .retain(|t| t.name != *name);
             }
             RaftRequest::AllocateSerial => {
+                // Return the pre-increment value as this entry's serial.
+                let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
+                return Some(serial);
             }
             RaftRequest::RotateSecretKey { scope, new_keypair } => {
                 // Mark existing keypairs with the same scope as read-only
@@ -170,6 +175,7 @@ impl StateMachineInner {
             }
             RaftRequest::Noop => {}
         }
+        None
     }
 }
 
@@ -235,9 +241,12 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                     });
                 }
                 EntryPayload::Normal(request) => {
-                    guard.apply_request(&request);
-                    responses.push(CouncilResponse::Applied {
-                        log_index: log_id.index,
+                    let allocated = guard.apply_request(&request);
+                    responses.push(match allocated {
+                        Some(serial) => CouncilResponse::SerialAllocated { serial },
+                        None => CouncilResponse::Applied {
+                            log_index: log_id.index,
+                        },
                     });
                 }
                 EntryPayload::Membership(membership) => {
@@ -939,10 +948,19 @@ mod tests {
         let mut inner = StateMachineInner::default();
         assert_eq!(inner.state.security_state.next_serial, 0);
 
-        inner.apply_request(&RaftRequest::AllocateSerial);
+        // Each apply returns the distinct serial it allocated — so two callers
+        // never derive the same value.
+        let first = inner.apply_request(&RaftRequest::AllocateSerial);
+        assert_eq!(first, Some(0));
         assert_eq!(inner.state.security_state.next_serial, 1);
 
-        inner.apply_request(&RaftRequest::AllocateSerial);
+        let second = inner.apply_request(&RaftRequest::AllocateSerial);
+        assert_eq!(second, Some(1));
         assert_eq!(inner.state.security_state.next_serial, 2);
+
+        assert_ne!(first, second);
+
+        // Non-allocating requests return None.
+        assert_eq!(inner.apply_request(&RaftRequest::Noop), None);
     }
 }

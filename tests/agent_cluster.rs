@@ -62,6 +62,8 @@ async fn agent_nodes_returns_membership() {
             is_council: true,
             is_leader: true,
             labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
+            first_seen: std::time::Instant::now(),
+            resources: None,
         },
         MembershipSnapshot {
             node_id: NodeId::new("node-2"),
@@ -71,6 +73,8 @@ async fn agent_nodes_returns_membership() {
             is_council: false,
             is_leader: false,
             labels: BTreeMap::new(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
         },
     ];
     let (_membership_tx, membership_rx) = watch::channel(snapshots);
