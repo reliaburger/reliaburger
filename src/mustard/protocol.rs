@@ -437,9 +437,13 @@ impl<T: MustardTransport> MustardNode<T> {
         let mut newly_dead = Vec::new();
 
         for member in self.membership.iter() {
+            // Measure from when suspicion *started* (`state_changed`), not from
+            // the last ACK. For a gossip-learned peer `last_ack` can be
+            // arbitrarily stale, which would promote it to Dead on the first
+            // failed probe — skipping the refutation window entirely.
             if member.state == NodeState::Suspect
                 && member.node_id != self.node_id
-                && now.duration_since(member.last_ack) > timeout
+                && now.duration_since(member.state_changed) > timeout
             {
                 newly_dead.push((member.node_id.clone(), member.address));
             }
@@ -695,18 +699,17 @@ mod tests {
 
         let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), config, t1);
 
-        // Add n2 and immediately suspect it
+        // Add n2 and suspect it (suspect() sets state_changed to now).
         node1.membership.add_node(
             NodeId::new("n2"),
             addr(2),
             1,
             BTreeMap::new(),
-            // last_ack far in the past
-            Instant::now() - Duration::from_secs(10),
+            Instant::now(),
         );
         node1.membership.suspect(&NodeId::new("n2"));
 
-        // Wait for suspicion timeout to elapse
+        // Wait for the suspicion timeout (measured from state_changed) to elapse.
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         // Run a cycle — should promote n2 to Dead
@@ -714,6 +717,33 @@ mod tests {
 
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
         assert_eq!(n2_state, NodeState::Dead);
+    }
+
+    #[tokio::test]
+    async fn fresh_suspect_not_promoted_despite_stale_ack() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+
+        let mut config = fast_config();
+        config.suspicion_timeout = Duration::from_millis(50);
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), config, t1);
+
+        // n2's last ACK is ancient, but it was only *just* suspected. The
+        // suspicion timer must run from suspicion start, not last_ack — so it
+        // stays Suspect (gets its refutation window), not immediately Dead.
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now() - Duration::from_secs(10),
+        );
+        node1.membership.suspect(&NodeId::new("n2"));
+
+        node1.run_one_cycle().await;
+
+        let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
+        assert_eq!(n2_state, NodeState::Suspect);
     }
 
     #[tokio::test]
