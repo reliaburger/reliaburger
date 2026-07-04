@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::meat::NodeId;
-use crate::mustard::membership::MembershipTable;
+use crate::mustard::membership::MembershipSnapshot;
 use crate::mustard::state::NodeState;
 
 // ---------------------------------------------------------------------------
@@ -53,22 +53,23 @@ impl Default for CouncilSelectionConfig {
 // Selection algorithm
 // ---------------------------------------------------------------------------
 
-/// Select candidates for council membership from the membership table.
+/// Select candidates for council membership from a gossip membership snapshot.
 ///
 /// Returns an ordered list of `NodeId`s, most preferred first. Length
 /// is at most `target_size - current_council.len()`.
 ///
 /// The algorithm:
 /// 1. Clamp `target_size` to `[min_council_size, max_council_size]`.
-/// 2. Filter: Alive, not already on council, old enough, resources
-///    reported and below thresholds.
+/// 2. Filter: Alive, not already on council, old enough, and — if resources are
+///    reported — below the CPU/memory thresholds. A member with no reported
+///    resources is treated as eligible (remote resources aren't gossiped yet).
 /// 3. Sort by zone novelty (descending), then node age (oldest first),
 ///    then node ID (lexicographic) for a fully deterministic order.
 /// 4. Take the first `needed` candidates.
 ///
 /// Pass `now` explicitly so tests can control time.
 pub fn select_council_candidates(
-    membership: &MembershipTable,
+    members: &[MembershipSnapshot],
     current_council: &[NodeId],
     target_size: usize,
     config: &CouncilSelectionConfig,
@@ -83,18 +84,20 @@ pub fn select_council_candidates(
     // Zones already represented in the current council.
     let council_zones: HashSet<&str> = current_council
         .iter()
-        .filter_map(|id| membership.get(id))
-        .filter_map(|n| n.labels.get(&config.zone_label_key).map(|s| s.as_str()))
+        .filter_map(|id| members.iter().find(|m| &m.node_id == id))
+        .filter_map(|m| m.labels.get(&config.zone_label_key).map(|s| s.as_str()))
         .collect();
 
     // Filter eligible candidates.
-    let mut candidates: Vec<_> = membership
+    let mut candidates: Vec<&MembershipSnapshot> = members
         .iter()
-        .filter(|n| {
-            n.state == NodeState::Alive
-                && !current_council.contains(&n.node_id)
-                && now.duration_since(n.first_seen) >= config.min_node_age
-                && n.resources.as_ref().is_some_and(|r| {
+        .filter(|m| {
+            m.state == NodeState::Alive
+                && !current_council.contains(&m.node_id)
+                && now.duration_since(m.first_seen) >= config.min_node_age
+                // Resources are optional: reported means enforce thresholds,
+                // unreported means eligible (remote resources aren't gossiped).
+                && m.resources.as_ref().is_none_or(|r| {
                     r.cpu_capacity_millicores > 0
                         && r.memory_capacity_mb > 0
                         && (r.cpu_used_millicores as f64 / r.cpu_capacity_millicores as f64)
@@ -125,7 +128,7 @@ pub fn select_council_candidates(
     candidates
         .into_iter()
         .take(needed)
-        .map(|n| n.node_id.clone())
+        .map(|m| m.node_id.clone())
         .collect()
 }
 
@@ -135,10 +138,10 @@ pub fn select_council_candidates(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
 
-    use crate::mustard::membership::{MembershipTable, ResourceSummary};
-    use crate::mustard::message::MembershipUpdate;
+    use crate::mustard::membership::{MembershipSnapshot, ResourceSummary};
     use crate::mustard::state::NodeState;
 
     use super::*;
@@ -161,9 +164,9 @@ mod tests {
         format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
-    /// Add a node to the table and then customise it via get_mut.
+    /// Push an Alive member snapshot with a backdated `first_seen`.
     fn add_node(
-        table: &mut MembershipTable,
+        members: &mut Vec<MembershipSnapshot>,
         name: &str,
         port: u16,
         now: Instant,
@@ -172,24 +175,29 @@ mod tests {
         resources: Option<ResourceSummary>,
     ) -> NodeId {
         let id = NodeId::new(name);
-        let update = MembershipUpdate {
+        let mut labels = BTreeMap::new();
+        if let Some(z) = zone {
+            labels.insert("zone".to_string(), z.to_string());
+        }
+        members.push(MembershipSnapshot {
             node_id: id.clone(),
             address: addr(port),
             state: NodeState::Alive,
             incarnation: 1,
-            lamport: 1,
-        };
-        // Use a backdated `now` so first_seen is in the past.
-        let join_time = now - age;
-        table.apply_update(&update, join_time);
-
-        if let Some(n) = table.get_mut(&id) {
-            n.resources = resources;
-            if let Some(z) = zone {
-                n.labels.insert("zone".to_string(), z.to_string());
-            }
-        }
+            is_council: false,
+            is_leader: false,
+            labels,
+            first_seen: now - age,
+            resources,
+        });
         id
+    }
+
+    /// Set a member's state in the snapshot list.
+    fn set_state(members: &mut [MembershipSnapshot], id: &NodeId, state: NodeState) {
+        if let Some(m) = members.iter_mut().find(|m| &m.node_id == id) {
+            m.state = state;
+        }
     }
 
     fn default_config() -> CouncilSelectionConfig {
@@ -206,11 +214,11 @@ mod tests {
     #[test]
     fn excludes_non_alive_nodes() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         let alive_id = add_node(
-            &mut table,
+            &mut members,
             "alive",
             1,
             now,
@@ -219,7 +227,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let suspect_id = add_node(
-            &mut table,
+            &mut members,
             "suspect",
             2,
             now,
@@ -228,7 +236,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let dead_id = add_node(
-            &mut table,
+            &mut members,
             "dead",
             3,
             now,
@@ -238,24 +246,20 @@ mod tests {
         );
 
         // Transition suspect and dead.
-        if let Some(n) = table.get_mut(&suspect_id) {
-            n.state = NodeState::Suspect;
-        }
-        if let Some(n) = table.get_mut(&dead_id) {
-            n.state = NodeState::Dead;
-        }
+        set_state(&mut members, &suspect_id, NodeState::Suspect);
+        set_state(&mut members, &dead_id, NodeState::Dead);
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
         assert_eq!(result, vec![alive_id]);
     }
 
     #[test]
     fn excludes_nodes_below_min_age() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
 
         let old_id = add_node(
-            &mut table,
+            &mut members,
             "old",
             1,
             now,
@@ -264,7 +268,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let _young_id = add_node(
-            &mut table,
+            &mut members,
             "young",
             2,
             now,
@@ -273,18 +277,18 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
         assert_eq!(result, vec![old_id]);
     }
 
     #[test]
     fn excludes_current_council_members() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         let council_id = add_node(
-            &mut table,
+            &mut members,
             "council",
             1,
             now,
@@ -293,7 +297,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let candidate_id = add_node(
-            &mut table,
+            &mut members,
             "candidate",
             2,
             now,
@@ -302,18 +306,18 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &[council_id], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[council_id], 3, &default_config(), now);
         assert_eq!(result, vec![candidate_id]);
     }
 
     #[test]
     fn excludes_overloaded_cpu() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         let healthy_id = add_node(
-            &mut table,
+            &mut members,
             "healthy",
             1,
             now,
@@ -322,7 +326,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let _overloaded_id = add_node(
-            &mut table,
+            &mut members,
             "overloaded",
             2,
             now,
@@ -335,18 +339,18 @@ mod tests {
             }),
         );
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
         assert_eq!(result, vec![healthy_id]);
     }
 
     #[test]
     fn excludes_overloaded_memory() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         let healthy_id = add_node(
-            &mut table,
+            &mut members,
             "healthy",
             1,
             now,
@@ -355,7 +359,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let _overloaded_id = add_node(
-            &mut table,
+            &mut members,
             "overloaded",
             2,
             now,
@@ -368,18 +372,18 @@ mod tests {
             }),
         );
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
         assert_eq!(result, vec![healthy_id]);
     }
 
     #[test]
-    fn excludes_nodes_without_resources() {
+    fn includes_nodes_without_resources() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         let with_resources = add_node(
-            &mut table,
+            &mut members,
             "reported",
             1,
             now,
@@ -387,10 +391,13 @@ mod tests {
             None,
             Some(healthy_resources()),
         );
-        let _no_resources = add_node(&mut table, "unreported", 2, now, old, None, None);
+        // Remote resources aren't gossiped, so unreported nodes must remain
+        // eligible — otherwise no peer would ever be selected.
+        let no_resources = add_node(&mut members, "unreported", 2, now, old, None, None);
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
-        assert_eq!(result, vec![with_resources]);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
+        assert!(result.contains(&with_resources));
+        assert!(result.contains(&no_resources));
     }
 
     // -------------------------------------------------------------------
@@ -400,12 +407,12 @@ mod tests {
     #[test]
     fn prefers_novel_zones() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         // Council member in zone-a.
         let council_id = add_node(
-            &mut table,
+            &mut members,
             "council-1",
             1,
             now,
@@ -416,7 +423,7 @@ mod tests {
 
         // Two candidates: one in zone-a (same), one in zone-b (novel).
         let _same_zone = add_node(
-            &mut table,
+            &mut members,
             "candidate-a",
             2,
             now,
@@ -425,7 +432,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let novel_zone = add_node(
-            &mut table,
+            &mut members,
             "candidate-b",
             3,
             now,
@@ -434,7 +441,7 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &[council_id], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[council_id], 3, &default_config(), now);
         // Novel zone should be first.
         assert_eq!(result[0], novel_zone);
     }
@@ -442,12 +449,12 @@ mod tests {
     #[test]
     fn no_zone_label_treated_as_not_novel() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         // Council member in zone-a.
         let council_id = add_node(
-            &mut table,
+            &mut members,
             "council-1",
             1,
             now,
@@ -458,7 +465,7 @@ mod tests {
 
         // Candidate with no zone label, candidate with novel zone.
         let _no_zone = add_node(
-            &mut table,
+            &mut members,
             "no-zone",
             2,
             now,
@@ -467,7 +474,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let novel = add_node(
-            &mut table,
+            &mut members,
             "zone-b",
             3,
             now,
@@ -476,7 +483,7 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &[council_id], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[council_id], 3, &default_config(), now);
         // Novel zone ranks above no-zone.
         assert_eq!(result[0], novel);
     }
@@ -484,11 +491,11 @@ mod tests {
     #[test]
     fn older_nodes_preferred_within_same_zone_novelty() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
 
         // Both in same zone, different ages.
         let older = add_node(
-            &mut table,
+            &mut members,
             "older",
             1,
             now,
@@ -497,7 +504,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let _younger = add_node(
-            &mut table,
+            &mut members,
             "younger",
             2,
             now,
@@ -506,7 +513,7 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
         assert_eq!(result[0], older);
     }
 
@@ -517,12 +524,12 @@ mod tests {
     #[test]
     fn deterministic_same_inputs_same_output() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         for i in 0..10 {
             add_node(
-                &mut table,
+                &mut members,
                 &format!("node-{:02}", i),
                 9000 + i,
                 now,
@@ -533,20 +540,20 @@ mod tests {
         }
 
         let config = default_config();
-        let r1 = select_council_candidates(&table, &[], 5, &config, now);
-        let r2 = select_council_candidates(&table, &[], 5, &config, now);
+        let r1 = select_council_candidates(&members, &[], 5, &config, now);
+        let r2 = select_council_candidates(&members, &[], 5, &config, now);
         assert_eq!(r1, r2);
     }
 
     #[test]
     fn lexicographic_tiebreak_for_same_age_and_zone() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let age = Duration::from_secs(700);
 
         // Same zone, same age — node ID breaks the tie.
         let alpha = add_node(
-            &mut table,
+            &mut members,
             "alpha",
             1,
             now,
@@ -555,7 +562,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let beta = add_node(
-            &mut table,
+            &mut members,
             "beta",
             2,
             now,
@@ -564,7 +571,7 @@ mod tests {
             Some(healthy_resources()),
         );
         let gamma = add_node(
-            &mut table,
+            &mut members,
             "gamma",
             3,
             now,
@@ -573,7 +580,7 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &[], 5, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 5, &default_config(), now);
         assert_eq!(result, vec![alpha, beta, gamma]);
     }
 
@@ -584,12 +591,12 @@ mod tests {
     #[test]
     fn target_size_clamped_to_bounds() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         for i in 0..10 {
             add_node(
-                &mut table,
+                &mut members,
                 &format!("node-{}", i),
                 9000 + i,
                 now,
@@ -602,24 +609,24 @@ mod tests {
         let config = default_config();
 
         // Target 1 should clamp to min (3).
-        let r = select_council_candidates(&table, &[], 1, &config, now);
+        let r = select_council_candidates(&members, &[], 1, &config, now);
         assert_eq!(r.len(), 3);
 
         // Target 20 should clamp to max (7).
-        let r = select_council_candidates(&table, &[], 20, &config, now);
+        let r = select_council_candidates(&members, &[], 20, &config, now);
         assert_eq!(r.len(), 7);
     }
 
     #[test]
     fn returns_empty_when_council_at_target_size() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
         let old = Duration::from_secs(700);
 
         let mut council = Vec::new();
         for i in 0..5 {
             let id = add_node(
-                &mut table,
+                &mut members,
                 &format!("council-{}", i),
                 9000 + i,
                 now,
@@ -631,7 +638,7 @@ mod tests {
         }
         // Extra non-council node.
         add_node(
-            &mut table,
+            &mut members,
             "extra",
             9100,
             now,
@@ -640,19 +647,19 @@ mod tests {
             Some(healthy_resources()),
         );
 
-        let result = select_council_candidates(&table, &council, 5, &default_config(), now);
+        let result = select_council_candidates(&members, &council, 5, &default_config(), now);
         assert!(result.is_empty());
     }
 
     #[test]
     fn returns_empty_when_no_eligible_candidates() {
         let now = Instant::now();
-        let mut table = MembershipTable::new();
+        let mut members: Vec<MembershipSnapshot> = Vec::new();
 
         // All nodes too young.
         for i in 0..5 {
             add_node(
-                &mut table,
+                &mut members,
                 &format!("young-{}", i),
                 9000 + i,
                 now,
@@ -662,7 +669,7 @@ mod tests {
             );
         }
 
-        let result = select_council_candidates(&table, &[], 3, &default_config(), now);
+        let result = select_council_candidates(&members, &[], 3, &default_config(), now);
         assert!(result.is_empty());
     }
 }
