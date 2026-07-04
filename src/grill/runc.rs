@@ -201,22 +201,17 @@ impl super::Grill for RuncGrill {
                 .await
                 .map_err(GrillError::ImagePull)?;
 
-            // Symlink the unpacked rootfs into the bundle directory
-            let bundle_rootfs = bundle_dir.join("rootfs");
-            // Remove existing rootfs if it exists (from a previous attempt)
-            let _ = tokio::fs::remove_file(&bundle_rootfs).await;
-            let _ = tokio::fs::remove_dir_all(&bundle_rootfs).await;
-            tokio::fs::symlink(&rootfs, &bundle_rootfs)
-                .await
-                .map_err(|e| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: format!("failed to symlink rootfs: {e}"),
-                })?;
-
-            // Update spec to use relative rootfs path within the bundle
-            spec.root.path = "rootfs".to_string();
+            // Point the spec at the unpacked rootfs by its absolute path.
+            // `runc run` rejects a relative or symlinked rootfs ("invalid
+            // rootfs: not an absolute path, or a symlink"), so we must not
+            // symlink it into the bundle as the old create/start path did.
+            spec.root.path = std::fs::canonicalize(&rootfs)
+                .unwrap_or(rootfs)
+                .to_string_lossy()
+                .to_string();
         } else {
-            // No image to pull — create empty rootfs directory (original behaviour)
+            // No image to pull — create an empty rootfs directory and point the
+            // spec at its absolute path (same rationale as above).
             let rootfs = bundle_dir.join("rootfs");
             tokio::fs::create_dir_all(&rootfs)
                 .await
@@ -224,6 +219,10 @@ impl super::Grill for RuncGrill {
                     instance: instance.clone(),
                     reason: format!("failed to create rootfs: {e}"),
                 })?;
+            spec.root.path = std::fs::canonicalize(&rootfs)
+                .unwrap_or(rootfs)
+                .to_string_lossy()
+                .to_string();
         }
 
         // Apply rootless modifications if running as non-root
@@ -656,5 +655,85 @@ mod tests {
 
         // Clean up
         let _ = grill.runc_command(&["delete", "--force", &id.0], &id).await;
+    }
+
+    // Validates the run-and-capture model end-to-end: the container's exit code
+    // is captured (so jobs don't get retried) and its stdout is readable.
+    #[tokio::test]
+    async fn runc_captures_exit_code_and_logs() {
+        if !runc_tests_enabled() || std::env::var("RELIABURGER_IMAGE_PULL_TESTS").is_err() {
+            eprintln!(
+                "skipping runc capture test (needs RELIABURGER_RUNC_TESTS=1 + RELIABURGER_IMAGE_PULL_TESTS=1)"
+            );
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            true,
+            tmp.path().join("state"),
+        );
+        let id = InstanceId("runc-capture".to_string());
+        let spec = crate::grill::oci::OciSpec {
+            root: crate::grill::oci::OciRoot {
+                path: "alpine:latest".to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                // Absolute path: a bare "sh" needs $PATH, which a hand-built
+                // spec doesn't set (real images set PATH via their image config).
+                args: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo captured-stdout; exit 7".to_string(),
+                ],
+                env: vec![],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: crate::grill::oci::standard_mounts(),
+            linux: crate::grill::oci::OciLinux {
+                namespaces: crate::grill::oci::standard_namespaces(None),
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+
+        if let Err(e) = grill.create(&id, &spec).await {
+            eprintln!("runc create failed (expected off-Linux): {e}");
+            return;
+        }
+        grill.start(&id).await.expect("runc run should spawn");
+
+        // Wait for the container to exit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if matches!(grill.state(&id).await, Ok(ContainerState::Stopped)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "container never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        // The log file holds the container's stdout+stderr (or runc's error if
+        // the run failed — surfaced in the assert messages).
+        let logs = grill.logs(&id).await.unwrap();
+        let code = grill.exit_code(&id).await;
+
+        // Exit code is captured (7), and stdout was written to the log file.
+        assert_eq!(code, Some(7), "exit code not captured (logs: {logs:?})");
+        assert!(
+            logs.contains("captured-stdout"),
+            "container stdout not captured, got: {logs:?}"
+        );
+
+        grill.kill(&id).await.ok();
     }
 }
