@@ -172,6 +172,10 @@ pub enum CouncilResponse {
     Ok,
     /// Success with the log index at which the entry was applied.
     Applied { log_index: u64 },
+    /// An `AllocateSerial` entry was applied; carries the serial assigned to
+    /// *this* entry so the caller doesn't have to race to read it back from
+    /// shared state (which returns duplicates under concurrent allocation).
+    SerialAllocated { serial: u64 },
 }
 
 // ---------------------------------------------------------------------------
