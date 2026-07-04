@@ -34,6 +34,9 @@ use super::supervisor::WorkloadSupervisor;
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// Grace period between SIGTERM and SIGKILL during shutdown.
+const SHUTDOWN_GRACE_SECS: u64 = 5;
+
 /// The address to probe an instance's health check at.
 ///
 /// A container with its own IP (runc/apple per-container netns) is probed at
@@ -2480,8 +2483,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
+        // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
+        // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
+        // is still running so nothing is orphaned.
         for id in &ids {
             let _ = self.supervisor.grill().stop(id).await;
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+        loop {
+            let mut all_stopped = true;
+            for id in &ids {
+                if !matches!(
+                    self.supervisor.grill().state(id).await,
+                    Ok(ContainerState::Stopped)
+                ) {
+                    all_stopped = false;
+                    break;
+                }
+            }
+            if all_stopped || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        for id in &ids {
+            if !matches!(
+                self.supervisor.grill().state(id).await,
+                Ok(ContainerState::Stopped)
+            ) {
+                let _ = self.supervisor.grill().kill(id).await;
+            }
         }
     }
 }
@@ -2580,6 +2611,38 @@ mod tests {
             path = "/healthz"
         "#;
         Config::parse(toml_str).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shutdown_escalates_to_kill_when_stop_is_ignored() {
+        let (_tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let grill_handle = grill.clone();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        // Pin the instance to Running so stop() is effectively ignored (the
+        // process refuses SIGTERM). shutdown_all must escalate to SIGKILL.
+        let id = InstanceId("web-0".to_string());
+        grill_handle.set_state(&id, ContainerState::Running);
+
+        agent.shutdown_all().await;
+
+        let calls = grill_handle.calls();
+        assert!(
+            calls.iter().any(|(op, i)| op == "stop" && i.0 == "web-0"),
+            "shutdown should SIGTERM first"
+        );
+        assert!(
+            calls.iter().any(|(op, i)| op == "kill" && i.0 == "web-0"),
+            "shutdown should escalate to SIGKILL when the process ignores stop"
+        );
     }
 
     #[tokio::test]

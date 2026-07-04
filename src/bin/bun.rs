@@ -515,11 +515,32 @@ async fn main() -> anyhow::Result<()> {
             .ok();
     });
 
-    // Wait for SIGINT or SIGTERM
+    // Wait for SIGINT or SIGTERM. Handling SIGTERM matters under systemd/docker
+    // stop — without it the agent was killed before shutdown_all ran, orphaning
+    // every workload process.
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        ctrl_c.await.ok();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("bun: failed to install SIGTERM handler: {e}");
+                    tokio::signal::ctrl_c().await.ok();
+                    signal_shutdown.cancel();
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+        }
         println!("\nbun: received shutdown signal");
         signal_shutdown.cancel();
     });

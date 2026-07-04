@@ -72,6 +72,13 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
+        // Reflect the stop in state (unless a test pinned a specific state), so
+        // callers that poll for exit — e.g. shutdown_all — observe it.
+        self.state_overrides
+            .lock()
+            .unwrap()
+            .entry(instance.clone())
+            .or_insert(ContainerState::Stopped);
         Ok(())
     }
 
@@ -80,6 +87,10 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("kill".to_string(), instance.clone()));
+        self.state_overrides
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), ContainerState::Stopped);
         Ok(())
     }
 
