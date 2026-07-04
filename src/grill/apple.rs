@@ -31,6 +31,7 @@ struct AppleEntry {
 /// Calls the `container` CLI for each operation. Requires Apple's
 /// container tool installed and `container system start` to have been run.
 /// macOS 15+ on Apple Silicon only.
+#[derive(Clone)]
 pub struct AppleContainerGrill {
     entries: Arc<Mutex<HashMap<InstanceId, AppleEntry>>>,
 }

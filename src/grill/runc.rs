@@ -40,6 +40,7 @@ struct RuncEntry {
 ///
 /// Calls the `runc` binary for each operation. Requires `runc` to be
 /// installed and in PATH. Supports rootless mode for non-root users.
+#[derive(Clone)]
 pub struct RuncGrill {
     /// Base directory for OCI bundles.
     bundle_base: PathBuf,

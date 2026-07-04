@@ -311,9 +311,12 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Sink for container log lines. When set, each started instance spawns a
+    /// forwarder that streams its output here (drained into the LogStore).
+    log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
 }
 
-impl<G: Grill> BunAgent<G> {
+impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Create a new agent in single-node mode (no cluster).
     pub fn new(
         grill: G,
@@ -344,6 +347,7 @@ impl<G: Grill> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            log_tx: None,
         }
     }
 
@@ -384,6 +388,7 @@ impl<G: Grill> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            log_tx: None,
         }
     }
 
@@ -392,6 +397,52 @@ impl<G: Grill> BunAgent<G> {
         &self,
     ) -> Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>> {
         Arc::clone(&self.deploy_history)
+    }
+
+    /// Set the sink that container log lines are forwarded to.
+    ///
+    /// The binary drains this into the LogStore so container output is
+    /// queryable. Without it, container output is only reachable live via
+    /// `relish logs` (which asks the runtime directly).
+    pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
+        self.log_tx = Some(log_tx);
+    }
+
+    /// Spawn a background forwarder that streams a started instance's log lines
+    /// into the configured log sink. No-op if no sink is set.
+    ///
+    /// Runs off the event loop (the grill handle is cloned into the task), so
+    /// following logs never blocks the agent.
+    fn spawn_log_forwarder(&self, instance_id: &InstanceId, app_name: &str, namespace: &str) {
+        let Some(log_tx) = self.log_tx.clone() else {
+            return;
+        };
+        let grill = self.supervisor.grill().clone();
+        let id = instance_id.clone();
+        let app = app_name.to_string();
+        let namespace = namespace.to_string();
+
+        let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
+        // Producer: the runtime streams complete stdout lines into line_tx.
+        let follow_grill = grill;
+        let follow_id = id.clone();
+        tokio::spawn(async move {
+            follow_grill.follow_logs(&follow_id, line_tx).await;
+        });
+        // Consumer: tag each line and forward it to the log sink.
+        tokio::spawn(async move {
+            while let Some(line) = line_rx.recv().await {
+                let record = crate::ketchup::types::LogRecord {
+                    app: app.clone(),
+                    namespace: namespace.clone(),
+                    stream: crate::ketchup::types::LogStream::Stdout,
+                    line,
+                };
+                if log_tx.send(record).await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// Run the agent event loop until shutdown is requested.
@@ -985,6 +1036,7 @@ impl<G: Grill> BunAgent<G> {
                         new_failed = true;
                         break;
                     }
+                    self.spawn_log_forwarder(&new_id, app_name, namespace);
 
                     // Health check: wait for process to be alive
                     // Uses health_timeout from deploy config (default 60s), capped at 5s for demo speed
@@ -1476,6 +1528,7 @@ impl<G: Grill> BunAgent<G> {
 
         // Call grill.start()
         self.supervisor.grill().start(instance_id).await?;
+        self.spawn_log_forwarder(instance_id, app_name, namespace);
 
         // Starting → HealthWait, then immediately to Running if no health checks
         {
@@ -1563,6 +1616,7 @@ impl<G: Grill> BunAgent<G> {
         }
 
         self.supervisor.grill().start(instance_id).await?;
+        self.spawn_log_forwarder(instance_id, job_name, namespace);
 
         // Starting → HealthWait → Running (no health checks for jobs)
         {
@@ -2409,6 +2463,37 @@ mod tests {
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn container_logs_forwarded_to_log_sink() {
+        // Use a real ProcessGrill so follow_logs actually streams output.
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        agent.set_log_sink(log_tx);
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        let config = Config::parse(
+            "[app.printer]\nimage = \"proc-grill:ignored\"\ncommand = [\"echo\", \"hello-logs\"]\n",
+        )
+        .unwrap();
+        let _ = send_deploy(&tx, config).await;
+
+        // The per-instance forwarder should stream the echoed line into the sink.
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), log_rx.recv())
+            .await
+            .expect("timed out waiting for a forwarded log record")
+            .expect("log channel closed");
+        assert_eq!(record.app, "printer");
+        assert_eq!(record.line, "hello-logs");
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     #[tokio::test]

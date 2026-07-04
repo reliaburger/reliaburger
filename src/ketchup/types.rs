@@ -9,6 +9,18 @@ pub enum LogStream {
     Stderr,
 }
 
+/// A container log line tagged with its source app/namespace/stream.
+///
+/// Emitted by the agent's per-instance log forwarders and drained into the
+/// `LogStore` so container output is queryable via `/v1/logs/entries`.
+#[derive(Debug, Clone)]
+pub struct LogRecord {
+    pub app: String,
+    pub namespace: String,
+    pub stream: LogStream,
+    pub line: String,
+}
+
 /// A single log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {

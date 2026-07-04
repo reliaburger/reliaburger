@@ -126,6 +126,10 @@ async fn main() -> anyhow::Result<()> {
     // agent with a real ClusterHandle. `_cluster_runtime` holds resources
     // that must outlive the agent; it drops at the end of main.
     let agent_shutdown = shutdown.clone();
+    // Channel carrying container log lines from the agent's per-instance
+    // forwarders into the LogStore (drained below, once the store exists).
+    let (log_tx, mut log_rx) =
+        tokio::sync::mpsc::channel::<reliaburger::ketchup::types::LogRecord>(1024);
     let _cluster_runtime;
     let mut agent = if cli.cluster {
         let params = cluster_params_from_config(&config);
@@ -144,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
+    agent.set_log_sink(log_tx);
     let deploy_history = agent.deploy_history_handle();
     let agent_handle = tokio::spawn(async move {
         agent.run().await;
@@ -195,6 +200,19 @@ async fn main() -> anyhow::Result<()> {
         &format!("runtime: {}", cli.runtime),
     );
     let log_store = Arc::new(RwLock::new(log_store_inner));
+
+    // Drain container log lines from the agent into the LogStore.
+    {
+        let drain_store = Arc::clone(&log_store);
+        tokio::spawn(async move {
+            while let Some(rec) = log_rx.recv().await {
+                drain_store
+                    .write()
+                    .await
+                    .append(&rec.app, &rec.namespace, rec.stream, &rec.line);
+            }
+        });
+    }
 
     println!("bun: observability enabled (metrics + logs + alerts)");
 

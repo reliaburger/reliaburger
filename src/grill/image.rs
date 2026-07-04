@@ -128,6 +128,7 @@ fn split_name_tag(s: &str) -> (&str, String) {
 ///   rootfs/{registry}/{repo}/{tag}/          — unpacked filesystem
 ///   manifests/{registry}/{repo}/{tag}.json   — cached manifests
 /// ```
+#[derive(Clone)]
 pub struct ImageStore {
     store_root: PathBuf,
 }

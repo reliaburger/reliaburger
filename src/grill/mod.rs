@@ -173,6 +173,7 @@ pub trait Grill: Send + Sync {
 /// Since `Grill` uses `impl Future` return types (not `dyn`-safe),
 /// we can't use trait objects. This enum dispatches to the concrete
 /// implementation selected at startup.
+#[derive(Clone)]
 pub enum AnyGrill {
     /// Cross-platform process-based runtime.
     Process(ProcessGrill),
