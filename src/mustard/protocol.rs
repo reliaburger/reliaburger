@@ -53,9 +53,9 @@ pub struct MustardNode<T: MustardTransport> {
     /// Optional watch channel for publishing membership snapshots.
     /// Set when running inside the agent, None in standalone tests.
     membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
-    /// Membership size at last publish. Used to avoid redundant publishes
-    /// when nothing changed.
-    last_published_member_count: usize,
+    /// Digest of the last-published membership. Used to publish on any content
+    /// change (state/incarnation/council/leader), not just a count change.
+    last_published_digest: Vec<(NodeId, NodeState, u64, bool, bool)>,
     /// Seed addresses to (re-)contact while this node has no live peers.
     /// Used to bootstrap a join by address without inserting a placeholder
     /// member: we ping the seed, and learn its real identity from the reply.
@@ -82,7 +82,7 @@ impl<T: MustardTransport> MustardNode<T> {
             transport,
             lamport: 0,
             membership_watch: None,
-            last_published_member_count: 0,
+            last_published_digest: Vec::new(),
             seeds: Vec::new(),
         }
     }
@@ -119,14 +119,29 @@ impl<T: MustardTransport> MustardNode<T> {
         self.membership_watch = Some(tx);
     }
 
-    /// Publish the current membership to the watch channel if it changed.
+    /// Publish the current membership to the watch channel if its *content*
+    /// changed. Comparing a digest (not just the member count) means state
+    /// transitions like Alive→Suspect — which keep the count constant until the
+    /// reap — are published promptly to the council reconciler and `relish nodes`.
     fn publish_membership(&mut self) {
-        let current_count = self.membership.len();
-        if current_count != self.last_published_member_count {
+        let snapshot = self.membership.snapshot();
+        let digest: Vec<(NodeId, NodeState, u64, bool, bool)> = snapshot
+            .iter()
+            .map(|m| {
+                (
+                    m.node_id.clone(),
+                    m.state,
+                    m.incarnation,
+                    m.is_council,
+                    m.is_leader,
+                )
+            })
+            .collect();
+        if digest != self.last_published_digest {
             if let Some(tx) = &self.membership_watch {
-                let _ = tx.send(self.membership.snapshot());
+                let _ = tx.send(snapshot);
             }
-            self.last_published_member_count = current_count;
+            self.last_published_digest = digest;
         }
     }
 
@@ -687,6 +702,41 @@ mod tests {
             .find(|u| u.node_id == NodeId::new("n2") && u.state == NodeState::Suspect)
             .expect("no Suspect update enqueued for n2");
         assert_eq!(suspect.incarnation, 5);
+    }
+
+    #[tokio::test]
+    async fn membership_watch_publishes_state_transitions() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+
+        let (tx, rx) = tokio::sync::watch::channel(Vec::new());
+        node1.set_membership_watch(tx);
+
+        node1.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node1.publish_membership();
+        assert!(
+            rx.borrow()
+                .iter()
+                .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Alive)
+        );
+
+        // Suspect n2 — the active-member count is unchanged, but the watch must
+        // still see the transition (the whole point of H7).
+        node1.membership.suspect(&NodeId::new("n2"));
+        node1.publish_membership();
+        assert!(
+            rx.borrow()
+                .iter()
+                .any(|m| m.node_id == NodeId::new("n2") && m.state == NodeState::Suspect),
+            "state transition not published without a count change"
+        );
     }
 
     #[tokio::test]
