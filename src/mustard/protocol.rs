@@ -334,8 +334,14 @@ impl<T: MustardTransport> MustardNode<T> {
                     .enqueue(update.clone(), self.membership.len());
             }
 
-            // If we're being suspected, refute it
-            if update.node_id == self.node_id && update.state == NodeState::Suspect {
+            // If we're being suspected *or* declared dead, refute it. Refuting
+            // Dead matters as much as Suspect: without it a false Dead about us
+            // is unrecoverable until the 60s reap (we'd be invisible to
+            // scheduling and the council the whole time). A higher incarnation
+            // resurrects us — see `resolve_conflict`.
+            if update.node_id == self.node_id
+                && matches!(update.state, NodeState::Suspect | NodeState::Dead)
+            {
                 self.refute();
             }
         }
@@ -746,6 +752,38 @@ mod tests {
         // Alive update was already sent in the ACK.
 
         drop(t1); // suppress unused warning
+    }
+
+    #[tokio::test]
+    async fn dead_refutation_bumps_incarnation() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        assert_eq!(node2.incarnation, 1);
+
+        // A gossip message that falsely declares us Dead.
+        let dead_msg = GossipMessage::new(
+            NodeId::new("n1"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n2"),
+                    address: addr(2),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                    lamport: 1,
+                }],
+            },
+        );
+
+        node2.handle_message(addr(1), dead_msg).await;
+
+        // We must refute a false Dead (not just Suspect) by bumping incarnation.
+        assert_eq!(node2.incarnation, 2);
+
+        drop(t1);
     }
 
     #[tokio::test]
