@@ -74,6 +74,36 @@ pub fn log_schema() -> Schema {
     ])
 }
 
+/// Returns the next flush counter for `data_dir`, one past the highest existing
+/// `{prefix}_NNNNNN.parquet` file (or 0 if none), so restarts don't overwrite.
+fn next_flush_counter(data_dir: &std::path::Path, prefix: &str) -> u64 {
+    let mut max_seen: Option<u64> = None;
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix(&format!("{prefix}_"))
+                && let Some(digits) = rest.strip_suffix(".parquet")
+                && let Ok(n) = digits.parse::<u64>()
+            {
+                max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
+            }
+        }
+    }
+    max_seen.map_or(0, |m| m + 1)
+}
+
+/// Whether `data_dir` contains at least one `.parquet` file.
+fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
+    std::fs::read_dir(data_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+        })
+        .unwrap_or(false)
+}
+
 /// A buffered log entry waiting to be flushed.
 struct BufferedLogEntry {
     timestamp: u64,
@@ -85,24 +115,28 @@ struct BufferedLogEntry {
 
 /// Arrow/DataFusion log store.
 ///
-/// Same architecture as MayoStore: buffer in memory, flush to Parquet
-/// periodically, query via DataFusion SQL. The unflushed buffer is
-/// included in every query so there are no blind spots.
+/// Same architecture as MayoStore: buffer in memory, flush to Parquet, query
+/// via DataFusion SQL over the on-disk Parquet directory unioned with the
+/// unflushed buffer. Persisted logs survive restarts and in-memory use stays
+/// bounded to the buffer.
 pub struct LogStore {
     buffer: Vec<BufferedLogEntry>,
-    batches: Vec<RecordBatch>,
     data_dir: PathBuf,
+    /// Seeded past any existing `logs_NNNNNN.parquet` so restarts don't clobber.
     flush_counter: u64,
 }
 
 impl LogStore {
-    /// Create a new log store writing Parquet to `data_dir`.
+    /// Open (or create) a log store writing Parquet to `data_dir`.
+    ///
+    /// Existing `logs_NNNNNN.parquet` files remain queryable and the flush
+    /// counter resumes past the highest one.
     pub fn new(data_dir: PathBuf) -> Self {
+        let flush_counter = next_flush_counter(&data_dir, "logs");
         Self {
             buffer: Vec::new(),
-            batches: Vec::new(),
             data_dir,
-            flush_counter: 0,
+            flush_counter,
         }
     }
 
@@ -196,34 +230,70 @@ impl LogStore {
             .close()
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
 
-        self.batches.push(batch);
+        // Durable on disk now; drop from memory. Queries read it back from the
+        // Parquet directory (see `session`).
         self.buffer.clear();
         self.flush_counter += 1;
         Ok(())
     }
 
-    /// Build a DataFusion session with all data (flushed + unflushed buffer).
+    /// Build a DataFusion session exposing a `logs` table over the on-disk
+    /// Parquet directory unioned with the unflushed buffer.
     async fn session(&self) -> Result<SessionContext, KetchupError> {
-        let ctx = SessionContext::new();
+        // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
+        // batches share the canonical `log_schema` with the in-memory buffer.
+        let config = SessionConfig::new().set_bool(
+            "datafusion.execution.parquet.schema_force_view_types",
+            false,
+        );
+        let ctx = SessionContext::new_with_config(config);
+        let schema = Arc::new(log_schema());
 
-        let mut all_batches = self.batches.clone();
+        let mut all_batches = self.read_disk_batches(&ctx).await?;
         if let Some(buffer_batch) = self.buffer_to_batch()? {
             all_batches.push(buffer_batch);
         }
-
         if all_batches.is_empty() {
-            let empty = RecordBatch::new_empty(Arc::new(log_schema()));
-            let table = MemTable::try_new(Arc::new(log_schema()), vec![vec![empty]])
-                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-            ctx.register_table("logs", Arc::new(table))
-                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        } else {
-            let table = MemTable::try_new(Arc::new(log_schema()), vec![all_batches])
-                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-            ctx.register_table("logs", Arc::new(table))
-                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+            all_batches.push(RecordBatch::new_empty(schema.clone()));
         }
+
+        let table = MemTable::try_new(schema, vec![all_batches])
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        ctx.register_table("logs", Arc::new(table))
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         Ok(ctx)
+    }
+
+    /// Read every `logs_*.parquet` file into RecordBatches normalised to the
+    /// canonical `log_schema`.
+    async fn read_disk_batches(
+        &self,
+        ctx: &SessionContext,
+    ) -> Result<Vec<RecordBatch>, KetchupError> {
+        if !dir_has_parquet(&self.data_dir) {
+            return Ok(Vec::new());
+        }
+        let dir = format!("{}/", self.data_dir.display());
+        ctx.register_parquet("logs_disk", &dir, ParquetReadOptions::default())
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        let batches = ctx
+            .sql("SELECT timestamp, app, namespace, stream, line FROM logs_disk")
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
+            .collect()
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+
+        let schema = Arc::new(log_schema());
+        let mut normalised = Vec::with_capacity(batches.len());
+        for batch in batches {
+            normalised.push(
+                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+                    .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?,
+            );
+        }
+        Ok(normalised)
     }
 
     /// Query logs using SQL and return raw JSON rows.
@@ -402,6 +472,44 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line, "hello world");
         assert_eq!(results[0].timestamp, 1000);
+    }
+
+    #[tokio::test]
+    async fn reopen_reads_persisted_logs_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = LogStore::new(dir.path().to_path_buf());
+            store.append_at(1, "web", "default", LogStream::Stdout, "first");
+            store.flush().await.unwrap();
+            store.append_at(2, "web", "default", LogStream::Stdout, "second");
+            store.flush().await.unwrap();
+        }
+
+        // Reopen over the same dir: prior logs are queryable, files untouched.
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        let results = store
+            .query("web", "default", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "persisted logs not reloaded after restart"
+        );
+
+        store.append_at(3, "web", "default", LogStream::Stdout, "third");
+        store.flush().await.unwrap();
+        let files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "parquet")
+            })
+            .count();
+        assert_eq!(files, 3, "restart clobbered an existing log file");
     }
 
     #[tokio::test]
