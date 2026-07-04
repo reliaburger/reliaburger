@@ -34,6 +34,17 @@ use super::supervisor::WorkloadSupervisor;
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// The address to probe an instance's health check at.
+///
+/// A container with its own IP (runc/apple per-container netns) is probed at
+/// that IP; ProcessGrill shares the host network, so it falls back to loopback.
+/// Previously hardcoded to loopback, which flapped every runc app unhealthy.
+fn probe_host(container_ip: Option<std::net::Ipv4Addr>) -> String {
+    container_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
 /// A progress event emitted during a deploy operation.
 ///
 /// Sent over an `mpsc` channel so the API layer can stream events
@@ -1697,7 +1708,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         for (instance_id, config) in due_checks {
             // Only probe instances in a probeable state
-            let state = self.supervisor.get_instance(&instance_id).map(|i| i.state);
+            let (state, probe_host) = match self.supervisor.get_instance(&instance_id) {
+                Some(i) => (Some(i.state), probe_host(i.container_ip)),
+                None => (None, "127.0.0.1".to_string()),
+            };
 
             let should_probe = matches!(
                 state,
@@ -1707,7 +1721,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             );
 
             if should_probe {
-                let status = probe_health(&config, "127.0.0.1").await;
+                let status = probe_health(&config, &probe_host).await;
 
                 let transition = self.supervisor.process_health_result(&instance_id, status);
 
@@ -2583,6 +2597,15 @@ mod tests {
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[test]
+    fn probe_host_prefers_container_ip() {
+        assert_eq!(probe_host(None), "127.0.0.1");
+        assert_eq!(
+            probe_host(Some(std::net::Ipv4Addr::new(10, 0, 2, 2))),
+            "10.0.2.2"
+        );
     }
 
     #[tokio::test]
