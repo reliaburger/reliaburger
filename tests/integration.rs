@@ -422,8 +422,8 @@ async fn health_check_triggers_restart() {
     let config = TestHarness::config_for_test_app(test_app.port());
     harness.client.apply(&config).await.unwrap();
 
-    // Wait for: health checks to pass (go running), then fail, then restart
-    // Health interval is 1s, threshold_unhealthy is 2
+    // Wait for: health checks to pass (go running), then fail, then restart.
+    // Health interval is 1s, threshold_unhealthy is 2.
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let statuses = harness.client.status().await.unwrap();
@@ -431,6 +431,18 @@ async fn health_check_triggers_restart() {
         statuses[0].restart_count > 0,
         "expected restart_count > 0, got {} (state: {})",
         statuses[0].restart_count,
+        statuses[0].state
+    );
+    // The old bug: re-drive rejected the same-id create and left the instance
+    // wedged in Preparing (old process leaked). A working re-drive tears down
+    // the old container, re-creates, and re-starts — so the instance reaches a
+    // live post-create state, never stuck in Preparing/Pending.
+    assert!(
+        matches!(
+            statuses[0].state.as_str(),
+            "running" | "health-wait" | "unhealthy"
+        ),
+        "restart re-drive stalled: instance stuck in {}",
         statuses[0].state
     );
 

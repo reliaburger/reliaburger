@@ -29,6 +29,7 @@ struct ProcessEntry {
 ///
 /// Spawns OS processes instead of OCI containers. Useful for
 /// development, testing, and platforms without container runtimes.
+#[derive(Clone)]
 pub struct ProcessGrill {
     processes: Arc<Mutex<HashMap<InstanceId, ProcessEntry>>>,
 }

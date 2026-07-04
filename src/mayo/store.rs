@@ -27,6 +27,37 @@ pub fn metrics_schema() -> Schema {
     ])
 }
 
+/// Returns the next flush counter for `data_dir`, one past the highest existing
+/// `{prefix}_NNNNNN.parquet` file (or 0 if none). Used so a restart resumes
+/// numbering instead of overwriting a previous run's files.
+pub(crate) fn next_flush_counter(data_dir: &std::path::Path, prefix: &str) -> u64 {
+    let mut max_seen: Option<u64> = None;
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix(&format!("{prefix}_"))
+                && let Some(digits) = rest.strip_suffix(".parquet")
+                && let Ok(n) = digits.parse::<u64>()
+            {
+                max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
+            }
+        }
+    }
+    max_seen.map_or(0, |m| m + 1)
+}
+
+/// Whether `data_dir` contains at least one `.parquet` file.
+pub(crate) fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
+    std::fs::read_dir(data_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "parquet"))
+        })
+        .unwrap_or(false)
+}
+
 /// A buffered sample waiting to be flushed.
 struct BufferedSample {
     timestamp: u64,
@@ -37,29 +68,33 @@ struct BufferedSample {
 
 /// Arrow/DataFusion time-series store.
 ///
-/// Inserts go into an in-memory buffer. On flush, the buffer is
-/// converted to an Arrow RecordBatch and accumulated. All batches
-/// are registered with DataFusion as a `MemTable` for SQL queries.
-/// Parquet files are written for persistence.
+/// Inserts go into an in-memory buffer. On flush, the buffer is written to a
+/// Parquet file and dropped from memory. Queries read the on-disk Parquet
+/// directory (durable across restarts) unioned with the unflushed buffer, so
+/// memory stays bounded to the buffer regardless of how much history is on
+/// disk.
 pub struct MayoStore {
     /// In-memory buffer of unflushed samples.
     buffer: Vec<BufferedSample>,
-    /// Accumulated RecordBatches (flushed from buffer).
-    batches: Vec<RecordBatch>,
     /// Directory for Parquet files.
     data_dir: PathBuf,
-    /// Counter for unique Parquet file names.
+    /// Counter for unique Parquet file names. Seeded past any existing files
+    /// so a restart never clobbers a previous run's data.
     flush_counter: u64,
 }
 
 impl MayoStore {
-    /// Create a new store writing Parquet to `data_dir`.
+    /// Open (or create) a store writing Parquet to `data_dir`.
+    ///
+    /// Existing `metrics_NNNNNN.parquet` files are left in place and remain
+    /// queryable; the flush counter resumes past the highest one so restarts
+    /// don't overwrite them.
     pub fn new(data_dir: PathBuf) -> Self {
+        let flush_counter = next_flush_counter(&data_dir, "metrics");
         Self {
             buffer: Vec::new(),
-            batches: Vec::new(),
             data_dir,
-            flush_counter: 0,
+            flush_counter,
         }
     }
 
@@ -135,36 +170,77 @@ impl MayoStore {
             .close()
             .map_err(|e| MayoError::Arrow(e.to_string()))?;
 
-        // Accumulate in memory for queries
-        self.batches.push(batch);
+        // The batch is durable on disk now; drop it from memory. Queries read
+        // it back from the Parquet directory (see `session`).
         self.buffer.clear();
         self.flush_counter += 1;
         Ok(())
     }
 
-    /// Build a DataFusion session with all data (flushed + unflushed buffer).
+    /// Build a DataFusion session exposing a `metrics` table over all data:
+    /// the on-disk Parquet directory unioned with the unflushed buffer.
     async fn session(&self) -> Result<SessionContext, MayoError> {
-        let ctx = SessionContext::new();
+        // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
+        // batches share the canonical `metrics_schema` with the in-memory
+        // buffer (DataFusion 45 forces view types by default).
+        let config = SessionConfig::new().set_bool(
+            "datafusion.execution.parquet.schema_force_view_types",
+            false,
+        );
+        let ctx = SessionContext::new_with_config(config);
+        let schema = Arc::new(metrics_schema());
 
-        // Collect all batches: flushed + current buffer
-        let mut all_batches = self.batches.clone();
+        // On-disk Parquet (durable, survives restarts). Read into memory only
+        // transiently for this query — nothing is retained on the struct.
+        let disk_batches = self.read_disk_batches(&ctx).await?;
+
+        // Unflushed buffer.
+        let mut all_batches = disk_batches;
         if let Some(buffer_batch) = self.buffer_to_batch()? {
             all_batches.push(buffer_batch);
         }
 
         if all_batches.is_empty() {
-            let empty = RecordBatch::new_empty(Arc::new(metrics_schema()));
-            let table = MemTable::try_new(Arc::new(metrics_schema()), vec![vec![empty]])
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-            ctx.register_table("metrics", Arc::new(table))
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-        } else {
-            let table = MemTable::try_new(Arc::new(metrics_schema()), vec![all_batches])
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-            ctx.register_table("metrics", Arc::new(table))
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
+            all_batches.push(RecordBatch::new_empty(schema.clone()));
         }
+
+        let table = MemTable::try_new(schema, vec![all_batches])
+            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
+        ctx.register_table("metrics", Arc::new(table))
+            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         Ok(ctx)
+    }
+
+    /// Read every `metrics_*.parquet` file in the data dir into RecordBatches,
+    /// normalised to the canonical `metrics_schema` (so the Parquet-inferred
+    /// nullability doesn't clash with the in-memory buffer's schema).
+    async fn read_disk_batches(&self, ctx: &SessionContext) -> Result<Vec<RecordBatch>, MayoError> {
+        if !dir_has_parquet(&self.data_dir) {
+            return Ok(Vec::new());
+        }
+        let dir = format!("{}/", self.data_dir.display());
+        ctx.register_parquet("metrics_disk", &dir, ParquetReadOptions::default())
+            .await
+            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
+        let df = ctx
+            .sql("SELECT timestamp, metric_name, labels, value FROM metrics_disk")
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+        // Re-cast to the canonical schema so a later UNION/MemTable is happy.
+        let schema = Arc::new(metrics_schema());
+        let mut normalised = Vec::with_capacity(batches.len());
+        for batch in batches {
+            normalised.push(
+                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+                    .map_err(|e| MayoError::Arrow(e.to_string()))?,
+            );
+        }
+        Ok(normalised)
     }
 
     /// Query metrics using SQL. Returns (timestamp, name, labels, value) tuples.
@@ -593,6 +669,58 @@ mod tests {
         let results = store.query("live_metric", 0, 9999).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].3, 42.0);
+    }
+
+    #[tokio::test]
+    async fn reopen_reads_persisted_parquet_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First run: flush two separate files.
+        {
+            let mut store = MayoStore::new(dir.path().to_path_buf());
+            store.insert(&MetricKey::simple("cpu"), Sample::at(1, 10.0));
+            store.flush().await.unwrap();
+            store.insert(&MetricKey::simple("cpu"), Sample::at(2, 20.0));
+            store.flush().await.unwrap();
+        }
+        let files_after_first = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "parquet")
+            })
+            .count();
+        assert_eq!(files_after_first, 2);
+
+        // Second run over the same dir: prior data is queryable...
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        let results = store.query("cpu", 0, 9999).await.unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "persisted data not reloaded after restart"
+        );
+
+        // ...and a new flush appends a third file, not overwriting file 000000.
+        store.insert(&MetricKey::simple("cpu"), Sample::at(3, 30.0));
+        store.flush().await.unwrap();
+        let files_after_second = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "parquet")
+            })
+            .count();
+        assert_eq!(files_after_second, 3, "restart clobbered an existing file");
+
+        let all = store.query("cpu", 0, 9999).await.unwrap();
+        assert_eq!(all.len(), 3);
     }
 
     #[tokio::test]

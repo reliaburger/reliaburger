@@ -31,6 +31,7 @@ struct AppleEntry {
 /// Calls the `container` CLI for each operation. Requires Apple's
 /// container tool installed and `container system start` to have been run.
 /// macOS 15+ on Apple Silicon only.
+#[derive(Clone)]
 pub struct AppleContainerGrill {
     entries: Arc<Mutex<HashMap<InstanceId, AppleEntry>>>,
 }
@@ -316,6 +317,22 @@ impl super::Grill for AppleContainerGrill {
                 reason: format!("unknown container state: {other}"),
             }),
         }
+    }
+
+    async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        let output = Self::container_command(&["inspect", &instance.0], instance)
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        // Try the common inspect JSON paths for the exit code.
+        inspect["State"]["ExitCode"]
+            .as_i64()
+            .or_else(|| inspect["state"]["exitCode"].as_i64())
+            .or_else(|| inspect["ExitCode"].as_i64())
+            .map(|code| code as i32)
     }
 }
 

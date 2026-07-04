@@ -30,6 +30,24 @@ use super::BunError;
 use super::probe::probe_health;
 use super::supervisor::WorkloadSupervisor;
 
+/// Maximum time an init container may run before the deploy fails. Bounds the
+/// init wait so a hung init can't wedge the agent event loop indefinitely.
+const INIT_TIMEOUT_SECS: u64 = 300;
+
+/// Grace period between SIGTERM and SIGKILL during shutdown.
+const SHUTDOWN_GRACE_SECS: u64 = 5;
+
+/// The address to probe an instance's health check at.
+///
+/// A container with its own IP (runc/apple per-container netns) is probed at
+/// that IP; ProcessGrill shares the host network, so it falls back to loopback.
+/// Previously hardcoded to loopback, which flapped every runc app unhealthy.
+fn probe_host(container_ip: Option<std::net::Ipv4Addr>) -> String {
+    container_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
 /// A progress event emitted during a deploy operation.
 ///
 /// Sent over an `mpsc` channel so the API layer can stream events
@@ -311,9 +329,12 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Sink for container log lines. When set, each started instance spawns a
+    /// forwarder that streams its output here (drained into the LogStore).
+    log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
 }
 
-impl<G: Grill> BunAgent<G> {
+impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Create a new agent in single-node mode (no cluster).
     pub fn new(
         grill: G,
@@ -344,6 +365,7 @@ impl<G: Grill> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            log_tx: None,
         }
     }
 
@@ -384,6 +406,7 @@ impl<G: Grill> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            log_tx: None,
         }
     }
 
@@ -392,6 +415,52 @@ impl<G: Grill> BunAgent<G> {
         &self,
     ) -> Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>> {
         Arc::clone(&self.deploy_history)
+    }
+
+    /// Set the sink that container log lines are forwarded to.
+    ///
+    /// The binary drains this into the LogStore so container output is
+    /// queryable. Without it, container output is only reachable live via
+    /// `relish logs` (which asks the runtime directly).
+    pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
+        self.log_tx = Some(log_tx);
+    }
+
+    /// Spawn a background forwarder that streams a started instance's log lines
+    /// into the configured log sink. No-op if no sink is set.
+    ///
+    /// Runs off the event loop (the grill handle is cloned into the task), so
+    /// following logs never blocks the agent.
+    fn spawn_log_forwarder(&self, instance_id: &InstanceId, app_name: &str, namespace: &str) {
+        let Some(log_tx) = self.log_tx.clone() else {
+            return;
+        };
+        let grill = self.supervisor.grill().clone();
+        let id = instance_id.clone();
+        let app = app_name.to_string();
+        let namespace = namespace.to_string();
+
+        let (line_tx, mut line_rx) = mpsc::channel::<String>(256);
+        // Producer: the runtime streams complete stdout lines into line_tx.
+        let follow_grill = grill;
+        let follow_id = id.clone();
+        tokio::spawn(async move {
+            follow_grill.follow_logs(&follow_id, line_tx).await;
+        });
+        // Consumer: tag each line and forward it to the log sink.
+        tokio::spawn(async move {
+            while let Some(line) = line_rx.recv().await {
+                let record = crate::ketchup::types::LogRecord {
+                    app: app.clone(),
+                    namespace: namespace.clone(),
+                    stream: crate::ketchup::types::LogStream::Stdout,
+                    line,
+                };
+                if log_tx.send(record).await.is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// Run the agent event loop until shutdown is requested.
@@ -413,6 +482,7 @@ impl<G: Grill> BunAgent<G> {
                 _ = health_interval.tick() => {
                     self.run_health_checks().await;
                     self.check_jobs().await;
+                    self.check_apps().await;
                     self.drive_pending_restarts().await;
                     self.expire_faults();
                     self.reconcile_firewall().await;
@@ -913,6 +983,10 @@ impl<G: Grill> BunAgent<G> {
 
                 // Start new instances with generation-tagged IDs
                 let mut new_ids = Vec::new();
+                // Track the host port allocated for each new instance so it can
+                // be recorded on the instance and registered as a backend.
+                let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
+                    std::collections::HashMap::new();
                 let mut new_failed = false;
                 for i in 0..replica_count {
                     let new_id = crate::grill::InstanceId(format!("{app_name}-g{deploy_gen}-{i}"));
@@ -985,12 +1059,23 @@ impl<G: Grill> BunAgent<G> {
                         new_failed = true;
                         break;
                     }
+                    self.spawn_log_forwarder(&new_id, app_name, namespace);
 
-                    // Health check: wait for process to be alive
-                    // Uses health_timeout from deploy config (default 60s), capped at 5s for demo speed
+                    // Health check: poll until the process is alive, returning
+                    // as soon as it's Running instead of always sleeping the
+                    // full window. Bounded by health_wait (capped at 5s).
+                    // TODO(Stage 2+): move rolling deploys off the event loop
+                    // entirely so even this bounded wait doesn't block the loop.
                     let wait = health_wait.min(std::time::Duration::from_secs(5));
-                    tokio::time::sleep(wait).await;
-                    match self.supervisor.grill.state(&new_id).await {
+                    let deadline = std::time::Instant::now() + wait;
+                    let mut probe = self.supervisor.grill.state(&new_id).await;
+                    while std::time::Instant::now() < deadline
+                        && !matches!(probe, Ok(crate::grill::state::ContainerState::Running))
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        probe = self.supervisor.grill.state(&new_id).await;
+                    }
+                    match probe {
                         Ok(crate::grill::state::ContainerState::Running) => {
                             let _ = events
                                 .send(ApplyEvent::Progress {
@@ -1028,13 +1113,19 @@ impl<G: Grill> BunAgent<G> {
                         }
                     }
 
+                    new_ports.insert(new_id.clone(), host_port);
                     new_ids.push(new_id);
                 }
 
                 if new_failed {
-                    // Rollback: kill any new instances we started, keep old ones
+                    // Rollback: kill any new instances we started, keep old ones.
+                    // These were grill-created but never inserted into supervisor
+                    // tracking, so release their ports here directly.
                     for new_id in &new_ids {
                         let _ = self.supervisor.grill.kill(new_id).await;
+                        if let Some(port) = new_ports.get(new_id).copied().flatten() {
+                            let _ = self.supervisor.port_allocator.release(port).await;
+                        }
                     }
                     // Record failed deploy in history
                     let entry = crate::meat::deploy_types::DeployHistoryEntry {
@@ -1074,13 +1165,17 @@ impl<G: Grill> BunAgent<G> {
 
                 // Register new instances in supervisor tracking
                 for new_id in &new_ids {
-                    let host_port = if spec.port.is_some() {
-                        // Port was already allocated above; we'd need to track it.
-                        // For now, the service map update below handles routing.
-                        None
-                    } else {
-                        None
-                    };
+                    let host_port = new_ports.get(new_id).copied().flatten();
+                    // Re-probe the app after a redeploy: build and register its
+                    // health config (previously dropped, so a redeployed app was
+                    // never health-checked again).
+                    let health_config = spec.health.as_ref().zip(spec.port).map(|(hs, port)| {
+                        crate::bun::health::HealthCheckConfig::from_spec(hs, port)
+                    });
+                    if let Some(ref cfg) = health_config {
+                        self.supervisor
+                            .register_health(new_id.clone(), cfg.clone(), now);
+                    }
                     // Add to supervisor's instance tracking
                     self.supervisor.instances.insert(
                         new_id.clone(),
@@ -1096,7 +1191,7 @@ impl<G: Grill> BunAgent<G> {
                             container_ip: None,
                             created_at: now,
                             restart_policy: crate::bun::restart::RestartPolicy::default(),
-                            health_config: None,
+                            health_config,
                             is_job: false,
                             image: spec.image.clone().unwrap_or_default(),
                             oci_spec: None,
@@ -1126,6 +1221,21 @@ impl<G: Grill> BunAgent<G> {
                     let _ = self
                         .service_map
                         .register_app(app_name, namespace, port, firewall);
+
+                    // Register each new instance as a backend so the service has
+                    // endpoints after the redeploy — previously it was left with
+                    // zero backends (`relish resolve` empty, ingress 502).
+                    for new_id in &new_ids {
+                        if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
+                            let backend = crate::onion::types::BackendInstance {
+                                instance_id: new_id.0.clone(),
+                                node_ip: std::net::Ipv4Addr::LOCALHOST,
+                                host_port,
+                                healthy: true,
+                            };
+                            let _ = self.service_map.add_backend(app_name, backend);
+                        }
+                    }
                 }
                 if let Some(ref ingress) = spec.ingress {
                     self.ingress_configs
@@ -1441,13 +1551,21 @@ impl<G: Grill> BunAgent<G> {
                 self.supervisor.grill().create(&init_id, &init_oci).await?;
                 self.supervisor.grill().start(&init_id).await?;
 
-                // Wait for init container to complete
+                // Wait for the init container to complete, bounded by a timeout
+                // so a hung init can't wedge the agent event loop forever.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
                 let failed = loop {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     let state = self.supervisor.grill().state(&init_id).await?;
                     if state == ContainerState::Stopped {
                         let exit_code = self.supervisor.grill().exit_code(&init_id).await;
                         break exit_code != Some(0);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        // Timed out — kill the init container and fail the deploy.
+                        let _ = self.supervisor.grill().kill(&init_id).await;
+                        break true;
                     }
                 };
 
@@ -1476,6 +1594,7 @@ impl<G: Grill> BunAgent<G> {
 
         // Call grill.start()
         self.supervisor.grill().start(instance_id).await?;
+        self.spawn_log_forwarder(instance_id, app_name, namespace);
 
         // Starting → HealthWait, then immediately to Running if no health checks
         {
@@ -1563,6 +1682,7 @@ impl<G: Grill> BunAgent<G> {
         }
 
         self.supervisor.grill().start(instance_id).await?;
+        self.spawn_log_forwarder(instance_id, job_name, namespace);
 
         // Starting → HealthWait → Running (no health checks for jobs)
         {
@@ -1591,7 +1711,10 @@ impl<G: Grill> BunAgent<G> {
 
         for (instance_id, config) in due_checks {
             // Only probe instances in a probeable state
-            let state = self.supervisor.get_instance(&instance_id).map(|i| i.state);
+            let (state, probe_host) = match self.supervisor.get_instance(&instance_id) {
+                Some(i) => (Some(i.state), probe_host(i.container_ip)),
+                None => (None, "127.0.0.1".to_string()),
+            };
 
             let should_probe = matches!(
                 state,
@@ -1601,7 +1724,7 @@ impl<G: Grill> BunAgent<G> {
             );
 
             if should_probe {
-                let status = probe_health(&config, "127.0.0.1").await;
+                let status = probe_health(&config, &probe_host).await;
 
                 let transition = self.supervisor.process_health_result(&instance_id, status);
 
@@ -1731,21 +1854,88 @@ impl<G: Grill> BunAgent<G> {
         }
     }
 
+    /// Detect crashed app instances and restart them.
+    ///
+    /// Health checks catch an app that fails its probe, but an app *without* a
+    /// health check that crashes was previously reported Running forever —
+    /// nothing polled the runtime. This polls non-job Running apps and, when the
+    /// container has exited, routes them through the restart path.
+    async fn check_apps(&mut self) {
+        let now = Instant::now();
+        let running_apps: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| !i.is_job && i.state == ContainerState::Running)
+            .map(|i| i.id.clone())
+            .collect();
+
+        for id in running_apps {
+            let grill_state = match self.supervisor.grill().state(&id).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if grill_state != ContainerState::Stopped {
+                continue;
+            }
+
+            // The process exited unexpectedly. Mark it Stopped, then restart.
+            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
+                    instance.state = s;
+                }
+                if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
+                    instance.state = s;
+                }
+            }
+            if let Err(BunError::RestartLimitExceeded { .. }) =
+                self.supervisor.maybe_restart(&id, now).await
+                && let Some(instance) = self.supervisor.get_instance_mut(&id)
+                && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
+            {
+                instance.state = s;
+            }
+        }
+    }
+
     /// Re-drive instances that are in Pending state after a restart.
     ///
     /// When `maybe_restart` transitions an instance back to Pending,
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
     async fn drive_pending_restarts(&mut self) {
-        let pending_restarts: Vec<(InstanceId, crate::grill::oci::OciSpec)> = self
+        #[allow(clippy::type_complexity)]
+        let pending_restarts: Vec<(
+            InstanceId,
+            crate::grill::oci::OciSpec,
+            String,
+            String,
+            Option<u16>,
+        )> = self
             .supervisor
             .list_instances()
             .iter()
             .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
-            .filter_map(|i| i.oci_spec.as_ref().map(|spec| (i.id.clone(), spec.clone())))
+            .filter_map(|i| {
+                i.oci_spec.as_ref().map(|spec| {
+                    (
+                        i.id.clone(),
+                        spec.clone(),
+                        i.app_name.clone(),
+                        i.namespace.clone(),
+                        i.host_port,
+                    )
+                })
+            })
             .collect();
 
-        for (id, oci_spec) in pending_restarts {
+        for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
+            // Tear down the old container first. Without this, the same-id
+            // create is rejected (ProcessGrill: stale-Running entry) or fails
+            // (runc/apple: container still exists), leaving the instance wedged
+            // in Preparing and the old process leaked.
+            let _ = self.supervisor.grill().kill(&id).await;
+
             // Pending → Preparing
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
                 match instance.state.transition_to(ContainerState::Preparing) {
@@ -1774,6 +1964,17 @@ impl<G: Grill> BunAgent<G> {
 
             if self.supervisor.grill().start(&id).await.is_err() {
                 continue;
+            }
+            // Re-wire the restarted instance: stream its logs and keep it routable.
+            self.spawn_log_forwarder(&id, &app_name, &namespace);
+            if let Some(port) = host_port {
+                let backend = crate::onion::types::BackendInstance {
+                    instance_id: id.0.clone(),
+                    node_ip: std::net::Ipv4Addr::LOCALHOST,
+                    host_port: port,
+                    healthy: true,
+                };
+                let _ = self.service_map.add_backend(&app_name, backend);
             }
 
             // Starting → HealthWait, then Running if no health checks
@@ -2231,25 +2432,15 @@ impl<G: Grill> BunAgent<G> {
             }
         }
 
-        // Spawn follow tasks for each instance
+        // Spawn a follow task per instance. The grill is Arc-backed and Clone,
+        // so each task owns a handle and streams concurrently — the agent event
+        // loop is never blocked waiting for a client to disconnect.
         for id in instance_ids {
-            let grill = self.supervisor.grill();
+            let grill = self.supervisor.grill().clone();
             let tx = lines.clone();
-            // follow_logs uses impl Future, so we need to call it inline.
-            // Spawn a task that calls follow_logs on the grill. Since Grill
-            // isn't object-safe, we can't box the future easily. Instead, we
-            // call follow_logs directly here for each instance. Because the
-            // agent's event loop would block, we just start the follow in a
-            // spawned task by calling it. But grill isn't 'static...
-            //
-            // Actually, the grill reference borrows self. We need to get a
-            // clone or Arc. ProcessGrill uses Arc internally, and follow_logs
-            // takes &self. Let's just call follow_logs here sequentially for
-            // one instance (the common case). For multiple instances, each
-            // follow would need to be spawned, but since follow_logs borrows
-            // &self, we call them one at a time. When the first one ends
-            // (process exits or channel closes), we move to the next.
-            grill.follow_logs(&id, tx).await;
+            tokio::spawn(async move {
+                grill.follow_logs(&id, tx).await;
+            });
         }
     }
 
@@ -2292,8 +2483,36 @@ impl<G: Grill> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
+        // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
+        // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
+        // is still running so nothing is orphaned.
         for id in &ids {
             let _ = self.supervisor.grill().stop(id).await;
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS);
+        loop {
+            let mut all_stopped = true;
+            for id in &ids {
+                if !matches!(
+                    self.supervisor.grill().state(id).await,
+                    Ok(ContainerState::Stopped)
+                ) {
+                    all_stopped = false;
+                    break;
+                }
+            }
+            if all_stopped || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        for id in &ids {
+            if !matches!(
+                self.supervisor.grill().state(id).await,
+                Ok(ContainerState::Stopped)
+            ) {
+                let _ = self.supervisor.grill().kill(id).await;
+            }
         }
     }
 }
@@ -2395,6 +2614,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_escalates_to_kill_when_stop_is_ignored() {
+        let (_tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let grill_handle = grill.clone();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        // Pin the instance to Running so stop() is effectively ignored (the
+        // process refuses SIGTERM). shutdown_all must escalate to SIGKILL.
+        let id = InstanceId("web-0".to_string());
+        grill_handle.set_state(&id, ContainerState::Running);
+
+        agent.shutdown_all().await;
+
+        let calls = grill_handle.calls();
+        assert!(
+            calls.iter().any(|(op, i)| op == "stop" && i.0 == "web-0"),
+            "shutdown should SIGTERM first"
+        );
+        assert!(
+            calls.iter().any(|(op, i)| op == "kill" && i.0 == "web-0"),
+            "shutdown should escalate to SIGKILL when the process ignores stop"
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_command_creates_instances() {
         let (mut agent, tx, shutdown) = test_agent();
 
@@ -2409,6 +2660,171 @@ mod tests {
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[test]
+    fn probe_host_prefers_container_ip() {
+        assert_eq!(probe_host(None), "127.0.0.1");
+        assert_eq!(
+            probe_host(Some(std::net::Ipv4Addr::new(10, 0, 2, 2))),
+            "10.0.2.2"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_logs_forwarded_to_log_sink() {
+        // Use a real ProcessGrill so follow_logs actually streams output.
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        agent.set_log_sink(log_tx);
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        let config = Config::parse(
+            "[app.printer]\nimage = \"proc-grill:ignored\"\ncommand = [\"echo\", \"hello-logs\"]\n",
+        )
+        .unwrap();
+        let _ = send_deploy(&tx, config).await;
+
+        // The per-instance forwarder should stream the echoed line into the sink.
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), log_rx.recv())
+            .await
+            .expect("timed out waiting for a forwarded log record")
+            .expect("log channel closed");
+        assert_eq!(record.app, "printer");
+        assert_eq!(record.line, "hello-logs");
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn crashed_app_without_health_check_is_restarted() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        // An app with no health check whose process exits immediately. Nothing
+        // probes it, so only crash detection can notice and restart it.
+        let config =
+            Config::parse("[app.crasher]\nimage = \"proc-grill:ignored\"\ncommand = [\"true\"]\n")
+                .unwrap();
+        let _ = send_deploy(&tx, config).await;
+
+        // Give the health tick (1s) a few cycles to detect the exit and restart.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let status = resp_rx.await.unwrap();
+        let crasher = status
+            .iter()
+            .find(|s| s.app_name == "crasher")
+            .expect("crasher not found");
+        assert!(
+            crasher.restart_count > 0,
+            "crashed app was never restarted (state: {})",
+            crasher.state
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+    }
+
+    #[tokio::test]
+    async fn redeploy_registers_backends_health_and_port() {
+        let (_tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+
+        let config = Config::parse(
+            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = 8080\n\n[app.web.health]\npath = \"/healthz\"\n",
+        )
+        .unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+
+        // Fresh deploy, then redeploy (existing instances → rolling path).
+        agent.deploy(config.clone(), &ev_tx).await;
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        // The service must have backends after the redeploy (was left empty).
+        let entry = agent
+            .service_map
+            .resolve("web")
+            .expect("web missing from service map");
+        assert!(
+            !entry.backends.is_empty(),
+            "redeploy left the service with zero backends"
+        );
+
+        // A redeployed instance keeps its port and health-check registration.
+        let inst = agent
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|i| i.app_name == "web")
+            .expect("no web instance after redeploy");
+        assert!(inst.host_port.is_some(), "redeploy dropped the host port");
+        assert!(
+            inst.health_config.is_some(),
+            "redeploy dropped the health check"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_logs_does_not_block_the_event_loop() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        // A long-running process whose follow would block the loop for 60s if
+        // handled inline.
+        let config = Config::parse(
+            "[app.sleeper]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
+        )
+        .unwrap();
+        let _ = send_deploy(&tx, config).await;
+
+        // Start following logs; never drain them.
+        let (line_tx, _line_rx) = mpsc::channel(16);
+        tx.send(AgentCommand::FollowLogs {
+            app_name: "sleeper".into(),
+            namespace: "default".into(),
+            tail: None,
+            lines: line_tx,
+        })
+        .await
+        .unwrap();
+
+        // A subsequent command must still be answered promptly.
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(3), resp_rx)
+            .await
+            .expect("event loop blocked by FollowLogs")
+            .unwrap();
+        assert!(!status.is_empty(), "sleeper should be listed");
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
     }
 
     #[tokio::test]
