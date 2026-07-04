@@ -114,6 +114,15 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
     }
 
+    /// Register an instance's health check with the health checker.
+    ///
+    /// `deploy_app` does this for fresh deploys; the agent's rolling-redeploy
+    /// path (which creates instances directly) calls this so replacement
+    /// instances are actually probed.
+    pub fn register_health(&mut self, id: InstanceId, config: HealthCheckConfig, now: Instant) {
+        self.health_checker.register(id, config, now);
+    }
+
     /// Deploy an app, creating workload instances in Pending state.
     ///
     /// Creates one instance per replica. For `DaemonSet` mode, creates

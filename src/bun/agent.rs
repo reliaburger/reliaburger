@@ -968,6 +968,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 // Start new instances with generation-tagged IDs
                 let mut new_ids = Vec::new();
+                // Track the host port allocated for each new instance so it can
+                // be recorded on the instance and registered as a backend.
+                let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
+                    std::collections::HashMap::new();
                 let mut new_failed = false;
                 for i in 0..replica_count {
                     let new_id = crate::grill::InstanceId(format!("{app_name}-g{deploy_gen}-{i}"));
@@ -1094,6 +1098,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         }
                     }
 
+                    new_ports.insert(new_id.clone(), host_port);
                     new_ids.push(new_id);
                 }
 
@@ -1140,13 +1145,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 // Register new instances in supervisor tracking
                 for new_id in &new_ids {
-                    let host_port = if spec.port.is_some() {
-                        // Port was already allocated above; we'd need to track it.
-                        // For now, the service map update below handles routing.
-                        None
-                    } else {
-                        None
-                    };
+                    let host_port = new_ports.get(new_id).copied().flatten();
+                    // Re-probe the app after a redeploy: build and register its
+                    // health config (previously dropped, so a redeployed app was
+                    // never health-checked again).
+                    let health_config = spec.health.as_ref().zip(spec.port).map(|(hs, port)| {
+                        crate::bun::health::HealthCheckConfig::from_spec(hs, port)
+                    });
+                    if let Some(ref cfg) = health_config {
+                        self.supervisor
+                            .register_health(new_id.clone(), cfg.clone(), now);
+                    }
                     // Add to supervisor's instance tracking
                     self.supervisor.instances.insert(
                         new_id.clone(),
@@ -1162,7 +1171,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             container_ip: None,
                             created_at: now,
                             restart_policy: crate::bun::restart::RestartPolicy::default(),
-                            health_config: None,
+                            health_config,
                             is_job: false,
                             image: spec.image.clone().unwrap_or_default(),
                             oci_spec: None,
@@ -1192,6 +1201,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let _ = self
                         .service_map
                         .register_app(app_name, namespace, port, firewall);
+
+                    // Register each new instance as a backend so the service has
+                    // endpoints after the redeploy — previously it was left with
+                    // zero backends (`relish resolve` empty, ingress 502).
+                    for new_id in &new_ids {
+                        if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
+                            let backend = crate::onion::types::BackendInstance {
+                                instance_id: new_id.0.clone(),
+                                node_ip: std::net::Ipv4Addr::LOCALHOST,
+                                host_port,
+                                healthy: true,
+                            };
+                            let _ = self.service_map.add_backend(app_name, backend);
+                        }
+                    }
                 }
                 if let Some(ref ingress) = spec.ingress {
                     self.ingress_configs
@@ -2506,6 +2530,50 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn redeploy_registers_backends_health_and_port() {
+        let (_tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+
+        let config = Config::parse(
+            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = 8080\n\n[app.web.health]\npath = \"/healthz\"\n",
+        )
+        .unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+
+        // Fresh deploy, then redeploy (existing instances → rolling path).
+        agent.deploy(config.clone(), &ev_tx).await;
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        // The service must have backends after the redeploy (was left empty).
+        let entry = agent
+            .service_map
+            .resolve("web")
+            .expect("web missing from service map");
+        assert!(
+            !entry.backends.is_empty(),
+            "redeploy left the service with zero backends"
+        );
+
+        // A redeployed instance keeps its port and health-check registration.
+        let inst = agent
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|i| i.app_name == "web")
+            .expect("no web instance after redeploy");
+        assert!(inst.host_port.is_some(), "redeploy dropped the host port");
+        assert!(
+            inst.health_config.is_some(),
+            "redeploy dropped the health check"
+        );
     }
 
     #[tokio::test]
