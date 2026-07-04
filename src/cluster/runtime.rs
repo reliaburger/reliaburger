@@ -45,6 +45,11 @@ const MAX_COUNCIL_SIZE: usize = 7;
 /// How often the leader reconciles the council against gossip membership.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Upper bound on a single reconciler membership operation. A peer whose Raft
+/// port is unreachable must not block the reconciler forever — on timeout we
+/// log and retry on the next tick.
+const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Owns resources that must outlive `start()` for the cluster to keep
 /// working, and exposes the local reporting aggregator's view. The spawned
 /// tasks stop when the shared `CancellationToken` is cancelled.
@@ -308,14 +313,44 @@ fn spawn_council_reconciler(
                         continue;
                     }
 
-                    // Add any new members as learners (blocking until they
-                    // catch up), then promote the whole set to voters.
+                    // Add any new members as learners, then promote the whole
+                    // set to voters. Each op is bounded by a timeout and its
+                    // error is logged (not discarded) so an unreachable peer
+                    // can't wedge the reconciler — it simply retries next tick.
                     for (id, info) in &desired {
                         if !current.contains(id) {
-                            let _ = council.add_learner(*id, info.clone()).await;
+                            match tokio::time::timeout(
+                                RECONCILE_OP_TIMEOUT,
+                                council.add_learner(*id, info.clone()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    eprintln!("council reconciler: add_learner({id}) failed: {e}");
+                                }
+                                Err(_) => {
+                                    eprintln!(
+                                        "council reconciler: add_learner({id}) timed out; will retry"
+                                    );
+                                }
+                            }
                         }
                     }
-                    let _ = council.change_membership(desired_ids).await;
+                    match tokio::time::timeout(
+                        RECONCILE_OP_TIMEOUT,
+                        council.change_membership(desired_ids),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            eprintln!("council reconciler: change_membership failed: {e}");
+                        }
+                        Err(_) => {
+                            eprintln!("council reconciler: change_membership timed out; will retry");
+                        }
+                    }
                 }
             }
         }
