@@ -468,6 +468,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 _ = health_interval.tick() => {
                     self.run_health_checks().await;
                     self.check_jobs().await;
+                    self.check_apps().await;
                     self.drive_pending_restarts().await;
                     self.expire_faults();
                     self.reconcile_firewall().await;
@@ -1831,6 +1832,50 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Detect crashed app instances and restart them.
+    ///
+    /// Health checks catch an app that fails its probe, but an app *without* a
+    /// health check that crashes was previously reported Running forever —
+    /// nothing polled the runtime. This polls non-job Running apps and, when the
+    /// container has exited, routes them through the restart path.
+    async fn check_apps(&mut self) {
+        let now = Instant::now();
+        let running_apps: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| !i.is_job && i.state == ContainerState::Running)
+            .map(|i| i.id.clone())
+            .collect();
+
+        for id in running_apps {
+            let grill_state = match self.supervisor.grill().state(&id).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if grill_state != ContainerState::Stopped {
+                continue;
+            }
+
+            // The process exited unexpectedly. Mark it Stopped, then restart.
+            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
+                    instance.state = s;
+                }
+                if let Ok(s) = instance.state.transition_to(ContainerState::Stopped) {
+                    instance.state = s;
+                }
+            }
+            if let Err(BunError::RestartLimitExceeded { .. }) =
+                self.supervisor.maybe_restart(&id, now).await
+                && let Some(instance) = self.supervisor.get_instance_mut(&id)
+                && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
+            {
+                instance.state = s;
+            }
+        }
+    }
+
     /// Re-drive instances that are in Pending state after a restart.
     ///
     /// When `maybe_restart` transitions an instance back to Pending,
@@ -2564,6 +2609,44 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn crashed_app_without_health_check_is_restarted() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        // An app with no health check whose process exits immediately. Nothing
+        // probes it, so only crash detection can notice and restart it.
+        let config =
+            Config::parse("[app.crasher]\nimage = \"proc-grill:ignored\"\ncommand = [\"true\"]\n")
+                .unwrap();
+        let _ = send_deploy(&tx, config).await;
+
+        // Give the health tick (1s) a few cycles to detect the exit and restart.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let status = resp_rx.await.unwrap();
+        let crasher = status
+            .iter()
+            .find(|s| s.app_name == "crasher")
+            .expect("crasher not found");
+        assert!(
+            crasher.restart_count > 0,
+            "crashed app was never restarted (state: {})",
+            crasher.state
+        );
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
     }
 
     #[tokio::test]

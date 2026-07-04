@@ -118,6 +118,11 @@ impl HealthStatus {
     }
 }
 
+/// Consecutive failed startup probes after which a HealthWait instance is given
+/// up as Failed (and restarted). At the 1s health interval this is ~1 minute —
+/// long enough for slow starts, short enough to not wait forever.
+const STARTUP_FAILURE_LIMIT: u32 = 60;
+
 /// Evaluate a probe result and determine whether a state transition is needed.
 ///
 /// Pure function: takes the probe result, current counters (already updated),
@@ -135,6 +140,15 @@ pub fn evaluate_result(
             if counters.consecutive_healthy >= config.threshold_healthy =>
         {
             Some(ContainerState::Running)
+        }
+        // Startup never succeeded: after a generous grace of consecutive failed
+        // probes, give up so the instance doesn't sit in HealthWait forever.
+        // Failed then flows into the restart path. The grace is deliberately
+        // large so a legitimately slow-starting app isn't killed prematurely.
+        (ContainerState::HealthWait, false)
+            if counters.consecutive_unhealthy >= STARTUP_FAILURE_LIMIT =>
+        {
+            Some(ContainerState::Failed)
         }
         // Running: enough consecutive failures → Unhealthy
         (ContainerState::Running, false)
@@ -402,6 +416,39 @@ mod tests {
             &config,
         );
         assert_eq!(result, Some(ContainerState::Running));
+    }
+
+    #[test]
+    fn health_wait_fails_after_startup_grace() {
+        let config = default_config();
+        // Just under the limit: still waiting.
+        let below = HealthCounters {
+            consecutive_healthy: 0,
+            consecutive_unhealthy: STARTUP_FAILURE_LIMIT - 1,
+        };
+        assert_eq!(
+            evaluate_result(
+                HealthStatus::Unhealthy,
+                &below,
+                ContainerState::HealthWait,
+                &config
+            ),
+            None
+        );
+        // At the limit: give up so it doesn't wait forever.
+        let at = HealthCounters {
+            consecutive_healthy: 0,
+            consecutive_unhealthy: STARTUP_FAILURE_LIMIT,
+        };
+        assert_eq!(
+            evaluate_result(
+                HealthStatus::Unhealthy,
+                &at,
+                ContainerState::HealthWait,
+                &config
+            ),
+            Some(ContainerState::Failed)
+        );
     }
 
     #[test]
