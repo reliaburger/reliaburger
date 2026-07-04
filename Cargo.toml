@@ -46,6 +46,7 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
+redb = "2"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
