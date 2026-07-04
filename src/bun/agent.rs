@@ -1104,9 +1104,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
 
                 if new_failed {
-                    // Rollback: kill any new instances we started, keep old ones
+                    // Rollback: kill any new instances we started, keep old ones.
+                    // These were grill-created but never inserted into supervisor
+                    // tracking, so release their ports here directly.
                     for new_id in &new_ids {
                         let _ = self.supervisor.grill.kill(new_id).await;
+                        if let Some(port) = new_ports.get(new_id).copied().flatten() {
+                            let _ = self.supervisor.port_allocator.release(port).await;
+                        }
                     }
                     // Record failed deploy in history
                     let entry = crate::meat::deploy_types::DeployHistoryEntry {

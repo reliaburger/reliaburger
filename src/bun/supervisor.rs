@@ -306,6 +306,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
             // Force-kill the process (SIGKILL, immediate, sets state to Stopped)
             let _ = self.grill.kill(id).await;
             self.health_checker.unregister(id);
+            // Return the instance's host port to the pool before dropping it,
+            // otherwise the allocation leaks until the agent restarts.
+            if let Some(instance) = self.instances.get(id)
+                && let Some(port) = instance.host_port
+            {
+                let _ = self.port_allocator.release(port).await;
+            }
             self.instances.remove(id);
         }
     }
@@ -503,6 +510,27 @@ mod tests {
         let mut spec = basic_app_spec(port);
         spec.replicas = Replicas::Fixed(n);
         spec
+    }
+
+    #[tokio::test]
+    async fn remove_app_releases_allocated_ports() {
+        let mut sup = test_supervisor();
+        let spec = app_spec_with_replicas(3, Some(8080));
+        sup.deploy_app("web", "default", &spec, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            sup.port_allocator.allocated_count().await,
+            3,
+            "each replica should allocate a port"
+        );
+
+        sup.remove_app("web", "default").await;
+        assert_eq!(
+            sup.port_allocator.allocated_count().await,
+            0,
+            "removing the app should release its ports"
+        );
     }
 
     // -- deploy_app -----------------------------------------------------------
