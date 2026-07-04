@@ -11,6 +11,25 @@ use tokio::io::AsyncWriteExt;
 
 use super::types::{Digest, PickleError};
 
+/// Reject any upload id that isn't in the exact shape we generate.
+///
+/// Ids come from `format!("{:032x}", rand::random::<u128>())`, so a valid id is
+/// 32 lowercase hex characters. Anything else — in particular a percent-decoded
+/// `../` sequence from the OCI upload URL — is refused before it can be joined
+/// into a filesystem path (see `upload_path`), closing a path-traversal that
+/// let a client append to or delete files outside the uploads directory.
+fn validate_upload_id(upload_id: &str) -> Result<(), PickleError> {
+    let valid = upload_id.len() == 32
+        && upload_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if valid {
+        Ok(())
+    } else {
+        Err(PickleError::InvalidUploadId(upload_id.to_string()))
+    }
+}
+
 /// Content-addressed blob store.
 ///
 /// Thread-safe: all operations use atomic file moves (no partial reads)
@@ -118,6 +137,7 @@ impl BlobStore {
         upload_id: &str,
         data: &[u8],
     ) -> Result<u64, PickleError> {
+        validate_upload_id(upload_id)?;
         let path = self.upload_path(upload_id);
         if !path.exists() {
             return Err(PickleError::UploadNotFound(upload_id.to_string()));
@@ -138,6 +158,7 @@ impl BlobStore {
         upload_id: &str,
         expected_digest: &Digest,
     ) -> Result<(), PickleError> {
+        validate_upload_id(upload_id)?;
         let upload_path = self.upload_path(upload_id);
         if !upload_path.exists() {
             return Err(PickleError::UploadNotFound(upload_id.to_string()));
@@ -167,6 +188,9 @@ impl BlobStore {
 
     /// Cancel an upload session, cleaning up the temp file.
     pub async fn cancel_upload(&self, upload_id: &str) {
+        if validate_upload_id(upload_id).is_err() {
+            return;
+        }
         let path = self.upload_path(upload_id);
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -336,6 +360,27 @@ mod tests {
         let (store, _dir) = test_store();
         let result = store.write_upload_chunk("nonexistent", b"data").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_id_with_traversal_is_rejected() {
+        let (store, dir) = test_store();
+
+        // A sentinel that lives outside the uploads/ directory. A traversal
+        // upload id (`../secret`) would otherwise let a client append to it.
+        let sentinel = dir.path().join("secret");
+        std::fs::write(&sentinel, b"original").unwrap();
+
+        for bad in ["../secret", "../../etc/passwd", "abc/def", "", "ABCDEF"] {
+            let err = store.write_upload_chunk(bad, b"pwned").await.unwrap_err();
+            assert!(
+                matches!(err, PickleError::InvalidUploadId(_)),
+                "expected InvalidUploadId for {bad:?}, got {err:?}"
+            );
+        }
+
+        // The sentinel must be untouched, and no file written outside uploads/.
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"original");
     }
 
     #[tokio::test]

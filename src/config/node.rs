@@ -225,6 +225,10 @@ pub struct ImagesSection {
     pub gc_interval_hours: u32,
     /// Port for the OCI Distribution API (Pickle registry).
     pub registry_port: u16,
+    /// Interface the registry binds to. Defaults to `127.0.0.1` (loopback) so
+    /// the registry is not exposed unauthenticated on all interfaces. Set to
+    /// `0.0.0.0` once cross-node replication (and auth) are wired.
+    pub registry_bind: String,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
 }
@@ -251,6 +255,7 @@ impl Default for ImagesSection {
             gc_retain_days: 7,
             gc_interval_hours: 1,
             registry_port: 5050,
+            registry_bind: "127.0.0.1".to_string(),
             trust_policy: TrustPolicySection::default(),
         }
     }
@@ -520,6 +525,23 @@ mod tests {
         let nc = NodeConfig::parse("").unwrap();
         assert!(!nc.images.trust_policy.require_signatures);
         assert!(nc.images.trust_policy.keys.is_empty());
+    }
+
+    #[test]
+    fn registry_binds_to_loopback_by_default() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.images.registry_bind, "127.0.0.1");
+        assert_eq!(nc.images.registry_port, 5050);
+    }
+
+    #[test]
+    fn registry_bind_is_configurable() {
+        let toml_str = r#"
+            [images]
+            registry_bind = "0.0.0.0"
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.images.registry_bind, "0.0.0.0");
     }
 
     #[test]

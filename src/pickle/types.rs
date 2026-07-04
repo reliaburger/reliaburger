@@ -406,6 +406,8 @@ pub enum PickleError {
     MissingLayer(Digest),
     #[error("upload session not found: {0}")]
     UploadNotFound(String),
+    #[error("invalid upload id: {0}")]
+    InvalidUploadId(String),
     #[error("digest mismatch: expected {expected}, got {actual}")]
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("replication failed: {0}")]

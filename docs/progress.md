@@ -239,11 +239,11 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 0 — Security & data-loss stop-the-bleed
 
-- [ ] `C1` Reject `..` components in OCI whiteout unpacking (host-file deletion via malicious layer)
-- [ ] `C2` Sanitise the pickle `upload_id` path segment (arbitrary file append/exfiltration)
-- [ ] `C4` Give the perimeter firewall its own nft table (or reconcile without flushing the container table)
-- [ ] `C5(d)` Decrypt `ENC[AGE:...]` secrets in the wired container-startup path
-- [ ] Bind the Pickle registry to loopback / require auth (it listens unauthenticated on `0.0.0.0`)
+- [x] `C1` Reject `..` components in OCI whiteout unpacking (host-file deletion via malicious layer) — `safe_join` in `grill/image.rs`
+- [x] `C2` Sanitise the pickle `upload_id` path segment (arbitrary file append/exfiltration) — `validate_upload_id` in `pickle/store.rs`, 400 in the handlers
+- [x] `C4` Give the perimeter firewall its own nft table — perimeter rules moved to `ip reliaburger_fw`, leaving the container `ip reliaburger` table untouched
+- [x] `C5(d)` Decrypt `ENC[AGE:...]` secrets in the wired container-startup path — plumbed via `generate_oci_spec_with_decryptor`; fails closed when no key is available (full decryption lights up with Stage 3 `wrapping_ikm`, L18)
+- [x] Bind the Pickle registry to loopback / require auth — `[images] registry_bind` defaults to `127.0.0.1`; token auth deferred to Stage 3
 
 ### Stage 1 — Correct the wired single-node path
 

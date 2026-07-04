@@ -277,6 +277,26 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Join `rel` onto `base`, rejecting any path that would escape `base`.
+///
+/// Only plain path components are allowed; absolute prefixes, root, and
+/// parent-dir (`..`) components are refused. Regular tar entries are sanitised
+/// by the tar crate's `unpack_in`, but whiteout targets are resolved by hand,
+/// so without this a layer entry such as `../../etc/.wh.passwd` would delete
+/// host files outside the rootfs.
+fn safe_join(base: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = base.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    out.starts_with(base).then_some(out)
+}
+
 /// Unpack OCI image layers (gzipped tarballs) into a rootfs directory.
 ///
 /// Layers are applied base-first (index 0 is the bottom layer).
@@ -338,7 +358,13 @@ pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), Image
             // Handle opaque whiteout: clear the entire parent directory
             if file_name == ".wh..wh..opq" {
                 if let Some(parent) = path.parent() {
-                    let target = rootfs.join(parent);
+                    let Some(target) = safe_join(rootfs, parent) else {
+                        eprintln!(
+                            "image: skipping opaque whiteout with unsafe path {}",
+                            path.display()
+                        );
+                        continue;
+                    };
                     if target.exists() {
                         // Remove all existing contents but keep the directory
                         for child in
@@ -366,7 +392,15 @@ pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), Image
             // Handle whiteout: delete the named file from a lower layer
             if let Some(deleted_name) = file_name.strip_prefix(".wh.") {
                 if let Some(parent) = path.parent() {
-                    let target = rootfs.join(parent).join(deleted_name);
+                    // Route the whole relative path through safe_join so neither
+                    // the parent nor a crafted `deleted_name` can escape rootfs.
+                    let Some(target) = safe_join(rootfs, &parent.join(deleted_name)) else {
+                        eprintln!(
+                            "image: skipping whiteout with unsafe path {}",
+                            path.display()
+                        );
+                        continue;
+                    };
                     if target.is_dir() {
                         let _ = std::fs::remove_dir_all(&target);
                     } else {
@@ -598,6 +632,27 @@ mod tests {
     }
 
     #[test]
+    fn whiteout_with_parent_traversal_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A sentinel file that lives *outside* the rootfs, as a sibling.
+        let sentinel = tmp.path().join("evil").join("target.txt");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"do not delete me").unwrap();
+
+        // A malicious layer whose whiteout entry tries to climb out of the
+        // rootfs (`../evil/.wh.target.txt`) to delete the sentinel.
+        let layer = tmp.path().join("evil-layer.tar.gz");
+        create_layer_with_raw_name(&layer, b"../evil/.wh.target.txt");
+
+        let rootfs = tmp.path().join("rootfs");
+        // Unpacking must succeed (a bad entry is skipped, not fatal)...
+        unpack_layers(&[layer], &rootfs).unwrap();
+        // ...and the out-of-rootfs sentinel must survive.
+        assert!(sentinel.exists(), "traversal whiteout escaped the rootfs");
+    }
+
+    #[test]
     fn unpack_preserves_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
 
@@ -620,6 +675,27 @@ mod tests {
 
     fn create_test_layer(path: &Path, files: &[(&str, &[u8])]) {
         create_test_layer_with_dirs(path, &[], files);
+    }
+
+    /// Build a one-entry layer whose name is written verbatim into the tar
+    /// header, bypassing the tar crate's own `..` rejection — needed to
+    /// simulate a malicious layer that a real registry could serve.
+    fn create_layer_with_raw_name(path: &Path, raw_name: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(encoder);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        if let Some(gnu) = header.as_gnu_mut() {
+            gnu.name[..raw_name.len()].copy_from_slice(raw_name);
+        }
+        header.set_cksum();
+        tar.append(&header, &[][..]).unwrap();
+
+        tar.into_inner().unwrap().finish().unwrap();
     }
 
     fn create_test_layer_with_dirs(path: &Path, dirs: &[&str], files: &[(&str, &[u8])]) {

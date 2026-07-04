@@ -458,7 +458,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start the Pickle OCI registry server
-    let registry_addr = format!("0.0.0.0:{}", config.images.registry_port);
+    let registry_addr = format!(
+        "{}:{}",
+        config.images.registry_bind, config.images.registry_port
+    );
     let pickle_dir = if std::fs::create_dir_all(&config.storage.images).is_ok() {
         config.storage.images.clone()
     } else {

@@ -81,10 +81,15 @@ pub fn generate_ruleset(config: &PerimeterConfig, cluster_nodes: &ClusterNodes) 
     // allow-members rule. Ensure the table exists, then delete it, so each
     // apply recreates the whole ruleset from a clean slate in one atomic
     // transaction.
-    rules.push_str("table ip reliaburger {}\n");
-    rules.push_str("delete table ip reliaburger\n");
+    //
+    // This is a table of its own (`reliaburger_fw`), separate from the
+    // `reliaburger` table that `grill::netns` uses for container port-mapping
+    // DNAT and masquerade. Flushing our own table on every reconcile must not
+    // wipe the NAT chains that keep running containers reachable.
+    rules.push_str("table ip reliaburger_fw {}\n");
+    rules.push_str("delete table ip reliaburger_fw\n");
 
-    rules.push_str("table ip reliaburger {\n");
+    rules.push_str("table ip reliaburger_fw {\n");
     rules.push_str("  chain input {\n");
     rules.push_str("    type filter hook input priority 0; policy accept;\n");
     rules.push('\n');
@@ -226,10 +231,25 @@ mod tests {
         // re-applying on a membership change (nft -f appends) doesn't stack
         // stale rules ahead of the fresh ones. The delete must come before
         // the real chain definition.
-        assert!(rules.contains("delete table ip reliaburger"));
-        let delete_pos = rules.find("delete table ip reliaburger").unwrap();
+        assert!(rules.contains("delete table ip reliaburger_fw"));
+        let delete_pos = rules.find("delete table ip reliaburger_fw").unwrap();
         let chain_pos = rules.find("chain input").unwrap();
         assert!(delete_pos < chain_pos);
+    }
+
+    #[test]
+    fn ruleset_uses_isolated_table_name() {
+        let config = default_config();
+        let nodes = cluster_with_nodes(&["10.0.1.1"]);
+        let rules = generate_ruleset(&config, &nodes);
+
+        // The perimeter firewall must live in its own table so that flushing it
+        // never touches the `reliaburger` table `grill::netns` uses for
+        // container DNAT/masquerade. Guard against a regression that would
+        // delete (and so wipe) that shared table.
+        assert!(rules.contains("table ip reliaburger_fw"));
+        assert!(!rules.contains("delete table ip reliaburger\n"));
+        assert!(!rules.contains("table ip reliaburger {")); // no bare container table
     }
 
     #[test]
