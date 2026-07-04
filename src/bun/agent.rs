@@ -30,6 +30,10 @@ use super::BunError;
 use super::probe::probe_health;
 use super::supervisor::WorkloadSupervisor;
 
+/// Maximum time an init container may run before the deploy fails. Bounds the
+/// init wait so a hung init can't wedge the agent event loop indefinitely.
+const INIT_TIMEOUT_SECS: u64 = 300;
+
 /// A progress event emitted during a deploy operation.
 ///
 /// Sent over an `mpsc` channel so the API layer can stream events
@@ -1038,11 +1042,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     self.spawn_log_forwarder(&new_id, app_name, namespace);
 
-                    // Health check: wait for process to be alive
-                    // Uses health_timeout from deploy config (default 60s), capped at 5s for demo speed
+                    // Health check: poll until the process is alive, returning
+                    // as soon as it's Running instead of always sleeping the
+                    // full window. Bounded by health_wait (capped at 5s).
+                    // TODO(Stage 2+): move rolling deploys off the event loop
+                    // entirely so even this bounded wait doesn't block the loop.
                     let wait = health_wait.min(std::time::Duration::from_secs(5));
-                    tokio::time::sleep(wait).await;
-                    match self.supervisor.grill.state(&new_id).await {
+                    let deadline = std::time::Instant::now() + wait;
+                    let mut probe = self.supervisor.grill.state(&new_id).await;
+                    while std::time::Instant::now() < deadline
+                        && !matches!(probe, Ok(crate::grill::state::ContainerState::Running))
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        probe = self.supervisor.grill.state(&new_id).await;
+                    }
+                    match probe {
                         Ok(crate::grill::state::ContainerState::Running) => {
                             let _ = events
                                 .send(ApplyEvent::Progress {
@@ -1493,13 +1507,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.supervisor.grill().create(&init_id, &init_oci).await?;
                 self.supervisor.grill().start(&init_id).await?;
 
-                // Wait for init container to complete
+                // Wait for the init container to complete, bounded by a timeout
+                // so a hung init can't wedge the agent event loop forever.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
                 let failed = loop {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     let state = self.supervisor.grill().state(&init_id).await?;
                     if state == ContainerState::Stopped {
                         let exit_code = self.supervisor.grill().exit_code(&init_id).await;
                         break exit_code != Some(0);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        // Timed out — kill the init container and fail the deploy.
+                        let _ = self.supervisor.grill().kill(&init_id).await;
+                        break true;
                     }
                 };
 
@@ -2285,25 +2307,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Spawn follow tasks for each instance
+        // Spawn a follow task per instance. The grill is Arc-backed and Clone,
+        // so each task owns a handle and streams concurrently — the agent event
+        // loop is never blocked waiting for a client to disconnect.
         for id in instance_ids {
-            let grill = self.supervisor.grill();
+            let grill = self.supervisor.grill().clone();
             let tx = lines.clone();
-            // follow_logs uses impl Future, so we need to call it inline.
-            // Spawn a task that calls follow_logs on the grill. Since Grill
-            // isn't object-safe, we can't box the future easily. Instead, we
-            // call follow_logs directly here for each instance. Because the
-            // agent's event loop would block, we just start the follow in a
-            // spawned task by calling it. But grill isn't 'static...
-            //
-            // Actually, the grill reference borrows self. We need to get a
-            // clone or Arc. ProcessGrill uses Arc internally, and follow_logs
-            // takes &self. Let's just call follow_logs here sequentially for
-            // one instance (the common case). For multiple instances, each
-            // follow would need to be spawned, but since follow_logs borrows
-            // &self, we call them one at a time. When the first one ends
-            // (process exits or channel closes), we move to the next.
-            grill.follow_logs(&id, tx).await;
+            tokio::spawn(async move {
+                grill.follow_logs(&id, tx).await;
+            });
         }
     }
 
@@ -2494,6 +2506,49 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn follow_logs_does_not_block_the_event_loop() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        // A long-running process whose follow would block the loop for 60s if
+        // handled inline.
+        let config = Config::parse(
+            "[app.sleeper]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
+        )
+        .unwrap();
+        let _ = send_deploy(&tx, config).await;
+
+        // Start following logs; never drain them.
+        let (line_tx, _line_rx) = mpsc::channel(16);
+        tx.send(AgentCommand::FollowLogs {
+            app_name: "sleeper".into(),
+            namespace: "default".into(),
+            tail: None,
+            lines: line_tx,
+        })
+        .await
+        .unwrap();
+
+        // A subsequent command must still be answered promptly.
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(3), resp_rx)
+            .await
+            .expect("event loop blocked by FollowLogs")
+            .unwrap();
+        assert!(!status.is_empty(), "sleeper should be listed");
+
+        shutdown.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
     }
 
     #[tokio::test]
