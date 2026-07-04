@@ -1837,15 +1837,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
     async fn drive_pending_restarts(&mut self) {
-        let pending_restarts: Vec<(InstanceId, crate::grill::oci::OciSpec)> = self
+        #[allow(clippy::type_complexity)]
+        let pending_restarts: Vec<(
+            InstanceId,
+            crate::grill::oci::OciSpec,
+            String,
+            String,
+            Option<u16>,
+        )> = self
             .supervisor
             .list_instances()
             .iter()
             .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
-            .filter_map(|i| i.oci_spec.as_ref().map(|spec| (i.id.clone(), spec.clone())))
+            .filter_map(|i| {
+                i.oci_spec.as_ref().map(|spec| {
+                    (
+                        i.id.clone(),
+                        spec.clone(),
+                        i.app_name.clone(),
+                        i.namespace.clone(),
+                        i.host_port,
+                    )
+                })
+            })
             .collect();
 
-        for (id, oci_spec) in pending_restarts {
+        for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
+            // Tear down the old container first. Without this, the same-id
+            // create is rejected (ProcessGrill: stale-Running entry) or fails
+            // (runc/apple: container still exists), leaving the instance wedged
+            // in Preparing and the old process leaked.
+            let _ = self.supervisor.grill().kill(&id).await;
+
             // Pending → Preparing
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
                 match instance.state.transition_to(ContainerState::Preparing) {
@@ -1874,6 +1897,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             if self.supervisor.grill().start(&id).await.is_err() {
                 continue;
+            }
+            // Re-wire the restarted instance: stream its logs and keep it routable.
+            self.spawn_log_forwarder(&id, &app_name, &namespace);
+            if let Some(port) = host_port {
+                let backend = crate::onion::types::BackendInstance {
+                    instance_id: id.0.clone(),
+                    node_ip: std::net::Ipv4Addr::LOCALHOST,
+                    host_port: port,
+                    healthy: true,
+                };
+                let _ = self.service_map.add_backend(&app_name, backend);
             }
 
             // Starting → HealthWait, then Running if no health checks
