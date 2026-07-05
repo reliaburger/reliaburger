@@ -11,19 +11,55 @@ use openraft::{
     EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership,
 };
+use redb::{Database, TableDefinition};
 use tokio::sync::RwLock;
 
 use super::types::{CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig};
+
+/// Persisted snapshot: `data` = JSON of `DesiredState` (which itself carries
+/// `last_applied_log` + `last_membership`), `index` = snapshot counter.
+const SNAPSHOT: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_snapshot");
+const SNAP_DATA_KEY: &str = "data";
+const SNAP_INDEX_KEY: &str = "index";
 
 // ---------------------------------------------------------------------------
 // Inner state
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct StateMachineInner {
     state: DesiredState,
     snapshot_index: u64,
     snapshot_data: Option<Vec<u8>>,
+    /// When set, snapshots are persisted here so applied state survives a
+    /// restart (the durable log replays only the post-snapshot tail).
+    db: Option<Arc<Database>>,
+}
+
+// Manual Debug: `redb::Database` isn't `Debug`, and its contents aren't useful
+// to print anyway.
+impl std::fmt::Debug for StateMachineInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateMachineInner")
+            .field("snapshot_index", &self.snapshot_index)
+            .field("has_snapshot", &self.snapshot_data.is_some())
+            .field("durable", &self.db.is_some())
+            .finish()
+    }
+}
+
+/// Write the latest snapshot (data + index) to redb, fsyncing on commit.
+// `redb::Error` is large but dictated by the crate; boxing it here buys nothing.
+#[allow(clippy::result_large_err)]
+fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::Error> {
+    let wtx = db.begin_write()?;
+    {
+        let mut t = wtx.open_table(SNAPSHOT)?;
+        t.insert(SNAP_DATA_KEY, data)?;
+        t.insert(SNAP_INDEX_KEY, index.to_le_bytes().as_slice())?;
+    }
+    wtx.commit()?;
+    Ok(())
 }
 
 impl StateMachineInner {
@@ -193,9 +229,48 @@ pub struct CouncilStateMachine {
 }
 
 impl CouncilStateMachine {
-    /// Create a new empty state machine.
+    /// Create a new empty in-memory state machine (tests).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a state machine backed by `db`, loading any persisted snapshot.
+    ///
+    /// On restart the loaded snapshot restores the applied state up to its
+    /// boundary; openraft then replays the durable log's post-snapshot tail.
+    #[allow(clippy::result_large_err)]
+    pub fn with_store(db: Arc<Database>) -> Result<Self, redb::Error> {
+        // Materialise the table so reads on a fresh store don't error.
+        let wtx = db.begin_write()?;
+        {
+            wtx.open_table(SNAPSHOT)?;
+        }
+        wtx.commit()?;
+
+        let mut inner = StateMachineInner::default();
+        {
+            let rtx = db.begin_read()?;
+            let t = rtx.open_table(SNAPSHOT)?;
+            if let Some(data) = t.get(SNAP_DATA_KEY)? {
+                let bytes = data.value().to_vec();
+                // A corrupt/incompatible snapshot is treated as absent rather
+                // than fatal — the log can still replay from the start.
+                if let Ok(state) = serde_json::from_slice::<DesiredState>(&bytes) {
+                    inner.state = state;
+                    inner.snapshot_data = Some(bytes);
+                }
+            }
+            if let Some(idx) = t.get(SNAP_INDEX_KEY)? {
+                let v = idx.value();
+                if v.len() == 8 {
+                    inner.snapshot_index = u64::from_le_bytes(v.try_into().unwrap());
+                }
+            }
+        }
+        inner.db = Some(db);
+        Ok(Self {
+            inner: Arc::new(RwLock::new(inner)),
+        })
     }
 
     /// Read the current desired state.
@@ -286,7 +361,13 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         guard.state.last_applied_log = meta.last_log_id;
         guard.state.last_membership = meta.last_membership.clone();
         guard.snapshot_index += 1;
-        guard.snapshot_data = Some(data);
+        guard.snapshot_data = Some(data.clone());
+
+        // Persist the installed snapshot so it survives a restart too.
+        if let Some(db) = &guard.db {
+            persist_snapshot(db, &data, guard.snapshot_index)
+                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+        }
         Ok(())
     }
 
@@ -331,6 +412,12 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
         guard.snapshot_index += 1;
         let snapshot_id = format!("mem-{}", guard.snapshot_index);
         guard.snapshot_data = Some(data.clone());
+
+        // Persist so applied state survives a restart.
+        if let Some(db) = &guard.db {
+            persist_snapshot(db, &data, guard.snapshot_index)
+                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+        }
 
         let meta = SnapshotMeta {
             last_log_id: guard.state.last_applied_log,
@@ -397,6 +484,43 @@ mod tests {
 
         let state = sm.desired_state().await;
         assert_eq!(state.apps.get(&app_id).unwrap().image, spec.image);
+    }
+
+    #[tokio::test]
+    async fn state_machine_snapshot_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sm.redb");
+        let app_id = AppId::new("web", "prod");
+        let spec = AppSpec {
+            image: Some("persisted:v1".to_string()),
+            ..default_spec()
+        };
+
+        // First run: apply an entry, then snapshot (persists to redb).
+        {
+            let db = std::sync::Arc::new(Database::create(&path).unwrap());
+            let mut sm = CouncilStateMachine::with_store(db).unwrap();
+            sm.apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec.clone()),
+                },
+            )])
+            .await
+            .unwrap();
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.build_snapshot().await.unwrap();
+        }
+
+        // Reopen: the applied state is restored from the persisted snapshot.
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let mut sm = CouncilStateMachine::with_store(db).unwrap();
+        let state = sm.desired_state().await;
+        assert_eq!(state.apps.get(&app_id).unwrap().image, spec.image);
+        let (last_applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(last_applied.map(|l| l.index), Some(1));
     }
 
     #[tokio::test]

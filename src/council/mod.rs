@@ -10,6 +10,7 @@
 /// - `MemLogStore` — in-memory Raft log storage
 /// - `CouncilStateMachine` — applies entries to desired cluster state
 /// - `InMemoryRaftRouter` — in-memory network for testing
+pub mod durable_log;
 pub mod log_store;
 pub mod network;
 pub mod node;

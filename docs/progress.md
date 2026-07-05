@@ -261,7 +261,7 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 2 — Cluster safety
 
-- [ ] `C3` Durable Raft log + vote; don't `initialize()` a previously-bootstrapped/non-empty node (split-brain) — **its own next stage (redb-backed, needs Lima restart-testing)**
+- [x] `C3` Durable Raft log + vote + state-machine snapshot (redb); bootstrap only when the store is fresh; re-seed gossip from the restored membership on restart. **Closes the last of the five review criticals.** Lima-verified: killing + restarting the bootstrap node no longer forms a second leader — it restores its durable `{1,2,3}` membership and rejoins as a follower (all nodes agree on one leader).
 - [x] `H4` SWIM: disseminate Suspect with the target's incarnation (not the prober's)
 - [x] `H5` SWIM: refute being declared `Dead`, not just `Suspect`
 - [x] `H6` SWIM: time suspicion from `state_changed`, not `last_ack`

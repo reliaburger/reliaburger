@@ -12,6 +12,7 @@ use openraft::{ChangeMembers, Raft, RaftNetworkFactory};
 use tokio::sync::watch;
 
 use super::CouncilError;
+#[cfg(test)]
 use super::log_store::MemLogStore;
 use super::state_machine::CouncilStateMachine;
 use super::types::{
@@ -58,14 +59,18 @@ impl CouncilNode {
     /// cluster. Call `initialize()` on the first node, then use
     /// `add_learner()` + `change_membership()` from the leader to
     /// grow the council.
-    pub async fn new<N: RaftNetworkFactory<TypeConfig>>(
+    pub async fn new<N, LS>(
         raft_id: u64,
         config: CouncilConfig,
         network: N,
-        log_store: MemLogStore,
+        log_store: LS,
         state_machine: CouncilStateMachine,
         wrapping_ikm: Option<[u8; 32]>,
-    ) -> Result<Self, CouncilError> {
+    ) -> Result<Self, CouncilError>
+    where
+        N: RaftNetworkFactory<TypeConfig>,
+        LS: openraft::storage::RaftLogStorage<TypeConfig>,
+    {
         let raft_config = Arc::new(
             config
                 .to_openraft_config()
