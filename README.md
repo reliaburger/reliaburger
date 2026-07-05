@@ -107,7 +107,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,595 tests across 11 completed phases.** See [progress.md](docs/progress.md) for the full checklist.
+**1,634 tests across 11 completed phases**, plus the Phase 11b review-and-hardening pass now closing the gap between "implemented" and "wired". See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -122,6 +122,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 9. User Experience | Done | 1,271 |
 | 10. Advanced Security | Done | 1,448 |
 | 11. Advanced Observability | Done | 1,595 |
+| 11b. Review & hardening | In progress | 1,634 |
 
 ## The book
 
