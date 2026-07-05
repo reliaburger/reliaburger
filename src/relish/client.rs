@@ -30,15 +30,52 @@ fn classify_error(e: reqwest::Error) -> RelishError {
     }
 }
 
+/// The `--token` CLI override, set once from `main` before any client is built.
+static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Record the `--token` CLI flag. Call once, in `main`, before dispatch.
+pub fn set_cli_token(token: Option<String>) {
+    let _ = CLI_TOKEN.set(token);
+}
+
+/// Resolve the auth token: the `--token` flag takes precedence over the
+/// `RELIABURGER_TOKEN` environment variable.
+fn resolve_token() -> Option<String> {
+    pick_token(CLI_TOKEN.get(), std::env::var("RELIABURGER_TOKEN").ok())
+}
+
+/// Precedence rule for [`resolve_token`], split out to be testable without the
+/// process-global flag and environment. A present `--token` flag wins;
+/// otherwise fall back to the environment value.
+fn pick_token(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<String> {
+    match cli_flag {
+        Some(Some(t)) => Some(t.clone()),
+        _ => env,
+    }
+}
+
 impl BunClient {
-    /// Create a client pointing at the given base URL.
+    /// Create a client pointing at the given base URL, attaching the resolved
+    /// auth token (`--token` flag or `RELIABURGER_TOKEN`) to every request.
     pub fn new(base_url: &str) -> Self {
+        Self::new_with_token(base_url, resolve_token().as_deref())
+    }
+
+    /// Create a client with an explicit token (or none). Used by tests; `new`
+    /// resolves the token from the flag/env instead.
+    pub fn new_with_token(base_url: &str, token: Option<&str>) -> Self {
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
+        if let Some(t) = token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+                builder = builder.default_headers(headers);
+            }
+        }
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .expect("failed to create HTTP client"),
+            client: builder.build().expect("failed to create HTTP client"),
         }
     }
 
@@ -876,5 +913,76 @@ impl BunClient {
             .as_str()
             .unwrap_or("batch submitted")
             .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Start a throwaway server that records the Authorization header it sees on
+    /// `GET /v1/health`. Returns its base URL and the captured value.
+    async fn capture_server() -> (String, Arc<Mutex<Option<String>>>) {
+        use axum::{Router, http::HeaderMap, routing::get};
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cap = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/v1/health",
+            get(move |headers: HeaderMap| {
+                let cap = Arc::clone(&cap);
+                async move {
+                    *cap.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), captured)
+    }
+
+    #[tokio::test]
+    async fn client_attaches_bearer_header_when_token_present() {
+        let (url, captured) = capture_server().await;
+        let client = BunClient::new_with_token(&url, Some("rbrg_abc"));
+        client.health().await.unwrap();
+        assert_eq!(captured.lock().unwrap().as_deref(), Some("Bearer rbrg_abc"));
+    }
+
+    #[tokio::test]
+    async fn client_sends_no_authorization_without_a_token() {
+        let (url, captured) = capture_server().await;
+        let client = BunClient::new_with_token(&url, None);
+        client.health().await.unwrap();
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_token_prefers_flag_over_env() {
+        let flag = Some("rbrg_flag".to_string());
+        assert_eq!(
+            pick_token(Some(&flag), Some("rbrg_env".to_string())),
+            Some("rbrg_flag".to_string())
+        );
+        // Flag explicitly absent -> fall back to env.
+        assert_eq!(
+            pick_token(Some(&None), Some("rbrg_env".to_string())),
+            Some("rbrg_env".to_string())
+        );
+        // Flag never set -> env.
+        assert_eq!(
+            pick_token(None, Some("rbrg_env".to_string())),
+            Some("rbrg_env".to_string())
+        );
+        // Neither -> none.
+        assert_eq!(pick_token(None, None), None);
     }
 }

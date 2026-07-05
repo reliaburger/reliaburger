@@ -17,6 +17,10 @@ struct Cli {
     #[arg(long, default_value = "human", global = true)]
     output: OutputFormat,
 
+    /// API token for authenticating to the agent. Overrides `RELIABURGER_TOKEN`.
+    #[arg(long, global = true)]
+    token: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -499,6 +503,9 @@ enum FaultAction {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Record the --token override (if any) before any client is built.
+    reliaburger::relish::client::set_cli_token(cli.token.clone());
 
     let result = match cli.command {
         Command::Apply { ref path } => commands::apply(path, cli.output).await,
@@ -1271,5 +1278,15 @@ mod tests {
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
         assert!(matches!(cli.command, Command::Batch { .. }));
+    }
+
+    #[test]
+    fn token_flag_parses_globally() {
+        // --token is accepted after the subcommand (global).
+        let cli = parse(&["relish", "status", "--token", "rbrg_abc"]).unwrap();
+        assert_eq!(cli.token.as_deref(), Some("rbrg_abc"));
+        // Absent by default.
+        let cli = parse(&["relish", "status"]).unwrap();
+        assert!(cli.token.is_none());
     }
 }

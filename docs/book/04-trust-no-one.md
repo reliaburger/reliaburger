@@ -426,6 +426,43 @@ Notice we lean on the durable store to make this idempotent. We don't track "hav
 
 The lesson is one every distributed system eventually teaches. "Implemented and tested" is not "working". A unit test proves a function does what it says when you call it with the right arguments. It says nothing about whether anything ever calls it with the right arguments. The wiring is the system.
 
+## The middleware nobody attached
+
+Loading the keys made the crypto *work*. It didn't make anything *enforced*. We had an `auth_middleware` — a proper axum layer that reads a Bearer token, validates the Argon2 hash, checks the role. We had tokens that now persisted in Raft. And the two were never introduced to each other. The router was built without the layer. `relish` sent no `Authorization` header. You could create a token, admire it, and then watch every unauthenticated request sail straight through.
+
+Turning it on sounds like one line: `.layer(auth_middleware)`. It wasn't, for three reasons worth walking through, because each is a design decision the naive version gets wrong.
+
+**When is the door locked?** The middleware already had a rule: if no tokens exist, allow everything. That reads like a bug ("fails open!") but it's the right default for a system you bootstrap yourself. A brand-new cluster has no tokens, and you need *some* way to create the first one. So the door is open until you create a token, and locks the moment you do. We kept that, but tightened it: the check keys on *user* tokens, not on the store being non-empty, because of the second problem.
+
+**Who authenticates the cluster to itself?** When you ask node A for logs that live partly on node B, A calls B's API. Turn on auth and that internal call gets a 401 — the cluster locks itself out. A needs a credential B will accept. We didn't want to store one (a stored token would make the store non-empty and slam the bootstrap door shut before you'd made a single real token). So the service token is *derived*, not stored:
+
+```rust
+pub fn derive_service_token(ikm: &[u8; 32]) -> Result<String, TokenError> {
+    let bytes = crypto::hkdf_derive_key(ikm, &SERVICE_TOKEN_SALT, "reliaburger-service-token-v1")?;
+    Ok(format!("rbrg_{}", hex::encode(bytes)))
+}
+```
+
+Every node runs this over the same master key (Stage 3a put it on every node) and gets the same string. The middleware is handed that string and accepts it as a `__system` principal, in constant time, alongside the stored-token check. So the cluster authenticates to itself with a shared secret nobody had to distribute — it falls out of the key they already share. And because it's never in the token store, it doesn't count as a "user token", so the bootstrap door stays open until *you* create the first real one.
+
+**How does the lock notice a new key?** We seeded the middleware's token store once, at startup. But tokens are created at runtime, on the leader, into Raft. A store loaded once at boot never sees them — you'd create a token and enforcement would never engage until a restart. So a small task re-reads the tokens from Raft every few seconds:
+
+```rust
+tokio::spawn(async move {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = refresh_shutdown.cancelled() => break,
+            _ = ticker.tick() => refresh_token_store(&refresh_store, &refresh_council).await,
+        }
+    }
+});
+```
+
+The `select!` is the idiom for "do this on a timer, but drop everything the moment we're told to shut down": whichever branch's future finishes first wins, and a cancelled `CancellationToken` resolves immediately. The five-second lag between creating a token and it being enforced is real, and deliberate — a poll is far simpler than threading a change-notification out of the Raft state machine, and five seconds is nothing for an operation you do by hand.
+
+Three problems, none of them the crypto. Attaching a middleware is trivial; deciding what happens during bootstrap, how the system talks to itself once locked, and how the lock learns about new keys is the actual work. Same lesson as before, one layer up: the wiring is the system.
+
 ## What Rust taught us
 
 Phase 4 is where Rust's ownership model really earns its keep. Cryptographic key material is the poster child for "use after free" and "double use" bugs. In C, you'd need to manually track which functions own which keys and when to zero them. In Rust, ownership rules enforce this automatically.
