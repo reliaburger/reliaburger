@@ -553,7 +553,15 @@ async fn logs_cross_node_handler(
 
         // Fan out to all nodes
         let timeout = std::time::Duration::from_secs(10);
-        match fan_out_query(&log_query, &node_urls, &state.http_client, timeout).await {
+        match fan_out_query(
+            &log_query,
+            &node_urls,
+            &state.http_client,
+            timeout,
+            state.service_token.as_deref(),
+        )
+        .await
+        {
             Ok(mut entries) => {
                 // Apply tail after merge (fan_out already merge-sorted)
                 if let Some(tail) = query.tail

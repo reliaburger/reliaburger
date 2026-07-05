@@ -61,9 +61,17 @@ pub async fn fan_out_cluster_query(
     council_urls: &[String],
     client: &reqwest::Client,
     timeout: Duration,
+    service_token: Option<&str>,
 ) -> MetricsQueryResult {
-    let (data_sources, warnings) =
-        fan_out_to_urls(query, council_urls, "/v1/metrics/rollup", client, timeout).await;
+    let (data_sources, warnings) = fan_out_to_urls(
+        query,
+        council_urls,
+        "/v1/metrics/rollup",
+        client,
+        timeout,
+        service_token,
+    )
+    .await;
 
     MetricsQueryResult {
         data: merge_cluster_results(data_sources),
@@ -80,9 +88,17 @@ pub async fn fan_out_app_query(
     node_urls: &[String],
     client: &reqwest::Client,
     timeout: Duration,
+    service_token: Option<&str>,
 ) -> MetricsQueryResult {
-    let (data_sources, warnings) =
-        fan_out_to_urls(query, node_urls, "/v1/metrics", client, timeout).await;
+    let (data_sources, warnings) = fan_out_to_urls(
+        query,
+        node_urls,
+        "/v1/metrics",
+        client,
+        timeout,
+        service_token,
+    )
+    .await;
 
     MetricsQueryResult {
         data: merge_metrics_results(data_sources),
@@ -97,6 +113,7 @@ async fn fan_out_to_urls(
     path: &str,
     client: &reqwest::Client,
     timeout: Duration,
+    service_token: Option<&str>,
 ) -> (Vec<Vec<MetricsQueryRow>>, Vec<QueryWarning>) {
     let mut handles = Vec::new();
 
@@ -109,6 +126,7 @@ async fn fan_out_to_urls(
         let end = query.end;
         let client = client.clone();
         let node_url = url.clone();
+        let token = service_token.map(str::to_string);
 
         handles.push(tokio::spawn(async move {
             let mut params = vec![format!("start={start}"), format!("end={end}")];
@@ -120,7 +138,8 @@ async fn fan_out_to_urls(
             }
             let req_url = format!("{endpoint}?{}", params.join("&"));
 
-            let resp = tokio::time::timeout(timeout, client.get(&req_url).send()).await;
+            let request = crate::sesame::auth::bearer_get(&client, &req_url, token.as_deref());
+            let resp = tokio::time::timeout(timeout, request.send()).await;
 
             match resp {
                 Ok(Ok(r)) if r.status().is_success() => {

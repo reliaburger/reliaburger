@@ -206,6 +206,21 @@ pub fn authorize(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Res
     }
 }
 
+/// Build a GET request builder, attaching a `Bearer` token when present.
+///
+/// Cross-node fan-out uses this to present the internal service token to peers,
+/// so their auth layer accepts the call as the system principal.
+pub fn bearer_get(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => client.get(url).bearer_auth(t),
+        None => client.get(url),
+    }
+}
+
 /// Helper to extract the `AuthContext` from a request's extensions.
 ///
 /// Returns `None` in pre-init mode (when no tokens are configured
@@ -371,5 +386,26 @@ mod tests {
         let state = AuthState::new(store, Some("rbrg_service".to_string()));
         let status = status_of(guarded_router(state), Some("Bearer rbrg_nope")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn bearer_get_sets_authorization_when_token_present() {
+        let client = reqwest::Client::new();
+        let req = bearer_get(&client, "http://x/v1/status", Some("rbrg_abc"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer rbrg_abc"
+        );
+    }
+
+    #[test]
+    fn bearer_get_omits_authorization_when_token_absent() {
+        let client = reqwest::Client::new();
+        let req = bearer_get(&client, "http://x/v1/status", None)
+            .build()
+            .unwrap();
+        assert!(req.headers().get("authorization").is_none());
     }
 }

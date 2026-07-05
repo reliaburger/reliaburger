@@ -103,7 +103,7 @@ async fn three_nodes_merge_sorted() {
 
     let client = reqwest::Client::new();
     let timeout = std::time::Duration::from_secs(5);
-    let result = fan_out_query(&query, &[url1, url2, url3], &client, timeout)
+    let result = fan_out_query(&query, &[url1, url2, url3], &client, timeout, None)
         .await
         .unwrap();
 
@@ -148,6 +148,7 @@ async fn deduplicates_overlapping_entries() {
         &[url1, url2],
         &client,
         std::time::Duration::from_secs(5),
+        None,
     )
     .await
     .unwrap();
@@ -193,6 +194,7 @@ async fn grep_filter_across_nodes() {
         &[url1, url2],
         &client,
         std::time::Duration::from_secs(5),
+        None,
     )
     .await
     .unwrap();
@@ -227,6 +229,7 @@ async fn partial_results_when_node_unreachable() {
         &[url1, url2],
         &client,
         std::time::Duration::from_secs(2),
+        None,
     )
     .await
     .unwrap();
@@ -259,6 +262,7 @@ async fn time_range_filter_across_nodes() {
         &[url1, url2],
         &client,
         std::time::Duration::from_secs(5),
+        None,
     )
     .await
     .unwrap();
