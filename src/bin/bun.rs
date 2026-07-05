@@ -161,6 +161,9 @@ async fn main() -> anyhow::Result<()> {
     let (log_tx, mut log_rx) =
         tokio::sync::mpsc::channel::<reliaburger::ketchup::types::LogRecord>(1024);
     let _cluster_runtime;
+    // Cloned out of the ClusterHandle before it's moved into the agent, so the
+    // API router can expose council-backed endpoints (JWKS, tokens, secrets).
+    let mut api_council: Option<Arc<reliaburger::council::CouncilNode>> = None;
     let mut agent = if cli.cluster {
         let params = cluster_params_from_config(&config)?;
         println!(
@@ -173,10 +176,26 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
         _cluster_runtime = Some(cluster_runtime);
+        api_council = handle.council.clone();
         BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
     } else {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
+    };
+
+    // Seed the auth token store once from the council's SecurityState. The auth
+    // middleware isn't attached yet (Stage 3b), so a one-shot load suffices:
+    // `token list` reads tokens live from the council, and tokens only need to
+    // enter this store once 3b turns enforcement on.
+    let api_token_store = if let Some(council) = &api_council {
+        let store = reliaburger::sesame::auth::new_token_store();
+        let tokens = council.security_state().await.api_tokens;
+        if !tokens.is_empty() {
+            *store.write().await = tokens;
+        }
+        Some(store)
+    } else {
+        None
     };
     agent.set_log_sink(log_tx);
     let deploy_history = agent.deploy_history_handle();
@@ -437,6 +456,8 @@ async fn main() -> anyhow::Result<()> {
         Some(deploy_history),
         Some(Arc::clone(&pickle_catalog)),
         alerts.clone(),
+        api_council.clone(),
+        api_token_store.clone(),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
