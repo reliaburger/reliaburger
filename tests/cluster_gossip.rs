@@ -81,6 +81,7 @@ async fn start_node(
             },
             seeds,
             wrapping_ikm: None,
+            bootstrap_security_state: None,
             data_dir,
         },
         shutdown.clone(),
