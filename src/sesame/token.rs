@@ -139,10 +139,55 @@ pub fn find_valid_token<'a>(
     Err(TokenError::ValidationFailed)
 }
 
+/// Fixed HKDF salt for the internal service token. The salt may be public;
+/// the security comes from the master key (`ikm`) staying secret.
+const SERVICE_TOKEN_SALT: [u8; 32] = *b"reliaburger-service-token-salt!!";
+
+/// Derive the cluster's internal service token from the master key.
+///
+/// Deterministic: every node derives the same token from the same `ikm` (the
+/// shared master secret loaded from `master.key`), so one node's cross-node
+/// fan-out call authenticates on any other node. It is never stored in the
+/// `SecurityState` — it's a side-channel credential the middleware accepts
+/// directly, so it doesn't count towards the "any user tokens?" check that
+/// gates enforcement.
+pub fn derive_service_token(ikm: &[u8; 32]) -> Result<String, TokenError> {
+    let bytes =
+        super::crypto::hkdf_derive_key(ikm, &SERVICE_TOKEN_SALT, "reliaburger-service-token-v1")
+            .map_err(|e| TokenError::GenerationFailed(e.to_string()))?;
+    Ok(format!("rbrg_{}", hex::encode(bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn service_token_is_deterministic_for_the_same_ikm() {
+        let ikm = [9u8; 32];
+        assert_eq!(
+            derive_service_token(&ikm).unwrap(),
+            derive_service_token(&ikm).unwrap()
+        );
+    }
+
+    #[test]
+    fn service_token_differs_for_different_ikm() {
+        assert_ne!(
+            derive_service_token(&[1u8; 32]).unwrap(),
+            derive_service_token(&[2u8; 32]).unwrap()
+        );
+    }
+
+    #[test]
+    fn service_token_carries_the_rbrg_prefix() {
+        assert!(
+            derive_service_token(&[7u8; 32])
+                .unwrap()
+                .starts_with("rbrg_")
+        );
+    }
 
     #[test]
     fn create_token_produces_unique_values() {
