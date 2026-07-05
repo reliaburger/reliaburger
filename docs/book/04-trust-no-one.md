@@ -375,6 +375,57 @@ All three intermediates sign directly from the root with `BasicConstraints::Cons
 
 The root keypair is available during this function (we need it to sign the intermediates) but it's not stored anywhere persistent. After `generate_ca_hierarchy` returns, the caller seals the root key with `age` and then drops it from memory. From that point on, the root key only exists encrypted on disk.
 
+## The keys nobody was holding
+
+Here's an uncomfortable thing we found much later, reviewing our own work. Every primitive in this chapter was implemented, tested, and correct. And almost none of it did anything at runtime.
+
+The reason was mundane. All the CA operations, the OIDC signing, the secret decryption at container startup, need one input: the 32-byte master secret, the `wrapping_ikm`. `relish init` generated it and wrote it to `{cluster}-master.key`. The running agent? It hardcoded `wrapping_ikm: None` with a `// TODO` next to it. So `sign_workload_csr` reached the line where it unwraps the CA key, found `None`, and bailed out with "no wrapping IKM available". The crypto was a beautifully built engine with no fuel line.
+
+Two symptoms followed from the same root. The bootstrap `SecurityState` — the CAs, the age keypair, the OIDC config — was never loaded into Raft either, so `/v1/identity/jwks` returned 503 and `relish token list` had nothing to list. And the dev cluster handed out no key material at all, so there was nothing to load even if we'd wired the loading.
+
+Fixing it is not glamorous, which is exactly why it's worth showing. First, a config section pointing the node at its secrets:
+
+```rust
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecuritySection {
+    pub master_key_path: Option<PathBuf>,
+    pub bootstrap_path: Option<PathBuf>,
+}
+```
+
+Both fields are `Option<PathBuf>`. A node with neither set still boots — that's the single-node case, no cluster, no PKI. A node with `master_key_path` set loads the key or dies trying. That "or dies trying" matters. A node told to load security material and then quietly booting *without* it is the worst outcome: it looks secure and isn't. So the loader fails closed, and it fails closed on file permissions too:
+
+```rust
+let mode = meta.permissions().mode();
+// Any group (0o070) or other (0o007) permission bit set is too open.
+if mode & 0o077 != 0 {
+    return Err(BootstrapError::PermissionsTooOpen { path: path.to_path_buf(), mode: mode & 0o777 });
+}
+```
+
+A master key that the whole box can read is a leaked master key. We refuse to load one.
+
+The `Option` then flows all the way through. `cluster_params_from_config` turns the two paths into an `Option<[u8; 32]>` and an `Option<Box<SecurityState>>`, and both ride into the runtime on the `ClusterParams` struct. On a genuinely fresh bootstrap — no seeds, and the durable Raft store from Chapter 2 reports itself empty — the node seeds the `SecurityState` into Raft exactly once:
+
+```rust
+if params.seeds.is_empty() && store_fresh {
+    let mut members = BTreeMap::new();
+    members.insert(raft_id, self_info.clone());
+    let _ = council.initialize(members).await;
+
+    if let Some(state) = &params.bootstrap_security_state
+        && let Err(e) = seed_bootstrap_state(&council, state).await
+    {
+        eprintln!("cluster: failed to seed security bootstrap state: {e}");
+    }
+}
+```
+
+Notice we lean on the durable store to make this idempotent. We don't track "have I seeded yet?" in a flag. A restarted node has a populated store, `store_fresh` is false, and the whole block is skipped. The `let Some(...) && let Err(...)` is Rust's `let`-chain: bind the state if it's there, run the seed, and only take the branch if it failed. From Raft, the state replicates to every node that joins, so only the bootstrap node ever needs the bootstrap file. The joiners get the master key (to unwrap their own operations) and read the rest out of consensus.
+
+The lesson is one every distributed system eventually teaches. "Implemented and tested" is not "working". A unit test proves a function does what it says when you call it with the right arguments. It says nothing about whether anything ever calls it with the right arguments. The wiring is the system.
+
 ## What Rust taught us
 
 Phase 4 is where Rust's ownership model really earns its keep. Cryptographic key material is the poster child for "use after free" and "double use" bugs. In C, you'd need to manually track which functions own which keys and when to zero them. In Rust, ownership rules enforce this automatically.
