@@ -77,6 +77,9 @@ pub struct ClusterParams {
     pub seeds: Vec<SocketAddr>,
     /// Master secret for unwrapping CA keys during council operations.
     pub wrapping_ikm: Option<[u8; 32]>,
+    /// Initial `SecurityState` to seed into Raft on a fresh bootstrap. Only the
+    /// bootstrap node sets this; it replicates to everyone else through Raft.
+    pub bootstrap_security_state: Option<Box<crate::sesame::types::SecurityState>>,
     /// Node data directory; the durable Raft log/snapshot live under `{data_dir}/raft/`.
     pub data_dir: std::path::PathBuf,
 }
@@ -208,6 +211,18 @@ pub async fn start(
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
         let _ = council.initialize(members).await;
+
+        // Seed the initial SecurityState (CAs, age keys, OIDC config) into Raft
+        // once, on this bootstrap node. It then replicates to every node that
+        // joins. Durable Raft (C3) makes this idempotent: a restart has a
+        // populated store, skips this whole block, and never re-seeds.
+        if let Some(state) = &params.bootstrap_security_state
+            && let Err(e) = seed_bootstrap_state(&council, state).await
+        {
+            // The cluster still forms without CA material; log loudly rather
+            // than abort so a seed failure is diagnosable, not silent.
+            eprintln!("cluster: failed to seed security bootstrap state: {e}");
+        }
     }
 
     let raft_metrics_rx = council.metrics();
@@ -319,6 +334,33 @@ fn spawn_leader_target_maintainer(
             }
         }
     });
+}
+
+/// Seed the initial `SecurityState` into Raft on a freshly bootstrapped
+/// cluster.
+///
+/// Called once, on the bootstrap node, immediately after `initialize`. Retries
+/// briefly while leadership settles: `client_write` can race the election that
+/// `initialize` kicks off and briefly return `ForwardToLeader` before this node
+/// finishes becoming leader.
+async fn seed_bootstrap_state(
+    council: &CouncilNode,
+    state: &crate::sesame::types::SecurityState,
+) -> Result<(), crate::council::CouncilError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let request =
+            crate::council::types::RaftRequest::SecurityStateInit(Box::new(state.clone()));
+        match council.write(request).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 /// Spawn the council reconciler: on the leader, periodically bring the Raft
@@ -530,6 +572,73 @@ mod tests {
         // And the council grew to the minimum size using the peers.
         assert_eq!(desired.len(), 3);
         assert!(to_add.iter().all(|(rid, _)| *rid != self_id));
+    }
+
+    /// Build a single-node in-memory council, initialised so it becomes leader.
+    async fn single_bootstrap_council() -> CouncilNode {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+
+        let router = InMemoryRaftRouter::new();
+        let id = 1u64;
+        let network = InMemoryRaftNetworkFactory::new(id, router.clone());
+        let node = CouncilNode::new(
+            id,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(id, node.raft().clone()).await;
+        let mut members = BTreeMap::new();
+        members.insert(id, info("node-1", 9444));
+        node.initialize(members).await.unwrap();
+        node
+    }
+
+    #[tokio::test]
+    async fn seed_bootstrap_state_writes_security_state_to_raft() {
+        let council = single_bootstrap_council().await;
+        let dir = std::env::temp_dir().join("rb-runtime-seed-write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("seedwrite", "node-1", &dir).unwrap();
+
+        seed_bootstrap_state(&council, &init.security_state)
+            .await
+            .unwrap();
+
+        let state = council.security_state().await;
+        assert_eq!(state.certificate_authorities.len(), 4);
+        assert!(state.cluster_age_keypair().is_some());
+        assert!(state.oidc_signing_config.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn seed_bootstrap_state_is_idempotent_on_reapply() {
+        let council = single_bootstrap_council().await;
+        let dir = std::env::temp_dir().join("rb-runtime-seed-idem");
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("seedidem", "node-1", &dir).unwrap();
+
+        // The apply arm overwrites, so re-seeding leaves one coherent state.
+        seed_bootstrap_state(&council, &init.security_state)
+            .await
+            .unwrap();
+        seed_bootstrap_state(&council, &init.security_state)
+            .await
+            .unwrap();
+
+        let state = council.security_state().await;
+        assert_eq!(state.certificate_authorities.len(), 4);
+        assert_eq!(
+            state.age_keypairs.len(),
+            init.security_state.age_keypairs.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

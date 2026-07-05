@@ -941,40 +941,45 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
 ///
 /// Generates a token, hashes it with Argon2id, and prints the plaintext
 /// to stdout (shown once, never stored).
-pub fn token_create(
+pub async fn token_create(
     name: &str,
     role_str: &str,
     apps: Option<&str>,
     namespaces: Option<&str>,
     ttl_days: Option<u64>,
 ) -> Result<(), RelishError> {
-    use crate::sesame::token::create_token;
-    use crate::sesame::types::{ApiRole, TokenScope};
-    use std::time::{Duration, SystemTime};
+    token_create_with_client(
+        name,
+        role_str,
+        apps,
+        namespaces,
+        ttl_days,
+        &BunClient::default_local(),
+    )
+    .await
+}
 
-    let role = match role_str {
-        "admin" => ApiRole::Admin,
-        "deployer" => ApiRole::Deployer,
-        "read-only" | "readonly" => ApiRole::ReadOnly,
-        other => {
-            return Err(RelishError::InitFailed(format!(
-                "unknown role: {other} (expected admin, deployer, or read-only)"
-            )));
-        }
-    };
+/// Create a token via the agent so it's persisted in Raft. The token is minted
+/// and hashed server-side; the plaintext is returned once and printed to
+/// stdout. An unreachable agent is an error (never a silent exit-0), and the
+/// role is validated server-side.
+async fn token_create_with_client(
+    name: &str,
+    role_str: &str,
+    apps: Option<&str>,
+    namespaces: Option<&str>,
+    ttl_days: Option<u64>,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    let apps_vec = apps.map(|a| a.split(',').map(|s| s.trim().to_string()).collect());
+    let namespaces_vec = namespaces.map(|n| n.split(',').map(|s| s.trim().to_string()).collect());
 
-    let scope = TokenScope {
-        apps: apps.map(|a| a.split(',').map(|s| s.trim().to_string()).collect()),
-        namespaces: namespaces.map(|n| n.split(',').map(|s| s.trim().to_string()).collect()),
-    };
-
-    let expires_at = ttl_days.map(|days| SystemTime::now() + Duration::from_secs(days * 86400));
-
-    let created = create_token(name, role, scope, expires_at)
-        .map_err(|e| RelishError::InitFailed(e.to_string()))?;
+    let plaintext = client
+        .token_create(name, role_str, apps_vec, namespaces_vec, ttl_days)
+        .await?;
 
     eprintln!("Token created: {name}");
-    eprintln!("  Role: {role}");
+    eprintln!("  Role: {role_str}");
     if let Some(apps) = apps {
         eprintln!("  Apps: {apps}");
     }
@@ -985,33 +990,54 @@ pub fn token_create(
         eprintln!("  TTL: {days} days");
     }
     eprintln!();
-    println!("{}", created.plaintext);
+    println!("{plaintext}");
 
     Ok(())
 }
 
 /// Print the cluster's age public key from the init output directory.
 ///
-/// Reads the security state written by `relish init` and extracts the
-/// age public key. This key can be used offline to encrypt secrets for
-/// `ENC[AGE:...]` config values.
+/// Reads the security bootstrap `relish init` wrote and extracts the
+/// cluster-wide age public key. This key can be used offline to encrypt
+/// secrets for `ENC[AGE:...]` config values.
 pub fn secret_pubkey(dir: &Path) -> Result<(), RelishError> {
-    let init_output_path = dir.join("sesame-state.json");
-    if !init_output_path.exists() {
-        return Err(RelishError::InitFailed(
-            "sesame-state.json not found — run `relish init` first".to_string(),
-        ));
-    }
-    let data = fs::read_to_string(&init_output_path)?;
-    let state: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| RelishError::InitFailed(format!("failed to parse sesame-state.json: {e}")))?;
-
-    let pubkey = state["age_public_key"]
-        .as_str()
-        .ok_or_else(|| RelishError::InitFailed("age_public_key not found in state".to_string()))?;
-
-    println!("{pubkey}");
+    println!("{}", resolve_secret_pubkey(dir)?);
     Ok(())
+}
+
+/// Find the `*-security-bootstrap.json` in `dir` and return its cluster-wide
+/// age public key.
+fn resolve_secret_pubkey(dir: &Path) -> Result<String, RelishError> {
+    use crate::sesame::types::SecurityState;
+
+    // `relish init` writes `{cluster}-security-bootstrap.json` — find it rather
+    // than guess the cluster name (the old code read a `sesame-state.json` that
+    // was never written, the X7 bug).
+    let bootstrap = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-security-bootstrap.json"))
+        })
+        .ok_or_else(|| {
+            RelishError::InitFailed(format!(
+                "no *-security-bootstrap.json found in {} — run `relish init` first",
+                dir.display()
+            ))
+        })?;
+
+    let data = fs::read_to_string(&bootstrap)?;
+    let state: SecurityState = serde_json::from_str(&data).map_err(|e| {
+        RelishError::InitFailed(format!("failed to parse {}: {e}", bootstrap.display()))
+    })?;
+
+    let keypair = state.cluster_age_keypair().ok_or_else(|| {
+        RelishError::InitFailed("no cluster-wide age key in security bootstrap".to_string())
+    })?;
+
+    Ok(keypair.public_key.clone())
 }
 
 /// Encrypt a plaintext value using an age public key.
@@ -1071,6 +1097,38 @@ mod tests {
     /// are refused immediately without waiting for a timeout.
     fn bogus_client() -> BunClient {
         BunClient::new("http://127.0.0.1:1")
+    }
+
+    #[test]
+    fn secret_pubkey_prints_age_key_from_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        // `relish init` writes the bootstrap file from the init result; mimic it.
+        let init =
+            crate::sesame::init::initialize_cluster("pubkeytest", "node-1", dir.path()).unwrap();
+        let bootstrap = dir.path().join("pubkeytest-security-bootstrap.json");
+        fs::write(
+            &bootstrap,
+            serde_json::to_string(&init.security_state).unwrap(),
+        )
+        .unwrap();
+
+        let key = resolve_secret_pubkey(dir.path()).unwrap();
+        assert_eq!(key, init.age_public_key);
+        assert!(key.starts_with("age1"), "got {key}");
+    }
+
+    #[test]
+    fn secret_pubkey_errors_without_bootstrap_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_secret_pubkey(dir.path());
+        assert!(result.is_err(), "missing bootstrap must error");
+    }
+
+    #[tokio::test]
+    async fn token_create_errors_when_agent_unreachable() {
+        let result =
+            token_create_with_client("ci-bot", "deployer", None, None, None, &bogus_client()).await;
+        assert!(result.is_err(), "unreachable agent must be an error");
     }
 
     fn write_temp_config(content: &str) -> tempfile::NamedTempFile {

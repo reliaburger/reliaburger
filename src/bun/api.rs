@@ -73,11 +73,15 @@ pub struct ApiState {
     pub rollup_store: Option<Arc<RwLock<RollupStore>>>,
     /// Cluster membership for cross-node queries (populated from gossip).
     pub membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
+    /// API token store, seeded from the council's `SecurityState`. Read by the
+    /// auth middleware (attached in Stage 3b; unused while `None`).
+    pub token_store: Option<crate::sesame::auth::TokenStore>,
     /// HTTP client for cross-node fan-out queries.
     pub http_client: reqwest::Client,
 }
 
 /// Build the API router.
+#[allow(clippy::too_many_arguments)]
 pub fn router(
     cmd_tx: mpsc::Sender<AgentCommand>,
     mayo: Option<Arc<RwLock<MayoStore>>>,
@@ -85,6 +89,8 @@ pub fn router(
     deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
     pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     alerts: Option<Arc<RwLock<AlertEvaluator>>>,
+    council: Option<Arc<crate::council::CouncilNode>>,
+    token_store: Option<crate::sesame::auth::TokenStore>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -95,9 +101,12 @@ pub fn router(
         deploy_history,
         pickle_catalog,
         gitops_webhook_tx: None,
-        council: None,
+        council,
         rollup_store: None,
         membership: None,
+        token_store,
+        // TODO(Stage 3b): attach auth_middleware over this state and refresh
+        // `token_store` live from Raft (it's seeded once at startup for now).
         http_client: reqwest::Client::new(),
     };
 
@@ -150,6 +159,7 @@ pub fn router(
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
+        .route("/v1/token/create", post(token_create_handler))
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
@@ -1858,6 +1868,95 @@ async fn token_revoke_handler(State(state): State<ApiState>, body: String) -> Re
     }
 }
 
+/// Create an API token and persist it via Raft.
+///
+/// The token is minted server-side (Argon2 hashing) and written to the
+/// SecurityState in one step, so the stored hash always matches the plaintext
+/// returned to the caller. The plaintext is shown once and never stored.
+async fn token_create_handler(State(state): State<ApiState>, body: String) -> Response {
+    #[derive(serde::Deserialize)]
+    struct CreateRequest {
+        name: String,
+        role: String,
+        #[serde(default)]
+        apps: Option<Vec<String>>,
+        #[serde(default)]
+        namespaces: Option<Vec<String>>,
+        #[serde(default)]
+        ttl_days: Option<u64>,
+    }
+
+    let req: CreateRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let role = match req.role.as_str() {
+        "admin" => crate::sesame::types::ApiRole::Admin,
+        "deployer" => crate::sesame::types::ApiRole::Deployer,
+        "read-only" | "readonly" => crate::sesame::types::ApiRole::ReadOnly,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown role: {other} (expected admin, deployer, or read-only)")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    let scope = crate::sesame::types::TokenScope {
+        apps: req.apps.clone(),
+        namespaces: req.namespaces.clone(),
+    };
+    let expires_at = req
+        .ttl_days
+        .map(|d| std::time::SystemTime::now() + std::time::Duration::from_secs(d * 86400));
+
+    let created = match crate::sesame::token::create_token(&req.name, role, scope, expires_at) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    match council
+        .write(crate::council::RaftRequest::CreateApiToken(created.token))
+        .await
+    {
+        Ok(_) => Json(serde_json::json!({
+            "name": req.name,
+            "role": req.role,
+            "token": created.plaintext,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Secret rotation endpoint
 // ---------------------------------------------------------------------------
@@ -1977,8 +2076,172 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None, None, None, None);
+        let app = router(cmd_tx, None, None, None, None, None, None, None);
         (app, shutdown)
+    }
+
+    /// Build a single-node council, initialised as leader and seeded with a
+    /// real `SecurityState` (four CAs, an age keypair, an OIDC config). `tag`
+    /// disambiguates the temp dir so concurrent tests don't collide.
+    async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
+        use std::collections::BTreeMap;
+
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
+
+        let raft_router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
+        let node = crate::council::CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        raft_router.register(1, node.raft().clone()).await;
+        let mut members = BTreeMap::new();
+        members.insert(
+            1,
+            CouncilNodeInfo {
+                addr: "127.0.0.1:9444".parse().unwrap(),
+                name: "node-1".into(),
+            },
+        );
+        node.initialize(members).await.unwrap();
+
+        let dir = std::env::temp_dir().join(format!("rb-api-seeded-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("apitest", "node-1", &dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Retry while leadership settles after initialize.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let req = RaftRequest::SecurityStateInit(Box::new(init.security_state.clone()));
+            if node.write(req).await.is_ok() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("seeding SecurityState timed out");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Arc::new(node)
+    }
+
+    /// Send a GET to `uri` against `app` and return (status, body bytes).
+    async fn get(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn identity_jwks_returns_key_when_council_present() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let council = seeded_council("jwks").await;
+        let app = router(cmd_tx, None, None, None, None, None, Some(council), None);
+
+        let (status, body) = get(app, "/v1/identity/jwks").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // JWKS response carries at least one key with the seeded OIDC material.
+        assert!(
+            json["keys"].as_array().is_some_and(|k| !k.is_empty()),
+            "expected a JWK, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_jwks_returns_503_without_council() {
+        let (app, shutdown) = test_setup();
+        let (status, _body) = get(app, "/v1/identity/jwks").await;
+        // Single-node mode (no council) is untouched: the endpoint 503s cleanly.
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn token_create_writes_to_raft_and_returns_plaintext() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let council = seeded_council("tokencreate").await;
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&council)),
+            None,
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/token/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": "ci-bot", "role": "deployer" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let plaintext = json["token"].as_str().unwrap();
+        assert!(plaintext.starts_with("rbrg_"), "got {plaintext}");
+
+        // The token landed in Raft, and the returned plaintext validates
+        // against the stored hash.
+        let stored = council.security_state().await.api_tokens;
+        let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
+        assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn token_list_returns_seeded_tokens() {
+        use crate::council::types::RaftRequest;
+        use crate::sesame::token::create_token;
+        use crate::sesame::types::{ApiRole, TokenScope};
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let council = seeded_council("tokenlist").await;
+        let created =
+            create_token("ci-bot", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        council
+            .write(RaftRequest::CreateApiToken(created.token))
+            .await
+            .unwrap();
+
+        let app = router(cmd_tx, None, None, None, None, None, Some(council), None);
+        let (status, body) = get(app, "/v1/token/list").await;
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = json["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"ci-bot"), "expected ci-bot in {json}");
     }
 
     #[tokio::test]
@@ -2076,7 +2339,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone(), None, None, None, None, None);
+        let app = router(cmd_tx.clone(), None, None, None, None, None, None, None);
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);

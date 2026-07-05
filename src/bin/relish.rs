@@ -648,13 +648,16 @@ async fn main() -> ExitCode {
                 apps,
                 namespaces,
                 ttl_days,
-            } => commands::token_create(
-                name,
-                role,
-                apps.as_deref(),
-                namespaces.as_deref(),
-                *ttl_days,
-            ),
+            } => {
+                commands::token_create(
+                    name,
+                    role,
+                    apps.as_deref(),
+                    namespaces.as_deref(),
+                    *ttl_days,
+                )
+                .await
+            }
             TokenAction::List => commands::token_list().await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },

@@ -726,6 +726,50 @@ impl BunClient {
         })
     }
 
+    /// Create an API token via the agent (persisted in Raft). Returns the
+    /// plaintext, shown once.
+    pub async fn token_create(
+        &self,
+        name: &str,
+        role: &str,
+        apps: Option<Vec<String>>,
+        namespaces: Option<Vec<String>>,
+        ttl_days: Option<u64>,
+    ) -> Result<String, RelishError> {
+        let url = format!("{}/v1/token/create", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "name": name,
+                "role": role,
+                "apps": apps,
+                "namespaces": namespaces,
+                "ttl_days": ttl_days,
+            }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })?;
+        json["token"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RelishError::ApiError {
+                status: 0,
+                body: "response missing token".to_string(),
+            })
+    }
+
     /// Revoke an API token by name.
     pub async fn token_revoke(&self, name: &str) -> Result<String, RelishError> {
         let url = format!("{}/v1/token/revoke", self.base_url);

@@ -270,14 +270,22 @@ each wiring item lands with an integration test that drives the **binary**, not 
 - [x] `M15` Council reconciler can't wedge — non-blocking membership ops with timeouts + logged errors
 - [x] `L5` Leader-safe, zone/age-aware council selection — reconciler retains current voters (never demotes the leader) and grows via `select_council_candidates`. **Live cluster-formation behaviour needs Lima verification**; resource-aware filtering awaits the reporting tree carrying real usage.
 
-### Stage 3 — Enforce the security that's claimed done
+### Stage 3a — Load the security foundation (wire, don't enforce)
 
-- [ ] `C5(a)` Attach the auth middleware to the routers (and fix fail-open on empty token store)
-- [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners
+- [x] `[security]` config section (`master_key_path`, `bootstrap_path`) + `sesame::bootstrap` loaders (hex master key + JSON SecurityState, fail-closed on world-readable perms)
+- [x] `L18` Load `wrapping_ikm` from the master key and seed the bootstrap `SecurityState` into Raft once (fresh bootstrap only; durable Raft makes it idempotent) — the already-wired CA/OIDC/secret-decryption machinery can now unwrap keys
+- [x] `L18` Populate `ApiState.council` + a token store — `/v1/identity/jwks` and `/v1/token/list` light up (were 503); other `None` fields (rollup/membership/gitops) are Stage 4
+- [x] `X2` Persist `relish token create` to Raft (server-side mint + `CreateApiToken`, plaintext shown once; unreachable agent is a hard error)
+- [x] `X7` `relish secret pubkey` reads the real `*-security-bootstrap.json` and prints the cluster age key
+- [x] `relish dev create` distributes the master key (every node) + security bootstrap (node 1) into `/etc/reliaburger` (0600) so a dev cluster boots with a real IKM + seeded SecurityState — the Stage 3a verification vehicle
+
+### Stage 3b — Enforce the security that's now loaded
+
+- [ ] `C5(a)` Attach the auth middleware to the routers (and fix fail-open on empty token store); live-refresh the token store from Raft
+- [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners (needs node-identity on-disk persistence)
 - [ ] `C5(c)` Sign + verify the gossip HMAC
-- [ ] `L18` Load SecurityState + `wrapping_ikm` from the bootstrap `relish init` writes; populate the `ApiState` `None` fields
 - [ ] `L17` Enforce CRL checks and image-signature verification (`require_signatures`)
-- [ ] `X2` / `X7` Persist `relish token create` to Raft; fix `relish secret pubkey` filename
+- [ ] Relish sends a Bearer token (`RELIABURGER_TOKEN`/config) so the CLI + UI still work once auth is on
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 

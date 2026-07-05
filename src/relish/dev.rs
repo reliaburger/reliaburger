@@ -215,6 +215,38 @@ async fn install_binary(
     Ok(())
 }
 
+/// Copy a host file into a VM at `dest` with mode 0600 (via a user-writable
+/// temp path + `sudo install`, since `limactl copy` runs unprivileged). Used
+/// for the master key and security bootstrap — both secrets.
+async fn install_secret_file(
+    vm: &str,
+    host_path: &std::path::Path,
+    dest: &str,
+) -> Result<(), RelishError> {
+    let file_name = host_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RelishError::LimaError {
+            command: "install secret".to_string(),
+            stderr: "non-UTF-8 file name".to_string(),
+        })?;
+    let tmp_dest = format!("/tmp/{file_name}");
+    limactl(&[
+        "copy",
+        host_path.to_str().ok_or_else(|| RelishError::LimaError {
+            command: "install secret".to_string(),
+            stderr: format!("non-UTF-8 path for {dest}"),
+        })?,
+        &format!("{vm}:{tmp_dest}"),
+    ])
+    .await?;
+    limactl(&[
+        "shell", vm, "sudo", "install", "-D", "-m", "600", &tmp_dest, dest,
+    ])
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Lima YAML generation
 // ---------------------------------------------------------------------------
@@ -248,10 +280,21 @@ provision:
 ///
 /// `node_ip` is the node's own shared-network IP; it's advertised so gossip,
 /// Raft, and reporting bind a peer-reachable address (not loopback).
+///
+/// Every node points at the shared master key. Only the bootstrap node (the
+/// one with an empty `join`) also points at the security bootstrap: it seeds
+/// the `SecurityState` into Raft once, and it replicates to everyone else.
 fn generate_node_config(node_name: &str, node_ip: &str, first_node_ip: Option<&str>) -> String {
     let join = match first_node_ip {
         Some(ip) => format!(r#"join = ["{ip}:9443"]"#),
         None => "join = []".to_string(),
+    };
+
+    // first_node_ip is None only for the bootstrap node.
+    let bootstrap_line = if first_node_ip.is_none() {
+        "\nbootstrap_path = \"/etc/reliaburger/security-bootstrap.json\""
+    } else {
+        ""
     };
 
     format!(
@@ -266,6 +309,9 @@ advertise_address = "{node_ip}"
 gossip_port = 9443
 raft_port = 9444
 reporting_port = 9445
+
+[security]
+master_key_path = "/etc/reliaburger/master.key"{bootstrap_line}
 "#
     )
 }
@@ -408,7 +454,30 @@ pub async fn create(
 
     let first_ip = cluster.nodes[0].ip.as_deref().unwrap();
 
-    // Generate and copy node configs
+    // Generate the cluster's security material once, on the host. Every node
+    // gets the master key (to build its wrapping IKM); only the bootstrap node
+    // gets the security bootstrap (it seeds SecurityState into Raft, which then
+    // replicates to the rest). Both are written 0600 and installed 0600.
+    println!("  generating security material...");
+    let sec_dir = std::env::temp_dir().join(format!("{name}-dev-security"));
+    std::fs::create_dir_all(&sec_dir)?;
+    let init = crate::sesame::init::initialize_cluster(name, &cluster.nodes[0].name, &sec_dir)
+        .map_err(|e| RelishError::InitFailed(e.to_string()))?;
+    let master_key_path = sec_dir.join("master.key");
+    std::fs::write(&master_key_path, hex::encode(init.master_secret))?;
+    let bootstrap_path = sec_dir.join("security-bootstrap.json");
+    std::fs::write(
+        &bootstrap_path,
+        serde_json::to_string(&init.security_state).map_err(RelishError::SerialiseJson)?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&master_key_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&bootstrap_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Generate and copy node configs + security material
     println!("  configuring cluster...");
     for (i, node) in cluster.nodes.iter().enumerate() {
         let join_ip = if i == 0 { None } else { Some(first_ip) };
@@ -439,7 +508,19 @@ pub async fn create(
         ])
         .await?;
         let _ = std::fs::remove_file(&config_path);
+
+        // Master key on every node; security bootstrap on the bootstrap node.
+        install_secret_file(&node.name, &master_key_path, "/etc/reliaburger/master.key").await?;
+        if i == 0 {
+            install_secret_file(
+                &node.name,
+                &bootstrap_path,
+                "/etc/reliaburger/security-bootstrap.json",
+            )
+            .await?;
+        }
     }
+    let _ = std::fs::remove_dir_all(&sec_dir);
 
     // Build (or use the provided) Linux binaries, then install on every node.
     let need_build = bun.is_none() || relish.is_none();
@@ -861,6 +942,34 @@ mod tests {
         assert!(config.contains(r#"join = ["192.168.105.2:9443"]"#));
         assert!(config.contains(r#"name = "reliaburger-2""#));
         assert!(config.contains(r#"advertise_address = "192.168.105.3""#));
+    }
+
+    #[test]
+    fn generate_node_config_includes_master_key_path_for_all_nodes() {
+        let first = generate_node_config("reliaburger-1", "192.168.105.2", None);
+        let joiner = generate_node_config("reliaburger-2", "192.168.105.3", Some("192.168.105.2"));
+        for config in [first, joiner] {
+            assert!(config.contains("[security]"));
+            assert!(config.contains(r#"master_key_path = "/etc/reliaburger/master.key""#));
+        }
+    }
+
+    #[test]
+    fn generate_node_config_includes_bootstrap_path_only_for_first_node() {
+        let first = generate_node_config("reliaburger-1", "192.168.105.2", None);
+        assert!(
+            first.contains(r#"bootstrap_path = "/etc/reliaburger/security-bootstrap.json""#),
+            "bootstrap node must load the security bootstrap"
+        );
+    }
+
+    #[test]
+    fn generate_node_config_omits_bootstrap_path_for_joiners() {
+        let joiner = generate_node_config("reliaburger-2", "192.168.105.3", Some("192.168.105.2"));
+        assert!(
+            !joiner.contains("bootstrap_path"),
+            "joiners get SecurityState from Raft, not a local bootstrap file"
+        );
     }
 
     #[test]
