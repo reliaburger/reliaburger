@@ -102,11 +102,8 @@ pub async fn start(
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
     node.set_membership_watch(membership_tx);
-
-    let gossip_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        node.run(gossip_shutdown).await;
-    });
+    // The gossip node is spawned *after* the council is built, so a restarted
+    // node can seed gossip from its restored Raft membership (see below).
 
     // --- Raft council ---
     // Every clustered node runs a CouncilNode and a Raft RPC server so the
@@ -154,6 +151,46 @@ pub async fn start(
     .await
     .map_err(|e| std::io::Error::other(format!("council init failed: {e}")))?;
     let council = Arc::new(council);
+
+    // On restart (no configured seeds, but a populated durable store), seed
+    // gossip from the RESTORED Raft membership. A restarted seeds-empty node
+    // otherwise comes up knowing no peers, so its perimeter firewall keeps the
+    // cluster ports closed and it never reconverges. Re-probing the restored
+    // peers (gossip is UDP, unfirewalled) reopens the firewall and lets Raft
+    // reconnect. Enabled by C3's durable membership.
+    if params.seeds.is_empty() && !store_fresh {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut seeds: Vec<SocketAddr> = Vec::new();
+        loop {
+            seeds.clear();
+            for (id, info) in council
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .nodes()
+            {
+                if *id != raft_id {
+                    let gossip_port = (info.addr.port() as i32 - port_offset) as u16;
+                    seeds.push(SocketAddr::new(info.addr.ip(), gossip_port));
+                }
+            }
+            // Wait briefly for openraft to finish loading the restored membership.
+            if !seeds.is_empty() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !seeds.is_empty() {
+            node.set_seeds(seeds);
+        }
+    }
+
+    // Now start gossip.
+    let gossip_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        node.run(gossip_shutdown).await;
+    });
 
     let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
     let raft = council.raft().clone();
