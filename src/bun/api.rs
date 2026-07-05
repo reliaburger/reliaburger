@@ -208,7 +208,16 @@ async fn health_handler() -> impl IntoResponse {
 /// Returns a Server-Sent Events stream. Each event's `data` field
 /// contains a JSON-serialised `ApplyEvent`. The stream ends after
 /// the `Complete` or `Error` event.
-async fn apply_handler(State(state): State<ApiState>, body: String) -> Response {
+async fn apply_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let config = match Config::parse(&body) {
         Ok(c) => c,
         Err(e) => {
@@ -324,9 +333,15 @@ async fn status_app_handler(
 
 /// Stop an app.
 async fn stop_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -605,10 +620,16 @@ struct ExecRequest {
 
 /// Execute a command inside a running instance.
 async fn exec_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Json(body): Json<ExecRequest>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -750,9 +771,15 @@ struct ChaosPartitionRequest {
 
 /// Inject a network partition.
 async fn chaos_partition_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Json(body): Json<ChaosPartitionRequest>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -787,7 +814,15 @@ async fn chaos_partition_handler(
 }
 
 /// Remove all network partitions.
-async fn chaos_heal_handler(State(state): State<ApiState>) -> Response {
+async fn chaos_heal_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -845,9 +880,15 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
 
 /// Inject a fault (Smoker).
 async fn fault_inject_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Json(request): Json<crate::smoker::types::FaultRequest>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -881,7 +922,16 @@ async fn fault_inject_handler(
 }
 
 /// Clear a specific fault by ID.
-async fn fault_clear_handler(State(state): State<ApiState>, Path(id): Path<u64>) -> Response {
+async fn fault_clear_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(id): Path<u64>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -915,7 +965,15 @@ async fn fault_clear_handler(State(state): State<ApiState>, Path(id): Path<u64>)
 }
 
 /// Clear all active faults.
-async fn fault_clear_all_handler(State(state): State<ApiState>) -> Response {
+async fn fault_clear_all_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -1774,7 +1832,16 @@ async fn identity_jwks_handler(State(state): State<ApiState>) -> Response {
 }
 
 /// Sign an image manifest digest and attach the signature via Raft.
-async fn identity_sign_handler(State(state): State<ApiState>, body: String) -> Response {
+async fn identity_sign_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
     #[derive(serde::Deserialize)]
     struct SignRequest {
         digest: String,
@@ -1820,7 +1887,15 @@ async fn identity_sign_handler(State(state): State<ApiState>, body: String) -> R
 // ---------------------------------------------------------------------------
 
 /// List API tokens from SecurityState in Raft.
-async fn token_list_handler(State(state): State<ApiState>) -> Response {
+async fn token_list_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
     let Some(ref council) = state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1847,7 +1922,16 @@ async fn token_list_handler(State(state): State<ApiState>) -> Response {
 }
 
 /// Revoke an API token by name via Raft.
-async fn token_revoke_handler(State(state): State<ApiState>, body: String) -> Response {
+async fn token_revoke_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
     #[derive(serde::Deserialize)]
     struct RevokeRequest {
         name: String,
@@ -1893,7 +1977,16 @@ async fn token_revoke_handler(State(state): State<ApiState>, body: String) -> Re
 /// The token is minted server-side (Argon2 hashing) and written to the
 /// SecurityState in one step, so the stored hash always matches the plaintext
 /// returned to the caller. The plaintext is shown once and never stored.
-async fn token_create_handler(State(state): State<ApiState>, body: String) -> Response {
+async fn token_create_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
     #[derive(serde::Deserialize)]
     struct CreateRequest {
         name: String,
@@ -1982,7 +2075,16 @@ async fn token_create_handler(State(state): State<ApiState>, body: String) -> Re
 // ---------------------------------------------------------------------------
 
 /// Rotate or finalise secret encryption key via Raft.
-async fn secret_rotate_handler(State(state): State<ApiState>, body: String) -> Response {
+async fn secret_rotate_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
     #[derive(serde::Deserialize)]
     struct RotateRequest {
         #[serde(default)]
@@ -2272,6 +2374,133 @@ mod tests {
             StatusCode::OK
         );
         shutdown.cancel();
+    }
+
+    /// POST `uri` with a Bearer token; return the status.
+    async fn post_status(app: Router, uri: &str, bearer: &str, body: &str) -> StatusCode {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    /// Build a router with a seeded council AND a user token of the given role
+    /// in the store, so role authorisation can be exercised end-to-end.
+    async fn setup_with_role(
+        tag: &str,
+        role: crate::sesame::types::ApiRole,
+    ) -> (Router, CancellationToken, String) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let council = seeded_council(tag).await;
+        let (token, plaintext) = a_user_token(role);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council),
+            Some(store),
+            None,
+        );
+        (app, shutdown, plaintext)
+    }
+
+    #[tokio::test]
+    async fn admin_token_may_create_tokens() {
+        let (app, shutdown, tok) =
+            setup_with_role("role-admin", crate::sesame::types::ApiRole::Admin).await;
+        let status = post_status(
+            app,
+            "/v1/token/create",
+            &tok,
+            &serde_json::json!({ "name": "x", "role": "deployer" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deployer_token_is_forbidden_from_creating_tokens() {
+        let (app, shutdown, tok) =
+            setup_with_role("role-dep-tok", crate::sesame::types::ApiRole::Deployer).await;
+        let status = post_status(
+            app,
+            "/v1/token/create",
+            &tok,
+            &serde_json::json!({ "name": "x", "role": "deployer" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deployer_token_may_apply() {
+        let (app, shutdown, tok) =
+            setup_with_role("role-dep-apply", crate::sesame::types::ApiRole::Deployer).await;
+        let status = post_status(app, "/v1/apply", &tok, "[app.web]\nimage = \"x:1\"\n").await;
+        // Deployer passes the role guard; the apply itself may then fall to
+        // dry-run, but it must not be a 403.
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn readonly_token_is_forbidden_from_applying() {
+        let (app, shutdown, tok) =
+            setup_with_role("role-ro-apply", crate::sesame::types::ApiRole::ReadOnly).await;
+        let status = post_status(app, "/v1/apply", &tok, "[app.web]\nimage = \"x:1\"\n").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn service_principal_may_create_tokens() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let council = seeded_council("role-system").await;
+        // A user token exists (enforcement on), but the service token wins.
+        let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council),
+            Some(store),
+            Some("rbrg_service".to_string()),
+        );
+        let status = post_status(
+            app,
+            "/v1/token/create",
+            "rbrg_service",
+            &serde_json::json!({ "name": "x", "role": "deployer" }).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
