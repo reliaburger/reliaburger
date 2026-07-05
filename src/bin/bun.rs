@@ -123,6 +123,18 @@ fn cluster_params_from_config(
     })
 }
 
+/// Overwrite the auth token store with the current API tokens from Raft.
+///
+/// Called on startup and every few seconds after, so a token created via
+/// `relish token create` starts being enforced without restarting the agent.
+async fn refresh_token_store(
+    store: &reliaburger::sesame::auth::TokenStore,
+    council: &reliaburger::council::CouncilNode,
+) {
+    let tokens = council.security_state().await.api_tokens;
+    *store.write().await = tokens;
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -183,16 +195,34 @@ async fn main() -> anyhow::Result<()> {
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
 
-    // Seed the auth token store once from the council's SecurityState. The auth
-    // middleware isn't attached yet (Stage 3b), so a one-shot load suffices:
-    // `token list` reads tokens live from the council, and tokens only need to
-    // enter this store once 3b turns enforcement on.
+    // Derive the internal service token from the shared master key, so bun's own
+    // cross-node fan-out calls authenticate as the system principal on peers.
+    let service_token = api_council
+        .as_ref()
+        .and_then(|c| c.wrapping_ikm())
+        .map(reliaburger::sesame::token::derive_service_token)
+        .transpose()?;
+
+    // Seed the auth token store from the council's SecurityState and keep it
+    // refreshed. The middleware reads this store; without the refresh, a token
+    // created after startup would never engage enforcement (the ≤5 s lag is
+    // deliberate).
     let api_token_store = if let Some(council) = &api_council {
         let store = reliaburger::sesame::auth::new_token_store();
-        let tokens = council.security_state().await.api_tokens;
-        if !tokens.is_empty() {
-            *store.write().await = tokens;
-        }
+        refresh_token_store(&store, council).await;
+
+        let refresh_store = Arc::clone(&store);
+        let refresh_council = Arc::clone(council);
+        let refresh_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = refresh_shutdown.cancelled() => break,
+                    _ = ticker.tick() => refresh_token_store(&refresh_store, &refresh_council).await,
+                }
+            }
+        });
         Some(store)
     } else {
         None
@@ -458,8 +488,7 @@ async fn main() -> anyhow::Result<()> {
         alerts.clone(),
         api_council.clone(),
         api_token_store.clone(),
-        // TODO(Stage 3b 6/7): derive + pass the service token here.
-        None,
+        service_token.clone(),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -662,5 +691,63 @@ async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
             ))
         }
         other => anyhow::bail!("unknown runtime: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use reliaburger::council::CouncilNode;
+    use reliaburger::council::log_store::MemLogStore;
+    use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use reliaburger::council::state_machine::CouncilStateMachine;
+    use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
+    use reliaburger::sesame::token::create_token;
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+
+    #[tokio::test]
+    async fn refresh_token_store_overwrites_with_current_raft_tokens() {
+        // A single-node in-memory council, initialised as leader.
+        let raft_router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
+        let council = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        raft_router.register(1, council.raft().clone()).await;
+        let mut members = BTreeMap::new();
+        members.insert(
+            1,
+            CouncilNodeInfo {
+                addr: "127.0.0.1:9444".parse().unwrap(),
+                name: "n1".into(),
+            },
+        );
+        council.initialize(members).await.unwrap();
+
+        let store = reliaburger::sesame::auth::new_token_store();
+        // Empty to start.
+        refresh_token_store(&store, &council).await;
+        assert!(store.read().await.is_empty());
+
+        // Create a token in Raft, then refresh: the store picks it up.
+        let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        council
+            .write(RaftRequest::CreateApiToken(created.token))
+            .await
+            .unwrap();
+        refresh_token_store(&store, &council).await;
+
+        let tokens = store.read().await;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].name, "ci");
     }
 }
