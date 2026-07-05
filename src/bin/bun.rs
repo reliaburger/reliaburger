@@ -458,6 +458,8 @@ async fn main() -> anyhow::Result<()> {
         alerts.clone(),
         api_council.clone(),
         api_token_store.clone(),
+        // TODO(Stage 3b 6/7): derive + pass the service token here.
+        None,
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {

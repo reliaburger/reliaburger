@@ -73,9 +73,12 @@ pub struct ApiState {
     pub rollup_store: Option<Arc<RwLock<RollupStore>>>,
     /// Cluster membership for cross-node queries (populated from gossip).
     pub membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
-    /// API token store, seeded from the council's `SecurityState`. Read by the
-    /// auth middleware (attached in Stage 3b; unused while `None`).
+    /// API token store, seeded from the council's `SecurityState` and refreshed
+    /// live. Read by the auth middleware.
     pub token_store: Option<crate::sesame::auth::TokenStore>,
+    /// The cluster's internal service token, presented on cross-node fan-out
+    /// calls so peers accept them as the system principal. `None` single-node.
+    pub service_token: Option<String>,
     /// HTTP client for cross-node fan-out queries.
     pub http_client: reqwest::Client,
 }
@@ -91,6 +94,7 @@ pub fn router(
     alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     council: Option<Arc<crate::council::CouncilNode>>,
     token_store: Option<crate::sesame::auth::TokenStore>,
+    service_token: Option<String>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -104,15 +108,38 @@ pub fn router(
         council,
         rollup_store: None,
         membership: None,
-        token_store,
-        // TODO(Stage 3b): attach auth_middleware over this state and refresh
-        // `token_store` live from Raft (it's seeded once at startup for now).
+        token_store: token_store.clone(),
+        service_token: service_token.clone(),
         http_client: reqwest::Client::new(),
     };
 
-    Router::new()
+    let auth_state = crate::sesame::auth::AuthState::new(
+        token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
+        service_token,
+    );
+
+    // Public routes need no token: liveness, the browser dashboard + UI, and
+    // the JWKS endpoint (public keys are meant to be readable).
+    let public = Router::new()
         .route("/", get(dashboard_handler))
         .route("/v1/health", get(health_handler))
+        .route("/v1/identity/jwks", get(identity_jwks_handler))
+        .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
+        .route("/ui/node/{name}", get(node_detail_handler))
+        .route("/ui/fragment/apps", get(fragment_apps_handler))
+        .route("/ui/fragment/nodes", get(fragment_nodes_handler))
+        .route("/ui/fragment/alerts", get(fragment_alerts_handler))
+        .route(
+            "/ui/fragment/app/{app}/{namespace}/instances",
+            get(fragment_instances_handler),
+        )
+        .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
+        .route("/ui/static/{*path}", get(static_asset_handler))
+        .with_state(state.clone());
+
+    // Everything else sits behind the auth layer. `route_layer` runs the
+    // middleware only for matched routes, so a 404 doesn't demand a token.
+    let protected = Router::new()
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
@@ -157,25 +184,18 @@ pub fn router(
         .route("/v1/batch", post(batch_submit_handler))
         .route("/v1/build", post(build_submit_handler))
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
-        .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
         .route("/v1/token/create", post(token_create_handler))
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
-        // Brioche UI pages and fragments
-        .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
-        .route("/ui/node/{name}", get(node_detail_handler))
-        .route("/ui/fragment/apps", get(fragment_apps_handler))
-        .route("/ui/fragment/nodes", get(fragment_nodes_handler))
-        .route("/ui/fragment/alerts", get(fragment_alerts_handler))
-        .route(
-            "/ui/fragment/app/{app}/{namespace}/instances",
-            get(fragment_instances_handler),
-        )
-        .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
-        .route("/ui/static/{*path}", get(static_asset_handler))
-        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            crate::sesame::auth::auth_middleware,
+        ))
+        .with_state(state);
+
+    public.merge(protected)
 }
 
 /// Liveness check.
@@ -2076,7 +2096,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None, None, None, None, None, None);
+        let app = router(cmd_tx, None, None, None, None, None, None, None, None);
         (app, shutdown)
     }
 
@@ -2150,11 +2170,125 @@ mod tests {
         (status, body.to_vec())
     }
 
+    /// GET `uri` with an optional Authorization header; return the status.
+    async fn get_status(app: Router, uri: &str, bearer: Option<&str>) -> StatusCode {
+        let mut req = axum::http::Request::builder().uri(uri);
+        if let Some(b) = bearer {
+            req = req.header("authorization", format!("Bearer {b}"));
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Build a router (with a running MockGrill agent) whose token store holds
+    /// `tokens` and whose auth layer knows `service_token`.
+    async fn setup_with_auth(
+        tokens: Vec<crate::sesame::types::ApiToken>,
+        service_token: Option<String>,
+    ) -> (Router, CancellationToken) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let store = crate::sesame::auth::new_token_store();
+        *store.write().await = tokens;
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            service_token,
+        );
+        (app, shutdown)
+    }
+
+    fn a_user_token(
+        role: crate::sesame::types::ApiRole,
+    ) -> (crate::sesame::types::ApiToken, String) {
+        let created = crate::sesame::token::create_token(
+            "u",
+            role,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        (created.token, created.plaintext)
+    }
+
+    #[tokio::test]
+    async fn router_stays_open_when_no_user_tokens_exist() {
+        let (app, shutdown) = setup_with_auth(vec![], None).await;
+        assert_eq!(get_status(app, "/v1/status", None).await, StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn protected_route_returns_401_without_a_token_once_a_user_token_exists() {
+        let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        assert_eq!(
+            get_status(app, "/v1/status", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn protected_route_returns_200_with_a_valid_token() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        assert_eq!(
+            get_status(app, "/v1/status", Some(&plaintext)).await,
+            StatusCode::OK
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn public_routes_need_no_token() {
+        // Even with enforcement on (a user token exists), health stays open.
+        let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        assert_eq!(get_status(app, "/v1/health", None).await, StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn service_token_authenticates_as_system() {
+        let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (app, shutdown) = setup_with_auth(vec![token], Some("rbrg_service".to_string())).await;
+        assert_eq!(
+            get_status(app, "/v1/status", Some("rbrg_service")).await,
+            StatusCode::OK
+        );
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn identity_jwks_returns_key_when_council_present() {
         let (cmd_tx, _cmd_rx) = mpsc::channel(32);
         let council = seeded_council("jwks").await;
-        let app = router(cmd_tx, None, None, None, None, None, Some(council), None);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council),
+            None,
+            None,
+        );
 
         let (status, body) = get(app, "/v1/identity/jwks").await;
         assert_eq!(status, StatusCode::OK);
@@ -2187,6 +2321,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&council)),
+            None,
             None,
         );
 
@@ -2231,7 +2366,17 @@ mod tests {
             .await
             .unwrap();
 
-        let app = router(cmd_tx, None, None, None, None, None, Some(council), None);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council),
+            None,
+            None,
+        );
         let (status, body) = get(app, "/v1/token/list").await;
         assert_eq!(status, StatusCode::OK);
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2339,7 +2484,17 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx.clone(), None, None, None, None, None, None, None);
+        let app = router(
+            cmd_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Deploy first via channel
         let (event_tx, mut event_rx) = mpsc::channel(64);
