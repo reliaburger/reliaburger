@@ -159,6 +159,7 @@ pub fn router(
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
+        .route("/v1/token/create", post(token_create_handler))
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
@@ -1867,6 +1868,95 @@ async fn token_revoke_handler(State(state): State<ApiState>, body: String) -> Re
     }
 }
 
+/// Create an API token and persist it via Raft.
+///
+/// The token is minted server-side (Argon2 hashing) and written to the
+/// SecurityState in one step, so the stored hash always matches the plaintext
+/// returned to the caller. The plaintext is shown once and never stored.
+async fn token_create_handler(State(state): State<ApiState>, body: String) -> Response {
+    #[derive(serde::Deserialize)]
+    struct CreateRequest {
+        name: String,
+        role: String,
+        #[serde(default)]
+        apps: Option<Vec<String>>,
+        #[serde(default)]
+        namespaces: Option<Vec<String>>,
+        #[serde(default)]
+        ttl_days: Option<u64>,
+    }
+
+    let req: CreateRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let role = match req.role.as_str() {
+        "admin" => crate::sesame::types::ApiRole::Admin,
+        "deployer" => crate::sesame::types::ApiRole::Deployer,
+        "read-only" | "readonly" => crate::sesame::types::ApiRole::ReadOnly,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown role: {other} (expected admin, deployer, or read-only)")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    let scope = crate::sesame::types::TokenScope {
+        apps: req.apps.clone(),
+        namespaces: req.namespaces.clone(),
+    };
+    let expires_at = req
+        .ttl_days
+        .map(|d| std::time::SystemTime::now() + std::time::Duration::from_secs(d * 86400));
+
+    let created = match crate::sesame::token::create_token(&req.name, role, scope, expires_at) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    match council
+        .write(crate::council::RaftRequest::CreateApiToken(created.token))
+        .await
+    {
+        Ok(_) => Json(serde_json::json!({
+            "name": req.name,
+            "role": req.role,
+            "token": created.plaintext,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Secret rotation endpoint
 // ---------------------------------------------------------------------------
@@ -2083,6 +2173,47 @@ mod tests {
         // Single-node mode (no council) is untouched: the endpoint 503s cleanly.
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn token_create_writes_to_raft_and_returns_plaintext() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let council = seeded_council("tokencreate").await;
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&council)),
+            None,
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/token/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": "ci-bot", "role": "deployer" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let plaintext = json["token"].as_str().unwrap();
+        assert!(plaintext.starts_with("rbrg_"), "got {plaintext}");
+
+        // The token landed in Raft, and the returned plaintext validates
+        // against the stored hash.
+        let stored = council.security_state().await.api_tokens;
+        let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
+        assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
     }
 
     #[tokio::test]
