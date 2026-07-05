@@ -24,6 +24,7 @@ pub struct NodeConfig {
     pub logs: LogsSection,
     pub alerts: AlertsSection,
     pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
+    pub security: SecuritySection,
     /// GitOps configuration (optional — only needed if GitOps is enabled).
     #[serde(default)]
     pub gitops: Option<crate::lettuce::types::GitOpsConfig>,
@@ -47,6 +48,22 @@ impl NodeConfig {
         })?;
         Self::parse(&content)
     }
+}
+
+/// Security material paths.
+///
+/// Points a clustered node at the secrets `relish init` produces. Both are
+/// optional so single-node and pre-security configs keep parsing. Every
+/// clustered node needs `master_key_path` (to build its wrapping IKM); only the
+/// bootstrap node needs `bootstrap_path` (it seeds the initial `SecurityState`
+/// into Raft, which then replicates to everyone else).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecuritySection {
+    /// Path to the hex-encoded 32-byte cluster master key (`{cluster}-master.key`).
+    pub master_key_path: Option<PathBuf>,
+    /// Path to the initial security bootstrap (`{cluster}-security-bootstrap.json`).
+    pub bootstrap_path: Option<PathBuf>,
 }
 
 /// Node identity and labels.
@@ -589,6 +606,31 @@ mod tests {
         );
         assert!(nc.alerts.destinations[0].secret.is_none());
         assert_eq!(nc.alerts.destinations[1].severity, vec!["critical"]);
+    }
+
+    #[test]
+    fn security_section_defaults_to_none() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(nc.security.master_key_path.is_none());
+        assert!(nc.security.bootstrap_path.is_none());
+    }
+
+    #[test]
+    fn parse_security_section_paths() {
+        let toml_str = r#"
+            [security]
+            master_key_path = "/etc/reliaburger/master.key"
+            bootstrap_path = "/etc/reliaburger/security-bootstrap.json"
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(
+            nc.security.master_key_path,
+            Some(PathBuf::from("/etc/reliaburger/master.key"))
+        );
+        assert_eq!(
+            nc.security.bootstrap_path,
+            Some(PathBuf::from("/etc/reliaburger/security-bootstrap.json"))
+        );
     }
 
     #[test]

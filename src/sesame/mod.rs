@@ -4,6 +4,7 @@
 //! certificate signing, key wrapping, secret encryption, and API tokens.
 
 pub mod auth;
+pub mod bootstrap;
 pub mod ca;
 pub mod cert;
 pub mod crypto;
