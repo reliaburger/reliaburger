@@ -334,6 +334,8 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ## Phase 13: Relish TUI
 
+Implementation plan: [docs/tui-plan-2026-07.md](tui-plan-2026-07.md)
+
 - [ ] Full interactive terminal UI (ratatui + crossterm)
 - [ ] Dashboard, apps, nodes, jobs, events, logs, routes, search, help views
 - [ ] Book chapter 13: "A Room with a View"
