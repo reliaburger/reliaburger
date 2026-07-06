@@ -25,6 +25,31 @@ pub fn new_token_store() -> TokenStore {
     Arc::new(RwLock::new(Vec::new()))
 }
 
+/// Reserved name for the internal service principal (the derived service
+/// token). Not a real user token; never stored in `SecurityState`.
+pub const SYSTEM_PRINCIPAL: &str = "__system";
+
+/// State shared with the auth middleware: the live user-token store plus the
+/// optional side-channel service token (see [`super::token::derive_service_token`]).
+#[derive(Clone)]
+pub struct AuthState {
+    /// User tokens, refreshed from Raft. Emptiness gates the bootstrap window.
+    pub tokens: TokenStore,
+    /// The cluster's internal service token, accepted as the system principal.
+    /// `None` in single-node mode (no master key).
+    pub service_token: Option<String>,
+}
+
+impl AuthState {
+    /// Build auth state from a token store and optional service token.
+    pub fn new(tokens: TokenStore, service_token: Option<String>) -> Self {
+        Self {
+            tokens,
+            service_token,
+        }
+    }
+}
+
 /// The result of authenticating a request.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
@@ -91,56 +116,108 @@ pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusC
     })
 }
 
+/// The `AuthContext` for the internal service principal (Admin-equivalent).
+fn system_context() -> AuthContext {
+    AuthContext {
+        token_name: SYSTEM_PRINCIPAL.to_string(),
+        role: ApiRole::Admin,
+        scoped_apps: None,
+        scoped_namespaces: None,
+    }
+}
+
+/// Constant-time comparison of two token strings, to avoid leaking the service
+/// token byte-by-byte through response timing. The length is not secret (all
+/// tokens share the fixed `rbrg_` + 64-hex shape), so an early length check is
+/// fine; the byte comparison itself is constant-time.
+fn tokens_equal(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Axum middleware that enforces Bearer token authentication.
 ///
-/// Skips authentication for `/v1/health` (liveness probe) and
-/// when the token store is empty (pre-init / single-node mode).
+/// Bypasses when no user tokens are configured (the bootstrap window: a fresh
+/// cluster is open until the operator creates the first token). The internal
+/// service token, if present, is accepted as the system principal and does not
+/// count towards that check. Route-level exemptions (health, UI, JWKS) are
+/// handled by the router, not here.
 ///
 /// Inserts an `AuthContext` extension into the request on success.
 pub async fn auth_middleware(
-    axum::extract::State(store): axum::extract::State<TokenStore>,
+    axum::extract::State(state): axum::extract::State<AuthState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path().to_string();
+    let bearer = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer);
 
-    // Skip auth for health check (liveness probes shouldn't need tokens)
-    if path == "/v1/health" {
+    // The service token is a system principal, accepted even during the
+    // bootstrap window so internal fan-out works from the first moment.
+    if let (Some(bearer), Some(service)) = (bearer, state.service_token.as_deref())
+        && tokens_equal(bearer, service)
+    {
+        request.extensions_mut().insert(system_context());
         return next.run(request).await;
     }
 
-    let tokens = store.read().await;
+    let tokens = state.tokens.read().await;
 
-    // If no tokens are configured, allow all requests (pre-init mode)
+    // No user tokens configured yet: allow all (pre-init / single-node mode).
     if tokens.is_empty() {
         return next.run(request).await;
     }
 
-    // Extract the Authorization header
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok());
-
-    let Some(header_value) = auth_header else {
+    let Some(bearer_token) = bearer else {
         return (StatusCode::UNAUTHORIZED, "missing authorization header").into_response();
     };
 
-    let Some(bearer_token) = extract_bearer(header_value) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "invalid authorization header format",
-        )
-            .into_response();
-    };
-
-    // Validate the token
     match authenticate(bearer_token, &tokens) {
         Ok(ctx) => {
             request.extensions_mut().insert(ctx);
             next.run(request).await
         }
         Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+/// Role check for handlers that receive an optional `AuthContext`.
+///
+/// `None` (the bootstrap window, where the middleware inserted no context) is
+/// allowed — enforcement only kicks in once user tokens exist. Otherwise the
+/// context's role must satisfy `required`.
+#[allow(clippy::result_large_err)]
+pub fn authorize(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Response> {
+    match ctx {
+        None => Ok(()),
+        Some(ctx) => {
+            require_role(ctx, required).map_err(|(status, msg)| (status, msg).into_response())
+        }
+    }
+}
+
+/// Build a GET request builder, attaching a `Bearer` token when present.
+///
+/// Cross-node fan-out uses this to present the internal service token to peers,
+/// so their auth layer accepts the call as the system principal.
+pub fn bearer_get(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => client.get(url).bearer_auth(t),
+        None => client.get(url),
     }
 }
 
@@ -234,5 +311,101 @@ mod tests {
         assert_eq!(extract_bearer("Bearer abc123"), Some("abc123"));
         assert_eq!(extract_bearer("Basic abc123"), None);
         assert_eq!(extract_bearer("bearer abc123"), None);
+    }
+
+    #[test]
+    fn authorize_allows_when_no_context_present() {
+        assert!(authorize(None, ApiRole::Admin).is_ok());
+    }
+
+    #[test]
+    fn authorize_allows_system_principal_for_admin_routes() {
+        let ctx = system_context();
+        assert!(authorize(Some(&ctx), ApiRole::Admin).is_ok());
+    }
+
+    #[test]
+    fn authorize_rejects_deployer_context_on_admin_route() {
+        let ctx = AuthContext {
+            token_name: "dep".to_string(),
+            role: ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        let err = authorize(Some(&ctx), ApiRole::Admin).unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- middleware behaviour ---
+
+    use axum::body::Body;
+    use axum::routing::get;
+    use axum::{Router, middleware::from_fn_with_state};
+    use tower::ServiceExt as _;
+
+    fn guarded_router(state: AuthState) -> Router {
+        Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(from_fn_with_state(state, auth_middleware))
+    }
+
+    async fn status_of(router: Router, header: Option<&str>) -> StatusCode {
+        let mut req = axum::http::Request::builder().uri("/x");
+        if let Some(h) = header {
+            req = req.header("authorization", h);
+        }
+        router
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn middleware_bypasses_when_no_user_tokens() {
+        let state = AuthState::new(new_token_store(), Some("rbrg_service".to_string()));
+        assert_eq!(status_of(guarded_router(state), None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn middleware_accepts_the_service_token_as_system() {
+        // A non-empty user store, so the bootstrap bypass is off.
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store, Some("rbrg_service".to_string()));
+        let status = status_of(guarded_router(state), Some("Bearer rbrg_service")).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn middleware_rejects_an_unknown_bearer_once_a_user_token_exists() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store, Some("rbrg_service".to_string()));
+        let status = status_of(guarded_router(state), Some("Bearer rbrg_nope")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn bearer_get_sets_authorization_when_token_present() {
+        let client = reqwest::Client::new();
+        let req = bearer_get(&client, "http://x/v1/status", Some("rbrg_abc"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers().get("authorization").unwrap(),
+            "Bearer rbrg_abc"
+        );
+    }
+
+    #[test]
+    fn bearer_get_omits_authorization_when_token_absent() {
+        let client = reqwest::Client::new();
+        let req = bearer_get(&client, "http://x/v1/status", None)
+            .build()
+            .unwrap();
+        assert!(req.headers().get("authorization").is_none());
     }
 }

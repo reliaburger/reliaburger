@@ -29,6 +29,7 @@ pub async fn fan_out_query(
     node_urls: &[String],
     client: &reqwest::Client,
     timeout: std::time::Duration,
+    service_token: Option<&str>,
 ) -> Result<Vec<LogEntry>, KetchupError> {
     let mut handles = Vec::new();
 
@@ -37,6 +38,7 @@ pub async fn fan_out_query(
         let app = query.app.clone();
         let namespace = query.namespace.clone();
         let grep = query.grep.clone();
+        let token = service_token.map(str::to_string);
         let tail = query.tail;
         let start = query.start;
         let end = query.end;
@@ -62,7 +64,8 @@ pub async fn fan_out_query(
                 req_url.push_str(&params.join("&"));
             }
 
-            let resp = tokio::time::timeout(timeout, client.get(&req_url).send()).await;
+            let request = crate::sesame::auth::bearer_get(&client, &req_url, token.as_deref());
+            let resp = tokio::time::timeout(timeout, request.send()).await;
 
             match resp {
                 Ok(Ok(r)) if r.status().is_success() => {

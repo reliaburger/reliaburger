@@ -279,13 +279,20 @@ each wiring item lands with an integration test that drives the **binary**, not 
 - [x] `X7` `relish secret pubkey` reads the real `*-security-bootstrap.json` and prints the cluster age key
 - [x] `relish dev create` distributes the master key (every node) + security bootstrap (node 1) into `/etc/reliaburger` (0600) so a dev cluster boots with a real IKM + seeded SecurityState — the Stage 3a verification vehicle
 
-### Stage 3b — Enforce the security that's now loaded
+### Stage 3b (auth) — Enforce API authentication
 
-- [ ] `C5(a)` Attach the auth middleware to the routers (and fix fail-open on empty token store); live-refresh the token store from Raft
-- [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners (needs node-identity on-disk persistence)
-- [ ] `C5(c)` Sign + verify the gossip HMAC
+- [x] `C5(a)` Attach `auth_middleware` via a split router (public: `/`, health, `/ui/*`, JWKS; protected: everything else). Bootstrap window kept but keyed on real user tokens only, and documented
+- [x] Derived side-channel service token (HKDF of the master key) so bun's own cross-node fan-out authenticates as a `__system` principal without tripping the bootstrap window
+- [x] Live-refresh the token store from Raft (5 s) so a token created via `relish token create` engages enforcement without a restart
+- [x] Per-route role authorisation (`authorize`): token/secret/identity-sign → Admin; apply/stop/exec/chaos/fault → Deployer; reads open to any valid token
+- [x] Relish sends a Bearer token (`--token` flag > `RELIABURGER_TOKEN`) on every request
+
+### Stage 3b (transport) — Enforce transport security
+
+- [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners (needs node-identity on-disk persistence — certs are never persisted and joiners never receive theirs)
+- [ ] `C5(c)` Sign + verify the gossip HMAC (distribute the public root CA cert; derive the key)
 - [ ] `L17` Enforce CRL checks and image-signature verification (`require_signatures`)
-- [ ] Relish sends a Bearer token (`RELIABURGER_TOKEN`/config) so the CLI + UI still work once auth is on
+- [ ] Brioche UI / dashboard auth (`/`, `/ui/*` left public in Stage 3b auth)
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
