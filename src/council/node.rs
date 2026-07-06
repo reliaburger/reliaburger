@@ -198,6 +198,11 @@ impl CouncilNode {
         self.state_machine.desired_state().await.security_state
     }
 
+    /// Read the current Pickle manifest catalogue from the state machine.
+    pub async fn manifest_catalog(&self) -> crate::pickle::types::ManifestCatalog {
+        self.state_machine.desired_state().await.manifest_catalog
+    }
+
     /// Sign a workload CSR with the Workload CA.
     ///
     /// This is a synchronous crypto operation — only `AllocateSerial`
@@ -376,6 +381,15 @@ mod tests {
         }
         // Initialise on node 1.
         nodes[0].initialize(members).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn manifest_catalog_returns_the_replicated_catalog() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        // A fresh council has an empty catalogue; the accessor reads it from the
+        // same replicated desired state as security_state().
+        assert!(nodes[0].manifest_catalog().await.manifests.is_empty());
     }
 
     /// Wait for a leader to be elected (up to timeout).
