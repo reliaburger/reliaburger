@@ -289,9 +289,10 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 3b (transport) — Enforce transport security
 
+- [x] `C5(c)` Sign + verify the gossip HMAC — key derived from the master secret (every node has it, nothing new distributed); UDP transport signs on send, drops unverified datagrams on recv
+- [x] `L17` (signatures) Enforce image-signature **verification** at deploy time — `verify_image_signature` actually verifies the bytes against the cluster root CA (not just presence); gated on the node trust policy, refuses unsigned/invalid Pickle images. Enforced locally in `deploy` (no central scheduler exists yet — that's Stage 4 L1)
 - [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners (needs node-identity on-disk persistence — certs are never persisted and joiners never receive theirs)
-- [ ] `C5(c)` Sign + verify the gossip HMAC (distribute the public root CA cert; derive the key)
-- [ ] `L17` Enforce CRL checks and image-signature verification (`require_signatures`)
+- [ ] `L17` (CRL) Enforce CRL / cert-revocation checks in `verify_keyless` (naturally rides with mTLS peer certs)
 - [ ] Brioche UI / dashboard auth (`/`, `/ui/*` left public in Stage 3b auth)
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
