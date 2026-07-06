@@ -170,6 +170,10 @@ const MAX_UDP_PAYLOAD: usize = 1400;
 pub struct UdpMustardTransport {
     socket: tokio::net::UdpSocket,
     blocklist: Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    /// Shared gossip HMAC key. When set, outgoing datagrams are signed and
+    /// incoming ones whose tag doesn't verify are dropped. `None` disables HMAC
+    /// (single-node / no master key), preserving the plaintext behaviour.
+    hmac_key: Option<ring::hmac::Key>,
 }
 
 impl UdpMustardTransport {
@@ -184,7 +188,14 @@ impl UdpMustardTransport {
         Ok(Self {
             socket,
             blocklist: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            hmac_key: None,
         })
+    }
+
+    /// Attach a gossip HMAC key (or `None` to leave datagrams unauthenticated).
+    pub fn with_key(mut self, key: Option<ring::hmac::Key>) -> Self {
+        self.hmac_key = key;
+        self
     }
 
     /// Get a handle to the blocklist for chaos injection.
@@ -207,8 +218,20 @@ impl MustardTransport for UdpMustardTransport {
             return Ok(()); // silently drop
         }
 
-        let bytes =
-            bincode::serialize(message).map_err(|e| MustardError::Serialisation(e.to_string()))?;
+        // Sign the datagram if a key is configured. Signing zeroes then fills
+        // the `hmac` field, so it doesn't change the on-wire size.
+        let bytes = match &self.hmac_key {
+            Some(key) => {
+                let signed = message
+                    .clone()
+                    .signed(key)
+                    .map_err(|e| MustardError::Serialisation(e.to_string()))?;
+                bincode::serialize(&signed)
+                    .map_err(|e| MustardError::Serialisation(e.to_string()))?
+            }
+            None => bincode::serialize(message)
+                .map_err(|e| MustardError::Serialisation(e.to_string()))?,
+        };
 
         if bytes.len() > MAX_UDP_PAYLOAD {
             return Err(MustardError::Serialisation(format!(
@@ -236,7 +259,16 @@ impl MustardTransport for UdpMustardTransport {
                         continue; // silently drop
                     }
                     match bincode::deserialize::<GossipMessage>(&buf[..len]) {
-                        Ok(msg) => return Some((from, msg)),
+                        Ok(msg) => {
+                            // Drop datagrams that don't carry a valid HMAC when a
+                            // key is configured — the integrity gate.
+                            if let Some(key) = &self.hmac_key
+                                && !msg.verify_hmac(key)
+                            {
+                                continue;
+                            }
+                            return Some((from, msg));
+                        }
                         Err(_) => {
                             // Skip malformed datagrams — don't crash on garbage.
                             continue;
@@ -372,5 +404,62 @@ mod tests {
         t1.send(addr(2), &ping_msg("node-1")).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), t2.recv()).await;
         assert!(result.is_err());
+    }
+
+    // --- gossip HMAC on the real UDP transport (ephemeral ports) ---
+
+    fn gossip_key(seed: u8) -> ring::hmac::Key {
+        crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[seed; 32])
+    }
+
+    #[tokio::test]
+    async fn udp_transport_with_matching_keys_delivers_the_message() {
+        let t1 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(gossip_key(1)));
+        let t2 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(gossip_key(1)));
+        let dst = t2.local_addr();
+
+        t1.send(dst, &ping_msg("node-1")).await.unwrap();
+        let (_, msg) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.sender, NodeId::new("node-1"));
+    }
+
+    #[tokio::test]
+    async fn udp_transport_with_mismatched_keys_drops_the_message() {
+        let t1 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(gossip_key(1)));
+        let t2 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(gossip_key(2)));
+        let dst = t2.local_addr();
+
+        t1.send(dst, &ping_msg("node-1")).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), t2.recv()).await;
+        assert!(result.is_err(), "a wrong-key datagram must be dropped");
+    }
+
+    #[tokio::test]
+    async fn udp_transport_without_keys_still_delivers() {
+        let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
+        let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
+        let dst = t2.local_addr();
+
+        t1.send(dst, &ping_msg("node-1")).await.unwrap();
+        let (_, msg) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.sender, NodeId::new("node-1"));
     }
 }

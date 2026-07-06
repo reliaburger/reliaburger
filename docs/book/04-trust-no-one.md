@@ -463,6 +463,52 @@ The `select!` is the idiom for "do this on a timer, but drop everything the mome
 
 Three problems, none of them the crypto. Attaching a middleware is trivial; deciding what happens during bootstrap, how the system talks to itself once locked, and how the lock learns about new keys is the actual work. Same lesson as before, one layer up: the wiring is the system.
 
+## Signing the whispers
+
+The API is behind a lock now. Gossip isn't. Every node shouts SWIM datagrams over UDP — "are you alive?", "I think node-3 is dead" — and anyone on the network can shout back a lie. A forged datagram claiming a healthy node is dead is a denial-of-service with no packets dropped. UDP can't do TLS, so we sign each datagram with an HMAC.
+
+The nice part is we don't need to distribute anything. The gossip key is derived from the master secret every node already loaded in Stage 3a:
+
+```rust
+pub fn derive_gossip_key(ikm: &[u8; 32]) -> hmac::Key { /* HKDF over the master key */ }
+```
+
+Same master key on every node, same derived key, no key exchange. (The original code derived it from the root CA *certificate* — but a certificate is public, so that authenticated nothing. The master key is the secret; use the secret.)
+
+Signing happens in the transport, not in the forty-odd places that build a message. The `GossipMessage` already had a `hmac: [u8; 32]` field sitting zeroed "until Phase 4". The trick is what you sign over: the message *with that field zeroed*, so sender and receiver compute identical bytes.
+
+```rust
+pub fn canonical_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+    let mut canonical = self.clone();
+    canonical.hmac = [0u8; 32];   // sign over the message minus the signature slot
+    bincode::serialize(&canonical)
+}
+```
+
+This carries a quiet load-bearing assumption: bincode has to produce the *same* bytes on both nodes. It does, but only because the payload is `Vec`s and scalars. The day someone adds a `HashMap` to a gossip message, its iteration order will differ per process, the bytes will differ, and every node will silently reject every other node's gossip — a cluster that dissolves for no visible reason. So `canonical_bytes` carries a comment that says, in effect: *if you put a map here, make it a `BTreeMap`.* The send path signs; the receive path drops anything that doesn't verify, reusing the exact `continue` that already skipped malformed datagrams. A node with the wrong master key now simply doesn't exist as far as its peers are concerned.
+
+One honest caveat we wrote down rather than hid: during a rolling upgrade, a node that's learned to verify will drop gossip from a peer that hasn't yet learned to sign (it's still sending zeroes). Because signing and verifying ship in the same binary and the key was already on every node, a coordinated restart converges in seconds. If we ever needed zero-downtime upgrades, we'd add an "accept unsigned during the transition" flag. We didn't need it, so we didn't build it — but we said so.
+
+## Verifying the ingredients
+
+The last gap: image signatures. We had a `verify_signature` that chains a signature to the cluster CA, and a config flag `require_signatures`. And in between, a check that only asked *is there a signature?* — never *is it valid?* A forged signature blob passed.
+
+The awkward discovery was that there was nowhere to call the real verifier. The function that would live in a scheduler — read desired state, place replicas, check the image — doesn't exist yet; central scheduling is a later chapter. The only place an image actually becomes a running container today is the agent's local deploy loop. So that's where the gate goes:
+
+```rust
+for (app_name, spec) in &config.app {
+    if let Err(reason) = self.enforce_image_signature(spec).await {
+        let _ = events.send(ApplyEvent::Error { message: reason }).await;
+        continue;   // refuse this app; the others still deploy
+    }
+    // ...deploy...
+}
+```
+
+`enforce_image_signature` reaches the root CA the same way secret decryption already did (through the council), looks the image up in the replicated manifest catalogue, and — for a Pickle-hosted image — verifies the signature against that CA. External-registry images (nginx from Docker Hub) aren't ours to vouch for, so they pass. A local image with no signature, or a tampered one, is refused. This is deliberately *local* enforcement: each node vouches for what it runs, which is exactly the right guarantee until a central scheduler exists to vouch cluster-wide.
+
+Two different domains — gossip integrity and registry trust — one theme. The primitive was always there; the enforcement point was the missing piece.
+
 ## What Rust taught us
 
 Phase 4 is where Rust's ownership model really earns its keep. Cryptographic key material is the poster child for "use after free" and "double use" bugs. In C, you'd need to manually track which functions own which keys and when to zero them. In Rust, ownership rules enforce this automatically.

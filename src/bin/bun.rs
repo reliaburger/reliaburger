@@ -228,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     agent.set_log_sink(log_tx);
+    agent.set_trust_policy(config.images.trust_policy.clone());
     let deploy_history = agent.deploy_history_handle();
     let agent_handle = tokio::spawn(async move {
         agent.run().await;

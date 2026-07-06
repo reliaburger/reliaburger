@@ -28,6 +28,9 @@ pub enum ScheduleError {
 
     #[error("image {image} requires a signature (require_signatures is enabled)")]
     UnsignedImage { image: String },
+
+    #[error("image {image} has an invalid signature: {reason}")]
+    InvalidSignature { image: String, reason: String },
 }
 
 /// The Meat scheduler.
@@ -209,20 +212,8 @@ pub fn check_image_schedulable(
         return Ok(()); // process workloads have no image
     };
 
-    // Parse "repository:tag" from the image reference
-    // Simple split — full ImageReference parsing isn't needed here
-    let (repo, tag) = if let Some((r, t)) = image_ref.rsplit_once(':') {
-        (r, t)
-    } else {
-        (image_ref, "latest")
-    };
-
-    // Strip any registry prefix for local Pickle images
-    // e.g. "localhost:5050/myapp:v1" → "myapp"
-    let repo = repo.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo);
-
     // Look up in catalog — if not found, it's an external image (allow it)
-    if let Some(manifest) = catalog.get_manifest_by_tag(repo, tag)
+    if let Some(manifest) = lookup_pickle_manifest(image_ref, catalog)
         && manifest.signature.is_none()
     {
         return Err(ScheduleError::UnsignedImage {
@@ -231,6 +222,63 @@ pub fn check_image_schedulable(
     }
 
     Ok(())
+}
+
+/// Look up a Pickle-hosted manifest for an image reference.
+///
+/// Parses `repository:tag` (defaulting the tag to `latest`) and strips any
+/// registry prefix (`localhost:5050/myapp:v1` → `myapp`). Returns `None` for
+/// images not in the catalogue — i.e. external-registry images.
+fn lookup_pickle_manifest<'a>(
+    image_ref: &str,
+    catalog: &'a crate::pickle::types::ManifestCatalog,
+) -> Option<&'a crate::pickle::types::ImageManifest> {
+    let (repo, tag) = image_ref.rsplit_once(':').unwrap_or((image_ref, "latest"));
+    let repo = repo.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo);
+    catalog.get_manifest_by_tag(repo, tag)
+}
+
+/// Verify an image's signature under the trust policy, for enforcement.
+///
+/// Unlike [`check_image_schedulable`] (presence only), this actually verifies
+/// the signature bytes. Semantics:
+/// - `require_signatures == false` → always allowed;
+/// - no image (process workload) → allowed;
+/// - external image (not in the Pickle catalogue) → allowed (out of scope of
+///   cluster trust);
+/// - Pickle image with no signature → [`ScheduleError::UnsignedImage`];
+/// - Pickle image with a signature → verified via
+///   [`crate::pickle::signing::verify_signature`], mapping failure to
+///   [`ScheduleError::InvalidSignature`].
+pub fn verify_image_signature(
+    image: Option<&str>,
+    catalog: &crate::pickle::types::ManifestCatalog,
+    trust_policy: &crate::config::node::TrustPolicySection,
+    root_ca_der: Option<&[u8]>,
+) -> Result<(), ScheduleError> {
+    if !trust_policy.require_signatures {
+        return Ok(());
+    }
+
+    let Some(image_ref) = image else {
+        return Ok(());
+    };
+
+    let Some(manifest) = lookup_pickle_manifest(image_ref, catalog) else {
+        return Ok(()); // external image
+    };
+
+    let Some(signature) = &manifest.signature else {
+        return Err(ScheduleError::UnsignedImage {
+            image: image_ref.to_string(),
+        });
+    };
+
+    crate::pickle::signing::verify_signature(signature, &manifest.digest, trust_policy, root_ca_der)
+        .map_err(|e| ScheduleError::InvalidSignature {
+            image: image_ref.to_string(),
+            reason: e.to_string(),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -604,5 +652,140 @@ mod tests {
         let result =
             super::check_image_schedulable(Some("docker.io/library/nginx:latest"), &catalog, true);
         assert!(result.is_ok());
+    }
+
+    // --- verify_image_signature (enforcement) ---
+
+    use crate::config::node::TrustPolicySection;
+
+    fn require_signatures() -> TrustPolicySection {
+        TrustPolicySection {
+            require_signatures: true,
+            keys: vec![],
+        }
+    }
+
+    /// Build a catalogue holding a `myapp:v1` manifest with the given signature,
+    /// and return `(catalog, manifest_digest)`.
+    fn catalog_with(
+        signature: Option<crate::pickle::types::ImageSignature>,
+    ) -> crate::pickle::types::ManifestCatalog {
+        use crate::pickle::types::*;
+        use std::collections::BTreeSet;
+
+        let mut catalog = ManifestCatalog::default();
+        let manifest = ImageManifest {
+            digest: Digest::from_sha256_hex(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            ),
+            config: LayerDescriptor {
+                digest: Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                size: 100,
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            },
+            layers: vec![],
+            repository: "myapp".to_string(),
+            tags: BTreeSet::new(),
+            total_size: 100,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature,
+        };
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "v1".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        catalog
+    }
+
+    /// Mint a real keyless signature over the catalogue's manifest digest,
+    /// returning `(signature, root_ca_der)`.
+    fn real_keyless_signature() -> (crate::pickle::types::ImageSignature, Vec<u8>) {
+        use crate::pickle::types::Digest;
+        use crate::sesame::{ca, types::SerialNumber};
+
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-ikm-32-bytes-padding-here!!").unwrap();
+        let (cert_der, key_der, _) = ca::issue_node_cert(
+            "workload",
+            SerialNumber(100),
+            &hierarchy.workload.signing_keypair,
+            &hierarchy.workload.certificate_params,
+        )
+        .unwrap();
+        let digest = Digest::from_sha256_hex(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
+        let sig = crate::pickle::signing::create_keyless_signature(
+            &digest,
+            &cert_der,
+            &key_der,
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
+            "https://test.reliaburger.dev",
+            "spiffe://test/ns/ci/job/build",
+        )
+        .unwrap();
+        (sig, hierarchy.root.ca.certificate_der)
+    }
+
+    #[test]
+    fn verify_image_signature_allows_any_image_when_signatures_not_required() {
+        let catalog = catalog_with(None);
+        let policy = TrustPolicySection::default();
+        assert!(super::verify_image_signature(Some("myapp:v1"), &catalog, &policy, None).is_ok());
+    }
+
+    #[test]
+    fn verify_image_signature_allows_an_external_image_not_in_the_catalog() {
+        let catalog = crate::pickle::types::ManifestCatalog::default();
+        let result = super::verify_image_signature(
+            Some("nginx:latest"),
+            &catalog,
+            &require_signatures(),
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_image_signature_rejects_a_pickle_image_with_no_signature() {
+        let catalog = catalog_with(None);
+        let result =
+            super::verify_image_signature(Some("myapp:v1"), &catalog, &require_signatures(), None);
+        assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
+    }
+
+    #[test]
+    fn verify_image_signature_accepts_a_pickle_image_with_a_valid_signature() {
+        let (sig, root_ca) = real_keyless_signature();
+        let catalog = catalog_with(Some(sig));
+        let result = super::verify_image_signature(
+            Some("myapp:v1"),
+            &catalog,
+            &require_signatures(),
+            Some(&root_ca),
+        );
+        assert!(result.is_ok(), "valid signature should verify: {result:?}");
+    }
+
+    #[test]
+    fn verify_image_signature_rejects_a_pickle_image_with_a_tampered_signature() {
+        let (mut sig, root_ca) = real_keyless_signature();
+        // Corrupt the signature bytes.
+        sig.signature = "AAAA".to_string();
+        let catalog = catalog_with(Some(sig));
+        let result = super::verify_image_signature(
+            Some("myapp:v1"),
+            &catalog,
+            &require_signatures(),
+            Some(&root_ca),
+        );
+        assert!(matches!(
+            result,
+            Err(ScheduleError::InvalidSignature { .. })
+        ));
     }
 }

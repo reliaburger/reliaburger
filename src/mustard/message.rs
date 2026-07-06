@@ -25,7 +25,8 @@ pub struct GossipMessage {
     pub sender: NodeId,
     /// Sender's current incarnation number.
     pub incarnation: u64,
-    /// HMAC-SHA256 of the serialised payload (zeroed until Phase 4 adds mTLS).
+    /// HMAC-SHA256 over the rest of the message. Zeroed at construction; the
+    /// transport signs it on send and verifies it on receive when keyed.
     pub hmac: [u8; 32],
     /// The message payload.
     pub payload: GossipPayload,
@@ -36,7 +37,7 @@ impl GossipMessage {
     pub const VERSION: u8 = 1;
 
     /// Create a new gossip message with the given sender and payload.
-    /// HMAC is zeroed; Phase 4 will populate it.
+    /// HMAC is zeroed; the transport signs it on send when a key is configured.
     pub fn new(sender: NodeId, incarnation: u64, payload: GossipPayload) -> Self {
         Self {
             version: Self::VERSION,
@@ -44,6 +45,38 @@ impl GossipMessage {
             incarnation,
             hmac: [0u8; 32],
             payload,
+        }
+    }
+
+    /// The canonical bytes the HMAC is computed over: the whole message with
+    /// `hmac` zeroed. Both sender and receiver compute this identically.
+    ///
+    /// This is deterministic only because the payload contains no unordered
+    /// collections (`GossipPayload` is `Vec`s and scalars). **Any future map
+    /// field must be an ordered map (`BTreeMap`)** — a `HashMap`'s bincode order
+    /// varies per process and would silently break cross-node verification.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        let mut canonical = self.clone();
+        canonical.hmac = [0u8; 32];
+        bincode::serialize(&canonical)
+    }
+
+    /// Return a copy of this message with `hmac` set to the HMAC of its
+    /// canonical bytes under `key`.
+    pub fn signed(mut self, key: &ring::hmac::Key) -> Result<Self, bincode::Error> {
+        self.hmac = [0u8; 32];
+        let tag = crate::sesame::mtls::gossip_hmac::sign(key, &self.canonical_bytes()?);
+        // HMAC-SHA256 is always 32 bytes.
+        self.hmac.copy_from_slice(&tag);
+        Ok(self)
+    }
+
+    /// Verify this message's `hmac` against its canonical bytes under `key`.
+    /// Returns `false` on any serialisation error or tag mismatch.
+    pub fn verify_hmac(&self, key: &ring::hmac::Key) -> bool {
+        match self.canonical_bytes() {
+            Ok(bytes) => crate::sesame::mtls::gossip_hmac::verify(key, &bytes, &self.hmac),
+            Err(_) => false,
         }
     }
 }
@@ -122,6 +155,55 @@ mod tests {
         assert_eq!(msg.hmac, [0u8; 32]);
         assert_eq!(msg.sender, NodeId::new("node-1"));
         assert_eq!(msg.incarnation, 1);
+    }
+
+    fn a_message() -> GossipMessage {
+        GossipMessage::new(
+            NodeId::new("sender"),
+            5,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("target"),
+                    address: test_addr(),
+                    state: NodeState::Alive,
+                    incarnation: 3,
+                    lamport: 10,
+                }],
+            },
+        )
+    }
+
+    #[test]
+    fn canonical_bytes_are_identical_regardless_of_hmac_contents() {
+        let mut a = a_message();
+        let mut b = a.clone();
+        a.hmac = [1u8; 32];
+        b.hmac = [2u8; 32];
+        assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
+    }
+
+    #[test]
+    fn signed_message_verifies_with_the_same_key() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let signed = a_message().signed(&key).unwrap();
+        assert_ne!(signed.hmac, [0u8; 32]);
+        assert!(signed.verify_hmac(&key));
+    }
+
+    #[test]
+    fn signed_message_fails_verification_after_payload_is_mutated() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let mut signed = a_message().signed(&key).unwrap();
+        signed.incarnation += 1;
+        assert!(!signed.verify_hmac(&key));
+    }
+
+    #[test]
+    fn signed_message_fails_verification_under_a_different_key() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let other = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[4u8; 32]);
+        let signed = a_message().signed(&key).unwrap();
+        assert!(!signed.verify_hmac(&other));
     }
 
     fn test_addr() -> std::net::SocketAddr {
