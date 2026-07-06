@@ -332,6 +332,10 @@ pub struct BunAgent<G: Grill> {
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
+    /// Image trust policy. When `require_signatures` is set, deploys of
+    /// Pickle-hosted images are gated on a valid signature. Defaults to
+    /// permissive so single-node / untrusted setups are unaffected.
+    trust_policy: crate::config::node::TrustPolicySection,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -366,6 +370,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             log_tx: None,
+            trust_policy: crate::config::node::TrustPolicySection::default(),
         }
     }
 
@@ -407,6 +412,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             log_tx: None,
+            trust_policy: crate::config::node::TrustPolicySection::default(),
         }
     }
 
@@ -424,6 +430,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `relish logs` (which asks the runtime directly).
     pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
         self.log_tx = Some(log_tx);
+    }
+
+    /// Set the image trust policy (from node config). When it requires
+    /// signatures, deploys verify Pickle-hosted images before creating them.
+    pub fn set_trust_policy(&mut self, trust_policy: crate::config::node::TrustPolicySection) {
+        self.trust_policy = trust_policy;
     }
 
     /// Spawn a background forwarder that streams a started instance's log lines
@@ -930,6 +942,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
+            // Gate on image signature before doing anything: an unsigned or
+            // invalidly-signed Pickle image is refused, but other apps in the
+            // same config still deploy.
+            if let Err(reason) = self.enforce_image_signature(spec).await {
+                let _ = events.send(ApplyEvent::Error { message: reason }).await;
+                continue;
+            }
+
             // Store the spec so the Brioche UI can display env vars safely.
             self.deployed_specs
                 .insert((app_name.clone(), namespace.to_string()), spec.clone());
@@ -1408,6 +1428,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// keypair are loaded into the council security state. Callers must then
     /// refuse to start any workload carrying encrypted secrets rather than leak
     /// the ciphertext into the container environment.
+    /// Enforce the image trust policy for a workload before deploying it.
+    ///
+    /// Returns `Err(reason)` to reject the deploy. It's a no-op (`Ok`) when the
+    /// policy doesn't require signatures, in single-node mode (no council), or
+    /// for external-registry images not in the Pickle catalogue. For a
+    /// Pickle-hosted image it verifies the signature against the cluster root
+    /// CA.
+    async fn enforce_image_signature(&self, spec: &AppSpec) -> Result<(), String> {
+        if !self.trust_policy.require_signatures {
+            return Ok(());
+        }
+        let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+            return Ok(());
+        };
+        let catalog = council.manifest_catalog().await;
+        let security_state = council.security_state().await;
+        let root_ca = security_state
+            .get_ca(crate::sesame::types::CaRole::Root)
+            .map(|ca| ca.certificate_der.clone());
+        crate::meat::scheduler::verify_image_signature(
+            spec.image.as_deref(),
+            &catalog,
+            &self.trust_policy,
+            root_ca.as_deref(),
+        )
+        .map_err(|e| e.to_string())
+    }
+
     async fn decrypt_identity(&self, namespace: &str) -> Option<age::x25519::Identity> {
         let cluster = self.cluster.as_ref()?;
         let ikm = cluster.wrapping_ikm?;
@@ -2611,6 +2659,40 @@ mod tests {
             path = "/healthz"
         "#;
         Config::parse(toml_str).unwrap()
+    }
+
+    fn require_signatures_policy() -> crate::config::node::TrustPolicySection {
+        crate::config::node::TrustPolicySection {
+            require_signatures: true,
+            keys: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn single_node_deploy_ignores_the_trust_policy() {
+        // require_signatures is on, but there's no council to consult, so a
+        // single-node deploy is not gated — instances still come up.
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_trust_policy(require_signatures_policy());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let events = send_deploy(&tx, basic_config()).await;
+        let (created, _) = expect_complete(&events);
+        assert_eq!(created, 1);
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn enforce_image_signature_allows_when_no_council() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        agent.set_trust_policy(require_signatures_policy());
+        let spec: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
+        // No cluster/council → the gate can't (and shouldn't) enforce.
+        assert!(agent.enforce_image_signature(&spec).await.is_ok());
     }
 
     #[tokio::test]
