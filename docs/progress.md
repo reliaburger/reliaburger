@@ -355,6 +355,9 @@ Implementation plan: [docs/tui-plan-2026-07.md](tui-plan-2026-07.md)
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
+> Detailed implementation plan: [chaos-plan-2026-07.md](chaos-plan-2026-07.md)
+> (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
+
 - [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
 - [ ] `relish test --chaos` (integration tests + Smoker fault injection)
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
