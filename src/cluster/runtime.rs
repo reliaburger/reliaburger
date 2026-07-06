@@ -91,9 +91,17 @@ pub async fn start(
     shutdown: CancellationToken,
 ) -> std::io::Result<(ClusterHandle, ClusterRuntime)> {
     // --- Gossip ---
+    // Authenticate gossip datagrams with an HMAC keyed by the shared master
+    // secret (every node derives the same key). Nodes without a master key
+    // (single-node / pre-security) get None and gossip in the clear as before.
+    let gossip_key = params
+        .wrapping_ikm
+        .as_ref()
+        .map(crate::sesame::mtls::gossip_hmac::derive_gossip_key);
     let transport = UdpMustardTransport::bind(params.gossip_addr)
         .await
-        .map_err(|e| std::io::Error::other(format!("gossip bind failed: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("gossip bind failed: {e}")))?
+        .with_key(gossip_key);
 
     let mut node = MustardNode::new(
         NodeId::new(&params.node_name),
