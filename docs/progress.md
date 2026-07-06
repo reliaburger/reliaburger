@@ -343,6 +343,9 @@ Implementation plan: [docs/tui-plan-2026-07.md](tui-plan-2026-07.md)
 
 ## Phase 14: Self-Upgrade
 
+> Detailed implementation plan: [self-upgrade-plan-2026-07.md](self-upgrade-plan-2026-07.md)
+> (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
+
 - [ ] Rolling binary replacement
 - [ ] Dual-signature verification
 - [ ] Automatic rollback on failure
