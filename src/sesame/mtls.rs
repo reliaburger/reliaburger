@@ -108,21 +108,21 @@ pub fn build_server_auth_only_client_config(
 /// HMAC-SHA256 authentication for gossip UDP messages.
 ///
 /// Since UDP can't use TLS, we authenticate gossip messages with a
-/// shared HMAC key derived from the cluster's root CA certificate.
+/// shared HMAC key derived from the cluster's master secret.
 pub mod gossip_hmac {
     use ring::hmac;
 
-    /// Derive an HMAC key from the root CA certificate.
+    /// Derive the shared gossip HMAC key from the cluster master secret.
     ///
-    /// All cluster nodes share the root CA cert, so they all derive
-    /// the same HMAC key. This provides authentication (proving the
-    /// sender is a cluster member) but not confidentiality.
-    pub fn derive_gossip_key(root_ca_der: &[u8]) -> hmac::Key {
-        // Use the root CA cert bytes as input to HKDF, then use the
-        // output as the HMAC key. This is a simplified approach —
-        // a production system would use a separate shared secret.
+    /// Every node loads the same 32-byte master key (`master.key`, Stage 3a),
+    /// so they all derive the same HMAC key deterministically. This
+    /// authenticates gossip datagrams (proving the sender holds the cluster
+    /// secret) but provides no confidentiality. The master key is secret, so
+    /// this is a genuine shared secret — unlike the earlier root-CA derivation,
+    /// where the CA cert is public.
+    pub fn derive_gossip_key(ikm: &[u8; 32]) -> hmac::Key {
         let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, b"reliaburger-gossip-hmac-v1");
-        let prk = salt.extract(root_ca_der);
+        let prk = salt.extract(ikm);
 
         let mut key_bytes = [0u8; 32];
         let info = [b"gossip-hmac" as &[u8]];
@@ -201,48 +201,36 @@ mod tests {
     }
 
     #[test]
-    fn gossip_hmac_sign_verify_round_trip() {
-        let (_, _, root_ca, _) = test_hierarchy();
-        let key = gossip_hmac::derive_gossip_key(&root_ca);
-
+    fn gossip_hmac_verifies_a_tag_it_signed() {
+        let key = gossip_hmac::derive_gossip_key(&[7u8; 32]);
         let payload = b"gossip ping message";
         let tag = gossip_hmac::sign(&key, payload);
         assert!(gossip_hmac::verify(&key, payload, &tag));
     }
 
     #[test]
-    fn gossip_hmac_wrong_payload_fails() {
-        let (_, _, root_ca, _) = test_hierarchy();
-        let key = gossip_hmac::derive_gossip_key(&root_ca);
-
-        let payload = b"original message";
-        let tag = gossip_hmac::sign(&key, payload);
+    fn gossip_hmac_rejects_a_tampered_payload() {
+        let key = gossip_hmac::derive_gossip_key(&[7u8; 32]);
+        let tag = gossip_hmac::sign(&key, b"original message");
         assert!(!gossip_hmac::verify(&key, b"tampered message", &tag));
     }
 
     #[test]
-    fn gossip_hmac_wrong_key_fails() {
-        let hierarchy1 = ca::generate_ca_hierarchy("cluster-a", b"ikm-a").unwrap();
-        let hierarchy2 = ca::generate_ca_hierarchy("cluster-b", b"ikm-b").unwrap();
-
-        let key1 = gossip_hmac::derive_gossip_key(&hierarchy1.root.ca.certificate_der);
-        let key2 = gossip_hmac::derive_gossip_key(&hierarchy2.root.ca.certificate_der);
-
+    fn derive_gossip_key_yields_different_keys_for_different_ikm() {
+        let key_a = gossip_hmac::derive_gossip_key(&[1u8; 32]);
+        let key_b = gossip_hmac::derive_gossip_key(&[2u8; 32]);
         let payload = b"message from cluster A";
-        let tag = gossip_hmac::sign(&key1, payload);
-        // Cluster B's key should not verify cluster A's tag
-        assert!(!gossip_hmac::verify(&key2, payload, &tag));
+        let tag = gossip_hmac::sign(&key_a, payload);
+        // A key derived from a different master secret must not verify A's tag.
+        assert!(!gossip_hmac::verify(&key_b, payload, &tag));
     }
 
     #[test]
-    fn gossip_hmac_deterministic_key_derivation() {
-        let (_, _, root_ca, _) = test_hierarchy();
-        let key1 = gossip_hmac::derive_gossip_key(&root_ca);
-        let key2 = gossip_hmac::derive_gossip_key(&root_ca);
-
-        let payload = b"test";
-        let tag1 = gossip_hmac::sign(&key1, payload);
-        // Same root CA produces same key, so both should verify
-        assert!(gossip_hmac::verify(&key2, payload, &tag1));
+    fn derive_gossip_key_yields_same_key_for_same_ikm() {
+        let key1 = gossip_hmac::derive_gossip_key(&[9u8; 32]);
+        let key2 = gossip_hmac::derive_gossip_key(&[9u8; 32]);
+        let tag = gossip_hmac::sign(&key1, b"test");
+        // Same master secret → same key → cross-verifies.
+        assert!(gossip_hmac::verify(&key2, b"test", &tag));
     }
 }
