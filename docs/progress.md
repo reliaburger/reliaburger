@@ -320,6 +320,9 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ## Phase 12: Optimisations
 
+> Detailed implementation plan: [optimisations-plan-2026-07.md](optimisations-plan-2026-07.md)
+> (17 commit-sized steps across 6 slices, verified ground truth, config/endpoint/test inventories, Lima acceptance runbook).
+
 - [ ] Wire `SubmitBatch` into the agent (resolve job specs → `schedule_batch` over cluster capacity → dispatch → track completion via `BatchTracker`, `/v1/batch/{id}` status)
 - [ ] Wire `SubmitBuild` into the agent (download context blob from Pickle → spawn buildah build/push → report `BuildResult`)
 - [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
