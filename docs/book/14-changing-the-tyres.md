@@ -533,3 +533,35 @@ The *snapshot* is a different story, deliberately: it's JSON, self-describing, a
 While a node swaps binaries, the scheduler shouldn't hand it new work. The mechanism is two small pieces: `ClusterUpgradeState::is_node_cordoned` says whether a node's record is in an actively-swapping phase (`Directed` or `Verifying` — a `Pending` node keeps taking work until its turn actually comes; cordoning the whole fleet at once would be a self-inflicted capacity outage), and `meat::filter::apply_upgrade_cordon` flips those nodes' `ready` flag in the scheduler's cache, which the existing filter already respects. No new filter logic — readiness was designed as the "don't place here" bit, and upgrades are just one more thing that clears it.
 
 Tests: `cargo test --lib council::state_machine` (the update/clear/bounded-history/compat set) and the `scheduler_skips_nodes_mid_upgrade` filter test. Next: the orchestrator that actually walks the fleet.
+
+## 14.9 Workers first, leader last
+
+Why that order? Blast radius, then arithmetic. Workers are individually expendable — the scheduler routes around any one of them, so they absorb a bad release cheapest, in configurable batches (`--parallel`). Council members carry Raft, so they go strictly one at a time: with 3 voters, quorum is 2, and one member mid-restart is exactly as many as you can spare (5 voters can spare 2, but one at a time keeps reasoning simple — a second is only directed after the first reports healthy). The leader goes last because it's the orchestrator; by the time its turn comes, every other node has proven the new binary works *in this cluster*, and the machine that directs its upgrade is already running it.
+
+The orchestrator (`src/upgrade/orchestrator.rs`) has three layers, testability decreasing as consequence increases — the same pattern as §14.6:
+
+1. **`step`** — one tick of the walk, generic over a `NodeControl` trait (probe a node, send a directive, trigger an election). All twelve behaviour tests run against a mock cluster in a `HashMap`; not one of them opens a socket.
+2. **`HttpNodeControl`** — the trait's boring production body: reqwest calls to each node's API with the cluster service token.
+3. **`run_orchestrator`** — the driver loop, spawned on every cluster node: every 3 seconds, *if I am the leader and an upgrade is active*, run `step`, persist to Raft if anything changed.
+
+### Idempotency is the resume story
+
+Every `step` begins by *polling reality* — `/v1/version` on each node it cares about — rather than trusting its own records. This one habit collapses a pile of failure modes into non-events:
+
+- A `Pending` node that's somehow already at the target (leader crashed after directing it, before recording it)? First poll says so; it's marked `Healthy` without ever being directed. There's a test named for it: `resume_skips_nodes_already_at_target`.
+- A directive sent but lost (node rebooted at the wrong moment)? `Directed` nodes that don't show an upgrade in flight get the directive re-sent next tick — and re-sending is safe because the node side is idempotent on `upgrade_id` (§14.6). We *chose* send-then-record over the classic record-then-send write-ahead: with idempotent directives, the worst outcome of either crash window is a retry, and retries are free.
+- A leadership change mid-walk? The new leader's copy of the loop reads the same Raft state and its first `step` re-polls everything. Resuming *is* the normal path; there is no special recovery code.
+
+Failure detection also falls out of polling. A node that was `Verifying` and reappears on its *old* version, no upgrade in flight, has self-reverted (§14.4 did its job) — mark it `Failed`, pause the whole run. A node that vanishes entirely trips a stuck-node timeout. Per the design doc, cluster-level reaction to failure is deliberately *pause and tell the operator*, not auto-rollback of the fleet: one node's revert is contained, but yanking N healthy nodes back because one disagreed multiplies the blast radius on the worst day. `upgrade resume` returns `Failed` nodes to `Pending` (where the poll-first habit sorts out what actually needs doing) and re-enters the earliest unfinished group.
+
+### The leadership transfer trick
+
+openraft 0.9 has no `transfer_leader`. What it does have is `Raft::trigger().elect()` — "call an election on yourself". So the transfer is: the old leader picks a council member that's already `Healthy` on the new version and POSTs to that node's `/v1/cluster/elect`; the member, with a fresher term, wins; the old leader's orchestrator loop simply stops passing the `is_leader()` gate. On the *new* leader, the same loop wakes up holding the same Raft state, sees phase `TransferringLeadership` and that *it isn't the node marked `Leader`* — so leadership has evidently moved — and advances to `UpgradingLeader`, directing its former boss like any other node. Two tests tell the story from both sides: `leadership_transfers_before_leader_upgrade` and `new_leader_resumes_and_directs_former_leader`.
+
+(A cluster whose council is just the leader itself skips the dance — there's nobody to hand over to, and no quorum to protect. The single-node "cluster" degrades to §14.6's local upgrade.)
+
+### What the API gained
+
+`POST /v1/upgrade/start` (admin, leader): the full plan — target version, hashes and signatures, `parallel`, the registry address nodes should fetch from, and the explicit node list with roles. Explicit, because deriving API addresses from gossip is one of the wiring seams this phase doesn't own (gossip knows gossip ports); relish builds the list, and the integration tests pass ports that only the test knows. `GET /v1/upgrade/cluster` reads the replicated state from any node. `resume` and `cluster-rollback` do what they say — rollback runs the same walk with `direct_rollback` directives and no distribution step, since every node still has the previous binary on disk (§14.3's retention earning its keep).
+
+`cargo test --lib upgrade::orchestrator`. Next: the operator's steering wheel — `relish upgrade`.

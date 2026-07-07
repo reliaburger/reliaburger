@@ -209,6 +209,14 @@ pub fn router_with_upgrade(
         .route("/v1/upgrade/apply", post(upgrade_apply_handler))
         .route("/v1/upgrade/status", get(upgrade_status_handler))
         .route("/v1/upgrade/rollback", post(upgrade_rollback_handler))
+        .route("/v1/upgrade/start", post(upgrade_start_handler))
+        .route("/v1/upgrade/cluster", get(upgrade_cluster_handler))
+        .route("/v1/upgrade/resume", post(upgrade_resume_handler))
+        .route(
+            "/v1/upgrade/cluster-rollback",
+            post(upgrade_cluster_rollback_handler),
+        )
+        .route("/v1/cluster/elect", post(cluster_elect_handler))
         .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
@@ -419,6 +427,339 @@ fn agent_unavailable() -> Response {
         Json(serde_json::json!({ "error": "agent unavailable" })),
     )
         .into_response()
+}
+
+/// A node in a cluster upgrade start request.
+#[derive(serde::Deserialize)]
+struct StartUpgradeNode {
+    node_id: String,
+    /// The node's bun API address (`host:port`).
+    address: String,
+    role: crate::upgrade::types::NodeRole,
+}
+
+/// Start a cluster-wide rolling upgrade (admin, leader only).
+///
+/// The caller (relish) has already pushed the binary blob to the leader's
+/// Pickle registry; this handler records the plan in Raft and the
+/// orchestrator loop takes it from there.
+async fn upgrade_start_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    #[derive(serde::Deserialize)]
+    struct StartRequest {
+        target_version: crate::upgrade::BinaryVersion,
+        binary_sha256: String,
+        embedded_signature: String,
+        #[serde(default)]
+        external_signature: Option<String>,
+        #[serde(default = "default_parallel")]
+        parallel: u32,
+        /// Registry the nodes fetch the binary from (the leader's Pickle).
+        registry_address: String,
+        nodes: Vec<StartUpgradeNode>,
+        #[serde(default)]
+        direction: Option<crate::upgrade::types::UpgradeDirection>,
+    }
+    fn default_parallel() -> u32 {
+        1
+    }
+
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "cluster upgrades need a council (cluster mode)" })),
+        )
+            .into_response();
+    };
+    let request: StartRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid request: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    if request.nodes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "nodes list must not be empty" })),
+        )
+            .into_response();
+    }
+    if council.desired_state().await.active_upgrade.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "an upgrade is already in progress" })),
+        )
+            .into_response();
+    }
+
+    let upgrade_id = format!(
+        "up-{}-{}",
+        request.target_version,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    );
+    let upgrade = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: upgrade_id.clone(),
+        target_version: request.target_version,
+        binary_sha256: request.binary_sha256,
+        embedded_signature: request.embedded_signature,
+        external_signature: request.external_signature,
+        parallel: request.parallel.max(1),
+        direction: request
+            .direction
+            .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade),
+        phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
+        registry_address: request.registry_address,
+        nodes: request
+            .nodes
+            .into_iter()
+            .map(|node| crate::upgrade::types::NodeUpgradeRecord {
+                node_id: node.node_id,
+                address: node.address,
+                role: node.role,
+                from_version: None,
+                phase: crate::upgrade::types::NodeUpgradePhase::Pending,
+                since: None,
+            })
+            .collect(),
+    };
+
+    match council
+        .write(crate::council::types::RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade),
+        })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "starting", "upgrade_id": upgrade_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("could not record the upgrade (are we the leader?): {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Cluster upgrade state, readable from any node (it's replicated).
+async fn upgrade_cluster_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    let desired = council.desired_state().await;
+    Json(serde_json::json!({
+        "active": desired.active_upgrade,
+        "history": desired.upgrade_history,
+    }))
+    .into_response()
+}
+
+/// Un-pause a paused cluster upgrade (admin, leader only).
+async fn upgrade_resume_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    let Some(upgrade) = council.desired_state().await.active_upgrade else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no upgrade in progress" })),
+        )
+            .into_response();
+    };
+    if !matches!(
+        upgrade.phase,
+        crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "the upgrade is not paused" })),
+        )
+            .into_response();
+    }
+
+    let resumed = crate::upgrade::orchestrator::resume(upgrade);
+    match council
+        .write(crate::council::types::RaftRequest::UpgradeUpdate {
+            state: Box::new(resumed),
+        })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "resumed" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Start a cluster-wide rolling rollback (admin, leader only). The
+/// binaries are already on every node's disk, so there is no registry or
+/// signature material — just a target version and the node list.
+async fn upgrade_cluster_rollback_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    #[derive(serde::Deserialize)]
+    struct RollbackRequest {
+        target_version: crate::upgrade::BinaryVersion,
+        nodes: Vec<StartUpgradeNode>,
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    let request: RollbackRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid request: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    if council.desired_state().await.active_upgrade.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "an upgrade is already in progress" })),
+        )
+            .into_response();
+    }
+
+    let upgrade_id = format!(
+        "rollback-{}-{}",
+        request.target_version,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default()
+    );
+    let upgrade = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: upgrade_id.clone(),
+        target_version: request.target_version,
+        binary_sha256: String::new(),
+        embedded_signature: String::new(),
+        external_signature: None,
+        parallel: 1,
+        direction: crate::upgrade::types::UpgradeDirection::Rollback,
+        phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
+        registry_address: String::new(),
+        nodes: request
+            .nodes
+            .into_iter()
+            .map(|node| crate::upgrade::types::NodeUpgradeRecord {
+                node_id: node.node_id,
+                address: node.address,
+                role: node.role,
+                from_version: None,
+                phase: crate::upgrade::types::NodeUpgradePhase::Pending,
+                since: None,
+            })
+            .collect(),
+    };
+
+    match council
+        .write(crate::council::types::RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade),
+        })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "rolling back", "upgrade_id": upgrade_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Ask this node to call a Raft election on itself (admin; internal —
+/// leadership transfer during upgrades, openraft 0.9 has no native
+/// transfer).
+async fn cluster_elect_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    match council.raft().trigger().elect().await {
+        Ok(()) => Json(serde_json::json!({ "status": "election triggered" })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// Deploy workloads, streaming progress via SSE.

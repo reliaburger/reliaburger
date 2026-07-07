@@ -169,6 +169,7 @@ mod tests {
             role: NodeRole::Worker,
             from_version: None,
             phase,
+            since: None,
         };
         let upgrade = ClusterUpgradeState {
             upgrade_id: "up-1".to_string(),
@@ -179,6 +180,7 @@ mod tests {
             parallel: 1,
             direction: UpgradeDirection::Upgrade,
             phase: ClusterUpgradePhase::UpgradingWorkers,
+            registry_address: String::new(),
             nodes: vec![
                 record("n1", NodeUpgradePhase::Directed),
                 record("n2", NodeUpgradePhase::Pending),

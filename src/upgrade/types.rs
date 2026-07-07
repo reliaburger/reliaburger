@@ -96,6 +96,10 @@ pub struct ClusterUpgradeState {
     pub parallel: u32,
     pub direction: UpgradeDirection,
     pub phase: ClusterUpgradePhase,
+    /// Registry address nodes fetch the binary from (leader's Pickle).
+    /// Empty for rollbacks (the binary is already on every node's disk).
+    #[serde(default)]
+    pub registry_address: String,
     /// Fixed at start from gossip membership; the rolling order walks it.
     pub nodes: Vec<NodeUpgradeRecord>,
 }
@@ -157,6 +161,9 @@ pub struct NodeUpgradeRecord {
     /// Populated from the first `/v1/version` poll.
     pub from_version: Option<BinaryVersion>,
     pub phase: NodeUpgradePhase,
+    /// When the node entered its current phase (drives stuck-node timeouts).
+    #[serde(default)]
+    pub since: Option<std::time::SystemTime>,
 }
 
 /// Per-node phase within the cluster upgrade.

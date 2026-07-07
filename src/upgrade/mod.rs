@@ -14,6 +14,7 @@ pub mod error;
 pub mod keys;
 pub mod manager;
 pub mod marker;
+pub mod orchestrator;
 pub mod signing;
 pub mod store;
 pub mod types;
@@ -21,3 +22,7 @@ pub mod version;
 
 pub use error::UpgradeError;
 pub use version::{BinaryVersion, resolve_running_version};
+
+/// Pickle repository name for distributing reliaburger binaries
+/// (single path segment — the registry routes require it).
+pub const BINARY_BLOB_REPO: &str = "reliaburger-bun";

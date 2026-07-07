@@ -472,9 +472,11 @@ impl UpgradeManager {
         match &directive.source {
             BinarySource::LocalFile { path } => Ok(tokio::fs::read(path).await?),
             BinarySource::Pickle { registry_address } => {
-                // Pickle stores the binary as a content-addressed blob.
+                // Pickle stores the binary as a content-addressed blob under
+                // a single-segment repository name (axum {name} routes).
                 let url = format!(
-                    "http://{registry_address}/v2/reliaburger/bun/blobs/sha256:{}",
+                    "http://{registry_address}/v2/{}/blobs/sha256:{}",
+                    super::BINARY_BLOB_REPO,
                     directive.binary_sha256
                 );
                 let response = reqwest::get(&url)

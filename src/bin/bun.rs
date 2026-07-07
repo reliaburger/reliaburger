@@ -490,6 +490,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Rolling-upgrade orchestrator: dormant unless this node is the Raft
+    // leader with an active upgrade in DesiredState (Phase 14).
+    if let Some(council) = api_council.clone() {
+        let control =
+            reliaburger::upgrade::orchestrator::HttpNodeControl::new(service_token.clone());
+        let orchestrator_cancel = shutdown.clone();
+        let orchestrator_node = node_name.clone();
+        tokio::spawn(async move {
+            reliaburger::upgrade::orchestrator::run_orchestrator(
+                council,
+                control,
+                orchestrator_node,
+                orchestrator_cancel,
+            )
+            .await;
+        });
+    }
+
     // Seed the auth token store from the council's SecurityState and keep it
     // refreshed. The middleware reads this store; without the refresh, a token
     // created after startup would never engage enforcement (the ≤5 s lag is

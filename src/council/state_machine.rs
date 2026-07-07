@@ -1186,6 +1186,7 @@ mod tests {
             parallel: 1,
             direction: crate::upgrade::types::UpgradeDirection::Upgrade,
             phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
+            registry_address: String::new(),
             nodes: vec![],
         }
     }
