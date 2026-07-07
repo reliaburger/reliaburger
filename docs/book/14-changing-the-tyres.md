@@ -330,3 +330,78 @@ One Rust note for the road. The decision arms use *match guards* — `MarkerPhas
 `cargo test --lib upgrade::marker`.
 
 Next, the prerequisite that makes the swap invisible to workloads: teaching the runtimes to *adopt* processes and containers they didn't start.
+
+## 14.5 Your children survive exec()
+
+Time to pay off the warning from the top of the chapter. When bun upgrades itself, it calls `execve(2)`: the kernel throws away the process's entire memory image and loads the new binary into the *same process*. Not a child, not a replacement — the same PID, mid-flight.
+
+What survives an exec, and what doesn't, is the single most important table in this chapter:
+
+| Survives | Destroyed |
+|---|---|
+| The PID | All memory — every struct, every `HashMap`, every `Child` handle |
+| Parent/child relationships — **your children are still your children** | All threads (including the entire tokio runtime) |
+| File descriptors *without* `O_CLOEXEC` | FDs *with* `O_CLOEXEC` — which is everything Rust's std and tokio open |
+| The environment (the §14.1 trap) | Signal handlers |
+| Working directory, resource limits | Locks tied to closed FDs (redb's, usefully) |
+
+Read the first column again. The workload processes ProcessGrill spawned, and the foreground `runc run` processes driving our containers, are children of bun. Exec doesn't touch them. **The workloads survive the upgrade by default.** The kernel does the hard part of "containers survive" for free.
+
+What doesn't survive is our *knowledge* of them. The `tokio::process::Child` handles, the entry maps, the supervisor state — all of it was memory. The new binary wakes up with running children it has never heard of. So the real work of this section isn't keeping workloads alive; it's rebuilding the bookkeeping. Three problems, each with a sharp edge.
+
+### Problem 1: remembering — instance records
+
+Every successfully started instance now writes a record to `{data_dir}/instances/{id}.json`: pids, ports, the OCI spec it was started from, the app spec (to rebuild health checks), where its logs go. On startup — before any reconciliation — the agent scans the records and asks the runtime to `adopt` each one. Adopted instances are seeded into the supervisor as `Running`; the reconcile loop then sees nothing missing and starts nothing twice. Records for dead processes are deleted, and those instances reschedule through the normal path.
+
+The sharp edge: **pids get reused**. A record saying "web-0 is pid 4242" proves nothing — 4242 might now be someone's text editor. Adopting it would mean health-checking, signalling, and eventually SIGKILLing an innocent process. So records also store the process's *start time*, and adoption requires both to match:
+
+```rust
+pub fn is_live(record: &InstanceRecord) -> bool {
+    match process_start_time(record.pid) {
+        Some(started_at) => started_at.abs_diff(record.pid_started_at) <= 2,
+        None => false,
+    }
+}
+```
+
+A pid plus its start time is, for practical purposes, a unique process identity. (The `±2s` slack exists because platforms round start times differently depending on when you ask. `abs_diff`, note, is the panic-free way to ask "how far apart" for unsigned integers — `a - b` on `u64` aborts in debug if `b > a`.)
+
+### Problem 2: the pipe trap — logs must be files
+
+ProcessGrill used to capture workload output with pipes: spawn with `Stdio::piped()`, read the other end in a tokio task. Follow the pieces through an exec. The reading task: gone (all threads). Bun's read-end FD: closed (CLOEXEC). The workload's write end: now points at a pipe nobody will ever read. The workload keeps serving happily until the pipe buffer fills or the kernel notices — and then its next `println!` gets **SIGPIPE, whose default action is process death**. The workload survives the upgrade and is then murdered by its own logging.
+
+The fix is the one runc used from day one: redirect stdout/stderr to *files*. A file doesn't care who reads it or whether the reader is alive; the workload appends through the swap without noticing, and the new bun just keeps reading from the recorded path. `ProcessGrill::with_log_dir` enables this mode (the binary uses it always; in-memory pipes remain for unit tests). This is the quiet lesson of the section: in a system where processes replace themselves, *shared state belongs in the filesystem, not in process plumbing*.
+
+### Problem 3: reaping — waitpid, ECHILD, and the two afterlives
+
+An adopted process has no `Child` handle, so someone must still collect its exit status when it dies — otherwise it lingers as a zombie. Here Unix hands us a fork in the road, because an adoptee has two possible histories:
+
+- **After an exec** (the upgrade path): it's still our child — same PID, remember. `waitpid(pid, WNOHANG)` works: it reports "still alive", or reaps the zombie and returns the exit code.
+- **After a full restart** (the crash path: the supervisor spawned a *new* bun process): the orphaned workload was reparented to init. `waitpid` returns `ECHILD` — "not your child" — and we fall back to `kill(pid, 0)`, the classic no-op signal that answers only "does this process exist?". The exit *code* is unknowable in this history; init reaped it.
+
+```rust
+match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
+    Ok(WaitStatus::StillAlive) => (true, None),
+    Ok(WaitStatus::Exited(_, code)) => (false, Some(code)),
+    Ok(_) => (false, None),                       // killed by signal, etc.
+    Err(Errno::ECHILD) => match kill(nix_pid, None) {
+        Ok(()) => (true, None),                   // alive, someone else's child
+        Err(_) => (false, None),                  // gone
+    },
+    Err(_) => (false, None),
+}
+```
+
+This is `poll_adopted_process`, and it's called from `state()` — which the supervisor polls continuously anyway, so polling doubles as reaping and no separate reaper task is needed. If you've only ever managed processes from Go's `os/exec` or Python's `subprocess`, this is the machinery those libraries hide from you; it stops being hideable the moment the process that called `spawn` isn't the process calling `wait`.
+
+RunC adoption is the same story one level up, with one extra check: besides the `runc run` pid being live, `runc state <id>` must report the *container* as `running` — the pid check authenticates the process, the state check authenticates the container. Apple Container adoption is deferred (`TODO(Phase 14 follow-up)`); macOS still exercises every line of this via ProcessGrill.
+
+### What we decided not to do
+
+- **A pidfd-based watcher.** Linux's `pidfd_open` gives race-free process handles and would beat polling — and doesn't exist on macOS. Polling from `state()` is portable and already on a loop we pay for.
+- **Persisting restart-backoff counters.** Adopted instances restart their backoff history from zero. Defensible (the new binary is a new regime) and one less thing to keep consistent; documented behaviour.
+- **Re-registering cluster routing at adoption time.** The reconcile paths rebuild routing anyway; doing it twice invites disagreement.
+
+The tests to read: `records::liveness_rejects_reused_pid` (the start-time fingerprint doing its job), `process::state_detects_adopted_instance_exit` (a real child, deliberately never `wait()`ed by the test, reaped through adoption polling), and `agent::startup_adopts_recorded_instances_instead_of_restarting` (the mock grill proving the supervisor calls `adopt`, and never `create`/`start`, for a recorded instance).
+
+With workloads able to out-live the process that started them, we can finally build the thing that kills that process on purpose: the node-level upgrade manager.

@@ -32,6 +32,9 @@ struct RuncEntry {
     log_path: PathBuf,
     /// The `runc run` child, once started.
     child: Option<tokio::process::Child>,
+    /// Pid of an adopted `runc run` process (started by a previous bun).
+    /// Mutually exclusive with `child`.
+    adopted_pid: Option<u32>,
     state: ContainerState,
     exit_code: Option<i32>,
 }
@@ -292,6 +295,7 @@ impl super::Grill for RuncGrill {
                 bundle_dir,
                 log_path,
                 child: None,
+                adopted_pid: None,
                 state: ContainerState::Pending,
                 exit_code: None,
             },
@@ -308,7 +312,7 @@ impl super::Grill for RuncGrill {
                 instance: instance.clone(),
             })?;
 
-        if entry.child.is_some() {
+        if entry.child.is_some() || entry.adopted_pid.is_some() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "already started".to_string(),
@@ -369,10 +373,13 @@ impl super::Grill for RuncGrill {
             .runc_command(&["kill", &instance.0, "SIGKILL"], instance)
             .await;
         // Also kill the `runc run` process in case the container is unresponsive.
-        if let Some(entry) = self.entries.lock().await.get_mut(instance)
-            && let Some(ref mut child) = entry.child
-        {
-            let _ = child.kill().await;
+        if let Some(entry) = self.entries.lock().await.get_mut(instance) {
+            if let Some(ref mut child) = entry.child {
+                let _ = child.kill().await;
+            } else if let Some(pid) = entry.adopted_pid {
+                let pid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            }
         }
         self.cleanup(instance).await;
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
@@ -404,6 +411,17 @@ impl super::Grill for RuncGrill {
                         entry.state = ContainerState::Stopped;
                     }
                 }
+            } else if let Some(pid) = entry.adopted_pid
+                && entry.state != ContainerState::Stopped
+            {
+                // Adopted `runc run` process: no handle, poll (and reap)
+                // by pid. See records::poll_adopted_process.
+                let (running, exit_code) = super::records::poll_adopted_process(pid);
+                if !running {
+                    just_exited = true;
+                    entry.state = ContainerState::Stopped;
+                    entry.exit_code = exit_code;
+                }
             }
             (entry.state, just_exited)
         };
@@ -423,13 +441,76 @@ impl super::Grill for RuncGrill {
         let entry = entries.get_mut(instance)?;
         // Reap the child so the exit code is captured even if state() wasn't
         // polled since exit.
-        if let Some(ref mut child) = entry.child
-            && let Ok(Some(status)) = child.try_wait()
+        if let Some(ref mut child) = entry.child {
+            if let Ok(Some(status)) = child.try_wait() {
+                entry.state = ContainerState::Stopped;
+                entry.exit_code = status.code();
+            }
+        } else if let Some(pid) = entry.adopted_pid
+            && entry.state != ContainerState::Stopped
         {
-            entry.state = ContainerState::Stopped;
-            entry.exit_code = status.code();
+            let (running, exit_code) = super::records::poll_adopted_process(pid);
+            if !running {
+                entry.state = ContainerState::Stopped;
+                entry.exit_code = exit_code;
+            }
         }
         entry.exit_code
+    }
+
+    async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        let entries = self.entries.lock().await;
+        let entry = entries.get(instance)?;
+        entry
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .or(entry.adopted_pid)
+    }
+
+    fn runtime_kind(&self) -> super::records::RuntimeKind {
+        super::records::RuntimeKind::Runc
+    }
+
+    async fn adopt(
+        &self,
+        instance: &InstanceId,
+        record: &super::records::InstanceRecord,
+    ) -> Result<bool, GrillError> {
+        // The recorded `runc run` process must still be the one we started...
+        if !super::records::is_live(record) {
+            return Ok(false);
+        }
+        // ...and runc itself must agree the container is running.
+        let container_id = record.runc_container_id.as_deref().unwrap_or(&instance.0);
+        let output = self
+            .runc_command(&["state", container_id], instance)
+            .await?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let running = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+            .is_some_and(|status| status == "running");
+        if !running {
+            return Ok(false);
+        }
+
+        let bundle_dir = self.bundle_base.join(&instance.0);
+        let log_path = bundle_dir.join("output.log");
+        self.entries.lock().await.insert(
+            instance.clone(),
+            RuncEntry {
+                bundle_dir,
+                log_path,
+                child: None,
+                adopted_pid: Some(record.pid),
+                state: ContainerState::Running,
+                exit_code: None,
+            },
+        );
+        Ok(true)
     }
 
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {

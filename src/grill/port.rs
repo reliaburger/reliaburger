@@ -28,6 +28,9 @@ pub enum PortError {
 
     #[error("port {port} is not currently allocated")]
     NotAllocated { port: u16 },
+
+    #[error("port {port} is already reserved")]
+    AlreadyReserved { port: u16 },
 }
 
 impl PortAllocator {
@@ -67,6 +70,19 @@ impl PortAllocator {
             start: self.range_start,
             end: self.range_end,
         })
+    }
+
+    /// Reserve a specific port (workload adoption after restart/upgrade:
+    /// the port is already in use by the surviving instance). Reserving a
+    /// port outside the range is allowed — the range only constrains fresh
+    /// allocations. Reserving an already-reserved port is an error.
+    pub async fn reserve(&self, port: u16) -> Result<(), PortError> {
+        let mut allocated = self.allocated.lock().await;
+        if allocated.insert(port) {
+            Ok(())
+        } else {
+            Err(PortError::AlreadyReserved { port })
+        }
     }
 
     /// Release a previously allocated port back to the pool.

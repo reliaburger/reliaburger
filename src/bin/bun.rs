@@ -204,8 +204,23 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Instance records + process log files ({data}/instances). Started
+    // workloads are recorded here so a future bun process (crash restart or
+    // self-upgrade exec) adopts them instead of restarting them.
+    let instances_dir = if std::fs::create_dir_all(config.storage.data.join("instances")).is_ok() {
+        config.storage.data.join("instances")
+    } else {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger")
+            .join("instances");
+        std::fs::create_dir_all(&fallback)
+            .map_err(|e| anyhow::anyhow!("failed to create instances directory: {e}"))?;
+        fallback
+    };
+
     // Select runtime
-    let runtime = select_runtime(&cli.runtime, container_nameserver).await?;
+    let runtime = select_runtime(&cli.runtime, container_nameserver, &instances_dir).await?;
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -444,6 +459,10 @@ async fn main() -> anyhow::Result<()> {
     };
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
+    agent.set_records_dir(instances_dir.clone());
+    // Adopt workloads that survived a previous bun process (restart or
+    // self-upgrade exec) BEFORE the agent loop starts reconciling.
+    agent.adopt_recorded_instances().await;
     let deploy_history = agent.deploy_history_handle();
 
     // Onion DNS: start the .internal responder when [dns] enables it,
@@ -1147,12 +1166,22 @@ async fn main() -> anyhow::Result<()> {
 async fn select_runtime(
     name: &str,
     dns_nameserver: Option<std::net::Ipv4Addr>,
+    instances_dir: &std::path::Path,
 ) -> anyhow::Result<AnyGrill> {
     // Silence the unused warning on platforms without runc.
     let _ = dns_nameserver;
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
+            // Rebuild the process fallback in file-backed mode: workload
+            // output must go to files (not pipes) to survive a self-upgrade
+            // exec and support adoption.
+            let runtime = match runtime {
+                AnyGrill::Process(_) => {
+                    AnyGrill::Process(ProcessGrill::with_log_dir(instances_dir.to_path_buf()))
+                }
+                other => other,
+            };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
                 #[cfg(target_os = "linux")]
@@ -1165,7 +1194,9 @@ async fn select_runtime(
         }
         "process" => {
             println!("bun: using process runtime");
-            Ok(AnyGrill::Process(ProcessGrill::new()))
+            Ok(AnyGrill::Process(ProcessGrill::with_log_dir(
+                instances_dir.to_path_buf(),
+            )))
         }
         #[cfg(target_os = "linux")]
         "runc" => {

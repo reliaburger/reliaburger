@@ -17,6 +17,7 @@ pub struct MockGrill {
     calls: Arc<Mutex<Vec<(String, InstanceId)>>>,
     state_overrides: Arc<Mutex<HashMap<InstanceId, ContainerState>>>,
     exit_codes: Arc<Mutex<HashMap<InstanceId, Option<i32>>>>,
+    adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
 }
 
 impl MockGrill {
@@ -47,6 +48,16 @@ impl MockGrill {
             .lock()
             .unwrap()
             .insert(instance.clone(), code);
+    }
+
+    /// Set whether `adopt()` will succeed for a specific instance.
+    /// Unconfigured instances decline adoption (like a dead process).
+    #[allow(dead_code)]
+    pub fn set_adopt_result(&self, instance: &InstanceId, adopted: bool) {
+        self.adopt_results
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), adopted);
     }
 }
 
@@ -109,5 +120,23 @@ impl super::Grill for MockGrill {
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
         let codes = self.exit_codes.lock().unwrap();
         codes.get(instance).copied().flatten()
+    }
+
+    async fn adopt(
+        &self,
+        instance: &InstanceId,
+        _record: &super::records::InstanceRecord,
+    ) -> Result<bool, GrillError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("adopt".to_string(), instance.clone()));
+        Ok(self
+            .adopt_results
+            .lock()
+            .unwrap()
+            .get(instance)
+            .copied()
+            .unwrap_or(false))
     }
 }

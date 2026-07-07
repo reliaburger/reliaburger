@@ -10,7 +10,7 @@
 //!   bun-v0.2.0.sig                       (detached signature envelope)
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::error::UpgradeError;
 use super::signing::SignatureEnvelope;
