@@ -204,20 +204,57 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Instance records + process log files ({data}/instances). Started
-    // workloads are recorded here so a future bun process (crash restart or
-    // self-upgrade exec) adopts them instead of restarting them.
-    let instances_dir = if std::fs::create_dir_all(config.storage.data.join("instances")).is_ok() {
-        config.storage.data.join("instances")
+    // Writable base for node-local runtime state (instance records,
+    // upgrade markers). Prefers the configured data dir, falls back to the
+    // user data dir like the metrics/logs stores below.
+    let data_base = if std::fs::create_dir_all(&config.storage.data).is_ok() {
+        config.storage.data.clone()
     } else {
         let fallback = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("instances");
+            .join("reliaburger");
         std::fs::create_dir_all(&fallback)
-            .map_err(|e| anyhow::anyhow!("failed to create instances directory: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to create data directory: {e}"))?;
         fallback
     };
+
+    // Instance records + process log files ({data}/instances). Started
+    // workloads are recorded here so a future bun process (crash restart or
+    // self-upgrade exec) adopts them instead of restarting them.
+    let instances_dir = data_base.join("instances");
+    std::fs::create_dir_all(&instances_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create instances directory: {e}"))?;
+
+    // Self-upgrade: build the manager and run startup recovery BEFORE any
+    // subsystem starts. A crash-looping new version reverts here; a freshly
+    // swapped-in version gets a verification marker to prove itself against.
+    let original_argv: Vec<String> = std::env::args().collect();
+    let upgrade_manager = match reliaburger::upgrade::manager::UpgradeManager::new(
+        &config.upgrades,
+        &data_base,
+        &exe_path,
+        running_version.clone(),
+        original_argv,
+    ) {
+        Ok(manager) => Some(manager),
+        Err(e) => {
+            eprintln!("bun: warning: self-upgrade unavailable: {e}");
+            None
+        }
+    };
+    let mut upgrade_verify = None;
+    if let Some(manager) = &upgrade_manager {
+        use reliaburger::upgrade::manager::StartupAction;
+        match manager.startup_action() {
+            Ok(StartupAction::Continue { verify }) => upgrade_verify = verify,
+            Ok(StartupAction::ExecPrevious) => {
+                // Only returns on error; on success the process is replaced.
+                let error = manager.exec_current_symlink();
+                anyhow::bail!("failed to exec previous version during revert: {error}");
+            }
+            Err(e) => eprintln!("bun: warning: upgrade startup recovery failed: {e}"),
+        }
+    }
 
     // Select runtime
     let runtime = select_runtime(&cli.runtime, container_nameserver, &instances_dir).await?;
@@ -460,6 +497,9 @@ async fn main() -> anyhow::Result<()> {
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
+    if let Some(manager) = upgrade_manager.clone() {
+        agent.set_upgrade_manager(manager);
+    }
     // Adopt workloads that survived a previous bun process (restart or
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
     agent.adopt_recorded_instances().await;
@@ -779,7 +819,31 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-    let app = api::router(
+    // A freshly swapped-in version must prove itself: after the boot grace
+    // period, ask the agent to verify that every pre-upgrade workload
+    // survived, then commit (or flag revert and exit).
+    // TODO(Phase 14, orchestration step): in cluster mode, also require
+    // gossip rejoin within upgrades.gossip_rejoin_secs before committing.
+    if let Some(marker) = upgrade_verify.take() {
+        let verify_tx = cmd_tx.clone();
+        let grace_secs = config.upgrades.boot_grace_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if verify_tx
+                .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
+                    marker,
+                    response: tx,
+                })
+                .await
+                .is_ok()
+            {
+                let _ = rx.await;
+            }
+        });
+    }
+
+    let app = api::router_with_upgrade(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
         Some(Arc::clone(&log_store)),
@@ -793,6 +857,7 @@ async fn main() -> anyhow::Result<()> {
         api_membership.clone(),
         gitops_webhook_tx,
         api_port,
+        upgrade_manager.clone().map(Arc::new),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {

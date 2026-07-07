@@ -405,3 +405,49 @@ RunC adoption is the same story one level up, with one extra check: besides the 
 The tests to read: `records::liveness_rejects_reused_pid` (the start-time fingerprint doing its job), `process::state_detects_adopted_instance_exit` (a real child, deliberately never `wait()`ed by the test, reaped through adoption polling), and `agent::startup_adopts_recorded_instances_instead_of_restarting` (the mock grill proving the supervisor calls `adopt`, and never `create`/`start`, for a recorded instance).
 
 With workloads able to out-live the process that started them, we can finally build the thing that kills that process on purpose: the node-level upgrade manager.
+
+## 14.6 Replacing yourself without dying
+
+All the pieces exist: versions, signatures, the store, the marker, adoption. The `UpgradeManager` strings them into the actual node-level upgrade, and its design pivots on one uncomfortable fact — somewhere in the middle of this sequence is a function call that, if it works, *never returns*.
+
+You can't unit-test `execv`. It replaces the test process. So the manager splits the sequence at exactly that line:
+
+- **`prepare(directive, inventory)`** — everything testable: check no upgrade is in flight (idempotent on `upgrade_id`, so a re-delivered directive is a no-op), fetch the binary (local file, or Pickle blob by its sha256), verify the dual signatures, stage into the store, write the `Staged` marker with the pre-upgrade workload inventory. If any of it fails, the error propagates and *the running system is untouched* — the symlink never moved.
+- **`execute(prepared)`** — the point of no return, kept almost too dumb to break: write the `Executed` marker, `activate` the symlink, `execv`. Three lines of consequence. It returns only on failure, and then puts the symlink back before reporting.
+
+The ordering inside those three lines is not negotiable, and it's worth spelling out why. Marker *before* symlink: if we crash between them, the marker says `Executed` but the previous version is still what runs — startup recovery reads that as a failed upgrade and reports it. Symlink *before* the marker would invert the failure: a crash leaves the *new* binary active with a marker claiming nothing was executed; the stale-marker path would archive it and the node would silently run an unverified version. Same three operations, opposite safety, purely from order.
+
+### The exec itself
+
+```rust
+let path_c = CString::new(path.to_string_lossy().into_owned())?;
+let mut argv_c = vec![path_c.clone()];
+for arg in self.original_argv.iter().skip(1) { argv_c.push(CString::new(arg.as_str())?); }
+
+// execv only returns on failure.
+let err = nix::unistd::execv(&path_c, &argv_c).err();
+```
+
+Three Rust-meets-Unix notes. `CString` is the NUL-terminated string C expects — and `CString::new` *fails* if the input contains a NUL byte, a check C callers routinely forget and Rust makes unskippable. We exec the *symlink* path, not the versioned file, so the new process's identity is the stable entry point (and §14.1's canonicalisation finds the real file behind it). And we replay the original argv — captured at startup — so `--config`, `--cluster` and friends survive into the new regime; the new binary re-parses them like any boot.
+
+What about all the open sockets, the redb database, the log files? This is where a decision Rust's std made years ago quietly pays off: every file descriptor Rust opens is `O_CLOEXEC` — closed atomically by the kernel *during* exec. No shutdown code runs (there's no code left to run), yet the listener port is free for the new process to bind, and redb's file locks (which live on the fds) evaporate with them. The new binary just... boots, like any boot. There's a sub-second blip where the API answers nothing; gossip shrugs it off (the incarnation number bumps on restart, existing behaviour).
+
+One genuinely awkward wrinkle: the upgrade arrives over HTTP, and the response must escape the process before exec destroys the socket. The agent replies `202 Accepted` after `prepare` succeeds, then sleeps 200ms before `execute`. Yes, a sleep. The alternatives (hooking response-flush completion through axum's internals) buy precision nobody needs — the caller polls `/v1/version` to observe the outcome anyway, so a lost response is survivable; the sleep just makes it rare.
+
+### Draining, verifying, committing
+
+While an upgrade is staged, the agent sets a **drain flag**: new deploys are refused with a clear message; running workloads are untouched. It's one `AtomicBool` — the cluster-level version of "don't schedule onto an upgrading node" comes later, in the orchestrator; this is the node defending itself.
+
+After the exec, the new binary's boot does what §14.4 and §14.5 built: startup recovery returns `Continue { verify: Some(marker) }`, workloads get adopted, and a task waits out `boot_grace_secs` (default 30 — surviving the grace period is itself part of the proof, since crashing inside it burns a boot attempt). Then the agent checks the marker's inventory: every workload that was `Running` before the swap must exist and be `Running` now. All present → `commit`: write history, delete the marker, GC old binaries (protecting the one we'd revert to — the §14.3 `protect` list in action). Anything missing → `mark_revert_pending` and `exit(1)`, handing the baton to the supervisor and the crash-loop machinery. The upgrade doesn't get to shrug off a lost workload as someone else's problem; a swap that eats a workload *is* a failed swap.
+
+The inventory deliberately skips jobs — a run-to-completion job finishing *during* the upgrade is success, not a casualty.
+
+### The first-ever upgrade
+
+A fresh install is a plain `bun` binary, no versioned files, no symlink. The first `prepare` on such a node detects that the running version has no file in the store and copies the current executable in as `bun-v0.1.0` before staging the new one — so rollback has something to return to even on a node that has never upgraded. (The copy gets a stub signature envelope; it isn't re-verified locally — we're already running it, that ship has sailed.) The chapter's opening honesty applies here too: a v0.1.0 *cluster* has no upgrade code at all, so the first deployment of upgrade-capable binaries is a manual rollout. Everything in this chapter applies from that version onward.
+
+### API surface
+
+Three protected endpoints and one public one land with this step: `POST /v1/upgrade/apply` (admin; the directive as JSON; 202 then exec), `POST /v1/upgrade/rollback` (admin; optional version, defaulting to the newest installed version older than the running one — no download, no re-verify, the binary was verified when it was staged), `GET /v1/upgrade/status` (marker + history), and public `GET /v1/version`. That last one is deliberately *not* routed through the agent's command channel: the upgrade orchestrator will poll it to gate every rolling step, and it must answer even when the agent loop is busy deploying. It reads the manager directly — one version string and one `stat()`.
+
+Tests: `cargo test --lib upgrade::manager`. The ones worth reading are `apply_verifies_before_staging` (a bad signature leaves *zero* trace — no staged file, no marker, symlink untouched) and `prepare_stages_binary_and_writes_staged_marker` (staging is visible, activation hasn't happened). The exec path itself gets its reckoning in the next section, with real binaries and a real supervisor.

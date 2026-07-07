@@ -47,6 +47,22 @@ pub enum UpgradeError {
         version: crate::upgrade::version::BinaryVersion,
     },
 
+    /// Another upgrade is already in flight on this node.
+    #[error("upgrade {upgrade_id} is already in flight on this node")]
+    AlreadyInFlight { upgrade_id: String },
+
+    /// No older version is installed to roll back to.
+    #[error("no older version installed to roll back to")]
+    NoRollbackTarget,
+
+    /// Downloading the binary failed.
+    #[error("failed to fetch binary from {url}: {reason}")]
+    FetchFailed { url: String, reason: String },
+
+    /// `execv` of the new binary failed.
+    #[error("exec failed: {reason}")]
+    ExecFailed { reason: String },
+
     /// An underlying filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),

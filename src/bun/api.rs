@@ -84,6 +84,9 @@ pub struct ApiState {
     /// The API port this cluster runs on (uniform across nodes), used
     /// to derive peer API addresses from raft/gossip IPs.
     pub api_port: u16,
+    /// Self-upgrade manager, for the fast dependency-free `/v1/version`
+    /// endpoint. Upgrade *operations* go through the agent command channel.
+    pub upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
 }
 
 /// Build the API router.
@@ -103,6 +106,42 @@ pub fn router(
     gitops_webhook_tx: Option<mpsc::Sender<()>>,
     api_port: u16,
 ) -> Router {
+    router_with_upgrade(
+        cmd_tx,
+        mayo,
+        log_store,
+        deploy_history,
+        pickle_catalog,
+        alerts,
+        council,
+        token_store,
+        service_token,
+        rollup_store,
+        membership,
+        gitops_webhook_tx,
+        api_port,
+        None,
+    )
+}
+
+/// Build the API router with a self-upgrade manager attached.
+#[allow(clippy::too_many_arguments)]
+pub fn router_with_upgrade(
+    cmd_tx: mpsc::Sender<AgentCommand>,
+    mayo: Option<Arc<RwLock<MayoStore>>>,
+    log_store: Option<Arc<RwLock<LogStore>>>,
+    deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
+    alerts: Option<Arc<RwLock<AlertEvaluator>>>,
+    council: Option<Arc<crate::council::CouncilNode>>,
+    token_store: Option<crate::sesame::auth::TokenStore>,
+    service_token: Option<String>,
+    rollup_store: Option<Arc<RwLock<RollupStore>>>,
+    membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
+    gitops_webhook_tx: Option<mpsc::Sender<()>>,
+    api_port: u16,
+    upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
+) -> Router {
     let state = ApiState {
         cmd_tx,
         mayo,
@@ -119,6 +158,7 @@ pub fn router(
         service_token: service_token.clone(),
         http_client: reqwest::Client::new(),
         api_port,
+        upgrade,
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
@@ -131,6 +171,7 @@ pub fn router(
     let public = Router::new()
         .route("/", get(dashboard_handler))
         .route("/v1/health", get(health_handler))
+        .route("/v1/version", get(version_handler))
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
         .route("/ui/node/{name}", get(node_detail_handler))
@@ -165,6 +206,9 @@ pub fn router(
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
         .route("/v1/cluster/join", post(join_handler))
+        .route("/v1/upgrade/apply", post(upgrade_apply_handler))
+        .route("/v1/upgrade/status", get(upgrade_status_handler))
+        .route("/v1/upgrade/rollback", post(upgrade_rollback_handler))
         .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
@@ -211,6 +255,170 @@ pub fn router(
 /// Liveness check.
 async fn health_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Report the running binary version (public, dependency-free, fast).
+///
+/// The upgrade orchestrator polls this to decide whether a node has
+/// reached its target version, so it must answer even when the agent
+/// loop is busy — hence direct manager access, not an AgentCommand.
+async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    match &state.upgrade {
+        Some(manager) => Json(serde_json::json!({
+            "version": manager.running_version().to_string(),
+            "upgrade_in_flight": manager.upgrade_in_flight(),
+        })),
+        None => Json(serde_json::json!({
+            "version": crate::upgrade::version::compiled_version().to_string(),
+            "upgrade_in_flight": false,
+        })),
+    }
+}
+
+/// Apply a node-level upgrade directive (admin). Responds 202 once the
+/// binary is verified and staged; the process execs moments later.
+async fn upgrade_apply_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    let directive: crate::upgrade::types::UpgradeDirective = match serde_json::from_str(&body) {
+        Ok(directive) => directive,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid directive: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::UpgradeApply {
+            directive,
+            response: tx,
+        })
+        .await
+        .is_err()
+    {
+        return agent_unavailable();
+    }
+    match rx.await {
+        Ok(Ok(())) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "upgrading" })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => agent_unavailable(),
+    }
+}
+
+/// Node-level upgrade status: running version, in-flight marker, history.
+async fn upgrade_status_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return resp;
+    }
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::UpgradeStatus { response: tx })
+        .await
+        .is_err()
+    {
+        return agent_unavailable();
+    }
+    match rx.await {
+        Ok(Ok(status)) => Json(status).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => agent_unavailable(),
+    }
+}
+
+/// Revert this node to a previous binary version (admin).
+async fn upgrade_rollback_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct RollbackRequest {
+        #[serde(default)]
+        version: Option<crate::upgrade::BinaryVersion>,
+    }
+    let request: RollbackRequest = if body.trim().is_empty() {
+        RollbackRequest::default()
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(request) => request,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid request: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let (tx, rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::UpgradeRollback {
+            version: request.version,
+            response: tx,
+        })
+        .await
+        .is_err()
+    {
+        return agent_unavailable();
+    }
+    match rx.await {
+        Ok(Ok(())) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "rolling back" })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(_) => agent_unavailable(),
+    }
+}
+
+fn agent_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "agent unavailable" })),
+    )
+        .into_response()
 }
 
 /// Deploy workloads, streaming progress via SSE.

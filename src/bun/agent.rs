@@ -185,6 +185,27 @@ pub enum AgentCommand {
         namespace: String,
         response: oneshot::Sender<Option<AppSpec>>,
     },
+    /// Apply a node-level upgrade directive (Phase 14). Responds Ok once
+    /// the upgrade is verified + staged; the exec happens just after.
+    UpgradeApply {
+        directive: crate::upgrade::types::UpgradeDirective,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Node-level upgrade status.
+    UpgradeStatus {
+        response: oneshot::Sender<Result<crate::upgrade::types::NodeUpgradeStatus, BunError>>,
+    },
+    /// Revert this node to a previous binary version.
+    UpgradeRollback {
+        version: Option<crate::upgrade::BinaryVersion>,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Post-boot self-verification of a freshly swapped-in version.
+    /// Commits on success; flags revert and exits on failure.
+    UpgradeVerify {
+        marker: crate::upgrade::marker::UpgradeMarker,
+        response: oneshot::Sender<Result<bool, BunError>>,
+    },
 }
 
 /// Active chaos fault injection state.
@@ -395,6 +416,12 @@ pub struct BunAgent<G: Grill> {
     /// crash restart or a self-upgrade exec) can adopt them instead of
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
+    /// Self-upgrade manager. `None` when upgrades are not configured
+    /// (upgrade commands then answer with an error).
+    upgrade: Option<crate::upgrade::manager::UpgradeManager>,
+    /// Set while an upgrade is staged/executing: new deploys are refused,
+    /// running workloads are untouched.
+    draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -442,6 +469,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
+            upgrade: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -496,6 +525,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
+            upgrade: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -604,6 +635,62 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
     pub fn set_records_dir(&mut self, dir: PathBuf) {
         self.records_dir = Some(dir);
+    }
+
+    /// Attach the self-upgrade manager (enables the upgrade commands).
+    pub fn set_upgrade_manager(&mut self, manager: crate::upgrade::manager::UpgradeManager) {
+        self.upgrade = Some(manager);
+    }
+
+    /// Snapshot of running (non-job) workloads for the upgrade marker:
+    /// these must all still be alive after the swap for it to commit.
+    async fn upgrade_inventory(&self) -> Vec<crate::upgrade::marker::InstanceInventory> {
+        let mut inventory = Vec::new();
+        for instance in self.supervisor.list_instances() {
+            if instance.is_job || instance.state != ContainerState::Running {
+                continue;
+            }
+            let Some(pid) = self.supervisor.grill().pid(&instance.id).await else {
+                continue;
+            };
+            let replica_index: u32 = instance
+                .id
+                .0
+                .rsplit('-')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            inventory.push(crate::upgrade::marker::InstanceInventory {
+                namespace: instance.namespace.clone(),
+                app_name: instance.app_name.clone(),
+                instance_id: replica_index,
+                pid,
+            });
+        }
+        inventory
+    }
+
+    /// Check that every pre-upgrade workload survived the swap.
+    async fn verify_upgrade_inventory(
+        &self,
+        marker: &crate::upgrade::marker::UpgradeMarker,
+    ) -> Result<(), String> {
+        for item in &marker.pre_upgrade_instances {
+            let id = InstanceId(format!("{}-{}", item.app_name, item.instance_id));
+            match self.supervisor.get_instance(&id) {
+                Some(instance) if instance.state == ContainerState::Running => {}
+                Some(instance) => {
+                    return Err(format!(
+                        "instance {id} is {} (was running before the upgrade)",
+                        instance.state
+                    ));
+                }
+                None => {
+                    return Err(format!("instance {id} was not adopted after the upgrade"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Write (or refresh) the instance record used for adoption after a bun
@@ -996,6 +1083,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
+                if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "node is draining for a binary upgrade; retry shortly"
+                                .to_string(),
+                        })
+                        .await;
+                    return;
+                }
                 self.deploy(config, &events).await;
             }
             AgentCommand::Stop {
@@ -1204,6 +1300,151 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let spec = self.deployed_specs.get(&(app_name, namespace)).cloned();
                 let _ = response.send(spec);
+            }
+            AgentCommand::UpgradeApply {
+                directive,
+                response,
+            } => {
+                self.handle_upgrade_apply(directive, response).await;
+            }
+            AgentCommand::UpgradeStatus { response } => {
+                let result = match &self.upgrade {
+                    Some(manager) => Ok(manager.status()),
+                    None => Err(BunError::UpgradesUnavailable),
+                };
+                let _ = response.send(result);
+            }
+            AgentCommand::UpgradeRollback { version, response } => {
+                self.handle_upgrade_rollback(version, response).await;
+            }
+            AgentCommand::UpgradeVerify { marker, response } => {
+                self.handle_upgrade_verify(marker, response).await;
+            }
+        }
+    }
+
+    /// Node-level upgrade: verify + stage, respond, then exec. On any
+    /// failure the node keeps running the current version, undrained.
+    async fn handle_upgrade_apply(
+        &mut self,
+        directive: crate::upgrade::types::UpgradeDirective,
+        response: oneshot::Sender<Result<(), BunError>>,
+    ) {
+        let Some(manager) = self.upgrade.clone() else {
+            let _ = response.send(Err(BunError::UpgradesUnavailable));
+            return;
+        };
+
+        // Stop taking new work while the swap is in progress. Running
+        // workloads are untouched (and survive the exec — see grill).
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let inventory = self.upgrade_inventory().await;
+        let prepared = match manager.prepare(&directive, inventory).await {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => {
+                // Same upgrade already in flight: idempotent OK.
+                let _ = response.send(Ok(()));
+                return;
+            }
+            Err(e) => {
+                self.draining
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = response.send(Err(BunError::Upgrade(e)));
+                return;
+            }
+        };
+
+        println!(
+            "bun: upgrading to {} (upgrade {})",
+            prepared.target_version(),
+            directive.upgrade_id
+        );
+        // Respond before the point of no return, and give the HTTP layer a
+        // moment to flush the response — exec closes every socket.
+        let _ = response.send(Ok(()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Only returns on failure (the symlink is already reverted then).
+        let error = manager.execute(prepared);
+        self.draining
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "bun: upgrade exec failed, still on {}: {error}",
+            manager.running_version()
+        );
+    }
+
+    /// Node-level rollback: same swap machinery, no download or re-verify.
+    async fn handle_upgrade_rollback(
+        &mut self,
+        version: Option<crate::upgrade::BinaryVersion>,
+        response: oneshot::Sender<Result<(), BunError>>,
+    ) {
+        let Some(manager) = self.upgrade.clone() else {
+            let _ = response.send(Err(BunError::UpgradesUnavailable));
+            return;
+        };
+
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let inventory = self.upgrade_inventory().await;
+        let prepared = match manager.prepare_rollback(version, inventory) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.draining
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = response.send(Err(BunError::Upgrade(e)));
+                return;
+            }
+        };
+
+        println!("bun: rolling back to {}", prepared.target_version());
+        let _ = response.send(Ok(()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let error = manager.execute(prepared);
+        self.draining
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "bun: rollback exec failed, still on {}: {error}",
+            manager.running_version()
+        );
+    }
+
+    /// Post-boot verification of a freshly swapped-in version: all
+    /// pre-upgrade workloads must have been adopted and still be Running.
+    /// Commit on success; flag revert and exit on failure (the supervisor
+    /// restarts us, and startup recovery swaps the old binary back).
+    async fn handle_upgrade_verify(
+        &mut self,
+        marker: crate::upgrade::marker::UpgradeMarker,
+        response: oneshot::Sender<Result<bool, BunError>>,
+    ) {
+        let Some(manager) = self.upgrade.clone() else {
+            let _ = response.send(Err(BunError::UpgradesUnavailable));
+            return;
+        };
+
+        match self.verify_upgrade_inventory(&marker).await {
+            Ok(()) => match manager.commit(&marker) {
+                Ok(()) => {
+                    println!(
+                        "bun: upgrade to {} verified and committed",
+                        marker.target_version
+                    );
+                    let _ = response.send(Ok(true));
+                }
+                Err(e) => {
+                    let _ = response.send(Err(BunError::Upgrade(e)));
+                }
+            },
+            Err(reason) => {
+                let _ = manager.mark_revert_pending(&marker, &reason);
+                let _ = response.send(Ok(false));
+                eprintln!("bun: exiting so the supervisor can restart into the revert");
+                std::process::exit(1);
             }
         }
     }

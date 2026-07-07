@@ -12,9 +12,11 @@
 
 pub mod error;
 pub mod keys;
+pub mod manager;
 pub mod marker;
 pub mod signing;
 pub mod store;
+pub mod types;
 pub mod version;
 
 pub use error::UpgradeError;

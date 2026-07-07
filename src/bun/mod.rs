@@ -78,4 +78,12 @@ pub enum BunError {
     /// A security or identity operation failed.
     #[error("security error: {reason}")]
     SecurityError { reason: String },
+
+    /// A self-upgrade operation failed.
+    #[error(transparent)]
+    Upgrade(#[from] crate::upgrade::UpgradeError),
+
+    /// Self-upgrade is not configured on this node.
+    #[error("self-upgrade is not available on this node (no upgrade manager)")]
+    UpgradesUnavailable,
 }
