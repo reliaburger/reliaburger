@@ -101,4 +101,8 @@ pub enum RelishError {
     /// IO error.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// Upgrade tooling error (key generation, signing).
+    #[error("{0}")]
+    Upgrade(#[from] crate::upgrade::error::UpgradeError),
 }

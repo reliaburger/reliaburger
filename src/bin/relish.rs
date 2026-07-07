@@ -354,6 +354,26 @@ enum DevAction {
     Disk,
     /// Clean cargo build artefacts in the test VM.
     Clean,
+    /// Generate an Ed25519 release signing keypair.
+    Keygen {
+        /// Output directory for release.key / release.pub.
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Sign a binary, producing a detached .sig envelope.
+    SignBinary {
+        /// PKCS#8 Ed25519 private key (release key).
+        #[arg(long)]
+        key: std::path::PathBuf,
+        /// Optional second key for the external signature.
+        #[arg(long)]
+        external_key: Option<std::path::PathBuf>,
+        /// Where to write the envelope (default: {binary}.sig).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Binary to sign.
+        binary: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -720,6 +740,18 @@ async fn main() -> ExitCode {
             }
             DevAction::Disk => reliaburger::relish::dev::disk().await,
             DevAction::Clean => reliaburger::relish::dev::clean().await,
+            DevAction::Keygen { out } => reliaburger::relish::dev::keygen(&out),
+            DevAction::SignBinary {
+                key,
+                external_key,
+                out,
+                binary,
+            } => reliaburger::relish::dev::sign_binary(
+                &key,
+                &binary,
+                external_key.as_deref(),
+                out.as_deref(),
+            ),
         },
     };
 

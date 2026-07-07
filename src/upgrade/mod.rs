@@ -11,6 +11,8 @@
 //! `docs/design/agent-bun.md` §5.5.
 
 pub mod error;
+pub mod keys;
+pub mod signing;
 pub mod version;
 
 pub use error::UpgradeError;

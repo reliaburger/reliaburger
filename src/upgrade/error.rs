@@ -1,11 +1,41 @@
 //! Error type for the upgrade subsystem.
 
+use std::path::PathBuf;
+
 /// Errors from the self-upgrade subsystem.
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeError {
     /// The input could not be parsed as a semantic version.
     #[error("invalid version {input:?}: {reason}")]
     InvalidVersion { input: String, reason: String },
+
+    /// A public or private key could not be parsed.
+    #[error("invalid key {input:?}: {reason}")]
+    InvalidKey { input: String, reason: String },
+
+    /// Keypair generation failed (entropy or ring internal error).
+    #[error("failed to generate an ed25519 keypair")]
+    KeyGeneration,
+
+    /// A signature envelope file was unreadable or malformed.
+    #[error("invalid signature envelope {path}: {reason}")]
+    InvalidEnvelope { path: PathBuf, reason: String },
+
+    /// The binary's hash does not match its envelope.
+    #[error("binary hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+
+    /// The embedded signature does not verify against any release key.
+    #[error("embedded signature does not verify against the release key set")]
+    EmbeddedSignatureInvalid,
+
+    /// The external signature is missing or does not verify.
+    #[error("external signature is missing or does not verify")]
+    ExternalSignatureInvalid,
+
+    /// A network upgrade was attempted without an external signing key.
+    #[error("network upgrades require upgrades.external_signing_key in node.toml")]
+    ExternalKeyRequired,
 
     /// An underlying filesystem operation failed.
     #[error(transparent)]

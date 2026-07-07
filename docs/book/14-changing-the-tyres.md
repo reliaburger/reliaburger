@@ -106,3 +106,90 @@ Two implementation details, both future bug reports pre-empted. We canonicalise 
 The tests for this section read like a specification: parsing with and without the `v`, rejection of garbage, the `0.2.0 < 0.10.0` ordering that string comparison gets wrong, pre-release precedence, the serde round-trip, and the sidecar behaviour through a symlink. Run them with `cargo test --lib upgrade::version`.
 
 Next: nobody should run a binary just because it showed up claiming to be v0.2.0. Signatures.
+
+## 14.2 Trust, but verify twice
+
+Here is the threat we're defending against. An upgrade means a node downloads an executable from the network and *replaces itself with it*. If an attacker can slip a malicious binary into that pipeline — a compromised CDN, a poisoned mirror, a man-in-the-middle on a badly configured network — they don't get a foothold, they get everything, on every node, wearing the orchestrator's own uniform. Image signing (Chapter 10) protected the workloads. This is the same idea pointed at ourselves, with less room for error.
+
+Reliaburger requires **two** signatures on every network-distributed binary, from keys with different owners and different failure modes:
+
+1. **The embedded release key.** A set of Ed25519 public keys compiled into the binary itself. Signature by one of these proves the file came out of the Reliaburger release process. If this key leaks, the *project* has a problem.
+2. **The external key.** An Ed25519 public key the operator generates themselves and puts in `node.toml` (`upgrades.external_signing_key`). Signature by this proves *this cluster's operator* approved *this specific binary*. If this key leaks, one organisation has a problem — and rotating it is a config change, not a re-release.
+
+An attacker has to compromise both, and they don't live in the same place. That's the whole design. Air-gapped upgrades (`relish upgrade start --binary`, where an operator hand-carries a file to the cluster) require only the embedded signature — the operator's approval is implicit in the hand-carrying — matching how `UpgradeConfig` was specced in the design doc.
+
+Why Ed25519, when Chapter 10's image signing used ECDSA P-256? The image path needed X.509 certificate *chains* — delegation, intermediates, revocation. Binary signing needs none of that; it's a fixed set of raw keys, and for raw keys Ed25519 is the boring, fast, hard-to-misuse choice. We already have an implementation in the tree: `ring`, which has been signing our OIDC tokens since the identity work. No new dependency, no new audit surface.
+
+### The envelope
+
+Signatures are *detached* — the binary stays byte-identical to what the release process produced, and the proof travels alongside as `bun-v0.2.0.sig`:
+
+```json
+{
+  "schema": 1,
+  "sha256": "9f2c…",
+  "embedded": "base64 signature from a release key",
+  "external": "base64 signature from the operator key, or null"
+}
+```
+
+Verification runs in a fixed order, cheapest and most-diagnostic first:
+
+```rust
+pub fn verify_binary(
+    bytes: &[u8],
+    envelope: &SignatureEnvelope,
+    release_keys: &[PublicKey],
+    external_key: Option<&PublicKey>,
+    network: bool,
+) -> Result<(), UpgradeError> {
+```
+
+Hash first — a corrupted download fails with `HashMismatch` and a retry is the fix, no need to wonder about attackers. Then the embedded signature, accepted if it verifies against *any* key in the release set. A set rather than a single key is what makes rotation survivable: ship a version trusting old+new, sign the next release with new only, drop old a release later. No flag day.
+
+Then the external signature, and here the type system does something worth noticing. The function takes `network: bool`, and the external logic is one `match` over three facts:
+
+```rust
+match (network, external_key, envelope.external.as_deref()) {
+    (true, None, _) => Err(UpgradeError::ExternalKeyRequired),
+    (true, Some(_), None) => Err(UpgradeError::ExternalSignatureInvalid),
+    (_, Some(key), Some(sig)) => { /* verify, either way */ }
+    (false, _, _) => Ok(()),
+}
+```
+
+Tuple matching like this is why Rust people keep banging on about exhaustiveness: every combination of "is this a network upgrade / is a key configured / did a signature arrive" is visibly handled, and adding a fourth input later makes the compiler list every arm that needs rethinking. Note the third arm's `_` for `network` — even on an air-gapped upgrade, if an external key *and* an external signature are both present, a mismatch is an error. Silently ignoring a failed check because it wasn't strictly required is how verification code rots.
+
+### Keys in source code, on purpose
+
+`src/upgrade/keys.rs` contains the release *public* key as a plain constant:
+
+```rust
+pub const EMBEDDED_RELEASE_KEYS: &[&str] =
+    &["ed25519:kdNmHSKOupiiF2i5vCyNrNMmEeagWZzB4DOm/w3a1IY="];
+```
+
+Public keys are public; committing one is fine and pinning it in the binary is the point — a config file must never be able to widen what a production binary trusts. The *private* key lives outside the repository (generated with `relish dev keygen`, which chmods it 0600 and prints a warning to that effect).
+
+Which raises the testing problem. Integration tests need to sign binaries, and they obviously don't get the real private key. So `node.toml` grows `upgrades.release_keys_override` — and the code that honours it is gated the same way as the version sidecar from §14.1:
+
+```rust
+if let Some(override_keys) = &section.release_keys_override {
+    if cfg!(debug_assertions) {
+        return override_keys.iter().map(|k| parse_public_key(k)).collect();
+    }
+    eprintln!("bun: warning: upgrades.release_keys_override is ignored in release builds");
+}
+```
+
+In a release build that branch collapses to the warning. A production binary's trust anchor is in its text segment, full stop.
+
+### What we decided not to do
+
+- **Certificate chains for binaries.** Sesame has a whole CA hierarchy we could have reused. It solves delegation problems we don't have here, at the cost of parsing X.509 in the most security-critical path we own.
+- **Signed release metadata (TUF-style).** The metadata file (`upgrade check`) travels over HTTPS unauthenticated-beyond-TLS. It can lie about what versions exist; it cannot make a node run anything, because the binary signatures gate execution. Full TUF adds freshness and rollback-attack protection — noted as future work, deliberately not built today.
+- **A single dual-purpose key.** Two signatures from keys in the same drawer is theatre. Different owners or don't bother.
+
+The tests are the specification again: correct dual signatures verify; a wrong hash fails before any signature work; tampered bytes fail even with a "fixed-up" hash; an unknown release key fails; the second key of a rotation-window set passes; a network upgrade without the external key or signature fails with the right error; air-gapped skips what it may skip and still rejects a present-but-wrong signature. `cargo test --lib upgrade::signing`.
+
+Next: where verified binaries live on disk, and how to swap one in atomically.
