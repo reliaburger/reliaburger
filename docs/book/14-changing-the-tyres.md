@@ -262,3 +262,71 @@ The `protect` list is the subtle part of GC, and it's the caller's job to fill i
 Tests: staging writes content, signature, and mode bits; activation swaps atomically and keeps the old file; activating a missing version refuses; GC keeps the newest three of five, respects protection, removes `.sig` sidecars, and does nothing when there's nothing to do; foreign files in the directory are ignored. `cargo test --lib upgrade::store`.
 
 Next: the state machine that decides, at every startup, whether this process is a fresh boot, a just-upgraded binary that must prove itself, or a crash-looping mistake that should put the old version back.
+
+## 14.4 A state machine you can trust your process to
+
+Here's the uncomfortable property of self-upgrade: the code that must recover from a failed upgrade runs *inside the thing that failed*. There is no adult in the room. If the new binary crashes on boot, whatever puts the old binary back has to be a fresh start of... the new binary, again, restarted by the supervisor, with no memory of the last attempt.
+
+No memory *in the process*, that is. So we give it memory on disk: a single marker file, `{data_dir}/upgrade/marker.json`, that exists exactly while an upgrade is in flight on this node. It records where we came from, where we're going, how the attempt is progressing, and — the crucial field — `boot_attempts`, how many times a binary has started with this marker present.
+
+Why a file and not Raft, where all our other state lives? Timing. The marker matters most in the exact moments when the runtime *isn't up*: between `exec()` and a working gossip mesh, or halfway through a crash loop. Raft needs a quorum; the marker needs `open(2)`. (Written atomically, of course — temp file, `fsync`, rename, same recipe as §14.3. A half-written marker would be a lie about the one thing we must not lie about.)
+
+### The phases, and the missing one
+
+```rust
+pub enum MarkerPhase {
+    Staged,        // binary + sig written, symlink NOT yet swapped
+    Executed,      // symlink swapped, exec called
+    Verifying,     // new binary booted, running self-checks
+    RevertPending, // give up: revert on next startup
+    Reverted,      // old binary back in control, failure not yet reported
+}
+```
+
+Notice what's *not* there: `Committed`. A committed upgrade deletes the marker. This is deliberate and worth stealing for your own designs: if "everything is fine" were a marker state, then every startup would have to distinguish "fine" from "stale leftover saying fine", and any bug that forgot to write the final state would leave a zombie marker changing future behaviour. Absence can't go stale. No marker, no upgrade in flight, one source of truth.
+
+### One pure function decides everything
+
+Every bun startup begins the same way: load the marker (if any), and hand it to a pure function together with two facts — what version am I (§14.1) and how many boot attempts are allowed:
+
+```rust
+pub fn decide_startup(
+    marker: Option<UpgradeMarker>,
+    running: &BinaryVersion,
+    max_boot_attempts: u32,
+) -> StartupDecision
+```
+
+It returns one of five instructions:
+
+```rust
+pub enum StartupDecision {
+    NormalBoot,
+    VerifyUpgrade { marker: UpgradeMarker },          // I'm the new version: prove myself
+    RevertAndExecPrevious { marker: UpgradeMarker },  // I've crash-looped: put the old one back
+    CompleteRevert { marker: UpgradeMarker },         // I'm the old version, back in control
+    ArchiveStaleMarker { reason: String },            // marker makes no sense: move it aside, boot
+}
+```
+
+The logic reads like a table. Marker says `Staged` — the process died *between* staging and the symlink swap, so nothing actually changed; archive the attempt and boot. Marker says `Executed` or `Verifying` and I'm the target version — count this boot: within budget, verify; past budget, flip to `RevertPending` and revert. Same phases but I'm the *previous* version — someone (an operator, probably) already put the old binary back; complete the revert so the failure gets reported instead of silently forgotten. `RevertPending` and I'm the previous version — the revert worked, complete it. And any combination that doesn't add up — running a version the marker never mentions — is `ArchiveStaleMarker`, because the one thing bookkeeping must never do is brick the node. The marker is moved to `marker.json.stale-1` (kept for the post-mortem), not deleted, and boot continues.
+
+Trace the crash-loop story through it, because this is the automatic rollback promised at the start of the chapter. Upgrade swaps and execs: `Executed`, attempts 0. New binary boots, decision increments to 1 — under the limit of 2 — `VerifyUpgrade`. It crashes. The supervisor (systemd in production, the test harness in tests) restarts the symlink, which still points at the new binary. Attempts 2: still `VerifyUpgrade`. Crashes again. Attempts 3: over budget — `RevertAndExecPrevious`. Startup flips the symlink back and execs the old binary, which wakes up, sees `RevertPending`-and-I'm-the-previous-version, and completes the revert: report the failure to the leader, archive the marker, get on with life. No human involved, and every step of that story is a unit test with the same name.
+
+### Why pure?
+
+`decide_startup` touches no filesystem, spawns nothing, execs nothing. All I/O happens before it (loading the marker) or after it (persisting the mutated marker the decision carries, then acting). That split is what makes the scariest logic in the chapter *boring to test*: the crash-loop test doesn't crash anything, it calls a function with `boot_attempts: 2` and asserts on the returned enum. Fourteen tests cover every phase-times-version combination, and they run in six milliseconds.
+
+The pattern deserves a name on the wall: **decide, then act**. Compute the decision as data with a pure function; let a thin imperative shell carry it out. You met a milder version in the scheduler (Chapter 2's filter/score pipeline). Here it's load-bearing, because the "act" part includes `execv` — which we can't unit-test at all (it replaces the test process!) and therefore want as thin and dumb as possible. The real exec-crash-revert cycle does get tested end to end, with real binaries and a real supervisor loop, in §14.7.
+
+One Rust note for the road. The decision arms use *match guards* — `MarkerPhase::Executed | MarkerPhase::Verifying if is_target =>` — combining or-patterns with a boolean condition. Guards cost you the compiler's exhaustiveness guarantee (it can't reason about the `if`), which is why the function ends with an explicit `_ => ArchiveStaleMarker` arm: the fallback isn't an oversight, it's the designed answer for "anything I didn't plan for".
+
+### What we decided not to do
+
+- **Keeping attempts in the supervisor.** systemd's `StartLimitBurst` could count restarts, but then the logic lives in a unit file we don't ship and can't test, and macOS/test environments behave differently. The marker makes the binary self-contained: any dumb `while true; do bun; done` loop is an adequate supervisor.
+- **Reverting on the *first* failed boot.** Transient failures exist (a port not yet released, a slow disk). One retry is cheap; the budget is configurable (`upgrades.max_boot_attempts`, default 2).
+- **Deleting stale markers.** Archiving costs nothing and the file is exactly what you'll want when diagnosing "why did node 7 revert last night".
+
+`cargo test --lib upgrade::marker`.
+
+Next, the prerequisite that makes the swap invisible to workloads: teaching the runtimes to *adopt* processes and containers they didn't start.

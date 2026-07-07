@@ -37,6 +37,10 @@ pub enum UpgradeError {
     #[error("network upgrades require upgrades.external_signing_key in node.toml")]
     ExternalKeyRequired,
 
+    /// An upgrade marker file was unreadable or malformed.
+    #[error("invalid upgrade marker {path}: {reason}")]
+    InvalidMarker { path: PathBuf, reason: String },
+
     /// The requested version has no binary in the store.
     #[error("version {version} is not installed in the binary store")]
     UnknownVersion {

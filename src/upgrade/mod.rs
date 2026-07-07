@@ -12,6 +12,7 @@
 
 pub mod error;
 pub mod keys;
+pub mod marker;
 pub mod signing;
 pub mod store;
 pub mod version;
