@@ -193,3 +193,72 @@ In a release build that branch collapses to the warning. A production binary's t
 The tests are the specification again: correct dual signatures verify; a wrong hash fails before any signature work; tampered bytes fail even with a "fixed-up" hash; an unknown release key fails; the second key of a rotation-window set passes; a network upgrade without the external key or signature fails with the right error; air-gapped skips what it may skip and still rejects a present-but-wrong signature. `cargo test --lib upgrade::signing`.
 
 Next: where verified binaries live on disk, and how to swap one in atomically.
+
+## 14.3 The symlink two-step
+
+A node that upgrades itself needs somewhere to keep binaries — plural, because rollback means the previous version must still be on disk when the new one turns out to be a lemon. The layout is old Unix wisdom, nothing clever:
+
+```
+{binary_dir}/
+  bun            -> bun-v0.2.0     (symlink, the entry point)
+  bun-v0.1.0                       (previous version, kept for rollback)
+  bun-v0.2.0                       (current version)
+  bun-v0.2.0.sig                   (detached signature envelope)
+```
+
+Every version is a separate immutable file; "which version runs here" is a single symlink; changing the version is changing the symlink. `BinaryStore` (in `src/upgrade/store.rs`) wraps this directory with five operations: `stage`, `activate`, `current_target`, `installed_versions`, `garbage_collect`.
+
+### Why not just overwrite the binary?
+
+Because you can't do it atomically, and this is the one file on the node where a half-written state is fatal. If the node loses power halfway through `cp new-bun /usr/local/bin/bun`, it now has *no working orchestrator binary* and no way to fix itself. (There's a separate, funnier failure on Linux: overwriting a binary that's currently executing gets you `ETXTBSY`, and "fixing" that by truncating first crashes the running process. Ask me how people learn this.)
+
+So writes never touch a live name. `stage` writes the new binary to a hidden temp file, `fsync`s it, sets the permission bits, and only then `rename(2)`s it to `bun-v0.2.0`. Rename within a filesystem is atomic: any observer sees the old state or the new state, never a torn one.
+
+`activate` plays the same trick one level up, on the symlink itself:
+
+```rust
+let tmp_link = self.binary_dir.join(format!(".{}.link-{}", self.stem, std::process::id()));
+let _ = std::fs::remove_file(&tmp_link);        // stale leftover from a crashed attempt
+std::os::unix::fs::symlink(&target, &tmp_link)?; // create pointing at bun-v0.2.0
+std::fs::rename(&tmp_link, self.symlink_path())?; // atomically replace `bun`
+```
+
+The naive `rm bun && ln -s bun-v0.2.0 bun` has a window — between the `rm` and the `ln` — where `bun` doesn't exist. Crash there and the supervisor's next restart fails with `ENOENT`. The temp-symlink-plus-rename dance has no window at all. You'll find this exact pattern in every serious deployment tool; now you know why.
+
+Two smaller touches. The symlink target is *relative* (`bun-v0.2.0`, not `/usr/local/bin/bun-v0.2.0`) so the directory survives being moved or mounted at a different path — which our tests, running out of temp directories, immediately rely on. And after every rename we `fsync` the *directory*: file renames are directory mutations, and a power cut can otherwise undo a rename whose file data had long since hit the platter. `File::sync_all` on a `File::open` of the directory is the slightly odd-looking Rust spelling of `fsync(dirfd)`.
+
+### Rust bits worth a look
+
+Setting the executable bit is our first brush with the `std::os::unix` extension traits:
+
+```rust
+use std::os::unix::fs::PermissionsExt;
+std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+```
+
+Rust's portable `std::fs` API has no concept of Unix permission bits, so the Unix-only parts live in extension traits you import explicitly. It's the same philosophy as `#[cfg(unix)]` (which guards this block): platform-specific code is allowed, but it announces itself.
+
+The GC's core is a nice little exercise in iterator thinking — sort ascending, and the deletion *candidates* are everything except the newest `retain`:
+
+```rust
+versions.sort();
+let candidate_count = versions.len().saturating_sub(retain as usize);
+for version in versions.into_iter().take(candidate_count) {
+    if protect.contains(&version) { continue; }
+    // delete binary + .sig sidecar
+}
+```
+
+`saturating_sub` is subtraction that stops at zero instead of panicking — with 2 versions installed and `retain = 3`, `2 - 3` on a `usize` would otherwise abort the process (in debug builds) or wrap around to a number with eighteen digits (in release builds, which is much worse). The sort works on `BinaryVersion` directly because of that derived `Ord` from §14.1; the semver rules quietly do the right thing when a pre-release is among the candidates.
+
+The `protect` list is the subtle part of GC, and it's the caller's job to fill it. Retention says "keep the newest three", but a live upgrade marker may reference an *older* version as its rollback target — deleting that one to satisfy a retention count would saw off the branch the node plans to retreat along. Passing protection explicitly (rather than having the store peek at marker files) keeps the store dumb and testable; `gc_never_deletes_protected_versions` pins the contract.
+
+### What we decided not to do
+
+- **Hard links or copies instead of a symlink.** Both make "which version is live?" a forensic question. `readlink` is self-documenting — `current_target` is five lines.
+- **Keeping binaries in Raft or Pickle only.** Distribution goes through Pickle (that's later in this chapter), but the *local* store must work with zero cluster dependencies: rollback happens at the exact moment the node is least able to talk to anyone.
+- **A manifest file listing installed versions.** The directory *is* the manifest. `installed_versions` scans for `{stem}-v*` names and ignores everything else; a manifest would just be a second copy of that truth, one crash away from disagreeing with it.
+
+Tests: staging writes content, signature, and mode bits; activation swaps atomically and keeps the old file; activating a missing version refuses; GC keeps the newest three of five, respects protection, removes `.sig` sidecars, and does nothing when there's nothing to do; foreign files in the directory are ignored. `cargo test --lib upgrade::store`.
+
+Next: the state machine that decides, at every startup, whether this process is a fresh boot, a just-upgraded binary that must prove itself, or a crash-looping mistake that should put the old version back.

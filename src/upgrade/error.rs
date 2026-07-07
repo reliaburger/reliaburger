@@ -37,6 +37,12 @@ pub enum UpgradeError {
     #[error("network upgrades require upgrades.external_signing_key in node.toml")]
     ExternalKeyRequired,
 
+    /// The requested version has no binary in the store.
+    #[error("version {version} is not installed in the binary store")]
+    UnknownVersion {
+        version: crate::upgrade::version::BinaryVersion,
+    },
+
     /// An underlying filesystem operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),

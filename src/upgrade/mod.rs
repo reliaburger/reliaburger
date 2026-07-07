@@ -13,6 +13,7 @@
 pub mod error;
 pub mod keys;
 pub mod signing;
+pub mod store;
 pub mod version;
 
 pub use error::UpgradeError;
