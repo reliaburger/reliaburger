@@ -256,6 +256,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Debug-only test hook: a `{exe}.fail-boot` sidecar next to the resolved
+    // binary makes this process exit now, simulating a broken release. It
+    // runs AFTER startup recovery so each failed boot burns an attempt and
+    // the crash-loop revert machinery gets exercised for real. Release
+    // builds never contain this branch.
+    if cfg!(debug_assertions)
+        && let Ok(resolved) = std::fs::canonicalize(&exe_path)
+        && {
+            let mut name = resolved
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            name.push(".fail-boot");
+            resolved.with_file_name(name).exists()
+        }
+    {
+        eprintln!("bun: fail-boot sidecar present; exiting (test hook)");
+        std::process::exit(101);
+    }
+
     // Select runtime
     let runtime = select_runtime(&cli.runtime, container_nameserver, &instances_dir).await?;
 

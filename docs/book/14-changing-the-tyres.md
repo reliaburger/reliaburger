@@ -451,3 +451,50 @@ A fresh install is a plain `bun` binary, no versioned files, no symlink. The fir
 Three protected endpoints and one public one land with this step: `POST /v1/upgrade/apply` (admin; the directive as JSON; 202 then exec), `POST /v1/upgrade/rollback` (admin; optional version, defaulting to the newest installed version older than the running one — no download, no re-verify, the binary was verified when it was staged), `GET /v1/upgrade/status` (marker + history), and public `GET /v1/version`. That last one is deliberately *not* routed through the agent's command channel: the upgrade orchestrator will poll it to gate every rolling step, and it must answer even when the agent loop is busy deploying. It reads the manager directly — one version string and one `stat()`.
 
 Tests: `cargo test --lib upgrade::manager`. The ones worth reading are `apply_verifies_before_staging` (a bad signature leaves *zero* trace — no staged file, no marker, symlink untouched) and `prepare_stages_binary_and_writes_staged_marker` (staging is visible, activation hasn't happened). The exec path itself gets its reckoning in the next section, with real binaries and a real supervisor.
+
+## 14.7 Testing a program that replaces itself
+
+Everything so far has been unit-testable because we kept carving the untestable parts away — the pure state machine, the prepare/execute split. The bill for that carving now comes due: nothing has actually exec'd anything. Time to run the real binary and watch it eat itself.
+
+`tests/self_upgrade.rs` is a different kind of test file. It doesn't call functions; it plays *operator*. Cargo helps more than you'd expect: for every `[[bin]]` target, integration tests get an env var with the compiled path — `env!("CARGO_BIN_EXE_bun")` — so the tests always drive the exact binary the build just produced, no `target/debug` guessing.
+
+Each test builds a miniature production node in a temp directory:
+
+```
+{tmp}/bin/bun -> bun-v0.1.0      # the store, symlink and all
+       bun-v0.1.0                # both "versions" are copies of the same
+       bun-v0.2.0                #   build, told apart by .version sidecars
+{tmp}/data/                      # marker, records, history
+{tmp}/node.toml                  # throwaway keys via release_keys_override
+```
+
+and then — the piece that makes the whole file honest — a **supervisor loop**, fifteen lines of tokio that impersonate systemd:
+
+```rust
+loop {
+    let mut child = Command::new(&symlink).args(...).spawn()?;
+    tokio::select! {
+        _ = child.wait() => {
+            if *stop_rx.borrow() { break; }
+            sleep(Duration::from_millis(200)).await;   // Restart=always
+        }
+        _ = stop_rx.changed() => { let _ = child.kill().await; break; }
+    }
+}
+```
+
+There's a lovely subtlety hiding in `child.wait()`. When the upgrade *succeeds*, the supervisor never notices: exec keeps the PID, so as far as `wait()` is concerned the child simply hasn't exited. The supervisor only wakes for crashes — which is exactly systemd's view of the world too. The test can even assert on it: the bun process's pid before and after a successful upgrade is *the same pid*.
+
+The five tests are the roadmap's five promises, verbatim:
+
+- **`single_node_upgrade_preserves_running_containers`** — deploy a testapp, note its pid, post a signed directive, wait for `/v1/version` to say v0.2.0. Assert the workload's pid didn't change and it still answers HTTP. The console output of this test is the whole chapter in four lines: `upgrading to v0.2.0` → `reliaburger node agent v0.2.0` → `adopted 1 running instance(s) from a previous process` → `upgrade to v0.2.0 verified and committed`.
+- **`single_node_rollback_reverts_to_previous_version`** — upgrade, then `POST /v1/upgrade/rollback`. Same workload pid across *both* swaps.
+- **`failed_upgrade_triggers_automatic_rollback`** — the star witness. The test drops a `bun-v0.2.0.fail-boot` sidecar (the §14.2-style debug-only hook; it fires *after* startup recovery, so each crash burns a boot attempt). Then: exec → crash → supervisor respawn → crash → respawn → attempts exhausted → symlink reverted → old binary boots → history records `Reverted`. No assertion in the test lifts a finger to help; it just waits for `/v1/version` to read v0.1.0 again. And the workload? Its parent died repeatedly, it got reparented to init, and the reverted binary adopted it back through the `ECHILD` path from §14.5 — same pid, never stopped serving. That single test exercises the marker, the boot-attempt budget, the symlink revert, reparenting, and adoption in one story.
+- **`version_retention_gc_keeps_last_three`** — four consecutive upgrades; asserts exactly v0.3.0–v0.5.0 remain on disk, sidecars gone with their binaries.
+- **`upgrade_rejects_bad_external_signature`** — right key, wrong bytes: `409`, and the node is byte-for-byte untouched.
+
+Two practical notes that will save you an afternoon. First, everything binds ephemeral ports — including the Pickle registry, whose default port turned out to be squatted on macOS dev machines (AirPlay sits on 5000; ask us how we know). Second, the tests are **serialised** with a file-local `tokio::sync::Mutex`: each one runs a full node with real processes, and five at once starve each other into flaky timeouts on a laptop. A `static SERIAL: Mutex<()>` and one `lock().await` per test is the cheapest fix that doesn't add a dependency.
+
+What we decided not to do: mock the supervisor (its behaviour under exec — *not waking up* — is part of what's under test), and share one harness across tests (isolation is the entire point; 40 seconds per test is the price and it's worth paying).
+
+Run them with `cargo test --test self_upgrade`. Next: teaching the *cluster* about upgrades — state in Raft, and a leader that walks the fleet.
