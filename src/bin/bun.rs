@@ -162,7 +162,13 @@ async fn refresh_token_store(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    println!("bun: reliaburger node agent v{}", env!("CARGO_PKG_VERSION"));
+    // Resolve the running version from the real executable path (not argv[0]):
+    // in debug builds a `.version` sidecar next to the binary can override it,
+    // which is how self-upgrade integration tests fake old/new versions.
+    let exe_path = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to resolve current executable path: {e}"))?;
+    let running_version = reliaburger::upgrade::resolve_running_version(&exe_path);
+    println!("bun: reliaburger node agent {running_version}");
 
     // Load node config
     let config = if let Some(ref path) = cli.config {
