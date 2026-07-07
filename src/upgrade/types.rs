@@ -77,3 +77,100 @@ pub struct NodeUpgradeStatus {
     /// Most recent history entries, newest last (bounded).
     pub history: Vec<UpgradeHistoryEntry>,
 }
+
+// ---------------------------------------------------------------------------
+// Cluster-level upgrade state (lives in Raft: DesiredState.active_upgrade)
+// ---------------------------------------------------------------------------
+
+/// Cluster-wide rolling upgrade state, replicated through Raft so a new
+/// leader resumes exactly where the old one stopped — that is how "the
+/// leader upgrades last" works at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterUpgradeState {
+    pub upgrade_id: String,
+    pub target_version: BinaryVersion,
+    pub binary_sha256: String,
+    pub embedded_signature: String,
+    pub external_signature: Option<String>,
+    /// Worker batch size (council members always go one at a time).
+    pub parallel: u32,
+    pub direction: UpgradeDirection,
+    pub phase: ClusterUpgradePhase,
+    /// Fixed at start from gossip membership; the rolling order walks it.
+    pub nodes: Vec<NodeUpgradeRecord>,
+}
+
+impl ClusterUpgradeState {
+    /// Should the scheduler avoid placing new work on this node right now?
+    pub fn is_node_cordoned(&self, node_id: &str) -> bool {
+        self.nodes.iter().any(|record| {
+            record.node_id == node_id
+                && matches!(
+                    record.phase,
+                    NodeUpgradePhase::Directed | NodeUpgradePhase::Verifying
+                )
+        })
+    }
+}
+
+/// Whether the run moves versions forward or back. Rollback walks the
+/// rolling order in reverse and skips the download/distribution step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpgradeDirection {
+    Upgrade,
+    Rollback,
+}
+
+/// Where the cluster-level rolling upgrade stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClusterUpgradePhase {
+    /// Leader is verifying the binary and distributing it via Pickle.
+    Preparing,
+    UpgradingWorkers,
+    UpgradingCouncil,
+    /// Leadership is being handed to an already-upgraded council member.
+    TransferringLeadership,
+    /// The former leader (now a follower) is being upgraded by the new one.
+    UpgradingLeader,
+    Completed,
+    /// Stopped on failure or by the operator; `upgrade resume` re-enters.
+    Paused {
+        reason: String,
+    },
+}
+
+/// A node's role at plan time (decides its position in the rolling order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeRole {
+    Worker,
+    Council,
+    Leader,
+}
+
+/// One node's progress within the cluster upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeUpgradeRecord {
+    pub node_id: String,
+    /// API address for directives and version polling.
+    pub address: String,
+    pub role: NodeRole,
+    /// Populated from the first `/v1/version` poll.
+    pub from_version: Option<BinaryVersion>,
+    pub phase: NodeUpgradePhase,
+}
+
+/// Per-node phase within the cluster upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeUpgradePhase {
+    Pending,
+    /// Directive accepted (2xx from /v1/upgrade/apply).
+    Directed,
+    /// Node reports the upgrade in flight; leader is polling.
+    Verifying,
+    /// Reports the target version, healthy, and gossip-alive.
+    Healthy,
+    Failed {
+        reason: String,
+    },
+    RolledBack,
+}

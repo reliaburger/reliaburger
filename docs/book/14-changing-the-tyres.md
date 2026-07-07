@@ -498,3 +498,38 @@ Two practical notes that will save you an afternoon. First, everything binds eph
 What we decided not to do: mock the supervisor (its behaviour under exec — *not waking up* — is part of what's under test), and share one harness across tests (isolation is the entire point; 40 seconds per test is the price and it's worth paying).
 
 Run them with `cargo test --test self_upgrade`. Next: teaching the *cluster* about upgrades — state in Raft, and a leader that walks the fleet.
+
+## 14.8 Where upgrade state lives
+
+A rolling upgrade across a cluster is a long-running process with a coordinator — and the coordinator is a node that will itself be upgraded before the run ends. If the plan lived in the leader's memory, "leader upgrades last" would be a paradox: transferring leadership would forget the plan. So the plan lives where everything durable lives in Reliaburger: the Raft-replicated `DesiredState`.
+
+```rust
+/// The rolling binary upgrade in progress, if any (at most one).
+#[serde(default)]
+pub active_upgrade: Option<ClusterUpgradeState>,
+/// Completed/abandoned cluster upgrades, newest last (bounded to 20).
+#[serde(default)]
+pub upgrade_history: Vec<ClusterUpgradeState>,
+```
+
+`ClusterUpgradeState` is the whole plan as data: target version, signatures, worker parallelism, direction (upgrade or rollback), the cluster phase (`Preparing → UpgradingWorkers → UpgradingCouncil → TransferringLeadership → UpgradingLeader → Completed`, with `Paused { reason }` as the escape hatch), and one `NodeUpgradeRecord` per node — role, address, observed version, per-node phase. When leadership moves mid-run, the new leader reads this and continues from exactly where the old one stopped. No handover protocol; the handover *is* the replication that already happened.
+
+Two new log entries drive it, and their design follows the deploy machinery from Chapter 7: `UpgradeUpdate { state }` (last-writer-wins full replacement — only the leader's orchestrator writes, so merging semantics would be complexity without a customer) and `UpgradeClear { upgrade_id }` (archive to bounded history). The clear checks the id: a stale clear racing a newer upgrade must not delete the wrong run.
+
+### The rule that can brick a cluster
+
+Here's the part to read twice. The Raft *log* is bincode-encoded, and bincode identifies an enum variant by its **index** — variant number 23 on the wire means "the 24th variant in your source file". Which means:
+
+**New `RaftRequest` variants are appended at the end. Never inserted. Never reordered. Never removed.**
+
+Break this and an old node replaying the log — or receiving entries from a mixed-version peer during, say, *a rolling upgrade* — decodes every entry after the insertion point as the wrong variant. Best case: a deserialisation error and a crashed node. Worst case: it decodes *successfully* as something else and applies garbage to the state machine. The comment in the source sits directly above the new variants, because that's the one place a future editor is guaranteed to be looking.
+
+The *snapshot* is a different story, deliberately: it's JSON, self-describing, and the two new fields carry `#[serde(default)]`. An old snapshot simply lacks those keys and they default to empty. That property is pinned by a test worth imitating — `old_snapshot_without_upgrade_fields_still_loads` serialises a current `DesiredState`, *deletes* the new keys to forge an old-format snapshot, and reloads it. Schema-evolution rules you don't test are schema-evolution rules you don't have.
+
+(Why is it fine that the log and snapshot disagree on format? The log needs compactness and speed; the snapshot needs to survive schema drift across years of versions. Different jobs, different serialisers — and the snapshot regularly *replaces* old log entries via compaction, which is what makes JSON's verbosity affordable.)
+
+### Cordoning
+
+While a node swaps binaries, the scheduler shouldn't hand it new work. The mechanism is two small pieces: `ClusterUpgradeState::is_node_cordoned` says whether a node's record is in an actively-swapping phase (`Directed` or `Verifying` — a `Pending` node keeps taking work until its turn actually comes; cordoning the whole fleet at once would be a self-inflicted capacity outage), and `meat::filter::apply_upgrade_cordon` flips those nodes' `ready` flag in the scheduler's cache, which the existing filter already respects. No new filter logic — readiness was designed as the "don't place here" bit, and upgrades are just one more thing that clears it.
+
+Tests: `cargo test --lib council::state_machine` (the update/clear/bounded-history/compat set) and the `scheduler_skips_nodes_mid_upgrade` filter test. Next: the orchestrator that actually walks the fleet.

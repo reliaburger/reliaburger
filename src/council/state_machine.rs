@@ -218,6 +218,24 @@ impl StateMachineInner {
                 self.state.security_state.crl.updated_at = std::time::SystemTime::now();
             }
             RaftRequest::Noop => {}
+            RaftRequest::UpgradeUpdate { state } => {
+                // Last-writer-wins: only the leader's orchestrator writes,
+                // and it always writes the full state.
+                self.state.active_upgrade = Some(*state.clone());
+            }
+            RaftRequest::UpgradeClear { upgrade_id } => {
+                if let Some(active) = self.state.active_upgrade.take() {
+                    if active.upgrade_id == *upgrade_id {
+                        self.state.upgrade_history.push(active);
+                        if self.state.upgrade_history.len() > 20 {
+                            self.state.upgrade_history.remove(0);
+                        }
+                    } else {
+                        // Clear for a different id: put it back untouched.
+                        self.state.active_upgrade = Some(active);
+                    }
+                }
+            }
         }
         None
     }
@@ -1154,5 +1172,100 @@ mod tests {
 
         // Requests without a bespoke response return None.
         assert_eq!(inner.apply_request(&RaftRequest::Noop), None);
+    }
+
+    // ---- cluster upgrade state (Phase 14) ----
+
+    fn upgrade_state(upgrade_id: &str) -> crate::upgrade::types::ClusterUpgradeState {
+        crate::upgrade::types::ClusterUpgradeState {
+            upgrade_id: upgrade_id.to_string(),
+            target_version: "v0.2.0".parse().unwrap(),
+            binary_sha256: "abc123".to_string(),
+            embedded_signature: "sig".to_string(),
+            external_signature: None,
+            parallel: 1,
+            direction: crate::upgrade::types::UpgradeDirection::Upgrade,
+            phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
+            nodes: vec![],
+        }
+    }
+
+    #[test]
+    fn upgrade_update_replaces_active_state() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        let mut advanced = upgrade_state("up-1");
+        advanced.phase = crate::upgrade::types::ClusterUpgradePhase::UpgradingWorkers;
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(advanced.clone()),
+        });
+
+        assert_eq!(inner.state.active_upgrade, Some(advanced));
+        assert!(inner.state.upgrade_history.is_empty());
+    }
+
+    #[test]
+    fn upgrade_clear_archives_to_history() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+
+        // A clear for a DIFFERENT id must not touch the active upgrade.
+        inner.apply_request(&RaftRequest::UpgradeClear {
+            upgrade_id: "up-other".to_string(),
+        });
+        assert!(inner.state.active_upgrade.is_some());
+
+        inner.apply_request(&RaftRequest::UpgradeClear {
+            upgrade_id: "up-1".to_string(),
+        });
+        assert!(inner.state.active_upgrade.is_none());
+        assert_eq!(inner.state.upgrade_history.len(), 1);
+        assert_eq!(inner.state.upgrade_history[0].upgrade_id, "up-1");
+    }
+
+    #[test]
+    fn upgrade_history_is_bounded() {
+        let mut inner = StateMachineInner::default();
+        for i in 0..25 {
+            let id = format!("up-{i}");
+            inner.apply_request(&RaftRequest::UpgradeUpdate {
+                state: Box::new(upgrade_state(&id)),
+            });
+            inner.apply_request(&RaftRequest::UpgradeClear { upgrade_id: id });
+        }
+        assert_eq!(inner.state.upgrade_history.len(), 20);
+        assert_eq!(inner.state.upgrade_history[0].upgrade_id, "up-5");
+    }
+
+    #[test]
+    fn old_snapshot_without_upgrade_fields_still_loads() {
+        // Serialise a current DesiredState, strip the Phase 14 fields to
+        // fake a snapshot written by an older binary, and reload. This is
+        // the serde(default) compatibility rule made executable.
+        let state = DesiredState::default();
+        let mut value = serde_json::to_value(&state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("active_upgrade");
+        object.remove("upgrade_history");
+
+        let reloaded: DesiredState = serde_json::from_value(value).unwrap();
+        assert!(reloaded.active_upgrade.is_none());
+        assert!(reloaded.upgrade_history.is_empty());
+    }
+
+    #[test]
+    fn snapshot_with_active_upgrade_roundtrips() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+
+        let json = serde_json::to_string(&inner.state).unwrap();
+        let reloaded: DesiredState = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.active_upgrade, inner.state.active_upgrade);
     }
 }
