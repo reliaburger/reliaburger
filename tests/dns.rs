@@ -2,7 +2,6 @@
 //! L9 + M8). Each test runs a real responder on an ephemeral UDP port
 //! and speaks wire-format DNS to it.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 

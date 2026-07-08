@@ -303,7 +303,7 @@ Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
 - [ ] `L2` Production `DeployDriver` + orchestrator for rolling/blue-green
 - [ ] `L3` Spawn the autoscale loop
 - [ ] `L4` Invoke state reconstruction after leader election; consume `Correction`s
-- [ ] `L6` / `L11` Consistent-hash reporting tree + rollups (worker → council → leader, `/v1/metrics/cluster`)
+- [x] `L6` / `L11` Reporting + rollups wired: `RollupWorker` spawned per node, aggregator gets a real rollup store, `/v1/metrics/cluster` serves from it; StateReports carry real capacity (`[resources]` now read) and requested-resource usage. Flat-star kept by design (tree deferred, see ch. 11); fixed a latent DataFusion overflow (`unwrap_or(u64::MAX)` time ranges, 4 handlers)
 - [x] `L7` Bind the Wrapper ingress listener — `[ingress]` node-config section (off by default), HTTP + HTTPS listeners (self-signed or disk certs), per-client rate limiting wired into the proxy path, WebSocket pass-through; drain-on-deploy integration lands with `L2` (W7)
 - [ ] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility) — **`L9`+`M8` done**: `[dns]` config section (off by default), responder spawned from bun, full hardening (recv errors non-fatal, per-query spawned forwards behind a semaphore, connected sockets + transaction-ID checks, NXDOMAIN for unmatched `.internal` with no upstream leak, QTYPE honoured, SERVFAIL on dead upstream), runc containers get `resolv.conf` pointed at the responder. `L8` eBPF loading lands with W12
 - [ ] `L10` / `M2` Schedule replication + GC; share the Pickle catalog via Raft/disk

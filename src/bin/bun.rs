@@ -120,7 +120,30 @@ fn cluster_params_from_config(
         wrapping_ikm,
         bootstrap_security_state,
         data_dir: config.storage.data.clone(),
+        // The MayoStore doesn't exist yet when params are built; the
+        // caller sets it before starting the runtime.
+        mayo: None,
+        rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
     })
+}
+
+/// Schedulable node capacity: system totals minus the `[resources]`
+/// reservation. Read once at startup.
+fn node_capacity(config: &NodeConfig) -> (u32, u32) {
+    use reliaburger::config::types::parse_resource_value;
+
+    let system = sysinfo::System::new_all();
+    let total_cpu_millicores = (system.cpus().len() as u64) * 1000;
+    let total_memory_mb = system.total_memory() / (1024 * 1024);
+
+    let reserved_cpu = parse_resource_value(&config.resources.reserved_cpu).unwrap_or(0);
+    let reserved_memory_mb =
+        parse_resource_value(&config.resources.reserved_memory).unwrap_or(0) / (1024 * 1024);
+
+    (
+        total_cpu_millicores.saturating_sub(reserved_cpu) as u32,
+        total_memory_mb.saturating_sub(reserved_memory_mb) as u32,
+    )
 }
 
 /// Overwrite the auth token store with the current API tokens from Raft.
@@ -184,6 +207,20 @@ async fn main() -> anyhow::Result<()> {
     // Create shutdown token
     let shutdown = CancellationToken::new();
 
+    // Mayo store first: the cluster runtime's rollup worker reads it, so
+    // it must exist before the runtime starts.
+    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
+        config.storage.metrics.clone()
+    } else {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger")
+            .join("metrics");
+        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
+        fallback
+    };
+    let mayo_store = Arc::new(RwLock::new(MayoStore::new(metrics_dir)));
+
     // Create the agent (extract deploy history handle before spawning).
     // In cluster mode, start the cluster runtime (gossip, …) and build the
     // agent with a real ClusterHandle. `_cluster_runtime` holds resources
@@ -197,8 +234,11 @@ async fn main() -> anyhow::Result<()> {
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
     let mut api_council: Option<Arc<reliaburger::council::CouncilNode>> = None;
+    // The leader-side rollup store, exposed at /v1/metrics/cluster.
+    let mut api_rollup_store = None;
     let mut agent = if cli.cluster {
-        let params = cluster_params_from_config(&config)?;
+        let mut params = cluster_params_from_config(&config)?;
+        params.mayo = Some(Arc::clone(&mayo_store));
         println!(
             "bun: cluster mode — gossip on {}, {} seed(s)",
             params.gossip_addr,
@@ -208,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
             reliaburger::cluster::runtime::start(params, agent_shutdown.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
+        api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         _cluster_runtime = Some(cluster_runtime);
         api_council = handle.council.clone();
         BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
@@ -215,6 +256,11 @@ async fn main() -> anyhow::Result<()> {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
+
+    // Report real schedulable capacity to the cluster (L6: StateReports
+    // used to carry zeroes).
+    let (capacity_cpu, capacity_memory) = node_capacity(&config);
+    agent.set_node_capacity(capacity_cpu, capacity_memory);
 
     // Derive the internal service token from the shared master key, so bun's own
     // cross-node fan-out calls authenticate as the system principal on peers.
@@ -297,19 +343,8 @@ async fn main() -> anyhow::Result<()> {
         agent.run().await;
     });
 
-    // Create observability stores
-    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
-        config.storage.metrics.clone()
-    } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("metrics");
-        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
-        fallback
-    };
-    let mayo_store = Arc::new(RwLock::new(MayoStore::new(metrics_dir)));
-
+    // Create observability stores (the Mayo store was created above,
+    // before the cluster runtime that its rollup worker feeds from)
     let logs_dir = if std::fs::create_dir_all(&config.storage.logs).is_ok() {
         config.storage.logs.clone()
     } else {
@@ -553,6 +588,7 @@ async fn main() -> anyhow::Result<()> {
         api_council.clone(),
         api_token_store.clone(),
         service_token.clone(),
+        api_rollup_store,
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {

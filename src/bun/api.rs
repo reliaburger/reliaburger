@@ -95,6 +95,7 @@ pub fn router(
     council: Option<Arc<crate::council::CouncilNode>>,
     token_store: Option<crate::sesame::auth::TokenStore>,
     service_token: Option<String>,
+    rollup_store: Option<Arc<RwLock<RollupStore>>>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -106,7 +107,7 @@ pub fn router(
         pickle_catalog,
         gitops_webhook_tx: None,
         council,
-        rollup_store: None,
+        rollup_store,
         membership: None,
         token_store: token_store.clone(),
         service_token: service_token.clone(),
@@ -1146,7 +1147,10 @@ async fn metrics_query_handler(
     let store = mayo.read().await;
     let name = params.name.as_deref().unwrap_or("*");
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     if name == "*" {
         let sql = format!(
@@ -1545,7 +1549,10 @@ async fn metrics_rollup_handler(
 
     let store = rollup_store.read().await;
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
@@ -1604,7 +1611,10 @@ async fn metrics_cluster_handler(
     // Query local rollup store directly (this council member's data)
     let store = rollup_store.read().await;
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
@@ -1665,7 +1675,10 @@ async fn metrics_app_handler(
 
     let store = mayo.read().await;
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     // Filter by app label in the local store
     let app_filter = format!("{namespace}/{app}");
@@ -2206,7 +2219,7 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None, None, None, None, None, None, None);
+        let app = router(cmd_tx, None, None, None, None, None, None, None, None, None);
         (app, shutdown)
     }
 
@@ -2318,6 +2331,7 @@ mod tests {
             None,
             Some(store),
             service_token,
+            None,
         );
         (app, shutdown)
     }
@@ -2428,6 +2442,7 @@ mod tests {
             Some(council),
             Some(store),
             None,
+            None,
         );
         (app, shutdown, plaintext)
     }
@@ -2500,6 +2515,7 @@ mod tests {
             Some(council),
             Some(store),
             Some("rbrg_service".to_string()),
+            None,
         );
         let status = post_status(
             app,
@@ -2523,6 +2539,7 @@ mod tests {
             None,
             None,
             Some(council),
+            None,
             None,
             None,
         );
@@ -2558,6 +2575,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&council)),
+            None,
             None,
             None,
         );
@@ -2611,6 +2629,7 @@ mod tests {
             None,
             None,
             Some(council),
+            None,
             None,
             None,
         );
@@ -2723,6 +2742,7 @@ mod tests {
 
         let app = router(
             cmd_tx.clone(),
+            None,
             None,
             None,
             None,

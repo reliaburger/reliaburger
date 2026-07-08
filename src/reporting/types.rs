@@ -80,6 +80,11 @@ pub struct CachedSpec {
 }
 
 /// Aggregate resource usage on a node.
+///
+/// "Used" values are the sums of the *requested* resources of running
+/// instances (commitments, not measured consumption — measurement is
+/// Mayo's job). Totals are schedulable capacity: system totals minus
+/// the `[resources]` reservation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceUsage {
     pub cpu_used_millicores: u32,
@@ -87,6 +92,12 @@ pub struct ResourceUsage {
     pub disk_used_mb: u64,
     pub gpu_used: u8,
     pub allocated_ports: Vec<u16>,
+    /// Schedulable CPU capacity. Zero from pre-capacity nodes.
+    #[serde(default)]
+    pub cpu_total_millicores: u32,
+    /// Schedulable memory capacity. Zero from pre-capacity nodes.
+    #[serde(default)]
+    pub memory_total_mb: u32,
 }
 
 /// Per-instance resource usage.
@@ -167,6 +178,8 @@ mod tests {
                 disk_used_mb: 5000,
                 gpu_used: 0,
                 allocated_ports: vec![8080],
+                cpu_total_millicores: 4000,
+                memory_total_mb: 8192,
             },
             event_log: vec![NodeEvent {
                 timestamp: SystemTime::now(),

@@ -50,6 +50,7 @@ impl TestHarness {
             None,
             None,
             None,
+            None,
         );
         let server_shutdown = shutdown.clone();
 

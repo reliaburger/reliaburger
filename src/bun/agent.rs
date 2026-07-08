@@ -334,6 +334,11 @@ pub struct BunAgent<G: Grill> {
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
+    /// Schedulable CPU capacity (system total minus `[resources]`
+    /// reserved), reported to the cluster. Zero until the binary sets it.
+    capacity_cpu_millicores: u32,
+    /// Schedulable memory capacity, reported to the cluster.
+    capacity_memory_mb: u32,
     /// Image trust policy. When `require_signatures` is set, deploys of
     /// Pickle-hosted images are gated on a valid signature. Defaults to
     /// permissive so single-node / untrusted setups are unaffected.
@@ -376,6 +381,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             log_tx: None,
+            capacity_cpu_millicores: 0,
+            capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
         }
     }
@@ -422,6 +429,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             log_tx: None,
+            capacity_cpu_millicores: 0,
+            capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
         }
     }
@@ -467,6 +476,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// signatures, deploys verify Pickle-hosted images before creating them.
     pub fn set_trust_policy(&mut self, trust_policy: crate::config::node::TrustPolicySection) {
         self.trust_policy = trust_policy;
+    }
+
+    /// Set the node's schedulable capacity (system totals minus the
+    /// `[resources]` reservation). Reported in every StateReport.
+    pub fn set_node_capacity(&mut self, cpu_millicores: u32, memory_mb: u32) {
+        self.capacity_cpu_millicores = cpu_millicores;
+        self.capacity_memory_mb = memory_mb;
     }
 
     /// Spawn a background forwarder that streams a started instance's log lines
@@ -560,6 +576,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .and_then(|(_, n)| n.parse::<u32>().ok())
                         .unwrap_or(0);
 
+                    // Requested resources from the deployed spec: these
+                    // are the commitments the scheduler must respect.
+                    let spec = self
+                        .deployed_specs
+                        .get(&(inst.app_name.clone(), inst.namespace.clone()));
+                    let cpu_request_millicores = spec
+                        .and_then(|s| s.cpu.as_ref())
+                        .map(|r| r.request as u32)
+                        .unwrap_or(0);
+                    let memory_request_mb = spec
+                        .and_then(|s| s.memory.as_ref())
+                        .map(|r| (r.request / (1024 * 1024)) as u32)
+                        .unwrap_or(0);
+
                     InstanceSnapshot {
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
@@ -569,10 +599,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         container_state: inst.state,
                         consecutive_unhealthy: inst.health_counters.consecutive_unhealthy,
                         uptime: inst.created_at.elapsed(),
+                        cpu_request_millicores,
+                        memory_request_mb,
                     }
                 })
                 .collect(),
             allocated_ports: instances.iter().filter_map(|i| i.host_port).collect(),
+            capacity_cpu_millicores: self.capacity_cpu_millicores,
+            capacity_memory_mb: self.capacity_memory_mb,
         };
         let _ = req.response.send(snapshot);
     }

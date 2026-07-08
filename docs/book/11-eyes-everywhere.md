@@ -170,6 +170,24 @@ fn update_parent(&mut self) {
 }
 ```
 
+### Switching it on
+
+Everything above was true of the library long before it was true of the running system. The July 2026 review found the `RollupWorker` was never spawned, the aggregator's rollup store was hardcoded to `None`, and `/v1/metrics/cluster` returned "no rollup store configured" — permanently. The chapter you just read described machinery with the ignition wires cut.
+
+The wiring itself is small, which is rather the point. The cluster runtime now creates the rollup store on every node (cheap when empty — only the leader's aggregator ever receives rollups to put in it, and running it everywhere means a leadership change needs no start/stop dance), hands it to the aggregator, spawns a `RollupWorker` per node against the local Mayo store, and exposes the store to the API. Three connections, maybe forty lines. The reason it took a whole review to notice they were missing is that every component *worked* — in its own unit tests, against its own fakes.
+
+And here's the lesson that pays for the whole exercise. The moment the wired path first ran end-to-end, it panicked. Not our code — DataFusion's. `/v1/metrics/cluster` defaulted its time range to `timestamp <= u64::MAX`, and DataFusion 45's filter-selectivity estimator computes the cardinality of that interval: the full unsigned domain, `u64::MAX` values, then adds one. In a debug build, that's an overflow panic in the middle of physical planning; in a release build it wraps silently and the planner carries on with a garbage estimate. Four handlers had the same `unwrap_or(u64::MAX)` default, all now clamped to `i64::MAX`.
+
+No unit test ever caught it because unit tests pass polite little timestamps like `1000`, and nothing exercised the open-ended default until a real endpoint served a real store. "Library-only" doesn't just mean features you can't use — it means bugs that haven't been allowed to happen yet.
+
+### Capacity, honestly
+
+The same wiring pass fixed the other zeroed field: `StateReport.resource_usage` used to be all zeroes, which would have made the Phase-2 scheduler's bin-packing arithmetic an elaborate way of dividing by zero. Reports now carry the node's schedulable capacity (system totals from `sysinfo`, minus the `[resources]` reservation — a config section that was parsed and ignored until now) and per-instance usage.
+
+One honesty note baked into the field docs: "used" is the sum of *requested* resources across running instances, not measured consumption. Requests are what the scheduler must respect when placing new work — a node with 4000m capacity and 3000m requested has 1000m to offer, however idle the workloads are right now. Measured consumption is Mayo's job, and it flows through the rollups above. Two numbers, two purposes; conflating them is how you end up with schedulers that overcommit a node because its workloads happened to be quiet during the measurement window.
+
+The reporting topology stays a flat star: every node reports straight to the leader. The consistent-hash tree this chapter's title promises is real in the library (`assignment.rs`) and deliberately unwired — with the council capped at seven and reports every few seconds, a star to the leader handles thousands of nodes before the maths says otherwise. When it does, the tree slots in behind the same `watch` channel interface without touching the workers.
+
 ## Two merge strategies
 
 When results come back from multiple sources, how you combine them depends on the query type.

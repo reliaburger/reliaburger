@@ -50,8 +50,12 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                                 container_state: ContainerState::Running,
                                 consecutive_unhealthy: 0,
                                 uptime: Duration::from_secs(60),
+                                cpu_request_millicores: 250,
+                                memory_request_mb: 128,
                             }],
                             allocated_ports: vec![8080],
+                            capacity_cpu_millicores: 4000,
+                            capacity_memory_mb: 8192,
                         };
                         let _ = req.response.send(snapshot);
                     } else {

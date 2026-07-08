@@ -45,8 +45,12 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                             container_state: ContainerState::Running,
                             consecutive_unhealthy: 0,
                             uptime: Duration::from_secs(1),
+                            cpu_request_millicores: 250,
+                            memory_request_mb: 128,
                         }],
                         allocated_ports: vec![8080],
+                        capacity_cpu_millicores: 4000,
+                        capacity_memory_mb: 8192,
                     });
                 }
             }
@@ -62,6 +66,16 @@ async fn start_node(
     gossip_port: u16,
     seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
+) -> (ClusterHandle, ClusterRuntime) {
+    start_node_with_mayo(name, gossip_port, seeds, shutdown, None).await
+}
+
+async fn start_node_with_mayo(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+    mayo: Option<std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>>>,
 ) -> (ClusterHandle, ClusterRuntime) {
     // A fresh, unique data dir per node so the durable Raft store starts empty
     // (stale state from a prior run would suppress the bootstrap).
@@ -83,6 +97,9 @@ async fn start_node(
             wrapping_ikm: None,
             bootstrap_security_state: None,
             data_dir,
+            mayo,
+            // Fast rollups so tests observe delivery quickly.
+            rollup_interval: Duration::from_millis(300),
         },
         shutdown.clone(),
     )
@@ -237,6 +254,166 @@ async fn three_node_council_elects_leader_and_grows() {
     shutdown.cancel();
     for h in handles {
         if let Some(c) = &h.council {
+            c.shutdown().await.ok();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4 W4: rollups + real resource reporting (L6/L11)
+// ---------------------------------------------------------------------------
+
+/// A MayoStore holding one flushed sample, so rollups have data.
+async fn seeded_mayo_store(
+    name: &str,
+) -> std::sync::Arc<tokio::sync::RwLock<reliaburger::mayo::store::MayoStore>> {
+    use reliaburger::mayo::types::{MetricKey, Sample};
+
+    let dir = std::env::temp_dir().join(format!("rb-w4-mayo-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut store = reliaburger::mayo::store::MayoStore::new(dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    store.insert(&MetricKey::simple("cpu"), Sample::at(now - 30, 42.0));
+    store.flush().await.unwrap();
+    std::sync::Arc::new(tokio::sync::RwLock::new(store))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollup_worker_delivers_node_rollups_to_the_leader() {
+    let shutdown = CancellationToken::new();
+
+    let m1 = seeded_mayo_store("r1").await;
+    let m2 = seeded_mayo_store("r2").await;
+    let m3 = seeded_mayo_store("r3").await;
+    let h1 = start_node_with_mayo("r1", 17641, vec![], &shutdown, Some(m1)).await;
+    let h2 = start_node_with_mayo("r2", 17643, vec![local(17641)], &shutdown, Some(m2)).await;
+    let h3 = start_node_with_mayo("r3", 17645, vec![local(17641)], &shutdown, Some(m3)).await;
+    let nodes = [&h1, &h2, &h3];
+
+    // Wait for a leader.
+    let elected = wait_until(Duration::from_secs(25), || {
+        nodes.iter().any(|n| thinks_it_is_leader(&n.0))
+    })
+    .await;
+    assert!(elected, "no leader elected");
+
+    let leader = nodes
+        .iter()
+        .find(|n| thinks_it_is_leader(&n.0))
+        .expect("leader exists");
+    let rollup_store = std::sync::Arc::clone(&leader.1.rollup_store);
+
+    // L11: the aggregator must ingest rollups pushed by the workers.
+    let ingested = wait_until(Duration::from_secs(15), || {
+        rollup_store
+            .try_read()
+            .map(|s| s.buffer_len() >= 3)
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        ingested,
+        "leader rollup store never ingested rollups from all nodes (have {})",
+        rollup_store.try_read().map(|s| s.buffer_len()).unwrap_or(0)
+    );
+
+    // The /v1/metrics/cluster endpoint on the leader must serve from the
+    // store instead of the eternal "no rollup store configured".
+    let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+    let app = reliaburger::bun::api::router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(std::sync::Arc::clone(&rollup_store)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let api_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { api_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
+
+    // The server task needs a beat to start accepting; retry briefly.
+    let mut body = String::new();
+    for _ in 0..20 {
+        match reqwest::get(format!("http://127.0.0.1:{port}/v1/metrics/cluster")).await {
+            Ok(response) => {
+                body = response.text().await.unwrap_or_default();
+                if !body.is_empty() {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!body.is_empty(), "metrics endpoint never responded");
+    assert!(
+        !body.contains("no rollup store configured"),
+        "endpoint still reports a missing rollup store: {body}"
+    );
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.0.council {
+            c.shutdown().await.ok();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn state_reports_carry_nonzero_capacity_and_usage() {
+    let shutdown = CancellationToken::new();
+
+    let h1 = start_node("cap1", 17741, vec![], &shutdown).await;
+    let h2 = start_node("cap2", 17743, vec![local(17741)], &shutdown).await;
+    let nodes = [&h1, &h2];
+
+    let elected = wait_until(Duration::from_secs(25), || {
+        nodes.iter().any(|n| thinks_it_is_leader(&n.0))
+    })
+    .await;
+    assert!(elected, "no leader elected");
+
+    let leader_agg = nodes
+        .iter()
+        .find(|n| thinks_it_is_leader(&n.0))
+        .map(|n| n.1.aggregated_rx.clone())
+        .expect("leader exists");
+
+    // L6: reports used to carry zeroed resource usage. The fake agent
+    // supplies capacity 4000m/8192MB and one instance requesting
+    // 250m/128MB; the aggregated view must show exactly that.
+    let real_resources = wait_until(Duration::from_secs(15), || {
+        let state = leader_agg.borrow();
+        state.reports.len() == 2
+            && state.reports.values().all(|r| {
+                r.resource_usage.cpu_total_millicores == 4000
+                    && r.resource_usage.memory_total_mb == 8192
+                    && r.resource_usage.cpu_used_millicores == 250
+                    && r.resource_usage.memory_used_mb == 128
+            })
+    })
+    .await;
+    assert!(real_resources, "aggregated reports still carry zeroes");
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.0.council {
             c.shutdown().await.ok();
         }
     }
