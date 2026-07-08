@@ -1,10 +1,22 @@
 //! Garbage collection for Pickle.
 //!
-//! Runs periodically on each node to reclaim disk space from unreferenced
-//! image layers. Protections:
-//! - Active images (referenced by apps in DesiredState) are never collected
-//! - Sole-copy layers (only one node holds them) are never collected
-//! - Retention window: unreferenced images are kept for `gc_retain_days`
+//! GC is two-phase (M2): a node first *nominates* deletion candidates
+//! with [`gc_candidates`] — deleting nothing — then submits them to an
+//! arbiter, and finally deletes only what was approved with
+//! [`delete_approved`]. In cluster mode the arbiter is the Raft state
+//! machine (`ManifestCatalog::apply_gc_report` runs serialised through
+//! the log, so two nodes racing to delete the last two copies of a
+//! layer cannot both win). Single-node mode applies the same rule to
+//! its local catalog.
+//!
+//! Candidate protections:
+//! - Active images (referenced by deployed apps) are never nominated
+//! - Tagged manifests' layers are never nominated
+//! - Sole-copy layers are never nominated (the arbiter re-checks)
+//! - Retention window: unreferenced images kept for `retain_days`
+//! - Orphan grace: untracked blobs younger than `orphan_grace` are
+//!   kept — a blob mid-push has no holder entry until its manifest
+//!   commits, and must not be swept out from under the upload
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
@@ -19,37 +31,52 @@ pub struct GcConfig {
     pub retain_days: u32,
     /// This node's ID.
     pub node_id: u64,
+    /// Minimum on-disk age before an untracked (orphan) blob becomes
+    /// a candidate. Protects blobs belonging to in-flight pushes.
+    pub orphan_grace: Duration,
 }
 
-/// The result of a GC sweep.
+/// Deletion candidates nominated by [`gc_candidates`].
+///
+/// Nothing has been deleted at this point; the candidates must go to
+/// the arbiter first.
 #[derive(Debug)]
-pub struct GcResult {
-    /// Layers deleted from this node.
-    pub deleted: Vec<Digest>,
+pub struct GcCandidates {
+    /// Layers this node proposes to delete.
+    pub candidates: Vec<Digest>,
     /// Layers skipped due to sole-copy protection.
     pub sole_copy_protected: usize,
     /// Layers skipped due to active reference.
     pub active_protected: usize,
     /// Layers skipped due to retention window.
     pub retention_protected: usize,
-    /// The GcReport to propose to Raft (if any layers were deleted).
-    pub report: Option<GcReport>,
+    /// Untracked blobs skipped because they're within the orphan grace
+    /// window (likely mid-push).
+    pub orphan_grace_protected: usize,
 }
 
-/// Run a garbage collection sweep.
-///
-/// Examines all blobs on the local store and determines which can be
-/// safely deleted. Never deletes:
-/// - Layers referenced by any manifest that has tags (active images)
-/// - Layers referenced by apps in the active deployment set
-/// - Layers where this node is the sole holder
-/// - Layers from manifests pushed within the retention window
-pub fn gc_sweep(
+impl GcCandidates {
+    /// The report to submit to the arbiter, or `None` when there is
+    /// nothing to nominate.
+    pub fn report(&self, node_id: u64) -> Option<GcReport> {
+        if self.candidates.is_empty() {
+            None
+        } else {
+            Some(GcReport {
+                node_id,
+                deleted_layers: self.candidates.clone(),
+            })
+        }
+    }
+}
+
+/// Phase 1: nominate deletion candidates. Deletes nothing.
+pub fn gc_candidates(
     store: &BlobStore,
     catalog: &ManifestCatalog,
     active_images: &HashSet<String>,
     config: &GcConfig,
-) -> Result<GcResult, super::types::PickleError> {
+) -> Result<GcCandidates, super::types::PickleError> {
     let local_blobs = store.list_blobs()?;
     let now = SystemTime::now();
     let retention_cutoff = now - Duration::from_secs(config.retain_days as u64 * 86400);
@@ -60,6 +87,7 @@ pub fn gc_sweep(
     let mut sole_copy_count = 0;
     let mut active_count = 0;
     let mut retention_count = 0;
+    let mut orphan_grace_count = 0;
 
     // Protect all layers from manifests that have tags or are actively deployed
     for (digest_str, manifest) in &catalog.manifests {
@@ -86,7 +114,6 @@ pub fn gc_sweep(
         }
     }
 
-    // Check sole-copy protection for each local blob
     let mut candidates: Vec<Digest> = Vec::new();
     for blob_digest in &local_blobs {
         if protected_digests.contains(blob_digest.as_str()) {
@@ -94,9 +121,18 @@ pub fn gc_sweep(
         }
 
         let holders = catalog.layer_holders(blob_digest.as_str());
-        // Empty holders = orphaned blob not tracked in Raft (safe to delete)
-        // Single holder = sole copy (never delete)
-        if holders.len() == 1 {
+        if holders.is_empty() {
+            // Untracked blob: an orphan, unless it's a push still in
+            // flight — its manifest hasn't committed yet, so give it a
+            // grace window before nominating.
+            if blob_age(store, blob_digest, now) < config.orphan_grace {
+                orphan_grace_count += 1;
+                continue;
+            }
+        } else if holders.len() == 1 {
+            // Sole copy: never nominate. The arbiter re-checks this
+            // authoritatively; skipping here just avoids pointless
+            // round-trips.
             sole_copy_count += 1;
             continue;
         }
@@ -104,32 +140,39 @@ pub fn gc_sweep(
         candidates.push(blob_digest.clone());
     }
 
-    // Delete candidates
-    let mut deleted = Vec::new();
-    for digest in &candidates {
-        if let Err(e) = store.delete_blob(digest) {
-            eprintln!("gc: failed to delete blob {digest}: {e}");
-            continue;
-        }
-        deleted.push(digest.clone());
-    }
-
-    let report = if deleted.is_empty() {
-        None
-    } else {
-        Some(GcReport {
-            node_id: config.node_id,
-            deleted_layers: deleted.clone(),
-        })
-    };
-
-    Ok(GcResult {
-        deleted,
+    Ok(GcCandidates {
+        candidates,
         sole_copy_protected: sole_copy_count,
         active_protected: active_count,
         retention_protected: retention_count,
-        report,
+        orphan_grace_protected: orphan_grace_count,
     })
+}
+
+/// Phase 2: physically delete the blobs the arbiter approved.
+///
+/// Per-blob failures are logged and skipped — a blob that fails to
+/// delete stays on disk and gets re-nominated next sweep (its holder
+/// entry is already gone, so it counts as an orphan then).
+pub fn delete_approved(store: &BlobStore, approved: &[Digest]) -> Vec<Digest> {
+    let mut deleted = Vec::new();
+    for digest in approved {
+        match store.delete_blob(digest) {
+            Ok(()) => deleted.push(digest.clone()),
+            Err(e) => eprintln!("gc: failed to delete blob {digest}: {e}"),
+        }
+    }
+    deleted
+}
+
+/// On-disk age of a blob; zero when unknown (treated as brand new,
+/// i.e. protected by the orphan grace window).
+fn blob_age(store: &BlobStore, digest: &Digest, now: SystemTime) -> Duration {
+    std::fs::metadata(store.blob_path(digest))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .unwrap_or(Duration::ZERO)
 }
 
 #[cfg(test)]
@@ -174,11 +217,12 @@ mod tests {
         GcConfig {
             retain_days: 0, // No retention for tests
             node_id: 1,
+            orphan_grace: Duration::ZERO, // fresh test blobs are eligible
         }
     }
 
     #[test]
-    fn gc_collects_unreferenced_blob() {
+    fn candidates_nominate_unreferenced_blob_without_deleting() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
         let catalog = ManifestCatalog::default();
@@ -187,9 +231,35 @@ mod tests {
         let orphan = test_digest("orphan1");
         write_fake_blob(&store, &orphan);
 
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
-        assert_eq!(result.deleted.len(), 1);
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        // Phase 1 never touches disk.
+        assert!(store.has_blob(&orphan));
+
+        // Phase 2 deletes only what was approved.
+        let deleted = delete_approved(&store, &result.candidates);
+        assert_eq!(deleted.len(), 1);
         assert!(!store.has_blob(&orphan));
+    }
+
+    #[test]
+    fn fresh_orphans_are_protected_by_the_grace_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let catalog = ManifestCatalog::default();
+
+        // A blob mid-push: on disk, no holder entry yet, seconds old.
+        let inflight = test_digest("inflight1");
+        write_fake_blob(&store, &inflight);
+
+        let config = GcConfig {
+            orphan_grace: Duration::from_secs(3600),
+            ..default_config()
+        };
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &config).unwrap();
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.orphan_grace_protected, 1);
+        assert!(store.has_blob(&inflight));
     }
 
     #[test]
@@ -209,8 +279,8 @@ mod tests {
             holder_nodes: BTreeSet::from([1, 2]),
         });
 
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
-        assert!(result.deleted.is_empty());
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert!(result.candidates.is_empty());
     }
 
     #[test]
@@ -233,8 +303,8 @@ mod tests {
         // Mark as actively deployed
         let active = HashSet::from(["myapp:latest".to_string()]);
 
-        let result = gc_sweep(&store, &catalog, &active, &default_config()).unwrap();
-        assert!(result.deleted.is_empty());
+        let result = gc_candidates(&store, &catalog, &active, &default_config()).unwrap();
+        assert!(result.candidates.is_empty());
         assert!(result.active_protected > 0);
     }
 
@@ -252,14 +322,14 @@ mod tests {
             updates: vec![(orphan.clone(), BTreeSet::from([1]))],
         });
 
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
-        assert!(result.deleted.is_empty());
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert!(result.candidates.is_empty());
         assert_eq!(result.sole_copy_protected, 1);
         assert!(store.has_blob(&orphan));
     }
 
     #[test]
-    fn gc_collects_multi_holder_unreferenced() {
+    fn gc_nominates_multi_holder_unreferenced() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
         let mut catalog = ManifestCatalog::default();
@@ -272,13 +342,14 @@ mod tests {
             updates: vec![(orphan.clone(), BTreeSet::from([1, 2]))],
         });
 
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
-        assert_eq!(result.deleted.len(), 1);
-        assert!(!store.has_blob(&orphan));
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        // Still on disk until the arbiter approves.
+        assert!(store.has_blob(&orphan));
     }
 
     #[test]
-    fn gc_report_contains_deleted_layers() {
+    fn gc_report_contains_nominated_layers() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
         let mut catalog = ManifestCatalog::default();
@@ -291,8 +362,8 @@ mod tests {
             updates: vec![(orphan.clone(), BTreeSet::from([1, 2]))],
         });
 
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
-        let report = result.report.unwrap();
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        let report = result.report(1).unwrap();
         assert_eq!(report.node_id, 1);
         assert_eq!(report.deleted_layers.len(), 1);
     }
@@ -309,31 +380,18 @@ mod tests {
             write_fake_blob(&store, d);
         }
 
-        // Delete the tag so it's "unreferenced" but within retention
-        catalog.apply_manifest_commit(&ManifestCommit {
-            manifest: manifest.clone(),
-            tag: "old".to_string(),
-            holder_nodes: BTreeSet::from([1, 2]),
-        });
-        catalog.apply_delete_tag(&crate::pickle::types::DeleteTag {
-            repository: "myapp".to_string(),
-            tag: "old".to_string(),
-        });
-
-        // Wait, the manifest is gone now after delete_tag. Let me adjust:
-        // Actually, we need a manifest that exists but has no tags and is recent.
-        // Re-add the manifest without tags directly.
+        // A manifest that exists but has no tags and is recent.
         catalog
             .manifests
             .push((manifest.digest.0.clone(), manifest.clone()));
 
         let config = GcConfig {
             retain_days: 7,
-            node_id: 1,
+            ..default_config()
         };
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &config).unwrap();
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &config).unwrap();
         // Layers from the recently pushed manifest should be protected
-        assert!(result.deleted.is_empty());
+        assert!(result.candidates.is_empty());
     }
 
     #[test]
@@ -342,8 +400,8 @@ mod tests {
         let store = BlobStore::new(dir.path());
         let catalog = ManifestCatalog::default();
 
-        let result = gc_sweep(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
-        assert!(result.deleted.is_empty());
-        assert!(result.report.is_none());
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert!(result.candidates.is_empty());
+        assert!(result.report(1).is_none());
     }
 }

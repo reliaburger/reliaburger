@@ -255,7 +255,25 @@ We considered a custom binary protocol (gRPC, or raw TCP with length-prefixed fr
 
 ### Sole-copy protection prevents cascading deletion
 
-Without sole-copy protection, GC on two nodes can race: both check the holder set, both see "two holders", both delete. Now nobody holds the layer. The fix is in Raft: after GC, the node proposes a `GcReport` that removes itself from the holder set. Because Raft proposals are serialised, the second node's GC will see only one holder remaining and skip the deletion.
+Without sole-copy protection, GC on two nodes can race: both check the holder set, both see "two holders", both delete. Now nobody holds the layer.
+
+An earlier edition of this section claimed Raft serialisation already fixed this. It didn't — and the gap between the claim and the code is instructive. The old flow was: check holders, *delete the blob*, then propose a `GcReport` to Raft. The proposal was serialised, sure, but the deletion had already happened before anyone arbitrated it. Two nodes could still both pass the local check and both delete; Raft just tidily recorded the data loss afterwards.
+
+The real fix inverts the order. GC is now two-phase: `gc_candidates` *nominates* layers (deleting nothing), the node proposes the nominations, and the state machine — applying entries one at a time — decides which deletions still leave at least one holder. Its verdict travels back in the applied entry's response (`CouncilResponse::GcApproved`), the same pattern serial allocation uses, and only then does `delete_approved` touch the disk. The second node in the race gets an empty approval list for the contested layer. In single-node mode the same arbitration rule runs against the local catalogue, so the invariant holds everywhere: no deletion before a verdict.
+
+There's one more race hiding in "orphaned" blobs: a layer being pushed right now has no holder entry yet, because its manifest hasn't committed. The old sweep classified those as orphans and deleted them mid-upload. Nominations now skip untracked blobs younger than an hour.
+
+### Wiring the registry into the cluster
+
+The July 2026 review found most of this chapter's machinery had no production caller: the catalogue was rebuilt empty on every boot (all image metadata lost on restart), pushes recorded a hardcoded holder set of `{0}`, and replication, pull, and GC were never scheduled. The wiring pass connected them:
+
+- **Real holders.** Pushes record the pushing node's actual raft id — derived from the node name even in single-node mode. No more made-up constants.
+- **Persistence.** The catalogue writes itself to `pickle-catalog.json` (temp-file-and-rename, as ever) after each commit and loads at boot. A corrupt file aborts startup: silently starting empty would orphan every blob on disk.
+- **Raft.** Council members also propose each commit to Raft, making the replicated catalogue the cluster's source of truth. Worker nodes outside the council can't write to Raft yet — proposal forwarding arrives with the scheduler wiring — so their pushes stay locally persisted until then, and the commit message says so out loud rather than pretending.
+- **Replication.** A leader-only loop compares each manifest's full-holder count against `[images] redundancy`, copies missing layers to gossip-selected peers over the ordinary OCI endpoints, and proposes the updated holder sets.
+- **GC on a schedule**, per the two-phase protocol above.
+
+The same pass fixed `relish build` (X1), whose context upload had been pointed at port 9117 — the Bun *API* port, which has no `/v2` routes — since the day it was written. It now uploads to the actual registry port, and `/v1/build` genuinely runs `buildah bud` and pushes the result back through the registry (or says plainly that it needs `buildah`, instead of returning an unconditional 501).
 
 ## Tests
 

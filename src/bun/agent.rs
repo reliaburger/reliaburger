@@ -89,6 +89,11 @@ pub enum AgentCommand {
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
     },
+    /// Get the image references of all current instances (for GC
+    /// protection: actively deployed images must not be collected).
+    ActiveImages {
+        response: oneshot::Sender<std::collections::HashSet<String>>,
+    },
     /// Get logs for an app.
     Logs {
         app_name: String,
@@ -735,6 +740,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::Status { response } => {
                 let statuses = self.get_status().await;
                 let _ = response.send(statuses);
+            }
+            AgentCommand::ActiveImages { response } => {
+                let images: std::collections::HashSet<String> = self
+                    .supervisor
+                    .list_instances()
+                    .iter()
+                    .map(|i| i.image.clone())
+                    .filter(|image| !image.is_empty())
+                    .collect();
+                let _ = response.send(images);
             }
             AgentCommand::Logs {
                 app_name,

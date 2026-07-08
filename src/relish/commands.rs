@@ -949,7 +949,7 @@ pub async fn images() -> Result<(), RelishError> {
 ///
 /// Reads `[build.*]` sections from the config, tars each context,
 /// uploads it to Pickle, and submits a build job.
-pub async fn build(path: &std::path::Path) -> Result<(), RelishError> {
+pub async fn build(path: &std::path::Path, registry_port: u16) -> Result<(), RelishError> {
     use crate::config::Config;
     use crate::pickle::build::{digest_of, execute_build, tar_context};
 
@@ -983,8 +983,9 @@ pub async fn build(path: &std::path::Path) -> Result<(), RelishError> {
             tar_bytes.len()
         );
 
-        // Upload context blob to Pickle
-        let upload_url = crate::pickle::build::context_upload_url(9117, &digest);
+        // Upload context blob to the Pickle registry (X1: this used to
+        // target the Bun API port, which has no /v2 routes).
+        let upload_url = crate::pickle::build::context_upload_url(registry_port, &digest);
         let resp = reqwest::Client::new()
             .post(&upload_url)
             .body(tar_bytes)
@@ -1004,10 +1005,12 @@ pub async fn build(path: &std::path::Path) -> Result<(), RelishError> {
         }
         println!("  context uploaded to Pickle");
 
-        // Prepare the build job
-        let job = execute_build(spec, &digest, None).map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("build preparation failed: {e}"),
+        // Prepare the build job (for display; the agent re-derives it)
+        let job = execute_build(spec, &digest, Some(registry_port)).map_err(|e| {
+            RelishError::ApiError {
+                status: 0,
+                body: format!("build preparation failed: {e}"),
+            }
         })?;
 
         println!(
@@ -1019,7 +1022,7 @@ pub async fn build(path: &std::path::Path) -> Result<(), RelishError> {
 
         // Submit build job to agent
         let result = client
-            .submit_build(name, &digest, &spec.destination)
+            .submit_build(name, &digest, registry_port, spec)
             .await?;
         println!("  {result}");
     }

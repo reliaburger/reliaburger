@@ -236,6 +236,8 @@ async fn main() -> anyhow::Result<()> {
     let mut api_council: Option<Arc<reliaburger::council::CouncilNode>> = None;
     // The leader-side rollup store, exposed at /v1/metrics/cluster.
     let mut api_rollup_store = None;
+    // Gossip membership for the pickle replication loop (cluster only).
+    let mut replication_membership = None;
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
@@ -251,6 +253,9 @@ async fn main() -> anyhow::Result<()> {
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         _cluster_runtime = Some(cluster_runtime);
         api_council = handle.council.clone();
+        // Cloned before the handle moves into the agent: the pickle
+        // replication loop derives its peer list from gossip.
+        replication_membership = Some(handle.membership_rx.clone());
         BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
     } else {
         _cluster_runtime = None;
@@ -567,8 +572,20 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
-    let pickle_catalog: Arc<RwLock<ManifestCatalog>> =
-        Arc::new(RwLock::new(ManifestCatalog::default()));
+    // L10: the catalog used to be `default()` on every boot — image
+    // metadata evaporated on restart. Load the persisted copy; a
+    // corrupt file aborts startup rather than silently orphaning blobs.
+    let _ = std::fs::create_dir_all(&config.storage.data);
+    let catalog_path = config.storage.data.join("pickle-catalog.json");
+    let loaded_catalog = ManifestCatalog::load_from(&catalog_path)
+        .map_err(|e| anyhow::anyhow!("failed to load pickle catalog: {e}"))?;
+    if !loaded_catalog.manifests.is_empty() {
+        println!(
+            "bun: pickle catalog loaded ({} manifests)",
+            loaded_catalog.manifests.len()
+        );
+    }
+    let pickle_catalog: Arc<RwLock<ManifestCatalog>> = Arc::new(RwLock::new(loaded_catalog));
 
     // Create the alert evaluator (shared between the API and the
     // evaluation loop so /v1/alerts always reflects current state).
@@ -577,6 +594,9 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Cloned for the GC task (asks the agent for actively deployed images).
+    let gc_cmd_tx = cmd_tx.clone();
 
     let app = api::router(
         cmd_tx,
@@ -678,10 +698,20 @@ async fn main() -> anyhow::Result<()> {
         );
         fallback
     };
-    let blob_store = BlobStore::new(&pickle_dir);
+    let node_name = config
+        .node
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
+    let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
+
+    let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     let pickle_state = PickleState {
-        store: Arc::new(blob_store),
+        store: Arc::clone(&blob_store),
         catalog: Arc::clone(&pickle_catalog),
+        node_raft_id,
+        council: api_council.clone(),
+        persist_path: Some(catalog_path.clone()),
     };
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
     let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
@@ -696,6 +726,226 @@ async fn main() -> anyhow::Result<()> {
             .await
             .ok();
     });
+
+    // Scheduled image GC (L10/M2): two-phase — nominate candidates,
+    // let the arbiter (Raft in cluster mode, the local catalog's same
+    // rule otherwise) approve, then delete only what was approved.
+    {
+        use reliaburger::council::types::{CouncilResponse, RaftRequest};
+        use reliaburger::pickle::gc::{GcConfig, delete_approved, gc_candidates};
+
+        let gc_store = Arc::clone(&blob_store);
+        let gc_catalog = Arc::clone(&pickle_catalog);
+        let gc_council = api_council.clone();
+        let gc_persist = catalog_path.clone();
+        let gc_shutdown = shutdown.clone();
+        let gc_config = GcConfig {
+            retain_days: config.images.gc_retain_days,
+            node_id: node_raft_id,
+            orphan_grace: std::time::Duration::from_secs(3600),
+        };
+        let gc_interval = std::time::Duration::from_secs(
+            u64::from(config.images.gc_interval_hours.max(1)) * 3600,
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(gc_interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = gc_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+
+                // Actively deployed images are never collected.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = gc_cmd_tx
+                    .send(reliaburger::bun::agent::AgentCommand::ActiveImages { response: tx })
+                    .await;
+                let active = rx.await.unwrap_or_default();
+
+                // Phase 1: nominate (fs walk off the runtime).
+                let catalog_snapshot = gc_catalog.read().await.clone();
+                let store = Arc::clone(&gc_store);
+                let gc_cfg = gc_config.clone();
+                let nominated = tokio::task::spawn_blocking(move || {
+                    gc_candidates(&store, &catalog_snapshot, &active, &gc_cfg)
+                })
+                .await;
+                let Ok(Ok(nominated)) = nominated else {
+                    continue;
+                };
+                let Some(report) = nominated.report(gc_config.node_id) else {
+                    continue;
+                };
+
+                // Arbitration: Raft serialises cluster-wide; single-node
+                // applies the identical rule to the local catalog.
+                let approved = match &gc_council {
+                    Some(council) => {
+                        match council.write(RaftRequest::GcReport(report.clone())).await {
+                            Ok(CouncilResponse::GcApproved { approved }) => {
+                                // Mirror the holder removal locally too.
+                                let mirror = reliaburger::pickle::types::GcReport {
+                                    node_id: report.node_id,
+                                    deleted_layers: approved.clone(),
+                                };
+                                let _ = gc_catalog.write().await.apply_gc_report(&mirror);
+                                approved
+                            }
+                            Ok(_) => Vec::new(),
+                            Err(e) => {
+                                eprintln!(
+                                    "bun: gc arbitration unavailable ({e}); deleting nothing"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => gc_catalog.write().await.apply_gc_report(&report),
+                };
+
+                if approved.is_empty() {
+                    continue;
+                }
+
+                // Persist the catalog change, then phase 2: delete.
+                let snapshot = gc_catalog.read().await.clone();
+                let persist = gc_persist.clone();
+                let store = Arc::clone(&gc_store);
+                let deleted = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = snapshot.persist_to(&persist) {
+                        eprintln!("bun: gc failed to persist catalog: {e}");
+                    }
+                    delete_approved(&store, &approved)
+                })
+                .await
+                .unwrap_or_default();
+                if !deleted.is_empty() {
+                    println!("bun: gc removed {} blob(s)", deleted.len());
+                }
+            }
+        });
+    }
+
+    // Pickle replication (L10): leader-only loop that keeps every
+    // manifest's layers on at least `[images] redundancy` nodes.
+    if let (Some(council), Some(membership_rx)) = (api_council.clone(), replication_membership) {
+        use reliaburger::pickle::replication::{
+            Peer, ReplicationConfig, replicate_manifest, select_peers,
+        };
+
+        let repl_store = Arc::clone(&blob_store);
+        let repl_shutdown = shutdown.clone();
+        let redundancy = config.images.redundancy.max(1);
+        let registry_port = config.images.registry_port;
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = repl_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                if !council.is_leader().await {
+                    continue;
+                }
+
+                let catalog = council.manifest_catalog().await;
+                let peers: Vec<Peer> = membership_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
+                    .map(|m| Peer {
+                        node_id: reliaburger::cluster::identity::raft_id_from_name(&m.node_id.0),
+                        base_url: format!("http://{}:{registry_port}", m.address.ip()),
+                    })
+                    .collect();
+                if peers.len() < 2 {
+                    continue; // nobody to replicate to
+                }
+
+                for (_, manifest) in &catalog.manifests {
+                    // Nodes that hold EVERY layer of this manifest.
+                    let mut full_holders: Option<std::collections::BTreeSet<u64>> = None;
+                    for digest in manifest.all_digests() {
+                        let holders = catalog.layer_holders(digest.as_str());
+                        full_holders = Some(match full_holders {
+                            Some(acc) => acc.intersection(&holders).copied().collect(),
+                            None => holders,
+                        });
+                    }
+                    let full_holders = full_holders.unwrap_or_default();
+                    if full_holders.len() >= redundancy as usize {
+                        continue;
+                    }
+
+                    // The leader replicates from its own blobs; skip
+                    // manifests it doesn't hold (their holder pushes
+                    // will be reconciled once forwarding lands in W6).
+                    if !manifest
+                        .all_digests()
+                        .iter()
+                        .all(|d| repl_store.has_blob(d))
+                    {
+                        continue;
+                    }
+
+                    let needed = redundancy as usize - full_holders.len();
+                    let targets = select_peers(&peers, 0, &full_holders, needed);
+                    if targets.is_empty() {
+                        continue;
+                    }
+
+                    let config = ReplicationConfig {
+                        redundancy,
+                        peer_timeout: std::time::Duration::from_secs(30),
+                    };
+                    match replicate_manifest(manifest, &repl_store, &targets, &config, &client)
+                        .await
+                    {
+                        Ok(result) => {
+                            let updates = manifest
+                                .all_digests()
+                                .iter()
+                                .map(|d| {
+                                    let mut holders = catalog.layer_holders(d.as_str());
+                                    holders.extend(result.successful_nodes.iter().copied());
+                                    ((*d).clone(), holders)
+                                })
+                                .collect();
+                            let update =
+                                reliaburger::pickle::types::UpdateLayerLocations { updates };
+                            if let Err(e) = council
+                                .write(
+                                    reliaburger::council::types::RaftRequest::UpdateLayerLocations(
+                                        update,
+                                    ),
+                                )
+                                .await
+                            {
+                                eprintln!("bun: replication holder update failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "bun: replication of {}:{} failed: {e}",
+                                manifest.repository,
+                                manifest
+                                    .tags
+                                    .iter()
+                                    .next()
+                                    .map(String::as_str)
+                                    .unwrap_or("?")
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Wait for SIGINT or SIGTERM. Handling SIGTERM matters under systemd/docker
     // stop — without it the agent was killed before shutdown_all ran, orphaning

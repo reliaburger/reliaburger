@@ -206,6 +206,9 @@ enum Command {
     Build {
         /// Path to a TOML config file with [build.*] sections.
         path: PathBuf,
+        /// Pickle registry port for context upload and image push.
+        #[arg(long, default_value_t = 5050)]
+        registry_port: u16,
     },
     /// Submit a batch of jobs for high-throughput scheduling.
     Batch {
@@ -657,7 +660,10 @@ async fn main() -> ExitCode {
         #[cfg(feature = "kubernetes")]
         Command::Export { ref file } => commands::export_k8s(file),
         Command::Images => commands::images().await,
-        Command::Build { ref path } => commands::build(path).await,
+        Command::Build {
+            ref path,
+            registry_port,
+        } => commands::build(path, registry_port).await,
         Command::Batch { ref path } => commands::batch(path).await,
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),

@@ -791,7 +791,8 @@ impl BunClient {
         &self,
         name: &str,
         context_digest: &str,
-        destination: &str,
+        registry_port: u16,
+        spec: &crate::config::build::BuildSpec,
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/build", self.base_url);
         let response = self
@@ -800,7 +801,8 @@ impl BunClient {
             .json(&serde_json::json!({
                 "name": name,
                 "context_digest": context_digest,
-                "destination": destination,
+                "registry_port": registry_port,
+                "spec": spec,
             }))
             .send()
             .await

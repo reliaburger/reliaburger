@@ -22,6 +22,59 @@ use super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCatalog, Mani
 pub struct PickleState {
     pub store: Arc<BlobStore>,
     pub catalog: Arc<RwLock<ManifestCatalog>>,
+    /// This node's raft id, recorded as the holder on pushes. Derived
+    /// from the node name even in single-node mode — never a made-up
+    /// constant.
+    pub node_raft_id: u64,
+    /// Council handle for proposing catalog changes to Raft (cluster
+    /// council members only; `None` single-node).
+    pub council: Option<Arc<crate::council::CouncilNode>>,
+    /// Where to persist the catalog after each mutation, so image
+    /// metadata survives restarts. `None` disables persistence (tests).
+    pub persist_path: Option<std::path::PathBuf>,
+}
+
+/// Record a committed manifest: apply to the local catalog, persist it
+/// to disk, and — when this node is a council member — propose it to
+/// Raft so the cluster-wide catalog tracks the real holder.
+///
+/// The Raft propose is best-effort: workers outside the council can't
+/// write to Raft yet (proposal forwarding arrives with the scheduler
+/// wiring), and a failed propose must not fail the push — the local
+/// catalog is already persisted and the replication loop reconciles
+/// holder sets from it later.
+async fn record_commit(state: &PickleState, manifest: ImageManifest, tag: String) {
+    let commit = ManifestCommit {
+        manifest,
+        tag,
+        holder_nodes: std::collections::BTreeSet::from([state.node_raft_id]),
+    };
+
+    let snapshot = {
+        let mut catalog = state.catalog.write().await;
+        catalog.apply_manifest_commit(&commit);
+        state.persist_path.as_ref().map(|_| catalog.clone())
+    };
+    if let (Some(path), Some(snapshot)) = (state.persist_path.clone(), snapshot) {
+        // File IO off the runtime; the catalog is small (KBs).
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = snapshot.persist_to(&path) {
+                eprintln!("pickle: failed to persist catalog: {e}");
+            }
+        })
+        .await;
+    }
+
+    if let Some(council) = &state.council
+        && let Err(e) = council
+            .write(crate::council::types::RaftRequest::ManifestCommit(commit))
+            .await
+    {
+        eprintln!(
+            "pickle: manifest commit not written to raft ({e}); \
+             local catalog persisted, replication will reconcile"
+        );
+    }
 }
 
 /// Build the OCI Distribution API router.
@@ -333,12 +386,7 @@ async fn manifest_put(
                 pushed_by: 0,
                 signature: None,
             };
-            let commit = ManifestCommit {
-                manifest,
-                tag: reference.clone(),
-                holder_nodes: std::collections::BTreeSet::from([0]),
-            };
-            state.catalog.write().await.apply_manifest_commit(&commit);
+            record_commit(&state, manifest, reference.clone()).await;
 
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -370,12 +418,7 @@ async fn manifest_put(
             pushed_by: 0,
             signature: None,
         };
-        let commit = ManifestCommit {
-            manifest,
-            tag: reference.clone(),
-            holder_nodes: std::collections::BTreeSet::from([0]),
-        };
-        state.catalog.write().await.apply_manifest_commit(&commit);
+        record_commit(&state, manifest, reference.clone()).await;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -456,12 +499,7 @@ async fn manifest_put(
         signature: None,
     };
 
-    let commit = ManifestCommit {
-        manifest,
-        tag: reference.clone(),
-        holder_nodes: std::collections::BTreeSet::from([0]),
-    };
-    state.catalog.write().await.apply_manifest_commit(&commit);
+    record_commit(&state, manifest, reference.clone()).await;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -569,6 +607,9 @@ mod tests {
         let state = PickleState {
             store: Arc::new(store),
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+            node_raft_id: 7,
+            council: None,
+            persist_path: None,
         };
         (state, dir)
     }
