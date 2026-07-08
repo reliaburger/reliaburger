@@ -31,6 +31,7 @@ struct Node {
     client: BunClient,
     handle: ClusterHandle,
     thinks_leader: watch::Receiver<bool>,
+    rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
 }
 
 use tokio::sync::watch;
@@ -79,6 +80,7 @@ async fn start_node(
     let membership_rx = handle.membership_rx.clone();
     let metrics_rx = handle.raft_metrics_rx.clone();
     let aggregated_rx = cluster_runtime.aggregated_rx.clone();
+    let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
 
     // Leak the runtime for the whole test (its tasks must outlive us).
     Box::leak(Box::new(cluster_runtime));
@@ -126,12 +128,18 @@ async fn start_node(
         });
     }
 
-    // Leader scheduler.
+    // Leader scheduler + autoscaler (fast interval for the test).
     if let Some(council) = &council {
         spawn_leader_scheduler(
             Arc::clone(council),
             membership_rx.clone(),
             aggregated_rx,
+            shutdown.clone(),
+        );
+        reliaburger::cluster::orchestrate::spawn_autoscaler(
+            Arc::clone(council),
+            Arc::clone(&rollup_store),
+            Duration::from_millis(500),
             shutdown.clone(),
         );
     }
@@ -212,6 +220,7 @@ async fn start_node(
             wrapping_ikm: None,
         },
         thinks_leader: leader_rx,
+        rollup_store,
     }
 }
 
@@ -339,5 +348,133 @@ async fn apply_on_any_node_places_across_the_cluster() {
             c.shutdown().await.ok();
         }
         let _ = &n.name;
+    }
+}
+
+/// Total "scaler" instances across all nodes.
+async fn total_scaler_instances(nodes: &[&Node]) -> usize {
+    let mut total = 0;
+    for node in nodes {
+        if let Ok(statuses) = node.client.status().await {
+            total += statuses.iter().filter(|s| s.app_name == "scaler").count();
+        }
+    }
+    total
+}
+
+/// W8 (L3): a high metric drives the autoscaler to raise the replica
+/// override, and the scheduler + reconcilers grow the app to max.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn autoscaler_scales_up_on_high_metric() {
+    use reliaburger::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+
+    let shutdown = CancellationToken::new();
+    let n1 = start_node("s1", 18541, vec![], &shutdown).await;
+    let n2 = start_node("s2", 18545, vec![local(18541)], &shutdown).await;
+    let n3 = start_node("s3", 18549, vec![local(18541)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Deploy a 1-replica app that autoscales on cpu, target 50%, max 3.
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.scaler]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        replicas = 1
+        cpu = "100m-200m"
+
+        [app.scaler.autoscale]
+        metric = "cpu"
+        target = "50%"
+        min = 1
+        max = 3
+        cooldown = "0s"
+    "#,
+    )
+    .unwrap();
+    let applier = nodes
+        .iter()
+        .find(|n| *n.thinks_leader.borrow())
+        .expect("leader");
+    let _ = tokio::time::timeout(Duration::from_secs(20), applier.client.apply(&config)).await;
+
+    // Wait until the single replica is placed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if total_scaler_instances(&nodes).await >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Feed a sustained HIGH cpu metric (0.95 » 0.50 target) into every
+    // node's rollup store, labelled for the app. The leader's autoscaler
+    // reads its own store.
+    for node in &nodes {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("app".to_string(), "scaler".to_string());
+        let rollup = NodeRollup {
+            node_id: reliaburger::meat::NodeId::new(&node.name),
+            timestamp: now.saturating_sub(30),
+            entries: vec![RollupEntry {
+                metric_name: "cpu".to_string(),
+                labels,
+                aggregate: RollupAggregate {
+                    min: 0.95,
+                    max: 0.95,
+                    sum: 0.95,
+                    count: 1,
+                },
+            }],
+        };
+        let mut w = node.rollup_store.write().await;
+        w.ingest(&rollup);
+        w.flush().await.unwrap();
+    }
+
+    // The autoscaler should raise the override; scheduler + reconcilers
+    // grow the app toward max (3).
+    let scaled = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            if total_scaler_instances(&nodes).await >= 3 {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        ok
+    };
+
+    if !scaled {
+        for n in &nodes {
+            if let Some(c) = &n.handle.council {
+                let ds = c.desired_state().await;
+                eprintln!("node {}: overrides={:?}", n.name, ds.autoscale_overrides);
+            }
+        }
+        panic!(
+            "autoscaler did not scale up; instances: {}",
+            total_scaler_instances(&nodes).await
+        );
+    }
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
     }
 }

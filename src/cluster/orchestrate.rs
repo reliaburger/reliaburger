@@ -87,10 +87,14 @@ pub fn spawn_leader_scheduler(
             }
 
             for (app_id, spec) in &desired.apps {
-                let want = match spec.replicas {
-                    Replicas::Fixed(n) => n as usize,
-                    Replicas::DaemonSet => alive.len(),
-                };
+                // Effective replicas = autoscale override (L3) if the
+                // autoscaler set one, else the spec/config baseline.
+                let override_replicas = desired
+                    .autoscale_overrides
+                    .iter()
+                    .find(|(k, _)| k == &app_id.to_string())
+                    .map(|(_, n)| *n);
+                let want = effective_replicas(spec, override_replicas, alive.len());
                 let placements_ok = desired
                     .scheduling
                     .get(app_id)
@@ -109,8 +113,13 @@ pub fn spawn_leader_scheduler(
                     // against unknown capacity would place blindly.
                     continue;
                 }
+                // Feed the scheduler the effective replica count.
+                let mut effective_spec = spec.clone();
+                if let Some(n) = override_replicas {
+                    effective_spec.replicas = Replicas::Fixed(n);
+                }
                 let mut scheduler = Scheduler::new(cache);
-                match scheduler.schedule_app(app_id, spec) {
+                match scheduler.schedule_app(app_id, &effective_spec) {
                     Ok(decision) => {
                         if let Err(e) = council
                             .write(RaftRequest::SchedulingDecision(decision))
@@ -126,6 +135,136 @@ pub fn spawn_leader_scheduler(
             }
         }
     });
+}
+
+/// The replica count the scheduler should target for an app: the
+/// autoscale override if the autoscaler set one, else the spec's own
+/// count (daemon sets fan out to every alive node).
+fn effective_replicas(spec: &AppSpec, override_replicas: Option<u32>, alive_count: usize) -> usize {
+    match (override_replicas, spec.replicas) {
+        (Some(n), _) => n as usize,
+        (None, Replicas::Fixed(n)) => n as usize,
+        (None, Replicas::DaemonSet) => alive_count,
+    }
+}
+
+/// Spawn the leader's autoscale loop (L3).
+///
+/// Every `interval`, on the leader, for each app with an
+/// `[autoscale]` section: query the app's metric from the rollup store,
+/// run the (tested) `evaluate` decision function, and commit an
+/// `AutoscaleOverride` to Raft when a scale is warranted. The scheduler
+/// then re-places at the new replica count.
+///
+/// The library's `run_autoscale_loop` takes a *synchronous*
+/// `app_provider` closure, which can't read async Raft desired state or
+/// the rollup store; this task drives the same pure functions
+/// (`AutoscaleConfig::from_spec`, `evaluate`, `AutoscaleTracker`)
+/// directly instead.
+pub fn spawn_autoscaler(
+    council: Arc<CouncilNode>,
+    rollup_store: Arc<tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>>,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
+    use crate::meat::autoscaler::{AutoscaleConfig, AutoscaleTracker, evaluate};
+
+    tokio::spawn(async move {
+        let mut tracker = AutoscaleTracker::default();
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            if !council.is_leader().await {
+                continue;
+            }
+
+            let desired = council.desired_state().await;
+            for (app_id, spec) in &desired.apps {
+                let Some(autoscale) = &spec.autoscale else {
+                    continue;
+                };
+                let Some(config) = AutoscaleConfig::from_spec(autoscale) else {
+                    continue;
+                };
+
+                // Baseline the tracker at the current effective replica
+                // count (override if one exists, else the spec's).
+                let baseline = desired
+                    .autoscale_overrides
+                    .iter()
+                    .find(|(k, _)| k == &app_id.to_string())
+                    .map(|(_, n)| *n)
+                    .unwrap_or(match spec.replicas {
+                        Replicas::Fixed(n) => n,
+                        Replicas::DaemonSet => continue, // daemon sets don't autoscale
+                    });
+
+                // Metric utilisation for this app over the last window.
+                let Some(metric) =
+                    app_metric_utilisation(&rollup_store, &config.metric, &app_id.name).await
+                else {
+                    continue; // no data yet
+                };
+
+                let now = std::time::Instant::now();
+                let state = tracker.get_or_insert(app_id, baseline);
+                // Keep the tracker's current in sync with cluster truth
+                // (another leader may have scaled while we were a follower).
+                state.current_replicas = baseline;
+                if let Some(decision) = evaluate(app_id, &config, state, metric, now) {
+                    tracker.apply_decision(&decision, now);
+                    if let Err(e) = council
+                        .write(RaftRequest::AutoscaleOverride {
+                            app_id: app_id.clone(),
+                            replicas: decision.to,
+                            reason: decision.reason.clone(),
+                        })
+                        .await
+                    {
+                        eprintln!("autoscaler: failed to commit override for {app_id}: {e}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Average utilisation of `metric` for `app` over the recent window,
+/// as a fraction, from the leader's rollup store.
+///
+/// Returns `None` when there's no data. The value is interpreted as a
+/// utilisation fraction (0.0–1.0) to compare against the autoscale
+/// target; the metric Mayo records must be scaled accordingly.
+async fn app_metric_utilisation(
+    rollup_store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
+    metric: &str,
+    app: &str,
+) -> Option<f64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let window_start = now.saturating_sub(300); // last 5 minutes
+
+    let store = rollup_store.read().await;
+    let aggregates = store
+        .query_cluster_aggregates(metric, window_start, now)
+        .await
+        .ok()?;
+    // Filter to rows whose labels mention this app, and average the
+    // per-timestamp means (sum/count).
+    let mut total = 0.0;
+    let mut n = 0u64;
+    for agg in &aggregates {
+        if agg.labels.contains(app) && agg.count > 0 {
+            total += agg.sum / f64::from(agg.count);
+            n += 1;
+        }
+    }
+    if n == 0 { None } else { Some(total / n as f64) }
 }
 
 /// Build the scheduler's view of the cluster from gossip membership
@@ -372,5 +511,75 @@ mod tests {
 
         let cache = build_cluster_cache(&members, &reports);
         assert_eq!(cache.node_count(), 0);
+    }
+
+    fn spec_from_toml(body: &str) -> AppSpec {
+        let config = crate::config::Config::parse(body).unwrap();
+        config.app.into_values().next().unwrap()
+    }
+
+    #[test]
+    fn effective_replicas_prefers_the_autoscale_override() {
+        let spec = spec_from_toml("[app.web]\nimage = \"x:1\"\nreplicas = 2\n");
+        // No override: the spec's own count.
+        assert_eq!(effective_replicas(&spec, None, 5), 2);
+        // Override: wins over the spec (L3 — this is how a scale takes
+        // effect; the scheduler re-places at the override count).
+        assert_eq!(effective_replicas(&spec, Some(4), 5), 4);
+    }
+
+    #[test]
+    fn effective_replicas_daemonset_fans_out() {
+        let spec = spec_from_toml("[app.web]\nimage = \"x:1\"\nreplicas = \"*\"\n");
+        assert_eq!(effective_replicas(&spec, None, 3), 3);
+    }
+
+    #[tokio::test]
+    async fn app_metric_utilisation_averages_the_app_rows() {
+        use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+        use crate::mayo::rollup_store::RollupStore;
+        use std::collections::BTreeMap as Map;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(RollupStore::new(dir.path().to_path_buf()));
+        {
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut labels = Map::new();
+            labels.insert("app".to_string(), "web".to_string());
+            let rollup = NodeRollup {
+                node_id: NodeId::new("n1"),
+                timestamp: now.saturating_sub(60),
+                entries: vec![RollupEntry {
+                    metric_name: "cpu".to_string(),
+                    labels,
+                    // sum 1.6 over 2 samples → mean 0.8 utilisation.
+                    aggregate: RollupAggregate {
+                        min: 0.7,
+                        max: 0.9,
+                        sum: 1.6,
+                        count: 2,
+                    },
+                }],
+            };
+            let mut w = store.write().await;
+            w.ingest(&rollup);
+            w.flush().await.unwrap();
+        }
+
+        let value = app_metric_utilisation(&store, "cpu", "web").await;
+        assert!(
+            value.is_some_and(|v| (v - 0.8).abs() < 1e-9),
+            "expected mean utilisation 0.8, got {value:?}"
+        );
+
+        // Unknown app → no data.
+        assert!(
+            app_metric_utilisation(&store, "cpu", "other")
+                .await
+                .is_none()
+        );
     }
 }

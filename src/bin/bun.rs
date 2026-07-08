@@ -309,6 +309,16 @@ async fn main() -> anyhow::Result<()> {
                 aggregated_rx,
                 shutdown.clone(),
             );
+            // L3: leader-only autoscale loop, feeding on the same rollup
+            // store /v1/metrics/cluster serves.
+            if let Some(rollup_store) = &api_rollup_store {
+                reliaburger::cluster::orchestrate::spawn_autoscaler(
+                    Arc::clone(council),
+                    Arc::clone(rollup_store),
+                    std::time::Duration::from_secs(30),
+                    shutdown.clone(),
+                );
+            }
         }
 
         // Peer API ports are derived from gossip ports by fixed offset

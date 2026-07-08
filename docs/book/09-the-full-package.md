@@ -151,6 +151,18 @@ scale_down_threshold = 0.8  # optional, default 0.8
 
 All three optional fields have sensible defaults. Most users will only set metric, target, min, and max.
 
+### Wiring it to the cluster
+
+The evaluation logic above — `compute_desired`, the hysteresis, the cooldown — was a library nobody spawned. The July 2026 review found `run_autoscale_loop` had no caller: `AutoscaleDecision`s were computed by tests and nothing else. An autoscaler that never runs is a thermostat with no wires.
+
+Wiring it revealed a small design mismatch worth explaining. `run_autoscale_loop` takes a *synchronous* `app_provider` closure — `Fn() -> Vec<(AppId, ...)>` — to list the apps to consider. But the apps live in the Raft desired state, which you read with an `async` call, and the metrics live in the rollup store, also async. A sync closure can't `await`. Rather than contort a shared cache to feed the sync closure, the leader task drives the same *pure* functions directly: `AutoscaleConfig::from_spec`, `evaluate`, and the `AutoscaleTracker`. The tested logic is reused; only the plumbing around it is new. When a library's shape doesn't fit the wiring, reach for its tested internals rather than bending the wiring to the shape.
+
+The loop lives where every leader-only loop in Reliaburger lives — spawned once, checking leadership each tick, no start/stop dance. Each cycle: read the desired apps, keep only those with an `[autoscale]` section, query the rollup store for each app's recent metric, run `evaluate`, and on a decision commit an `AutoscaleOverride` to Raft.
+
+That last word is the whole trick. The autoscaler doesn't deploy anything or talk to nodes. It writes one number to Raft — the desired replica count — and stops. The scheduler from Chapter 2 already watches desired state; it now reads the *effective* replica count (the override if one exists, else the spec's) and re-places accordingly, and the per-node reconcilers converge. Scaling is just another edit to desired state, flowing through the exact machinery a manual `relish apply` uses. No parallel path, no special case. The integration test drives it end to end: deploy a one-replica app, feed a sustained 95% CPU metric into the rollup stores, and watch the cluster grow the app to its `max` of three — purely because a number changed in Raft.
+
+One honesty note on the metric. The autoscaler compares the rollup value against the target as a *utilisation fraction* (0.95 vs 0.70). What Mayo actually records for an app therefore has to be scaled that way; a metric reported in raw millicores would need a target expressed to match. The code documents this at the query seam rather than silently assuming.
+
 ## Config tooling
 
 Before GitOps, before Kubernetes migration, before any of the fancy stuff, you need basic config manipulation tools. Three commands, all local (no cluster contact needed).
