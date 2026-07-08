@@ -432,6 +432,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.log_tx = Some(log_tx);
     }
 
+    /// Get a shared handle to the ingress routing table.
+    ///
+    /// The Wrapper proxy reads routes from this table; the agent
+    /// rebuilds it on every deploy, stop, and health change.
+    pub fn routing_table_handle(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>> {
+        Arc::clone(&self.routing_table)
+    }
+
     /// Set the image trust policy (from node config). When it requires
     /// signatures, deploys verify Pickle-hosted images before creating them.
     pub fn set_trust_policy(&mut self, trust_policy: crate::config::node::TrustPolicySection) {

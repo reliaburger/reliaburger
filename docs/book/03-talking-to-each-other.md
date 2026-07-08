@@ -621,6 +621,22 @@ Stale token buckets (no requests for 5 minutes) are garbage collected every 60 s
 
 Phase 3 ships with a TLS stub — we can listen on port 443 with self-signed certificates for testing. Real certificate management (ACME for Let's Encrypt, or cluster CA for air-gapped environments) comes in Phase 4 when we build Sesame, the PKI layer. TLS 1.0 and 1.1 are rejected; only 1.2 and 1.3 are accepted.
 
+### Switching the proxy on
+
+Confession time. Everything you've just read about the Wrapper — the routing table, rate limiting, draining, TLS — was true of the *library* for a long time before it was true of the *binary*. The July 2026 review found that `run_proxy` had zero production callers. No listener was ever bound. The agent dutifully rebuilt the routing table on every deploy, and nothing ever read it. A complete front door, tested and documented, leaning against the wall next to the doorframe.
+
+The wiring is a good case study in how subsystems connect in Reliaburger, because the proxy lives *outside* the agent's event loop. The agent owns the routing table and rebuilds it on deploys; the proxy reads it on every request. They share it the standard Rust way: `Arc<tokio::sync::RwLock<RoutingTable>>`. The agent hands out a clone of the `Arc` before it moves into its spawned task, and from then on the two tasks communicate through the lock — writers rare (deploys), readers hot (every request). No channel needed, because the proxy never tells the agent anything.
+
+Three details from the wiring are worth keeping:
+
+*Binding is separate from serving.* `bind_proxy` opens the listeners and returns a `BoundProxy` whose addresses you can inspect; `.serve()` starts the traffic. Why split them? Tests. A test binds port 0, the OS assigns a free port, and the test reads the real address before sending requests. If binding and serving were one call, a test would have to guess ports — and port-guessing tests are flaky tests.
+
+*The TLS accept loop spawns the handshake.* A TLS handshake involves round trips, and a client can stretch those out for as long as you let it. Do the handshake inline in the accept loop and one slow client stops every new connection behind it. So the loop accepts the TCP connection, spawns a task, and *that task* does the handshake. An ingress that can be stalled by one malicious dial-up modem isn't much of a front door.
+
+*Rate limiting needs to know who's asking.* The token buckets are per-client-IP, which means the handler needs the peer address. Axum provides this via `ConnectInfo<SocketAddr>` — but only if you serve the router with `into_make_service_with_connect_info`. Forget that (we did, briefly) and the extractor fails at runtime, not compile time. It's one of the few places axum can't type-check your wiring end to end.
+
+The config side is a new `[ingress]` section in node.toml, disabled by default — binding listeners on 80/443 is not something a node should do just because the code can. `relish` and the dashboard don't change at all: `/v1/routes` was already serving the routing table; now the table finally has traffic flowing through it.
+
 ## The Perimeter: nftables Firewall
 
 ### What we're protecting

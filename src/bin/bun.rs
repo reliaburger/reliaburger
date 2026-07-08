@@ -230,6 +230,31 @@ async fn main() -> anyhow::Result<()> {
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
     let deploy_history = agent.deploy_history_handle();
+
+    // Wrapper ingress: bind the HTTP(S) listeners when [ingress] enables
+    // them, sharing the routing table the agent rebuilds on deploys.
+    if config.ingress.enabled {
+        let routing_table = agent.routing_table_handle();
+        let wrapper_config = config.ingress.to_wrapper_config();
+        let ingress_shutdown = shutdown.clone();
+        let bound = reliaburger::wrapper::proxy::bind_proxy(
+            wrapper_config,
+            routing_table,
+            ingress_shutdown,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind ingress listeners: {e}"))?;
+        println!(
+            "bun: ingress listening on http {} / https {}",
+            bound.http_addr, bound.https_addr
+        );
+        tokio::spawn(async move {
+            if let Err(e) = bound.serve().await {
+                eprintln!("bun: ingress proxy exited with error: {e}");
+            }
+        });
+    }
+
     let agent_handle = tokio::spawn(async move {
         agent.run().await;
     });

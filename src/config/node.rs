@@ -28,7 +28,7 @@ pub struct NodeConfig {
     /// GitOps configuration (optional — only needed if GitOps is enabled).
     #[serde(default)]
     pub gitops: Option<crate::lettuce::types::GitOpsConfig>,
-    // TODO(Phase 3): ingress section
+    pub ingress: IngressSection,
     // TODO(Phase 14): upgrades section
 }
 
@@ -47,6 +47,56 @@ impl NodeConfig {
             }
         })?;
         Self::parse(&content)
+    }
+}
+
+/// Wrapper ingress proxy configuration.
+///
+/// Disabled by default: enabling binds real listeners on the node, so
+/// it must be an explicit choice. Ports default to the standard 80/443
+/// (bun typically runs as root in cluster VMs); tests override with
+/// port 0 to get ephemeral assignments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngressSection {
+    /// Bind the ingress listeners on this node.
+    pub enabled: bool,
+    /// HTTP listen port.
+    pub http_port: u16,
+    /// HTTPS listen port.
+    pub https_port: u16,
+    /// TLS certificate PEM path. Self-signed at startup if unset.
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key PEM path.
+    pub tls_key: Option<PathBuf>,
+    /// Maximum concurrent proxied connections.
+    pub max_connections: usize,
+}
+
+impl Default for IngressSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_port: 80,
+            https_port: 443,
+            tls_cert: None,
+            tls_key: None,
+            max_connections: 10_000,
+        }
+    }
+}
+
+impl IngressSection {
+    /// Convert into the Wrapper subsystem's config type.
+    pub fn to_wrapper_config(&self) -> crate::wrapper::types::WrapperConfig {
+        crate::wrapper::types::WrapperConfig {
+            http_port: self.http_port,
+            https_port: self.https_port,
+            max_connections: self.max_connections,
+            worker_threads: 4,
+            tls_cert_path: self.tls_cert.clone(),
+            tls_key_path: self.tls_key.clone(),
+        }
     }
 }
 
@@ -413,6 +463,35 @@ mod tests {
             }
         );
         assert!(nc.cluster.join.is_empty());
+    }
+
+    /// L7: enabling ingress binds real listeners, so it must be opt-in.
+    #[test]
+    fn ingress_disabled_by_default() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(!nc.ingress.enabled);
+        assert_eq!(nc.ingress.http_port, 80);
+        assert_eq!(nc.ingress.https_port, 443);
+    }
+
+    #[test]
+    fn ingress_section_parses_and_converts() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ingress]
+            enabled = true
+            http_port = 8080
+            https_port = 8443
+            max_connections = 500
+        "#,
+        )
+        .unwrap();
+        assert!(nc.ingress.enabled);
+        let wc = nc.ingress.to_wrapper_config();
+        assert_eq!(wc.http_port, 8080);
+        assert_eq!(wc.https_port, 8443);
+        assert_eq!(wc.max_connections, 500);
+        assert!(wc.tls_cert_path.is_none());
     }
 
     #[test]

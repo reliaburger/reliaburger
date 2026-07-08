@@ -304,7 +304,7 @@ Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
 - [ ] `L3` Spawn the autoscale loop
 - [ ] `L4` Invoke state reconstruction after leader election; consume `Correction`s
 - [ ] `L6` / `L11` Consistent-hash reporting tree + rollups (worker → council → leader, `/v1/metrics/cluster`)
-- [ ] `L7` Bind the Wrapper ingress listener (proxy, rate-limit, draining, TLS, WebSocket)
+- [x] `L7` Bind the Wrapper ingress listener — `[ingress]` node-config section (off by default), HTTP + HTTPS listeners (self-signed or disk certs), per-client rate limiting wired into the proxy path, WebSocket pass-through; drain-on-deploy integration lands with `L2` (W7)
 - [ ] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility)
 - [ ] `L10` / `M2` Schedule replication + GC; share the Pickle catalog via Raft/disk
 - [ ] `L13` Spawn the Lettuce GitOps sync loop; enable the webhook endpoint; fix `H12` trusted-key check
