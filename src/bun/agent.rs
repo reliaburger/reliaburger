@@ -542,6 +542,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.capacity_memory_mb = memory_mb;
     }
 
+    /// Enable or disable the perimeter firewall. In-process multi-node tests
+    /// run several agents on one host and must not spawn `nft` against the
+    /// shared host firewall (`with_cluster` enables it by default on Linux).
+    pub fn set_perimeter_enabled(&mut self, enabled: bool) {
+        self.perimeter_config.enabled = enabled;
+    }
+
     /// Attach a loaded eBPF handle so the agent can write fault and
     /// egress map entries (L8). Only present with the `ebpf` feature;
     /// `bun` calls this at startup when `[ebpf] enabled`.

@@ -100,6 +100,9 @@ async fn start_node(
         handle,
     );
     agent.set_node_capacity(8000, 16384);
+    // Several agents share this host; don't spawn nft against the real
+    // host firewall (`with_cluster` enables it by default on Linux).
+    agent.set_perimeter_enabled(false);
     tokio::spawn(async move { agent.run().await });
 
     // Membership table (peer API addresses = gossip IP + offset 3).
