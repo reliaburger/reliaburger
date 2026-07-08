@@ -392,6 +392,20 @@ pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
 }
 ```
 
+### Switching it on
+
+All of the above — `execute_sync`, the diff engine, signature verification, the webhook validator — was a library nobody ran. The July 2026 review found `execute_sync` had no caller, `/v1/gitops/webhook` returned 503 unconditionally (`gitops_webhook_tx` was hardcoded `None`), and the `[gitops]` config section was parsed and never read. A GitOps engine that never touches git.
+
+The runner (`spawn_gitops_sync`) is the missing piece: a leader-only task that clones the configured repo, then on each poll tick or webhook nudge reads the current apps and last-applied sha from Raft, runs `execute_sync` in `spawn_blocking` (git shells out; never on the async runtime), and applies the resulting changes — `Add`/`Update` become `AppSpec` writes to Raft, `Remove` becomes `AppDelete`. Exactly the desired-state writes a manual `relish apply` makes, which means the scheduler and reconcilers from Chapter 2 pick them up for free. Git becomes just another writer of desired state. The webhook endpoint now has a channel to nudge, so a `git push` hook triggers a sync in milliseconds instead of waiting for the poll.
+
+Wiring it flushed out a bug that only a real repo could surface. `execute_sync` starts by fetching, and treats "fetch found no new commit" as "nothing to do". But the *first* sync after cloning has nothing new to fetch — the clone already contains the commit — yet the desired state has never been applied. The result: a freshly-configured GitOps repo synced *nothing* until someone pushed a second commit. The fix distinguishes "no new commit since last fetch" from "current HEAD not yet applied": when the repo's HEAD differs from the last-*applied* sha, sync it regardless of whether the fetch pulled anything. The unit tests never caught this because they drove `execute_sync` with a mock repo whose `fetch` returned a commit on demand; only a real bare clone, where the first fetch is genuinely a no-op, exposed it.
+
+### The trusted key that trusted everyone (H12)
+
+One security fix rides along. Lettuce can require commits to be GPG-signed by a trusted key, and `is_key_trusted` checked the signing fingerprint against the configured allowlist. Or it looked like it did. After the loop that searched for a matching key, the function ended with `return true` — a comment explained it as "trust any valid signature when trusted_keys is provided." So a validly-signed commit from *any* key sailed through: a departed employee's key, a compromised laptop, an attacker who forked your repo and signed with their own key. The allowlist was decoration; the only check that ran was "is the signature cryptographically valid," which proves the committer holds *some* private key, not *your* private key.
+
+The fix is one line — return whether any trusted fingerprint appears in the verify output, with no fall-through. A valid signature from an unlisted key is now `UntrustedKey`, and the commit is rejected. The two regression tests are the ones that should have existed from the start: a matching fingerprint is trusted, an unlisted one is not. It's a reminder that a security check which always returns "yes" is worse than no check, because it shows up green in the audit.
+
 ## Kubernetes migration
 
 Most teams don't start from scratch. They have existing Kubernetes manifests -- dozens of them, spread across namespaces, wired together with Services, Ingresses, HPAs, ConfigMaps. Asking those teams to rewrite everything in TOML by hand is a non-starter.

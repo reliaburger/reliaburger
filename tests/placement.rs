@@ -179,6 +179,7 @@ async fn start_node(
         None,
         None,
         Some(Arc::clone(&membership_table)),
+        None,
         api_port,
     );
     let sd = shutdown.clone();

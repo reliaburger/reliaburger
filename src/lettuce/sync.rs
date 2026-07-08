@@ -32,6 +32,19 @@ pub struct SyncOutcome {
     pub file_errors: HashMap<String, String>,
 }
 
+/// A "nothing to do" outcome with the given reason.
+fn skipped(reason: &str) -> SyncOutcome {
+    SyncOutcome {
+        commit: None,
+        result: SyncResult::Skipped {
+            reason: reason.to_string(),
+        },
+        diff_summary: None,
+        changes: Vec::new(),
+        file_errors: HashMap::new(),
+    }
+}
+
 /// Execute a single sync cycle.
 ///
 /// This is the pure logic of the sync loop, separated from the
@@ -47,15 +60,23 @@ pub fn execute_sync(
     let new_commit = match repo.fetch() {
         Ok(Some(commit)) => commit,
         Ok(None) => {
-            return SyncOutcome {
-                commit: None,
-                result: SyncResult::Skipped {
-                    reason: "HEAD unchanged".to_string(),
+            // No *new* commit since the last fetch — but the current
+            // HEAD may still be unapplied (e.g. the very first sync
+            // after cloning, where the clone already contains the
+            // commit so there's nothing to "fetch"). Apply when HEAD
+            // differs from what we last applied; otherwise skip.
+            let head = repo.head_sha().ok();
+            let up_to_date =
+                matches!((head.as_deref(), last_applied_sha), (Some(h), Some(a)) if h == a);
+            match (head, up_to_date) {
+                (Some(head_sha), false) => match repo.commit_info(&head_sha) {
+                    Ok(commit) => commit,
+                    Err(_) => {
+                        return skipped("HEAD unchanged");
+                    }
                 },
-                diff_summary: None,
-                changes: Vec::new(),
-                file_errors: HashMap::new(),
-            };
+                _ => return skipped("HEAD unchanged"),
+            }
         }
         Err(e) => {
             return SyncOutcome {

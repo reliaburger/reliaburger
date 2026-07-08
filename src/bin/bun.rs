@@ -692,6 +692,25 @@ async fn main() -> anyhow::Result<()> {
     // Cloned for the GC task (asks the agent for actively deployed images).
     let gc_cmd_tx = cmd_tx.clone();
 
+    // GitOps (L13): if [gitops] is configured on a cluster node, spawn
+    // the leader-only sync loop and hand the API a webhook sender that
+    // nudges it. The webhook endpoint returns 503 without this.
+    let gitops_webhook_tx =
+        if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
+            let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
+            reliaburger::lettuce::runner::spawn_gitops_sync(
+                council,
+                gitops,
+                webhook_rx,
+                config.storage.data.clone(),
+                shutdown.clone(),
+            );
+            println!("bun: gitops sync loop started");
+            Some(webhook_tx)
+        } else {
+            None
+        };
+
     let app = api::router(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
@@ -704,6 +723,7 @@ async fn main() -> anyhow::Result<()> {
         service_token.clone(),
         api_rollup_store,
         api_membership.clone(),
+        gitops_webhook_tx,
         api_port,
     );
     let server_shutdown = shutdown.clone();

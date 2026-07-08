@@ -100,6 +100,7 @@ pub fn router(
     service_token: Option<String>,
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
     membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
+    gitops_webhook_tx: Option<mpsc::Sender<()>>,
     api_port: u16,
 ) -> Router {
     let state = ApiState {
@@ -110,7 +111,7 @@ pub fn router(
         alerts,
         deploy_history,
         pickle_catalog,
-        gitops_webhook_tx: None,
+        gitops_webhook_tx,
         council,
         rollup_store,
         membership,
@@ -2633,7 +2634,7 @@ mod tests {
         });
 
         let app = router(
-            cmd_tx, None, None, None, None, None, None, None, None, None, None, 9117,
+            cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117,
         );
         (app, shutdown)
     }
@@ -2746,6 +2747,7 @@ mod tests {
             None,
             Some(store),
             service_token,
+            None,
             None,
             None,
             9117,
@@ -2861,6 +2863,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             9117,
         );
         (app, shutdown, plaintext)
@@ -2936,6 +2939,7 @@ mod tests {
             Some("rbrg_service".to_string()),
             None,
             None,
+            None,
             9117,
         );
         let status = post_status(
@@ -2960,6 +2964,7 @@ mod tests {
             None,
             None,
             Some(council),
+            None,
             None,
             None,
             None,
@@ -2998,6 +3003,7 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&council)),
+            None,
             None,
             None,
             None,
@@ -3054,6 +3060,7 @@ mod tests {
             None,
             None,
             Some(council),
+            None,
             None,
             None,
             None,
@@ -3169,6 +3176,7 @@ mod tests {
 
         let app = router(
             cmd_tx.clone(),
+            None,
             None,
             None,
             None,
