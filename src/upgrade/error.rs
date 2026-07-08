@@ -51,6 +51,11 @@ pub enum UpgradeError {
     #[error("upgrade {upgrade_id} is already in flight on this node")]
     AlreadyInFlight { upgrade_id: String },
 
+    /// This node already attempted and reverted this exact upgrade.
+    /// Retrying needs a fresh upgrade id (see `orchestrator::resume`).
+    #[error("upgrade {upgrade_id} already failed and was reverted on this node")]
+    PreviouslyFailed { upgrade_id: String },
+
     /// No older version is installed to roll back to.
     #[error("no older version installed to roll back to")]
     NoRollbackTarget,

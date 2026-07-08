@@ -153,6 +153,16 @@ impl UpgradeManager {
         &self.store
     }
 
+    /// Upgrade ids this node attempted and reverted (recent history).
+    /// The leader polls these to detect node-side reverts.
+    pub fn reverted_upgrade_ids(&self) -> Vec<String> {
+        self.read_history()
+            .into_iter()
+            .filter(|entry| entry.outcome == UpgradeOutcome::Reverted)
+            .map(|entry| entry.upgrade_id)
+            .collect()
+    }
+
     /// Node-level status: running version, in-flight marker, recent history.
     pub fn status(&self) -> NodeUpgradeStatus {
         let in_flight = UpgradeMarker::load(&self.marker_path).ok().flatten();
@@ -185,6 +195,15 @@ impl UpgradeManager {
             }
             return Err(UpgradeError::AlreadyInFlight {
                 upgrade_id: existing.upgrade_id,
+            });
+        }
+        // Never re-attempt an id this node already reverted: after a revert
+        // the marker is gone, so without this check a re-delivered (or
+        // leader-retried) directive would crash-loop the node forever.
+        // Retries get a fresh id (orchestrator::resume renames the run).
+        if self.reverted_upgrade_ids().contains(&directive.upgrade_id) {
+            return Err(UpgradeError::PreviouslyFailed {
+                upgrade_id: directive.upgrade_id.clone(),
             });
         }
 

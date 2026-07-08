@@ -275,10 +275,14 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
         Some(manager) => Json(serde_json::json!({
             "version": manager.running_version().to_string(),
             "upgrade_in_flight": manager.upgrade_in_flight(),
+            // Ids this node attempted and reverted — the orchestrator
+            // reads these to detect node-side reverts.
+            "failed_upgrade_ids": manager.reverted_upgrade_ids(),
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
             "upgrade_in_flight": false,
+            "failed_upgrade_ids": [],
         })),
     }
 }

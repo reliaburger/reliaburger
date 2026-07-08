@@ -31,6 +31,8 @@ pub struct NodeProbe {
     pub version: BinaryVersion,
     pub healthy: bool,
     pub upgrade_in_flight: bool,
+    /// Upgrade ids the node attempted and reverted.
+    pub failed_upgrade_ids: Vec<String>,
 }
 
 /// Effects the orchestrator performs on nodes. Mocked in unit tests; the
@@ -172,6 +174,7 @@ async fn poll_and_drive_group<C: NodeControl>(
 ) {
     let target = state.target_version.clone();
     let direction = state.direction;
+    let state_upgrade_id = state.upgrade_id.clone();
     let directive = build_directive(state);
     let budget = if role == NodeRole::Worker {
         state.parallel.max(1) as usize
@@ -198,6 +201,27 @@ async fn poll_and_drive_group<C: NodeControl>(
 
         if record.from_version.is_none() {
             record.from_version = Some(probe.version.clone());
+        }
+
+        // The node itself says it attempted and reverted this run: failed,
+        // regardless of which phase we thought it was in.
+        if probe.failed_upgrade_ids.contains(&state_upgrade_id)
+            && matches!(
+                record.phase,
+                NodeUpgradePhase::Directed | NodeUpgradePhase::Verifying
+            )
+        {
+            set_phase(
+                record,
+                NodeUpgradePhase::Failed {
+                    reason: format!(
+                        "node {} reverted the upgrade (came back on {})",
+                        record.node_id, probe.version
+                    ),
+                },
+                context.now,
+            );
+            continue;
         }
 
         if probe.version == target && probe.healthy && !probe.upgrade_in_flight {
@@ -360,10 +384,15 @@ fn group_in_flight(state: &ClusterUpgradeState, role: NodeRole) -> usize {
 /// Un-pause a paused upgrade: failed nodes go back to Pending (they are
 /// re-polled and re-directed; a node already at target skips straight to
 /// Healthy), and the phase re-enters the earliest unfinished group.
+///
+/// The run gets a FRESH upgrade id: nodes refuse to re-attempt an id they
+/// already reverted (the crash-loop-forever guard), so a retry must look
+/// like a new run to them.
 pub fn resume(mut state: ClusterUpgradeState) -> ClusterUpgradeState {
     if !matches!(state.phase, ClusterUpgradePhase::Paused { .. }) {
         return state;
     }
+    state.upgrade_id = format!("{}-retry", state.upgrade_id);
     for record in &mut state.nodes {
         if matches!(record.phase, NodeUpgradePhase::Failed { .. }) {
             record.phase = NodeUpgradePhase::Pending;
@@ -424,6 +453,14 @@ impl NodeControl for HttpNodeControl {
         let value: serde_json::Value = version_response.json().await.ok()?;
         let version: BinaryVersion = value["version"].as_str()?.parse().ok()?;
         let upgrade_in_flight = value["upgrade_in_flight"].as_bool().unwrap_or(false);
+        let failed_upgrade_ids = value["failed_upgrade_ids"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let healthy = matches!(
             self.client
@@ -437,6 +474,7 @@ impl NodeControl for HttpNodeControl {
             version,
             healthy,
             upgrade_in_flight,
+            failed_upgrade_ids,
         })
     }
 
@@ -573,6 +611,14 @@ pub async fn run_orchestrator(
                 "bun: cluster upgrade {} to {} complete",
                 next.upgrade_id, next.target_version
             );
+            // Persist the FINAL state before clearing, so the archived
+            // history entry shows the completed walk (every node Healthy),
+            // not whatever mid-walk snapshot Raft last saw.
+            let _ = council
+                .write(RaftRequest::UpgradeUpdate {
+                    state: Box::new(next.clone()),
+                })
+                .await;
             let _ = council
                 .write(RaftRequest::UpgradeClear {
                     upgrade_id: next.upgrade_id.clone(),
@@ -623,6 +669,19 @@ mod tests {
                     version: v(version),
                     healthy,
                     upgrade_in_flight: in_flight,
+                    failed_upgrade_ids: Vec::new(),
+                },
+            );
+        }
+
+        fn set_failed(&self, address: &str, version: &str, failed_id: &str) {
+            self.nodes.lock().unwrap().insert(
+                address.to_string(),
+                NodeProbe {
+                    version: v(version),
+                    healthy: true,
+                    upgrade_in_flight: false,
+                    failed_upgrade_ids: vec![failed_id.to_string()],
                 },
             );
         }
@@ -920,6 +979,50 @@ mod tests {
         assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Directed);
         assert_eq!(*control.rollbacks.lock().unwrap(), vec!["addr-w1"]);
         assert!(control.directed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_reported_revert_marks_failed_and_pauses() {
+        let control = MockControl::default();
+        // The node is back, healthy, on the old version — and its history
+        // says it reverted OUR upgrade id (even though the leader only
+        // ever saw it as Directed; the crash loop was too fast to observe).
+        control.set_failed("addr-w1", "0.1.0", "up-1");
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Directed)],
+            1,
+        );
+
+        let state = step(state, &control, &context()).await;
+
+        assert!(matches!(
+            state.nodes[0].phase,
+            NodeUpgradePhase::Failed { .. }
+        ));
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_issues_a_fresh_attempt_id() {
+        let mut state = cluster_state(
+            vec![record(
+                "w1",
+                NodeRole::Worker,
+                NodeUpgradePhase::Failed {
+                    reason: "boom".to_string(),
+                },
+            )],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::Paused {
+            reason: "boom".to_string(),
+        };
+
+        let resumed = resume(state);
+
+        // Nodes refuse ids they already reverted, so the retry must not
+        // reuse the old one.
+        assert_eq!(resumed.upgrade_id, "up-1-retry");
     }
 
     #[tokio::test]
