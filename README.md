@@ -107,7 +107,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,695 tests across 11 completed phases** (plus 10 Lima-gated eBPF integration tests run in the dev VM), including the Stage 4 wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the eBPF data path (service discovery + egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist.
+**1,703 tests across 11 completed phases** (plus 12 Lima-gated eBPF integration tests run in the dev VM), including the Phase 11b review-and-wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the full eBPF data path (service discovery, kernel connect-rewrite, network fault injection, and egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist and the [branch PR summary](docs/pr-stage-4.md).
 
 | Phase | Status | Tests |
 |-------|--------|-------|
