@@ -29,6 +29,7 @@ pub struct NodeConfig {
     #[serde(default)]
     pub gitops: Option<crate::lettuce::types::GitOpsConfig>,
     pub ingress: IngressSection,
+    pub dns: DnsSection,
     // TODO(Phase 14): upgrades section
 }
 
@@ -47,6 +48,58 @@ impl NodeConfig {
             }
         })?;
         Self::parse(&content)
+    }
+}
+
+/// DNS responder configuration.
+///
+/// Disabled by default: the standard listen address is `127.0.0.53:53`
+/// and binding port 53 needs root, so it must be an explicit choice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsSection {
+    /// Start the `.internal` DNS responder on this node.
+    pub enabled: bool,
+    /// Listen address, e.g. "127.0.0.53:53".
+    pub listen: String,
+    /// Upstream resolver for non-`.internal` names.
+    pub upstream: String,
+}
+
+impl Default for DnsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.53:53".to_string(),
+            upstream: "8.8.8.8:53".to_string(),
+        }
+    }
+}
+
+impl DnsSection {
+    /// Convert into the Onion DNS responder's config type.
+    ///
+    /// Fails when the listen or upstream addresses don't parse.
+    pub fn to_dns_config(&self) -> Result<crate::onion::dns::DnsConfig, super::error::ConfigError> {
+        let listen_addr =
+            self.listen
+                .parse()
+                .map_err(|_| super::error::ConfigError::InvalidValue {
+                    field: "dns.listen".to_string(),
+                    value: self.listen.clone(),
+                })?;
+        let upstream =
+            self.upstream
+                .parse()
+                .map_err(|_| super::error::ConfigError::InvalidValue {
+                    field: "dns.upstream".to_string(),
+                    value: self.upstream.clone(),
+                })?;
+        Ok(crate::onion::dns::DnsConfig {
+            listen_addr,
+            upstream,
+            upstream_timeout: std::time::Duration::from_secs(2),
+        })
     }
 }
 

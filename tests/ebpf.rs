@@ -356,11 +356,9 @@ async fn dns_responder_resolves_internal_name() {
         return;
     }
 
-    let svc_map = Arc::new(RwLock::new(ServiceMap::new()));
-    {
-        let mut map = svc_map.write().await;
-        map.register_app("redis", "default", 6379, None).unwrap();
-    }
+    let mut map = ServiceMap::new();
+    map.register_app("redis", "default", 6379, None).unwrap();
+    let (_map_tx, map_rx) = tokio::sync::watch::channel(map);
 
     let shutdown = CancellationToken::new();
 
@@ -368,12 +366,12 @@ async fn dns_responder_resolves_internal_name() {
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
         upstream: "8.8.8.8:53".parse().unwrap(),
+        upstream_timeout: Duration::from_secs(2),
     };
 
-    let map_clone = svc_map.clone();
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        let _ = reliaburger::onion::dns::run_dns_responder(config, map_clone, shutdown_clone).await;
+        let _ = reliaburger::onion::dns::run_dns_responder(config, map_rx, shutdown_clone).await;
     });
 
     // Give the responder a moment to bind
@@ -410,19 +408,19 @@ async fn dns_responder_non_internal_times_out() {
         return;
     }
 
-    let svc_map = Arc::new(RwLock::new(ServiceMap::new()));
+    let (_map_tx, map_rx) = tokio::sync::watch::channel(ServiceMap::new());
     let shutdown = CancellationToken::new();
 
     // Point upstream at a non-existent resolver so forwarding times out
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
         upstream: "192.0.2.1:53".parse().unwrap(), // TEST-NET, unreachable
+        upstream_timeout: Duration::from_millis(500),
     };
 
-    let map_clone = svc_map.clone();
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        let _ = reliaburger::onion::dns::run_dns_responder(config, map_clone, shutdown_clone).await;
+        let _ = reliaburger::onion::dns::run_dns_responder(config, map_rx, shutdown_clone).await;
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -432,13 +430,15 @@ async fn dns_responder_non_internal_times_out() {
     socket.send_to(&query, "127.0.0.1:15354").await.unwrap();
 
     let mut buf = [0u8; 512];
-    let result = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
+    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+        .await
+        .expect("expected a SERVFAIL response, not silence")
+        .expect("recv failed");
 
-    // Should time out since upstream is unreachable
-    assert!(
-        result.is_err(),
-        "non-.internal query should not be answered locally"
-    );
+    // M8 hardening: an unreachable upstream now yields SERVFAIL
+    // (RCODE 2) instead of leaving the client to time out.
+    assert_eq!(buf[3] & 0x0F, 2, "expected SERVFAIL for dead upstream");
+    assert!(len >= 12);
 
     shutdown.cancel();
 }

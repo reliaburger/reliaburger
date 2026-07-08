@@ -154,8 +154,29 @@ async fn main() -> anyhow::Result<()> {
         config.network.port_range.end,
     );
 
+    // Containers can only be pointed at the DNS responder when it
+    // listens on port 53 (resolv.conf has no port syntax) on an IPv4
+    // address; otherwise host DNS applies and we say so.
+    let container_nameserver = if config.dns.enabled {
+        match config.dns.to_dns_config()? {
+            c if c.listen_addr.port() == 53 => match c.listen_addr.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                std::net::IpAddr::V6(_) => None,
+            },
+            c => {
+                println!(
+                    "bun: dns listen {} is not port 53 — containers keep host DNS",
+                    c.listen_addr
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Select runtime
-    let runtime = select_runtime(&cli.runtime).await?;
+    let runtime = select_runtime(&cli.runtime, container_nameserver).await?;
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -230,6 +251,23 @@ async fn main() -> anyhow::Result<()> {
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
     let deploy_history = agent.deploy_history_handle();
+
+    // Onion DNS: start the .internal responder when [dns] enables it,
+    // resolving from the agent's service-map snapshots.
+    if config.dns.enabled {
+        let dns_config = config.dns.to_dns_config()?;
+        let service_map_rx = agent.service_map_watch();
+        let dns_shutdown = shutdown.clone();
+        println!("bun: dns responder on {}", dns_config.listen_addr);
+        tokio::spawn(async move {
+            if let Err(e) =
+                reliaburger::onion::dns::run_dns_responder(dns_config, service_map_rx, dns_shutdown)
+                    .await
+            {
+                eprintln!("bun: dns responder failed to bind: {e}");
+            }
+        });
+    }
 
     // Wrapper ingress: bind the HTTP(S) listeners when [ingress] enables
     // them, sharing the routing table the agent rebuilds on deploys.
@@ -660,7 +698,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
+async fn select_runtime(
+    name: &str,
+    dns_nameserver: Option<std::net::Ipv4Addr>,
+) -> anyhow::Result<AnyGrill> {
+    // Silence the unused warning on platforms without runc.
+    let _ = dns_nameserver;
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
@@ -702,12 +745,19 @@ async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
                 )
             };
 
-            Ok(AnyGrill::Runc(reliaburger::grill::runc::RuncGrill::new(
+            let mut grill = reliaburger::grill::runc::RuncGrill::new(
                 bundle_base,
                 image_store,
                 is_rootless,
                 state_dir,
-            )))
+            );
+            // Containers resolve .internal via the node's DNS responder;
+            // resolv.conf has no port syntax, so this only applies to
+            // port-53 listeners (checked by the caller).
+            if let Some(nameserver) = dns_nameserver {
+                grill = grill.with_dns_nameserver(nameserver);
+            }
+            Ok(AnyGrill::Runc(grill))
         }
         #[cfg(target_os = "macos")]
         "apple" => {

@@ -12,6 +12,11 @@ use super::vip::{VirtualIP, name_to_id};
 ///
 /// All mutations go through this struct's methods, which enforce
 /// invariants (max backends, unique instance IDs, etc.).
+///
+/// `Clone` exists so the agent can publish read-only snapshots over a
+/// `watch` channel; the DNS responder resolves from those snapshots
+/// without contending with the agent's event loop.
+#[derive(Clone)]
 pub struct ServiceMap {
     entries: HashMap<String, ServiceEntry>,
 }

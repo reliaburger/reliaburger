@@ -440,6 +440,24 @@ The DNS responder only handles UDP queries. DNS over TCP (used when responses ex
 
 This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
 
+### A DNS server that doesn't fall over
+
+The first version of the responder worked in the demo and would have been a disaster in production. It's worth listing what was wrong, because every one of these is a classic UDP server mistake:
+
+1. **One bad packet killed it.** The receive error propagated with `?` straight out of the serve loop. On UDP, `recv_from` can fail for reasons that have nothing to do with your socket — an ICMP port-unreachable from a previous send, for instance. One of those and every container on the node lost DNS until the next restart.
+2. **Forwarding was serial.** Upstream queries were awaited inline in the serve loop, on one shared socket. One slow upstream exchange meant every other query — including instant `.internal` lookups — queued behind it.
+3. **Replies weren't checked.** The shared upstream socket accepted a datagram from anyone, and whatever arrived first got relayed to the client. Classic cache-poisoning surface.
+4. **Unknown `.internal` names leaked upstream.** Ask for `secret-project.internal`, get no local match, and the query — internal service name and all — went to 8.8.8.8.
+5. **Every query type got an A record.** AAAA, MX, whatever: here's an IPv4 address. Resolvers get very confused by that.
+
+The hardened version fixes each in turn. Receive errors log and `continue` — the loop is never allowed to die. Public-name forwards spawn a task each (bounded by a `Semaphore` with 64 permits, so a query flood can't spawn unbounded tasks), and each forward uses a *fresh connected socket*: `connect` makes the kernel drop datagrams from any other source, and we additionally check the reply's transaction ID against the query's. A wrong-ID reply — a spoof or a stale packet — is ignored and the client eventually gets SERVFAIL, never the attacker's bytes.
+
+The responder is now properly authoritative for `.internal`: unknown names get NXDOMAIN locally and are never forwarded, AAAA on a known name gets an empty NOERROR ("the name exists, it just has no IPv6"), and unsupported types get NOTIMP. Not one internal byte reaches the upstream.
+
+The Rust-flavoured part is how the responder reads the service map. The agent *owns* its `ServiceMap` — it mutates it freely inside its event loop, no locks. Sharing it with the DNS task via `Arc<RwLock<…>>` would have meant threading lock acquisitions through dozens of agent call sites. Instead the agent publishes a *snapshot* on a `tokio::sync::watch` channel every time the map changes (the same moment it rebuilds the routing table). A watch channel holds exactly one value — the latest — and the responder reads it with `borrow()`, no await, no contention. The cost is a clone of the map per change; deploys are rare and maps are small, so that's a bargain for keeping the agent lock-free. Go programmers will recognise the shape: don't share memory, communicate — except here the borrow checker enforces it.
+
+Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`, written into the rootfs at create time when `[dns]` is enabled. One catch — `resolv.conf` has no port syntax, so this only works when the responder listens on port 53, and the listen address must be reachable from inside the container's network namespace (the node's bridge IP, not `127.0.0.53`). ProcessGrill and Apple Container workloads keep host DNS; they were never namespaced away from it in the first place.
+
 ### Testing service discovery
 
 How do you test code that runs in the kernel? Two approaches, at different levels of fidelity.

@@ -310,6 +310,8 @@ pub struct BunAgent<G: Grill> {
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Publisher for service-map snapshots (DNS responder subscribes).
+    service_map_tx: tokio::sync::watch::Sender<crate::onion::service_map::ServiceMap>,
     /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
@@ -356,6 +358,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            service_map_tx: tokio::sync::watch::channel(
+                crate::onion::service_map::ServiceMap::new(),
+            )
+            .0,
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
             )),
@@ -392,6 +398,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            service_map_tx: tokio::sync::watch::channel(
+                crate::onion::service_map::ServiceMap::new(),
+            )
+            .0,
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
             )),
@@ -440,6 +450,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
     ) -> Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>> {
         Arc::clone(&self.routing_table)
+    }
+
+    /// Subscribe to service-map snapshots.
+    ///
+    /// The agent publishes a snapshot whenever the map changes (same
+    /// cadence as routing-table rebuilds). The DNS responder resolves
+    /// `.internal` names from these snapshots.
+    pub fn service_map_watch(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::onion::service_map::ServiceMap> {
+        self.service_map_tx.subscribe()
     }
 
     /// Set the image trust policy (from node config). When it requires
@@ -2105,6 +2126,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn rebuild_routing_table(&self) {
         let mut table = self.routing_table.write().await;
         table.rebuild(&self.service_map, &self.ingress_configs);
+        drop(table);
+
+        // Publish a service-map snapshot for out-of-loop readers (DNS).
+        // send() only errs when no receiver exists, which is fine.
+        let _ = self.service_map_tx.send(self.service_map.clone());
     }
 
     /// Reconcile the perimeter firewall if cluster membership changed.
