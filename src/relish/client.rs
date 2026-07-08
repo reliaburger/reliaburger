@@ -1038,6 +1038,104 @@ impl BunClient {
             .unwrap_or("batch submitted")
             .to_string())
     }
+
+    // ---- self-upgrade (Phase 14) ----
+
+    /// The version the node reports (`GET /v1/version`).
+    pub async fn node_version(&self) -> Result<String, RelishError> {
+        let json = self.get_json("/v1/version").await?;
+        Ok(json["version"].as_str().unwrap_or("?").to_string())
+    }
+
+    /// Node-level upgrade status.
+    pub async fn upgrade_status(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/upgrade/status").await
+    }
+
+    /// Cluster-level upgrade state (errors when there is no council).
+    pub async fn upgrade_cluster(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/upgrade/cluster").await
+    }
+
+    /// Apply a node-level upgrade directive.
+    pub async fn upgrade_apply(
+        &self,
+        directive: &crate::upgrade::types::UpgradeDirective,
+    ) -> Result<(), RelishError> {
+        let body = serde_json::to_string(directive).map_err(RelishError::SerialiseJson)?;
+        self.post_json("/v1/upgrade/apply", body).await.map(|_| ())
+    }
+
+    /// Start a cluster-wide rolling upgrade (leader only).
+    pub async fn upgrade_start(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/upgrade/start", request.to_string())
+            .await
+    }
+
+    /// Start a cluster-wide rolling rollback (leader only).
+    pub async fn upgrade_cluster_rollback(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/upgrade/cluster-rollback", request.to_string())
+            .await
+    }
+
+    /// Roll this node back to a previous binary version.
+    pub async fn upgrade_node_rollback(&self, version: Option<&str>) -> Result<(), RelishError> {
+        let body = match version {
+            Some(version) => serde_json::json!({ "version": version }).to_string(),
+            None => String::new(),
+        };
+        self.post_json("/v1/upgrade/rollback", body)
+            .await
+            .map(|_| ())
+    }
+
+    /// Un-pause a paused cluster upgrade (leader only).
+    pub async fn upgrade_resume(&self) -> Result<(), RelishError> {
+        self.post_json("/v1/upgrade/resume", String::new())
+            .await
+            .map(|_| ())
+    }
+
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}{path}", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })
+    }
+
+    async fn post_json(&self, path: &str, body: String) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}{path}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response
+            .json()
+            .await
+            .or_else(|_| Ok(serde_json::Value::Null))
+    }
 }
 
 #[cfg(test)]

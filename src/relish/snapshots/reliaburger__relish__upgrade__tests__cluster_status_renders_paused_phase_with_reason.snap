@@ -1,0 +1,7 @@
+---
+source: src/relish/upgrade.rs
+assertion_line: 602
+expression: render_cluster_status(&cluster)
+---
+upgrade up-1 to v0.2.0 — phase: Paused (node n2 reverted to v0.1.0)
+NODE                 ROLE       PHASE        FROM

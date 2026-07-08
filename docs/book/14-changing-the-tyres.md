@@ -565,3 +565,41 @@ openraft 0.9 has no `transfer_leader`. What it does have is `Raft::trigger().ele
 `POST /v1/upgrade/start` (admin, leader): the full plan — target version, hashes and signatures, `parallel`, the registry address nodes should fetch from, and the explicit node list with roles. Explicit, because deriving API addresses from gossip is one of the wiring seams this phase doesn't own (gossip knows gossip ports); relish builds the list, and the integration tests pass ports that only the test knows. `GET /v1/upgrade/cluster` reads the replicated state from any node. `resume` and `cluster-rollback` do what they say — rollback runs the same walk with `direct_rollback` directives and no distribution step, since every node still has the previous binary on disk (§14.3's retention earning its keep).
 
 `cargo test --lib upgrade::orchestrator`. Next: the operator's steering wheel — `relish upgrade`.
+
+## 14.10 Driving it from relish
+
+Everything so far is machinery an operator never touches directly. The interface is six subcommands, and the design goal for all of them is the same: an upgrade is a scary operation, so the CLI should make the state of the world *legible* at every step.
+
+```
+relish upgrade check                   # anything newer than what I'm running?
+relish upgrade plan v0.2.0             # what would happen, in what order?
+relish upgrade start v0.2.0            # do it (network)
+relish upgrade start --binary ./bun-v0.2.0   # do it (air-gapped)
+relish upgrade status                  # where are we?
+relish upgrade rollback v0.1.0         # undo it
+relish upgrade resume                  # carry on after a pause
+```
+
+`check` fetches the **release metadata** — a static JSON file listing versions and per-platform artefacts (`{os}-{arch}` keys from `std::env::consts`, so the binary knows its own platform). The metadata is served over HTTPS but deliberately *not* signed: it can at worst advertise versions that don't exist, because nothing executes without the per-binary dual signatures from §14.2. Signing the metadata (TUF-style freshness guarantees) is real hardening we consciously deferred; the trust anchor is the binary signature, full stop.
+
+`start` has two personalities. The network flow downloads the artefact, checks its hash against the metadata, and takes the signatures from the metadata entry. The air-gapped flow reads a local file and its `.sig` envelope. Either way relish then asks the connected node a question that shapes everything after: *are you a cluster?* (`GET /v1/upgrade/cluster` answers 503 on a single node.) Single node → build a `LocalFile` directive and POST it straight to §14.6's node-level endpoint. Cluster → push the binary as a content-addressed blob to the leader's Pickle registry (a plain monolithic Distribution-API upload — the same registry that serves container images happily serves *our own* binary, which has a pleasing circularity), then POST the plan to `/v1/upgrade/start` and let the orchestrator walk.
+
+Notice what relish deliberately does **not** do: verify the signatures itself. It could — it embeds the same release keys — but the nodes *must* verify regardless (relish is outside their trust boundary), and a relish-side check would give integration tests signed with throwaway keys a false failure. One verification, in the place that matters.
+
+One wart, worn openly: the start request needs each node's *API* address, and gossip only advertises gossip addresses. relish derives `gossip-ip:9117` (the default API port) and offers `--node-address id=host:port` overrides for anything unusual. The honest fix — nodes advertising their API port through gossip — is queued behind the membership wire-format freeze from §14.8.
+
+`plan` and `status` are the legibility half. Both are pure functions from data to a string, which makes them perfect **snapshot test** material — `insta::assert_snapshot!(render_plan("v0.2.0", 5, 2, 1, 2))` stores the rendered output in a `.snap` file under version control, and any change to the wording shows up as a reviewable diff instead of a broken `assert_eq` on a multi-line string literal. (First time we've used insta in this book: the workflow is run the test, eyeball the generated `.snap.new`, accept it. The eyeballing is the point — ours caught a single-node plan promising a "leadership transfer" with nobody to transfer to.)
+
+```
+$ relish upgrade plan v0.2.0 --cluster-size 8 --parallel 2
+upgrade plan to v0.2.0 (8 node(s))
+  1. workers: 5 node(s) in 3 batch(es) of up to 2
+  2. council members: 2 node(s), strictly one at a time
+  3. leadership transfer, then the former leader
+estimated duration: ~5 min (assuming 45s per node)
+workloads keep running throughout (adoption across exec)
+```
+
+`rollback` mirrors `start`'s cluster/single-node split, with one asymmetry worth explaining: on a single node the version is optional (the node knows its own previous version — §14.6 defaults to the newest installed version older than the running one), but a *cluster* rollback demands an explicit version, because the leader has no single answer to "previous" across a fleet that may have been paused mid-upgrade. Forcing the operator to name the target is friction in exactly the place friction belongs.
+
+Tests: the render functions and address/role derivation under `cargo test --lib relish::upgrade`, metadata parsing under `upgrade::metadata`. Next, the dress rehearsal: a real multi-node cluster upgrading itself end to end.

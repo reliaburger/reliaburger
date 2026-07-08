@@ -59,6 +59,10 @@ pub enum UpgradeError {
     #[error("failed to fetch binary from {url}: {reason}")]
     FetchFailed { url: String, reason: String },
 
+    /// Release metadata was unreadable or malformed.
+    #[error("invalid release metadata: {reason}")]
+    InvalidMetadata { reason: String },
+
     /// `execv` of the new binary failed.
     #[error("exec failed: {reason}")]
     ExecFailed { reason: String },

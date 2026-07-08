@@ -235,6 +235,68 @@ enum Command {
         #[command(subcommand)]
         action: DevAction,
     },
+    /// Rolling binary upgrades (Phase 14).
+    Upgrade {
+        #[command(subcommand)]
+        action: UpgradeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpgradeAction {
+    /// Check for available updates.
+    Check {
+        /// Release metadata URL.
+        #[arg(long, default_value = reliaburger::relish::upgrade::DEFAULT_RELEASE_URL)]
+        url: String,
+    },
+    /// Start a rolling upgrade (network: pass a version; air-gapped:
+    /// pass --binary).
+    Start {
+        /// Target version, e.g. v0.2.0 (downloads via the release metadata).
+        version: Option<String>,
+        /// Local binary to upgrade from instead (expects {path}.sig).
+        #[arg(long)]
+        binary: Option<std::path::PathBuf>,
+        /// Signature envelope path (default: {binary}.sig).
+        #[arg(long)]
+        sig: Option<std::path::PathBuf>,
+        /// Worker upgrade parallelism.
+        #[arg(long, default_value = "1")]
+        parallel: u32,
+        /// The leader's Pickle registry nodes fetch from (host:port).
+        #[arg(long)]
+        registry: Option<String>,
+        /// Release metadata URL.
+        #[arg(long, default_value = reliaburger::relish::upgrade::DEFAULT_RELEASE_URL)]
+        url: String,
+        /// Per-node API address override, node_id=host:port (repeatable).
+        #[arg(long = "node-address")]
+        node_addresses: Vec<String>,
+    },
+    /// Preview the rolling order and estimated duration.
+    Plan {
+        /// Target version (display only).
+        version: String,
+        /// Plan for a hypothetical cluster of this size instead of the
+        /// live one.
+        #[arg(long)]
+        cluster_size: Option<usize>,
+        /// Worker upgrade parallelism.
+        #[arg(long, default_value = "1")]
+        parallel: u32,
+    },
+    /// Show upgrade progress.
+    Status,
+    /// Roll back to a previous version (cluster: version required).
+    Rollback {
+        version: Option<String>,
+        /// Per-node API address override, node_id=host:port (repeatable).
+        #[arg(long = "node-address")]
+        node_addresses: Vec<String>,
+    },
+    /// Resume a paused upgrade.
+    Resume,
 }
 
 #[derive(Subcommand)]
@@ -753,6 +815,51 @@ async fn main() -> ExitCode {
                 out.as_deref(),
             ),
         },
+        Command::Upgrade { action } => {
+            let client = reliaburger::relish::client::BunClient::default_local();
+            match action {
+                UpgradeAction::Check { url } => {
+                    reliaburger::relish::upgrade::check(&client, &url).await
+                }
+                UpgradeAction::Start {
+                    version,
+                    binary,
+                    sig,
+                    parallel,
+                    registry,
+                    url,
+                    node_addresses,
+                } => {
+                    reliaburger::relish::upgrade::start(
+                        &client,
+                        reliaburger::relish::upgrade::StartArgs {
+                            version,
+                            binary,
+                            sig,
+                            parallel,
+                            registry,
+                            metadata_url: url,
+                            node_addresses,
+                        },
+                    )
+                    .await
+                }
+                UpgradeAction::Plan {
+                    version,
+                    cluster_size,
+                    parallel,
+                } => {
+                    reliaburger::relish::upgrade::plan(&client, &version, cluster_size, parallel)
+                        .await
+                }
+                UpgradeAction::Status => reliaburger::relish::upgrade::status(&client).await,
+                UpgradeAction::Rollback {
+                    version,
+                    node_addresses,
+                } => reliaburger::relish::upgrade::rollback(&client, version, node_addresses).await,
+                UpgradeAction::Resume => reliaburger::relish::upgrade::resume(&client).await,
+            }
+        }
     };
 
     match result {

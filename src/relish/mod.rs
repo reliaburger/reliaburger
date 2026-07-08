@@ -27,6 +27,7 @@ pub mod k8s_export;
 pub mod k8s_import;
 pub mod output;
 pub mod plan;
+pub mod upgrade;
 
 pub use output::OutputFormat;
 pub use plan::{ApplyPlan, PlanAction, PlanEntry};
