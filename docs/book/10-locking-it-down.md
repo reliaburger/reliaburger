@@ -423,6 +423,18 @@ We added an async re-resolution function that uses `tokio::net::lookup_host()` i
 
 The key difference from the sync version: it doesn't block the tokio runtime, so it can run alongside health checks and identity rotation without stalling the event loop.
 
+### Actually enforcing it
+
+For a long time that resolution went nowhere. The parser worked, the async re-resolver worked, `egress_to_bpf_entries` built the map entries — but nothing wrote them to the kernel, so `[egress] allow = […]` was a comment. Wiring it in raises one genuinely new problem: **which cgroup?**
+
+The eBPF `connect4` hook, when it sees a non-VIP destination, asks `bpf_get_current_cgroup_id()` — the cgroup of whichever process is calling `connect()` — and looks that id up in `egress_enabled_map`. If enforcement is on for that cgroup, the destination must be present in `egress_map` or the connection is refused. So the userspace side has to know each instance's cgroup id, and it has to be *the same number the kernel will produce*.
+
+On cgroup v2 that number is the inode of the instance's cgroup directory. We read `/proc/<pid>/cgroup` — the `0::<path>` line is the v2 path — join it under `/sys/fs/cgroup`, and `stat` the directory. Its `st_ino` is exactly what `bpf_get_current_cgroup_id()` returns. (This is our first time reaching for `MetadataExt::ino()` — the Unix-specific extension trait that exposes the raw inode number that portable `std::fs::Metadata` hides.)
+
+The rest is bookkeeping. When an instance reaches Running, the agent resolves its cgroup id, resolves the allowlist (DNS off the event loop via `spawn_blocking`), writes an `egress_map` entry per destination, and flips `egress_enabled_map` for the cgroup. When the instance stops, it clears the enable flag. Because each instance gets a fresh cgroup with a unique inode, we don't even need to scrub the individual allow entries on stop — with nothing enforcing against that cgroup id, they're inert, and a future instance gets a different id.
+
+Two honesty notes. First, this is eBPF-only: a build without the feature, or a non-Linux host, warns loudly that `[egress]` is *not* being enforced rather than silently allowing everything (that was deliberate — see the deferred-nftables discussion below). Second, verifying it needs the kernel. The `egress_denied_by_default_allowed_when_listed` test in `tests/ebpf.rs` runs in the Lima VM: it loads the real program, allows a single `127.0.0.1:port` for the *test's own* cgroup (the process doing the connecting, so the ids line up), and asserts the listed port connects while an unlisted one is refused with `EPERM`. As with the connect rewrite in Chapter 3, `EPERM` — not `ECONNREFUSED` — is what a BPF `return 0` becomes.
+
 ## What we learned
 
 **A JWT is three base64url segments, not a dependency.** We minted OIDC tokens in about 30 lines using `ring` (which we already had for Ed25519) and `base64`. Pulling in a JWT crate would have added a dependency and its transitive tree to encode `header.claims.signature`. When the format is this simple and you already own the crypto, write the 30 lines.

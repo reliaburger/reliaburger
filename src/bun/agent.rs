@@ -328,6 +328,10 @@ pub struct BunAgent<G: Grill> {
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(feature = "ebpf")]
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
+    /// Cgroup id programmed into the egress maps for each instance with an
+    /// egress allowlist, so enforcement can be lifted when it stops (L16).
+    #[cfg(feature = "ebpf")]
+    egress_cgroups: std::collections::HashMap<InstanceId, u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Publisher for service-map snapshots (DNS responder subscribes).
@@ -386,6 +390,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
+            #[cfg(feature = "ebpf")]
+            egress_cgroups: std::collections::HashMap::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -429,6 +435,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
+            #[cfg(feature = "ebpf")]
+            egress_cgroups: std::collections::HashMap::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -1314,17 +1322,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Delete a BPF map entry for a cleared or expired fault.
     fn delete_fault_bpf_entry(&mut self, _rule: &crate::smoker::types::FaultRule) {
         #[cfg(feature = "ebpf")]
-        if let Some(ref ebpf_handle) = self.onion_ebpf {
-            if _rule.fault_type.requires_ebpf() {
-                let rt = tokio::runtime::Handle::current();
-                let ebpf = ebpf_handle.clone();
-                let rule_type = format!("{}", _rule.fault_type);
-                rt.spawn(async move {
-                    let mut ebpf = ebpf.lock().await;
-                    eprintln!("smoker: deleting BPF entry for {rule_type}");
-                    let _ = &mut *ebpf;
-                });
-            }
+        if let Some(ref ebpf_handle) = self.onion_ebpf
+            && _rule.fault_type.requires_ebpf()
+        {
+            let rt = tokio::runtime::Handle::current();
+            let ebpf = ebpf_handle.clone();
+            let rule_type = format!("{}", _rule.fault_type);
+            rt.spawn(async move {
+                let mut ebpf = ebpf.lock().await;
+                eprintln!("smoker: deleting BPF entry for {rule_type}");
+                let _ = &mut *ebpf;
+            });
         }
         #[cfg(not(feature = "ebpf"))]
         if _rule.fault_type.requires_ebpf() {
@@ -2098,8 +2106,110 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = self.service_map.add_backend(app_name, backend);
         }
 
+        // L16: program the egress allowlist for this instance's cgroup.
+        self.apply_egress(instance_id, spec).await;
+
         Ok(())
     }
+
+    /// Program an instance's egress allowlist into the eBPF maps (L16).
+    ///
+    /// With an `[egress] allow` list, only the listed destinations are
+    /// permitted from the instance's cgroup; everything else is denied at
+    /// the kernel. A no-op without an allowlist (all egress permitted) or
+    /// when the eBPF data path isn't loaded — in which case it warns, per
+    /// the default-deny-is-unenforced contract, rather than pretending.
+    #[cfg(feature = "ebpf")]
+    async fn apply_egress(&mut self, instance_id: &InstanceId, spec: &AppSpec) {
+        let Some(egress) = spec.egress.as_ref().filter(|e| !e.allow.is_empty()) else {
+            return;
+        };
+
+        let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
+            return;
+        };
+        let Some(cgroup_id) = crate::sesame::egress::cgroup_id_of_pid(pid) else {
+            eprintln!(
+                "sesame: could not resolve cgroup for {}; egress unenforced",
+                instance_id.0
+            );
+            return;
+        };
+
+        // DNS resolution can block — do it off the event loop.
+        let allow = egress.allow.clone();
+        let resolved = match tokio::task::spawn_blocking(move || {
+            crate::sesame::egress::resolve_egress_entries(&allow)
+        })
+        .await
+        {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "sesame: egress resolution failed for {}: {e}",
+                    instance_id.0
+                );
+                return;
+            }
+            Err(_) => return,
+        };
+
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            eprintln!(
+                "sesame: [egress] set for {} but eBPF is not loaded; egress is NOT enforced",
+                instance_id.0
+            );
+            return;
+        };
+
+        let entries = crate::sesame::egress::egress_to_bpf_entries(&[cgroup_id], &resolved);
+        let mut ebpf = handle.lock().await;
+        for (key, value) in entries {
+            if let Err(e) = crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value) {
+                eprintln!("sesame: egress map write failed for {}: {e}", instance_id.0);
+                return;
+            }
+        }
+        if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
+            eprintln!(
+                "sesame: enabling egress enforcement failed for {}: {e}",
+                instance_id.0
+            );
+            return;
+        }
+        drop(ebpf);
+        self.egress_cgroups.insert(instance_id.clone(), cgroup_id);
+    }
+
+    /// Egress enforcement is a no-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn apply_egress(&mut self, _instance_id: &InstanceId, spec: &AppSpec) {
+        if spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty()) {
+            eprintln!(
+                "sesame: [egress] configured but this build has no eBPF support; egress is NOT enforced"
+            );
+        }
+    }
+
+    /// Lift egress enforcement for a stopped instance's cgroup (L16).
+    ///
+    /// Enforcement is keyed by the cgroup id, which is unique per
+    /// instance, so clearing the enable flag is enough; stale allow
+    /// entries become inert once nothing enforces against them.
+    #[cfg(feature = "ebpf")]
+    async fn clear_egress(&mut self, instance_id: &InstanceId) {
+        let Some(cgroup_id) = self.egress_cgroups.remove(instance_id) else {
+            return;
+        };
+        if let Some(handle) = self.onion_ebpf.as_ref() {
+            let mut ebpf = handle.lock().await;
+            let _ = crate::sesame::egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id);
+        }
+    }
+
+    /// No-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
 
     /// Drive a job instance through startup: Pending → Preparing → Starting → Running.
     ///
@@ -2506,6 +2616,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Remove backends and unregister from the service map
         for id in &instances {
             let _ = self.service_map.remove_backend(app_name, &id.0);
+            self.clear_egress(id).await;
         }
         let _ = self.service_map.unregister_app(app_name);
         self.ingress_configs.remove(app_name);

@@ -344,6 +344,81 @@ async fn ebpf_connect_non_vip_passes_through() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 2b: Egress allowlist (L16)
+// ---------------------------------------------------------------------------
+
+/// With egress enforcement on for a cgroup, a listed destination is
+/// reachable and every other destination is denied (EPERM). We enforce
+/// on the *test's own* cgroup — the process doing the connects — so the
+/// eBPF `bpf_get_current_cgroup_id()` matches what we program.
+#[tokio::test]
+async fn egress_denied_by_default_allowed_when_listed() {
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // Two real listeners: one we'll allow, one we won't.
+    let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let allowed_port = allowed.local_addr().unwrap().port();
+    let denied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let denied_port = denied.local_addr().unwrap().port();
+
+    let cgroup_id =
+        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+
+    // Allow only 127.0.0.1:allowed_port for our cgroup, then enforce.
+    let key = EgressKey {
+        src_cgroup_id: cgroup_id,
+        dst_ip: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+        dst_port: allowed_port.to_be(),
+        _pad: 0,
+    };
+    egress::write_egress_entry(
+        &mut ebpf.bpf,
+        key,
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .expect("write egress entry");
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable egress enforcement");
+
+    // The allowed destination connects.
+    let ok = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), allowed_port),
+        Duration::from_secs(2),
+    );
+    assert!(
+        ok.is_ok(),
+        "listed egress destination should connect: {ok:?}"
+    );
+
+    // The unlisted destination is denied with EPERM (BPF returns 0).
+    let blocked = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port),
+        Duration::from_secs(2),
+    );
+    assert!(
+        matches!(
+            blocked.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "unlisted egress destination should be denied with EPERM, got {blocked:?}"
+    );
+
+    // Lift enforcement so the harness's own connections are unaffected.
+    egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("clear enforcement");
+    ebpf.detach();
+}
+
+// ---------------------------------------------------------------------------
 // Tier 3: DNS responder
 // ---------------------------------------------------------------------------
 
