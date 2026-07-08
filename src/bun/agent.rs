@@ -1242,6 +1242,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         completed_at: SystemTime::now(),
                         steps_completed: 0,
                         steps_total: replica_count as usize,
+                        spec: Some(Box::new(spec.clone())),
                     };
                     self.deploy_history.write().await.push(entry);
                     let _ = events
@@ -1357,6 +1358,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     completed_at: SystemTime::now(),
                     steps_completed: new_ids.len(),
                     steps_total: new_ids.len(),
+                    spec: Some(Box::new(spec.clone())),
                 };
                 self.deploy_history.write().await.push(entry);
 
@@ -1434,6 +1436,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     })
                     .await;
             }
+
+            // Record the fresh deploy in history so `relish rollback`
+            // has a previous version to return to (this path recorded
+            // nothing before, so the first deploy was invisible).
+            let entry = crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
+                app_id: crate::meat::types::AppId::new(app_name, namespace),
+                image: spec.image.clone().unwrap_or_default(),
+                result: crate::meat::deploy_types::DeployResult::Completed,
+                created_at: SystemTime::now(),
+                completed_at: SystemTime::now(),
+                steps_completed: ids.len(),
+                steps_total: ids.len(),
+                spec: Some(Box::new(spec.clone())),
+            };
+            self.deploy_history.write().await.push(entry);
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }

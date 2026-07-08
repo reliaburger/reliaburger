@@ -959,6 +959,7 @@ mod tests {
             completed_at: std::time::SystemTime::UNIX_EPOCH,
             steps_completed: 3,
             steps_total: 3,
+            spec: None,
         }
     }
 

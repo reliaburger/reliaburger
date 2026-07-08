@@ -389,6 +389,11 @@ pub struct DeployHistoryEntry {
     pub completed_at: SystemTime,
     pub steps_completed: usize,
     pub steps_total: usize,
+    /// The full app spec deployed, so `relish rollback` can re-apply a
+    /// previous version. `None` for entries from paths that don't carry
+    /// the spec (e.g. `from_state`, and pre-X3 history).
+    #[serde(default)]
+    pub spec: Option<Box<crate::config::app::AppSpec>>,
 }
 
 impl DeployHistoryEntry {
@@ -416,6 +421,7 @@ impl DeployHistoryEntry {
             completed_at: state.phase_changed_at,
             steps_completed: completed,
             steps_total: state.steps.len(),
+            spec: None,
         }
     }
 }

@@ -32,6 +32,7 @@ impl TestHarness {
         let port_allocator = PortAllocator::new(40000, 41000);
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let deploy_history = agent.deploy_history_handle();
 
         tokio::spawn(async move {
             agent.run().await;
@@ -44,7 +45,7 @@ impl TestHarness {
             cmd_tx.clone(),
             None,
             None,
-            None,
+            Some(deploy_history),
             None,
             None,
             None,
@@ -692,4 +693,109 @@ async fn volume_config_deploys_successfully() {
     let statuses = harness.client.status().await.unwrap();
     assert_eq!(statuses[0].app_name, "volapp");
     assert_eq!(statuses[0].state, "running");
+}
+
+/// X3 regression: `relish rollback` used to only print advice. The
+/// server now redeploys the previous successful spec, and the deploy
+/// history carries the spec needed to do so.
+#[tokio::test]
+async fn rollback_redeploys_the_previous_spec() {
+    let harness = TestHarness::start().await;
+    let http = reqwest::Client::new();
+
+    // Deploy v1, then v2 (a redeploy of the same app, new command).
+    let v1 = Config::parse(
+        r#"
+        [app.svc]
+        image = "test:v1"
+        command = ["sh", "-c", "echo VERSION-ONE; sleep 300"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&v1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let v2 = Config::parse(
+        r#"
+        [app.svc]
+        image = "test:v2"
+        command = ["sh", "-c", "echo VERSION-TWO; sleep 300"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&v2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // History should hold both, with specs attached.
+    let history: serde_json::Value = http
+        .get(format!(
+            "{}/v1/deploys/history/svc",
+            harness.client.base_url()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = history["history"].as_array().unwrap();
+    assert!(entries.len() >= 2, "expected v1 + v2 in history");
+    assert!(
+        entries.iter().all(|e| e["spec"].is_object()),
+        "history entries must carry the spec for rollback"
+    );
+
+    // Roll back: redeploys v1's spec (test:v1).
+    harness.client.rollback("svc", "default").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The newest history entry is now v1 again.
+    let history: serde_json::Value = http
+        .get(format!(
+            "{}/v1/deploys/history/svc",
+            harness.client.base_url()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = history["history"].as_array().unwrap();
+    let newest = entries.last().unwrap();
+    assert_eq!(
+        newest["image"].as_str(),
+        Some("test:v1"),
+        "rollback should have redeployed v1"
+    );
+}
+
+/// Rollback with no prior version is a clean 404, not a panic.
+#[tokio::test]
+async fn rollback_without_history_returns_not_found() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.only]
+        image = "test:v1"
+        command = ["sleep", "300"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Only one deploy: nothing to roll back to.
+    let err = harness
+        .client
+        .rollback("only", "default")
+        .await
+        .unwrap_err();
+    match err {
+        reliaburger::relish::RelishError::ApiError { status, .. } => {
+            assert_eq!(status, 404);
+        }
+        other => panic!("expected 404 ApiError, got {other:?}"),
+    }
 }

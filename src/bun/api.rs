@@ -187,6 +187,7 @@ pub fn router(
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
+        .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(batch_submit_handler))
@@ -1952,6 +1953,85 @@ async fn deploys_history_handler(
     let all = history.read().await;
     let filtered: Vec<&DeployHistoryEntry> = all.iter().filter(|e| e.app_id.name == app).collect();
     Json(serde_json::json!({"app": app, "history": filtered}))
+}
+
+/// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
+/// successful spec (X3).
+///
+/// "Previous" means the last-but-one distinct successful deploy: the
+/// most recent completed entry is the *current* version, so rollback
+/// targets the one before it. Re-applies through the same path as
+/// `apply` (Raft in cluster mode, local deploy otherwise).
+async fn rollback_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    let Some(history) = &state.deploy_history else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "deploy history unavailable"})),
+        )
+            .into_response();
+    };
+
+    // Successful deploys for this app, newest first, that carry a spec.
+    let target_spec = {
+        let all = history.read().await;
+        let mut successful: Vec<&DeployHistoryEntry> = all
+            .iter()
+            .filter(|e| {
+                e.app_id.name == app
+                    && e.app_id.namespace == namespace
+                    && e.result == crate::meat::deploy_types::DeployResult::Completed
+                    && e.spec.is_some()
+            })
+            .collect();
+        successful.reverse(); // newest first
+        // [0] is the current version; [1] is the rollback target.
+        successful.get(1).and_then(|e| e.spec.clone()).map(|s| *s)
+    };
+
+    let Some(spec) = target_spec else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no previous successful deploy to roll {app} back to")
+            })),
+        )
+            .into_response();
+    };
+
+    // Re-apply the previous spec through the standard deploy path.
+    let mut config = Config::default();
+    config.app.insert(app.clone(), spec);
+    let raw = toml::to_string(&config).unwrap_or_default();
+
+    if let Some(council) = &state.council {
+        return cluster_apply(state.clone(), Arc::clone(council), config, raw).await;
+    }
+
+    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    if state
+        .cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: event_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "agent unavailable"})),
+        )
+            .into_response();
+    }
+    let stream = ReceiverStream::new(event_rx).map(|e| {
+        Ok::<_, std::convert::Infallible>(
+            Event::default().data(serde_json::to_string(&e).unwrap_or_default()),
+        )
+    });
+    Sse::new(stream).into_response()
 }
 
 /// `GET /v1/images` — list images in the local Pickle registry.

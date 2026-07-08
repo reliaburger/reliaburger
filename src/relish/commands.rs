@@ -691,35 +691,10 @@ pub async fn history(app: &str) -> Result<(), RelishError> {
 pub async fn rollback(app: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
-
-    // Find the last successful deploy image from history
-    let url = format!("{}/v1/deploys/history/{app}", client.base_url());
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|_| RelishError::AgentUnreachable)?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| RelishError::ApiError {
-        status: 0,
-        body: e.to_string(),
-    })?;
-
-    let last_good = body["history"].as_array().and_then(|entries| {
-        entries
-            .iter()
-            .rev()
-            .find(|e| e["result"].as_str() == Some("Completed"))
-    });
-
-    match last_good {
-        Some(entry) => {
-            let image = entry["image"].as_str().unwrap_or("unknown");
-            println!("rollback {app} to image: {image}");
-            println!("(use `relish apply` with the previous config to rollback)");
-        }
-        None => {
-            println!("no successful deploy found in history for {app}");
-        }
-    }
-
+    // X3: rollback used to only print advice. It now calls the server,
+    // which redeploys the previous successful spec.
+    client.rollback(app, "default").await?;
+    println!("rolled {app} back to its previous version");
     Ok(())
 }
 

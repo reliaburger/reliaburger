@@ -259,6 +259,52 @@ impl BunClient {
         })
     }
 
+    /// Roll an app back to its previous successful spec (X3).
+    ///
+    /// The server streams deploy progress as SSE; we drain it, surfacing
+    /// any error, and return once the stream closes.
+    pub async fn rollback(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/rollback/{app}/{namespace}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(classify_error)?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(end) = buffer.find("\n\n") {
+                let event_text = buffer[..end].to_string();
+                buffer = buffer[end + 2..].to_string();
+                if let Some(data) = event_text.lines().find_map(|l| l.strip_prefix("data:"))
+                    && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
+                {
+                    match event {
+                        ApplyEvent::Progress { message } => eprintln!("  {message}"),
+                        ApplyEvent::Error { message } => {
+                            return Err(RelishError::ApiError {
+                                status: 500,
+                                body: message,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Get status of all instances.
     pub async fn status(&self) -> Result<Vec<InstanceStatus>, RelishError> {
         let url = format!("{}/v1/status", self.base_url);
