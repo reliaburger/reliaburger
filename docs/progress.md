@@ -299,7 +299,7 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
 
-- [ ] `L1` Scheduler → placement → remote dispatch (deploys currently always run on the local agent); fix `H8` spread weighting
+- [x] `L1` Scheduler → placement → remote dispatch: `relish apply` under `--cluster` commits `AppSpec`s to Raft (followers forward to the leader); a leader-only scheduler places replicas and commits `SchedulingDecision`s; every node polls `/v1/placements/{node}` and reconciles its instances (idempotent). `H8` fixed (spread weight 60 > bin-pack 50; test now asserts distinct nodes). Flushed out a latent bug: durable Raft log + council TCP RPC used bincode, which can't drive the config types' `deserialize_any` — both switched to self-describing JSON (matching the snapshot). Binary-driven test in `tests/placement.rs`
 - [ ] `L2` Production `DeployDriver` + orchestrator for rolling/blue-green
 - [ ] `L3` Spawn the autoscale loop
 - [ ] `L4` Invoke state reconstruction after leader election; consume `Correction`s

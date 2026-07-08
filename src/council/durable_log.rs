@@ -51,6 +51,15 @@ fn write_err<E: std::error::Error + 'static>(e: E) -> StorageError<u64> {
     StorageError::from(StorageIOError::write_logs(&e))
 }
 
+/// Decode a log entry from stored bytes.
+///
+/// Reads JSON (the current format); silently accepting the old bincode
+/// format is deliberately not attempted — the entry payloads it could
+/// hold (`AppSpec`) never round-tripped through bincode anyway.
+fn decode_entry(bytes: &[u8]) -> Result<Entry<TypeConfig>, StorageError<u64>> {
+    serde_json::from_slice(bytes).map_err(read_err)
+}
+
 impl DurableLogStore {
     /// Open (or create) a durable log store at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, redb::Error> {
@@ -120,7 +129,7 @@ impl DurableLogStore {
         let rtx = self.db.begin_read().map_err(read_err)?;
         let t = rtx.open_table(ENTRIES).map_err(read_err)?;
         match t.get(index).map_err(read_err)? {
-            Some(v) => Ok(Some(bincode::deserialize(v.value()).map_err(read_err)?)),
+            Some(v) => Ok(Some(decode_entry(v.value())?)),
             None => Ok(None),
         }
     }
@@ -138,7 +147,7 @@ impl DurableLogStore {
         let mut out = Vec::new();
         for row in t.range::<u64>(bounds).map_err(read_err)? {
             let (_, v) = row.map_err(read_err)?;
-            out.push(bincode::deserialize(v.value()).map_err(read_err)?);
+            out.push(decode_entry(v.value())?);
         }
         Ok(out)
     }
@@ -153,7 +162,14 @@ impl DurableLogStore {
         {
             let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
             for entry in entries {
-                let bytes = bincode::serialize(&entry).map_err(write_err)?;
+                // JSON, not bincode: log entries carry `RaftRequest`, whose
+                // `AppSpec` uses config types (`Replicas`, `ResourceRange`)
+                // with `deserialize_any` for TOML ergonomics. bincode is not
+                // self-describing and cannot drive `deserialize_any`, so it
+                // corrupts on read-back. The snapshot already uses JSON for
+                // the same reason. Votes/log-ids stay bincode — they're
+                // plain openraft numeric types.
+                let bytes = serde_json::to_vec(&entry).map_err(write_err)?;
                 t.insert(entry.log_id.index, bytes.as_slice())
                     .map_err(write_err)?;
             }

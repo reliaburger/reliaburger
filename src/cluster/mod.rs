@@ -13,4 +13,5 @@
 //! reporting tree are layered on in follow-up changes.
 
 pub mod identity;
+pub mod orchestrate;
 pub mod runtime;

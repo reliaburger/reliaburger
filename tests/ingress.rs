@@ -88,6 +88,8 @@ impl IngressHarness {
             None,
             None,
             None,
+            None,
+            9117,
         );
         let server_shutdown = shutdown.clone();
         tokio::spawn(async move {

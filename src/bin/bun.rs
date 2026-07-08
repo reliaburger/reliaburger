@@ -230,6 +230,18 @@ async fn main() -> anyhow::Result<()> {
     // forwarders into the LogStore (drained below, once the store exists).
     let (log_tx, mut log_rx) =
         tokio::sync::mpsc::channel::<reliaburger::ketchup::types::LogRecord>(1024);
+    let node_name = config
+        .node
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
+    let api_port: u16 = cli
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9117);
+
     let _cluster_runtime;
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
@@ -238,6 +250,12 @@ async fn main() -> anyhow::Result<()> {
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
     let mut replication_membership = None;
+    // Peer API addresses for cross-node fan-out and apply forwarding.
+    let mut api_membership: Option<Arc<RwLock<Vec<api::NodeMembershipInfo>>>> = None;
+    // Handles the orchestration tasks need, captured before the
+    // ClusterHandle moves into the agent (spawned further down, once
+    // the service token exists).
+    let mut orchestration = None;
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
@@ -251,11 +269,16 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
-        _cluster_runtime = Some(cluster_runtime);
         api_council = handle.council.clone();
         // Cloned before the handle moves into the agent: the pickle
         // replication loop derives its peer list from gossip.
         replication_membership = Some(handle.membership_rx.clone());
+        orchestration = Some((
+            handle.membership_rx.clone(),
+            handle.raft_metrics_rx.clone(),
+            cluster_runtime.aggregated_rx.clone(),
+        ));
+        _cluster_runtime = Some(cluster_runtime);
         BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
     } else {
         _cluster_runtime = None;
@@ -274,6 +297,66 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|c| c.wrapping_ikm())
         .map(reliaburger::sesame::token::derive_service_token)
         .transpose()?;
+
+    // L1 orchestration: the leader schedules desired apps into
+    // placements, every node keeps a fresh peer-API table, and every
+    // node reconciles its instances against its assignments.
+    if let Some((membership_rx, metrics_rx, aggregated_rx)) = orchestration {
+        if let Some(council) = &api_council {
+            reliaburger::cluster::orchestrate::spawn_leader_scheduler(
+                Arc::clone(council),
+                membership_rx.clone(),
+                aggregated_rx,
+                shutdown.clone(),
+            );
+        }
+
+        // Peer API ports are derived from gossip ports by fixed offset
+        // (uniform ports in production; distinct blocks on single-host
+        // clusters).
+        let gossip_to_api_offset = api_port as i32 - config.cluster.gossip_port as i32;
+        let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        api_membership = Some(Arc::clone(&membership_table));
+        let mut refresher_rx = membership_rx;
+        let refresher_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                let snapshot: Vec<api::NodeMembershipInfo> = refresher_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
+                    .map(|m| api::NodeMembershipInfo {
+                        node_id: m.node_id.clone(),
+                        address: std::net::SocketAddr::new(
+                            m.address.ip(),
+                            (m.address.port() as i32 + gossip_to_api_offset) as u16,
+                        ),
+                    })
+                    .collect();
+                *membership_table.write().await = snapshot;
+                tokio::select! {
+                    _ = refresher_shutdown.cancelled() => break,
+                    changed = refresher_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        if let Some(metrics_rx) = metrics_rx {
+            reliaburger::cluster::orchestrate::spawn_placement_reconciler(
+                node_name.clone(),
+                metrics_rx,
+                api_port as i32 - config.cluster.raft_port as i32,
+                service_token.clone(),
+                cmd_tx.clone(),
+                shutdown.clone(),
+            );
+        }
+    }
 
     // Seed the auth token store from the council's SecurityState and keep it
     // refreshed. The middleware reads this store; without the refresh, a token
@@ -609,6 +692,8 @@ async fn main() -> anyhow::Result<()> {
         api_token_store.clone(),
         service_token.clone(),
         api_rollup_store,
+        api_membership.clone(),
+        api_port,
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -698,11 +783,6 @@ async fn main() -> anyhow::Result<()> {
         );
         fallback
     };
-    let node_name = config
-        .node
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));

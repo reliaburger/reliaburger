@@ -355,6 +355,38 @@ mod tests {
         for p in &decision.placements {
             assert_eq!(p.resources.cpu_millicores, 500);
         }
+
+        // H8 regression: this test used to pass with all three replicas
+        // on ONE node — it never asserted distinctness, and the old
+        // spread weight (10 vs bin-pack's 50) stacked them.
+        let distinct: std::collections::HashSet<_> =
+            decision.placements.iter().map(|p| &p.node_id).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "replicas must spread across distinct nodes; got {:?}",
+            decision.placements
+        );
+    }
+
+    /// H8: three equal nodes, three replicas — one replica per node.
+    #[test]
+    fn replicas_spread_across_distinct_nodes() {
+        let mut scheduler = Scheduler::new(cluster_3_nodes());
+
+        let mut spec = default_spec();
+        spec.replicas = Replicas::Fixed(3);
+        spec.cpu = Some(ResourceRange {
+            request: 100,
+            limit: 200,
+        });
+
+        let app = AppId::new("api", "prod");
+        let decision = scheduler.schedule_app(&app, &spec).unwrap();
+
+        let distinct: std::collections::HashSet<_> =
+            decision.placements.iter().map(|p| &p.node_id).collect();
+        assert_eq!(distinct.len(), 3);
     }
 
     #[test]
