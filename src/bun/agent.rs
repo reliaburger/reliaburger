@@ -351,6 +351,10 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
+    /// A wall-clock generation collided when two redeploys landed in the
+    /// same second; this never repeats within a process.
+    next_deploy_gen: u64,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -400,6 +404,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            next_deploy_gen: 1,
             log_tx: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
@@ -448,6 +453,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            next_deploy_gen: 1,
             log_tx: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
@@ -1374,12 +1380,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .unwrap_or_default();
                 let health_wait = deploy_config.health_timeout;
 
-                // Generate new instance IDs that don't collide with existing ones
-                let deploy_gen = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    % 10000;
+                // Generate new instance IDs that don't collide with existing
+                // ones. A monotonic counter, not wall-clock seconds: two
+                // redeploys in the same second used to produce identical IDs
+                // and the second create failed "instance already exists".
+                let deploy_gen = self.next_deploy_gen;
+                self.next_deploy_gen += 1;
                 let replica_count = match spec.replicas {
                     crate::config::types::Replicas::Fixed(n) => n,
                     crate::config::types::Replicas::DaemonSet => 1,
