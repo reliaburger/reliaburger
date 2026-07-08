@@ -30,6 +30,7 @@ pub struct NodeConfig {
     pub gitops: Option<crate::lettuce::types::GitOpsConfig>,
     pub ingress: IngressSection,
     pub dns: DnsSection,
+    pub ebpf: EbpfSection,
     // TODO(Phase 14): upgrades section
 }
 
@@ -100,6 +101,47 @@ impl DnsSection {
             upstream,
             upstream_timeout: std::time::Duration::from_secs(2),
         })
+    }
+}
+
+/// eBPF data-path configuration (Onion service resolution, Smoker
+/// network faults, Sesame egress allowlists).
+///
+/// Disabled by default: loading eBPF programs needs root, a 5.7+ kernel
+/// and cgroup v2, and it is Linux-only. `program_dir` defaults to the
+/// directory the build compiled the `.bpf.o` objects into (baked in at
+/// build time), so a dev/Lima build "just works" with `enabled = true`;
+/// a packaged install points it at the installed objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EbpfSection {
+    /// Load and attach the eBPF programs on this node at startup.
+    pub enabled: bool,
+    /// Directory holding the compiled `.bpf.o` objects. When unset, the
+    /// build-time output directory is used.
+    pub program_dir: Option<PathBuf>,
+    /// Root cgroup v2 path to attach the connect hook to.
+    pub cgroup_path: PathBuf,
+}
+
+impl Default for EbpfSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            program_dir: None,
+            cgroup_path: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
+}
+
+impl EbpfSection {
+    /// Resolve the directory to load `.bpf.o` objects from: the explicit
+    /// config value, or the build-time output directory baked in by
+    /// `build.rs`. Returns `None` if neither is available.
+    pub fn resolve_program_dir(&self) -> Option<PathBuf> {
+        self.program_dir
+            .clone()
+            .or_else(|| option_env!("RELIABURGER_BPF_DIR").map(PathBuf::from))
     }
 }
 
@@ -545,6 +587,34 @@ mod tests {
         assert_eq!(wc.https_port, 8443);
         assert_eq!(wc.max_connections, 500);
         assert!(wc.tls_cert_path.is_none());
+    }
+
+    /// L8: loading eBPF needs root + a recent kernel, so it is opt-in.
+    #[test]
+    fn ebpf_disabled_by_default() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(!nc.ebpf.enabled);
+        assert_eq!(nc.ebpf.cgroup_path, PathBuf::from("/sys/fs/cgroup"));
+        assert!(nc.ebpf.program_dir.is_none());
+    }
+
+    #[test]
+    fn ebpf_section_parses_explicit_program_dir() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ebpf]
+            enabled = true
+            program_dir = "/opt/reliaburger/bpf"
+            cgroup_path = "/sys/fs/cgroup"
+        "#,
+        )
+        .unwrap();
+        assert!(nc.ebpf.enabled);
+        // An explicit program_dir wins over the build-time default.
+        assert_eq!(
+            nc.ebpf.resolve_program_dir(),
+            Some(PathBuf::from("/opt/reliaburger/bpf"))
+        );
     }
 
     #[test]

@@ -14,7 +14,6 @@
 
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::onion::ebpf::loader::OnionEbpf;
@@ -22,7 +21,6 @@ use reliaburger::onion::ebpf::maps::BpfServiceMap;
 use reliaburger::onion::service_map::ServiceMap;
 use reliaburger::onion::types::BackendInstance;
 use reliaburger::onion::vip::VirtualIP;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 fn ebpf_tests_enabled() -> bool {

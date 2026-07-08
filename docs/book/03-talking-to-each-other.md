@@ -404,6 +404,20 @@ The service map needs to stay in sync with reality. Four events matter:
 
 The ordering matters. We register the service *before* starting instances so that the DNS name resolves as early as possible. We unregister *after* stopping so that in-flight connections can drain. And we update health synchronously in the event loop so there's no window where the map disagrees with reality.
 
+### Loading the programs at boot
+
+All of the above assumes the eBPF programs are actually in the kernel. For a long time they weren't. The loader existed, the maps were defined, the `.bpf.c` sources compiled — but nothing ever called `OnionEbpf::load()`, so the field on the agent that would hold the handle was permanently `None`. Everything the connect hook was meant to do fell back to userspace-only behaviour: the service map worked for `relish resolve`, but no `connect()` was ever rewritten in the kernel.
+
+Wiring it in production comes down to three questions, and each has a slightly awkward answer.
+
+**When?** At `bun` startup, gated on an `[ebpf]` config section that defaults to *off*. Loading eBPF needs root, a 5.7+ kernel, and cgroup v2 — none of which hold on a laptop or in the default `cargo test` run. So it's opt-in, like the ingress listener and the DNS responder before it. A node that enables it but is built without the `ebpf` Cargo feature prints a clear warning that enforcement is off, rather than pretending.
+
+**Where are the objects?** `build.rs` compiles the `.bpf.o` files into Cargo's `OUT_DIR`, a hash-suffixed path nobody wants to type. Rather than force an install step, the build script bakes that path into the binary with `cargo:rustc-env=RELIABURGER_BPF_DIR=…`, and the config reads it back with `option_env!`. So a dev or Lima build with `[ebpf] enabled = true` finds its own objects automatically; a packaged install overrides `program_dir` to point at wherever the objects were installed. This is the first time we've used `option_env!` — it's like `env!`, but returns an `Option` instead of failing to compile when the variable is absent, which is exactly right for a default that only exists in eBPF-feature builds.
+
+**What if it fails?** A node that can't load eBPF logs the error and keeps running without kernel enforcement. Refusing to start would be worse: the data plane (containers, health checks, the userspace service map) is entirely independent of the connect hook. Losing the hook degrades service resolution to "no VIP rewriting"; it doesn't take the node down.
+
+The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Nine tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
+
 ### How gossip keeps the service map consistent
 
 Everything above describes what happens on a single node. But a 10-node cluster has 10 service maps, and they all need to agree. When the scheduler places `redis-0` on node A, node B needs to know about it too — otherwise `curl redis.internal` from a container on node B goes nowhere.

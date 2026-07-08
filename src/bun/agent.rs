@@ -511,6 +511,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.capacity_memory_mb = memory_mb;
     }
 
+    /// Attach a loaded eBPF handle so the agent can write fault and
+    /// egress map entries (L8). Only present with the `ebpf` feature;
+    /// `bun` calls this at startup when `[ebpf] enabled`.
+    #[cfg(feature = "ebpf")]
+    pub fn set_onion_ebpf(
+        &mut self,
+        ebpf: std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
+    ) {
+        self.onion_ebpf = Some(ebpf);
+    }
+
     /// Spawn a background forwarder that streams a started instance's log lines
     /// into the configured log sink. No-op if no sink is set.
     ///

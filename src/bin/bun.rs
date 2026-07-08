@@ -290,6 +290,49 @@ async fn main() -> anyhow::Result<()> {
     let (capacity_cpu, capacity_memory) = node_capacity(&config);
     agent.set_node_capacity(capacity_cpu, capacity_memory);
 
+    // L8: load and attach the eBPF data path (Onion connect rewrite,
+    // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.
+    // A load failure is logged and the node continues without kernel
+    // enforcement rather than refusing to start.
+    if config.ebpf.enabled {
+        match config.ebpf.resolve_program_dir() {
+            Some(program_dir) => {
+                #[cfg(feature = "ebpf")]
+                match reliaburger::onion::ebpf::loader::OnionEbpf::load(
+                    &program_dir,
+                    &config.ebpf.cgroup_path,
+                ) {
+                    Ok(ebpf) => {
+                        eprintln!(
+                            "bun: eBPF data path loaded from {} (attached={})",
+                            program_dir.display(),
+                            ebpf.is_attached()
+                        );
+                        agent.set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "bun: failed to load eBPF data path: {e}; continuing without enforcement"
+                        );
+                    }
+                }
+                #[cfg(not(feature = "ebpf"))]
+                {
+                    let _ = program_dir;
+                    eprintln!(
+                        "bun: [ebpf] enabled but this binary was built without the `ebpf` feature; \
+                         network faults and egress allowlists are NOT enforced"
+                    );
+                }
+            }
+            None => {
+                eprintln!(
+                    "bun: [ebpf] enabled but no program_dir set and no build-time objects; skipping"
+                );
+            }
+        }
+    }
+
     // Derive the internal service token from the shared master key, so bun's own
     // cross-node fan-out calls authenticate as the system principal on peers.
     let service_token = api_council
