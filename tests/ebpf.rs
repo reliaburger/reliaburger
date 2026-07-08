@@ -344,6 +344,93 @@ async fn ebpf_connect_non_vip_passes_through() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 2a: Agent-driven backend_map sync (L8 completeness)
+// ---------------------------------------------------------------------------
+
+/// A real `BunAgent` with a loaded eBPF handle must mirror a deployed
+/// app's backends into the kernel `backend_map` — the production path,
+/// not a manual `BpfServiceMap` write. Deploy through the agent command
+/// channel and read the map back.
+#[tokio::test]
+async fn agent_deploy_populates_backend_map() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::process::ProcessGrill;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    // Keep our own clone of the handle to read the map after the deploy.
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
+    ));
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        ProcessGrill::new(),
+        PortAllocator::new(41100, 41400),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        port = 8080
+    "#,
+    )
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while ev_rx.recv().await.is_some() {}
+
+    // Let the instance reach Running and register its backend.
+    let vip = VirtualIP::from_app_name("web");
+    let bpf = BpfServiceMap::new();
+    let populated = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            let has_backend = {
+                let mut e = ebpf.lock().await;
+                bpf.read_backends(&mut e, vip, 8080)
+                    .is_some_and(|v| v.count >= 1)
+            };
+            if has_backend {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        ok
+    };
+    assert!(
+        populated,
+        "agent never mirrored the deployed app's backend into backend_map"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2b: Egress allowlist (L16)
 // ---------------------------------------------------------------------------
 

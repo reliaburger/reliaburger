@@ -530,6 +530,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.onion_ebpf = Some(ebpf);
     }
 
+    /// Mirror an app's current service-map entry into the kernel
+    /// `backend_map` so the eBPF connect hook rewrites its VIP to live
+    /// backends (L8 completeness). Called after every service-map add /
+    /// health change. A no-op without the eBPF data path loaded.
+    #[cfg(feature = "ebpf")]
+    async fn sync_backend_ebpf(&self, app_name: &str) {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.service_map.resolve(app_name).cloned() else {
+            return;
+        };
+        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
+        let mut ebpf = handle.lock().await;
+        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry);
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    async fn sync_backend_ebpf(&self, _app_name: &str) {}
+
+    /// Drop an app's `backend_map` entry. Must be called *before* the app
+    /// is unregistered from the service map, while its VIP/port are still
+    /// known. A no-op without the eBPF data path loaded.
+    #[cfg(feature = "ebpf")]
+    async fn remove_backend_ebpf(&self, app_name: &str) {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let Some(port) = self.service_map.resolve(app_name).map(|e| e.port) else {
+            return;
+        };
+        let vip = crate::onion::vip::VirtualIP::from_app_name(app_name);
+        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
+        let mut ebpf = handle.lock().await;
+        bpf.remove_backends_bpf(&mut ebpf, vip, port);
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    async fn remove_backend_ebpf(&self, _app_name: &str) {}
+
     /// Spawn a background forwarder that streams a started instance's log lines
     /// into the configured log sink. No-op if no sink is set.
     ///
@@ -1591,6 +1631,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .await;
                 }
                 self.supervisor.remove_app(app_name, namespace).await;
+                self.remove_backend_ebpf(app_name).await;
                 let _ = self.service_map.unregister_app(app_name);
 
                 // Register new instances in supervisor tracking
@@ -1666,6 +1707,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             let _ = self.service_map.add_backend(app_name, backend);
                         }
                     }
+                    self.sync_backend_ebpf(app_name).await;
                 }
                 if let Some(ref ingress) = spec.ingress {
                     self.ingress_configs
@@ -1730,6 +1772,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = self
                     .service_map
                     .register_app(app_name, namespace, port, firewall);
+                self.sync_backend_ebpf(app_name).await;
             }
 
             // Store ingress config for routing table
@@ -2106,6 +2149,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = self.service_map.add_backend(app_name, backend);
         }
 
+        // L8: mirror the freshly-registered backend into the eBPF backend_map.
+        self.sync_backend_ebpf(app_name).await;
+
         // L16: program the egress allowlist for this instance's cgroup.
         self.apply_egress(instance_id, spec).await;
 
@@ -2310,27 +2356,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 let transition = self.supervisor.process_health_result(&instance_id, status);
 
-                // Propagate health transitions to the service map
+                // Propagate health transitions to the service map, noting the
+                // app so we can re-sync its eBPF backend_map entry afterwards.
+                let mut health_changed_app: Option<String> = None;
                 match &transition {
                     Ok(Some(ContainerState::Running)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let _ = self.service_map.set_backend_health(
-                                &inst.app_name,
-                                &instance_id.0,
-                                true,
-                            );
+                            let app = inst.app_name.clone();
+                            let _ = self
+                                .service_map
+                                .set_backend_health(&app, &instance_id.0, true);
+                            health_changed_app = Some(app);
                         }
                     }
                     Ok(Some(ContainerState::Unhealthy)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let _ = self.service_map.set_backend_health(
-                                &inst.app_name,
-                                &instance_id.0,
-                                false,
-                            );
+                            let app = inst.app_name.clone();
+                            let _ =
+                                self.service_map
+                                    .set_backend_health(&app, &instance_id.0, false);
+                            health_changed_app = Some(app);
                         }
                     }
                     _ => {}
+                }
+                if let Some(app) = health_changed_app {
+                    self.sync_backend_ebpf(&app).await;
                 }
 
                 // Handle restart if unhealthy
@@ -2558,6 +2609,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = self.service_map.add_backend(&app_name, backend);
             }
+            self.sync_backend_ebpf(&app_name).await;
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -2618,6 +2670,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = self.service_map.remove_backend(app_name, &id.0);
             self.clear_egress(id).await;
         }
+        self.remove_backend_ebpf(app_name).await;
         let _ = self.service_map.unregister_app(app_name);
         self.ingress_configs.remove(app_name);
         self.rebuild_routing_table().await;
