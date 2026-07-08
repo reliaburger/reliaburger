@@ -802,15 +802,15 @@ async fn main() -> ExitCode {
             }
             DevAction::Disk => reliaburger::relish::dev::disk().await,
             DevAction::Clean => reliaburger::relish::dev::clean().await,
-            DevAction::Keygen { out } => reliaburger::relish::dev::keygen(&out),
+            DevAction::Keygen { out } => reliaburger::relish::dev::keygen(out),
             DevAction::SignBinary {
                 key,
                 external_key,
                 out,
                 binary,
             } => reliaburger::relish::dev::sign_binary(
-                &key,
-                &binary,
+                key,
+                binary,
                 external_key.as_deref(),
                 out.as_deref(),
             ),

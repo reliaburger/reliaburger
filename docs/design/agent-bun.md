@@ -963,6 +963,28 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 
 The self-upgrade mechanism replaces the Bun binary on every node in a rolling fashion. Bun is the orchestrator for its own upgrade.
 
+> **Implementation notes (July 2026, Phase 14).** The shipped implementation
+> deviates from this section in three places, each recorded with its rationale
+> in `docs/self-upgrade-plan-2026-07.md`:
+>
+> 1. **Directives travel over the node HTTP API, not the reporting tree.**
+>    The reporting tree is upstream-only (reports and acks); adding a
+>    downstream path would have changed its bincode wire format mid-phase.
+>    The leader POSTs to each node's token-authenticated `/v1/upgrade/apply`.
+> 2. **Version discovery polls `GET /v1/version`, not gossip.** Adding a
+>    version field to `MembershipUpdate` breaks bincode decoding for old
+>    nodes during the exact mixed-version window upgrades create.
+> 3. **Leadership transfer is `raft.trigger().elect()` on an upgraded
+>    member** (via `POST /v1/cluster/elect`) — openraft 0.9 has no native
+>    transfer.
+>
+> Additionally: rollback runs the SAME order as upgrade (workers → council →
+> leader last) rather than the reverse order suggested below — leader-last is
+> the invariant that keeps the orchestrator coordinated; and nodes remember
+> reverted upgrade ids and refuse to re-attempt them (retries via
+> `relish upgrade resume` are issued under a fresh id), which closes a
+> re-delivery crash-loop this section did not anticipate.
+
 **Node-level upgrade sequence (executed on each node):**
 
 ```

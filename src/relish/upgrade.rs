@@ -341,12 +341,7 @@ fn render_cluster_status(cluster: &serde_json::Value) -> String {
                 render_phase(&active["phase"]),
             )
             .unwrap();
-            writeln!(
-                out,
-                "{:<20} {:<10} {:<12} {}",
-                "NODE", "ROLE", "PHASE", "FROM"
-            )
-            .unwrap();
+            writeln!(out, "{:<20} {:<10} {:<12} FROM", "NODE", "ROLE", "PHASE").unwrap();
             for node in active["nodes"].as_array().into_iter().flatten() {
                 writeln!(
                     out,

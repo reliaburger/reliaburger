@@ -348,8 +348,7 @@ impl UpgradeManager {
                 installed.sort();
                 installed
                     .into_iter()
-                    .filter(|v| *v < self.running_version)
-                    .next_back()
+                    .rfind(|v| *v < self.running_version)
                     .ok_or(UpgradeError::NoRollbackTarget)?
             }
         };
@@ -458,9 +457,10 @@ impl UpgradeManager {
             recorded_at: std::time::SystemTime::now(),
         })?;
         UpgradeMarker::remove(&self.marker_path)?;
-        let deleted = self
-            .store
-            .garbage_collect(self.retain_versions, &[marker.previous_version.clone()])?;
+        let deleted = self.store.garbage_collect(
+            self.retain_versions,
+            std::slice::from_ref(&marker.previous_version),
+        )?;
         for version in deleted {
             println!("bun: retention gc removed binary {version}");
         }

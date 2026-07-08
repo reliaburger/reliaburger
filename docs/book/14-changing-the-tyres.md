@@ -625,3 +625,21 @@ The fix has three interlocking parts, and the pattern is worth keeping: **make f
 These are the slowest tests in the repository — a couple of minutes each, serialised for the same starvation reasons as §14.7 — and the cheapest confidence per line in the whole phase. When someone asks whether the cluster can really upgrade itself, the answer is a test name.
 
 What remains is bookkeeping: progress ticked, READMEs updated, and this chapter closed out with the lessons that only showed up in the doing.
+
+## 14.12 Lessons learned
+
+**The kernel does the hard part, if you let it.** The headline feature — workloads surviving the upgrade — is mostly a property of `exec()` we chose not to break. Children survive; memory doesn't. Everything we built (records, adoption, file-backed logs) exists to reconstruct *knowledge*, not to keep processes alive. Knowing precisely what a syscall preserves turned a scary feature into a bookkeeping exercise.
+
+**Attach state to artefacts, not processes.** The chapter's recurring trap, in three costumes: the env-var version override (env survives exec — wrong version reported), piped logs (pipes die with their reader — SIGPIPE kills the workload), and in-memory upgrade state (memory dies at exec — no revert possible). The fix was the same every time: put it in a file next to the thing it describes. In a system where processes replace themselves, the filesystem is the only memory you can trust.
+
+**Decide, then act.** The two scariest pieces — the startup rollback decision and the rolling-walk step — are (nearly) pure functions returning data, with thin imperative shells around the unrunnable parts (`execv`, real HTTP). Twenty-six unit tests cover logic that would otherwise need a crashed process or a live cluster per assertion. The shells stayed dumb enough that the eight real-binary integration tests could carry them.
+
+**Idempotency by observation beats bookkeeping by memory.** The orchestrator re-polls reality (`/v1/version`) before every decision, so leader crashes, lost directives, and resumes all collapse into the same code path: look, then act. And where two idempotency mechanisms composed into a livelock (§14.11's revert/re-send loop), the cure was making failure a *reported fact* — nodes advertising "I tried that id and reverted it" — rather than something the leader infers from version numbers.
+
+**Wire formats are one-way doors.** Half the design decisions in this phase (D5, D6, the append-only `RaftRequest` rule) were dictated by bincode's index-based enum encoding — laid down long before upgrades existed, and binding precisely at the moment old and new binaries must talk. If your system will ever upgrade itself, mixed-version compatibility is a constraint on your *first* release, not your second.
+
+**What we'd do differently.** Gossip should advertise API ports (the `gossip-ip:9117` derivation is the phase's ugliest seam); a self-describing wire format for membership would have let version info ride along for free; and the boot-attempt budget plus grace timers are wall-clock heuristics that a supervisor-integration API (sd_notify-style readiness) would make crisp. All deferred with eyes open — each would have doubled the phase for a marginal improvement to a path that now has eight end-to-end tests standing on it.
+
+The milestone holds: `relish upgrade start v0.2.0` rolls a live cluster onto a new binary — signatures checked twice, workloads never blinking, leadership handed over mid-flight, and a poisoned release walking itself back without a human in the loop. The cluster changes its own tyres at full speed.
+
+Next, Phase 15: teaching Reliaburger to test, benchmark, and diagnose itself — `relish test`, `relish bench`, and the long-promised `relish wtf`.

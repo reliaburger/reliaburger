@@ -382,12 +382,19 @@ Implementation plan: [docs/tui-plan-2026-07.md](tui-plan-2026-07.md)
 > Detailed implementation plan: [self-upgrade-plan-2026-07.md](self-upgrade-plan-2026-07.md)
 > (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
 
-- [ ] Rolling binary replacement
-- [ ] Dual-signature verification
-- [ ] Automatic rollback on failure
-- [ ] Version retention and GC
-- [ ] Book chapter 14: "Changing the Tyres at Full Speed"
-- [ ] All Phase 14 tests green
+- [x] Rolling binary replacement (exec-in-place; workers → council → leadership transfer → former leader; state in Raft; `relish upgrade` command set)
+- [x] Dual-signature verification (embedded Ed25519 release key set + external operator key from node.toml; air-gapped `--binary` needs embedded only)
+- [x] Automatic rollback on failure (crash-loop boot budget reverts the symlink; nodes refuse previously-reverted upgrade ids; leader pauses the run; `upgrade resume` retries with a fresh id)
+- [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
+- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption; pid+start-time fingerprinting; file-backed process logs). `[runc adoption unverified on Linux]`; AppleGrill adoption deferred (TODO in grill/apple.rs)
+- [x] Book chapter 14: "Changing the Tyres at Full Speed"
+- [x] All Phase 14 tests green (99 unit + 5 single-node + 3 cluster integration tests, real binaries under a supervisor harness)
+
+Deferred wiring (seams marked with TODOs): scheduler cordoning awaits an
+in-binary `ClusterStateCache` (`meat::filter::apply_upgrade_cordon` is ready);
+node API addresses are derived `gossip-ip:9117` until gossip advertises API
+ports; cluster-mode post-upgrade verification checks adopted workloads but
+not yet gossip-rejoin explicitly.
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
