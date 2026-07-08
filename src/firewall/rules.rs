@@ -127,9 +127,13 @@ pub fn generate_ruleset(config: &PerimeterConfig, cluster_nodes: &ClusterNodes) 
     rules.push_str(&format!("    tcp dport {port_start}-{port_end} drop\n"));
     rules.push('\n');
 
-    // Block external access to cluster ports
+    // Block external access to cluster ports on both protocols. Gossip is
+    // UDP (M18: a tcp-only drop left the gossip port externally reachable);
+    // Raft/reporting are TCP. Cluster members bypass these via the
+    // `ip saddr … accept` rule above, so dropping both is safe.
     for port in &config.cluster_ports {
         rules.push_str(&format!("    tcp dport {port} drop\n"));
+        rules.push_str(&format!("    udp dport {port} drop\n"));
     }
     rules.push('\n');
 
@@ -280,6 +284,20 @@ mod tests {
         assert!(rules.contains("tcp dport 9443 drop"));
         assert!(rules.contains("tcp dport 9444 drop"));
         assert!(rules.contains("tcp dport 9445 drop"));
+    }
+
+    /// M18: cluster ports must be dropped on UDP too — gossip is UDP, and a
+    /// tcp-only rule left the gossip port externally reachable.
+    #[test]
+    fn cluster_ports_blocked_on_udp_too() {
+        let config = default_config();
+        let rules = generate_ruleset(&config, &ClusterNodes::new());
+        for port in &config.cluster_ports {
+            assert!(
+                rules.contains(&format!("udp dport {port} drop")),
+                "cluster port {port} not dropped on UDP"
+            );
+        }
     }
 
     #[test]

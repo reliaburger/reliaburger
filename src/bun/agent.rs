@@ -359,8 +359,10 @@ pub struct BunAgent<G: Grill> {
     ingress_configs: std::collections::HashMap<String, crate::config::app::IngressSpec>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
-    /// Last known cluster node count for firewall reconciliation.
-    last_firewall_node_count: usize,
+    /// Last applied cluster-node set for firewall reconciliation. `None`
+    /// until the first apply, so a standalone node (empty set) still gets
+    /// the firewall; comparing the set (not a count) catches node swaps (M18).
+    last_firewall_nodes: Option<crate::firewall::rules::ClusterNodes>,
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
@@ -425,7 +427,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 enabled: false,
                 ..Default::default()
             },
-            last_firewall_node_count: 0,
+            last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
@@ -478,7 +480,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 enabled: false,
                 ..Default::default()
             },
-            last_firewall_node_count: 0,
+            last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
@@ -2932,12 +2934,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
 
-        // Collect cluster node IPs from gossip membership
+        // Collect cluster node IPs from gossip membership. Reconcile when
+        // the *set* changes — a node swap keeps the count constant (M18) —
+        // and always on the first pass (`None`), so a standalone node with
+        // no peers still gets the firewall applied.
         let cluster_nodes = self.collect_cluster_node_ips();
-        let node_count = cluster_nodes.len();
-
-        // Only regenerate if membership changed
-        if node_count == self.last_firewall_node_count {
+        if self.last_firewall_nodes.as_ref() == Some(&cluster_nodes) {
             return;
         }
 
@@ -2947,7 +2949,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(e) = crate::firewall::rules::apply_ruleset(&ruleset).await {
             eprintln!("warning: firewall reconciliation failed: {e}");
         } else {
-            self.last_firewall_node_count = node_count;
+            self.last_firewall_nodes = Some(cluster_nodes);
         }
     }
 
