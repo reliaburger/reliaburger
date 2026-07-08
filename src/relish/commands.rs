@@ -19,18 +19,30 @@ use crate::bun::agent::CouncilStatus;
 ///
 /// If a Bun agent is running, sends the config for deployment.
 /// Progress events are streamed to stderr in real time.
-/// If no agent is reachable, falls back to showing the dry-run plan.
-pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
-    apply_with_client(path, output, &BunClient::default_local()).await
+/// With `--dry-run`, prints the plan and exits 0 without deploying.
+/// Without `--dry-run`, an unreachable agent is an error: the plan is
+/// still printed for reference, but the exit code is non-zero so
+/// scripts and CI cannot mistake "nothing happened" for a deploy.
+pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
+    apply_with_client(path, output, dry_run, &BunClient::default_local()).await
 }
 
 async fn apply_with_client(
     path: &Path,
     output: OutputFormat,
+    dry_run: bool,
     client: &BunClient,
 ) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
+
+    if dry_run {
+        let plan = generate_plan(&config, None);
+        let formatted = format_output(&plan, output)?;
+        println!("{formatted}");
+        println!("\n(dry run — nothing deployed)");
+        return Ok(());
+    }
 
     match client.health().await {
         Ok(()) => {
@@ -44,12 +56,14 @@ async fn apply_with_client(
             Ok(())
         }
         Err(_) => {
-            // Agent unreachable — fall back to dry-run
+            // X5: show the plan for reference, but fail — a dead agent
+            // must not make a deploy look successful.
             let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, output)?;
             println!("{formatted}");
-            println!("\n(dry run — bun agent not reachable, showing plan only)");
-            Ok(())
+            eprintln!("\nerror: bun agent not reachable — nothing was deployed");
+            eprintln!("(use --dry-run to preview a plan without an agent)");
+            Err(RelishError::AgentUnreachable)
         }
     }
 }
@@ -85,17 +99,99 @@ async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
 }
 
 /// Stream logs from an app or job.
-pub async fn logs(name: &str, tail: Option<usize>, follow: bool) -> Result<(), RelishError> {
-    logs_with_client(name, tail, follow, &BunClient::default_local()).await
+pub async fn logs(
+    name: &str,
+    tail: Option<usize>,
+    follow: bool,
+    grep: Option<String>,
+    since: Option<String>,
+    json_field: Option<String>,
+) -> Result<(), RelishError> {
+    let options = build_log_options(tail, follow, grep, since, json_field, unix_now())?;
+    logs_with_client(name, &options, &BunClient::default_local()).await
+}
+
+/// Translate the CLI flags into [`LogOptions`], validating as we go.
+fn build_log_options(
+    tail: Option<usize>,
+    follow: bool,
+    grep: Option<String>,
+    since: Option<String>,
+    json_field: Option<String>,
+    now_epoch: u64,
+) -> Result<super::client::LogOptions, RelishError> {
+    let start = match since {
+        Some(s) => Some(parse_since(&s, now_epoch)?),
+        None => None,
+    };
+    let json_field = match json_field {
+        Some(s) => Some(parse_json_field(&s)?),
+        None => None,
+    };
+    Ok(super::client::LogOptions {
+        tail,
+        follow,
+        grep,
+        start,
+        json_field,
+    })
+}
+
+/// Parse a `--since` value: raw epoch seconds, or a duration like
+/// `30s`, `5m`, `2h`, `1d` subtracted from now.
+fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+    if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
+        return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
+            flag: "since".to_string(),
+            reason: e.to_string(),
+        });
+    }
+
+    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => {
+            return Err(RelishError::InvalidFlag {
+                flag: "since".to_string(),
+                reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
+            });
+        }
+    };
+    let amount: u64 = number.parse().map_err(|_| RelishError::InvalidFlag {
+        flag: "since".to_string(),
+        reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
+    })?;
+    Ok(now_epoch.saturating_sub(amount * multiplier))
+}
+
+/// Parse a `--json-field` value of the form `key=value`.
+fn parse_json_field(value: &str) -> Result<(String, String), RelishError> {
+    match value.split_once('=') {
+        Some((key, val)) if !key.is_empty() => Ok((key.to_string(), val.to_string())),
+        _ => Err(RelishError::InvalidFlag {
+            flag: "json-field".to_string(),
+            reason: format!("{value:?} — expected key=value"),
+        }),
+    }
+}
+
+/// Current unix time in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn logs_with_client(
     name: &str,
-    tail: Option<usize>,
-    follow: bool,
+    options: &super::client::LogOptions,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let log_output = client.logs(name, "default", tail, follow).await?;
+    let log_output = client.logs(name, "default", options).await?;
     if !log_output.is_empty() {
         println!("{log_output}");
     }
@@ -517,9 +613,19 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 ///
 /// Parses the config, sends it to the agent for a rolling deploy
 /// (if the app already exists, the agent performs a rolling update).
-pub async fn deploy(path: &Path) -> Result<(), RelishError> {
+/// With `--dry-run`, prints the plan and exits 0 without deploying;
+/// otherwise an unreachable agent is an error (X5).
+pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
+
+    if dry_run {
+        let plan = generate_plan(&config, None);
+        let formatted = format_output(&plan, super::OutputFormat::Human)?;
+        println!("{formatted}");
+        println!("\n(dry run — nothing deployed)");
+        return Ok(());
+    }
 
     let client = BunClient::default_local();
     match client.health().await {
@@ -536,8 +642,9 @@ pub async fn deploy(path: &Path) -> Result<(), RelishError> {
             let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, super::OutputFormat::Human)?;
             println!("{formatted}");
-            println!("\n(dry run — bun agent not reachable)");
-            Ok(())
+            eprintln!("\nerror: bun agent not reachable — nothing was deployed");
+            eprintln!("(use --dry-run to preview a plan without an agent)");
+            Err(RelishError::AgentUnreachable)
         }
     }
 }
@@ -1137,8 +1244,25 @@ mod tests {
         f
     }
 
+    /// X5 regression: an unreachable agent used to fall back to a
+    /// dry-run plan and exit 0, making dead-agent deploys look green.
     #[tokio::test]
-    async fn apply_with_valid_config_falls_back_to_dry_run() {
+    async fn apply_exits_nonzero_when_agent_unreachable() {
+        let f = write_temp_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+        "#,
+        );
+        let err = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn apply_dry_run_succeeds_without_agent() {
         let f = write_temp_config(
             r#"
             [app.web]
@@ -1147,7 +1271,7 @@ mod tests {
         "#,
         );
         assert!(
-            apply_with_client(f.path(), OutputFormat::Human, &bogus_client())
+            apply_with_client(f.path(), OutputFormat::Human, true, &bogus_client())
                 .await
                 .is_ok()
         );
@@ -1158,6 +1282,7 @@ mod tests {
         let result = apply_with_client(
             Path::new("/nonexistent/config.toml"),
             OutputFormat::Human,
+            false,
             &bogus_client(),
         )
         .await;
@@ -1172,7 +1297,7 @@ mod tests {
     #[tokio::test]
     async fn apply_with_invalid_toml_errors() {
         let f = write_temp_config("this is not valid toml [[[");
-        let result = apply_with_client(f.path(), OutputFormat::Human, &bogus_client()).await;
+        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
         assert!(result.is_err());
     }
 
@@ -1184,12 +1309,60 @@ mod tests {
             replicas = 3
         "#,
         );
-        let result = apply_with_client(f.path(), OutputFormat::Human, &bogus_client()).await;
+        let result = apply_with_client(f.path(), OutputFormat::Human, false, &bogus_client()).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
             matches!(err, RelishError::Config(_)),
             "expected Config error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn since_accepts_epoch_and_duration_suffixes() {
+        let now = 1_750_000_000;
+        assert_eq!(parse_since("1749000000", now).unwrap(), 1_749_000_000);
+        assert_eq!(parse_since("30s", now).unwrap(), now - 30);
+        assert_eq!(parse_since("5m", now).unwrap(), now - 300);
+        assert_eq!(parse_since("2h", now).unwrap(), now - 7200);
+        assert_eq!(parse_since("1d", now).unwrap(), now - 86_400);
+    }
+
+    #[test]
+    fn since_rejects_unknown_units_and_garbage() {
+        let now = 1_750_000_000;
+        assert!(parse_since("5w", now).is_err());
+        assert!(parse_since("", now).is_err());
+        assert!(parse_since("abc", now).is_err());
+    }
+
+    #[test]
+    fn json_field_parses_key_value_and_rejects_malformed() {
+        assert_eq!(
+            parse_json_field("level=error").unwrap(),
+            ("level".to_string(), "error".to_string())
+        );
+        assert!(parse_json_field("no-equals-sign").is_err());
+        assert!(parse_json_field("=value").is_err());
+    }
+
+    #[test]
+    fn log_options_carry_all_flags() {
+        let options = build_log_options(
+            Some(50),
+            false,
+            Some("error".to_string()),
+            Some("5m".to_string()),
+            Some("level=warn".to_string()),
+            1_750_000_000,
+        )
+        .unwrap();
+        assert_eq!(options.tail, Some(50));
+        assert_eq!(options.grep.as_deref(), Some("error"));
+        assert_eq!(options.start, Some(1_750_000_000 - 300));
+        assert_eq!(
+            options.json_field,
+            Some(("level".to_string(), "warn".to_string()))
         );
     }
 
@@ -1201,7 +1374,8 @@ mod tests {
 
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
-        let err = logs_with_client("web", None, false, &bogus_client())
+        let options = super::super::client::LogOptions::default();
+        let err = logs_with_client("web", &options, &bogus_client())
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));

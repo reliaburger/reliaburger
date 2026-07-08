@@ -12,7 +12,7 @@ use reliaburger::bun::testapp::{TestApp, TestAppMode};
 use reliaburger::config::Config;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
-use reliaburger::relish::client::BunClient;
+use reliaburger::relish::client::{BunClient, LogOptions};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -241,7 +241,10 @@ async fn logs_for_deployed_app() {
         .unwrap();
 
     // ProcessGrill returns empty logs for sleep, but the call should succeed
-    let result = harness.client.logs("worker", "default", None, false).await;
+    let result = harness
+        .client
+        .logs("worker", "default", &LogOptions::default())
+        .await;
     assert!(result.is_ok());
 }
 
@@ -480,13 +483,90 @@ async fn logs_with_tail_returns_limited_lines() {
 
     let result = harness
         .client
-        .logs("echoer", "default", Some(1), false)
+        .logs(
+            "echoer",
+            "default",
+            &LogOptions {
+                tail: Some(1),
+                ..LogOptions::default()
+            },
+        )
         .await
         .unwrap();
 
     let lines: Vec<&str> = result.lines().collect();
     assert_eq!(lines.len(), 1, "expected 1 line, got: {result:?}");
     assert_eq!(lines[0], "line3");
+}
+
+/// X4 regression: `--grep` used to be parsed then silently discarded.
+#[tokio::test]
+async fn logs_grep_filters_lines() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.grepper]
+        image = "test:v1"
+        command = ["sh", "-c", "echo alpha-one; echo beta-two; echo alpha-three"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = harness
+        .client
+        .logs(
+            "grepper",
+            "default",
+            &LogOptions {
+                grep: Some("alpha".to_string()),
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 alpha lines, got: {result:?}");
+    assert!(lines.iter().all(|l| l.contains("alpha")), "got: {result:?}");
+}
+
+/// X4: `--json-field key=value` keeps only matching JSON lines.
+#[tokio::test]
+async fn logs_json_field_filters_structured_lines() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.jsonlogger]
+        image = "test:v1"
+        command = ["sh", "-c", "echo '{\"level\":\"error\",\"msg\":\"boom\"}'; echo '{\"level\":\"info\",\"msg\":\"fine\"}'; echo plain-text"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = harness
+        .client
+        .logs(
+            "jsonlogger",
+            "default",
+            &LogOptions {
+                json_field: Some(("level".to_string(), "error".to_string())),
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 1, "expected 1 error line, got: {result:?}");
+    assert!(lines[0].contains("boom"));
 }
 
 #[tokio::test]

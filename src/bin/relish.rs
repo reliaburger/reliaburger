@@ -31,6 +31,9 @@ enum Command {
     Apply {
         /// Path to a TOML config file or directory.
         path: PathBuf,
+        /// Show the plan without deploying (exits 0 even with no agent).
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show cluster and app status.
     Status,
@@ -137,6 +140,9 @@ enum Command {
     Deploy {
         /// Path to a TOML config file.
         path: PathBuf,
+        /// Show the plan without deploying (exits 0 even with no agent).
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show deploy history for an app.
     History {
@@ -508,16 +514,26 @@ async fn main() -> ExitCode {
     reliaburger::relish::client::set_cli_token(cli.token.clone());
 
     let result = match cli.command {
-        Command::Apply { ref path } => commands::apply(path, cli.output).await,
+        Command::Apply { ref path, dry_run } => commands::apply(path, cli.output, dry_run).await,
         Command::Status => commands::status().await,
         Command::Logs {
             ref name,
             tail,
             follow,
-            grep: ref _grep,
-            since: ref _since,
-            json_field: ref _json_field,
-        } => commands::logs(name, tail, follow).await,
+            ref grep,
+            ref since,
+            ref json_field,
+        } => {
+            commands::logs(
+                name,
+                tail,
+                follow,
+                grep.clone(),
+                since.clone(),
+                json_field.clone(),
+            )
+            .await
+        }
         Command::LogsExport {
             ref dest,
             ref node_id,
@@ -626,7 +642,7 @@ async fn main() -> ExitCode {
                 speed,
             } => reliaburger::relish::fault::scenario(path, *dry_run, *speed).await,
         },
-        Command::Deploy { ref path } => commands::deploy(path).await,
+        Command::Deploy { ref path, dry_run } => commands::deploy(path, dry_run).await,
         Command::History { ref app } => commands::history(app).await,
         Command::Rollback { ref app } => commands::rollback(app).await,
         Command::Lint { ref path } => commands::lint(path),
@@ -723,8 +739,41 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path } if path.to_str() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, dry_run: false } if path.to_str() == Some("config.toml"))
         );
+    }
+
+    #[test]
+    fn parse_apply_dry_run_flag() {
+        let cli = parse(&["relish", "apply", "config.toml", "--dry-run"]).unwrap();
+        assert!(matches!(cli.command, Command::Apply { dry_run: true, .. }));
+    }
+
+    #[test]
+    fn parse_logs_filter_flags() {
+        let cli = parse(&[
+            "relish",
+            "logs",
+            "web",
+            "--grep",
+            "error",
+            "--since",
+            "5m",
+            "--json-field",
+            "level=warn",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Logs {
+                ref grep,
+                ref since,
+                ref json_field,
+                ..
+            } if grep.as_deref() == Some("error")
+                && since.as_deref() == Some("5m")
+                && json_field.as_deref() == Some("level=warn")
+        ));
     }
 
     #[test]

@@ -297,7 +297,7 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
 
     // Convert Deployments → Apps (with correlated Service, Ingress, HPA)
     for (name, deploy) in &deployments {
-        let mut app = deployment_to_app(deploy);
+        let mut app = deployment_to_app(name, deploy, &mut report);
 
         // Correlate Service by name match
         if let Some(svc) = services.get(name) {
@@ -317,10 +317,10 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
             apply_hpa(&mut app, hpa);
         }
 
-        config.app.insert(name.clone(), app);
+        let key = insert_app_without_overwrite(&mut config, &mut report, name, app, "Deployment");
         report
             .converted
-            .push(format!("Deployment/{name} → [app.{name}]"));
+            .push(format!("Deployment/{name} → [app.{key}]"));
     }
 
     // Convert DaemonSets → Apps with replicas = "*"
@@ -329,19 +329,19 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
         if let Some(svc) = services.get(name) {
             apply_service(&mut app, svc);
         }
-        config.app.insert(name.clone(), app);
-        report.converted.push(format!(
-            "DaemonSet/{name} → [app.{name}] (replicas = \"*\")"
-        ));
+        let key = insert_app_without_overwrite(&mut config, &mut report, name, app, "DaemonSet");
+        report
+            .converted
+            .push(format!("DaemonSet/{name} → [app.{key}] (replicas = \"*\")"));
     }
 
     // Convert StatefulSets → Apps with warning
     for (name, ss) in &statefulsets {
         let app = statefulset_to_app(ss);
-        config.app.insert(name.clone(), app);
+        let key = insert_app_without_overwrite(&mut config, &mut report, name, app, "StatefulSet");
         report
             .converted
-            .push(format!("StatefulSet/{name} → [app.{name}]"));
+            .push(format!("StatefulSet/{name} → [app.{key}]"));
         report.warnings.push(MigrationWarning {
             resource: format!("StatefulSet/{name}"),
             message: "ordering guarantees and stable network IDs lost".to_string(),
@@ -383,11 +383,42 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
     (config, report)
 }
 
+/// Insert an app under its own name, or under `{namespace}-{name}` when
+/// the name is already taken by a resource from another namespace.
+/// K8s scopes names per namespace; a flat TOML table does not, so a
+/// silent `insert` would overwrite the earlier app.
+fn insert_app_without_overwrite(
+    config: &mut Config,
+    report: &mut MigrationReport,
+    name: &str,
+    app: AppSpec,
+    kind: &str,
+) -> String {
+    let key = if config.app.contains_key(name) {
+        let namespace = app
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let renamed = format!("{namespace}-{name}");
+        report.warnings.push(MigrationWarning {
+            resource: format!("{kind}/{name}"),
+            message: format!(
+                "name collides with an earlier resource from another namespace; imported as [app.{renamed}]"
+            ),
+        });
+        renamed
+    } else {
+        name.to_string()
+    };
+    config.app.insert(key.clone(), app);
+    key
+}
+
 // ---------------------------------------------------------------------------
 // Field mapping: Deployment → AppSpec
 // ---------------------------------------------------------------------------
 
-fn deployment_to_app(deploy: &Deployment) -> AppSpec {
+fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationReport) -> AppSpec {
     let spec = deploy.spec.as_ref();
     let template = spec.map(|s| &s.template);
     let pod_spec = template.and_then(|t| t.spec.as_ref());
@@ -395,6 +426,16 @@ fn deployment_to_app(deploy: &Deployment) -> AppSpec {
 
     let mut app = empty_app_spec();
     app.image = container.and_then(|c| c.image.clone());
+    app.namespace = deploy.metadata.namespace.clone();
+
+    // K8s splits the entrypoint into `command` (argv prefix) and `args`;
+    // Reliaburger has a single command vector — concatenate them.
+    if let Some(c) = container {
+        let mut command = c.command.clone().unwrap_or_default();
+        command.extend(c.args.clone().unwrap_or_default());
+        app.command = command;
+    }
+
     app.replicas = spec
         .and_then(|s| s.replicas)
         .map(|r| Replicas::Fixed(r as u32))
@@ -432,12 +473,22 @@ fn deployment_to_app(deploy: &Deployment) -> AppSpec {
         }
     }
 
-    // Env vars
+    // Env vars. Plain values convert directly; `valueFrom` references
+    // (secret/configmap/field) have no automatic mapping — surface them
+    // as warnings instead of dropping them silently.
     if let Some(env_list) = container.and_then(|c| c.env.as_ref()) {
         for env_var in env_list {
             if let Some(ref value) = env_var.value {
                 app.env
                     .insert(env_var.name.clone(), EnvValue::Plain(value.clone()));
+            } else if env_var.value_from.is_some() {
+                report.warnings.push(MigrationWarning {
+                    resource: format!("Deployment/{name}"),
+                    message: format!(
+                        "env {} uses valueFrom (secret/configmap/field ref) — set the value manually or use `relish secret encrypt`",
+                        env_var.name
+                    ),
+                });
             }
         }
     }
@@ -500,6 +551,7 @@ fn daemonset_to_app(ds: &DaemonSet) -> AppSpec {
 
     let mut app = empty_app_spec();
     app.image = container.and_then(|c| c.image.clone());
+    app.namespace = ds.metadata.namespace.clone();
     app.replicas = Replicas::DaemonSet;
     app.port = container
         .and_then(|c| c.ports.as_ref())
@@ -516,6 +568,7 @@ fn statefulset_to_app(ss: &StatefulSet) -> AppSpec {
 
     let mut app = empty_app_spec();
     app.image = container.and_then(|c| c.image.clone());
+    app.namespace = ss.metadata.namespace.clone();
     app.replicas = spec
         .and_then(|s| s.replicas)
         .map(|r| Replicas::Fixed(r as u32))
@@ -742,6 +795,107 @@ spec:
         assert_eq!(app.image.as_deref(), Some("myapp:v1"));
         assert_eq!(app.replicas, Replicas::Fixed(3));
         assert_eq!(app.port, Some(8080));
+    }
+
+    /// M17 regression: `command`/`args`, `env.valueFrom` and the K8s
+    /// namespace used to be silently dropped on import.
+    #[test]
+    fn k8s_import_preserves_command_args_valuefrom_namespace() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: staging
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: worker
+        image: worker:v3
+        command: ["python"]
+        args: ["-m", "worker.main"]
+        env:
+        - name: MODE
+          value: fast
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: password
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        let app = &result.config.app["worker"];
+
+        // command + args concatenated into the single command vector
+        assert_eq!(app.command, vec!["python", "-m", "worker.main"]);
+
+        // namespace preserved
+        assert_eq!(app.namespace.as_deref(), Some("staging"));
+
+        // plain env kept
+        assert!(matches!(
+            app.env.get("MODE"),
+            Some(EnvValue::Plain(v)) if v == "fast"
+        ));
+
+        // valueFrom entries not silently dropped: absent from env but warned
+        assert!(!app.env.contains_key("DB_PASSWORD"));
+        let warnings: Vec<String> = result
+            .report
+            .warnings
+            .iter()
+            .map(|w| format!("{}: {}", w.resource, w.message))
+            .collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("DB_PASSWORD")),
+            "expected a valueFrom warning for DB_PASSWORD, got: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("NODE_NAME")),
+            "expected a valueFrom warning for NODE_NAME, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn k8s_import_same_name_in_two_namespaces_does_not_overwrite() {
+        let yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: alpha
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        image: api:alpha
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: beta
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        image: api:beta
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app.len(), 2, "second app must not overwrite");
+        assert_eq!(result.config.app["api"].image.as_deref(), Some("api:alpha"));
+        assert_eq!(
+            result.config.app["beta-api"].image.as_deref(),
+            Some("api:beta")
+        );
     }
 
     #[test]

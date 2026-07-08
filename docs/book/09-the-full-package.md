@@ -179,6 +179,38 @@ Reformats a TOML config with canonical section ordering. The order is: namespace
 
 The formatter is idempotent. Running it twice produces the same output as running it once.
 
+#### The bug that ate configs
+
+The first version of the formatter had a bug that's worth dissecting, because the fix teaches a defensive pattern you'll reuse.
+
+The emission code walked one level of nesting: `[app.web]` worked, but a nested table like `[app.web.health]` hit a fallback that serialised the whole health table with `toml::to_string`. That function serialises a *document* — `path = "/health"` on its own line — not a *value*. The output ended up as `health = path = "/health"`, which isn't TOML at all. And because `relish fmt` writes in place, it wrote that garbage straight over your config. Format once, lose your file.
+
+Two fixes. The first is the obvious one: emit sections recursively, so `[app.web.health]` gets its own dotted header no matter how deep it nests. Scalar fields print inline via `toml::Value`'s `Display` implementation, which produces value syntax (strings quoted, arrays bracketed), never document syntax.
+
+The second fix is the interesting one. The formatter now refuses to return output it can't verify:
+
+```rust
+fn verify_roundtrip(
+    original: &BTreeMap<String, toml::Value>,
+    output: &str,
+) -> Result<(), RelishError> {
+    let reparsed: BTreeMap<String, toml::Value> = toml::from_str(output)
+        .map_err(|e| RelishError::FormatFailed(format!(
+            "formatter produced invalid TOML ({e}); file left untouched"
+        )))?;
+    if &reparsed != original {
+        return Err(RelishError::FormatFailed(
+            "formatted output would change the config's meaning; file left untouched".to_string(),
+        ));
+    }
+    Ok(())
+}
+```
+
+Parse what you're about to write, and compare it with what you started from. `toml::Value` derives `PartialEq`, so `!=` here is a deep structural comparison of the whole value tree — every table, every array, every string, in one operator. In C you'd write a recursive comparison by hand; in Rust the derive gives it to you for free, and the compiler guarantees it stays in sync with the type.
+
+Can you see what this buys us? The formatter can still have bugs. But now a bug produces an error message instead of a corrupted file. When a tool rewrites user data in place, "fail loudly" beats "trust the code" every time.
+
 ### `relish diff`
 
 Shows a structural, field-by-field diff between two configs. Not a text diff -- a semantic one. It knows that changing `image` from `v1` to `v2` is a modification, adding a new `[app.api]` section is an addition, and removing `[job.migrate]` is a deletion.
@@ -192,6 +224,16 @@ $ relish diff old.toml new.toml
 ```
 
 The output serialises to JSON for programmatic consumption. Lettuce's diff engine reuses the same structural comparison logic.
+
+### Exit codes are an API
+
+A CLI has two output channels: what it prints, and what it returns. Scripts read the second one. For a long time `relish apply` got this wrong: when the agent was unreachable, it printed a dry-run plan, added a polite note, and exited 0. Run that from CI with the agent down and your pipeline goes green while deploying nothing.
+
+The fix splits the two intents apart. `relish apply --dry-run` previews the plan and exits 0 — that's the explicit "don't deploy" path. Plain `relish apply` with no reachable agent still prints the plan for reference, but exits non-zero with an error saying nothing was deployed. If a script wanted the old behaviour, it now has to ask for it by name.
+
+The same pass fixed a quieter lie in `relish logs`. The `--grep`, `--since`, and `--json-field` flags parsed fine and were then bound to variables named `_grep`, `_since`, `_json_field` — the underscore prefix being Rust's way of saying "I know this is unused, don't warn me". The flags did nothing, silently. Now `--grep` and `--since` travel to the server as query parameters (the endpoints already supported them), and `--json-field key=value` filters client-side, keeping only lines that parse as JSON with a matching field. In follow mode the SSE stream can't filter server-side, so the same filters apply client-side as each line arrives.
+
+The lesson generalises. An unused-variable warning is the compiler telling you your feature doesn't work; naming the variable `_grep` to quiet it is shooting the messenger. If a flag exists, it either works or the command should reject it.
 
 ## WebSocket proxying
 
@@ -407,7 +449,10 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 
 - `spec.replicas` → `replicas`
 - `spec.template.spec.containers[0].image` → `image`
-- `spec.template.spec.containers[0].ports[0].containerPort` → `port`
+- `containers[0].command` + `containers[0].args` → `command` (concatenated — K8s splits the argv into two fields, we keep one)
+- `metadata.namespace` → `namespace`
+- `containers[0].ports[0].containerPort` → `port`
+- `env[].value` → `env` (plain values)
 - `readinessProbe.httpGet.path` → `health.path`
 - `strategy.rollingUpdate.maxSurge` → `deploy.max_surge`
 - `terminationGracePeriodSeconds` → `deploy.drain_timeout`
@@ -415,6 +460,12 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 - `initContainers` → `init`
 
 DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly.
+
+Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
+
+Env vars that use `valueFrom` (secret refs, configmap refs, field refs) still can't map automatically — there's no way to reach into another cluster's secret store. But now they land in the migration report as warnings naming each variable, instead of vanishing. The rule the importer follows: convert what you can, warn about what you can't, drop nothing silently.
+
+One more K8s-ism: names are scoped per namespace, so `api` in `alpha` and `api` in `beta` are different workloads. A flat TOML table has one key per name. When the importer sees a collision it keeps the first app under its own name and imports the second as `[app.beta-api]`, with a warning — rather than letting the second overwrite the first.
 
 ### The migration report
 

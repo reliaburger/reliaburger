@@ -25,58 +25,89 @@ pub fn format_toml(input: &str) -> Result<String, RelishError> {
     let table: BTreeMap<String, toml::Value> =
         toml::from_str(input).map_err(|e| RelishError::FormatFailed(e.to_string()))?;
 
-    // Rebuild with canonical section ordering
     let mut output = String::new();
 
-    // First emit sections in canonical order
-    for &section in SECTION_ORDER {
-        if let Some(value) = table.get(section) {
-            append_section(&mut output, section, value);
-        }
-    }
-
-    // Then emit any sections not in the canonical list (alphabetically)
+    // Top-level scalars first: emitted after any section header they
+    // would silently become part of that section, changing the config.
+    let mut scalars = String::new();
     for (key, value) in &table {
-        if !SECTION_ORDER.contains(&key.as_str()) {
-            append_section(&mut output, key, value);
+        if !value.is_table() {
+            scalars.push_str(&format!("{key} = {}\n", inline_value(value)));
+        }
+    }
+    if !scalars.is_empty() {
+        output.push_str(&scalars);
+        output.push('\n');
+    }
+
+    // Sections in canonical order, then any others alphabetically
+    for &section in SECTION_ORDER {
+        if let Some(toml::Value::Table(sub)) = table.get(section) {
+            append_table(&mut output, section, sub);
+        }
+    }
+    for (key, value) in &table {
+        if !SECTION_ORDER.contains(&key.as_str())
+            && let toml::Value::Table(sub) = value
+        {
+            append_table(&mut output, key, sub);
         }
     }
 
+    verify_roundtrip(&table, &output)?;
     Ok(output)
 }
 
-/// Append a top-level section to the output string.
-fn append_section(output: &mut String, key: &str, value: &toml::Value) {
-    match value {
-        toml::Value::Table(sub) => {
-            // Each sub-key becomes a [key.subkey] section
-            for (sub_key, sub_val) in sub {
-                output.push_str(&format!("[{key}.{sub_key}]\n"));
-                if let toml::Value::Table(fields) = sub_val {
-                    append_fields(output, fields);
-                } else {
-                    output.push_str(&format!("{sub_key} = {}\n", format_value(sub_val)));
-                }
-                output.push('\n');
+/// Refuse to hand back output that re-parses to a different value tree.
+///
+/// This is the guard against formatter bugs corrupting user configs: the
+/// caller writes the formatted string over the original file, so a
+/// mismatch here must fail loudly rather than silently lose data.
+fn verify_roundtrip(
+    original: &BTreeMap<String, toml::Value>,
+    output: &str,
+) -> Result<(), RelishError> {
+    let reparsed: BTreeMap<String, toml::Value> = toml::from_str(output).map_err(|e| {
+        RelishError::FormatFailed(format!(
+            "formatter produced invalid TOML ({e}); file left untouched"
+        ))
+    })?;
+    if &reparsed != original {
+        return Err(RelishError::FormatFailed(
+            "formatted output would change the config's meaning; file left untouched".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Append a table as a `[path]` section: scalar and array fields first,
+/// then each nested table recursively as its own dotted section.
+fn append_table(output: &mut String, path: &str, table: &toml::map::Map<String, toml::Value>) {
+    let has_scalars = table.values().any(|v| !v.is_table());
+
+    if has_scalars || table.is_empty() {
+        output.push_str(&format!("[{path}]\n"));
+        for (k, v) in table {
+            if !v.is_table() {
+                output.push_str(&format!("{k} = {}\n", inline_value(v)));
             }
         }
-        _ => {
-            output.push_str(&format!("{key} = {}\n\n", format_value(value)));
+        output.push('\n');
+    }
+
+    for (k, v) in table {
+        if let toml::Value::Table(sub) = v {
+            append_table(output, &format!("{path}.{k}"), sub);
         }
     }
 }
 
-/// Append table fields (key = value pairs) sorted alphabetically.
-fn append_fields(output: &mut String, fields: &toml::map::Map<String, toml::Value>) {
-    for (k, v) in fields {
-        output.push_str(&format!("{k} = {}\n", format_value(v)));
-    }
-}
-
-/// Format a TOML value for output.
-fn format_value(value: &toml::Value) -> String {
-    // Use toml's serialiser for correct escaping
-    toml::to_string(value).unwrap_or_else(|_| value.to_string())
+/// Format a TOML value inline (strings quoted, arrays bracketed,
+/// tables in `{ … }` form). `toml::Value`'s `Display` produces exactly
+/// this; `toml::to_string` must NOT be used here — it serialises tables
+/// in document form, which is invalid on the right of `=`.
+fn inline_value(value: &toml::Value) -> String {
+    value.to_string()
 }
 
 /// Check whether a TOML string is already formatted.
@@ -171,5 +202,104 @@ port = 8080
         let input = "[app.web]\nimage = \"myapp:v1\"\n";
         let formatted = format_toml(input).unwrap();
         assert!(is_formatted(&formatted).unwrap());
+    }
+
+    /// H11 regression: nested tables like `[app.web.health]` used to be
+    /// emitted in document form on the right of `=`, producing invalid
+    /// TOML that was written back over the user's file.
+    #[test]
+    fn fmt_roundtrips_nested_health_ingress_autoscale_tables() {
+        let input = r#"
+[app.web]
+image = "myapp:v1"
+replicas = 3
+port = 8080
+
+[app.web.health]
+path = "/health"
+interval = 5
+threshold_unhealthy = 3
+
+[app.web.ingress]
+host = "web.example.com"
+
+[app.web.deploy]
+strategy = "rolling"
+max_unavailable = 1
+
+[app.web.autoscale]
+metric = "cpu"
+target = "70%"
+min = 1
+max = 10
+"#;
+        let original: BTreeMap<String, toml::Value> = toml::from_str(input).unwrap();
+        let formatted = format_toml(input).unwrap();
+        let reparsed: BTreeMap<String, toml::Value> = toml::from_str(&formatted)
+            .unwrap_or_else(|e| panic!("formatted output is invalid TOML: {e}\n{formatted}"));
+        assert_eq!(original, reparsed, "value tree changed:\n{formatted}");
+    }
+
+    #[test]
+    fn fmt_roundtrips_deeply_nested_and_array_values() {
+        let input = r#"
+[app.api]
+image = "api:v2"
+command = ["serve", "--port", "9000"]
+
+[app.api.env]
+LOG_LEVEL = "debug"
+
+[app.api.placement]
+required = ["zone=eu-west"]
+preferred = []
+"#;
+        let original: BTreeMap<String, toml::Value> = toml::from_str(input).unwrap();
+        let formatted = format_toml(input).unwrap();
+        let reparsed: BTreeMap<String, toml::Value> = toml::from_str(&formatted).unwrap();
+        assert_eq!(original, reparsed, "value tree changed:\n{formatted}");
+    }
+
+    #[test]
+    fn fmt_nested_output_is_idempotent() {
+        let input = r#"
+[app.web]
+image = "myapp:v1"
+
+[app.web.health]
+path = "/health"
+"#;
+        let first = format_toml(input).unwrap();
+        let second = format_toml(&first).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn roundtrip_guard_rejects_output_that_changes_meaning() {
+        let original: BTreeMap<String, toml::Value> =
+            toml::from_str("[app.web]\nport = 8080\n").unwrap();
+        // Output that parses fine but carries a different value
+        let err = verify_roundtrip(&original, "[app.web]\nport = 9999\n").unwrap_err();
+        assert!(err.to_string().contains("meaning"), "got: {err}");
+    }
+
+    #[test]
+    fn roundtrip_guard_rejects_invalid_output() {
+        let original: BTreeMap<String, toml::Value> =
+            toml::from_str("[app.web]\nport = 8080\n").unwrap();
+        let err = verify_roundtrip(&original, "not [ valid").unwrap_err();
+        assert!(err.to_string().contains("invalid TOML"), "got: {err}");
+    }
+
+    #[test]
+    fn fmt_emits_top_level_scalars_before_sections() {
+        // A top-level scalar emitted after a section header would be
+        // swallowed into that section on re-parse; the guard catches it,
+        // but the emission order must make it valid in the first place.
+        let input = "title = \"cluster\"\n\n[app.web]\nimage = \"a:1\"\n";
+        let formatted = format_toml(input).unwrap();
+        let title_pos = formatted.find("title").unwrap();
+        let section_pos = formatted.find("[app").unwrap();
+        assert!(title_pos < section_pos, "got:\n{formatted}");
     }
 }

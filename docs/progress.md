@@ -297,6 +297,8 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
+Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
+
 - [ ] `L1` Scheduler → placement → remote dispatch (deploys currently always run on the local agent); fix `H8` spread weighting
 - [ ] `L2` Production `DeployDriver` + orchestrator for rolling/blue-green
 - [ ] `L3` Spawn the autoscale loop
@@ -308,9 +310,9 @@ each wiring item lands with an integration test that drives the **binary**, not 
 - [ ] `L13` Spawn the Lettuce GitOps sync loop; enable the webhook endpoint; fix `H12` trusted-key check
 - [ ] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists (currently faults are only recorded)
 - [ ] `L16` Program egress allowlists
-- [ ] `M17` K8s import fidelity (`command`/`args`, `env.valueFrom`, namespace)
-- [ ] `H11` Fix `relish fmt` for nested-table configs (currently writes invalid TOML back over the file)
-- [ ] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `relish build` target/501, `rollback` no-op, `logs --grep` discarded, dry-run exit 0, no-args TUI claim
+- [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
+- [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
+- [ ] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X1` build lands with W5, `X3` rollback with W7, `X6` no-args TUI → [tui-plan-2026-07.md](tui-plan-2026-07.md)
 
 ### Throughout
 
