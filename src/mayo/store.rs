@@ -17,6 +17,14 @@ use datafusion::prelude::*;
 
 use super::types::{MayoError, MetricKey, Sample};
 
+/// Escape a value for safe interpolation into a single-quoted SQL string
+/// literal (M1). DataFusion follows standard SQL: a `'` inside a literal is
+/// doubled. Without this, a query param like `x' OR '1'='1` breaks out of
+/// the literal and can read other namespaces' data.
+pub(crate) fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Arrow schema for the metrics table.
 pub fn metrics_schema() -> Schema {
     Schema::new(vec![
@@ -302,6 +310,7 @@ impl MayoStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        let metric_name = escape_sql_literal(metric_name);
         let sql = format!(
             "SELECT timestamp, metric_name, labels, value FROM metrics \
              WHERE metric_name = '{metric_name}' \
@@ -328,6 +337,8 @@ impl MayoStore {
             .as_secs();
         let start = now.saturating_sub(window_secs);
 
+        let metric_name = escape_sql_literal(metric_name);
+        let app_label = escape_sql_literal(app_label);
         let sql = format!(
             "SELECT AVG(value) as avg_val FROM metrics \
              WHERE metric_name = '{metric_name}' \
@@ -559,6 +570,26 @@ mod tests {
 
         let results = store.query("nonexistent", 0, 9999).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn escape_sql_literal_doubles_quotes() {
+        assert_eq!(escape_sql_literal("cpu_usage"), "cpu_usage");
+        assert_eq!(escape_sql_literal("a'b"), "a''b");
+        assert_eq!(escape_sql_literal("x' OR '1'='1"), "x'' OR ''1''=''1");
+    }
+
+    /// M1: an injection payload in the metric name must not break out of
+    /// the SQL literal and leak another metric's rows.
+    #[tokio::test]
+    async fn query_metric_name_injection_is_neutralised() {
+        let (mut store, _dir) = test_store();
+        store.insert(&MetricKey::simple("secret"), Sample::at(1000, 9.9));
+        store.flush().await.unwrap();
+
+        // Classic `' OR '1'='1` — if unescaped it would return every row.
+        let results = store.query("x' OR '1'='1", 0, 9999).await.unwrap();
+        assert!(results.is_empty(), "SQL injection leaked rows: {results:?}");
     }
 
     #[tokio::test]
