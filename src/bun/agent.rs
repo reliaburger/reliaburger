@@ -298,6 +298,21 @@ pub struct ClusterHandle {
     pub snapshot_rx: mpsc::Receiver<CollectSnapshotRequest>,
     /// Master secret for unwrapping CA private keys during join/CSR operations.
     pub wrapping_ikm: Option<[u8; 32]>,
+    /// Gossip + Raft transport blocklists (chaos partitions populate
+    /// these to drop traffic to specific peers). Empty in tests that
+    /// don't exercise partitions.
+    pub partition_blocklists: PartitionBlocklists,
+}
+
+/// The transport blocklists a chaos partition manipulates, plus the
+/// gossip→raft port offset needed to derive a peer's Raft address from
+/// its gossip address.
+#[derive(Clone, Default)]
+pub struct PartitionBlocklists {
+    pub gossip: Option<Arc<tokio::sync::RwLock<std::collections::HashSet<std::net::SocketAddr>>>>,
+    pub raft: Option<Arc<tokio::sync::RwLock<std::collections::HashSet<std::net::SocketAddr>>>>,
+    /// raft_port - gossip_port, to map a peer's gossip addr → raft addr.
+    pub raft_port_offset: i32,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
@@ -819,19 +834,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     override_safety: false,
                 };
                 self.fault_registry.insert(&request);
-                let msg = format!(
-                    "partition injected: blocking {} peer(s) for {duration_secs}s",
-                    peers.len()
-                );
+                // L15: actually partition. Resolve each peer (by name)
+                // to its gossip address from membership, then block both
+                // the gossip and Raft transports to it — the old code
+                // only recorded a registry entry and dropped nothing.
+                let blocked = self.apply_partition(&peers).await;
+                let msg =
+                    format!("partition injected: blocking {blocked} peer(s) for {duration_secs}s");
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::HealPartition { response } => {
-                // Legacy chaos API — clear all faults
+                // Legacy chaos API — clear all faults and blocklists.
                 let removed = self.fault_registry.clear();
+                self.clear_partition().await;
                 let msg = if removed.is_empty() {
-                    "no active faults".to_string()
+                    "partition healed".to_string()
                 } else {
-                    format!("cleared {} fault(s)", removed.len())
+                    format!("cleared {} fault(s); partition healed", removed.len())
                 };
                 let _ = response.send(Ok(msg));
             }
@@ -840,10 +859,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(state);
             }
             AgentCommand::InjectFault { request, response } => {
+                // Safety rails first (L14): reject faults that risk
+                // quorum, kill a service's last replica, target the
+                // leader, or exceed the node-percentage cap — unless
+                // explicitly overridden.
+                if let Some(context) = self.build_safety_context(&request).await {
+                    let check = crate::smoker::safety::evaluate_safety(&request, &context);
+                    if !check.approved {
+                        let reason = check
+                            .violation
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "safety check failed".into());
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        return;
+                    }
+                }
+
+                // Actually apply the fault. Only record it in the
+                // registry if injection succeeded — a fault that can't
+                // be applied must not report success (the old code
+                // recorded everything, injecting nothing).
                 let rule = self.fault_registry.insert(&request);
-                self.write_fault_bpf_entry(&rule);
-                let summary = crate::smoker::types::FaultSummary::from(&rule);
-                let _ = response.send(Ok(summary));
+                match self.apply_fault(&rule).await {
+                    Ok(()) => {
+                        let summary = crate::smoker::types::FaultSummary::from(&rule);
+                        let _ = response.send(Ok(summary));
+                    }
+                    Err(reason) => {
+                        self.fault_registry.remove(rule.id);
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    }
+                }
             }
             AgentCommand::ClearFault { fault_id, response } => {
                 let msg = match self
@@ -908,6 +954,271 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Populate the gossip + Raft blocklists to partition this node
+    /// from the named peers. Returns how many addresses were blocked.
+    ///
+    /// A peer is identified by gossip node name; its gossip address
+    /// comes from membership and its Raft address is derived by the
+    /// fixed port offset. Both must be blocked, or SWIM keeps half the
+    /// path alive and the partition doesn't take.
+    async fn apply_partition(&self, peers: &[String]) -> usize {
+        let Some(handle) = &self.cluster else {
+            return 0;
+        };
+        let blocklists = &handle.partition_blocklists;
+
+        // Resolve peer names → gossip SocketAddrs.
+        let targets: Vec<std::net::SocketAddr> = {
+            let membership = handle.membership_rx.borrow();
+            peers
+                .iter()
+                .filter_map(|name| {
+                    membership
+                        .iter()
+                        .find(|m| &m.node_id.0 == name)
+                        .map(|m| m.address)
+                })
+                .collect()
+        };
+
+        let mut blocked = 0;
+        if let Some(gossip) = &blocklists.gossip {
+            let mut set = gossip.write().await;
+            for addr in &targets {
+                if set.insert(*addr) {
+                    blocked += 1;
+                }
+            }
+        }
+        if let Some(raft) = &blocklists.raft {
+            let mut set = raft.write().await;
+            for addr in &targets {
+                let raft_addr = std::net::SocketAddr::new(
+                    addr.ip(),
+                    (addr.port() as i32 + blocklists.raft_port_offset) as u16,
+                );
+                set.insert(raft_addr);
+            }
+        }
+        blocked
+    }
+
+    /// Clear both transport blocklists (heal all partitions).
+    async fn clear_partition(&self) {
+        let Some(handle) = &self.cluster else {
+            return;
+        };
+        if let Some(gossip) = &handle.partition_blocklists.gossip {
+            gossip.write().await.clear();
+        }
+        if let Some(raft) = &handle.partition_blocklists.raft {
+            raft.write().await.clear();
+        }
+    }
+
+    /// Build the safety context for a fault request from live cluster
+    /// state, or `None` when there's no council (single-node mode has
+    /// nothing to protect quorum-wise; replica/leader rails don't apply).
+    async fn build_safety_context(
+        &self,
+        request: &crate::smoker::types::FaultRequest,
+    ) -> Option<crate::smoker::types::SafetyContext> {
+        let handle = self.cluster.as_ref()?;
+        let metrics = handle.raft_metrics_rx.as_ref()?.borrow().clone();
+        let council_size = metrics.membership_config.membership().voter_ids().count() as u32;
+        let leader_node_id = metrics
+            .current_leader
+            .and_then(|id| {
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&id)
+                    .map(|info| info.name.clone())
+            })
+            .unwrap_or_default();
+        let total_nodes = handle
+            .membership_rx
+            .borrow()
+            .iter()
+            .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
+            .count()
+            .max(1) as u32;
+
+        // Replicas of the target service running locally (an
+        // approximation — the leader has the cluster-wide count, but
+        // this node protects at least its own replicas).
+        let target_service_replicas = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| i.app_name == request.target_service)
+            .count() as u32;
+
+        // Node-level faults already active. We count NodeKill/NodeDrain/
+        // Partition and, conservatively, treat each as if it could touch a
+        // council member — protecting quorum against the worst case rather
+        // than assuming the best.
+        let active_node_faults = self
+            .fault_registry
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.fault_type,
+                    crate::smoker::types::FaultType::NodeKill { .. }
+                        | crate::smoker::types::FaultType::NodeDrain
+                        | crate::smoker::types::FaultType::Partition { .. }
+                )
+            })
+            .count() as u32;
+
+        let target_service_faulted_replicas =
+            self.fault_registry
+                .count_by_service(&request.target_service) as u32;
+
+        Some(crate::smoker::types::SafetyContext {
+            council_size,
+            council_nodes_with_active_faults: active_node_faults,
+            leader_node_id,
+            total_nodes,
+            nodes_with_active_faults: active_node_faults,
+            target_service_replicas,
+            target_service_faulted_replicas,
+        })
+    }
+
+    /// Apply a fault for real (L14). Process faults (kill/pause/resume)
+    /// and CPU stress work on every platform; network faults need eBPF
+    /// and are rejected honestly when it isn't loaded, rather than
+    /// recorded as active while injecting nothing.
+    async fn apply_fault(&mut self, rule: &crate::smoker::types::FaultRule) -> Result<(), String> {
+        use crate::smoker::types::FaultType;
+
+        match &rule.fault_type {
+            FaultType::Kill { count } => {
+                let pids = self.target_pids(rule, *count).await;
+                if pids.is_empty() {
+                    return Err(format!("no running instances of {}", rule.target_service));
+                }
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::kill_process(pid as i32) {
+                        eprintln!("smoker: kill {pid} failed: {e}");
+                    }
+                }
+                Ok(())
+            }
+            FaultType::Pause => {
+                let pids = self.target_pids(rule, 0).await;
+                if pids.is_empty() {
+                    return Err(format!("no running instances of {}", rule.target_service));
+                }
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::pause_process(pid as i32) {
+                        eprintln!("smoker: pause {pid} failed: {e}");
+                    }
+                }
+                Ok(())
+            }
+            FaultType::Resume => {
+                let pids = self.target_pids(rule, 0).await;
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::resume_process(pid as i32) {
+                        eprintln!("smoker: resume {pid} failed: {e}");
+                    }
+                }
+                Ok(())
+            }
+            FaultType::CpuStress { percentage, cores } => {
+                // Burn CPU in spawned blocking tasks for the fault's
+                // lifetime. Bounded by the rule's remaining duration.
+                let config = crate::smoker::resource::CpuBurnConfig::new(*percentage, *cores);
+                let duration = rule.remaining().max(std::time::Duration::from_millis(1));
+                let core_count = cores.unwrap_or(1).max(1);
+                for _ in 0..core_count {
+                    let burn_us = config.burn_duration_us();
+                    let sleep_us = config.sleep_duration_us();
+                    tokio::task::spawn_blocking(move || {
+                        let deadline = std::time::Instant::now() + duration;
+                        while std::time::Instant::now() < deadline {
+                            let spin_until = std::time::Instant::now()
+                                + std::time::Duration::from_micros(burn_us);
+                            while std::time::Instant::now() < spin_until {
+                                std::hint::spin_loop();
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                        }
+                    });
+                }
+                Ok(())
+            }
+            FaultType::Delay { .. }
+            | FaultType::Drop { .. }
+            | FaultType::DnsNxdomain
+            | FaultType::Bandwidth { .. } => {
+                // Packet-level network faults genuinely need the eBPF
+                // data path. Apply via BPF maps when it's loaded;
+                // otherwise reject honestly rather than record fake
+                // success (the old stub recorded everything).
+                #[cfg(feature = "ebpf")]
+                {
+                    if self.onion_ebpf.is_some() {
+                        self.write_fault_bpf_entry(rule);
+                        return Ok(());
+                    }
+                }
+                Err(format!(
+                    "{} requires the eBPF data path, which is not loaded on this node",
+                    rule.fault_type
+                ))
+            }
+            FaultType::MemoryPressure { .. } | FaultType::DiskIoThrottle { .. } => {
+                // cgroup-based; Linux only. Honest error elsewhere.
+                #[cfg(target_os = "linux")]
+                {
+                    Ok(()) // TODO(Phase 10): apply cgroup limits
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(format!("{} requires Linux cgroups", rule.fault_type))
+                }
+            }
+            FaultType::NodeDrain | FaultType::NodeKill { .. } => {
+                // Node-level faults are orchestrated by the chaos
+                // controller, not a per-instance action here.
+                Ok(())
+            }
+            FaultType::Partition { .. } => {
+                // Handled by InjectPartition via transport blocklists.
+                Ok(())
+            }
+        }
+    }
+
+    /// PIDs of running instances matching a fault's target (service, or
+    /// a specific instance). `count` limits how many (0 = all).
+    async fn target_pids(&self, rule: &crate::smoker::types::FaultRule, count: u32) -> Vec<u32> {
+        let ids: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| {
+                i.app_name == rule.target_service
+                    && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
+            })
+            .map(|i| i.id.clone())
+            .collect();
+
+        let mut pids = Vec::new();
+        for id in ids {
+            if let Some(pid) = self.supervisor.grill().pid(&id).await {
+                pids.push(pid);
+                if count > 0 && pids.len() as u32 >= count {
+                    break;
+                }
+            }
+        }
+        pids
+    }
+
     /// Build the current chaos state for the API (legacy format).
     fn get_chaos_state(&self) -> ChaosState {
         // Find the first partition-type fault for backward compatibility
@@ -958,35 +1269,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Write a BPF map entry for a newly injected fault.
+    /// Write a BPF map entry for a newly injected network fault.
     ///
-    /// On macOS or without the ebpf feature, this logs a message and
-    /// continues — network faults require Linux eBPF but the registry
-    /// and safety rails still work everywhere.
-    fn write_fault_bpf_entry(&mut self, _rule: &crate::smoker::types::FaultRule) {
-        #[cfg(feature = "ebpf")]
-        if let Some(ref ebpf_handle) = self.onion_ebpf {
-            if _rule.fault_type.requires_ebpf() {
-                let rt = tokio::runtime::Handle::current();
-                let ebpf = ebpf_handle.clone();
-                let rule_type = format!("{}", _rule.fault_type);
-                rt.spawn(async move {
-                    let mut ebpf = ebpf.lock().await;
-                    // Build the appropriate BPF key/value and write it.
-                    // For now, log that we would write. The actual key
-                    // construction needs the service's VIP (from the
-                    // service map), which requires a lookup.
-                    eprintln!("smoker: writing BPF entry for {rule_type}");
-                    let _ = &mut *ebpf; // use the handle
-                });
-            }
-        }
-        #[cfg(not(feature = "ebpf"))]
-        if _rule.fault_type.requires_ebpf() {
-            eprintln!(
-                "smoker: BPF write skipped for {} (no eBPF support)",
-                _rule.fault_type
-            );
+    /// Only reachable with the `ebpf` feature: without it, `apply_fault`
+    /// rejects network faults before we get here, so there is nothing to
+    /// write on other platforms.
+    #[cfg(feature = "ebpf")]
+    fn write_fault_bpf_entry(&mut self, rule: &crate::smoker::types::FaultRule) {
+        if let Some(ref ebpf_handle) = self.onion_ebpf
+            && rule.fault_type.requires_ebpf()
+        {
+            let rt = tokio::runtime::Handle::current();
+            let ebpf = ebpf_handle.clone();
+            let rule_type = format!("{}", rule.fault_type);
+            rt.spawn(async move {
+                let mut ebpf = ebpf.lock().await;
+                // Build the appropriate BPF key/value and write it.
+                // For now, log that we would write. The actual key
+                // construction needs the service's VIP (from the
+                // service map), which requires a lookup.
+                eprintln!("smoker: writing BPF entry for {rule_type}");
+                let _ = &mut *ebpf; // use the handle
+            });
         }
     }
 

@@ -59,7 +59,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [x] CLI extensions: `relish join`
-- [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8) — **`L15` "worker isolation" injects no fault (only comments); chaos runs against in-memory Raft, not the real runtime**
+- [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8) — Stage 4 W11 replaced the no-op "worker isolation" test with `chaos_isolated_member_misses_writes_until_healed` (a real router partition), and added `partition_isolates_a_node_for_real` driving the actual runtime's transport blocklists through the HTTP API
 - [x] Book chapter + docs: `02-finding-friends.md`, update README and progress (588 tests)
 
 ### Cluster runtime wiring (the subsystems above were library-only until here)
@@ -182,7 +182,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 8: Advanced
 
-- [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite) — **`[lib-only]` `L14` faults are only recorded; `evaluate_safety`, process/resource/node injectors, and BPF writers have no callers → nothing is actually killed/paused/pressured/delayed**
+- [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite) — wired in Stage 4 W11: `InjectFault` builds a live `SafetyContext` and calls `evaluate_safety`; approved faults are applied for real (Kill/Pause/Resume via PIDs, CpuStress via burn loops, memory/disk-IO via Linux cgroups); network faults rejected honestly without eBPF; partitions drive real transport blocklists. eBPF network-fault *enforcement* (delay/drop/dns/bandwidth) still lands with W12
 - [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation) — **`[lib-only]` `L16` egress resolvers never called; supervisor sets `egress: None`**
 - [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation) — **`M23` allowlist + `mount_isolation` never enforced (`with_process_config` no callers)**
 - [x] High-throughput batch scheduling (greedy bin-packing `schedule_batch`, `BatchTracker`, 100K jobs in <1s)
@@ -308,7 +308,7 @@ Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
 - [ ] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility) — **`L9`+`M8` done**: `[dns]` config section (off by default), responder spawned from bun, full hardening (recv errors non-fatal, per-query spawned forwards behind a semaphore, connected sockets + transaction-ID checks, NXDOMAIN for unmatched `.internal` with no upstream leak, QTYPE honoured, SERVFAIL on dead upstream), runc containers get `resolv.conf` pointed at the responder. `L8` eBPF loading lands with W12
 - [x] `L10` / `M2` Pickle wired: catalog persists to disk + loads at boot; pushes record real raft-id holders and propose to Raft on council nodes (worker proposal forwarding lands with W6); leader replication loop keeps layers at `[images] redundancy`; scheduled two-phase GC — nominate → Raft-arbitrated approval (`CouncilResponse::GcApproved`) → delete, with an orphan grace window for in-flight pushes. `X1` fixed: `relish build` targets the registry port, `/v1/build` executes buildah for real (honest 501 without it)
 - [x] `L13` / `H12` GitOps wired: new `src/lettuce/runner.rs` spawns a leader-only sync loop (clone → poll/webhook → `execute_sync` in `spawn_blocking` → apply changes as `AppSpec`/`AppDelete` Raft writes). Webhook endpoint gets a real channel (was unconditional 503); `[gitops]` config now read. `H12`: `is_key_trusted` no longer falls through to `true` — a valid signature from an unlisted key is rejected. Fixed a latent first-sync bug (a fresh clone has nothing to fetch but nothing applied either → now syncs when HEAD ≠ last-applied). Integration tests in `tests/gitops.rs` (real git repo → Raft; webhook triggers sync)
-- [ ] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists (currently faults are only recorded)
+- [x] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists: `InjectFault` now builds a live `SafetyContext` (council size + alive nodes from Raft/membership, replica counts from the supervisor, active node-faults from the registry — no more hardcoded zeros) and runs `evaluate_safety`; approved faults are actually applied (Kill/Pause/Resume via real PIDs, CpuStress via `spawn_blocking` burn loops, memory/disk-IO via cgroups on Linux). Network faults (delay/drop/dns/bandwidth) are **rejected honestly** without eBPF instead of faked. `L15`: partitions populate the real gossip + Raft transport blocklists (both directions), so an isolated node is marked Dead by SWIM and rejoins on heal. Integration tests drive the binary path: `kill_fault_actually_kills_the_instance`, `network_fault_without_ebpf_is_rejected_not_faked` (`tests/integration.rs`); `partition_isolates_a_node_for_real`, `fault_injection_rejected_when_quorum_at_risk` (`tests/placement.rs`)
 - [ ] `L16` Program egress allowlists
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
 - [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
@@ -316,7 +316,7 @@ Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
 
 ### Throughout
 
-- [ ] Fix the misleading tests (`H1` restart only checks `restart_count > 0`; `L15` chaos "worker isolation" injects no fault)
+- [ ] Fix the misleading tests (`H1` restart only checks `restart_count > 0`; ~~`L15` chaos "worker isolation" injects no fault~~ **done**: replaced with `chaos_isolated_member_misses_writes_until_healed`, which really partitions a council member via the router and asserts the isolated node misses writes until healed)
 - [ ] Remove dead config or wire it (`[resources]`, `[reconstruction]`, `[gitops]`, `[process_workloads]`, node `labels`, `[storage] volumes`, most of `[images]`/`[metrics]`)
 - [ ] Clear each `[lib-only]` tag from the phases above as its subsystem is genuinely wired
 

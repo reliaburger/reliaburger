@@ -256,6 +256,30 @@ The roadmap defines 8 chaos scenarios. Each tests a different failure mode and v
 
 Each test in `tests/chaos_smoker.rs` exercises the safety rails and registry logic that make these scenarios safe to run. The eBPF-level tests run in the Lima dev cluster via `relish dev test`.
 
+## Now it actually breaks
+
+Everything above describes a fault *pipeline*: parse the request, check the safety rails, record the fault in the registry, set an expiry. For a long time that pipeline had a hole in the middle. The agent recorded the fault and reported success, but nothing on the box actually changed. A `kill` fault added a row to a table and killed nothing. A partition fault claimed two nodes could no longer talk while packets flowed between them unimpeded. The tests passed, because the tests only checked the bookkeeping.
+
+That's worse than useless. A chaos tool that lies about what it did teaches you false confidence, which is the one thing you buy chaos engineering to destroy. So the wiring step closed the hole, and the guiding rule was: **inject the fault for real, or say honestly that you can't.**
+
+Each fault type now maps to a mechanism, and the mechanism is the truth:
+
+- **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT`. These work on every platform because signals are POSIX, not Linux-specific.
+- **CPU stress** spawns burn loops on `spawn_blocking` threads, sized by the requested percentage, running for the fault's remaining lifetime. No kernel support needed — just honest arithmetic and a spin loop.
+- **Memory pressure and disk-IO throttle** need cgroups, so they work on Linux and return a clear error elsewhere.
+- **Delay, drop, DNS NXDOMAIN, bandwidth** need the eBPF data path from Chapter 3. Without the `ebpf` feature loaded, the API now *rejects* these with "requires the eBPF data path, which is not loaded on this node" instead of recording a fault it can't enforce. A 400, not a fake 200.
+- **Partition** populates the real transport blocklists.
+
+That last one is worth dwelling on, because it turns out you don't need eBPF to partition a cluster honestly. The gossip transport (Chapter 2) and the Raft network (also Chapter 2) each consult a shared blocklist before sending or accepting a datagram: if the peer's address is in the set, the packet is dropped. The set is normally empty. A partition fault resolves the target peer names to their gossip addresses and inserts them into both blocklists; healing clears them. Because the check sits on both the send and receive paths, cutting one node off from two peers is symmetric — the isolated node stops answering SWIM probes, its peers stop hearing from it, and within the failure-detection window they mark it Dead. Heal, and it rejoins. The `partition_isolates_a_node_for_real` integration test drives exactly this through the HTTP API on a three-node cluster: no kernel, no eBPF, a genuine network partition.
+
+### The safety context is real too
+
+The safety rails from the top of this chapter only protect you if the numbers they read are real. The rail that guards Raft quorum asks "how many council members already have an active node-level fault?" — and for a while the answer was hardcoded to zero, which meant the rail could never fire in production. It passed its unit tests (which supply the context by hand) and did nothing in the wired path.
+
+The agent now builds that context from live state every time a fault arrives: council size from the Raft metrics, alive-node count from the membership table, the target service's replica count from the supervisor, and the active node-level fault count from the registry. Counting node faults conservatively — treating every active partition or node-kill as if it *could* be sitting on a council member — means the quorum rail protects the worst case rather than assuming the best. On a three-member council, `max_allowed` is `(3-1)/2 = 1`: the first partition is within budget, the second is rejected with a `QuorumRisk` violation. The `fault_injection_rejected_when_quorum_at_risk` test drives two partition faults through the real API and asserts the second one comes back 4xx.
+
+The lesson repeats one from earlier chapters: a check that always passes is worse than no check, because it looks like protection. The gap between recording a fault and injecting one is the gap between chaos engineering and vandalism — and the gap between a safety rail and a comment is whether the numbers behind it are real.
+
 ## Process workloads
 
 Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.

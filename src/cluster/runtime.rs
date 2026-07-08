@@ -111,6 +111,9 @@ pub async fn start(
         .await
         .map_err(|e| std::io::Error::other(format!("gossip bind failed: {e}")))?
         .with_key(gossip_key);
+    // Grab the gossip blocklist before the transport moves into the
+    // node — chaos partitions populate it to silently drop datagrams.
+    let gossip_blocklist = transport.blocklist();
 
     let mut node = MustardNode::new(
         NodeId::new(&params.node_name),
@@ -160,6 +163,9 @@ pub async fn start(
         .map_err(|e| std::io::Error::other(format!("raft snapshot store load failed: {e}")))?;
 
     let factory = TcpRaftNetworkFactory::new(raft_id);
+    // Same for the Raft RPC blocklist — a partition must cut both the
+    // gossip and Raft transports or SWIM half-detects the peer.
+    let raft_blocklist = factory.blocklist();
     let council = CouncilNode::new(
         raft_id,
         CouncilConfig::default(),
@@ -333,6 +339,11 @@ pub async fn start(
         council: Some(council),
         snapshot_rx,
         wrapping_ikm: params.wrapping_ikm,
+        partition_blocklists: crate::bun::agent::PartitionBlocklists {
+            gossip: Some(gossip_blocklist),
+            raft: Some(raft_blocklist),
+            raft_port_offset: port_offset,
+        },
     };
 
     Ok((

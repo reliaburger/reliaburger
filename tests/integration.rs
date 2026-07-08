@@ -800,3 +800,120 @@ async fn rollback_without_history_returns_not_found() {
         other => panic!("expected 404 ApiError, got {other:?}"),
     }
 }
+
+/// L14 regression: a Kill fault used to only insert a registry entry —
+/// it killed nothing. Now it actually sends SIGKILL to the instance.
+#[tokio::test]
+async fn kill_fault_actually_kills_the_instance() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let harness = TestHarness::start().await;
+
+    // A long-running process app so there's a live PID to kill.
+    let config = Config::parse(
+        r#"
+        [app.victim]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Grab the PID before the kill.
+    let before = harness.client.status().await.unwrap();
+    let pid_before = before
+        .iter()
+        .find(|s| s.app_name == "victim")
+        .and_then(|s| s.pid)
+        .expect("victim should have a pid");
+
+    let fault = FaultRequest {
+        fault_type: FaultType::Kill { count: 0 },
+        target_service: "victim".into(),
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(5),
+        injected_by: "test".into(),
+        reason: Some("kill test".into()),
+        include_leader: false,
+        override_safety: false,
+    };
+    harness.client.inject_fault(&fault).await.unwrap();
+
+    // The original PID must be dead (the supervisor may restart the app
+    // with a NEW pid, but the killed process is gone).
+    let killed = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            // kill -0 to the old pid: an error means it's gone.
+            let alive = libc_kill(pid_before as i32, 0) == 0;
+            if !alive {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        ok
+    };
+    assert!(
+        killed,
+        "the victim's original process {pid_before} survived the Kill fault"
+    );
+}
+
+/// L14: eBPF-only network faults are rejected honestly when eBPF isn't
+/// loaded, instead of being recorded as active while injecting nothing.
+#[tokio::test]
+async fn network_fault_without_ebpf_is_rejected_not_faked() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let harness = TestHarness::start().await;
+    let config = Config::parse(
+        r#"
+        [app.svc]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let fault = FaultRequest {
+        fault_type: FaultType::Delay {
+            delay_ns: 100_000_000,
+            jitter_ns: 0,
+        },
+        target_service: "svc".into(),
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(5),
+        injected_by: "test".into(),
+        reason: None,
+        include_leader: false,
+        override_safety: false,
+    };
+    let result = harness.client.inject_fault(&fault).await;
+    assert!(
+        result.is_err(),
+        "a network fault without eBPF should be rejected, not silently accepted"
+    );
+
+    // And it must NOT be recorded as an active fault.
+    let active = harness.client.list_faults().await.unwrap();
+    assert!(
+        active.is_empty(),
+        "rejected fault must not appear in the active list: {active:?}"
+    );
+}
+
+// Minimal FFI to `kill(2)` for the liveness probe above (no extra crate).
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+fn libc_kill(pid: i32, sig: i32) -> i32 {
+    unsafe { kill(pid, sig) }
+}

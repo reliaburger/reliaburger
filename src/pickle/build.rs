@@ -376,7 +376,9 @@ mod tests {
     fn execute_build_uses_default_port() {
         let spec = spec_with_destination("pickle://app:latest");
         let job = execute_build(&spec, "sha256:abc", None).unwrap();
-        assert!(job.local_tag.contains("9117"));
+        // Defaults to the Pickle registry port (5050), not the Bun API
+        // port — see the X1 regression note on DEFAULT_PICKLE_PORT.
+        assert!(job.local_tag.contains("5050"));
     }
 
     #[test]

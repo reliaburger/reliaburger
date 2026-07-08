@@ -226,6 +226,7 @@ async fn start_node(
             council,
             snapshot_rx: mpsc::channel(1).1,
             wrapping_ikm: None,
+            partition_blocklists: Default::default(),
         },
         thinks_leader: leader_rx,
         rollup_store,
@@ -478,6 +479,160 @@ async fn autoscaler_scales_up_on_high_metric() {
             total_scaler_instances(&nodes).await
         );
     }
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
+    }
+}
+
+/// W11 (L14): the quorum safety rail rejects a node-level fault that
+/// would risk Raft majority. On a 3-member council `max_allowed = 1`, so
+/// the first partition fault is accepted but a second one — which would
+/// put two council members at risk — is rejected with a 4xx. Drives the
+/// binary path through `/v1/fault`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn fault_injection_rejected_when_quorum_at_risk() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let shutdown = CancellationToken::new();
+    let n1 = start_node("r1", 18741, vec![], &shutdown).await;
+    let n2 = start_node("r2", 18745, vec![local(18741)], &shutdown).await;
+    let n3 = start_node("r3", 18749, vec![local(18741)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+
+    // Wait for a 3-member council so `council_size == 3`.
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await; // let the council grow to 3
+
+    let leader = nodes
+        .iter()
+        .find(|n| *n.thinks_leader.borrow())
+        .expect("leader exists");
+
+    let partition_fault = |by: &str| FaultRequest {
+        fault_type: FaultType::Partition {
+            source_app: None,
+            source_cgroup_id: 0,
+        },
+        target_service: String::new(),
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(60),
+        injected_by: by.into(),
+        reason: None,
+        include_leader: false,
+        override_safety: false,
+    };
+
+    // First node-level fault: within the quorum budget, accepted.
+    leader
+        .client
+        .inject_fault(&partition_fault("first"))
+        .await
+        .expect("first partition should be within the quorum budget");
+
+    // Second node-level fault: would put a majority of the 3-member
+    // council at risk, so the rail must reject it.
+    let rejected = leader.client.inject_fault(&partition_fault("second")).await;
+    assert!(
+        rejected.is_err(),
+        "second node fault should be rejected to protect quorum, got {rejected:?}"
+    );
+    let msg = format!("{}", rejected.unwrap_err()).to_lowercase();
+    assert!(
+        msg.contains("quorum"),
+        "rejection should cite the quorum rail, got: {msg}"
+    );
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
+    }
+}
+
+/// One node's view of another's SWIM state, by name.
+fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::state::NodeState> {
+    observer
+        .handle
+        .membership_rx
+        .borrow()
+        .iter()
+        .find(|m| m.node_id.0 == target)
+        .map(|m| m.state)
+}
+
+/// W11 (L15): a chaos partition populates the real gossip + Raft
+/// transport blocklists, so the isolated node stops answering SWIM
+/// probes and its peers mark it Dead. Healing clears the blocklists and
+/// the node rejoins. This drives the binary path: `/v1/chaos/partition`
+/// on the isolated node, membership observed through the peers' watch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn partition_isolates_a_node_for_real() {
+    use reliaburger::mustard::state::NodeState;
+
+    let shutdown = CancellationToken::new();
+    let n1 = start_node("q1", 18641, vec![], &shutdown).await;
+    let n2 = start_node("q2", 18645, vec![local(18641)], &shutdown).await;
+    let n3 = start_node("q3", 18649, vec![local(18641)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+
+    // Everyone sees everyone Alive before we cut the wire.
+    let converged = wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|obs| {
+            ["q1", "q2", "q3"]
+                .iter()
+                .all(|t| peer_state(obs, t) == Some(NodeState::Alive))
+        })
+    })
+    .await;
+    assert!(converged, "cluster never fully converged to Alive");
+
+    // Cut q3 off from q1 and q2. The partition is injected ON q3, whose
+    // agent holds the real blocklist handles; the transport drops traffic
+    // both to and from the blocked peers, so detection is symmetric.
+    n3.client
+        .inject_partition(&["q1".to_string(), "q2".to_string()], 60)
+        .await
+        .expect("partition injection should succeed");
+
+    // q1 must stop seeing q3 as Alive within the SWIM failure-detection
+    // window. The membership snapshot drops down nodes, so a confirmed-Dead
+    // q3 disappears from the view entirely (`None`) — either way it is no
+    // longer a live peer.
+    let detected = wait_until(Duration::from_secs(30), || {
+        peer_state(&n1, "q3") != Some(NodeState::Alive)
+    })
+    .await;
+    assert!(
+        detected,
+        "q1 never dropped the partitioned q3 from its live view; saw {:?}",
+        peer_state(&n1, "q3")
+    );
+
+    // Heal: clear q3's blocklists and it should rejoin and be Alive again.
+    n3.client
+        .heal_partition()
+        .await
+        .expect("heal should succeed");
+
+    let recovered = wait_until(Duration::from_secs(30), || {
+        peer_state(&n1, "q3") == Some(NodeState::Alive)
+    })
+    .await;
+    assert!(
+        recovered,
+        "q3 never recovered to Alive after healing; saw {:?}",
+        peer_state(&n1, "q3")
+    );
 
     shutdown.cancel();
     for n in nodes {
