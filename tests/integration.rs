@@ -12,7 +12,7 @@ use reliaburger::bun::testapp::{TestApp, TestAppMode};
 use reliaburger::config::Config;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
-use reliaburger::relish::client::BunClient;
+use reliaburger::relish::client::{BunClient, LogOptions};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,7 @@ impl TestHarness {
         let port_allocator = PortAllocator::new(40000, 41000);
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let deploy_history = agent.deploy_history_handle();
 
         tokio::spawn(async move {
             agent.run().await;
@@ -44,12 +45,16 @@ impl TestHarness {
             cmd_tx.clone(),
             None,
             None,
+            Some(deploy_history),
             None,
             None,
             None,
             None,
             None,
             None,
+            None,
+            None,
+            9117,
         );
         let server_shutdown = shutdown.clone();
 
@@ -241,7 +246,10 @@ async fn logs_for_deployed_app() {
         .unwrap();
 
     // ProcessGrill returns empty logs for sleep, but the call should succeed
-    let result = harness.client.logs("worker", "default", None, false).await;
+    let result = harness
+        .client
+        .logs("worker", "default", &LogOptions::default())
+        .await;
     assert!(result.is_ok());
 }
 
@@ -480,13 +488,90 @@ async fn logs_with_tail_returns_limited_lines() {
 
     let result = harness
         .client
-        .logs("echoer", "default", Some(1), false)
+        .logs(
+            "echoer",
+            "default",
+            &LogOptions {
+                tail: Some(1),
+                ..LogOptions::default()
+            },
+        )
         .await
         .unwrap();
 
     let lines: Vec<&str> = result.lines().collect();
     assert_eq!(lines.len(), 1, "expected 1 line, got: {result:?}");
     assert_eq!(lines[0], "line3");
+}
+
+/// X4 regression: `--grep` used to be parsed then silently discarded.
+#[tokio::test]
+async fn logs_grep_filters_lines() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.grepper]
+        image = "test:v1"
+        command = ["sh", "-c", "echo alpha-one; echo beta-two; echo alpha-three"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = harness
+        .client
+        .logs(
+            "grepper",
+            "default",
+            &LogOptions {
+                grep: Some("alpha".to_string()),
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 alpha lines, got: {result:?}");
+    assert!(lines.iter().all(|l| l.contains("alpha")), "got: {result:?}");
+}
+
+/// X4: `--json-field key=value` keeps only matching JSON lines.
+#[tokio::test]
+async fn logs_json_field_filters_structured_lines() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.jsonlogger]
+        image = "test:v1"
+        command = ["sh", "-c", "echo '{\"level\":\"error\",\"msg\":\"boom\"}'; echo '{\"level\":\"info\",\"msg\":\"fine\"}'; echo plain-text"]
+    "#,
+    )
+    .unwrap();
+
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let result = harness
+        .client
+        .logs(
+            "jsonlogger",
+            "default",
+            &LogOptions {
+                json_field: Some(("level".to_string(), "error".to_string())),
+                ..LogOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 1, "expected 1 error line, got: {result:?}");
+    assert!(lines[0].contains("boom"));
 }
 
 #[tokio::test]
@@ -609,4 +694,226 @@ async fn volume_config_deploys_successfully() {
     let statuses = harness.client.status().await.unwrap();
     assert_eq!(statuses[0].app_name, "volapp");
     assert_eq!(statuses[0].state, "running");
+}
+
+/// X3 regression: `relish rollback` used to only print advice. The
+/// server now redeploys the previous successful spec, and the deploy
+/// history carries the spec needed to do so.
+#[tokio::test]
+async fn rollback_redeploys_the_previous_spec() {
+    let harness = TestHarness::start().await;
+    let http = reqwest::Client::new();
+
+    // Deploy v1, then v2 (a redeploy of the same app, new command).
+    let v1 = Config::parse(
+        r#"
+        [app.svc]
+        image = "test:v1"
+        command = ["sh", "-c", "echo VERSION-ONE; sleep 300"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&v1).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let v2 = Config::parse(
+        r#"
+        [app.svc]
+        image = "test:v2"
+        command = ["sh", "-c", "echo VERSION-TWO; sleep 300"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&v2).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // History should hold both, with specs attached.
+    let history: serde_json::Value = http
+        .get(format!(
+            "{}/v1/deploys/history/svc",
+            harness.client.base_url()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = history["history"].as_array().unwrap();
+    assert!(entries.len() >= 2, "expected v1 + v2 in history");
+    assert!(
+        entries.iter().all(|e| e["spec"].is_object()),
+        "history entries must carry the spec for rollback"
+    );
+
+    // Roll back: redeploys v1's spec (test:v1).
+    harness.client.rollback("svc", "default").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The newest history entry is now v1 again.
+    let history: serde_json::Value = http
+        .get(format!(
+            "{}/v1/deploys/history/svc",
+            harness.client.base_url()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = history["history"].as_array().unwrap();
+    let newest = entries.last().unwrap();
+    assert_eq!(
+        newest["image"].as_str(),
+        Some("test:v1"),
+        "rollback should have redeployed v1"
+    );
+}
+
+/// Rollback with no prior version is a clean 404, not a panic.
+#[tokio::test]
+async fn rollback_without_history_returns_not_found() {
+    let harness = TestHarness::start().await;
+
+    let config = Config::parse(
+        r#"
+        [app.only]
+        image = "test:v1"
+        command = ["sleep", "300"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Only one deploy: nothing to roll back to.
+    let err = harness
+        .client
+        .rollback("only", "default")
+        .await
+        .unwrap_err();
+    match err {
+        reliaburger::relish::RelishError::ApiError { status, .. } => {
+            assert_eq!(status, 404);
+        }
+        other => panic!("expected 404 ApiError, got {other:?}"),
+    }
+}
+
+/// L14 regression: a Kill fault used to only insert a registry entry —
+/// it killed nothing. Now it actually sends SIGKILL to the instance.
+#[tokio::test]
+async fn kill_fault_actually_kills_the_instance() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let harness = TestHarness::start().await;
+
+    // A long-running process app so there's a live PID to kill.
+    let config = Config::parse(
+        r#"
+        [app.victim]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Grab the PID before the kill.
+    let before = harness.client.status().await.unwrap();
+    let pid_before = before
+        .iter()
+        .find(|s| s.app_name == "victim")
+        .and_then(|s| s.pid)
+        .expect("victim should have a pid");
+
+    let fault = FaultRequest {
+        fault_type: FaultType::Kill { count: 0 },
+        target_service: "victim".into(),
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(5),
+        injected_by: "test".into(),
+        reason: Some("kill test".into()),
+        include_leader: false,
+        override_safety: false,
+    };
+    harness.client.inject_fault(&fault).await.unwrap();
+
+    // The original PID must be dead (the supervisor may restart the app
+    // with a NEW pid, but the killed process is gone).
+    let killed = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            // kill -0 to the old pid: an error means it's gone.
+            let alive = libc_kill(pid_before as i32, 0) == 0;
+            if !alive {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        ok
+    };
+    assert!(
+        killed,
+        "the victim's original process {pid_before} survived the Kill fault"
+    );
+}
+
+/// L14: eBPF-only network faults are rejected honestly when eBPF isn't
+/// loaded, instead of being recorded as active while injecting nothing.
+#[tokio::test]
+async fn network_fault_without_ebpf_is_rejected_not_faked() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let harness = TestHarness::start().await;
+    let config = Config::parse(
+        r#"
+        [app.svc]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let fault = FaultRequest {
+        fault_type: FaultType::Delay {
+            delay_ns: 100_000_000,
+            jitter_ns: 0,
+        },
+        target_service: "svc".into(),
+        target_instance: None,
+        target_node: None,
+        duration: Duration::from_secs(5),
+        injected_by: "test".into(),
+        reason: None,
+        include_leader: false,
+        override_safety: false,
+    };
+    let result = harness.client.inject_fault(&fault).await;
+    assert!(
+        result.is_err(),
+        "a network fault without eBPF should be rejected, not silently accepted"
+    );
+
+    // And it must NOT be recorded as an active fault.
+    let active = harness.client.list_faults().await.unwrap();
+    assert!(
+        active.is_empty(),
+        "rejected fault must not appear in the active list: {active:?}"
+    );
+}
+
+// Minimal FFI to `kill(2)` for the liveness probe above (no extra crate).
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+fn libc_kill(pid: i32, sig: i32) -> i32 {
+    unsafe { kill(pid, sig) }
 }

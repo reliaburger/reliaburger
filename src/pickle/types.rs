@@ -281,17 +281,67 @@ impl ManifestCatalog {
         }
     }
 
-    /// Apply a GcReport (remove node from holder sets for deleted layers).
-    pub fn apply_gc_report(&mut self, report: &GcReport) {
+    /// Apply a GcReport, arbitrating which deletions are safe.
+    ///
+    /// The report is a *proposal*: the node nominates layers it wants
+    /// to delete, and this method — running serialised inside the Raft
+    /// apply loop — approves only deletions that leave at least one
+    /// other holder. This closes the M2 race where two nodes each
+    /// holding one of two copies both saw `holders.len() == 2` and
+    /// both deleted, losing the layer entirely.
+    ///
+    /// Returns the approved digests; the proposing node physically
+    /// deletes only those. Untracked layers (no holder entry) are
+    /// approved as orphans.
+    pub fn apply_gc_report(&mut self, report: &GcReport) -> Vec<Digest> {
+        let mut approved = Vec::new();
         for digest in &report.deleted_layers {
             let digest_str = &digest.0;
-            if let Some((_, holders)) = self
+            match self
                 .layer_locations
                 .iter_mut()
                 .find(|(d, _)| d == digest_str)
             {
-                holders.remove(&report.node_id);
+                Some((_, holders)) => {
+                    let others = holders.iter().filter(|&&n| n != report.node_id).count();
+                    if others >= 1 && holders.remove(&report.node_id) {
+                        approved.push(digest.clone());
+                    }
+                    // Sole copy (or the node isn't a holder): rejected —
+                    // the layer stays where it is.
+                }
+                None => {
+                    // Orphan: not tracked in the catalog, nothing to lose.
+                    approved.push(digest.clone());
+                }
             }
+        }
+        approved
+    }
+
+    /// Serialise the catalog to a JSON file (crash-safe: write to a
+    /// temp file, then rename over the target).
+    ///
+    /// Single-node mode has no Raft to remember the catalog, and even
+    /// cluster nodes want their local holder view back after a restart.
+    pub fn persist_to(&self, path: &std::path::Path) -> Result<(), PickleError> {
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a catalog previously written by [`persist_to`]. A missing
+    /// file yields an empty catalog (fresh node); a corrupt file is an
+    /// error — silently starting empty would orphan every stored blob.
+    pub fn load_from(path: &std::path::Path) -> Result<Self, PickleError> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| PickleError::CatalogPersist(format!("corrupt catalog: {e}"))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(PickleError::CatalogPersist(e.to_string())),
         }
     }
 
@@ -412,6 +462,8 @@ pub enum PickleError {
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("replication failed: {0}")]
     ReplicationFailed(String),
+    #[error("catalog persistence failed: {0}")]
+    CatalogPersist(String),
     #[error("signature verification failed: {0}")]
     SignatureError(String),
     #[error("io error: {0}")]
@@ -425,6 +477,68 @@ pub enum PickleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L10 regression: the catalog used to be `default()` on every
+    /// boot, so image metadata evaporated on restart.
+    #[test]
+    fn catalog_persists_and_reloads_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(
+                Digest(format!("sha256:{:0>64}", "cafe")),
+                BTreeSet::from([3, 9]),
+            )],
+        });
+        catalog.persist_to(&path).unwrap();
+
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(
+            reloaded.layer_holders(&format!("sha256:{:0>64}", "cafe")),
+            BTreeSet::from([3, 9])
+        );
+    }
+
+    #[test]
+    fn catalog_load_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ManifestCatalog::load_from(&dir.path().join("nope.json")).unwrap();
+        assert!(catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn catalog_load_corrupt_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+        std::fs::write(&path, b"not json at all {{{").unwrap();
+        // Silently starting empty would orphan every stored blob.
+        assert!(ManifestCatalog::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn gc_report_apply_rejects_last_copy_and_approves_orphans() {
+        let mut catalog = ManifestCatalog::default();
+        let tracked = Digest(format!("sha256:{:0>64}", "aa"));
+        let orphan = Digest(format!("sha256:{:0>64}", "bb"));
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(tracked.clone(), BTreeSet::from([1]))],
+        });
+
+        let approved = catalog.apply_gc_report(&GcReport {
+            node_id: 1,
+            deleted_layers: vec![tracked.clone(), orphan.clone()],
+        });
+
+        // The sole tracked copy is refused; the untracked orphan passes.
+        assert_eq!(approved, vec![orphan]);
+        assert_eq!(
+            catalog.layer_holders(tracked.as_str()),
+            BTreeSet::from([1]),
+            "sole holder must be preserved"
+        );
+    }
 
     #[test]
     fn digest_new_valid() {

@@ -20,6 +20,14 @@ use datafusion::prelude::*;
 
 use super::types::{KetchupError, LogEntry, LogStream};
 
+/// Escape a value for safe interpolation into a single-quoted SQL string
+/// literal (M1): a `'` is doubled, per standard SQL / DataFusion. Prevents
+/// a log query param from breaking out of the literal to read other
+/// tenants' logs.
+pub(crate) fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Rows per Parquet row group for flushed log files.
 ///
 /// Logs are written in small row groups so that row-group statistics and
@@ -389,6 +397,10 @@ impl LogStore {
         grep: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<LogEntry>, KetchupError> {
+        // M1: escape single quotes so an app/namespace/grep param can't
+        // break out of the SQL string literal and read other tenants' logs.
+        let app = escape_sql_literal(app);
+        let namespace = escape_sql_literal(namespace);
         let mut conditions = vec![
             format!("app = '{app}'"),
             format!("namespace = '{namespace}'"),
@@ -400,6 +412,7 @@ impl LogStore {
             conditions.push(format!("timestamp <= {e}"));
         }
         if let Some(g) = grep {
+            let g = escape_sql_literal(g);
             conditions.push(format!("line LIKE '%{g}%'"));
         }
 
@@ -472,6 +485,26 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line, "hello world");
         assert_eq!(results[0].timestamp, 1000);
+    }
+
+    #[test]
+    fn escape_sql_literal_doubles_quotes() {
+        assert_eq!(escape_sql_literal("web"), "web");
+        assert_eq!(escape_sql_literal("a' OR '1'='1"), "a'' OR ''1''=''1");
+    }
+
+    /// M1: an injection payload in the app filter must not read another
+    /// tenant's logs.
+    #[tokio::test]
+    async fn query_app_injection_is_neutralised() {
+        let (mut store, _dir) = test_store();
+        store.append_at(1, "secret", "prod", LogStream::Stdout, "top secret");
+
+        let results = store
+            .query("x' OR '1'='1", "default", None, None, None, None)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "SQL injection leaked logs: {results:?}");
     }
 
     #[tokio::test]

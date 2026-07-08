@@ -125,6 +125,25 @@ pub fn resolve_egress_entries(allow_list: &[String]) -> Result<Vec<(Ipv4Addr, u1
     Ok(resolved)
 }
 
+/// A set of resolved egress destinations (IP + port).
+pub type EgressDestinations = Vec<(Ipv4Addr, u16)>;
+
+/// Diff a previously-resolved egress destination set against a freshly
+/// re-resolved one. Returns `(to_add, to_remove)` — destinations newly
+/// present and destinations gone — so the periodic re-resolution loop can
+/// program only the delta into the eBPF egress map. Order-independent.
+pub fn egress_diff(
+    old: &[(Ipv4Addr, u16)],
+    new: &[(Ipv4Addr, u16)],
+) -> (EgressDestinations, EgressDestinations) {
+    use std::collections::HashSet;
+    let old_set: HashSet<(Ipv4Addr, u16)> = old.iter().copied().collect();
+    let new_set: HashSet<(Ipv4Addr, u16)> = new.iter().copied().collect();
+    let to_add = new_set.difference(&old_set).copied().collect();
+    let to_remove = old_set.difference(&new_set).copied().collect();
+    (to_add, to_remove)
+}
+
 /// Build BPF map entries from resolved egress rules.
 ///
 /// Each entry allows a specific (cgroup, dst_ip, dst_port) tuple.
@@ -212,6 +231,114 @@ pub async fn re_resolve_egress_async(
     Ok(resolved)
 }
 
+/// Resolve the cgroup v2 id for a process — the value the eBPF
+/// `bpf_get_current_cgroup_id()` helper returns for that process's
+/// connections, which is the inode of its cgroup v2 directory.
+///
+/// Linux-only; returns `None` off Linux or on any read/stat error (a
+/// short-lived process may already be gone).
+#[cfg(target_os = "linux")]
+pub fn cgroup_id_of_pid(pid: u32) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    // The cgroup v2 line in /proc/<pid>/cgroup is "0::<relative-path>".
+    let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let rel = content.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let full = format!("/sys/fs/cgroup{rel}");
+    std::fs::metadata(&full).ok().map(|meta| meta.ino())
+}
+
+/// Stub off Linux: there are no cgroups to resolve.
+#[cfg(not(target_os = "linux"))]
+pub fn cgroup_id_of_pid(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Value written to `egress_enabled_map` to turn on enforcement.
+pub const EGRESS_ENFORCE: u32 = 1;
+
+/// eBPF egress map writers. With the `ebpf` feature these write the
+/// `egress_map` (allowed destinations) and `egress_enabled_map`
+/// (per-cgroup enforcement flag); without it they return `Unsupported`.
+#[cfg(feature = "ebpf")]
+mod maps {
+    use super::{EGRESS_ENFORCE, EgressKey, EgressMapError, EgressValue};
+    use aya::maps::HashMap;
+
+    /// Enable egress enforcement for a cgroup: with this set, any
+    /// destination not present in `egress_map` for the cgroup is denied.
+    pub fn set_egress_enforced(bpf: &mut aya::Ebpf, cgroup_id: u64) -> Result<(), EgressMapError> {
+        let mut map: HashMap<_, u64, u32> = HashMap::try_from(
+            bpf.map_mut("egress_enabled_map")
+                .ok_or(EgressMapError::MapNotFound {
+                    map_name: "egress_enabled_map",
+                })?,
+        )?;
+        map.insert(cgroup_id, EGRESS_ENFORCE, 0)?;
+        Ok(())
+    }
+
+    /// Turn egress enforcement off for a cgroup (used on instance stop).
+    pub fn clear_egress_enforced(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+    ) -> Result<(), EgressMapError> {
+        let mut map: HashMap<_, u64, u32> = HashMap::try_from(
+            bpf.map_mut("egress_enabled_map")
+                .ok_or(EgressMapError::MapNotFound {
+                    map_name: "egress_enabled_map",
+                })?,
+        )?;
+        let _ = map.remove(&cgroup_id);
+        Ok(())
+    }
+
+    /// Allow a single (cgroup, dst_ip, dst_port) destination.
+    pub fn write_egress_entry(
+        bpf: &mut aya::Ebpf,
+        key: EgressKey,
+        value: EgressValue,
+    ) -> Result<(), EgressMapError> {
+        let mut map: HashMap<_, EgressKey, EgressValue> = HashMap::try_from(
+            bpf.map_mut("egress_map")
+                .ok_or(EgressMapError::MapNotFound {
+                    map_name: "egress_map",
+                })?,
+        )?;
+        map.insert(key, value, 0)?;
+        Ok(())
+    }
+
+    /// Remove a previously allowed destination.
+    pub fn delete_egress_entry(bpf: &mut aya::Ebpf, key: EgressKey) -> Result<(), EgressMapError> {
+        let mut map: HashMap<_, EgressKey, EgressValue> = HashMap::try_from(
+            bpf.map_mut("egress_map")
+                .ok_or(EgressMapError::MapNotFound {
+                    map_name: "egress_map",
+                })?,
+        )?;
+        let _ = map.remove(&key);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ebpf")]
+pub use maps::*;
+
+/// Errors from writing the eBPF egress maps.
+#[derive(Debug, thiserror::Error)]
+pub enum EgressMapError {
+    #[error("egress eBPF maps require Linux with --features ebpf")]
+    Unsupported,
+
+    #[cfg(feature = "ebpf")]
+    #[error("egress map operation failed: {0}")]
+    MapError(#[from] aya::maps::MapError),
+
+    #[error("egress map {map_name:?} not found in the loaded program")]
+    MapNotFound { map_name: &'static str },
+}
+
 /// Errors from egress allowlist resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
@@ -234,6 +361,27 @@ mod tests {
     fn parse_ip_port() {
         let result = parse_egress_entry("1.2.3.4:443").unwrap();
         assert_eq!(result, vec![(Ipv4Addr::new(1, 2, 3, 4), 443)]);
+    }
+
+    #[test]
+    fn egress_diff_reports_added_and_removed() {
+        let a = (Ipv4Addr::new(1, 1, 1, 1), 443);
+        let b = (Ipv4Addr::new(2, 2, 2, 2), 443);
+        let c = (Ipv4Addr::new(3, 3, 3, 3), 443);
+
+        // b stays, a is removed, c is added.
+        let (add, remove) = egress_diff(&[a, b], &[b, c]);
+        assert_eq!(add, vec![c]);
+        assert_eq!(remove, vec![a]);
+    }
+
+    #[test]
+    fn egress_diff_empty_when_unchanged() {
+        let a = (Ipv4Addr::new(1, 1, 1, 1), 443);
+        let b = (Ipv4Addr::new(2, 2, 2, 2), 80);
+        let (add, remove) = egress_diff(&[a, b], &[b, a]);
+        assert!(add.is_empty());
+        assert!(remove.is_empty());
     }
 
     #[test]

@@ -120,7 +120,30 @@ fn cluster_params_from_config(
         wrapping_ikm,
         bootstrap_security_state,
         data_dir: config.storage.data.clone(),
+        // The MayoStore doesn't exist yet when params are built; the
+        // caller sets it before starting the runtime.
+        mayo: None,
+        rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
     })
+}
+
+/// Schedulable node capacity: system totals minus the `[resources]`
+/// reservation. Read once at startup.
+fn node_capacity(config: &NodeConfig) -> (u32, u32) {
+    use reliaburger::config::types::parse_resource_value;
+
+    let system = sysinfo::System::new_all();
+    let total_cpu_millicores = (system.cpus().len() as u64) * 1000;
+    let total_memory_mb = system.total_memory() / (1024 * 1024);
+
+    let reserved_cpu = parse_resource_value(&config.resources.reserved_cpu).unwrap_or(0);
+    let reserved_memory_mb =
+        parse_resource_value(&config.resources.reserved_memory).unwrap_or(0) / (1024 * 1024);
+
+    (
+        total_cpu_millicores.saturating_sub(reserved_cpu) as u32,
+        total_memory_mb.saturating_sub(reserved_memory_mb) as u32,
+    )
 }
 
 /// Overwrite the auth token store with the current API tokens from Raft.
@@ -154,14 +177,49 @@ async fn main() -> anyhow::Result<()> {
         config.network.port_range.end,
     );
 
+    // Containers can only be pointed at the DNS responder when it
+    // listens on port 53 (resolv.conf has no port syntax) on an IPv4
+    // address; otherwise host DNS applies and we say so.
+    let container_nameserver = if config.dns.enabled {
+        match config.dns.to_dns_config()? {
+            c if c.listen_addr.port() == 53 => match c.listen_addr.ip() {
+                std::net::IpAddr::V4(ip) => Some(ip),
+                std::net::IpAddr::V6(_) => None,
+            },
+            c => {
+                println!(
+                    "bun: dns listen {} is not port 53 — containers keep host DNS",
+                    c.listen_addr
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Select runtime
-    let runtime = select_runtime(&cli.runtime).await?;
+    let runtime = select_runtime(&cli.runtime, container_nameserver).await?;
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     // Create shutdown token
     let shutdown = CancellationToken::new();
+
+    // Mayo store first: the cluster runtime's rollup worker reads it, so
+    // it must exist before the runtime starts.
+    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
+        config.storage.metrics.clone()
+    } else {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger")
+            .join("metrics");
+        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
+        fallback
+    };
+    let mayo_store = Arc::new(RwLock::new(MayoStore::new(metrics_dir)));
 
     // Create the agent (extract deploy history handle before spawning).
     // In cluster mode, start the cluster runtime (gossip, …) and build the
@@ -172,12 +230,35 @@ async fn main() -> anyhow::Result<()> {
     // forwarders into the LogStore (drained below, once the store exists).
     let (log_tx, mut log_rx) =
         tokio::sync::mpsc::channel::<reliaburger::ketchup::types::LogRecord>(1024);
+    let node_name = config
+        .node
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
+    let api_port: u16 = cli
+        .listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9117);
+
     let _cluster_runtime;
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
     let mut api_council: Option<Arc<reliaburger::council::CouncilNode>> = None;
+    // The leader-side rollup store, exposed at /v1/metrics/cluster.
+    let mut api_rollup_store = None;
+    // Gossip membership for the pickle replication loop (cluster only).
+    let mut replication_membership = None;
+    // Peer API addresses for cross-node fan-out and apply forwarding.
+    let mut api_membership: Option<Arc<RwLock<Vec<api::NodeMembershipInfo>>>> = None;
+    // Handles the orchestration tasks need, captured before the
+    // ClusterHandle moves into the agent (spawned further down, once
+    // the service token exists).
+    let mut orchestration = None;
     let mut agent = if cli.cluster {
-        let params = cluster_params_from_config(&config)?;
+        let mut params = cluster_params_from_config(&config)?;
+        params.mayo = Some(Arc::clone(&mayo_store));
         println!(
             "bun: cluster mode — gossip on {}, {} seed(s)",
             params.gossip_addr,
@@ -187,13 +268,70 @@ async fn main() -> anyhow::Result<()> {
             reliaburger::cluster::runtime::start(params, agent_shutdown.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
-        _cluster_runtime = Some(cluster_runtime);
+        api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
+        // Cloned before the handle moves into the agent: the pickle
+        // replication loop derives its peer list from gossip.
+        replication_membership = Some(handle.membership_rx.clone());
+        orchestration = Some((
+            handle.membership_rx.clone(),
+            handle.raft_metrics_rx.clone(),
+            cluster_runtime.aggregated_rx.clone(),
+        ));
+        _cluster_runtime = Some(cluster_runtime);
         BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
     } else {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
+
+    // Report real schedulable capacity to the cluster (L6: StateReports
+    // used to carry zeroes).
+    let (capacity_cpu, capacity_memory) = node_capacity(&config);
+    agent.set_node_capacity(capacity_cpu, capacity_memory);
+
+    // L8: load and attach the eBPF data path (Onion connect rewrite,
+    // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.
+    // A load failure is logged and the node continues without kernel
+    // enforcement rather than refusing to start.
+    if config.ebpf.enabled {
+        match config.ebpf.resolve_program_dir() {
+            Some(program_dir) => {
+                #[cfg(feature = "ebpf")]
+                match reliaburger::onion::ebpf::loader::OnionEbpf::load(
+                    &program_dir,
+                    &config.ebpf.cgroup_path,
+                ) {
+                    Ok(ebpf) => {
+                        eprintln!(
+                            "bun: eBPF data path loaded from {} (attached={})",
+                            program_dir.display(),
+                            ebpf.is_attached()
+                        );
+                        agent.set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "bun: failed to load eBPF data path: {e}; continuing without enforcement"
+                        );
+                    }
+                }
+                #[cfg(not(feature = "ebpf"))]
+                {
+                    let _ = program_dir;
+                    eprintln!(
+                        "bun: [ebpf] enabled but this binary was built without the `ebpf` feature; \
+                         network faults and egress allowlists are NOT enforced"
+                    );
+                }
+            }
+            None => {
+                eprintln!(
+                    "bun: [ebpf] enabled but no program_dir set and no build-time objects; skipping"
+                );
+            }
+        }
+    }
 
     // Derive the internal service token from the shared master key, so bun's own
     // cross-node fan-out calls authenticate as the system principal on peers.
@@ -202,6 +340,77 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|c| c.wrapping_ikm())
         .map(reliaburger::sesame::token::derive_service_token)
         .transpose()?;
+
+    // L1 orchestration: the leader schedules desired apps into
+    // placements, every node keeps a fresh peer-API table, and every
+    // node reconciles its instances against its assignments.
+    if let Some((membership_rx, metrics_rx, aggregated_rx)) = orchestration {
+        if let Some(council) = &api_council {
+            reliaburger::cluster::orchestrate::spawn_leader_scheduler(
+                Arc::clone(council),
+                membership_rx.clone(),
+                aggregated_rx,
+                config.reconstruction.clone(),
+                shutdown.clone(),
+            );
+            // L3: leader-only autoscale loop, feeding on the same rollup
+            // store /v1/metrics/cluster serves.
+            if let Some(rollup_store) = &api_rollup_store {
+                reliaburger::cluster::orchestrate::spawn_autoscaler(
+                    Arc::clone(council),
+                    Arc::clone(rollup_store),
+                    std::time::Duration::from_secs(30),
+                    shutdown.clone(),
+                );
+            }
+        }
+
+        // Peer API ports are derived from gossip ports by fixed offset
+        // (uniform ports in production; distinct blocks on single-host
+        // clusters).
+        let gossip_to_api_offset = api_port as i32 - config.cluster.gossip_port as i32;
+        let membership_table: Arc<RwLock<Vec<api::NodeMembershipInfo>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        api_membership = Some(Arc::clone(&membership_table));
+        let mut refresher_rx = membership_rx;
+        let refresher_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                let snapshot: Vec<api::NodeMembershipInfo> = refresher_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
+                    .map(|m| api::NodeMembershipInfo {
+                        node_id: m.node_id.clone(),
+                        address: std::net::SocketAddr::new(
+                            m.address.ip(),
+                            (m.address.port() as i32 + gossip_to_api_offset) as u16,
+                        ),
+                    })
+                    .collect();
+                *membership_table.write().await = snapshot;
+                tokio::select! {
+                    _ = refresher_shutdown.cancelled() => break,
+                    changed = refresher_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        if let Some(metrics_rx) = metrics_rx {
+            reliaburger::cluster::orchestrate::spawn_placement_reconciler(
+                node_name.clone(),
+                metrics_rx,
+                api_port as i32 - config.cluster.raft_port as i32,
+                service_token.clone(),
+                cmd_tx.clone(),
+                shutdown.clone(),
+            );
+        }
+    }
 
     // Seed the auth token store from the council's SecurityState and keep it
     // refreshed. The middleware reads this store; without the refresh, a token
@@ -230,23 +439,54 @@ async fn main() -> anyhow::Result<()> {
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
     let deploy_history = agent.deploy_history_handle();
+
+    // Onion DNS: start the .internal responder when [dns] enables it,
+    // resolving from the agent's service-map snapshots.
+    if config.dns.enabled {
+        let dns_config = config.dns.to_dns_config()?;
+        let service_map_rx = agent.service_map_watch();
+        let dns_shutdown = shutdown.clone();
+        println!("bun: dns responder on {}", dns_config.listen_addr);
+        tokio::spawn(async move {
+            if let Err(e) =
+                reliaburger::onion::dns::run_dns_responder(dns_config, service_map_rx, dns_shutdown)
+                    .await
+            {
+                eprintln!("bun: dns responder failed to bind: {e}");
+            }
+        });
+    }
+
+    // Wrapper ingress: bind the HTTP(S) listeners when [ingress] enables
+    // them, sharing the routing table the agent rebuilds on deploys.
+    if config.ingress.enabled {
+        let routing_table = agent.routing_table_handle();
+        let wrapper_config = config.ingress.to_wrapper_config();
+        let ingress_shutdown = shutdown.clone();
+        let bound = reliaburger::wrapper::proxy::bind_proxy(
+            wrapper_config,
+            routing_table,
+            ingress_shutdown,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind ingress listeners: {e}"))?;
+        println!(
+            "bun: ingress listening on http {} / https {}",
+            bound.http_addr, bound.https_addr
+        );
+        tokio::spawn(async move {
+            if let Err(e) = bound.serve().await {
+                eprintln!("bun: ingress proxy exited with error: {e}");
+            }
+        });
+    }
+
     let agent_handle = tokio::spawn(async move {
         agent.run().await;
     });
 
-    // Create observability stores
-    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
-        config.storage.metrics.clone()
-    } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("metrics");
-        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
-        fallback
-    };
-    let mayo_store = Arc::new(RwLock::new(MayoStore::new(metrics_dir)));
-
+    // Create observability stores (the Mayo store was created above,
+    // before the cluster runtime that its rollup worker feeds from)
     let logs_dir = if std::fs::create_dir_all(&config.storage.logs).is_ok() {
         config.storage.logs.clone()
     } else {
@@ -469,8 +709,20 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
-    let pickle_catalog: Arc<RwLock<ManifestCatalog>> =
-        Arc::new(RwLock::new(ManifestCatalog::default()));
+    // L10: the catalog used to be `default()` on every boot — image
+    // metadata evaporated on restart. Load the persisted copy; a
+    // corrupt file aborts startup rather than silently orphaning blobs.
+    let _ = std::fs::create_dir_all(&config.storage.data);
+    let catalog_path = config.storage.data.join("pickle-catalog.json");
+    let loaded_catalog = ManifestCatalog::load_from(&catalog_path)
+        .map_err(|e| anyhow::anyhow!("failed to load pickle catalog: {e}"))?;
+    if !loaded_catalog.manifests.is_empty() {
+        println!(
+            "bun: pickle catalog loaded ({} manifests)",
+            loaded_catalog.manifests.len()
+        );
+    }
+    let pickle_catalog: Arc<RwLock<ManifestCatalog>> = Arc::new(RwLock::new(loaded_catalog));
 
     // Create the alert evaluator (shared between the API and the
     // evaluation loop so /v1/alerts always reflects current state).
@@ -479,6 +731,28 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
+    // Cloned for the GC task (asks the agent for actively deployed images).
+    let gc_cmd_tx = cmd_tx.clone();
+
+    // GitOps (L13): if [gitops] is configured on a cluster node, spawn
+    // the leader-only sync loop and hand the API a webhook sender that
+    // nudges it. The webhook endpoint returns 503 without this.
+    let gitops_webhook_tx =
+        if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
+            let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
+            reliaburger::lettuce::runner::spawn_gitops_sync(
+                council,
+                gitops,
+                webhook_rx,
+                config.storage.data.clone(),
+                shutdown.clone(),
+            );
+            println!("bun: gitops sync loop started");
+            Some(webhook_tx)
+        } else {
+            None
+        };
 
     let app = api::router(
         cmd_tx,
@@ -490,6 +764,10 @@ async fn main() -> anyhow::Result<()> {
         api_council.clone(),
         api_token_store.clone(),
         service_token.clone(),
+        api_rollup_store,
+        api_membership.clone(),
+        gitops_webhook_tx,
+        api_port,
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -579,10 +857,15 @@ async fn main() -> anyhow::Result<()> {
         );
         fallback
     };
-    let blob_store = BlobStore::new(&pickle_dir);
+    let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
+
+    let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     let pickle_state = PickleState {
-        store: Arc::new(blob_store),
+        store: Arc::clone(&blob_store),
         catalog: Arc::clone(&pickle_catalog),
+        node_raft_id,
+        council: api_council.clone(),
+        persist_path: Some(catalog_path.clone()),
     };
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
     let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
@@ -597,6 +880,226 @@ async fn main() -> anyhow::Result<()> {
             .await
             .ok();
     });
+
+    // Scheduled image GC (L10/M2): two-phase — nominate candidates,
+    // let the arbiter (Raft in cluster mode, the local catalog's same
+    // rule otherwise) approve, then delete only what was approved.
+    {
+        use reliaburger::council::types::{CouncilResponse, RaftRequest};
+        use reliaburger::pickle::gc::{GcConfig, delete_approved, gc_candidates};
+
+        let gc_store = Arc::clone(&blob_store);
+        let gc_catalog = Arc::clone(&pickle_catalog);
+        let gc_council = api_council.clone();
+        let gc_persist = catalog_path.clone();
+        let gc_shutdown = shutdown.clone();
+        let gc_config = GcConfig {
+            retain_days: config.images.gc_retain_days,
+            node_id: node_raft_id,
+            orphan_grace: std::time::Duration::from_secs(3600),
+        };
+        let gc_interval = std::time::Duration::from_secs(
+            u64::from(config.images.gc_interval_hours.max(1)) * 3600,
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(gc_interval);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = gc_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+
+                // Actively deployed images are never collected.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = gc_cmd_tx
+                    .send(reliaburger::bun::agent::AgentCommand::ActiveImages { response: tx })
+                    .await;
+                let active = rx.await.unwrap_or_default();
+
+                // Phase 1: nominate (fs walk off the runtime).
+                let catalog_snapshot = gc_catalog.read().await.clone();
+                let store = Arc::clone(&gc_store);
+                let gc_cfg = gc_config.clone();
+                let nominated = tokio::task::spawn_blocking(move || {
+                    gc_candidates(&store, &catalog_snapshot, &active, &gc_cfg)
+                })
+                .await;
+                let Ok(Ok(nominated)) = nominated else {
+                    continue;
+                };
+                let Some(report) = nominated.report(gc_config.node_id) else {
+                    continue;
+                };
+
+                // Arbitration: Raft serialises cluster-wide; single-node
+                // applies the identical rule to the local catalog.
+                let approved = match &gc_council {
+                    Some(council) => {
+                        match council.write(RaftRequest::GcReport(report.clone())).await {
+                            Ok(CouncilResponse::GcApproved { approved }) => {
+                                // Mirror the holder removal locally too.
+                                let mirror = reliaburger::pickle::types::GcReport {
+                                    node_id: report.node_id,
+                                    deleted_layers: approved.clone(),
+                                };
+                                let _ = gc_catalog.write().await.apply_gc_report(&mirror);
+                                approved
+                            }
+                            Ok(_) => Vec::new(),
+                            Err(e) => {
+                                eprintln!(
+                                    "bun: gc arbitration unavailable ({e}); deleting nothing"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => gc_catalog.write().await.apply_gc_report(&report),
+                };
+
+                if approved.is_empty() {
+                    continue;
+                }
+
+                // Persist the catalog change, then phase 2: delete.
+                let snapshot = gc_catalog.read().await.clone();
+                let persist = gc_persist.clone();
+                let store = Arc::clone(&gc_store);
+                let deleted = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = snapshot.persist_to(&persist) {
+                        eprintln!("bun: gc failed to persist catalog: {e}");
+                    }
+                    delete_approved(&store, &approved)
+                })
+                .await
+                .unwrap_or_default();
+                if !deleted.is_empty() {
+                    println!("bun: gc removed {} blob(s)", deleted.len());
+                }
+            }
+        });
+    }
+
+    // Pickle replication (L10): leader-only loop that keeps every
+    // manifest's layers on at least `[images] redundancy` nodes.
+    if let (Some(council), Some(membership_rx)) = (api_council.clone(), replication_membership) {
+        use reliaburger::pickle::replication::{
+            Peer, ReplicationConfig, replicate_manifest, select_peers,
+        };
+
+        let repl_store = Arc::clone(&blob_store);
+        let repl_shutdown = shutdown.clone();
+        let redundancy = config.images.redundancy.max(1);
+        let registry_port = config.images.registry_port;
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = repl_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                if !council.is_leader().await {
+                    continue;
+                }
+
+                let catalog = council.manifest_catalog().await;
+                let peers: Vec<Peer> = membership_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
+                    .map(|m| Peer {
+                        node_id: reliaburger::cluster::identity::raft_id_from_name(&m.node_id.0),
+                        base_url: format!("http://{}:{registry_port}", m.address.ip()),
+                    })
+                    .collect();
+                if peers.len() < 2 {
+                    continue; // nobody to replicate to
+                }
+
+                for (_, manifest) in &catalog.manifests {
+                    // Nodes that hold EVERY layer of this manifest.
+                    let mut full_holders: Option<std::collections::BTreeSet<u64>> = None;
+                    for digest in manifest.all_digests() {
+                        let holders = catalog.layer_holders(digest.as_str());
+                        full_holders = Some(match full_holders {
+                            Some(acc) => acc.intersection(&holders).copied().collect(),
+                            None => holders,
+                        });
+                    }
+                    let full_holders = full_holders.unwrap_or_default();
+                    if full_holders.len() >= redundancy as usize {
+                        continue;
+                    }
+
+                    // The leader replicates from its own blobs; skip
+                    // manifests it doesn't hold (their holder pushes
+                    // will be reconciled once forwarding lands in W6).
+                    if !manifest
+                        .all_digests()
+                        .iter()
+                        .all(|d| repl_store.has_blob(d))
+                    {
+                        continue;
+                    }
+
+                    let needed = redundancy as usize - full_holders.len();
+                    let targets = select_peers(&peers, 0, &full_holders, needed);
+                    if targets.is_empty() {
+                        continue;
+                    }
+
+                    let config = ReplicationConfig {
+                        redundancy,
+                        peer_timeout: std::time::Duration::from_secs(30),
+                    };
+                    match replicate_manifest(manifest, &repl_store, &targets, &config, &client)
+                        .await
+                    {
+                        Ok(result) => {
+                            let updates = manifest
+                                .all_digests()
+                                .iter()
+                                .map(|d| {
+                                    let mut holders = catalog.layer_holders(d.as_str());
+                                    holders.extend(result.successful_nodes.iter().copied());
+                                    ((*d).clone(), holders)
+                                })
+                                .collect();
+                            let update =
+                                reliaburger::pickle::types::UpdateLayerLocations { updates };
+                            if let Err(e) = council
+                                .write(
+                                    reliaburger::council::types::RaftRequest::UpdateLayerLocations(
+                                        update,
+                                    ),
+                                )
+                                .await
+                            {
+                                eprintln!("bun: replication holder update failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "bun: replication of {}:{} failed: {e}",
+                                manifest.repository,
+                                manifest
+                                    .tags
+                                    .iter()
+                                    .next()
+                                    .map(String::as_str)
+                                    .unwrap_or("?")
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Wait for SIGINT or SIGTERM. Handling SIGTERM matters under systemd/docker
     // stop — without it the agent was killed before shutdown_all ran, orphaning
@@ -635,7 +1138,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
+async fn select_runtime(
+    name: &str,
+    dns_nameserver: Option<std::net::Ipv4Addr>,
+) -> anyhow::Result<AnyGrill> {
+    // Silence the unused warning on platforms without runc.
+    let _ = dns_nameserver;
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
@@ -677,12 +1185,19 @@ async fn select_runtime(name: &str) -> anyhow::Result<AnyGrill> {
                 )
             };
 
-            Ok(AnyGrill::Runc(reliaburger::grill::runc::RuncGrill::new(
+            let mut grill = reliaburger::grill::runc::RuncGrill::new(
                 bundle_base,
                 image_store,
                 is_rootless,
                 state_dir,
-            )))
+            );
+            // Containers resolve .internal via the node's DNS responder;
+            // resolv.conf has no port syntax, so this only applies to
+            // port-53 listeners (checked by the caller).
+            if let Some(nameserver) = dns_nameserver {
+                grill = grill.with_dns_nameserver(nameserver);
+            }
+            Ok(AnyGrill::Runc(grill))
         }
         #[cfg(target_os = "macos")]
         "apple" => {

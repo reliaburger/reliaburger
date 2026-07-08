@@ -131,7 +131,7 @@ impl GitRepo {
     }
 
     /// Get commit info for a specific SHA.
-    fn commit_info(&self, sha: &str) -> Result<CommitInfo, LettuceError> {
+    pub fn commit_info(&self, sha: &str) -> Result<CommitInfo, LettuceError> {
         let output = Command::new("git")
             .args(["log", "-1", "--format=%H%n%s%n%an%n%ct", sha])
             .current_dir(&self.path)

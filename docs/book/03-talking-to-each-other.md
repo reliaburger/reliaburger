@@ -404,6 +404,20 @@ The service map needs to stay in sync with reality. Four events matter:
 
 The ordering matters. We register the service *before* starting instances so that the DNS name resolves as early as possible. We unregister *after* stopping so that in-flight connections can drain. And we update health synchronously in the event loop so there's no window where the map disagrees with reality.
 
+### Loading the programs at boot
+
+All of the above assumes the eBPF programs are actually in the kernel. For a long time they weren't. The loader existed, the maps were defined, the `.bpf.c` sources compiled — but nothing ever called `OnionEbpf::load()`, so the field on the agent that would hold the handle was permanently `None`. Everything the connect hook was meant to do fell back to userspace-only behaviour: the service map worked for `relish resolve`, but no `connect()` was ever rewritten in the kernel.
+
+Wiring it in production comes down to three questions, and each has a slightly awkward answer.
+
+**When?** At `bun` startup, gated on an `[ebpf]` config section that defaults to *off*. Loading eBPF needs root, a 5.7+ kernel, and cgroup v2 — none of which hold on a laptop or in the default `cargo test` run. So it's opt-in, like the ingress listener and the DNS responder before it. A node that enables it but is built without the `ebpf` Cargo feature prints a clear warning that enforcement is off, rather than pretending.
+
+**Where are the objects?** `build.rs` compiles the `.bpf.o` files into Cargo's `OUT_DIR`, a hash-suffixed path nobody wants to type. Rather than force an install step, the build script bakes that path into the binary with `cargo:rustc-env=RELIABURGER_BPF_DIR=…`, and the config reads it back with `option_env!`. So a dev or Lima build with `[ebpf] enabled = true` finds its own objects automatically; a packaged install overrides `program_dir` to point at wherever the objects were installed. This is the first time we've used `option_env!` — it's like `env!`, but returns an `Option` instead of failing to compile when the variable is absent, which is exactly right for a default that only exists in eBPF-feature builds.
+
+**What if it fails?** A node that can't load eBPF logs the error and keeps running without kernel enforcement. Refusing to start would be worse: the data plane (containers, health checks, the userspace service map) is entirely independent of the connect hook. Losing the hook degrades service resolution to "no VIP rewriting"; it doesn't take the node down.
+
+The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Nine tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
+
 ### How gossip keeps the service map consistent
 
 Everything above describes what happens on a single node. But a 10-node cluster has 10 service maps, and they all need to agree. When the scheduler places `redis-0` on node A, node B needs to know about it too — otherwise `curl redis.internal` from a container on node B goes nowhere.
@@ -439,6 +453,24 @@ The connect rewrite — the part that actually matters for latency — is still 
 The DNS responder only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) goes to the upstream resolver, which doesn't know about `.internal` names.
 
 This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
+
+### A DNS server that doesn't fall over
+
+The first version of the responder worked in the demo and would have been a disaster in production. It's worth listing what was wrong, because every one of these is a classic UDP server mistake:
+
+1. **One bad packet killed it.** The receive error propagated with `?` straight out of the serve loop. On UDP, `recv_from` can fail for reasons that have nothing to do with your socket — an ICMP port-unreachable from a previous send, for instance. One of those and every container on the node lost DNS until the next restart.
+2. **Forwarding was serial.** Upstream queries were awaited inline in the serve loop, on one shared socket. One slow upstream exchange meant every other query — including instant `.internal` lookups — queued behind it.
+3. **Replies weren't checked.** The shared upstream socket accepted a datagram from anyone, and whatever arrived first got relayed to the client. Classic cache-poisoning surface.
+4. **Unknown `.internal` names leaked upstream.** Ask for `secret-project.internal`, get no local match, and the query — internal service name and all — went to 8.8.8.8.
+5. **Every query type got an A record.** AAAA, MX, whatever: here's an IPv4 address. Resolvers get very confused by that.
+
+The hardened version fixes each in turn. Receive errors log and `continue` — the loop is never allowed to die. Public-name forwards spawn a task each (bounded by a `Semaphore` with 64 permits, so a query flood can't spawn unbounded tasks), and each forward uses a *fresh connected socket*: `connect` makes the kernel drop datagrams from any other source, and we additionally check the reply's transaction ID against the query's. A wrong-ID reply — a spoof or a stale packet — is ignored and the client eventually gets SERVFAIL, never the attacker's bytes.
+
+The responder is now properly authoritative for `.internal`: unknown names get NXDOMAIN locally and are never forwarded, AAAA on a known name gets an empty NOERROR ("the name exists, it just has no IPv6"), and unsupported types get NOTIMP. Not one internal byte reaches the upstream.
+
+The Rust-flavoured part is how the responder reads the service map. The agent *owns* its `ServiceMap` — it mutates it freely inside its event loop, no locks. Sharing it with the DNS task via `Arc<RwLock<…>>` would have meant threading lock acquisitions through dozens of agent call sites. Instead the agent publishes a *snapshot* on a `tokio::sync::watch` channel every time the map changes (the same moment it rebuilds the routing table). A watch channel holds exactly one value — the latest — and the responder reads it with `borrow()`, no await, no contention. The cost is a clone of the map per change; deploys are rare and maps are small, so that's a bargain for keeping the agent lock-free. Go programmers will recognise the shape: don't share memory, communicate — except here the borrow checker enforces it.
+
+Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`, written into the rootfs at create time when `[dns]` is enabled. One catch — `resolv.conf` has no port syntax, so this only works when the responder listens on port 53, and the listen address must be reachable from inside the container's network namespace (the node's bridge IP, not `127.0.0.53`). ProcessGrill and Apple Container workloads keep host DNS; they were never namespaced away from it in the first place.
 
 ### Testing service discovery
 
@@ -620,6 +652,22 @@ Stale token buckets (no requests for 5 minutes) are garbage collected every 60 s
 ### TLS
 
 Phase 3 ships with a TLS stub — we can listen on port 443 with self-signed certificates for testing. Real certificate management (ACME for Let's Encrypt, or cluster CA for air-gapped environments) comes in Phase 4 when we build Sesame, the PKI layer. TLS 1.0 and 1.1 are rejected; only 1.2 and 1.3 are accepted.
+
+### Switching the proxy on
+
+Confession time. Everything you've just read about the Wrapper — the routing table, rate limiting, draining, TLS — was true of the *library* for a long time before it was true of the *binary*. The July 2026 review found that `run_proxy` had zero production callers. No listener was ever bound. The agent dutifully rebuilt the routing table on every deploy, and nothing ever read it. A complete front door, tested and documented, leaning against the wall next to the doorframe.
+
+The wiring is a good case study in how subsystems connect in Reliaburger, because the proxy lives *outside* the agent's event loop. The agent owns the routing table and rebuilds it on deploys; the proxy reads it on every request. They share it the standard Rust way: `Arc<tokio::sync::RwLock<RoutingTable>>`. The agent hands out a clone of the `Arc` before it moves into its spawned task, and from then on the two tasks communicate through the lock — writers rare (deploys), readers hot (every request). No channel needed, because the proxy never tells the agent anything.
+
+Three details from the wiring are worth keeping:
+
+*Binding is separate from serving.* `bind_proxy` opens the listeners and returns a `BoundProxy` whose addresses you can inspect; `.serve()` starts the traffic. Why split them? Tests. A test binds port 0, the OS assigns a free port, and the test reads the real address before sending requests. If binding and serving were one call, a test would have to guess ports — and port-guessing tests are flaky tests.
+
+*The TLS accept loop spawns the handshake.* A TLS handshake involves round trips, and a client can stretch those out for as long as you let it. Do the handshake inline in the accept loop and one slow client stops every new connection behind it. So the loop accepts the TCP connection, spawns a task, and *that task* does the handshake. An ingress that can be stalled by one malicious dial-up modem isn't much of a front door.
+
+*Rate limiting needs to know who's asking.* The token buckets are per-client-IP, which means the handler needs the peer address. Axum provides this via `ConnectInfo<SocketAddr>` — but only if you serve the router with `into_make_service_with_connect_info`. Forget that (we did, briefly) and the extractor fails at runtime, not compile time. It's one of the few places axum can't type-check your wiring end to end.
+
+The config side is a new `[ingress]` section in node.toml, disabled by default — binding listeners on 80/443 is not something a node should do just because the code can. `relish` and the dashboard don't change at all: `/v1/routes` was already serving the routing table; now the table finally has traffic flowing through it.
 
 ## The Perimeter: nftables Firewall
 

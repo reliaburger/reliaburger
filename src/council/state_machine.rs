@@ -63,9 +63,11 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
 }
 
 impl StateMachineInner {
-    /// Apply a request. Returns the allocated serial for `AllocateSerial`
-    /// (so the caller gets *its* value, not a racy read-back), `None` otherwise.
-    fn apply_request(&mut self, request: &RaftRequest) -> Option<u64> {
+    /// Apply a request. Returns a request-specific response for entries
+    /// that carry a verdict back to the proposer (`AllocateSerial` gets
+    /// its serial, `GcReport` gets the approved deletions); `None` means
+    /// the generic `Applied` response.
+    fn apply_request(&mut self, request: &RaftRequest) -> Option<CouncilResponse> {
         match request {
             RaftRequest::AppSpec { app_id, spec } => {
                 self.state.apps.insert(app_id.clone(), *spec.clone());
@@ -89,7 +91,13 @@ impl StateMachineInner {
                 self.state.manifest_catalog.apply_update_locations(update);
             }
             RaftRequest::GcReport(report) => {
-                self.state.manifest_catalog.apply_gc_report(report);
+                // The state machine is the deletion arbiter (M2): apply
+                // runs serialised through the Raft log, so two nodes
+                // racing to delete the last two copies of a layer get
+                // their reports arbitrated in order — the second one is
+                // refused the digest that would lose its final holder.
+                let approved = self.state.manifest_catalog.apply_gc_report(report);
+                return Some(CouncilResponse::GcApproved { approved });
             }
             RaftRequest::DeleteTag(delete) => {
                 self.state.manifest_catalog.apply_delete_tag(delete);
@@ -182,7 +190,7 @@ impl StateMachineInner {
                 // Return the pre-increment value as this entry's serial.
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
-                return Some(serial);
+                return Some(CouncilResponse::SerialAllocated { serial });
             }
             RaftRequest::RotateSecretKey { scope, new_keypair } => {
                 // Mark existing keypairs with the same scope as read-only
@@ -316,13 +324,10 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                     });
                 }
                 EntryPayload::Normal(request) => {
-                    let allocated = guard.apply_request(&request);
-                    responses.push(match allocated {
-                        Some(serial) => CouncilResponse::SerialAllocated { serial },
-                        None => CouncilResponse::Applied {
-                            log_index: log_id.index,
-                        },
-                    });
+                    let response = guard.apply_request(&request);
+                    responses.push(response.unwrap_or(CouncilResponse::Applied {
+                        log_index: log_id.index,
+                    }));
                 }
                 EntryPayload::Membership(membership) => {
                     guard.state.last_membership = StoredMembership::new(Some(log_id), membership);
@@ -824,13 +829,75 @@ mod tests {
             node_id: 2,
             deleted_layers: vec![digest.clone()],
         };
-        sm.apply(vec![normal_entry(1, 2, RaftRequest::GcReport(report))])
+        let responses = sm
+            .apply(vec![normal_entry(1, 2, RaftRequest::GcReport(report))])
             .await
             .unwrap();
 
+        // The deletion is safe (two holders remain), so it's approved.
+        assert_eq!(
+            responses[0],
+            CouncilResponse::GcApproved {
+                approved: vec![digest.clone()]
+            }
+        );
         let state = sm.desired_state().await;
         let holders = state.manifest_catalog.layer_holders(digest.as_str());
         assert_eq!(holders, std::collections::BTreeSet::from([1, 3]));
+    }
+
+    /// M2 regression: two nodes each holding one of two copies race to
+    /// GC the same layer. The log serialises their reports; the first
+    /// is approved, the second must be refused or the layer is lost.
+    #[tokio::test]
+    async fn gc_never_deletes_the_last_copy() {
+        let mut sm = CouncilStateMachine::new();
+
+        let digest = test_digest("precious");
+        let update = crate::pickle::types::UpdateLayerLocations {
+            updates: vec![(digest.clone(), std::collections::BTreeSet::from([1, 2]))],
+        };
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::UpdateLayerLocations(update),
+        )])
+        .await
+        .unwrap();
+
+        // Both nodes nominate the layer, in log order.
+        let report_from_1 = crate::pickle::types::GcReport {
+            node_id: 1,
+            deleted_layers: vec![digest.clone()],
+        };
+        let report_from_2 = crate::pickle::types::GcReport {
+            node_id: 2,
+            deleted_layers: vec![digest.clone()],
+        };
+        let responses = sm
+            .apply(vec![
+                normal_entry(1, 2, RaftRequest::GcReport(report_from_1)),
+                normal_entry(1, 3, RaftRequest::GcReport(report_from_2)),
+            ])
+            .await
+            .unwrap();
+
+        // Node 1 wins the race; node 2's nomination is refused.
+        assert_eq!(
+            responses[0],
+            CouncilResponse::GcApproved {
+                approved: vec![digest.clone()]
+            }
+        );
+        assert_eq!(
+            responses[1],
+            CouncilResponse::GcApproved { approved: vec![] }
+        );
+
+        // The sole remaining copy (node 2's) is still tracked.
+        let state = sm.desired_state().await;
+        let holders = state.manifest_catalog.layer_holders(digest.as_str());
+        assert_eq!(holders, std::collections::BTreeSet::from([2]));
     }
 
     #[tokio::test]
@@ -892,6 +959,7 @@ mod tests {
             completed_at: std::time::SystemTime::UNIX_EPOCH,
             steps_completed: 3,
             steps_total: 3,
+            spec: None,
         }
     }
 
@@ -1075,16 +1143,16 @@ mod tests {
         // Each apply returns the distinct serial it allocated — so two callers
         // never derive the same value.
         let first = inner.apply_request(&RaftRequest::AllocateSerial);
-        assert_eq!(first, Some(0));
+        assert_eq!(first, Some(CouncilResponse::SerialAllocated { serial: 0 }));
         assert_eq!(inner.state.security_state.next_serial, 1);
 
         let second = inner.apply_request(&RaftRequest::AllocateSerial);
-        assert_eq!(second, Some(1));
+        assert_eq!(second, Some(CouncilResponse::SerialAllocated { serial: 1 }));
         assert_eq!(inner.state.security_state.next_serial, 2);
 
         assert_ne!(first, second);
 
-        // Non-allocating requests return None.
+        // Requests without a bespoke response return None.
         assert_eq!(inner.apply_request(&RaftRequest::Noop), None);
     }
 }

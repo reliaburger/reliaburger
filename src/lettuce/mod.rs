@@ -12,6 +12,7 @@
 pub mod coordinator;
 pub mod diff;
 pub mod git;
+pub mod runner;
 pub mod sync;
 pub mod types;
 pub mod verify;

@@ -59,6 +59,10 @@ pub struct RuncGrill {
     node_index: u16,
     /// Counter for assigning container indices within the node's subnet.
     next_container_index: Arc<Mutex<u16>>,
+    /// Nameserver written into each container's /etc/resolv.conf, so
+    /// `.internal` names resolve inside containers. `None` leaves the
+    /// image's resolv.conf untouched (host DNS).
+    dns_nameserver: Option<std::net::Ipv4Addr>,
 }
 
 impl RuncGrill {
@@ -86,7 +90,18 @@ impl RuncGrill {
             networks: Arc::new(Mutex::new(HashMap::new())),
             node_index,
             next_container_index: Arc::new(Mutex::new(0)),
+            dns_nameserver: None,
         }
+    }
+
+    /// Point containers' `/etc/resolv.conf` at this nameserver.
+    ///
+    /// The address must be reachable from inside container network
+    /// namespaces (i.e. not a host-loopback address like 127.0.0.53 —
+    /// use the node's bridge/gateway IP).
+    pub fn with_dns_nameserver(mut self, nameserver: std::net::Ipv4Addr) -> Self {
+        self.dns_nameserver = Some(nameserver);
+        self
     }
 
     /// Run a runc command and return its output.
@@ -223,6 +238,22 @@ impl super::Grill for RuncGrill {
                 .unwrap_or(rootfs)
                 .to_string_lossy()
                 .to_string();
+        }
+
+        // Point the container at the node's DNS responder. The rootfs
+        // may be shared between containers of the same image; the
+        // content is node-constant, so repeated writes are idempotent.
+        if let Some(nameserver) = self.dns_nameserver {
+            let resolv_path = std::path::Path::new(&spec.root.path)
+                .join("etc")
+                .join("resolv.conf");
+            if let Some(parent) = resolv_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let content = resolv_conf_content(nameserver);
+            if let Err(e) = tokio::fs::write(&resolv_path, content).await {
+                eprintln!("warning: failed to write resolv.conf for {instance}: {e}");
+            }
         }
 
         // Apply rootless modifications if running as non-root
@@ -502,6 +533,14 @@ impl super::Grill for RuncGrill {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
+}
+
+/// Render the resolv.conf pointing containers at the node's resolver.
+///
+/// `ndots:0` keeps single-label lookups (like `redis.internal`) from
+/// being expanded through search domains first.
+fn resolv_conf_content(nameserver: std::net::Ipv4Addr) -> String {
+    format!("nameserver {nameserver}\noptions ndots:0\n")
 }
 
 impl Drop for RuncGrill {

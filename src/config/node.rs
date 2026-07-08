@@ -28,7 +28,9 @@ pub struct NodeConfig {
     /// GitOps configuration (optional — only needed if GitOps is enabled).
     #[serde(default)]
     pub gitops: Option<crate::lettuce::types::GitOpsConfig>,
-    // TODO(Phase 3): ingress section
+    pub ingress: IngressSection,
+    pub dns: DnsSection,
+    pub ebpf: EbpfSection,
     // TODO(Phase 14): upgrades section
 }
 
@@ -47,6 +49,149 @@ impl NodeConfig {
             }
         })?;
         Self::parse(&content)
+    }
+}
+
+/// DNS responder configuration.
+///
+/// Disabled by default: the standard listen address is `127.0.0.53:53`
+/// and binding port 53 needs root, so it must be an explicit choice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsSection {
+    /// Start the `.internal` DNS responder on this node.
+    pub enabled: bool,
+    /// Listen address, e.g. "127.0.0.53:53".
+    pub listen: String,
+    /// Upstream resolver for non-`.internal` names.
+    pub upstream: String,
+}
+
+impl Default for DnsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.53:53".to_string(),
+            upstream: "8.8.8.8:53".to_string(),
+        }
+    }
+}
+
+impl DnsSection {
+    /// Convert into the Onion DNS responder's config type.
+    ///
+    /// Fails when the listen or upstream addresses don't parse.
+    pub fn to_dns_config(&self) -> Result<crate::onion::dns::DnsConfig, super::error::ConfigError> {
+        let listen_addr =
+            self.listen
+                .parse()
+                .map_err(|_| super::error::ConfigError::InvalidValue {
+                    field: "dns.listen".to_string(),
+                    value: self.listen.clone(),
+                })?;
+        let upstream =
+            self.upstream
+                .parse()
+                .map_err(|_| super::error::ConfigError::InvalidValue {
+                    field: "dns.upstream".to_string(),
+                    value: self.upstream.clone(),
+                })?;
+        Ok(crate::onion::dns::DnsConfig {
+            listen_addr,
+            upstream,
+            upstream_timeout: std::time::Duration::from_secs(2),
+        })
+    }
+}
+
+/// eBPF data-path configuration (Onion service resolution, Smoker
+/// network faults, Sesame egress allowlists).
+///
+/// Disabled by default: loading eBPF programs needs root, a 5.7+ kernel
+/// and cgroup v2, and it is Linux-only. `program_dir` defaults to the
+/// directory the build compiled the `.bpf.o` objects into (baked in at
+/// build time), so a dev/Lima build "just works" with `enabled = true`;
+/// a packaged install points it at the installed objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EbpfSection {
+    /// Load and attach the eBPF programs on this node at startup.
+    pub enabled: bool,
+    /// Directory holding the compiled `.bpf.o` objects. When unset, the
+    /// build-time output directory is used.
+    pub program_dir: Option<PathBuf>,
+    /// Root cgroup v2 path to attach the connect hook to.
+    pub cgroup_path: PathBuf,
+}
+
+impl Default for EbpfSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            program_dir: None,
+            cgroup_path: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
+}
+
+impl EbpfSection {
+    /// Resolve the directory to load `.bpf.o` objects from: the explicit
+    /// config value, or the build-time output directory baked in by
+    /// `build.rs`. Returns `None` if neither is available.
+    pub fn resolve_program_dir(&self) -> Option<PathBuf> {
+        self.program_dir
+            .clone()
+            .or_else(|| option_env!("RELIABURGER_BPF_DIR").map(PathBuf::from))
+    }
+}
+
+/// Wrapper ingress proxy configuration.
+///
+/// Disabled by default: enabling binds real listeners on the node, so
+/// it must be an explicit choice. Ports default to the standard 80/443
+/// (bun typically runs as root in cluster VMs); tests override with
+/// port 0 to get ephemeral assignments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IngressSection {
+    /// Bind the ingress listeners on this node.
+    pub enabled: bool,
+    /// HTTP listen port.
+    pub http_port: u16,
+    /// HTTPS listen port.
+    pub https_port: u16,
+    /// TLS certificate PEM path. Self-signed at startup if unset.
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key PEM path.
+    pub tls_key: Option<PathBuf>,
+    /// Maximum concurrent proxied connections.
+    pub max_connections: usize,
+}
+
+impl Default for IngressSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            http_port: 80,
+            https_port: 443,
+            tls_cert: None,
+            tls_key: None,
+            max_connections: 10_000,
+        }
+    }
+}
+
+impl IngressSection {
+    /// Convert into the Wrapper subsystem's config type.
+    pub fn to_wrapper_config(&self) -> crate::wrapper::types::WrapperConfig {
+        crate::wrapper::types::WrapperConfig {
+            http_port: self.http_port,
+            https_port: self.https_port,
+            max_connections: self.max_connections,
+            worker_threads: 4,
+            tls_cert_path: self.tls_cert.clone(),
+            tls_key_path: self.tls_key.clone(),
+        }
     }
 }
 
@@ -413,6 +558,63 @@ mod tests {
             }
         );
         assert!(nc.cluster.join.is_empty());
+    }
+
+    /// L7: enabling ingress binds real listeners, so it must be opt-in.
+    #[test]
+    fn ingress_disabled_by_default() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(!nc.ingress.enabled);
+        assert_eq!(nc.ingress.http_port, 80);
+        assert_eq!(nc.ingress.https_port, 443);
+    }
+
+    #[test]
+    fn ingress_section_parses_and_converts() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ingress]
+            enabled = true
+            http_port = 8080
+            https_port = 8443
+            max_connections = 500
+        "#,
+        )
+        .unwrap();
+        assert!(nc.ingress.enabled);
+        let wc = nc.ingress.to_wrapper_config();
+        assert_eq!(wc.http_port, 8080);
+        assert_eq!(wc.https_port, 8443);
+        assert_eq!(wc.max_connections, 500);
+        assert!(wc.tls_cert_path.is_none());
+    }
+
+    /// L8: loading eBPF needs root + a recent kernel, so it is opt-in.
+    #[test]
+    fn ebpf_disabled_by_default() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(!nc.ebpf.enabled);
+        assert_eq!(nc.ebpf.cgroup_path, PathBuf::from("/sys/fs/cgroup"));
+        assert!(nc.ebpf.program_dir.is_none());
+    }
+
+    #[test]
+    fn ebpf_section_parses_explicit_program_dir() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ebpf]
+            enabled = true
+            program_dir = "/opt/reliaburger/bpf"
+            cgroup_path = "/sys/fs/cgroup"
+        "#,
+        )
+        .unwrap();
+        assert!(nc.ebpf.enabled);
+        // An explicit program_dir wins over the build-time default.
+        assert_eq!(
+            nc.ebpf.resolve_program_dir(),
+            Some(PathBuf::from("/opt/reliaburger/bpf"))
+        );
     }
 
     #[test]

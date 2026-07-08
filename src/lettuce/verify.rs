@@ -74,16 +74,19 @@ pub fn commit_modifies_script(
         .any(|line| line.starts_with('+') && !line.starts_with("+++") && line.contains("script")))
 }
 
-/// Check whether a key fingerprint from verify output is in the trusted set.
+/// Check whether the signing key from `git verify-commit --raw` output
+/// is in the trusted set.
+///
+/// H12 regression: this used to `return true` after the loop when no
+/// trusted key matched, so a validly-signed commit from ANY key (a
+/// disgruntled ex-employee's, an attacker's) was accepted as long as
+/// the signature itself verified. The allowlist did nothing. It now
+/// returns `false` when no trusted fingerprint appears in the output —
+/// a valid signature from an untrusted key is `UntrustedKey`, rejected.
 fn is_key_trusted(verify_output: &str, trusted_keys: &[String]) -> bool {
-    for key in trusted_keys {
-        if verify_output.contains(key) {
-            return true;
-        }
-    }
-    // If no specific key matching, trust any valid signature
-    // when trusted_keys is provided (the verify-commit already passed)
-    true
+    trusted_keys
+        .iter()
+        .any(|key| verify_output.contains(key.as_str()))
 }
 
 #[cfg(test)]
@@ -101,5 +104,25 @@ mod tests {
         };
         let result = verify_commit(Path::new("/nonexistent"), &commit, &[]);
         assert_eq!(result, SignatureStatus::NotChecked);
+    }
+
+    /// H12 regression: a matching fingerprint is trusted.
+    #[test]
+    fn matching_fingerprint_is_trusted() {
+        let raw = "VALIDSIG ABCDEF0123456789 2026-01-01 dev@example.com";
+        assert!(is_key_trusted(raw, &["ABCDEF0123456789".to_string()]));
+    }
+
+    /// H12 regression: a valid signature from an UNLISTED key is NOT
+    /// trusted (it used to be, via the fall-through `return true`).
+    #[test]
+    fn unlisted_key_is_not_trusted() {
+        let raw = "VALIDSIG DEADBEEFDEADBEEF 2026-01-01 attacker@evil.example";
+        assert!(!is_key_trusted(raw, &["ABCDEF0123456789".to_string()]));
+    }
+
+    #[test]
+    fn empty_trusted_set_trusts_nothing() {
+        assert!(!is_key_trusted("VALIDSIG ABC", &[]));
     }
 }

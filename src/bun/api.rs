@@ -81,6 +81,9 @@ pub struct ApiState {
     pub service_token: Option<String>,
     /// HTTP client for cross-node fan-out queries.
     pub http_client: reqwest::Client,
+    /// The API port this cluster runs on (uniform across nodes), used
+    /// to derive peer API addresses from raft/gossip IPs.
+    pub api_port: u16,
 }
 
 /// Build the API router.
@@ -95,6 +98,10 @@ pub fn router(
     council: Option<Arc<crate::council::CouncilNode>>,
     token_store: Option<crate::sesame::auth::TokenStore>,
     service_token: Option<String>,
+    rollup_store: Option<Arc<RwLock<RollupStore>>>,
+    membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
+    gitops_webhook_tx: Option<mpsc::Sender<()>>,
+    api_port: u16,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -104,13 +111,14 @@ pub fn router(
         alerts,
         deploy_history,
         pickle_catalog,
-        gitops_webhook_tx: None,
+        gitops_webhook_tx,
         council,
-        rollup_store: None,
-        membership: None,
+        rollup_store,
+        membership,
         token_store: token_store.clone(),
         service_token: service_token.clone(),
         http_client: reqwest::Client::new(),
+        api_port,
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
@@ -180,6 +188,8 @@ pub fn router(
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
+        .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
+        .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(batch_submit_handler))
         .route("/v1/build", post(build_submit_handler))
@@ -237,6 +247,15 @@ async fn apply_handler(
             .into_response();
     }
 
+    // Cluster mode (L1): apps become desired state in Raft; the leader
+    // schedules them and every node's reconciler converges. Jobs stay
+    // on the receiving node (cluster-wide job scheduling is later work).
+    if let Some(council) = &state.council
+        && !config.app.is_empty()
+    {
+        return cluster_apply(state.clone(), Arc::clone(council), config, body).await;
+    }
+
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     if state
         .cmd_tx
@@ -260,6 +279,197 @@ async fn apply_handler(
     });
 
     Sse::new(stream).into_response()
+}
+
+/// Apply a config in cluster mode: propose each app spec to Raft.
+///
+/// On a follower, the whole request is forwarded to the leader's API
+/// (openraft does not forward client writes), streaming its SSE
+/// response back verbatim. Jobs in the same config still deploy on the
+/// receiving node after the specs commit.
+async fn cluster_apply(
+    state: ApiState,
+    council: Arc<crate::council::CouncilNode>,
+    config: Config,
+    raw_body: String,
+) -> Response {
+    // Follower? Forward to the leader rather than half-failing.
+    if !council.is_leader().await {
+        let Some(leader_url) = leader_api_url(&state, &council).await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "no cluster leader known yet; retry shortly"
+                })),
+            )
+                .into_response();
+        };
+        let mut request = state
+            .http_client
+            .post(format!("{leader_url}/v1/apply"))
+            .body(raw_body);
+        if let Some(token) = &state.service_token {
+            request = request.bearer_auth(token);
+        }
+        return match request.send().await {
+            Ok(response) => {
+                let stream = response.bytes_stream();
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("failed to forward apply to the leader: {e}")
+                })),
+            )
+                .into_response(),
+        };
+    }
+
+    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    let cmd_tx = state.cmd_tx.clone();
+    tokio::spawn(async move {
+        let mut committed = 0usize;
+        for (name, spec) in &config.app {
+            let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+            let app_id = crate::meat::AppId::new(name, &namespace);
+            match council
+                .write(crate::council::types::RaftRequest::AppSpec {
+                    app_id,
+                    spec: Box::new(spec.clone()),
+                })
+                .await
+            {
+                Ok(_) => {
+                    committed += 1;
+                    let _ = event_tx
+                        .send(ApplyEvent::Progress {
+                            message: format!(
+                                "app {name}: spec committed to the cluster; scheduling"
+                            ),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            message: format!("app {name}: raft write failed: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // Jobs are not cluster-scheduled yet; run them here, as before.
+        if !config.job.is_empty() {
+            let _ = event_tx
+                .send(ApplyEvent::Progress {
+                    message: format!(
+                        "{} job(s) deploying on this node (jobs are not cluster-scheduled yet)",
+                        config.job.len()
+                    ),
+                })
+                .await;
+            let job_config = Config {
+                job: config.job.clone(),
+                ..Config::default()
+            };
+            let _ = cmd_tx
+                .send(AgentCommand::Deploy {
+                    config: job_config,
+                    events: event_tx.clone(),
+                })
+                .await;
+            // The agent sends Complete/Error for the job deploy.
+            return;
+        }
+
+        let _ = event_tx
+            .send(ApplyEvent::Complete {
+                created: committed,
+                instances: vec![],
+            })
+            .await;
+    });
+
+    let stream = ReceiverStream::new(event_rx).map(|apply_event| {
+        let json = serde_json::to_string(&apply_event).unwrap_or_default();
+        Ok::<_, std::convert::Infallible>(Event::default().data(json))
+    });
+    Sse::new(stream).into_response()
+}
+
+/// Resolve the current leader's API base URL.
+///
+/// Preferred source is the gossip-fed membership table (it stores real
+/// per-node API addresses); the fallback derives from the leader's
+/// raft IP and this node's own API port, which is correct only when
+/// ports are uniform across the cluster.
+async fn leader_api_url(state: &ApiState, council: &crate::council::CouncilNode) -> Option<String> {
+    let leader_id = council.current_leader().await?;
+    let (leader_name, leader_ip) = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        let info = metrics
+            .membership_config
+            .membership()
+            .get_node(&leader_id)?;
+        (info.name.clone(), info.addr.ip())
+    };
+
+    if let Some(membership) = &state.membership {
+        let members = membership.read().await;
+        if let Some(info) = members
+            .iter()
+            .find(|m| m.node_id == crate::meat::NodeId::new(&leader_name))
+        {
+            return Some(format!("http://{}", info.address));
+        }
+    }
+
+    Some(format!("http://{leader_ip}:{}", state.api_port))
+}
+
+/// `GET /v1/placements/{node_id}` — the apps (and per-node replica
+/// counts) the leader has assigned to a node. Served from the Raft
+/// state machine; reconcilers poll this every couple of seconds.
+async fn placements_handler(
+    State(state): State<ApiState>,
+    Path(node_id): Path<String>,
+) -> Response {
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "not running in cluster mode" })),
+        )
+            .into_response();
+    };
+
+    let desired = council.desired_state().await;
+    let node = crate::meat::NodeId::new(&node_id);
+
+    let mut apps = Vec::new();
+    for (app_id, placements) in &desired.scheduling {
+        let replicas = placements.iter().filter(|p| p.node_id == node).count() as u32;
+        if replicas == 0 {
+            continue;
+        }
+        let Some(spec) = desired.apps.get(app_id) else {
+            continue; // spec deleted; placements lag briefly
+        };
+        apps.push(crate::cluster::orchestrate::NodeAssignment {
+            name: app_id.name.clone(),
+            namespace: app_id.namespace.clone(),
+            replicas,
+            spec: spec.clone(),
+        });
+    }
+
+    Json(crate::cluster::orchestrate::NodeAssignments { apps }).into_response()
 }
 
 /// List all instances.
@@ -1146,7 +1356,10 @@ async fn metrics_query_handler(
     let store = mayo.read().await;
     let name = params.name.as_deref().unwrap_or("*");
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     if name == "*" {
         let sql = format!(
@@ -1545,7 +1758,10 @@ async fn metrics_rollup_handler(
 
     let store = rollup_store.read().await;
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
@@ -1604,7 +1820,10 @@ async fn metrics_cluster_handler(
     // Query local rollup store directly (this council member's data)
     let store = rollup_store.read().await;
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
@@ -1665,7 +1884,10 @@ async fn metrics_app_handler(
 
     let store = mayo.read().await;
     let start = params.start.unwrap_or(0);
-    let end = params.end.unwrap_or(u64::MAX);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     // Filter by app label in the local store
     let app_filter = format!("{namespace}/{app}");
@@ -1734,6 +1956,85 @@ async fn deploys_history_handler(
     Json(serde_json::json!({"app": app, "history": filtered}))
 }
 
+/// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
+/// successful spec (X3).
+///
+/// "Previous" means the last-but-one distinct successful deploy: the
+/// most recent completed entry is the *current* version, so rollback
+/// targets the one before it. Re-applies through the same path as
+/// `apply` (Raft in cluster mode, local deploy otherwise).
+async fn rollback_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    let Some(history) = &state.deploy_history else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "deploy history unavailable"})),
+        )
+            .into_response();
+    };
+
+    // Successful deploys for this app, newest first, that carry a spec.
+    let target_spec = {
+        let all = history.read().await;
+        let mut successful: Vec<&DeployHistoryEntry> = all
+            .iter()
+            .filter(|e| {
+                e.app_id.name == app
+                    && e.app_id.namespace == namespace
+                    && e.result == crate::meat::deploy_types::DeployResult::Completed
+                    && e.spec.is_some()
+            })
+            .collect();
+        successful.reverse(); // newest first
+        // [0] is the current version; [1] is the rollback target.
+        successful.get(1).and_then(|e| e.spec.clone()).map(|s| *s)
+    };
+
+    let Some(spec) = target_spec else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no previous successful deploy to roll {app} back to")
+            })),
+        )
+            .into_response();
+    };
+
+    // Re-apply the previous spec through the standard deploy path.
+    let mut config = Config::default();
+    config.app.insert(app.clone(), spec);
+    let raw = toml::to_string(&config).unwrap_or_default();
+
+    if let Some(council) = &state.council {
+        return cluster_apply(state.clone(), Arc::clone(council), config, raw).await;
+    }
+
+    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    if state
+        .cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: event_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "agent unavailable"})),
+        )
+            .into_response();
+    }
+    let stream = ReceiverStream::new(event_rx).map(|e| {
+        Ok::<_, std::convert::Infallible>(
+            Event::default().data(serde_json::to_string(&e).unwrap_or_default()),
+        )
+    });
+    Sse::new(stream).into_response()
+}
+
 /// `GET /v1/images` — list images in the local Pickle registry.
 async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(catalog) = &state.pickle_catalog else {
@@ -1774,20 +2075,146 @@ async fn batch_submit_handler() -> Response {
         .into_response()
 }
 
-/// Submit a build job.
+/// Request body for `/v1/build`.
+#[derive(serde::Deserialize)]
+struct BuildSubmitRequest {
+    name: String,
+    context_digest: String,
+    registry_port: u16,
+    spec: crate::config::build::BuildSpec,
+}
+
+/// Submit a build job: fetch the context blob from the local Pickle
+/// registry, run `buildah bud` + `buildah push` against it, and let the
+/// push land the image back in Pickle through the standard endpoints.
 ///
-/// Not yet wired into the live agent. `execute_build` constructs the buildah
-/// commands (and is unit-tested), but downloading the context blob, spawning
-/// buildah, and pushing the result are deferred to Phase 12. Returns 501
-/// rather than pretending to accept.
-async fn build_submit_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "build execution is not yet wired into the agent (deferred to Phase 12)"
-        })),
-    )
-        .into_response()
+/// Requires `buildah` on PATH (Linux build nodes); without it the
+/// response says so honestly instead of pretending to accept (X1).
+/// The build runs synchronously — minutes-long builds hold the request
+/// open, matching the CLI's 300 s client timeout.
+async fn build_submit_handler(Json(request): Json<BuildSubmitRequest>) -> Response {
+    // Builder present?
+    if tokio::process::Command::new("buildah")
+        .arg("--version")
+        .output()
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "build execution requires `buildah` on PATH \
+                          (available on Linux build nodes; not supported on macOS)"
+            })),
+        )
+            .into_response();
+    }
+
+    let job = match crate::pickle::build::execute_build(
+        &request.spec,
+        &request.context_digest,
+        Some(request.registry_port),
+    ) {
+        Ok(job) => job,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid build spec: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Fetch the context blob from the local registry.
+    let context_url =
+        crate::pickle::build::context_download_url(request.registry_port, &request.context_digest);
+    let context = match reqwest::get(&context_url).await {
+        Ok(response) if response.status().is_success() => match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("context read failed: {e}")})),
+                )
+                    .into_response();
+            }
+        },
+        _ => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "context blob {} not found in the registry",
+                        request.context_digest
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Extract the tarred context (blocking IO off the runtime).
+    let build_dir = std::env::temp_dir()
+        .join("reliaburger-build")
+        .join(request.context_digest.replace(':', "-"));
+    let extract_dir = build_dir.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&extract_dir)?;
+        tar::Archive::new(&context[..]).unpack(&extract_dir)?;
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
+    if !matches!(extracted, Ok(Ok(()))) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "failed to extract build context"})),
+        )
+            .into_response();
+    }
+
+    // Run the build, then the push. Both are external processes; the
+    // push targets the local registry, so the result lands in Pickle
+    // through the same handlers a `docker push` would use (real
+    // holders, catalog persistence, Raft propose — all for free).
+    for (label, cmd) in [("build", &job.build_cmd), ("push", &job.push_cmd)] {
+        let (program, args) = match cmd.split_first() {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let output = tokio::process::Command::new(program)
+            .args(args)
+            .current_dir(&build_dir)
+            .output()
+            .await;
+        match output {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("buildah {label} failed for {}: {tail}", request.name)
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to run buildah {label}: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": format!("built and pushed {}", job.local_tag),
+    }))
+    .into_response()
 }
 
 /// GitOps webhook handler.
@@ -2206,7 +2633,9 @@ mod tests {
             agent.run().await;
         });
 
-        let app = router(cmd_tx, None, None, None, None, None, None, None, None);
+        let app = router(
+            cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117,
+        );
         (app, shutdown)
     }
 
@@ -2318,6 +2747,10 @@ mod tests {
             None,
             Some(store),
             service_token,
+            None,
+            None,
+            None,
+            9117,
         );
         (app, shutdown)
     }
@@ -2428,6 +2861,10 @@ mod tests {
             Some(council),
             Some(store),
             None,
+            None,
+            None,
+            None,
+            9117,
         );
         (app, shutdown, plaintext)
     }
@@ -2500,6 +2937,10 @@ mod tests {
             Some(council),
             Some(store),
             Some("rbrg_service".to_string()),
+            None,
+            None,
+            None,
+            9117,
         );
         let status = post_status(
             app,
@@ -2525,6 +2966,10 @@ mod tests {
             Some(council),
             None,
             None,
+            None,
+            None,
+            None,
+            9117,
         );
 
         let (status, body) = get(app, "/v1/identity/jwks").await;
@@ -2560,6 +3005,10 @@ mod tests {
             Some(Arc::clone(&council)),
             None,
             None,
+            None,
+            None,
+            None,
+            9117,
         );
 
         let response = app
@@ -2613,6 +3062,10 @@ mod tests {
             Some(council),
             None,
             None,
+            None,
+            None,
+            None,
+            9117,
         );
         let (status, body) = get(app, "/v1/token/list").await;
         assert_eq!(status, StatusCode::OK);
@@ -2731,6 +3184,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            9117,
         );
 
         // Deploy first via channel

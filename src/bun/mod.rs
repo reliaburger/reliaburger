@@ -53,6 +53,11 @@ pub enum BunError {
     #[error("deploy failed for {app_name:?}: {reason}")]
     DeployFailed { app_name: String, reason: String },
 
+    /// A fault injection was rejected (safety rail, or unsupported on
+    /// this platform / without the eBPF feature).
+    #[error("fault rejected: {reason}")]
+    FaultRejected { reason: String },
+
     /// The workload has exceeded its restart limit.
     #[error(
         "instance {instance_id} exceeded restart limit: {restart_count}/{max_restarts} restarts"

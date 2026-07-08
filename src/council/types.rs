@@ -176,6 +176,13 @@ pub enum CouncilResponse {
     /// *this* entry so the caller doesn't have to race to read it back from
     /// shared state (which returns duplicates under concurrent allocation).
     SerialAllocated { serial: u64 },
+    /// A `GcReport` entry was applied; carries the digests the state
+    /// machine approved for physical deletion. Nominations that would
+    /// have removed a layer's last holder are absent — the proposing
+    /// node must keep those blobs.
+    GcApproved {
+        approved: Vec<crate::pickle::types::Digest>,
+    },
 }
 
 // ---------------------------------------------------------------------------

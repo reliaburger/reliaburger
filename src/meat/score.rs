@@ -1,22 +1,32 @@
 /// Phase 2: Score.
 ///
-/// Ranks candidate nodes on a 0–100 scale. Higher is better.
+/// Ranks candidate nodes on a 0–130 scale. Higher is better.
 /// The score is a weighted sum of several dimensions:
-/// - Bin-packing (50%): prefer fuller nodes to maximise density
-/// - Preferred labels (20%): prefer nodes matching soft constraints
-/// - Spread (10%): penalise nodes already running the same app
-/// - Stability (5%): prefer longer-running nodes (placeholder)
-/// - Image locality (15%): prefer nodes with cached images (placeholder)
+/// - Spread (40): penalise nodes already running the same app
+/// - Bin-packing (50): prefer fuller nodes to maximise density
+/// - Preferred labels (20): prefer nodes matching soft constraints
+/// - Stability (5): prefer longer-running nodes
+/// - Image locality (15): prefer nodes with cached images
 use std::collections::BTreeMap;
 
 use super::cluster_state::ClusterStateCache;
 use super::types::{AppId, NodeId, Resources};
 
-/// Score weights (out of 100).
+/// Score weights.
+///
+/// H8 regression note: spread used to be 10 against bin-pack's 50, so
+/// the bin-packer put every replica of an app on the same node.
+/// Replicas exist to survive a node failure; packing them together
+/// defeats the point. Spread contributes 0 or its full weight (a node
+/// either runs the app or it doesn't), while bin-pack contributes at
+/// most 50 — so spread's weight must EXCEED 50 for a same-app-free
+/// node to always outrank a fuller node that already runs the app.
+/// Among nodes that don't run the app (or all do), bin-pack still
+/// decides as before.
 const WEIGHT_BIN_PACK: u32 = 50;
 const WEIGHT_PREFERRED: u32 = 20;
 const WEIGHT_IMAGE: u32 = 15;
-const WEIGHT_SPREAD: u32 = 10;
+const WEIGHT_SPREAD: u32 = 60;
 const WEIGHT_STABILITY: u32 = 5;
 
 /// Score all candidate nodes and return them sorted by score (descending),

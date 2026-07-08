@@ -67,4 +67,9 @@ fn compile_ebpf() {
     // Also watch shared headers
     println!("cargo:rerun-if-changed=ebpf/onion_common.h");
     println!("cargo:rerun-if-changed=ebpf/smoker_common.h");
+
+    // Bake the object directory into the binary so `[ebpf]` can default
+    // `program_dir` to where we just wrote the `.bpf.o` files — no
+    // install step needed for dev/Lima builds.
+    println!("cargo:rustc-env=RELIABURGER_BPF_DIR={out_dir}");
 }

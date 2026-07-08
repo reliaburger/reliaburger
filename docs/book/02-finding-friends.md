@@ -1444,7 +1444,15 @@ pub enum LearningOutcome {
 }
 ```
 
-When the learning period ends — by threshold or timeout — the controller calls `compute_diff` and produces a `ReconstructionResult` with the corrections, the list of unknown nodes, and the list of reported nodes. The corrections aren't executed yet (the scheduler doesn't exist), but they're ready for when it does.
+When the learning period ends — by threshold or timeout — the controller calls `compute_diff` and produces a `ReconstructionResult` with the corrections, the list of unknown nodes, and the list of reported nodes.
+
+The original edition of this section ended that sentence with "the corrections aren't executed yet (the scheduler doesn't exist), but they're ready for when it does." That was honest at the time and stale by July 2026: the scheduler *did* exist by then (Chapter 2's Meat), but the `ReconstructionController` still had no caller. Another library with the ignition wires cut.
+
+The wiring turned out smaller than the machinery, because the controller and the scheduler slot together naturally. Both are leader-only; both run on the same 2-second tick. So reconstruction lives inside the scheduler loop as a gate. On the leadership edge — the tick where this node discovers it's the leader — the loop calls `on_leader_elected(alive_count)` and enters the learning period. While the controller's phase isn't `Active`, the loop feeds each round of reports through `on_report_received`, checks the timeout, and then *skips scheduling entirely*. Only once reconstruction reaches `Active` does the loop go on to place apps.
+
+That gate is the whole point, and it's worth restating why. A freshly-elected leader doesn't yet know what's running where — the workers haven't reported since it took charge. If it scheduled immediately, it would look at desired state ("web wants 3 replicas"), see no reports proving they exist, and cheerfully start three more. The learning period is the leader holding its hands still until the picture fills in. `compute_diff`'s `MissingApp` and `ExtraApp` corrections then fall out for free: once the loop is scheduling again, it already reconciles placements against desired state on every tick, which *is* applying those corrections. We didn't need a separate execution path for them — the gate was the missing piece, not the diff.
+
+One design note on what we *didn't* wire. The controller also reports `UnknownNode` corrections — nodes that never reported during the learning window. An early attempt excluded those nodes from scheduling. That backfired: a node merely slow to report in a two-second window got permanently blacklisted, and replicas piled onto the nodes that did report. The fix was to trust the gate and nothing more. A node that reports late isn't unknown for long; the ordinary scheduler picks it up on the next tick. The lesson is one this whole stage keeps teaching in different keys: wire the load-bearing thing, and resist gold-plating the rest.
 
 ### Key invariants
 
@@ -1764,6 +1772,36 @@ CHAOS  Council Partition
 Every injection has a TTL. If you forget to heal, the agent does it for you. `relish chaos status` shows active partitions and their remaining time. `relish chaos heal` cleans up immediately.
 
 This is a foundation. Phase 8 adds Smoker, which uses eBPF for fine-grained fault injection: network delays, packet drops, DNS failures, CPU stress. But the principle is the same: inject, observe, heal, verify. Make failure routine so recovery is trustworthy.
+
+## The scheduler finally schedules
+
+Here is an uncomfortable admission. Everything above — the Meat scheduler, its four-phase Filter/Score/Select/Commit pipeline, the cluster state cache — was a library nobody called. The July 2026 review put it bluntly: no code path in the running binary ever schedules a workload onto another node. `relish apply` deployed to whichever node you happened to hit, and that node ran every replica itself. A distributed scheduler that only ever schedules locally isn't distributed; it's decoration.
+
+Wiring it up is the structural heart of the whole cluster, so it's worth being precise about the design.
+
+### Desired state, not remote procedure calls
+
+The obvious way to place a replica on another node is to call it: "start this container." That's a push RPC, and it drags a tail of problems behind it. What if the call times out — did it start or not? What if the target dies mid-deploy? What if the leader that issued the call loses leadership before the replica is healthy? Every one of those needs bookkeeping, retries, idempotency keys.
+
+Reliaburger already has a machine that solves exactly these problems: Raft. So placement is desired state, not a command. `relish apply` commits the `AppSpec` to Raft. The leader runs the scheduler and commits a `SchedulingDecision` — a list of `(node, replica)` placements — also to Raft. Every node polls the leader for "what is assigned to me" and reconciles its local instances to match: start what's missing, stop what's no longer listed.
+
+The word that earns its keep here is *reconcile*. The node isn't told "start this container" once and expected to remember; it's told "you should be running these apps" over and over, and it makes reality match. A node that crashes and restarts re-reads its assignments and rebuilds. A reconcile that half-fails just runs again next tick. A new leader inherits the same desired state and keeps going. There is no per-instance RPC whose failure needs a bespoke recovery path, because there is no per-instance RPC. Kubernetes users will recognise the shape — it's the controller pattern, and it's popular for exactly this reason.
+
+Workers poll the leader over HTTP (`GET /v1/placements/{node}`) rather than being Raft voters, because the council is capped at seven and a hundred-node cluster can't make everyone a voter. This is the same flat-star simplification the reporting tree uses, and it covers clusters up to the council size completely; larger fan-out is a later refinement behind the same interface.
+
+### H8: the weight nobody integration-tested
+
+While wiring the scheduler we fixed a bug the review flagged: `schedule_fixed_replicas_places_all` asserted that three replicas produced three placements, but never that they landed on *different* nodes. They didn't. The score weights had bin-packing at 50 and spread at 10, so the bin-packer's preference for the fullest node swamped the spread penalty — every replica stacked onto one machine. An app runs multiple replicas precisely so it survives one node failing; packing them together defeats the entire purpose.
+
+Spread now weighs 60. The reasoning is arithmetic, not taste: spread contributes all-or-nothing (a node either already runs the app or it doesn't), while bin-pack maxes out at 50, so spread's weight has to exceed 50 for an app-free node to always beat a fuller node that already runs the app. Among nodes that are equal on spread — none run the app, or all do — bin-pack still breaks the tie as before. The test now asserts distinctness, so the weight can't silently regress again.
+
+### One bug the wiring flushed out
+
+The first time an `AppSpec` was ever written to Raft in anger, the write hung forever. Not our code — the serialization underneath it.
+
+The durable Raft log and the council's TCP RPC both used bincode, a compact binary format. bincode is *not self-describing*: it writes no field names or type tags, so on read-back it must be told exactly what type to expect. That's fine for plain structs. But Reliaburger's config types accept flexible TOML — `replicas = 3` or `replicas = "*"`, `cpu = "200m-400m"` — and implement that with serde's `deserialize_any`, which asks the format "what's actually there?" A self-describing format like JSON can answer. bincode can't, and returns nonsense.
+
+The bug had hidden for months because the only tests that wrote an `AppSpec` to Raft used a single-node, in-memory cluster — no serialization to disk, no replication over the wire. The moment a real three-node cluster tried to replicate an app-spec entry to a follower, the follower couldn't decode the RPC, never acked, and the write stalled. The snapshot code had actually hit this earlier and quietly switched to JSON; the log and RPC paths never got the memo. Now they have. The lesson the review keeps teaching: "library-only" doesn't just mean unused features — it means untriggered bugs, waiting for the first real caller.
 
 ## What we built
 

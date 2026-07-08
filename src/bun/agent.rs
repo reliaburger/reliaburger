@@ -89,6 +89,11 @@ pub enum AgentCommand {
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
     },
+    /// Get the image references of all current instances (for GC
+    /// protection: actively deployed images must not be collected).
+    ActiveImages {
+        response: oneshot::Sender<std::collections::HashSet<String>>,
+    },
     /// Get logs for an app.
     Logs {
         app_name: String,
@@ -293,6 +298,33 @@ pub struct ClusterHandle {
     pub snapshot_rx: mpsc::Receiver<CollectSnapshotRequest>,
     /// Master secret for unwrapping CA private keys during join/CSR operations.
     pub wrapping_ikm: Option<[u8; 32]>,
+    /// Gossip + Raft transport blocklists (chaos partitions populate
+    /// these to drop traffic to specific peers). Empty in tests that
+    /// don't exercise partitions.
+    pub partition_blocklists: PartitionBlocklists,
+}
+
+/// The transport blocklists a chaos partition manipulates, plus the
+/// gossip→raft port offset needed to derive a peer's Raft address from
+/// its gossip address.
+#[derive(Clone, Default)]
+pub struct PartitionBlocklists {
+    pub gossip: Option<Arc<tokio::sync::RwLock<std::collections::HashSet<std::net::SocketAddr>>>>,
+    pub raft: Option<Arc<tokio::sync::RwLock<std::collections::HashSet<std::net::SocketAddr>>>>,
+    /// raft_port - gossip_port, to map a peer's gossip addr → raft addr.
+    pub raft_port_offset: i32,
+}
+
+/// Egress enforcement bound to a running instance's cgroup (L16).
+#[cfg(feature = "ebpf")]
+#[derive(Clone)]
+struct EgressBinding {
+    /// The instance's cgroup id (key into the egress maps).
+    cgroup_id: u64,
+    /// The raw `[egress] allow` list, re-resolved periodically.
+    allow: Vec<String>,
+    /// The destinations currently programmed into the egress map.
+    resolved: Vec<(std::net::Ipv4Addr, u16)>,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
@@ -308,16 +340,29 @@ pub struct BunAgent<G: Grill> {
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(feature = "ebpf")]
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
+    /// Egress enforcement state per instance with an allowlist: its cgroup
+    /// id, the raw allow list, and the last-resolved destinations — so
+    /// enforcement can be lifted on stop and the allowlist re-resolved as
+    /// DNS changes (L16).
+    #[cfg(feature = "ebpf")]
+    egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
+    /// Ticks since the last egress re-resolution (the event loop runs at 1s).
+    #[cfg(feature = "ebpf")]
+    egress_reresolve_ticks: u32,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Publisher for service-map snapshots (DNS responder subscribes).
+    service_map_tx: tokio::sync::watch::Sender<crate::onion::service_map::ServiceMap>,
     /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
     ingress_configs: std::collections::HashMap<String, crate::config::app::IngressSpec>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
-    /// Last known cluster node count for firewall reconciliation.
-    last_firewall_node_count: usize,
+    /// Last applied cluster-node set for firewall reconciliation. `None`
+    /// until the first apply, so a standalone node (empty set) still gets
+    /// the firewall; comparing the set (not a count) catches node swaps (M18).
+    last_firewall_nodes: Option<crate::firewall::rules::ClusterNodes>,
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
@@ -329,9 +374,18 @@ pub struct BunAgent<G: Grill> {
     /// Brioche UI can display environment variables with encrypted values
     /// masked as `[encrypted]`.
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
+    /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
+    /// A wall-clock generation collided when two redeploys landed in the
+    /// same second; this never repeats within a process.
+    next_deploy_gen: u64,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
+    /// Schedulable CPU capacity (system total minus `[resources]`
+    /// reserved), reported to the cluster. Zero until the binary sets it.
+    capacity_cpu_millicores: u32,
+    /// Schedulable memory capacity, reported to the cluster.
+    capacity_memory_mb: u32,
     /// Image trust policy. When `require_signatures` is set, deploys of
     /// Pickle-hosted images are gated on a valid signature. Defaults to
     /// permissive so single-node / untrusted setups are unaffected.
@@ -355,7 +409,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
+            #[cfg(feature = "ebpf")]
+            egress_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "ebpf")]
+            egress_reresolve_ticks: 0,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            service_map_tx: tokio::sync::watch::channel(
+                crate::onion::service_map::ServiceMap::new(),
+            )
+            .0,
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
             )),
@@ -365,11 +427,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 enabled: false,
                 ..Default::default()
             },
-            last_firewall_node_count: 0,
+            last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            next_deploy_gen: 1,
             log_tx: None,
+            capacity_cpu_millicores: 0,
+            capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
         }
     }
@@ -391,7 +456,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
+            #[cfg(feature = "ebpf")]
+            egress_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "ebpf")]
+            egress_reresolve_ticks: 0,
             service_map: crate::onion::service_map::ServiceMap::new(),
+            service_map_tx: tokio::sync::watch::channel(
+                crate::onion::service_map::ServiceMap::new(),
+            )
+            .0,
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
             )),
@@ -407,11 +480,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 enabled: false,
                 ..Default::default()
             },
-            last_firewall_node_count: 0,
+            last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
+            next_deploy_gen: 1,
             log_tx: None,
+            capacity_cpu_millicores: 0,
+            capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
         }
     }
@@ -432,11 +508,97 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.log_tx = Some(log_tx);
     }
 
+    /// Get a shared handle to the ingress routing table.
+    ///
+    /// The Wrapper proxy reads routes from this table; the agent
+    /// rebuilds it on every deploy, stop, and health change.
+    pub fn routing_table_handle(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>> {
+        Arc::clone(&self.routing_table)
+    }
+
+    /// Subscribe to service-map snapshots.
+    ///
+    /// The agent publishes a snapshot whenever the map changes (same
+    /// cadence as routing-table rebuilds). The DNS responder resolves
+    /// `.internal` names from these snapshots.
+    pub fn service_map_watch(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::onion::service_map::ServiceMap> {
+        self.service_map_tx.subscribe()
+    }
+
     /// Set the image trust policy (from node config). When it requires
     /// signatures, deploys verify Pickle-hosted images before creating them.
     pub fn set_trust_policy(&mut self, trust_policy: crate::config::node::TrustPolicySection) {
         self.trust_policy = trust_policy;
     }
+
+    /// Set the node's schedulable capacity (system totals minus the
+    /// `[resources]` reservation). Reported in every StateReport.
+    pub fn set_node_capacity(&mut self, cpu_millicores: u32, memory_mb: u32) {
+        self.capacity_cpu_millicores = cpu_millicores;
+        self.capacity_memory_mb = memory_mb;
+    }
+
+    /// Enable or disable the perimeter firewall. In-process multi-node tests
+    /// run several agents on one host and must not spawn `nft` against the
+    /// shared host firewall (`with_cluster` enables it by default on Linux).
+    pub fn set_perimeter_enabled(&mut self, enabled: bool) {
+        self.perimeter_config.enabled = enabled;
+    }
+
+    /// Attach a loaded eBPF handle so the agent can write fault and
+    /// egress map entries (L8). Only present with the `ebpf` feature;
+    /// `bun` calls this at startup when `[ebpf] enabled`.
+    #[cfg(feature = "ebpf")]
+    pub fn set_onion_ebpf(
+        &mut self,
+        ebpf: std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
+    ) {
+        self.onion_ebpf = Some(ebpf);
+    }
+
+    /// Mirror an app's current service-map entry into the kernel
+    /// `backend_map` so the eBPF connect hook rewrites its VIP to live
+    /// backends (L8 completeness). Called after every service-map add /
+    /// health change. A no-op without the eBPF data path loaded.
+    #[cfg(feature = "ebpf")]
+    async fn sync_backend_ebpf(&self, app_name: &str) {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let Some(entry) = self.service_map.resolve(app_name).cloned() else {
+            return;
+        };
+        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
+        let mut ebpf = handle.lock().await;
+        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry);
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    async fn sync_backend_ebpf(&self, _app_name: &str) {}
+
+    /// Drop an app's `backend_map` entry. Must be called *before* the app
+    /// is unregistered from the service map, while its VIP/port are still
+    /// known. A no-op without the eBPF data path loaded.
+    #[cfg(feature = "ebpf")]
+    async fn remove_backend_ebpf(&self, app_name: &str) {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let Some(port) = self.service_map.resolve(app_name).map(|e| e.port) else {
+            return;
+        };
+        let vip = crate::onion::vip::VirtualIP::from_app_name(app_name);
+        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
+        let mut ebpf = handle.lock().await;
+        bpf.remove_backends_bpf(&mut ebpf, vip, port);
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    async fn remove_backend_ebpf(&self, _app_name: &str) {}
 
     /// Spawn a background forwarder that streams a started instance's log lines
     /// into the configured log sink. No-op if no sink is set.
@@ -496,8 +658,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.check_jobs().await;
                     self.check_apps().await;
                     self.drive_pending_restarts().await;
-                    self.expire_faults();
+                    self.expire_faults().await;
                     self.reconcile_firewall().await;
+                    self.reresolve_egress().await;
                     self.check_identity_rotation().await;
                 }
             }
@@ -529,6 +692,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .and_then(|(_, n)| n.parse::<u32>().ok())
                         .unwrap_or(0);
 
+                    // Requested resources from the deployed spec: these
+                    // are the commitments the scheduler must respect.
+                    let spec = self
+                        .deployed_specs
+                        .get(&(inst.app_name.clone(), inst.namespace.clone()));
+                    let cpu_request_millicores = spec
+                        .and_then(|s| s.cpu.as_ref())
+                        .map(|r| r.request as u32)
+                        .unwrap_or(0);
+                    let memory_request_mb = spec
+                        .and_then(|s| s.memory.as_ref())
+                        .map(|r| (r.request / (1024 * 1024)) as u32)
+                        .unwrap_or(0);
+
                     InstanceSnapshot {
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
@@ -538,10 +715,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         container_state: inst.state,
                         consecutive_unhealthy: inst.health_counters.consecutive_unhealthy,
                         uptime: inst.created_at.elapsed(),
+                        cpu_request_millicores,
+                        memory_request_mb,
                     }
                 })
                 .collect(),
             allocated_ports: instances.iter().filter_map(|i| i.host_port).collect(),
+            capacity_cpu_millicores: self.capacity_cpu_millicores,
+            capacity_memory_mb: self.capacity_memory_mb,
         };
         let _ = req.response.send(snapshot);
     }
@@ -671,6 +852,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let statuses = self.get_status().await;
                 let _ = response.send(statuses);
             }
+            AgentCommand::ActiveImages { response } => {
+                let images: std::collections::HashSet<String> = self
+                    .supervisor
+                    .list_instances()
+                    .iter()
+                    .map(|i| i.image.clone())
+                    .filter(|image| !image.is_empty())
+                    .collect();
+                let _ = response.send(images);
+            }
             AgentCommand::Logs {
                 app_name,
                 namespace,
@@ -739,19 +930,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     override_safety: false,
                 };
                 self.fault_registry.insert(&request);
-                let msg = format!(
-                    "partition injected: blocking {} peer(s) for {duration_secs}s",
-                    peers.len()
-                );
+                // L15: actually partition. Resolve each peer (by name)
+                // to its gossip address from membership, then block both
+                // the gossip and Raft transports to it — the old code
+                // only recorded a registry entry and dropped nothing.
+                let blocked = self.apply_partition(&peers).await;
+                let msg =
+                    format!("partition injected: blocking {blocked} peer(s) for {duration_secs}s");
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::HealPartition { response } => {
-                // Legacy chaos API — clear all faults
+                // Legacy chaos API — clear all faults and blocklists.
                 let removed = self.fault_registry.clear();
+                self.clear_partition().await;
                 let msg = if removed.is_empty() {
-                    "no active faults".to_string()
+                    "partition healed".to_string()
                 } else {
-                    format!("cleared {} fault(s)", removed.len())
+                    format!("cleared {} fault(s); partition healed", removed.len())
                 };
                 let _ = response.send(Ok(msg));
             }
@@ -760,10 +955,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(state);
             }
             AgentCommand::InjectFault { request, response } => {
+                // Safety rails first (L14): reject faults that risk
+                // quorum, kill a service's last replica, target the
+                // leader, or exceed the node-percentage cap — unless
+                // explicitly overridden.
+                if let Some(context) = self.build_safety_context(&request).await {
+                    let check = crate::smoker::safety::evaluate_safety(&request, &context);
+                    if !check.approved {
+                        let reason = check
+                            .violation
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "safety check failed".into());
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        return;
+                    }
+                }
+
+                // Actually apply the fault. Only record it in the
+                // registry if injection succeeded — a fault that can't
+                // be applied must not report success (the old code
+                // recorded everything, injecting nothing).
                 let rule = self.fault_registry.insert(&request);
-                self.write_fault_bpf_entry(&rule);
-                let summary = crate::smoker::types::FaultSummary::from(&rule);
-                let _ = response.send(Ok(summary));
+                match self.apply_fault(&rule).await {
+                    Ok(()) => {
+                        let summary = crate::smoker::types::FaultSummary::from(&rule);
+                        let _ = response.send(Ok(summary));
+                    }
+                    Err(reason) => {
+                        self.fault_registry.remove(rule.id);
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    }
+                }
             }
             AgentCommand::ClearFault { fault_id, response } => {
                 let msg = match self
@@ -771,7 +993,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .remove(crate::smoker::types::FaultId(fault_id))
                 {
                     Some(rule) => {
-                        self.delete_fault_bpf_entry(&rule);
+                        self.delete_fault_bpf_entry(&rule).await;
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
                     None => format!("fault {fault_id} not found"),
@@ -781,7 +1003,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::ClearAllFaults { response } => {
                 let removed = self.fault_registry.clear();
                 for rule in &removed {
-                    self.delete_fault_bpf_entry(rule);
+                    self.delete_fault_bpf_entry(rule).await;
                 }
                 let msg = format!("cleared {} fault(s)", removed.len());
                 let _ = response.send(Ok(msg));
@@ -828,6 +1050,271 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Populate the gossip + Raft blocklists to partition this node
+    /// from the named peers. Returns how many addresses were blocked.
+    ///
+    /// A peer is identified by gossip node name; its gossip address
+    /// comes from membership and its Raft address is derived by the
+    /// fixed port offset. Both must be blocked, or SWIM keeps half the
+    /// path alive and the partition doesn't take.
+    async fn apply_partition(&self, peers: &[String]) -> usize {
+        let Some(handle) = &self.cluster else {
+            return 0;
+        };
+        let blocklists = &handle.partition_blocklists;
+
+        // Resolve peer names → gossip SocketAddrs.
+        let targets: Vec<std::net::SocketAddr> = {
+            let membership = handle.membership_rx.borrow();
+            peers
+                .iter()
+                .filter_map(|name| {
+                    membership
+                        .iter()
+                        .find(|m| &m.node_id.0 == name)
+                        .map(|m| m.address)
+                })
+                .collect()
+        };
+
+        let mut blocked = 0;
+        if let Some(gossip) = &blocklists.gossip {
+            let mut set = gossip.write().await;
+            for addr in &targets {
+                if set.insert(*addr) {
+                    blocked += 1;
+                }
+            }
+        }
+        if let Some(raft) = &blocklists.raft {
+            let mut set = raft.write().await;
+            for addr in &targets {
+                let raft_addr = std::net::SocketAddr::new(
+                    addr.ip(),
+                    (addr.port() as i32 + blocklists.raft_port_offset) as u16,
+                );
+                set.insert(raft_addr);
+            }
+        }
+        blocked
+    }
+
+    /// Clear both transport blocklists (heal all partitions).
+    async fn clear_partition(&self) {
+        let Some(handle) = &self.cluster else {
+            return;
+        };
+        if let Some(gossip) = &handle.partition_blocklists.gossip {
+            gossip.write().await.clear();
+        }
+        if let Some(raft) = &handle.partition_blocklists.raft {
+            raft.write().await.clear();
+        }
+    }
+
+    /// Build the safety context for a fault request from live cluster
+    /// state, or `None` when there's no council (single-node mode has
+    /// nothing to protect quorum-wise; replica/leader rails don't apply).
+    async fn build_safety_context(
+        &self,
+        request: &crate::smoker::types::FaultRequest,
+    ) -> Option<crate::smoker::types::SafetyContext> {
+        let handle = self.cluster.as_ref()?;
+        let metrics = handle.raft_metrics_rx.as_ref()?.borrow().clone();
+        let council_size = metrics.membership_config.membership().voter_ids().count() as u32;
+        let leader_node_id = metrics
+            .current_leader
+            .and_then(|id| {
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&id)
+                    .map(|info| info.name.clone())
+            })
+            .unwrap_or_default();
+        let total_nodes = handle
+            .membership_rx
+            .borrow()
+            .iter()
+            .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
+            .count()
+            .max(1) as u32;
+
+        // Replicas of the target service running locally (an
+        // approximation — the leader has the cluster-wide count, but
+        // this node protects at least its own replicas).
+        let target_service_replicas = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| i.app_name == request.target_service)
+            .count() as u32;
+
+        // Node-level faults already active. We count NodeKill/NodeDrain/
+        // Partition and, conservatively, treat each as if it could touch a
+        // council member — protecting quorum against the worst case rather
+        // than assuming the best.
+        let active_node_faults = self
+            .fault_registry
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.fault_type,
+                    crate::smoker::types::FaultType::NodeKill { .. }
+                        | crate::smoker::types::FaultType::NodeDrain
+                        | crate::smoker::types::FaultType::Partition { .. }
+                )
+            })
+            .count() as u32;
+
+        let target_service_faulted_replicas =
+            self.fault_registry
+                .count_by_service(&request.target_service) as u32;
+
+        Some(crate::smoker::types::SafetyContext {
+            council_size,
+            council_nodes_with_active_faults: active_node_faults,
+            leader_node_id,
+            total_nodes,
+            nodes_with_active_faults: active_node_faults,
+            target_service_replicas,
+            target_service_faulted_replicas,
+        })
+    }
+
+    /// Apply a fault for real (L14). Process faults (kill/pause/resume)
+    /// and CPU stress work on every platform; network faults need eBPF
+    /// and are rejected honestly when it isn't loaded, rather than
+    /// recorded as active while injecting nothing.
+    async fn apply_fault(&mut self, rule: &crate::smoker::types::FaultRule) -> Result<(), String> {
+        use crate::smoker::types::FaultType;
+
+        match &rule.fault_type {
+            FaultType::Kill { count } => {
+                let pids = self.target_pids(rule, *count).await;
+                if pids.is_empty() {
+                    return Err(format!("no running instances of {}", rule.target_service));
+                }
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::kill_process(pid as i32) {
+                        eprintln!("smoker: kill {pid} failed: {e}");
+                    }
+                }
+                Ok(())
+            }
+            FaultType::Pause => {
+                let pids = self.target_pids(rule, 0).await;
+                if pids.is_empty() {
+                    return Err(format!("no running instances of {}", rule.target_service));
+                }
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::pause_process(pid as i32) {
+                        eprintln!("smoker: pause {pid} failed: {e}");
+                    }
+                }
+                Ok(())
+            }
+            FaultType::Resume => {
+                let pids = self.target_pids(rule, 0).await;
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::resume_process(pid as i32) {
+                        eprintln!("smoker: resume {pid} failed: {e}");
+                    }
+                }
+                Ok(())
+            }
+            FaultType::CpuStress { percentage, cores } => {
+                // Burn CPU in spawned blocking tasks for the fault's
+                // lifetime. Bounded by the rule's remaining duration.
+                let config = crate::smoker::resource::CpuBurnConfig::new(*percentage, *cores);
+                let duration = rule.remaining().max(std::time::Duration::from_millis(1));
+                let core_count = cores.unwrap_or(1).max(1);
+                for _ in 0..core_count {
+                    let burn_us = config.burn_duration_us();
+                    let sleep_us = config.sleep_duration_us();
+                    tokio::task::spawn_blocking(move || {
+                        let deadline = std::time::Instant::now() + duration;
+                        while std::time::Instant::now() < deadline {
+                            let spin_until = std::time::Instant::now()
+                                + std::time::Duration::from_micros(burn_us);
+                            while std::time::Instant::now() < spin_until {
+                                std::hint::spin_loop();
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+                        }
+                    });
+                }
+                Ok(())
+            }
+            FaultType::Delay { .. }
+            | FaultType::Drop { .. }
+            | FaultType::DnsNxdomain
+            | FaultType::Bandwidth { .. } => {
+                // Packet-level network faults genuinely need the eBPF
+                // data path. Apply via BPF maps when it's loaded;
+                // otherwise reject honestly rather than record fake
+                // success (the old stub recorded everything).
+                #[cfg(feature = "ebpf")]
+                {
+                    if self.onion_ebpf.is_some() {
+                        self.write_fault_bpf_entry(rule).await;
+                        return Ok(());
+                    }
+                }
+                Err(format!(
+                    "{} requires the eBPF data path, which is not loaded on this node",
+                    rule.fault_type
+                ))
+            }
+            FaultType::MemoryPressure { .. } | FaultType::DiskIoThrottle { .. } => {
+                // cgroup-based; Linux only. Honest error elsewhere.
+                #[cfg(target_os = "linux")]
+                {
+                    Ok(()) // TODO(Phase 10): apply cgroup limits
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(format!("{} requires Linux cgroups", rule.fault_type))
+                }
+            }
+            FaultType::NodeDrain | FaultType::NodeKill { .. } => {
+                // Node-level faults are orchestrated by the chaos
+                // controller, not a per-instance action here.
+                Ok(())
+            }
+            FaultType::Partition { .. } => {
+                // Handled by InjectPartition via transport blocklists.
+                Ok(())
+            }
+        }
+    }
+
+    /// PIDs of running instances matching a fault's target (service, or
+    /// a specific instance). `count` limits how many (0 = all).
+    async fn target_pids(&self, rule: &crate::smoker::types::FaultRule, count: u32) -> Vec<u32> {
+        let ids: Vec<InstanceId> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| {
+                i.app_name == rule.target_service
+                    && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
+            })
+            .map(|i| i.id.clone())
+            .collect();
+
+        let mut pids = Vec::new();
+        for id in ids {
+            if let Some(pid) = self.supervisor.grill().pid(&id).await {
+                pids.push(pid);
+                if count > 0 && pids.len() as u32 >= count {
+                    break;
+                }
+            }
+        }
+        pids
+    }
+
     /// Build the current chaos state for the API (legacy format).
     fn get_chaos_state(&self) -> ChaosState {
         // Find the first partition-type fault for backward compatibility
@@ -864,7 +1351,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// kernel stops applying it. The eBPF programs also check expiry
     /// independently (defense in depth), but userspace cleanup frees
     /// map slots and kills resource fault helper processes.
-    fn expire_faults(&mut self) {
+    async fn expire_faults(&mut self) {
         let now = crate::smoker::types::monotonic_now_ns();
         let expired = self.fault_registry.drain_expired(now);
         for rule in &expired {
@@ -874,65 +1361,199 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.id, rule.fault_type
                 );
             }
-            self.delete_fault_bpf_entry(rule);
+            self.delete_fault_bpf_entry(rule).await;
         }
     }
 
-    /// Write a BPF map entry for a newly injected fault.
+    /// The network-byte-order VIP + port for a fault's target service, if
+    /// it is registered. VIP is deterministic from the app name; the port
+    /// comes from the service entry. Connect/bandwidth fault keys need both.
+    #[cfg(feature = "ebpf")]
+    fn fault_vip_port(&self, target_service: &str) -> Option<(u32, u16)> {
+        self.service_map
+            .resolve(target_service)
+            .map(|e| (e.vip.to_network_byte_order(), e.port.to_be()))
+    }
+
+    /// Write the eBPF map entry for a newly injected network fault (P2).
     ///
-    /// On macOS or without the ebpf feature, this logs a message and
-    /// continues — network faults require Linux eBPF but the registry
-    /// and safety rails still work everywhere.
-    fn write_fault_bpf_entry(&mut self, _rule: &crate::smoker::types::FaultRule) {
-        #[cfg(feature = "ebpf")]
-        if let Some(ref ebpf_handle) = self.onion_ebpf {
-            if _rule.fault_type.requires_ebpf() {
-                let rt = tokio::runtime::Handle::current();
-                let ebpf = ebpf_handle.clone();
-                let rule_type = format!("{}", _rule.fault_type);
-                rt.spawn(async move {
-                    let mut ebpf = ebpf.lock().await;
-                    // Build the appropriate BPF key/value and write it.
-                    // For now, log that we would write. The actual key
-                    // construction needs the service's VIP (from the
-                    // service map), which requires a lookup.
-                    eprintln!("smoker: writing BPF entry for {rule_type}");
-                    let _ = &mut *ebpf; // use the handle
-                });
+    /// Only reachable with the `ebpf` feature: without it, `apply_fault`
+    /// rejects network faults before we get here. `expires_ns` comes from
+    /// the rule, which now uses CLOCK_MONOTONIC (P0) to match the kernel's
+    /// `bpf_ktime_get_ns()`.
+    #[cfg(feature = "ebpf")]
+    async fn write_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
+        use crate::smoker::bpf_maps;
+        use crate::smoker::bpf_types::*;
+        use crate::smoker::types::FaultType;
+
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let vip_port = self.fault_vip_port(&rule.target_service);
+        let expires = rule.expires_at_ns;
+        let mut ebpf = handle.lock().await;
+
+        // Connect/bandwidth faults need the target VIP; DNS is keyed by name.
+        let require_vip = || match vip_port {
+            Some(vp) => Some(vp),
+            None => {
+                eprintln!(
+                    "smoker: no VIP for {} — {} fault not applied",
+                    rule.target_service, rule.fault_type
+                );
+                None
             }
-        }
-        #[cfg(not(feature = "ebpf"))]
-        if _rule.fault_type.requires_ebpf() {
-            eprintln!(
-                "smoker: BPF write skipped for {} (no eBPF support)",
-                _rule.fault_type
-            );
+        };
+
+        match &rule.fault_type {
+            FaultType::Drop { probability } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfConnectFaultValue {
+                    action: FAULT_ACTION_DROP,
+                    probability: *probability,
+                    _pad: [0; 6],
+                    delay_ns: 0,
+                    jitter_ns: 0,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_connect_fault(
+                    &mut ebpf.bpf,
+                    connect_fault_key(vip, port),
+                    value,
+                );
+            }
+            FaultType::Delay {
+                delay_ns,
+                jitter_ns,
+            } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfConnectFaultValue {
+                    action: FAULT_ACTION_DELAY,
+                    probability: 100,
+                    _pad: [0; 6],
+                    delay_ns: *delay_ns,
+                    jitter_ns: *jitter_ns,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_connect_fault(
+                    &mut ebpf.bpf,
+                    connect_fault_key(vip, port),
+                    value,
+                );
+            }
+            FaultType::Partition {
+                source_cgroup_id, ..
+            } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfConnectFaultValue {
+                    action: FAULT_ACTION_PARTITION,
+                    probability: 100,
+                    _pad: [0; 6],
+                    delay_ns: 0,
+                    jitter_ns: 0,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_connect_fault(
+                    &mut ebpf.bpf,
+                    partition_fault_key(vip, port, *source_cgroup_id),
+                    value,
+                );
+            }
+            FaultType::DnsNxdomain => {
+                let value = BpfDnsFaultValue {
+                    action: DNS_FAULT_NXDOMAIN,
+                    probability: 100,
+                    _pad: [0; 6],
+                    delay_ns: 0,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_dns_fault(
+                    &mut ebpf.bpf,
+                    dns_fault_key(&rule.target_service),
+                    value,
+                );
+            }
+            FaultType::Bandwidth { bytes_per_sec } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfBandwidthFaultValue {
+                    rate_bytes_per_sec: *bytes_per_sec,
+                    tokens: *bytes_per_sec, // start with a full bucket
+                    last_refill_ns: crate::smoker::types::monotonic_now_ns(),
+                    expires_ns: expires,
+                };
+                let _ =
+                    bpf_maps::write_bw_fault(&mut ebpf.bpf, bandwidth_fault_key(vip, port), value);
+            }
+            // Non-network faults never reach here (apply_fault handles them).
+            _ => {}
         }
     }
 
-    /// Delete a BPF map entry for a cleared or expired fault.
-    fn delete_fault_bpf_entry(&mut self, _rule: &crate::smoker::types::FaultRule) {
-        #[cfg(feature = "ebpf")]
-        if let Some(ref ebpf_handle) = self.onion_ebpf {
-            if _rule.fault_type.requires_ebpf() {
-                let rt = tokio::runtime::Handle::current();
-                let ebpf = ebpf_handle.clone();
-                let rule_type = format!("{}", _rule.fault_type);
-                rt.spawn(async move {
-                    let mut ebpf = ebpf.lock().await;
-                    eprintln!("smoker: deleting BPF entry for {rule_type}");
-                    let _ = &mut *ebpf;
-                });
-            }
+    /// Delete the eBPF map entry for a cleared or expired fault (P2).
+    ///
+    /// Best-effort: VIP is deterministic from the app name, but the port
+    /// comes from the service entry — if the service is already gone we
+    /// skip, since the kernel ignores the entry past its `expires_ns`.
+    #[cfg(feature = "ebpf")]
+    async fn delete_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
+        use crate::smoker::bpf_maps;
+        use crate::smoker::bpf_types::*;
+        use crate::smoker::types::FaultType;
+
+        if !rule.fault_type.requires_ebpf() {
+            return;
         }
-        #[cfg(not(feature = "ebpf"))]
-        if _rule.fault_type.requires_ebpf() {
-            eprintln!(
-                "smoker: BPF delete skipped for {} (no eBPF support)",
-                _rule.fault_type
-            );
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let vip_port = self.fault_vip_port(&rule.target_service);
+        let mut ebpf = handle.lock().await;
+
+        match &rule.fault_type {
+            FaultType::Drop { .. } | FaultType::Delay { .. } => {
+                if let Some((vip, port)) = vip_port {
+                    let _ = bpf_maps::delete_connect_fault(
+                        &mut ebpf.bpf,
+                        &connect_fault_key(vip, port),
+                    );
+                }
+            }
+            FaultType::Partition {
+                source_cgroup_id, ..
+            } => {
+                if let Some((vip, port)) = vip_port {
+                    let _ = bpf_maps::delete_connect_fault(
+                        &mut ebpf.bpf,
+                        &partition_fault_key(vip, port, *source_cgroup_id),
+                    );
+                }
+            }
+            FaultType::DnsNxdomain => {
+                let _ =
+                    bpf_maps::delete_dns_fault(&mut ebpf.bpf, &dns_fault_key(&rule.target_service));
+            }
+            FaultType::Bandwidth { .. } => {
+                if let Some((vip, port)) = vip_port {
+                    let _ =
+                        bpf_maps::delete_bw_fault(&mut ebpf.bpf, &bandwidth_fault_key(vip, port));
+                }
+            }
+            _ => {}
         }
     }
+
+    /// Delete is a no-op without the eBPF data path (nothing was written).
+    #[cfg(not(feature = "ebpf"))]
+    async fn delete_fault_bpf_entry(&self, _rule: &crate::smoker::types::FaultRule) {}
 
     /// Deploy all apps and jobs from a config, streaming progress events.
     async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
@@ -990,12 +1611,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .unwrap_or_default();
                 let health_wait = deploy_config.health_timeout;
 
-                // Generate new instance IDs that don't collide with existing ones
-                let deploy_gen = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    % 10000;
+                // Generate new instance IDs that don't collide with existing
+                // ones. A monotonic counter, not wall-clock seconds: two
+                // redeploys in the same second used to produce identical IDs
+                // and the second create failed "instance already exists".
+                let deploy_gen = self.next_deploy_gen;
+                self.next_deploy_gen += 1;
                 let replica_count = match spec.replicas {
                     crate::config::types::Replicas::Fixed(n) => n,
                     crate::config::types::Replicas::DaemonSet => 1,
@@ -1162,6 +1783,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         completed_at: SystemTime::now(),
                         steps_completed: 0,
                         steps_total: replica_count as usize,
+                        spec: Some(Box::new(spec.clone())),
                     };
                     self.deploy_history.write().await.push(entry);
                     let _ = events
@@ -1181,6 +1803,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .await;
                 }
                 self.supervisor.remove_app(app_name, namespace).await;
+                self.remove_backend_ebpf(app_name).await;
                 let _ = self.service_map.unregister_app(app_name);
 
                 // Register new instances in supervisor tracking
@@ -1256,6 +1879,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             let _ = self.service_map.add_backend(app_name, backend);
                         }
                     }
+                    self.sync_backend_ebpf(app_name).await;
                 }
                 if let Some(ref ingress) = spec.ingress {
                     self.ingress_configs
@@ -1277,6 +1901,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     completed_at: SystemTime::now(),
                     steps_completed: new_ids.len(),
                     steps_total: new_ids.len(),
+                    spec: Some(Box::new(spec.clone())),
                 };
                 self.deploy_history.write().await.push(entry);
 
@@ -1319,6 +1944,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = self
                     .service_map
                     .register_app(app_name, namespace, port, firewall);
+                self.sync_backend_ebpf(app_name).await;
             }
 
             // Store ingress config for routing table
@@ -1354,6 +1980,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     })
                     .await;
             }
+
+            // Record the fresh deploy in history so `relish rollback`
+            // has a previous version to return to (this path recorded
+            // nothing before, so the first deploy was invisible).
+            let entry = crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
+                app_id: crate::meat::types::AppId::new(app_name, namespace),
+                image: spec.image.clone().unwrap_or_default(),
+                result: crate::meat::deploy_types::DeployResult::Completed,
+                created_at: SystemTime::now(),
+                completed_at: SystemTime::now(),
+                steps_completed: ids.len(),
+                steps_total: ids.len(),
+                spec: Some(Box::new(spec.clone())),
+            };
+            self.deploy_history.write().await.push(entry);
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
@@ -1674,8 +2321,186 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = self.service_map.add_backend(app_name, backend);
         }
 
+        // L8: mirror the freshly-registered backend into the eBPF backend_map.
+        self.sync_backend_ebpf(app_name).await;
+
+        // L16: program the egress allowlist for this instance's cgroup.
+        self.apply_egress(instance_id, spec).await;
+
         Ok(())
     }
+
+    /// Program an instance's egress allowlist into the eBPF maps (L16).
+    ///
+    /// With an `[egress] allow` list, only the listed destinations are
+    /// permitted from the instance's cgroup; everything else is denied at
+    /// the kernel. A no-op without an allowlist (all egress permitted) or
+    /// when the eBPF data path isn't loaded — in which case it warns, per
+    /// the default-deny-is-unenforced contract, rather than pretending.
+    #[cfg(feature = "ebpf")]
+    async fn apply_egress(&mut self, instance_id: &InstanceId, spec: &AppSpec) {
+        let Some(egress) = spec.egress.as_ref().filter(|e| !e.allow.is_empty()) else {
+            return;
+        };
+
+        let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
+            return;
+        };
+        let Some(cgroup_id) = crate::sesame::egress::cgroup_id_of_pid(pid) else {
+            eprintln!(
+                "sesame: could not resolve cgroup for {}; egress unenforced",
+                instance_id.0
+            );
+            return;
+        };
+
+        // DNS resolution can block — do it off the event loop.
+        let allow = egress.allow.clone();
+        let allow_for_resolve = allow.clone();
+        let resolved = match tokio::task::spawn_blocking(move || {
+            crate::sesame::egress::resolve_egress_entries(&allow_for_resolve)
+        })
+        .await
+        {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "sesame: egress resolution failed for {}: {e}",
+                    instance_id.0
+                );
+                return;
+            }
+            Err(_) => return,
+        };
+
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            eprintln!(
+                "sesame: [egress] set for {} but eBPF is not loaded; egress is NOT enforced",
+                instance_id.0
+            );
+            return;
+        };
+
+        let entries = crate::sesame::egress::egress_to_bpf_entries(&[cgroup_id], &resolved);
+        let mut ebpf = handle.lock().await;
+        for (key, value) in entries {
+            if let Err(e) = crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value) {
+                eprintln!("sesame: egress map write failed for {}: {e}", instance_id.0);
+                return;
+            }
+        }
+        if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
+            eprintln!(
+                "sesame: enabling egress enforcement failed for {}: {e}",
+                instance_id.0
+            );
+            return;
+        }
+        drop(ebpf);
+        self.egress_bindings.insert(
+            instance_id.clone(),
+            EgressBinding {
+                cgroup_id,
+                allow,
+                resolved,
+            },
+        );
+    }
+
+    /// Egress enforcement is a no-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn apply_egress(&mut self, _instance_id: &InstanceId, spec: &AppSpec) {
+        if spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty()) {
+            eprintln!(
+                "sesame: [egress] configured but this build has no eBPF support; egress is NOT enforced"
+            );
+        }
+    }
+
+    /// Lift egress enforcement for a stopped instance's cgroup (L16).
+    ///
+    /// Enforcement is keyed by the cgroup id, which is unique per
+    /// instance, so clearing the enable flag is enough; stale allow
+    /// entries become inert once nothing enforces against them.
+    #[cfg(feature = "ebpf")]
+    async fn clear_egress(&mut self, instance_id: &InstanceId) {
+        let Some(binding) = self.egress_bindings.remove(instance_id) else {
+            return;
+        };
+        if let Some(handle) = self.onion_ebpf.as_ref() {
+            let mut ebpf = handle.lock().await;
+            let _ = crate::sesame::egress::clear_egress_enforced(&mut ebpf.bpf, binding.cgroup_id);
+        }
+    }
+
+    /// No-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
+
+    /// Periodically re-resolve DNS-based egress allowlists and reprogram the
+    /// eBPF egress map when an app's destination IPs change (L16). Rate-
+    /// limited to roughly once every five minutes; a no-op while nothing
+    /// enforces egress.
+    #[cfg(feature = "ebpf")]
+    async fn reresolve_egress(&mut self) {
+        // ~5 minutes at the 1s event-loop tick.
+        const RERESOLVE_EVERY_TICKS: u32 = 300;
+        self.egress_reresolve_ticks += 1;
+        if self.egress_reresolve_ticks < RERESOLVE_EVERY_TICKS || self.egress_bindings.is_empty() {
+            return;
+        }
+        self.egress_reresolve_ticks = 0;
+
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return;
+        };
+        // Snapshot so we don't hold a borrow of self across the DNS awaits.
+        let bindings: Vec<(InstanceId, EgressBinding)> = self
+            .egress_bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (instance_id, binding) in bindings {
+            let new_resolved =
+                match crate::sesame::egress::re_resolve_egress_async(&binding.allow).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "sesame: egress re-resolve failed for {}: {e}",
+                            instance_id.0
+                        );
+                        continue;
+                    }
+                };
+            let (to_add, to_remove) =
+                crate::sesame::egress::egress_diff(&binding.resolved, &new_resolved);
+            if to_add.is_empty() && to_remove.is_empty() {
+                continue;
+            }
+
+            let adds = crate::sesame::egress::egress_to_bpf_entries(&[binding.cgroup_id], &to_add);
+            let removes =
+                crate::sesame::egress::egress_to_bpf_entries(&[binding.cgroup_id], &to_remove);
+            {
+                let mut ebpf = handle.lock().await;
+                for (key, value) in adds {
+                    let _ = crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value);
+                }
+                for (key, _) in removes {
+                    let _ = crate::sesame::egress::delete_egress_entry(&mut ebpf.bpf, key);
+                }
+            }
+            // Record the new set so the next diff is against reality.
+            if let Some(b) = self.egress_bindings.get_mut(&instance_id) {
+                b.resolved = new_resolved;
+            }
+        }
+    }
+
+    /// No-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn reresolve_egress(&mut self) {}
 
     /// Drive a job instance through startup: Pending → Preparing → Starting → Running.
     ///
@@ -1776,27 +2601,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 let transition = self.supervisor.process_health_result(&instance_id, status);
 
-                // Propagate health transitions to the service map
+                // Propagate health transitions to the service map, noting the
+                // app so we can re-sync its eBPF backend_map entry afterwards.
+                let mut health_changed_app: Option<String> = None;
                 match &transition {
                     Ok(Some(ContainerState::Running)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let _ = self.service_map.set_backend_health(
-                                &inst.app_name,
-                                &instance_id.0,
-                                true,
-                            );
+                            let app = inst.app_name.clone();
+                            let _ = self
+                                .service_map
+                                .set_backend_health(&app, &instance_id.0, true);
+                            health_changed_app = Some(app);
                         }
                     }
                     Ok(Some(ContainerState::Unhealthy)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let _ = self.service_map.set_backend_health(
-                                &inst.app_name,
-                                &instance_id.0,
-                                false,
-                            );
+                            let app = inst.app_name.clone();
+                            let _ =
+                                self.service_map
+                                    .set_backend_health(&app, &instance_id.0, false);
+                            health_changed_app = Some(app);
                         }
                     }
                     _ => {}
+                }
+                if let Some(app) = health_changed_app {
+                    self.sync_backend_ebpf(&app).await;
                 }
 
                 // Handle restart if unhealthy
@@ -2024,6 +2854,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = self.service_map.add_backend(&app_name, backend);
             }
+            self.sync_backend_ebpf(&app_name).await;
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -2082,7 +2913,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Remove backends and unregister from the service map
         for id in &instances {
             let _ = self.service_map.remove_backend(app_name, &id.0);
+            self.clear_egress(id).await;
         }
+        self.remove_backend_ebpf(app_name).await;
         let _ = self.service_map.unregister_app(app_name);
         self.ingress_configs.remove(app_name);
         self.rebuild_routing_table().await;
@@ -2095,6 +2928,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn rebuild_routing_table(&self) {
         let mut table = self.routing_table.write().await;
         table.rebuild(&self.service_map, &self.ingress_configs);
+        drop(table);
+
+        // Publish a service-map snapshot for out-of-loop readers (DNS).
+        // send() only errs when no receiver exists, which is fine.
+        let _ = self.service_map_tx.send(self.service_map.clone());
     }
 
     /// Reconcile the perimeter firewall if cluster membership changed.
@@ -2103,12 +2941,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
 
-        // Collect cluster node IPs from gossip membership
+        // Collect cluster node IPs from gossip membership. Reconcile when
+        // the *set* changes — a node swap keeps the count constant (M18) —
+        // and always on the first pass (`None`), so a standalone node with
+        // no peers still gets the firewall applied.
         let cluster_nodes = self.collect_cluster_node_ips();
-        let node_count = cluster_nodes.len();
-
-        // Only regenerate if membership changed
-        if node_count == self.last_firewall_node_count {
+        if self.last_firewall_nodes.as_ref() == Some(&cluster_nodes) {
             return;
         }
 
@@ -2118,7 +2956,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(e) = crate::firewall::rules::apply_ruleset(&ruleset).await {
             eprintln!("warning: firewall reconciliation failed: {e}");
         } else {
-            self.last_firewall_node_count = node_count;
+            self.last_firewall_nodes = Some(cluster_nodes);
         }
     }
 

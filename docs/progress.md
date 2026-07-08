@@ -59,7 +59,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [x] CLI extensions: `relish join`
-- [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8) — **`L15` "worker isolation" injects no fault (only comments); chaos runs against in-memory Raft, not the real runtime**
+- [x] Chaos tests: council partition, worker isolation (full council loss deferred to Phase 4/8) — Stage 4 W11 replaced the no-op "worker isolation" test with `chaos_isolated_member_misses_writes_until_healed` (a real router partition), and added `partition_isolates_a_node_for_real` driving the actual runtime's transport blocklists through the HTTP API
 - [x] Book chapter + docs: `02-finding-friends.md`, update README and progress (588 tests)
 
 ### Cluster runtime wiring (the subsystems above were library-only until here)
@@ -182,7 +182,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 8: Advanced
 
-- [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite) — **`[lib-only]` `L14` faults are only recorded; `evaluate_safety`, process/resource/node injectors, and BPF writers have no callers → nothing is actually killed/paused/pressured/delayed**
+- [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite) — wired in Stage 4 W11: `InjectFault` builds a live `SafetyContext` and calls `evaluate_safety`; approved faults are applied for real (Kill/Pause/Resume via PIDs, CpuStress via burn loops, memory/disk-IO via Linux cgroups); network faults rejected honestly without eBPF; partitions drive real transport blocklists. eBPF network-fault *enforcement* (delay/drop/dns/bandwidth) still lands with W12
 - [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation) — **`[lib-only]` `L16` egress resolvers never called; supervisor sets `egress: None`**
 - [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation) — **`M23` allowlist + `mount_isolation` never enforced (`with_process_config` no callers)**
 - [x] High-throughput batch scheduling (greedy bin-packing `schedule_batch`, `BatchTracker`, 100K jobs in <1s)
@@ -297,26 +297,59 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
-- [ ] `L1` Scheduler → placement → remote dispatch (deploys currently always run on the local agent); fix `H8` spread weighting
-- [ ] `L2` Production `DeployDriver` + orchestrator for rolling/blue-green
-- [ ] `L3` Spawn the autoscale loop
-- [ ] `L4` Invoke state reconstruction after leader election; consume `Correction`s
-- [ ] `L6` / `L11` Consistent-hash reporting tree + rollups (worker → council → leader, `/v1/metrics/cluster`)
-- [ ] `L7` Bind the Wrapper ingress listener (proxy, rate-limit, draining, TLS, WebSocket)
-- [ ] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility)
-- [ ] `L10` / `M2` Schedule replication + GC; share the Pickle catalog via Raft/disk
-- [ ] `L13` Spawn the Lettuce GitOps sync loop; enable the webhook endpoint; fix `H12` trusted-key check
-- [ ] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists (currently faults are only recorded)
-- [ ] `L16` Program egress allowlists
-- [ ] `M17` K8s import fidelity (`command`/`args`, `env.valueFrom`, namespace)
-- [ ] `H11` Fix `relish fmt` for nested-table configs (currently writes invalid TOML back over the file)
-- [ ] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `relish build` target/501, `rollback` no-op, `logs --grep` discarded, dry-run exit 0, no-args TUI claim
+Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
+
+- [x] `L1` Scheduler → placement → remote dispatch: `relish apply` under `--cluster` commits `AppSpec`s to Raft (followers forward to the leader); a leader-only scheduler places replicas and commits `SchedulingDecision`s; every node polls `/v1/placements/{node}` and reconciles its instances (idempotent). `H8` fixed (spread weight 60 > bin-pack 50; test now asserts distinct nodes). Flushed out a latent bug: durable Raft log + council TCP RPC used bincode, which can't drive the config types' `deserialize_any` — both switched to self-describing JSON (matching the snapshot). Binary-driven test in `tests/placement.rs`
+- [x] `L2` / `M16` / `X3` — `M16`: orchestrator no longer leaks a failed step's own half-started instance (regression test asserts it's stopped). `X3`: `relish rollback` actually rolls back — deploy history now carries the full `AppSpec` (every path records it, including the first deploy), `POST /v1/rollback/{app}/{ns}` redeploys the previous successful spec via the apply path (Raft in cluster mode). Note: cluster-wide *staged* rollout (max_unavailable gating across nodes) rides on the W6 desired-state reconciler and the per-node rolling redeploy; the imperative `DeployOrchestrator` stays library-side (correct + unit-tested) rather than duplicated as a parallel cluster driver
+- [x] `L3` Autoscale loop wired: leader-only task drives the tested pure functions (`evaluate`/`AutoscaleTracker`/`AutoscaleConfig::from_spec` — the library's sync `app_provider` closure can't read async Raft/rollup state), reads each `[autoscale]` app's metric from the rollup store, and commits `AutoscaleOverride` to Raft. The scheduler now targets *effective* replicas (override ∨ spec), so a scale flows through the same placement→reconcile path as apply. End-to-end test: high metric → override → grows to `max`
+- [x] `L4` State reconstruction wired into the leader scheduler loop: on the leadership edge it calls `on_leader_elected`, runs a learning period (feeding reports through `on_report_received`/`check_timeout`), and **gates scheduling** until phase == Active — so a fresh leader never re-places apps that are running but haven't reported yet. `MissingApp`/`ExtraApp` corrections are realised by the loop's ordinary placement reconciliation; `UnknownNode` exclusion was deliberately dropped (it blacklisted slow-reporting nodes and caused churn). `[reconstruction]` config now read (dead-config cleared)
+- [x] `L6` / `L11` Reporting + rollups wired: `RollupWorker` spawned per node, aggregator gets a real rollup store, `/v1/metrics/cluster` serves from it; StateReports carry real capacity (`[resources]` now read) and requested-resource usage. Flat-star kept by design (tree deferred, see ch. 11); fixed a latent DataFusion overflow (`unwrap_or(u64::MAX)` time ranges, 4 handlers)
+- [x] `L7` Bind the Wrapper ingress listener — `[ingress]` node-config section (off by default), HTTP + HTTPS listeners (self-signed or disk certs), per-client rate limiting wired into the proxy path, WebSocket pass-through; drain-on-deploy integration lands with `L2` (W7)
+- [x] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility) — **`L9`+`M8` done**: `[dns]` config section (off by default), responder spawned from bun, full hardening (recv errors non-fatal, per-query spawned forwards behind a semaphore, connected sockets + transaction-ID checks, NXDOMAIN for unmatched `.internal` with no upstream leak, QTYPE honoured, SERVFAIL on dead upstream), runc containers get `resolv.conf` pointed at the responder. **`L8` done**: `[ebpf]` config section (off by default; `program_dir` defaults to the build-time `OUT_DIR` baked in via `build.rs` `RELIABURGER_BPF_DIR`, so dev/Lima builds self-locate their `.bpf.o`), `bun` loads + attaches `OnionEbpf` at startup (load failure logs and continues without enforcement; non-`ebpf` builds warn that enforcement is off). Verified in the `reliaburger-test` Lima VM: `cargo build --features ebpf` compiles the objects and all 9 `tests/ebpf.rs` integration tests pass (load/attach, backend-map read/write/remove, connect→VIP rewrite, no-backend deny `EPERM`, non-VIP passthrough, `.internal` DNS). Not covered by `make ci` (needs root + kernel 5.7+ + cgroup v2)
+  - **eBPF production enforcement now complete** (Phase 11b follow-up, P0–P3): the agent syncs its live service map into the kernel `backend_map` at every mutation (`agent_deploy_populates_backend_map`), the fault-map writers write real `fault_connect_map`/`fault_dns_map`/`fault_bw_map` entries with CLOCK_MONOTONIC expiry that matches the kernel (`agent_drop_fault_refuses_vip_with_eperm`), and egress allowlists re-resolve periodically. All verified in the Lima VM.
+- [x] `L10` / `M2` Pickle wired: catalog persists to disk + loads at boot; pushes record real raft-id holders and propose to Raft on council nodes (worker proposal forwarding lands with W6); leader replication loop keeps layers at `[images] redundancy`; scheduled two-phase GC — nominate → Raft-arbitrated approval (`CouncilResponse::GcApproved`) → delete, with an orphan grace window for in-flight pushes. `X1` fixed: `relish build` targets the registry port, `/v1/build` executes buildah for real (honest 501 without it)
+- [x] `L13` / `H12` GitOps wired: new `src/lettuce/runner.rs` spawns a leader-only sync loop (clone → poll/webhook → `execute_sync` in `spawn_blocking` → apply changes as `AppSpec`/`AppDelete` Raft writes). Webhook endpoint gets a real channel (was unconditional 503); `[gitops]` config now read. `H12`: `is_key_trusted` no longer falls through to `true` — a valid signature from an unlisted key is rejected. Fixed a latent first-sync bug (a fresh clone has nothing to fetch but nothing applied either → now syncs when HEAD ≠ last-applied). Integration tests in `tests/gitops.rs` (real git repo → Raft; webhook triggers sync)
+- [x] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists: `InjectFault` now builds a live `SafetyContext` (council size + alive nodes from Raft/membership, replica counts from the supervisor, active node-faults from the registry — no more hardcoded zeros) and runs `evaluate_safety`; approved faults are actually applied (Kill/Pause/Resume via real PIDs, CpuStress via `spawn_blocking` burn loops, memory/disk-IO via cgroups on Linux). Network faults (delay/drop/dns/bandwidth) are **rejected honestly** without eBPF, and **injected for real** when the eBPF data path is loaded (P2: `write_fault_bpf_entry` writes `fault_connect_map`/`fault_dns_map`/`fault_bw_map`, expiry on CLOCK_MONOTONIC to match the kernel; `agent_drop_fault_refuses_vip_with_eperm`). `L15`: partitions populate the real gossip + Raft transport blocklists (both directions), so an isolated node is marked Dead by SWIM and rejoins on heal. Integration tests drive the binary path: `kill_fault_actually_kills_the_instance`, `network_fault_without_ebpf_is_rejected_not_faked` (`tests/integration.rs`); `partition_isolates_a_node_for_real`, `fault_injection_rejected_when_quorum_at_risk` (`tests/placement.rs`)
+- [x] `L16` Program egress allowlists — an app's `[egress] allow` list is now enforced in the kernel: on instance start the agent resolves the instance's cgroup id (from `/proc/<pid>/cgroup` → cgroup v2 dir inode), resolves the allowlist (DNS off the event loop via `spawn_blocking`), writes the `egress_map` entries and flips `egress_enabled_map` for that cgroup; on stop it lifts enforcement. A rate-limited event-loop task re-resolves each allowlist and reprograms the delta as DNS changes (P3: `egress_diff` + `re_resolve_egress_async`). Non-eBPF/non-Linux builds warn that egress is unenforced (default-deny is eBPF-only, per D5). Verified in the Lima VM: `egress_denied_by_default_allowed_when_listed` (`tests/ebpf.rs`) loads the real program, allows one destination for the test's own cgroup, and asserts the listed destination connects while an unlisted one is denied with `EPERM`
+- [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
+- [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
+- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [tui-plan-2026-07.md](tui-plan-2026-07.md)
 
 ### Throughout
 
-- [ ] Fix the misleading tests (`H1` restart only checks `restart_count > 0`; `L15` chaos "worker isolation" injects no fault)
-- [ ] Remove dead config or wire it (`[resources]`, `[reconstruction]`, `[gitops]`, `[process_workloads]`, node `labels`, `[storage] volumes`, most of `[images]`/`[metrics]`)
-- [ ] Clear each `[lib-only]` tag from the phases above as its subsystem is genuinely wired
+- [x] Fix the misleading tests — `L15` "worker isolation" (was a no-op) replaced with `chaos_isolated_member_misses_writes_until_healed`, which really partitions a council member and asserts the isolated node misses writes until healed. `H1` restart tests now assert real post-restart behaviour, not just a counter bump: `health_check_triggers_restart` checks the instance reached a live re-created state (`running`/`health-wait`/`unhealthy`, never stuck in `Preparing`), and `job_failed_retries_then_fails` asserts the terminal `failed` state after retries exhaust
+- [x] Remove dead config or wire it — wired during Stage 4: `[resources]` (W4), `[reconstruction]` (W9), `[gitops]` (W10), `[images]` (W5), `[metrics]` (W4), node `labels` (W6), new `[ingress]`/`[dns]`/`[ebpf]` (W2/W3/W12). Still genuinely dead and **documented, not silently dropped** (out of Stage 4 scope): `[process_workloads]` (M23), `[storage] volumes` (M21), `[logs] max_file_size_mb`
+- [x] Clear each `[lib-only]` tag from the phases above as its subsystem is genuinely wired — the Smoker fault-injection `[lib-only]` tag (Phase 8) is cleared; the eBPF network-fault enforcement + service-map→backend sync gaps were subsequently closed (P0–P3, see the `L8` item)
+
+### Beyond Phase 11b — deferred & un-staged review items
+
+The [July 2026 review](review-2026-07.md) staged a specific remediation plan
+(Stages 0–4). **Every item in that plan is now done** — including the eBPF
+production-enforcement follow-ups (P0–P3) and three security Mediums pulled
+forward (P4: `M25`, `M1`, `M18`). The findings below were **never part of the
+review's Stages 0–4** (or were explicitly deferred). They are recorded here as
+the authoritative post-Phase-11b backlog — nothing silently dropped.
+
+**Deferred by design (were carved out of their stage):**
+- `C5(b)` — mTLS on the Raft RPC and agent API listeners (Stage 3b deferral).
+- `L17` — CRL enforcement at connect time (image-signature verification is done; Stage 3b deferral).
+- `X6` — the no-args `relish` TUI → [tui-plan-2026-07.md](tui-plan-2026-07.md).
+
+**Never-staged Mediums (still open, confirmed in code):**
+- `M3` — whole-blob `std::fs` + SHA-256 run on the async runtime (no `spawn_blocking`); large pushes stall the event loop.
+- `M4` — log/metric dedup only removes *adjacent* duplicates, so cross-node dupes survive.
+- `M5` — VIP collisions unchecked (SipHash into 65,534 slots; ~50% odds near ~300 apps).
+- `M6` — service map keyed by app name only; the same name in two namespaces collides.
+- `M7` — a crashed app with no health check stays `Running` forever (only jobs are exit-monitored).
+- `M19` — alert webhooks build only a generic payload; Slack/PagerDuty formats are never applied.
+- `M20` — log export is filesystem-only (`object_store` has only the `fs` feature); an `s3://`/`gs://` target is treated as a local dir.
+- `M21` — managed volumes: mount entries generated but the host dir is never created (`[storage] volumes` dead config).
+- `M22` — rootless: resource limits silently dropped; slirp4netns has no callers (empty netns).
+- `M23` — process-workload allowlist + `mount_isolation` never enforced (`[process_workloads]` dead config).
+- `M24` — `KetchupStore::today()` calendar math can emit month 13 (dead path today).
+- `X8` — `relish logs-export` copies files directly, racing the agent's export checkpoint (never contacts the agent).
+
+**All ~24 Low findings** remain open (review §Low): container blob-cache re-verify, `parse_num` overflow, weak `raft_id_from_name` djb2 hash, non-constant-time join-token compare, `verify_jwt` skips `aud`/`iss`, keyless verify ignores cert validity/SPIFFE, `manifest_put` doesn't verify referenced blobs, upload sessions never expire, fan-out swallows node failures / doesn't URL-encode params, IPv6 Host-header mangling, git arg-injection (`--` separator), diff engine re-adds every job per sync, and the rest. None were staged for Phase 11b.
 
 ## Phase 12: Optimisations
 

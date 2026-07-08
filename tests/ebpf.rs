@@ -14,7 +14,6 @@
 
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::onion::ebpf::loader::OnionEbpf;
@@ -22,7 +21,6 @@ use reliaburger::onion::ebpf::maps::BpfServiceMap;
 use reliaburger::onion::service_map::ServiceMap;
 use reliaburger::onion::types::BackendInstance;
 use reliaburger::onion::vip::VirtualIP;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 fn ebpf_tests_enabled() -> bool {
@@ -346,6 +344,299 @@ async fn ebpf_connect_non_vip_passes_through() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 2a: Agent-driven backend_map sync (L8 completeness)
+// ---------------------------------------------------------------------------
+
+/// A real `BunAgent` with a loaded eBPF handle must mirror a deployed
+/// app's backends into the kernel `backend_map` — the production path,
+/// not a manual `BpfServiceMap` write. Deploy through the agent command
+/// channel and read the map back.
+#[tokio::test]
+async fn agent_deploy_populates_backend_map() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::process::ProcessGrill;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    // Keep our own clone of the handle to read the map after the deploy.
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
+    ));
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        ProcessGrill::new(),
+        PortAllocator::new(41100, 41400),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        port = 8080
+    "#,
+    )
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while ev_rx.recv().await.is_some() {}
+
+    // Let the instance reach Running and register its backend.
+    let vip = VirtualIP::from_app_name("web");
+    let bpf = BpfServiceMap::new();
+    let populated = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            let has_backend = {
+                let mut e = ebpf.lock().await;
+                bpf.read_backends(&mut e, vip, 8080)
+                    .is_some_and(|v| v.count >= 1)
+            };
+            if has_backend {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        ok
+    };
+    assert!(
+        populated,
+        "agent never mirrored the deployed app's backend into backend_map"
+    );
+
+    shutdown.cancel();
+}
+
+/// A `Drop` fault injected through the agent must land in the kernel
+/// `fault_connect_map` and refuse connections to the service VIP with
+/// EPERM — the eBPF fault path, driven end to end (P2). Before the fault
+/// the VIP has a backend, so a connect is *rewritten* (and refused by the
+/// absent listener with ECONNREFUSED, not EPERM); after the fault it is
+/// dropped (EPERM) regardless of backends.
+#[tokio::test]
+async fn agent_drop_fault_refuses_vip_with_eperm() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::process::ProcessGrill;
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
+    ));
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        ProcessGrill::new(),
+        PortAllocator::new(41500, 41800),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    tokio::spawn(async move { agent.run().await });
+
+    let service_port: u16 = 8090;
+    let config = Config::parse(&format!(
+        r#"
+        [app.faulty]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        port = {service_port}
+    "#
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while ev_rx.recv().await.is_some() {}
+
+    let vip = VirtualIP::from_app_name("faulty");
+    let bpf = BpfServiceMap::new();
+    // Wait for the backend to register so the VIP resolves to a real entry.
+    for _ in 0..25 {
+        let has = {
+            let mut e = ebpf.lock().await;
+            bpf.read_backends(&mut e, vip, service_port)
+                .is_some_and(|v| v.count >= 1)
+        };
+        if has {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let vip_addr = SocketAddr::new(vip.0.into(), service_port);
+
+    // Control: with a backend but no fault, the connect is rewritten to the
+    // (non-listening) backend → ECONNREFUSED, never EPERM.
+    let before = TcpStream::connect_timeout(&vip_addr, Duration::from_secs(1));
+    assert_ne!(
+        before.as_ref().err().map(|e| e.kind()),
+        Some(ErrorKind::PermissionDenied),
+        "VIP should not be dropped before the fault"
+    );
+
+    // Inject a 100% Drop fault on the service.
+    let (resp_tx, resp_rx) = oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::InjectFault {
+            request: FaultRequest {
+                fault_type: FaultType::Drop { probability: 100 },
+                target_service: "faulty".into(),
+                target_instance: None,
+                target_node: None,
+                duration: Duration::from_secs(30),
+                injected_by: "test".into(),
+                reason: None,
+                include_leader: false,
+                override_safety: false,
+            },
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+    resp_rx
+        .await
+        .unwrap()
+        .expect("drop fault should be accepted");
+
+    // Now the VIP is dropped before any rewrite → EPERM.
+    let dropped = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            let r = TcpStream::connect_timeout(&vip_addr, Duration::from_secs(1));
+            if r.as_ref().err().map(|e| e.kind()) == Some(ErrorKind::PermissionDenied) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        ok
+    };
+    assert!(
+        dropped,
+        "Drop fault did not refuse the VIP with EPERM (fault_connect_map not applied)"
+    );
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2b: Egress allowlist (L16)
+// ---------------------------------------------------------------------------
+
+/// With egress enforcement on for a cgroup, a listed destination is
+/// reachable and every other destination is denied (EPERM). We enforce
+/// on the *test's own* cgroup — the process doing the connects — so the
+/// eBPF `bpf_get_current_cgroup_id()` matches what we program.
+#[tokio::test]
+async fn egress_denied_by_default_allowed_when_listed() {
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // Two real listeners: one we'll allow, one we won't.
+    let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let allowed_port = allowed.local_addr().unwrap().port();
+    let denied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let denied_port = denied.local_addr().unwrap().port();
+
+    let cgroup_id =
+        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+
+    // Allow only 127.0.0.1:allowed_port for our cgroup, then enforce.
+    let key = EgressKey {
+        src_cgroup_id: cgroup_id,
+        dst_ip: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+        dst_port: allowed_port.to_be(),
+        _pad: 0,
+    };
+    egress::write_egress_entry(
+        &mut ebpf.bpf,
+        key,
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .expect("write egress entry");
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable egress enforcement");
+
+    // The allowed destination connects.
+    let ok = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), allowed_port),
+        Duration::from_secs(2),
+    );
+    assert!(
+        ok.is_ok(),
+        "listed egress destination should connect: {ok:?}"
+    );
+
+    // The unlisted destination is denied with EPERM (BPF returns 0).
+    let blocked = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), denied_port),
+        Duration::from_secs(2),
+    );
+    assert!(
+        matches!(
+            blocked.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "unlisted egress destination should be denied with EPERM, got {blocked:?}"
+    );
+
+    // Lift enforcement so the harness's own connections are unaffected.
+    egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("clear enforcement");
+    ebpf.detach();
+}
+
+// ---------------------------------------------------------------------------
 // Tier 3: DNS responder
 // ---------------------------------------------------------------------------
 
@@ -356,11 +647,9 @@ async fn dns_responder_resolves_internal_name() {
         return;
     }
 
-    let svc_map = Arc::new(RwLock::new(ServiceMap::new()));
-    {
-        let mut map = svc_map.write().await;
-        map.register_app("redis", "default", 6379, None).unwrap();
-    }
+    let mut map = ServiceMap::new();
+    map.register_app("redis", "default", 6379, None).unwrap();
+    let (_map_tx, map_rx) = tokio::sync::watch::channel(map);
 
     let shutdown = CancellationToken::new();
 
@@ -368,12 +657,12 @@ async fn dns_responder_resolves_internal_name() {
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
         upstream: "8.8.8.8:53".parse().unwrap(),
+        upstream_timeout: Duration::from_secs(2),
     };
 
-    let map_clone = svc_map.clone();
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        let _ = reliaburger::onion::dns::run_dns_responder(config, map_clone, shutdown_clone).await;
+        let _ = reliaburger::onion::dns::run_dns_responder(config, map_rx, shutdown_clone).await;
     });
 
     // Give the responder a moment to bind
@@ -410,19 +699,19 @@ async fn dns_responder_non_internal_times_out() {
         return;
     }
 
-    let svc_map = Arc::new(RwLock::new(ServiceMap::new()));
+    let (_map_tx, map_rx) = tokio::sync::watch::channel(ServiceMap::new());
     let shutdown = CancellationToken::new();
 
     // Point upstream at a non-existent resolver so forwarding times out
     let config = reliaburger::onion::dns::DnsConfig {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
         upstream: "192.0.2.1:53".parse().unwrap(), // TEST-NET, unreachable
+        upstream_timeout: Duration::from_millis(500),
     };
 
-    let map_clone = svc_map.clone();
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        let _ = reliaburger::onion::dns::run_dns_responder(config, map_clone, shutdown_clone).await;
+        let _ = reliaburger::onion::dns::run_dns_responder(config, map_rx, shutdown_clone).await;
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -432,13 +721,15 @@ async fn dns_responder_non_internal_times_out() {
     socket.send_to(&query, "127.0.0.1:15354").await.unwrap();
 
     let mut buf = [0u8; 512];
-    let result = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
+    let (len, _) = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+        .await
+        .expect("expected a SERVFAIL response, not silence")
+        .expect("recv failed");
 
-    // Should time out since upstream is unreachable
-    assert!(
-        result.is_err(),
-        "non-.internal query should not be answered locally"
-    );
+    // M8 hardening: an unreachable upstream now yields SERVFAIL
+    // (RCODE 2) instead of leaving the client to time out.
+    assert_eq!(buf[3] & 0x0F, 2, "expected SERVFAIL for dead upstream");
+    assert!(len >= 12);
 
     shutdown.cancel();
 }

@@ -88,12 +88,15 @@ async fn agent_nodes_returns_membership() {
         council: None,
         snapshot_rx,
         wrapping_ikm: None,
+        partition_blocklists: Default::default(),
     };
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
     let mut agent =
         BunAgent::with_cluster(grill, port_allocator, cmd_rx, shutdown.clone(), cluster);
+    // Co-located test agents must not touch the shared host firewall.
+    agent.set_perimeter_enabled(false);
 
     let handle = tokio::spawn(async move { agent.run().await });
 
@@ -167,12 +170,15 @@ async fn agent_council_returns_raft_state() {
         council: Some(council.clone()),
         snapshot_rx,
         wrapping_ikm: None,
+        partition_blocklists: Default::default(),
     };
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
     let mut agent =
         BunAgent::with_cluster(grill, port_allocator, cmd_rx, shutdown.clone(), cluster);
+    // Co-located test agents must not touch the shared host firewall.
+    agent.set_perimeter_enabled(false);
 
     let handle = tokio::spawn(async move { agent.run().await });
 
@@ -310,12 +316,15 @@ async fn agent_snapshot_request_returns_instances() {
         council: None,
         snapshot_rx,
         wrapping_ikm: None,
+        partition_blocklists: Default::default(),
     };
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
     let mut agent =
         BunAgent::with_cluster(grill, port_allocator, cmd_rx, shutdown.clone(), cluster);
+    // Co-located test agents must not touch the shared host firewall.
+    agent.set_perimeter_enabled(false);
 
     let handle = tokio::spawn(async move { agent.run().await });
 

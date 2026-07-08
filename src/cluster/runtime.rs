@@ -58,6 +58,10 @@ pub struct ClusterRuntime {
     /// (the flat-star topology has every node report to the leader), where it
     /// holds the latest state report from every node.
     pub aggregated_rx: watch::Receiver<AggregatedState>,
+    /// Rollup store fed by the aggregator from incoming `MetricsRollup`
+    /// messages. Only populated on the leader (same flat-star rule);
+    /// the API serves `/v1/metrics/cluster` from it.
+    pub rollup_store: Arc<tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>>,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -82,6 +86,11 @@ pub struct ClusterParams {
     pub bootstrap_security_state: Option<Box<crate::sesame::types::SecurityState>>,
     /// Node data directory; the durable Raft log/snapshot live under `{data_dir}/raft/`.
     pub data_dir: std::path::PathBuf,
+    /// Local Mayo metrics store. When set, a `RollupWorker` pushes
+    /// per-node rollups to the leader on `rollup_interval`.
+    pub mayo: Option<Arc<tokio::sync::RwLock<crate::mayo::store::MayoStore>>>,
+    /// How often the rollup worker pushes (from `[metrics] rollup_interval_secs`).
+    pub rollup_interval: Duration,
 }
 
 /// Start gossip + the Raft council and return a `ClusterHandle` plus a
@@ -102,6 +111,9 @@ pub async fn start(
         .await
         .map_err(|e| std::io::Error::other(format!("gossip bind failed: {e}")))?
         .with_key(gossip_key);
+    // Grab the gossip blocklist before the transport moves into the
+    // node — chaos partitions populate it to silently drop datagrams.
+    let gossip_blocklist = transport.blocklist();
 
     let mut node = MustardNode::new(
         NodeId::new(&params.node_name),
@@ -151,6 +163,9 @@ pub async fn start(
         .map_err(|e| std::io::Error::other(format!("raft snapshot store load failed: {e}")))?;
 
     let factory = TcpRaftNetworkFactory::new(raft_id);
+    // Same for the Raft RPC blocklist — a partition must cut both the
+    // gossip and Raft transports or SWIM half-detects the peer.
+    let raft_blocklist = factory.blocklist();
     let council = CouncilNode::new(
         raft_id,
         CouncilConfig::default(),
@@ -254,11 +269,17 @@ pub async fn start(
     let agg_transport = TcpReportingTransport::bind(reporting_addr, shutdown.clone())
         .await
         .map_err(|e| std::io::Error::other(format!("reporting bind failed: {e}")))?;
+    // The rollup store lives on every node (cheap when empty) so a
+    // leadership change needs no start/stop dance — only the leader's
+    // aggregator actually receives rollups to ingest into it.
+    let rollup_store = Arc::new(tokio::sync::RwLock::new(
+        crate::mayo::rollup_store::RollupStore::new(params.data_dir.join("rollups")),
+    ));
     let (mut aggregator, aggregated_rx) = ReportAggregator::new(
         agg_transport,
         params.reporting_config.clone(),
         shutdown.clone(),
-        None,
+        Some(Arc::clone(&rollup_store)),
     );
     tokio::spawn(async move { aggregator.run().await });
 
@@ -281,6 +302,7 @@ pub async fn start(
     )
     .await
     .map_err(|e| std::io::Error::other(format!("reporting worker bind failed: {e}")))?;
+    let rollup_council_rx = council_rx.clone();
     let mut worker = ReportWorker::new(
         NodeId::new(&params.node_name),
         worker_transport,
@@ -291,15 +313,46 @@ pub async fn start(
     );
     tokio::spawn(async move { worker.run().await });
 
+    // Rollup worker: pushes this node's metric rollups to the leader,
+    // where the aggregator ingests them into the rollup store.
+    if let Some(mayo) = params.mayo.clone() {
+        let rollup_transport = TcpReportingTransport::bind(
+            SocketAddr::new(params.gossip_addr.ip(), 0),
+            shutdown.clone(),
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("rollup worker bind failed: {e}")))?;
+        let mut rollup_worker = crate::mayo::rollup_worker::RollupWorker::new(
+            NodeId::new(&params.node_name),
+            rollup_transport,
+            mayo,
+            rollup_council_rx,
+            params.rollup_interval,
+            shutdown.clone(),
+        );
+        tokio::spawn(async move { rollup_worker.run().await });
+    }
+
     let handle = ClusterHandle {
         membership_rx,
         raft_metrics_rx: Some(raft_metrics_rx),
         council: Some(council),
         snapshot_rx,
         wrapping_ikm: params.wrapping_ikm,
+        partition_blocklists: crate::bun::agent::PartitionBlocklists {
+            gossip: Some(gossip_blocklist),
+            raft: Some(raft_blocklist),
+            raft_port_offset: port_offset,
+        },
     };
 
-    Ok((handle, ClusterRuntime { aggregated_rx }))
+    Ok((
+        handle,
+        ClusterRuntime {
+            aggregated_rx,
+            rollup_store,
+        },
+    ))
 }
 
 /// Keep `council_tx` pointing at the current Raft leader's reporting address

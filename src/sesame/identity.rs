@@ -203,18 +203,39 @@ pub fn write_identity_to_tmpfs(
     let bundle_pem = format!("{}{}", cert_pem, identity.ca_chain_pem);
 
     atomic_write(&dir.join("cert.pem"), cert_pem.as_bytes())?;
-    atomic_write(&dir.join("key.pem"), key_pem.as_bytes())?;
+    // The private key and the JWT are secrets — owner-only (M25). The certs
+    // are public material and stay world-readable.
+    atomic_write_mode(&dir.join("key.pem"), key_pem.as_bytes(), Some(0o600))?;
     atomic_write(&dir.join("ca.pem"), identity.ca_chain_pem.as_bytes())?;
     atomic_write(&dir.join("bundle.pem"), bundle_pem.as_bytes())?;
-    atomic_write(&dir.join("token"), identity.jwt_token.as_bytes())?;
+    atomic_write_mode(
+        &dir.join("token"),
+        identity.jwt_token.as_bytes(),
+        Some(0o600),
+    )?;
 
     Ok(())
 }
 
 /// Write data to a temp file then atomically rename.
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, data, None)
+}
+
+/// Write + atomic rename, optionally restricting the final file mode.
+///
+/// The mode is applied to the temp file before the rename so the file is
+/// never briefly world-readable at its final path (M25).
+fn atomic_write_mode(path: &Path, data: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -342,6 +363,26 @@ mod tests {
             workload_ca_cert_der,
             root_ca_cert_der,
         )
+    }
+
+    /// M25: the private key is written owner-only; public certs are not
+    /// forced to 0600.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_mode_restricts_the_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("key.pem");
+        let public = dir.path().join("cert.pem");
+
+        atomic_write_mode(&secret, b"PRIVATE KEY", Some(0o600)).unwrap();
+        atomic_write(&public, b"CERTIFICATE").unwrap();
+
+        let secret_mode = std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777;
+        assert_eq!(secret_mode, 0o600, "private key must be owner-only");
+        let public_mode = std::fs::metadata(&public).unwrap().permissions().mode() & 0o777;
+        assert_ne!(public_mode, 0o600, "public cert need not be restricted");
     }
 
     #[test]

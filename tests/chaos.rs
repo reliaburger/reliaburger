@@ -162,56 +162,71 @@ async fn chaos_council_partition_majority_continues() {
     }
 }
 
-/// Worker isolation: gossip partition doesn't affect Raft (council still works).
+/// Isolate one council member: the majority keeps making progress and
+/// the isolated node genuinely misses writes until it is healed.
 ///
-/// This tests that partitioning at the gossip layer doesn't break the
-/// Raft consensus among council members. In a real cluster, the isolated
-/// worker's apps would keep running (data plane unaffected).
+/// The previous version of this test never actually partitioned anything
+/// — it asserted that all nodes saw a write nobody was prevented from
+/// receiving. This version cuts node 3 off from nodes 1 and 2 through the
+/// router, so the assertions describe a real partition: the majority
+/// writes, the isolated node does NOT see that write, and healing lets it
+/// catch up.
 #[tokio::test]
-async fn chaos_worker_isolation_council_unaffected() {
-    let (nodes, _router) = create_cluster(3).await;
+async fn chaos_isolated_member_misses_writes_until_healed() {
+    let (nodes, router) = create_cluster(3).await;
     init_cluster(&nodes).await;
 
-    let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+    wait_for_leader(&nodes, Duration::from_secs(5))
         .await
         .expect("leader should be elected");
 
-    // Write initial state
-    let leader = &nodes[(leader_id - 1) as usize];
-    leader
+    // Cut node 3 off from the majority (1, 2) in both directions.
+    let isolated = 3u64;
+    let majority = [1u64, 2];
+    for &m in &majority {
+        router.partition(isolated, m).await;
+    }
+
+    // The majority must re-establish (or keep) a leader among {1, 2}.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut majority_leader = None;
+    for &id in &majority {
+        if let Some(lid) = nodes[(id - 1) as usize].current_leader().await
+            && majority.contains(&lid)
+        {
+            majority_leader = Some(lid);
+            break;
+        }
+    }
+    let majority_leader = majority_leader.expect("majority {1,2} should hold a leader");
+
+    // The majority leader writes while node 3 is isolated.
+    nodes[(majority_leader - 1) as usize]
         .write(RaftRequest::ConfigSet {
-            key: "app".to_string(),
-            value: "running".to_string(),
+            key: "during_isolation".to_string(),
+            value: "committed".to_string(),
         })
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // In a real cluster, we'd partition the gossip transport for a worker node.
-    // Here we test that the council survives even when a node is partitioned
-    // from the gossip mesh (but council members can still reach each other).
+    // The isolated node must NOT have the write — proof the cut is real.
+    let isolated_state = nodes[(isolated - 1) as usize].desired_state().await;
+    assert!(
+        !isolated_state.config.contains_key("during_isolation"),
+        "isolated node should not receive writes while partitioned"
+    );
 
-    // Simulate: partition node 3 from gossip (but Raft stays connected for council)
-    // This verifies the key invariant: data plane (apps) is independent of gossip.
+    // Heal and let node 3 catch up.
+    router.heal().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Council can still write
-    leader
-        .write(RaftRequest::ConfigSet {
-            key: "after_isolation".to_string(),
-            value: "still_works".to_string(),
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // All council members have the write
     for (i, node) in nodes.iter().enumerate() {
         let state = node.desired_state().await;
         assert_eq!(
-            state.config.get("after_isolation").map(String::as_str),
-            Some("still_works"),
-            "node {} should have the post-isolation write",
+            state.config.get("during_isolation").map(String::as_str),
+            Some("committed"),
+            "node {} missing the write after heal",
             i + 1
         );
     }

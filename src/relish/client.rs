@@ -21,6 +21,67 @@ pub struct BunClient {
     client: reqwest::Client,
 }
 
+/// Options for fetching or streaming logs.
+///
+/// `grep` and `start` are also sent server-side where the endpoint
+/// supports them; `json_field` is client-side only (there is no
+/// server-side equivalent).
+#[derive(Debug, Clone, Default)]
+pub struct LogOptions {
+    pub tail: Option<usize>,
+    pub follow: bool,
+    /// Keep only lines containing this substring.
+    pub grep: Option<String>,
+    /// Keep only entries at or after this unix timestamp (seconds).
+    pub start: Option<u64>,
+    /// Keep only lines that parse as JSON where `field == value`.
+    pub json_field: Option<(String, String)>,
+}
+
+impl LogOptions {
+    /// Query parameters understood by the server-side log endpoints.
+    fn query_params(&self) -> Vec<(String, String)> {
+        let mut params = Vec::new();
+        if let Some(n) = self.tail {
+            params.push(("tail".to_string(), n.to_string()));
+        }
+        if let Some(ref g) = self.grep {
+            params.push(("grep".to_string(), g.clone()));
+        }
+        if let Some(s) = self.start {
+            params.push(("start".to_string(), s.to_string()));
+        }
+        params
+    }
+
+    /// Client-side line filter: substring grep plus JSON field match.
+    fn matches(&self, line: &str) -> bool {
+        if let Some(ref g) = self.grep
+            && !line.contains(g.as_str())
+        {
+            return false;
+        }
+        if let Some((ref key, ref want)) = self.json_field {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return false;
+            };
+            let Some(field) = value.get(key) else {
+                return false;
+            };
+            // Compare string fields directly; render other JSON types
+            // (numbers, bools) to text so `level=3` matches `"level": 3`.
+            let found = match field.as_str() {
+                Some(s) => s == want,
+                None => &field.to_string() == want,
+            };
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Classify a reqwest send error as either a timeout or a connection failure.
 fn classify_error(e: reqwest::Error) -> RelishError {
     if e.is_timeout() {
@@ -198,6 +259,52 @@ impl BunClient {
         })
     }
 
+    /// Roll an app back to its previous successful spec (X3).
+    ///
+    /// The server streams deploy progress as SSE; we drain it, surfacing
+    /// any error, and return once the stream closes.
+    pub async fn rollback(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
+        let url = format!("{}/v1/rollback/{app}/{namespace}", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(classify_error)?;
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(end) = buffer.find("\n\n") {
+                let event_text = buffer[..end].to_string();
+                buffer = buffer[end + 2..].to_string();
+                if let Some(data) = event_text.lines().find_map(|l| l.strip_prefix("data:"))
+                    && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
+                {
+                    match event {
+                        ApplyEvent::Progress { message } => eprintln!("  {message}"),
+                        ApplyEvent::Error { message } => {
+                            return Err(RelishError::ApiError {
+                                status: 500,
+                                body: message,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Get status of all instances.
     pub async fn status(&self) -> Result<Vec<InstanceStatus>, RelishError> {
         let url = format!("{}/v1/status", self.base_url);
@@ -246,28 +353,25 @@ impl BunClient {
         &self,
         app: &str,
         namespace: &str,
-        tail: Option<usize>,
-        follow: bool,
+        options: &LogOptions,
     ) -> Result<String, RelishError> {
-        if follow {
-            // Follow mode uses the SSE endpoint (local only)
-            return self.logs_follow(app, namespace, tail).await;
+        if options.follow {
+            // Follow mode uses the SSE endpoint (local only). The SSE
+            // path does not filter server-side, so filters apply here.
+            return self.logs_follow(app, namespace, options).await;
         }
 
         // Non-follow: try the cross-node query endpoint first.
         // In cluster mode this fans out to all nodes running the app.
         // In single-node mode it queries the local LogStore.
-        let mut url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
-        let mut params = Vec::new();
-        if let Some(n) = tail {
-            params.push(format!("tail={n}"));
-        }
-        if !params.is_empty() {
-            url.push('?');
-            url.push_str(&params.join("&"));
-        }
+        let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
 
-        if let Ok(response) = self.client.get(&url).send().await
+        if let Ok(response) = self
+            .client
+            .get(&url)
+            .query(&options.query_params())
+            .send()
+            .await
             && response.status().is_success()
             && let Ok(result) = response.json::<serde_json::Value>().await
         {
@@ -275,8 +379,13 @@ impl BunClient {
             if let Some(entries) = result["entries"].as_array() {
                 for entry in entries {
                     let line = entry["line"].as_str().unwrap_or("");
-                    output.push_str(line);
-                    output.push('\n');
+                    // Filters also apply client-side: json_field has no
+                    // server-side equivalent, and grep re-checking is
+                    // harmless when the server already filtered.
+                    if options.matches(line) {
+                        output.push_str(line);
+                        output.push('\n');
+                    }
                 }
             }
 
@@ -302,7 +411,7 @@ impl BunClient {
 
         // Fall back to the local agent endpoint (process logs that
         // haven't been ingested into the LogStore yet)
-        self.logs_local(app, namespace, tail).await
+        self.logs_local(app, namespace, options).await
     }
 
     /// Query local agent logs (process stdout/stderr).
@@ -310,14 +419,17 @@ impl BunClient {
         &self,
         app: &str,
         namespace: &str,
-        tail: Option<usize>,
+        options: &LogOptions,
     ) -> Result<String, RelishError> {
-        let mut url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
-        if let Some(n) = tail {
-            url.push_str(&format!("?tail={n}"));
-        }
+        let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
 
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .client
+            .get(&url)
+            .query(&options.query_params())
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -330,7 +442,9 @@ impl BunClient {
             body: format!("failed to parse response: {e}"),
         })?;
 
-        Ok(json["logs"].as_str().unwrap_or("").to_string())
+        let logs = json["logs"].as_str().unwrap_or("");
+        let filtered: Vec<&str> = logs.lines().filter(|l| options.matches(l)).collect();
+        Ok(filtered.join("\n"))
     }
 
     /// Follow logs via SSE stream (local node only).
@@ -338,17 +452,19 @@ impl BunClient {
         &self,
         app: &str,
         namespace: &str,
-        tail: Option<usize>,
+        options: &LogOptions,
     ) -> Result<String, RelishError> {
-        let mut url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
-        let mut params = vec!["follow=true".to_string()];
-        if let Some(n) = tail {
-            params.push(format!("tail={n}"));
-        }
-        url.push('?');
-        url.push_str(&params.join("&"));
+        let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+        let mut params = options.query_params();
+        params.push(("follow".to_string(), "true".to_string()));
 
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .client
+            .get(&url)
+            .query(&params)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -369,7 +485,10 @@ impl BunClient {
 
                 for line in event_text.lines() {
                     if let Some(data) = line.strip_prefix("data:") {
-                        println!("{}", data.trim());
+                        let data = data.trim();
+                        if options.matches(data) {
+                            println!("{data}");
+                        }
                     }
                 }
             }
@@ -377,7 +496,10 @@ impl BunClient {
 
         for line in buffer.lines() {
             if let Some(data) = line.strip_prefix("data:") {
-                println!("{}", data.trim());
+                let data = data.trim();
+                if options.matches(data) {
+                    println!("{data}");
+                }
             }
         }
 
@@ -715,7 +837,8 @@ impl BunClient {
         &self,
         name: &str,
         context_digest: &str,
-        destination: &str,
+        registry_port: u16,
+        spec: &crate::config::build::BuildSpec,
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/build", self.base_url);
         let response = self
@@ -724,7 +847,8 @@ impl BunClient {
             .json(&serde_json::json!({
                 "name": name,
                 "context_digest": context_digest,
-                "destination": destination,
+                "registry_port": registry_port,
+                "spec": spec,
             }))
             .send()
             .await

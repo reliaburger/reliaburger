@@ -56,6 +56,10 @@ pub enum RelishError {
     #[error("bun agent not reachable at localhost:9117 (is it running?)")]
     AgentUnreachable,
 
+    /// A command-line flag value could not be parsed.
+    #[error("invalid --{flag} value: {reason}")]
+    InvalidFlag { flag: String, reason: String },
+
     /// A request to the agent timed out. The operation may still be running.
     #[error("request timed out (the operation may still be running on the agent)")]
     RequestTimeout,

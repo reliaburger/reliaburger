@@ -277,7 +277,12 @@ async fn handle_raft_rpc(mut stream: tokio::net::TcpStream, raft: Raft<TypeConfi
     let Some(payload) = read_frame(&mut stream).await else {
         return;
     };
-    let Ok(rpc) = bincode::deserialize::<RaftRpc>(&payload) else {
+    // JSON, not bincode: AppendEntries carries log entries whose
+    // `AppSpec` payload uses `deserialize_any` config types (see
+    // durable_log). bincode is not self-describing and corrupts them,
+    // so a replicated AppSpec entry would never deserialise on the
+    // follower and the write would hang forever.
+    let Ok(rpc) = serde_json::from_slice::<RaftRpc>(&payload) else {
         return;
     };
 
@@ -296,7 +301,7 @@ async fn handle_raft_rpc(mut stream: tokio::net::TcpStream, raft: Raft<TypeConfi
         },
     };
 
-    if let Ok(bytes) = bincode::serialize(&response) {
+    if let Ok(bytes) = serde_json::to_vec(&response) {
         let _ = write_frame(&mut stream, &bytes).await;
     }
 }
@@ -384,7 +389,8 @@ impl TcpRaftNetwork {
 
     /// Inner RPC implementation (called within a timeout).
     async fn rpc_inner(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
-        let payload = bincode::serialize(&rpc)
+        // JSON to match handle_raft_rpc (self-describing; see there).
+        let payload = serde_json::to_vec(&rpc)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
 
         let mut stream = tokio::net::TcpStream::connect(self.target_addr)
@@ -399,7 +405,7 @@ impl TcpRaftNetwork {
             .await
             .ok_or_else(|| Unreachable::new(&RouterError("read response failed".into())))?;
 
-        bincode::deserialize(&resp_payload)
+        serde_json::from_slice(&resp_payload)
             .map_err(|e| Unreachable::new(&RouterError(format!("deserialize: {e}"))))
     }
 }

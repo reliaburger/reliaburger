@@ -42,6 +42,10 @@ pub struct InstanceSnapshot {
     pub consecutive_unhealthy: u32,
     /// When the instance was created (for uptime calculation).
     pub uptime: Duration,
+    /// CPU requested by the instance's spec (millicores).
+    pub cpu_request_millicores: u32,
+    /// Memory requested by the instance's spec (MB).
+    pub memory_request_mb: u32,
 }
 
 /// Full snapshot of the agent's state for building a StateReport.
@@ -51,6 +55,10 @@ pub struct AgentSnapshot {
     pub instances: Vec<InstanceSnapshot>,
     /// Allocated ports across all instances.
     pub allocated_ports: Vec<u16>,
+    /// Schedulable CPU capacity (system total minus reserved).
+    pub capacity_cpu_millicores: u32,
+    /// Schedulable memory capacity (system total minus reserved).
+    pub capacity_memory_mb: u32,
 }
 
 /// Request sent to the agent to collect a state snapshot.
@@ -195,10 +203,22 @@ impl<T: ReportingTransport> ReportWorker<T> {
                     port: inst.port,
                     health_status,
                     uptime: inst.uptime,
-                    resource_usage: AppResourceUsage::default(),
+                    resource_usage: AppResourceUsage {
+                        cpu_millicores: inst.cpu_request_millicores,
+                        memory_mb: inst.memory_request_mb,
+                    },
                 }
             })
             .collect();
+
+        // "Used" is the sum of requests over running instances — the
+        // commitments the scheduler must respect, not measured load.
+        let cpu_used: u32 = snapshot
+            .instances
+            .iter()
+            .map(|i| i.cpu_request_millicores)
+            .sum();
+        let memory_used: u32 = snapshot.instances.iter().map(|i| i.memory_request_mb).sum();
 
         StateReport {
             node_id: self.node_id.clone(),
@@ -206,11 +226,13 @@ impl<T: ReportingTransport> ReportWorker<T> {
             running_apps,
             cached_specs: vec![],
             resource_usage: ResourceUsage {
-                cpu_used_millicores: 0,
-                memory_used_mb: 0,
+                cpu_used_millicores: cpu_used,
+                memory_used_mb: memory_used,
                 disk_used_mb: 0,
                 gpu_used: 0,
                 allocated_ports: snapshot.allocated_ports,
+                cpu_total_millicores: snapshot.capacity_cpu_millicores,
+                memory_total_mb: snapshot.capacity_memory_mb,
             },
             event_log: vec![],
         }
@@ -259,8 +281,12 @@ mod tests {
                                     container_state: ContainerState::Running,
                                     consecutive_unhealthy: 0,
                                     uptime: Duration::from_secs(120),
+                                    cpu_request_millicores: 250,
+                                    memory_request_mb: 128,
                                 }],
                                 allocated_ports: vec![8080],
+                                capacity_cpu_millicores: 7500,
+                                capacity_memory_mb: 15_872,
                             };
                             let _ = req.response.send(snapshot);
                         } else {
@@ -308,6 +334,13 @@ mod tests {
                 assert_eq!(r.running_apps.len(), 1);
                 assert_eq!(r.running_apps[0].app_name, "web");
                 assert_eq!(r.running_apps[0].health_status, ReportHealthStatus::Healthy);
+                // L6: reports must carry real capacity and commitments,
+                // not the zeroed placeholders they used to.
+                assert_eq!(r.resource_usage.cpu_used_millicores, 250);
+                assert_eq!(r.resource_usage.memory_used_mb, 128);
+                assert_eq!(r.resource_usage.cpu_total_millicores, 7500);
+                assert_eq!(r.resource_usage.memory_total_mb, 15_872);
+                assert_eq!(r.running_apps[0].resource_usage.cpu_millicores, 250);
             }
             _ => panic!("expected Report"),
         }

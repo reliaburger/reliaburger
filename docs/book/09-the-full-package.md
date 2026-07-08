@@ -151,6 +151,18 @@ scale_down_threshold = 0.8  # optional, default 0.8
 
 All three optional fields have sensible defaults. Most users will only set metric, target, min, and max.
 
+### Wiring it to the cluster
+
+The evaluation logic above — `compute_desired`, the hysteresis, the cooldown — was a library nobody spawned. The July 2026 review found `run_autoscale_loop` had no caller: `AutoscaleDecision`s were computed by tests and nothing else. An autoscaler that never runs is a thermostat with no wires.
+
+Wiring it revealed a small design mismatch worth explaining. `run_autoscale_loop` takes a *synchronous* `app_provider` closure — `Fn() -> Vec<(AppId, ...)>` — to list the apps to consider. But the apps live in the Raft desired state, which you read with an `async` call, and the metrics live in the rollup store, also async. A sync closure can't `await`. Rather than contort a shared cache to feed the sync closure, the leader task drives the same *pure* functions directly: `AutoscaleConfig::from_spec`, `evaluate`, and the `AutoscaleTracker`. The tested logic is reused; only the plumbing around it is new. When a library's shape doesn't fit the wiring, reach for its tested internals rather than bending the wiring to the shape.
+
+The loop lives where every leader-only loop in Reliaburger lives — spawned once, checking leadership each tick, no start/stop dance. Each cycle: read the desired apps, keep only those with an `[autoscale]` section, query the rollup store for each app's recent metric, run `evaluate`, and on a decision commit an `AutoscaleOverride` to Raft.
+
+That last word is the whole trick. The autoscaler doesn't deploy anything or talk to nodes. It writes one number to Raft — the desired replica count — and stops. The scheduler from Chapter 2 already watches desired state; it now reads the *effective* replica count (the override if one exists, else the spec's) and re-places accordingly, and the per-node reconcilers converge. Scaling is just another edit to desired state, flowing through the exact machinery a manual `relish apply` uses. No parallel path, no special case. The integration test drives it end to end: deploy a one-replica app, feed a sustained 95% CPU metric into the rollup stores, and watch the cluster grow the app to its `max` of three — purely because a number changed in Raft.
+
+One honesty note on the metric. The autoscaler compares the rollup value against the target as a *utilisation fraction* (0.95 vs 0.70). What Mayo actually records for an app therefore has to be scaled that way; a metric reported in raw millicores would need a target expressed to match. The code documents this at the query seam rather than silently assuming.
+
 ## Config tooling
 
 Before GitOps, before Kubernetes migration, before any of the fancy stuff, you need basic config manipulation tools. Three commands, all local (no cluster contact needed).
@@ -179,6 +191,38 @@ Reformats a TOML config with canonical section ordering. The order is: namespace
 
 The formatter is idempotent. Running it twice produces the same output as running it once.
 
+#### The bug that ate configs
+
+The first version of the formatter had a bug that's worth dissecting, because the fix teaches a defensive pattern you'll reuse.
+
+The emission code walked one level of nesting: `[app.web]` worked, but a nested table like `[app.web.health]` hit a fallback that serialised the whole health table with `toml::to_string`. That function serialises a *document* — `path = "/health"` on its own line — not a *value*. The output ended up as `health = path = "/health"`, which isn't TOML at all. And because `relish fmt` writes in place, it wrote that garbage straight over your config. Format once, lose your file.
+
+Two fixes. The first is the obvious one: emit sections recursively, so `[app.web.health]` gets its own dotted header no matter how deep it nests. Scalar fields print inline via `toml::Value`'s `Display` implementation, which produces value syntax (strings quoted, arrays bracketed), never document syntax.
+
+The second fix is the interesting one. The formatter now refuses to return output it can't verify:
+
+```rust
+fn verify_roundtrip(
+    original: &BTreeMap<String, toml::Value>,
+    output: &str,
+) -> Result<(), RelishError> {
+    let reparsed: BTreeMap<String, toml::Value> = toml::from_str(output)
+        .map_err(|e| RelishError::FormatFailed(format!(
+            "formatter produced invalid TOML ({e}); file left untouched"
+        )))?;
+    if &reparsed != original {
+        return Err(RelishError::FormatFailed(
+            "formatted output would change the config's meaning; file left untouched".to_string(),
+        ));
+    }
+    Ok(())
+}
+```
+
+Parse what you're about to write, and compare it with what you started from. `toml::Value` derives `PartialEq`, so `!=` here is a deep structural comparison of the whole value tree — every table, every array, every string, in one operator. In C you'd write a recursive comparison by hand; in Rust the derive gives it to you for free, and the compiler guarantees it stays in sync with the type.
+
+Can you see what this buys us? The formatter can still have bugs. But now a bug produces an error message instead of a corrupted file. When a tool rewrites user data in place, "fail loudly" beats "trust the code" every time.
+
 ### `relish diff`
 
 Shows a structural, field-by-field diff between two configs. Not a text diff -- a semantic one. It knows that changing `image` from `v1` to `v2` is a modification, adding a new `[app.api]` section is an addition, and removing `[job.migrate]` is a deletion.
@@ -192,6 +236,16 @@ $ relish diff old.toml new.toml
 ```
 
 The output serialises to JSON for programmatic consumption. Lettuce's diff engine reuses the same structural comparison logic.
+
+### Exit codes are an API
+
+A CLI has two output channels: what it prints, and what it returns. Scripts read the second one. For a long time `relish apply` got this wrong: when the agent was unreachable, it printed a dry-run plan, added a polite note, and exited 0. Run that from CI with the agent down and your pipeline goes green while deploying nothing.
+
+The fix splits the two intents apart. `relish apply --dry-run` previews the plan and exits 0 — that's the explicit "don't deploy" path. Plain `relish apply` with no reachable agent still prints the plan for reference, but exits non-zero with an error saying nothing was deployed. If a script wanted the old behaviour, it now has to ask for it by name.
+
+The same pass fixed a quieter lie in `relish logs`. The `--grep`, `--since`, and `--json-field` flags parsed fine and were then bound to variables named `_grep`, `_since`, `_json_field` — the underscore prefix being Rust's way of saying "I know this is unused, don't warn me". The flags did nothing, silently. Now `--grep` and `--since` travel to the server as query parameters (the endpoints already supported them), and `--json-field key=value` filters client-side, keeping only lines that parse as JSON with a matching field. In follow mode the SSE stream can't filter server-side, so the same filters apply client-side as each line arrives.
+
+The lesson generalises. An unused-variable warning is the compiler telling you your feature doesn't work; naming the variable `_grep` to quiet it is shooting the messenger. If a flag exists, it either works or the command should reject it.
 
 ## WebSocket proxying
 
@@ -338,6 +392,20 @@ pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
 }
 ```
 
+### Switching it on
+
+All of the above — `execute_sync`, the diff engine, signature verification, the webhook validator — was a library nobody ran. The July 2026 review found `execute_sync` had no caller, `/v1/gitops/webhook` returned 503 unconditionally (`gitops_webhook_tx` was hardcoded `None`), and the `[gitops]` config section was parsed and never read. A GitOps engine that never touches git.
+
+The runner (`spawn_gitops_sync`) is the missing piece: a leader-only task that clones the configured repo, then on each poll tick or webhook nudge reads the current apps and last-applied sha from Raft, runs `execute_sync` in `spawn_blocking` (git shells out; never on the async runtime), and applies the resulting changes — `Add`/`Update` become `AppSpec` writes to Raft, `Remove` becomes `AppDelete`. Exactly the desired-state writes a manual `relish apply` makes, which means the scheduler and reconcilers from Chapter 2 pick them up for free. Git becomes just another writer of desired state. The webhook endpoint now has a channel to nudge, so a `git push` hook triggers a sync in milliseconds instead of waiting for the poll.
+
+Wiring it flushed out a bug that only a real repo could surface. `execute_sync` starts by fetching, and treats "fetch found no new commit" as "nothing to do". But the *first* sync after cloning has nothing new to fetch — the clone already contains the commit — yet the desired state has never been applied. The result: a freshly-configured GitOps repo synced *nothing* until someone pushed a second commit. The fix distinguishes "no new commit since last fetch" from "current HEAD not yet applied": when the repo's HEAD differs from the last-*applied* sha, sync it regardless of whether the fetch pulled anything. The unit tests never caught this because they drove `execute_sync` with a mock repo whose `fetch` returned a commit on demand; only a real bare clone, where the first fetch is genuinely a no-op, exposed it.
+
+### The trusted key that trusted everyone (H12)
+
+One security fix rides along. Lettuce can require commits to be GPG-signed by a trusted key, and `is_key_trusted` checked the signing fingerprint against the configured allowlist. Or it looked like it did. After the loop that searched for a matching key, the function ended with `return true` — a comment explained it as "trust any valid signature when trusted_keys is provided." So a validly-signed commit from *any* key sailed through: a departed employee's key, a compromised laptop, an attacker who forked your repo and signed with their own key. The allowlist was decoration; the only check that ran was "is the signature cryptographically valid," which proves the committer holds *some* private key, not *your* private key.
+
+The fix is one line — return whether any trusted fingerprint appears in the verify output, with no fall-through. A valid signature from an unlisted key is now `UntrustedKey`, and the commit is rejected. The two regression tests are the ones that should have existed from the start: a matching fingerprint is trusted, an unlisted one is not. It's a reminder that a security check which always returns "yes" is worse than no check, because it shows up green in the audit.
+
 ## Kubernetes migration
 
 Most teams don't start from scratch. They have existing Kubernetes manifests -- dozens of them, spread across namespaces, wired together with Services, Ingresses, HPAs, ConfigMaps. Asking those teams to rewrite everything in TOML by hand is a non-starter.
@@ -407,7 +475,10 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 
 - `spec.replicas` → `replicas`
 - `spec.template.spec.containers[0].image` → `image`
-- `spec.template.spec.containers[0].ports[0].containerPort` → `port`
+- `containers[0].command` + `containers[0].args` → `command` (concatenated — K8s splits the argv into two fields, we keep one)
+- `metadata.namespace` → `namespace`
+- `containers[0].ports[0].containerPort` → `port`
+- `env[].value` → `env` (plain values)
 - `readinessProbe.httpGet.path` → `health.path`
 - `strategy.rollingUpdate.maxSurge` → `deploy.max_surge`
 - `terminationGracePeriodSeconds` → `deploy.drain_timeout`
@@ -415,6 +486,12 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 - `initContainers` → `init`
 
 DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly.
+
+Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
+
+Env vars that use `valueFrom` (secret refs, configmap refs, field refs) still can't map automatically — there's no way to reach into another cluster's secret store. But now they land in the migration report as warnings naming each variable, instead of vanishing. The rule the importer follows: convert what you can, warn about what you can't, drop nothing silently.
+
+One more K8s-ism: names are scoped per namespace, so `api` in `alpha` and `api` in `beta` are different workloads. A flat TOML table has one key per name. When the importer sees a collision it keeps the first app under its own name and imports the second as `[app.beta-api]`, with a warning — rather than letting the second overwrite the first.
 
 ### The migration report
 

@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 use crate::config::build::{BuildSpec, PickleDestination, parse_pickle_destination};
 use crate::config::error::ConfigError;
 
-/// Default Pickle registry port (same as the Bun API port).
-const DEFAULT_PICKLE_PORT: u16 = 9117;
+/// Default Pickle registry port.
+///
+/// X1 regression note: this used to be 9117 — the *Bun API* port,
+/// which has no `/v2` routes — so context uploads always 404ed.
+/// It must match `ImagesSection::default().registry_port`.
+const DEFAULT_PICKLE_PORT: u16 = 5050;
 
 /// A prepared buildah build, ready for execution as a process job.
 ///
@@ -372,7 +376,9 @@ mod tests {
     fn execute_build_uses_default_port() {
         let spec = spec_with_destination("pickle://app:latest");
         let job = execute_build(&spec, "sha256:abc", None).unwrap();
-        assert!(job.local_tag.contains("9117"));
+        // Defaults to the Pickle registry port (5050), not the Bun API
+        // port — see the X1 regression note on DEFAULT_PICKLE_PORT.
+        assert!(job.local_tag.contains("5050"));
     }
 
     #[test]
@@ -482,11 +488,11 @@ mod tests {
     }
 
     #[test]
-    fn context_upload_url_format() {
-        let url = context_upload_url(9117, "sha256:abc123");
+    fn context_upload_url_targets_the_registry_port() {
+        let url = context_upload_url(5050, "sha256:abc123");
         assert_eq!(
             url,
-            "http://localhost:9117/v2/_buildcontext/blobs/uploads/?digest=sha256:abc123"
+            "http://localhost:5050/v2/_buildcontext/blobs/uploads/?digest=sha256:abc123"
         );
     }
 

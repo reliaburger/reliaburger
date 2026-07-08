@@ -118,6 +118,21 @@ impl<D: DeployDriver> DeployOrchestrator<D> {
                 }
                 Err(_e) => {
                     self.state.steps[i].phase = StepPhase::Failed;
+
+                    // M16: clean up the failed step's OWN half-started
+                    // instance. A step can fail after start_instance
+                    // succeeded but await_healthy timed out, leaving a
+                    // new (unhealthy) instance recorded but never stopped.
+                    // execute_rollback only reverts *completed* earlier
+                    // steps, so without this the failed instance leaked
+                    // (orphaned container + leaked port).
+                    if let Some(new_id) = self.state.steps[i].new_instance.clone() {
+                        let _ = self
+                            .driver
+                            .remove_from_routing(&self.state.request.app_id.name, &new_id);
+                        let _ = self.driver.stop_instance(&new_id);
+                    }
+
                     let _ = self.state.transition(DeployEvent::StepFailed(i));
 
                     if self.state.phase == DeployPhase::Reverting {
@@ -261,6 +276,10 @@ pub mod mock {
         start_counter: RefCell<usize>,
         /// Counts await_healthy calls independently.
         health_counter: RefCell<usize>,
+        /// Instance IDs that were started (in order).
+        started: RefCell<Vec<String>>,
+        /// Instance IDs that were stopped.
+        stopped: RefCell<Vec<String>>,
     }
 
     impl MockDriver {
@@ -274,7 +293,14 @@ pub mod mock {
                 step_counter: RefCell::new(0),
                 start_counter: RefCell::new(0),
                 health_counter: RefCell::new(0),
+                started: RefCell::new(Vec::new()),
+                stopped: RefCell::new(Vec::new()),
             }
+        }
+
+        /// Whether `stop_instance` was called for this id.
+        pub fn was_stopped(&self, instance_id: &str) -> bool {
+            self.stopped.borrow().iter().any(|id| id == instance_id)
         }
 
         /// Fail the Nth health check call (0-indexed).
@@ -314,6 +340,7 @@ pub mod mock {
             let mut id = self.next_instance_id.borrow_mut();
             let instance = format!("instance-{id}");
             *id += 1;
+            self.started.borrow_mut().push(instance.clone());
             Ok((instance, Some(8080)))
         }
 
@@ -350,9 +377,10 @@ pub mod mock {
             Ok(())
         }
 
-        fn stop_instance(&self, _instance_id: &str) -> Result<(), DeployError> {
+        fn stop_instance(&self, instance_id: &str) -> Result<(), DeployError> {
             // Increment step counter after a full step cycle
             *self.step_counter.borrow_mut() += 1;
+            self.stopped.borrow_mut().push(instance_id.to_string());
             Ok(())
         }
 
@@ -499,5 +527,26 @@ mod tests {
         let mut orch = DeployOrchestrator::new(DeployId(1), request("myapp:v2"), driver);
         let result = orch.execute().unwrap();
         assert_eq!(result, DeployResult::RolledBack);
+    }
+
+    /// M16 regression: a step that starts its new instance and then
+    /// fails health used to leave that instance running (orphaned
+    /// container + leaked port). It must be stopped on failure.
+    #[test]
+    fn failed_step_stops_its_own_new_instance() {
+        // Two replicas, second step fails its health check. Its new
+        // instance was started; it must end up stopped.
+        let driver = MockDriver::new(placements(2)).fail_health_at(1);
+        let mut orch = DeployOrchestrator::new(DeployId(1), request("myapp:v2"), driver);
+        orch.execute().unwrap();
+
+        let failed_new = orch.state.steps[1]
+            .new_instance
+            .clone()
+            .expect("failed step started a new instance");
+        assert!(
+            orch.driver.was_stopped(&failed_new),
+            "the failed step's new instance {failed_new} leaked"
+        );
     }
 }
