@@ -49,27 +49,53 @@ pub struct NodeAssignments {
     pub apps: Vec<NodeAssignment>,
 }
 
-/// Spawn the leader's scheduling loop.
+/// Spawn the leader's scheduling loop, with state reconstruction (L4).
 ///
 /// Leader-only (checked every tick, so leadership changes need no
-/// start/stop dance). For every desired app whose placements are
-/// missing, sized wrongly, or reference dead nodes, runs the Phase-2
-/// scheduler over live capacity data and proposes the new
-/// `SchedulingDecision` to Raft.
+/// start/stop dance). A freshly-elected leader first runs a *learning
+/// period*: it waits for enough workers to report their actual running
+/// apps before it schedules anything. Without this, a new leader would
+/// re-place apps that are already running but haven't reported yet,
+/// duplicating workloads. Once the learning period completes (coverage
+/// threshold met, or timeout), the loop schedules as normal: for every
+/// desired app whose placements are missing, sized wrongly, or on dead
+/// nodes, it runs the scheduler and commits a `SchedulingDecision`.
+/// Nodes that never reported (`UnknownNode` corrections) are excluded
+/// from placement until they do.
 pub fn spawn_leader_scheduler(
     council: Arc<CouncilNode>,
     membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
     aggregated_rx: watch::Receiver<AggregatedState>,
+    reconstruction_config: crate::config::node::ReconstructionSection,
     shutdown: CancellationToken,
 ) {
+    use crate::reconstruction::controller::ReconstructionController;
+    use crate::reconstruction::types::ReconstructionPhase;
+
     tokio::spawn(async move {
+        let mut reconstruction = ReconstructionController::new(reconstruction_config);
+        let mut was_leader = false;
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tick.tick() => {}
             }
-            if !council.is_leader().await {
+
+            let is_leader = council.is_leader().await;
+            // Leadership edges drive the reconstruction state machine.
+            if is_leader && !was_leader {
+                let alive_count = membership_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == NodeState::Alive)
+                    .count();
+                reconstruction.on_leader_elected(alive_count);
+            } else if !is_leader && was_leader {
+                reconstruction.on_leader_lost();
+            }
+            was_leader = is_leader;
+            if !is_leader {
                 continue;
             }
 
@@ -77,7 +103,7 @@ pub fn spawn_leader_scheduler(
             let members = membership_rx.borrow().clone();
             let reports = aggregated_rx.borrow().clone();
 
-            let alive: HashSet<NodeId> = members
+            let alive: Vec<NodeId> = members
                 .iter()
                 .filter(|m| m.state == NodeState::Alive)
                 .map(|m| m.node_id.clone())
@@ -85,6 +111,24 @@ pub fn spawn_leader_scheduler(
             if alive.is_empty() {
                 continue;
             }
+
+            // Learning period: feed reports in, check the timeout, and
+            // do NOT schedule until reconstruction reaches Active. This
+            // is the L4 gate — a fresh leader waits for workers to report
+            // what they're actually running before it schedules, so it
+            // never re-places an app that's already running but hasn't
+            // reported yet. Once Active, scheduling proceeds over all
+            // alive nodes; a node that reports late is simply picked up
+            // by the ordinary scheduler on a later tick.
+            if reconstruction.phase() != ReconstructionPhase::Active {
+                reconstruction.on_report_received(&reports, &desired, &alive);
+                reconstruction.check_timeout(&desired, &alive, &reports);
+                if reconstruction.phase() != ReconstructionPhase::Active {
+                    continue; // still learning — hold off on scheduling
+                }
+            }
+
+            let alive: HashSet<NodeId> = alive.into_iter().collect();
 
             for (app_id, spec) in &desired.apps {
                 // Effective replicas = autoscale override (L3) if the

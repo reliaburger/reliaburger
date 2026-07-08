@@ -307,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(council),
                 membership_rx.clone(),
                 aggregated_rx,
+                config.reconstruction.clone(),
                 shutdown.clone(),
             );
             // L3: leader-only autoscale loop, feeding on the same rollup

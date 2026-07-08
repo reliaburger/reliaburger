@@ -134,6 +134,13 @@ async fn start_node(
             Arc::clone(council),
             membership_rx.clone(),
             aggregated_rx,
+            // Fast learning period so the test doesn't wait long.
+            reliaburger::config::node::ReconstructionSection {
+                report_threshold_percent: 95,
+                learning_period_timeout_secs: 2,
+                large_cluster_timeout_secs: 4,
+                large_cluster_node_count: 5000,
+            },
             shutdown.clone(),
         );
         reliaburger::cluster::orchestrate::spawn_autoscaler(

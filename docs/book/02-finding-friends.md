@@ -1444,7 +1444,15 @@ pub enum LearningOutcome {
 }
 ```
 
-When the learning period ends — by threshold or timeout — the controller calls `compute_diff` and produces a `ReconstructionResult` with the corrections, the list of unknown nodes, and the list of reported nodes. The corrections aren't executed yet (the scheduler doesn't exist), but they're ready for when it does.
+When the learning period ends — by threshold or timeout — the controller calls `compute_diff` and produces a `ReconstructionResult` with the corrections, the list of unknown nodes, and the list of reported nodes.
+
+The original edition of this section ended that sentence with "the corrections aren't executed yet (the scheduler doesn't exist), but they're ready for when it does." That was honest at the time and stale by July 2026: the scheduler *did* exist by then (Chapter 2's Meat), but the `ReconstructionController` still had no caller. Another library with the ignition wires cut.
+
+The wiring turned out smaller than the machinery, because the controller and the scheduler slot together naturally. Both are leader-only; both run on the same 2-second tick. So reconstruction lives inside the scheduler loop as a gate. On the leadership edge — the tick where this node discovers it's the leader — the loop calls `on_leader_elected(alive_count)` and enters the learning period. While the controller's phase isn't `Active`, the loop feeds each round of reports through `on_report_received`, checks the timeout, and then *skips scheduling entirely*. Only once reconstruction reaches `Active` does the loop go on to place apps.
+
+That gate is the whole point, and it's worth restating why. A freshly-elected leader doesn't yet know what's running where — the workers haven't reported since it took charge. If it scheduled immediately, it would look at desired state ("web wants 3 replicas"), see no reports proving they exist, and cheerfully start three more. The learning period is the leader holding its hands still until the picture fills in. `compute_diff`'s `MissingApp` and `ExtraApp` corrections then fall out for free: once the loop is scheduling again, it already reconciles placements against desired state on every tick, which *is* applying those corrections. We didn't need a separate execution path for them — the gate was the missing piece, not the diff.
+
+One design note on what we *didn't* wire. The controller also reports `UnknownNode` corrections — nodes that never reported during the learning window. An early attempt excluded those nodes from scheduling. That backfired: a node merely slow to report in a two-second window got permanently blacklisted, and replicas piled onto the nodes that did report. The fix was to trust the gate and nothing more. A node that reports late isn't unknown for long; the ordinary scheduler picks it up on the next tick. The lesson is one this whole stage keeps teaching in different keys: wire the load-bearing thing, and resist gold-plating the rest.
 
 ### Key invariants
 
