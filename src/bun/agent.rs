@@ -315,6 +315,18 @@ pub struct PartitionBlocklists {
     pub raft_port_offset: i32,
 }
 
+/// Egress enforcement bound to a running instance's cgroup (L16).
+#[cfg(feature = "ebpf")]
+#[derive(Clone)]
+struct EgressBinding {
+    /// The instance's cgroup id (key into the egress maps).
+    cgroup_id: u64,
+    /// The raw `[egress] allow` list, re-resolved periodically.
+    allow: Vec<String>,
+    /// The destinations currently programmed into the egress map.
+    resolved: Vec<(std::net::Ipv4Addr, u16)>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -328,10 +340,15 @@ pub struct BunAgent<G: Grill> {
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(feature = "ebpf")]
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
-    /// Cgroup id programmed into the egress maps for each instance with an
-    /// egress allowlist, so enforcement can be lifted when it stops (L16).
+    /// Egress enforcement state per instance with an allowlist: its cgroup
+    /// id, the raw allow list, and the last-resolved destinations — so
+    /// enforcement can be lifted on stop and the allowlist re-resolved as
+    /// DNS changes (L16).
     #[cfg(feature = "ebpf")]
-    egress_cgroups: std::collections::HashMap<InstanceId, u64>,
+    egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
+    /// Ticks since the last egress re-resolution (the event loop runs at 1s).
+    #[cfg(feature = "ebpf")]
+    egress_reresolve_ticks: u32,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Publisher for service-map snapshots (DNS responder subscribes).
@@ -391,7 +408,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
             #[cfg(feature = "ebpf")]
-            egress_cgroups: std::collections::HashMap::new(),
+            egress_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "ebpf")]
+            egress_reresolve_ticks: 0,
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -436,7 +455,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
             #[cfg(feature = "ebpf")]
-            egress_cgroups: std::collections::HashMap::new(),
+            egress_bindings: std::collections::HashMap::new(),
+            #[cfg(feature = "ebpf")]
+            egress_reresolve_ticks: 0,
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -630,6 +651,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.drive_pending_restarts().await;
                     self.expire_faults().await;
                     self.reconcile_firewall().await;
+                    self.reresolve_egress().await;
                     self.check_identity_rotation().await;
                 }
             }
@@ -2325,8 +2347,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // DNS resolution can block — do it off the event loop.
         let allow = egress.allow.clone();
+        let allow_for_resolve = allow.clone();
         let resolved = match tokio::task::spawn_blocking(move || {
-            crate::sesame::egress::resolve_egress_entries(&allow)
+            crate::sesame::egress::resolve_egress_entries(&allow_for_resolve)
         })
         .await
         {
@@ -2365,7 +2388,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
         drop(ebpf);
-        self.egress_cgroups.insert(instance_id.clone(), cgroup_id);
+        self.egress_bindings.insert(
+            instance_id.clone(),
+            EgressBinding {
+                cgroup_id,
+                allow,
+                resolved,
+            },
+        );
     }
 
     /// Egress enforcement is a no-op without the eBPF data path.
@@ -2385,18 +2415,83 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// entries become inert once nothing enforces against them.
     #[cfg(feature = "ebpf")]
     async fn clear_egress(&mut self, instance_id: &InstanceId) {
-        let Some(cgroup_id) = self.egress_cgroups.remove(instance_id) else {
+        let Some(binding) = self.egress_bindings.remove(instance_id) else {
             return;
         };
         if let Some(handle) = self.onion_ebpf.as_ref() {
             let mut ebpf = handle.lock().await;
-            let _ = crate::sesame::egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id);
+            let _ = crate::sesame::egress::clear_egress_enforced(&mut ebpf.bpf, binding.cgroup_id);
         }
     }
 
     /// No-op without the eBPF data path.
     #[cfg(not(feature = "ebpf"))]
     async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
+
+    /// Periodically re-resolve DNS-based egress allowlists and reprogram the
+    /// eBPF egress map when an app's destination IPs change (L16). Rate-
+    /// limited to roughly once every five minutes; a no-op while nothing
+    /// enforces egress.
+    #[cfg(feature = "ebpf")]
+    async fn reresolve_egress(&mut self) {
+        // ~5 minutes at the 1s event-loop tick.
+        const RERESOLVE_EVERY_TICKS: u32 = 300;
+        self.egress_reresolve_ticks += 1;
+        if self.egress_reresolve_ticks < RERESOLVE_EVERY_TICKS || self.egress_bindings.is_empty() {
+            return;
+        }
+        self.egress_reresolve_ticks = 0;
+
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return;
+        };
+        // Snapshot so we don't hold a borrow of self across the DNS awaits.
+        let bindings: Vec<(InstanceId, EgressBinding)> = self
+            .egress_bindings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (instance_id, binding) in bindings {
+            let new_resolved =
+                match crate::sesame::egress::re_resolve_egress_async(&binding.allow).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "sesame: egress re-resolve failed for {}: {e}",
+                            instance_id.0
+                        );
+                        continue;
+                    }
+                };
+            let (to_add, to_remove) =
+                crate::sesame::egress::egress_diff(&binding.resolved, &new_resolved);
+            if to_add.is_empty() && to_remove.is_empty() {
+                continue;
+            }
+
+            let adds = crate::sesame::egress::egress_to_bpf_entries(&[binding.cgroup_id], &to_add);
+            let removes =
+                crate::sesame::egress::egress_to_bpf_entries(&[binding.cgroup_id], &to_remove);
+            {
+                let mut ebpf = handle.lock().await;
+                for (key, value) in adds {
+                    let _ = crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value);
+                }
+                for (key, _) in removes {
+                    let _ = crate::sesame::egress::delete_egress_entry(&mut ebpf.bpf, key);
+                }
+            }
+            // Record the new set so the next diff is against reality.
+            if let Some(b) = self.egress_bindings.get_mut(&instance_id) {
+                b.resolved = new_resolved;
+            }
+        }
+    }
+
+    /// No-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn reresolve_egress(&mut self) {}
 
     /// Drive a job instance through startup: Pending → Preparing → Starting → Running.
     ///

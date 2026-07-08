@@ -125,6 +125,25 @@ pub fn resolve_egress_entries(allow_list: &[String]) -> Result<Vec<(Ipv4Addr, u1
     Ok(resolved)
 }
 
+/// A set of resolved egress destinations (IP + port).
+pub type EgressDestinations = Vec<(Ipv4Addr, u16)>;
+
+/// Diff a previously-resolved egress destination set against a freshly
+/// re-resolved one. Returns `(to_add, to_remove)` — destinations newly
+/// present and destinations gone — so the periodic re-resolution loop can
+/// program only the delta into the eBPF egress map. Order-independent.
+pub fn egress_diff(
+    old: &[(Ipv4Addr, u16)],
+    new: &[(Ipv4Addr, u16)],
+) -> (EgressDestinations, EgressDestinations) {
+    use std::collections::HashSet;
+    let old_set: HashSet<(Ipv4Addr, u16)> = old.iter().copied().collect();
+    let new_set: HashSet<(Ipv4Addr, u16)> = new.iter().copied().collect();
+    let to_add = new_set.difference(&old_set).copied().collect();
+    let to_remove = old_set.difference(&new_set).copied().collect();
+    (to_add, to_remove)
+}
+
 /// Build BPF map entries from resolved egress rules.
 ///
 /// Each entry allows a specific (cgroup, dst_ip, dst_port) tuple.
@@ -342,6 +361,27 @@ mod tests {
     fn parse_ip_port() {
         let result = parse_egress_entry("1.2.3.4:443").unwrap();
         assert_eq!(result, vec![(Ipv4Addr::new(1, 2, 3, 4), 443)]);
+    }
+
+    #[test]
+    fn egress_diff_reports_added_and_removed() {
+        let a = (Ipv4Addr::new(1, 1, 1, 1), 443);
+        let b = (Ipv4Addr::new(2, 2, 2, 2), 443);
+        let c = (Ipv4Addr::new(3, 3, 3, 3), 443);
+
+        // b stays, a is removed, c is added.
+        let (add, remove) = egress_diff(&[a, b], &[b, c]);
+        assert_eq!(add, vec![c]);
+        assert_eq!(remove, vec![a]);
+    }
+
+    #[test]
+    fn egress_diff_empty_when_unchanged() {
+        let a = (Ipv4Addr::new(1, 1, 1, 1), 443);
+        let b = (Ipv4Addr::new(2, 2, 2, 2), 80);
+        let (add, remove) = egress_diff(&[a, b], &[b, a]);
+        assert!(add.is_empty());
+        assert!(remove.is_empty());
     }
 
     #[test]
