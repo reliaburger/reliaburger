@@ -4033,6 +4033,7 @@ dependencies = [
  "hyper-util",
  "insta",
  "k8s-openapi",
+ "libc",
  "mime_guess",
  "nix",
  "object_store 0.12.5",

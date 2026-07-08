@@ -292,10 +292,30 @@ impl FaultRule {
 
 /// Current monotonic clock in nanoseconds.
 ///
-/// Uses `Instant` difference from a fixed epoch. This is not wall-clock
-/// time — it's only meaningful relative to other values from the same
-/// process.
+/// On Linux this reads `CLOCK_MONOTONIC` (nanoseconds since boot) so the
+/// fault `expires_ns` we write into the eBPF maps agree with what the
+/// programs compare against — the kernel side uses `bpf_ktime_get_ns()`,
+/// which is the same clock. A process-relative `Instant` epoch (as used
+/// before) is billions of ns smaller, so faults would never expire in the
+/// kernel. Off Linux there is no eBPF data path, so the `Instant` epoch is
+/// fine — it only needs to be internally consistent for the registry.
 pub fn monotonic_now_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, properly-aligned `timespec`; the kernel
+        // only writes into it and returns 0 on success. CLOCK_MONOTONIC is
+        // always available on Linux.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        if rc == 0 {
+            return (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64);
+        }
+        // Fall through to the Instant epoch on the (near-impossible) error.
+    }
+
     use std::sync::OnceLock;
     use std::time::Instant;
 
