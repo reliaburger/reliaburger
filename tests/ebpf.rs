@@ -430,6 +430,137 @@ async fn agent_deploy_populates_backend_map() {
     shutdown.cancel();
 }
 
+/// A `Drop` fault injected through the agent must land in the kernel
+/// `fault_connect_map` and refuse connections to the service VIP with
+/// EPERM — the eBPF fault path, driven end to end (P2). Before the fault
+/// the VIP has a backend, so a connect is *rewritten* (and refused by the
+/// absent listener with ECONNREFUSED, not EPERM); after the fault it is
+/// dropped (EPERM) regardless of backends.
+#[tokio::test]
+async fn agent_drop_fault_refuses_vip_with_eperm() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::process::ProcessGrill;
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
+    ));
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        ProcessGrill::new(),
+        PortAllocator::new(41500, 41800),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    tokio::spawn(async move { agent.run().await });
+
+    let service_port: u16 = 8090;
+    let config = Config::parse(&format!(
+        r#"
+        [app.faulty]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        port = {service_port}
+    "#
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while ev_rx.recv().await.is_some() {}
+
+    let vip = VirtualIP::from_app_name("faulty");
+    let bpf = BpfServiceMap::new();
+    // Wait for the backend to register so the VIP resolves to a real entry.
+    for _ in 0..25 {
+        let has = {
+            let mut e = ebpf.lock().await;
+            bpf.read_backends(&mut e, vip, service_port)
+                .is_some_and(|v| v.count >= 1)
+        };
+        if has {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let vip_addr = SocketAddr::new(vip.0.into(), service_port);
+
+    // Control: with a backend but no fault, the connect is rewritten to the
+    // (non-listening) backend → ECONNREFUSED, never EPERM.
+    let before = TcpStream::connect_timeout(&vip_addr, Duration::from_secs(1));
+    assert_ne!(
+        before.as_ref().err().map(|e| e.kind()),
+        Some(ErrorKind::PermissionDenied),
+        "VIP should not be dropped before the fault"
+    );
+
+    // Inject a 100% Drop fault on the service.
+    let (resp_tx, resp_rx) = oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::InjectFault {
+            request: FaultRequest {
+                fault_type: FaultType::Drop { probability: 100 },
+                target_service: "faulty".into(),
+                target_instance: None,
+                target_node: None,
+                duration: Duration::from_secs(30),
+                injected_by: "test".into(),
+                reason: None,
+                include_leader: false,
+                override_safety: false,
+            },
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+    resp_rx
+        .await
+        .unwrap()
+        .expect("drop fault should be accepted");
+
+    // Now the VIP is dropped before any rewrite → EPERM.
+    let dropped = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut ok = false;
+        while tokio::time::Instant::now() < deadline {
+            let r = TcpStream::connect_timeout(&vip_addr, Duration::from_secs(1));
+            if r.as_ref().err().map(|e| e.kind()) == Some(ErrorKind::PermissionDenied) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        ok
+    };
+    assert!(
+        dropped,
+        "Drop fault did not refuse the VIP with EPERM (fault_connect_map not applied)"
+    );
+
+    shutdown.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2b: Egress allowlist (L16)
 // ---------------------------------------------------------------------------

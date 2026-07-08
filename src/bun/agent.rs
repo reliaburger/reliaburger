@@ -628,7 +628,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.check_jobs().await;
                     self.check_apps().await;
                     self.drive_pending_restarts().await;
-                    self.expire_faults();
+                    self.expire_faults().await;
                     self.reconcile_firewall().await;
                     self.check_identity_rotation().await;
                 }
@@ -962,7 +962,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .remove(crate::smoker::types::FaultId(fault_id))
                 {
                     Some(rule) => {
-                        self.delete_fault_bpf_entry(&rule);
+                        self.delete_fault_bpf_entry(&rule).await;
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
                     None => format!("fault {fault_id} not found"),
@@ -972,7 +972,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::ClearAllFaults { response } => {
                 let removed = self.fault_registry.clear();
                 for rule in &removed {
-                    self.delete_fault_bpf_entry(rule);
+                    self.delete_fault_bpf_entry(rule).await;
                 }
                 let msg = format!("cleared {} fault(s)", removed.len());
                 let _ = response.send(Ok(msg));
@@ -1226,7 +1226,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 #[cfg(feature = "ebpf")]
                 {
                     if self.onion_ebpf.is_some() {
-                        self.write_fault_bpf_entry(rule);
+                        self.write_fault_bpf_entry(rule).await;
                         return Ok(());
                     }
                 }
@@ -1320,7 +1320,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// kernel stops applying it. The eBPF programs also check expiry
     /// independently (defense in depth), but userspace cleanup frees
     /// map slots and kills resource fault helper processes.
-    fn expire_faults(&mut self) {
+    async fn expire_faults(&mut self) {
         let now = crate::smoker::types::monotonic_now_ns();
         let expired = self.fault_registry.drain_expired(now);
         for rule in &expired {
@@ -1330,58 +1330,199 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.id, rule.fault_type
                 );
             }
-            self.delete_fault_bpf_entry(rule);
+            self.delete_fault_bpf_entry(rule).await;
         }
     }
 
-    /// Write a BPF map entry for a newly injected network fault.
+    /// The network-byte-order VIP + port for a fault's target service, if
+    /// it is registered. VIP is deterministic from the app name; the port
+    /// comes from the service entry. Connect/bandwidth fault keys need both.
+    #[cfg(feature = "ebpf")]
+    fn fault_vip_port(&self, target_service: &str) -> Option<(u32, u16)> {
+        self.service_map
+            .resolve(target_service)
+            .map(|e| (e.vip.to_network_byte_order(), e.port.to_be()))
+    }
+
+    /// Write the eBPF map entry for a newly injected network fault (P2).
     ///
     /// Only reachable with the `ebpf` feature: without it, `apply_fault`
-    /// rejects network faults before we get here, so there is nothing to
-    /// write on other platforms.
+    /// rejects network faults before we get here. `expires_ns` comes from
+    /// the rule, which now uses CLOCK_MONOTONIC (P0) to match the kernel's
+    /// `bpf_ktime_get_ns()`.
     #[cfg(feature = "ebpf")]
-    fn write_fault_bpf_entry(&mut self, rule: &crate::smoker::types::FaultRule) {
-        if let Some(ref ebpf_handle) = self.onion_ebpf
-            && rule.fault_type.requires_ebpf()
-        {
-            let rt = tokio::runtime::Handle::current();
-            let ebpf = ebpf_handle.clone();
-            let rule_type = format!("{}", rule.fault_type);
-            rt.spawn(async move {
-                let mut ebpf = ebpf.lock().await;
-                // Build the appropriate BPF key/value and write it.
-                // For now, log that we would write. The actual key
-                // construction needs the service's VIP (from the
-                // service map), which requires a lookup.
-                eprintln!("smoker: writing BPF entry for {rule_type}");
-                let _ = &mut *ebpf; // use the handle
-            });
+    async fn write_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
+        use crate::smoker::bpf_maps;
+        use crate::smoker::bpf_types::*;
+        use crate::smoker::types::FaultType;
+
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let vip_port = self.fault_vip_port(&rule.target_service);
+        let expires = rule.expires_at_ns;
+        let mut ebpf = handle.lock().await;
+
+        // Connect/bandwidth faults need the target VIP; DNS is keyed by name.
+        let require_vip = || match vip_port {
+            Some(vp) => Some(vp),
+            None => {
+                eprintln!(
+                    "smoker: no VIP for {} — {} fault not applied",
+                    rule.target_service, rule.fault_type
+                );
+                None
+            }
+        };
+
+        match &rule.fault_type {
+            FaultType::Drop { probability } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfConnectFaultValue {
+                    action: FAULT_ACTION_DROP,
+                    probability: *probability,
+                    _pad: [0; 6],
+                    delay_ns: 0,
+                    jitter_ns: 0,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_connect_fault(
+                    &mut ebpf.bpf,
+                    connect_fault_key(vip, port),
+                    value,
+                );
+            }
+            FaultType::Delay {
+                delay_ns,
+                jitter_ns,
+            } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfConnectFaultValue {
+                    action: FAULT_ACTION_DELAY,
+                    probability: 100,
+                    _pad: [0; 6],
+                    delay_ns: *delay_ns,
+                    jitter_ns: *jitter_ns,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_connect_fault(
+                    &mut ebpf.bpf,
+                    connect_fault_key(vip, port),
+                    value,
+                );
+            }
+            FaultType::Partition {
+                source_cgroup_id, ..
+            } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfConnectFaultValue {
+                    action: FAULT_ACTION_PARTITION,
+                    probability: 100,
+                    _pad: [0; 6],
+                    delay_ns: 0,
+                    jitter_ns: 0,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_connect_fault(
+                    &mut ebpf.bpf,
+                    partition_fault_key(vip, port, *source_cgroup_id),
+                    value,
+                );
+            }
+            FaultType::DnsNxdomain => {
+                let value = BpfDnsFaultValue {
+                    action: DNS_FAULT_NXDOMAIN,
+                    probability: 100,
+                    _pad: [0; 6],
+                    delay_ns: 0,
+                    expires_ns: expires,
+                };
+                let _ = bpf_maps::write_dns_fault(
+                    &mut ebpf.bpf,
+                    dns_fault_key(&rule.target_service),
+                    value,
+                );
+            }
+            FaultType::Bandwidth { bytes_per_sec } => {
+                let Some((vip, port)) = require_vip() else {
+                    return;
+                };
+                let value = BpfBandwidthFaultValue {
+                    rate_bytes_per_sec: *bytes_per_sec,
+                    tokens: *bytes_per_sec, // start with a full bucket
+                    last_refill_ns: crate::smoker::types::monotonic_now_ns(),
+                    expires_ns: expires,
+                };
+                let _ =
+                    bpf_maps::write_bw_fault(&mut ebpf.bpf, bandwidth_fault_key(vip, port), value);
+            }
+            // Non-network faults never reach here (apply_fault handles them).
+            _ => {}
         }
     }
 
-    /// Delete a BPF map entry for a cleared or expired fault.
-    fn delete_fault_bpf_entry(&mut self, _rule: &crate::smoker::types::FaultRule) {
-        #[cfg(feature = "ebpf")]
-        if let Some(ref ebpf_handle) = self.onion_ebpf
-            && _rule.fault_type.requires_ebpf()
-        {
-            let rt = tokio::runtime::Handle::current();
-            let ebpf = ebpf_handle.clone();
-            let rule_type = format!("{}", _rule.fault_type);
-            rt.spawn(async move {
-                let mut ebpf = ebpf.lock().await;
-                eprintln!("smoker: deleting BPF entry for {rule_type}");
-                let _ = &mut *ebpf;
-            });
+    /// Delete the eBPF map entry for a cleared or expired fault (P2).
+    ///
+    /// Best-effort: VIP is deterministic from the app name, but the port
+    /// comes from the service entry — if the service is already gone we
+    /// skip, since the kernel ignores the entry past its `expires_ns`.
+    #[cfg(feature = "ebpf")]
+    async fn delete_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
+        use crate::smoker::bpf_maps;
+        use crate::smoker::bpf_types::*;
+        use crate::smoker::types::FaultType;
+
+        if !rule.fault_type.requires_ebpf() {
+            return;
         }
-        #[cfg(not(feature = "ebpf"))]
-        if _rule.fault_type.requires_ebpf() {
-            eprintln!(
-                "smoker: BPF delete skipped for {} (no eBPF support)",
-                _rule.fault_type
-            );
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return;
+        };
+        let vip_port = self.fault_vip_port(&rule.target_service);
+        let mut ebpf = handle.lock().await;
+
+        match &rule.fault_type {
+            FaultType::Drop { .. } | FaultType::Delay { .. } => {
+                if let Some((vip, port)) = vip_port {
+                    let _ = bpf_maps::delete_connect_fault(
+                        &mut ebpf.bpf,
+                        &connect_fault_key(vip, port),
+                    );
+                }
+            }
+            FaultType::Partition {
+                source_cgroup_id, ..
+            } => {
+                if let Some((vip, port)) = vip_port {
+                    let _ = bpf_maps::delete_connect_fault(
+                        &mut ebpf.bpf,
+                        &partition_fault_key(vip, port, *source_cgroup_id),
+                    );
+                }
+            }
+            FaultType::DnsNxdomain => {
+                let _ =
+                    bpf_maps::delete_dns_fault(&mut ebpf.bpf, &dns_fault_key(&rule.target_service));
+            }
+            FaultType::Bandwidth { .. } => {
+                if let Some((vip, port)) = vip_port {
+                    let _ =
+                        bpf_maps::delete_bw_fault(&mut ebpf.bpf, &bandwidth_fault_key(vip, port));
+                }
+            }
+            _ => {}
         }
     }
+
+    /// Delete is a no-op without the eBPF data path (nothing was written).
+    #[cfg(not(feature = "ebpf"))]
+    async fn delete_fault_bpf_entry(&self, _rule: &crate::smoker::types::FaultRule) {}
 
     /// Deploy all apps and jobs from a config, streaming progress events.
     async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
