@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (1818 and counting)
+make test                    # run all tests (1880 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -108,11 +108,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-<<<<<<< HEAD
-**1,703 tests across 11 completed phases** (plus 12 Lima-gated eBPF integration tests run in the dev VM), including the Phase 11b review-and-wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the full eBPF data path (service discovery, kernel connect-rewrite, network fault injection, and egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist and the [branch PR summary](docs/pr-stage-4.md).
-=======
-**1,790 tests across 12 completed phases**, plus the Phase 11b review-and-hardening pass now closing the gap between "implemented" and "wired". See [progress.md](docs/progress.md) for the full checklist.
->>>>>>> 066c449 (Docs: Phase 14 complete — book chapter 14, progress, READMEs (Phase 14, 12/12))
+**1,880 tests across 12 completed phases** (plus 12 Lima-gated eBPF integration tests run in the dev VM), including the Phase 11b review-and-wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the full eBPF data path (service discovery, kernel connect-rewrite, network fault injection, and egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist and the [branch PR summary](docs/pr-stage-4.md).
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -127,14 +123,14 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 9. User Experience | Done | 1,271 |
 | 10. Advanced Security | Done | 1,448 |
 | 11. Advanced Observability | Done | 1,595 |
-| 11b. Review & hardening | In progress | 1,675 |
-| 14. Self-Upgrade | Done | 1,790 |
+| 11b. Review & wiring | Done | 1,703 |
+| 14. Self-Upgrade | Done | 1,880 |
 
 Phase 14 (rolling binary upgrades) landed ahead of 12 and 13: `relish
 upgrade start v0.2.0` rolls a live cluster onto a new dual-signed binary —
 workloads survive the swap (same pids, adopted across `exec()`), a
-crash-looping release reverts itself, and the leader hands over leadership
-before upgrading last.
+crash-looping release reverts itself, and the leader upgrades itself last
+(in place, quorum preserved through the sub-second exec bounce).
 
 ## The book
 

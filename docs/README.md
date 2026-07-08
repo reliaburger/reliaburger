@@ -273,8 +273,8 @@ Commands:
 version, running workloads are *adopted* by the new binary (same pids, no
 restarts), and a crash-looping upgrade automatically reverts to the previous
 binary. On a cluster the Raft leader rolls the fleet: workers first (with
-`--parallel`), council members one at a time, then leadership transfers and
-the former leader upgrades last.
+`--parallel`), council members one at a time, then the leader upgrades
+itself last (in place; a ≥3-node council keeps quorum through the bounce).
 
 Requirements:
 

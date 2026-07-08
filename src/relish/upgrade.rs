@@ -309,12 +309,10 @@ fn render_plan(
         step += 1;
     }
     if leader > 0 {
-        if council > 0 {
-            writeln!(out, "  {step}. leadership transfer, then the former leader").unwrap();
-        } else {
-            // Nobody to hand leadership to: the leader swaps in place.
-            writeln!(out, "  {step}. the leader, swapped in place").unwrap();
-        }
+        // The leader always upgrades last, in place (openraft 0.9 can't
+        // gracefully hand off; a >=3-node council keeps quorum through the
+        // sub-second exec bounce).
+        writeln!(out, "  {step}. the leader, in place (last)").unwrap();
         estimate += SECONDS_PER_NODE;
     }
     writeln!(

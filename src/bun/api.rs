@@ -737,9 +737,8 @@ async fn upgrade_cluster_rollback_handler(
     }
 }
 
-/// Ask this node to call a Raft election on itself (admin; internal —
-/// leadership transfer during upgrades, openraft 0.9 has no native
-/// transfer).
+/// Ask this node to call a Raft election on itself (admin; manual
+/// recovery tool — e.g. to move leadership off a node before maintenance).
 async fn cluster_elect_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,

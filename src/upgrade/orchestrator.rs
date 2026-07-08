@@ -54,13 +54,6 @@ pub trait NodeControl: Send + Sync {
         address: &str,
         version: &BinaryVersion,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
-
-    /// Ask a council member to call an election on itself (leadership
-    /// transfer, openraft 0.9 has no native transfer).
-    fn trigger_election(
-        &self,
-        address: &str,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 /// Inputs the driver supplies each tick.
@@ -125,30 +118,15 @@ pub async fn step<C: NodeControl>(
         }
 
         ClusterUpgradePhase::TransferringLeadership => {
-            let leader_record = state.nodes.iter().find(|n| n.role == NodeRole::Leader);
-            let leader_is_me = leader_record
-                .map(|n| n.node_id == context.self_node_id)
-                .unwrap_or(false);
-
-            if leader_is_me {
-                // Still the old leader: ask an upgraded council member to
-                // take over. Re-triggered on later ticks if nothing moved.
-                if let Some(target) = state
-                    .nodes
-                    .iter()
-                    .find(|n| n.role == NodeRole::Council && n.phase == NodeUpgradePhase::Healthy)
-                {
-                    let _ = control.trigger_election(&target.address).await;
-                } else {
-                    // No upgraded member to hand over to (e.g. no council
-                    // peers at all): upgrade ourselves via the local path.
-                    state.phase = ClusterUpgradePhase::UpgradingLeader;
-                }
-            } else {
-                // Leadership moved — WE are the new leader now (only the
-                // leader runs this code). Go finish the former leader.
-                state.phase = ClusterUpgradePhase::UpgradingLeader;
-            }
+            // openraft 0.9 has no graceful leadership transfer, and a naive
+            // `trigger().elect()` on a follower cannot win against a live
+            // leader's heartbeats (anti-disruption/leader-stickiness). So
+            // the leader upgrades IN PLACE: exec is sub-second, a council of
+            // >=3 keeps quorum through the bounce, and the returning node
+            // re-establishes leadership and finishes the run via the
+            // poll-first idempotency below. See the Phase 14 notes in
+            // docs/design/agent-bun.md 5.5.
+            state.phase = ClusterUpgradePhase::UpgradingLeader;
             state
         }
 
@@ -519,23 +497,6 @@ impl NodeControl for HttpNodeControl {
             Err(format!("{status}: {body}"))
         }
     }
-
-    async fn trigger_election(&self, address: &str) -> Result<(), String> {
-        let response = self
-            .with_auth(
-                self.client
-                    .post(format!("http://{address}/v1/cluster/elect"))
-                    .body(""),
-            )
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(response.status().to_string())
-        }
-    }
 }
 
 /// Can the council afford to have one voter mid-restart?
@@ -658,7 +619,6 @@ mod tests {
         nodes: Mutex<HashMap<String, NodeProbe>>,
         directives: Mutex<Vec<String>>,
         rollbacks: Mutex<Vec<String>>,
-        elections: Mutex<Vec<String>>,
     }
 
     impl MockControl {
@@ -711,11 +671,6 @@ mod tests {
             _version: &BinaryVersion,
         ) -> Result<(), String> {
             self.rollbacks.lock().unwrap().push(address.to_string());
-            Ok(())
-        }
-
-        async fn trigger_election(&self, address: &str) -> Result<(), String> {
-            self.elections.lock().unwrap().push(address.to_string());
             Ok(())
         }
     }
@@ -879,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leadership_transfers_before_leader_upgrade() {
+    async fn council_done_advances_to_leader_phase() {
         let control = MockControl::default();
         let mut state = cluster_state(
             vec![
@@ -892,41 +847,34 @@ mod tests {
         control.set("addr-c1", "0.2.0", true, false);
         control.set("addr-leader", "0.1.0", true, false);
 
-        // Council done -> transfer phase.
+        // Council done -> transfer phase (a one-tick pass-through since
+        // openraft 0.9 can't gracefully transfer; see the phase comment).
         let state = step(state, &control, &context()).await;
         assert_eq!(state.phase, ClusterUpgradePhase::TransferringLeadership);
-
-        // Old leader ticks the transfer phase: asks c1 to elect itself,
-        // and does NOT direct its own upgrade.
-        let state = step(state, &control, &context()).await;
-        assert_eq!(state.phase, ClusterUpgradePhase::TransferringLeadership);
-        assert_eq!(*control.elections.lock().unwrap(), vec!["addr-c1"]);
         assert!(control.directed().is_empty());
+
+        // Transfer phase collapses straight to UpgradingLeader.
+        let state = step(state, &control, &context()).await;
+        assert_eq!(state.phase, ClusterUpgradePhase::UpgradingLeader);
     }
 
     #[tokio::test]
-    async fn new_leader_resumes_and_directs_former_leader() {
+    async fn leader_upgrades_itself_in_place_last() {
         let control = MockControl::default();
-        control.set("addr-old-leader", "0.1.0", true, false);
+        control.set("addr-leader", "0.1.0", true, false);
         let mut state = cluster_state(
             vec![
                 record("c1", NodeRole::Council, NodeUpgradePhase::Healthy),
-                record("old-leader", NodeRole::Leader, NodeUpgradePhase::Pending),
+                record("leader", NodeRole::Leader, NodeUpgradePhase::Pending),
             ],
             1,
         );
-        state.phase = ClusterUpgradePhase::TransferringLeadership;
+        state.phase = ClusterUpgradePhase::UpgradingLeader;
 
-        // We are c1: leadership moved to us; the orchestrator resumes here.
-        let mut ctx = context();
-        ctx.self_node_id = "c1".to_string();
-        let state = step(state, &control, &ctx).await;
-        assert_eq!(state.phase, ClusterUpgradePhase::UpgradingLeader);
-
-        let state = step(state, &control, &ctx).await;
+        // The current leader directs its own upgrade (over its local API).
+        let state = step(state, &control, &context()).await;
         assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Directed);
-        assert_eq!(control.directed(), vec!["addr-old-leader"]);
-        let _ = state;
+        assert_eq!(control.directed(), vec!["addr-leader"]);
     }
 
     #[tokio::test]

@@ -1,9 +1,9 @@
 ---
 source: src/relish/upgrade.rs
-assertion_line: 570
+assertion_line: 573
 expression: "render_plan(\"v0.2.0\", 0, 0, 1, 1)"
 ---
 upgrade plan to v0.2.0 (1 node(s))
-  1. the leader, swapped in place
+  1. the leader, in place (last)
 estimated duration: ~1 min (assuming 45s per node)
 workloads keep running throughout (adoption across exec)

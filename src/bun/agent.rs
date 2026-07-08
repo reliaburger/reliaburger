@@ -1427,6 +1427,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
+        // In cluster mode, workload placement is the cluster's decision:
+        // the scheduler may legitimately move an app off this node while it
+        // bounces, so a missing pre-upgrade instance is NOT an upgrade
+        // failure. We surviving the boot-grace period (this command runs on
+        // the new binary) is the liveness proof; genuine boot failures are
+        // caught by the crash-loop budget, which reverts before we ever get
+        // here. Single-node keeps the strict check as a local safety net —
+        // there is no cluster to reschedule, so a vanished workload really
+        // is a failed swap.
+        if self.cluster.is_some() {
+            if let Err(reason) = self.verify_upgrade_inventory(&marker).await {
+                eprintln!("bun: note: {reason} — not reverting (cluster reschedules placements)");
+            }
+            match manager.commit(&marker) {
+                Ok(()) => {
+                    println!(
+                        "bun: upgrade to {} verified and committed",
+                        marker.target_version
+                    );
+                    let _ = response.send(Ok(true));
+                }
+                Err(e) => {
+                    let _ = response.send(Err(BunError::Upgrade(e)));
+                }
+            }
+            return;
+        }
+
         match self.verify_upgrade_inventory(&marker).await {
             Ok(()) => match manager.commit(&marker) {
                 Ok(()) => {

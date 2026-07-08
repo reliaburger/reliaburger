@@ -974,9 +974,15 @@ The self-upgrade mechanism replaces the Bun binary on every node in a rolling fa
 > 2. **Version discovery polls `GET /v1/version`, not gossip.** Adding a
 >    version field to `MembershipUpdate` breaks bincode decoding for old
 >    nodes during the exact mixed-version window upgrades create.
-> 3. **Leadership transfer is `raft.trigger().elect()` on an upgraded
->    member** (via `POST /v1/cluster/elect`) — openraft 0.9 has no native
->    transfer.
+> 3. **The leader upgrades in place; there is no leadership transfer.**
+>    openraft 0.9 has no graceful transfer, and a naive
+>    `raft.trigger().elect()` on a follower cannot win against a live
+>    leader's heartbeats (anti-disruption / leader-stickiness). So the
+>    leader execs itself last: exec is sub-second, a council of ≥3 keeps
+>    quorum through the bounce, and the returning node re-establishes
+>    leadership and completes the run via the orchestrator's poll-first
+>    idempotency. (`POST /v1/cluster/elect` remains a manual admin
+>    recovery tool but is not used by the upgrade path.)
 >
 > Additionally: rollback runs the SAME order as upgrade (workers → council →
 > leader last) rather than the reverse order suggested below — leader-last is

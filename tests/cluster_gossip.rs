@@ -353,14 +353,13 @@ async fn rollup_worker_delivers_node_rollups_to_the_leader() {
     // The server task needs a beat to start accepting; retry briefly.
     let mut body = String::new();
     for _ in 0..20 {
-        match reqwest::get(format!("http://127.0.0.1:{port}/v1/metrics/cluster")).await {
-            Ok(response) => {
-                body = response.text().await.unwrap_or_default();
-                if !body.is_empty() {
-                    break;
-                }
+        if let Ok(response) =
+            reqwest::get(format!("http://127.0.0.1:{port}/v1/metrics/cluster")).await
+        {
+            body = response.text().await.unwrap_or_default();
+            if !body.is_empty() {
+                break;
             }
-            Err(_) => {}
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
