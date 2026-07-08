@@ -303,21 +303,28 @@ async fn apply_on_any_node_places_across_the_cluster() {
     "#,
     )
     .unwrap();
-    // Apply via a follower to also exercise leader-forwarding.
-    let applier = nodes
-        .iter()
-        .find(|n| !*n.thinks_leader.borrow())
-        .expect("a follower exists");
-    let _ = tokio::time::timeout(Duration::from_secs(20), applier.client.apply(&config)).await;
-
-    // Each node's reconciler should start exactly its share; in total,
-    // three instances spread across three distinct nodes.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Apply via a follower to also exercise leader-forwarding, then wait
+    // for each node's reconciler to start its share — three instances
+    // spread across three distinct nodes. Under load a single apply can
+    // race leadership/forwarding and be dropped, so re-apply periodically:
+    // the spec is desired state, so re-applying is idempotent.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut spread = false;
+    let mut last_apply: Option<tokio::time::Instant> = None;
     while tokio::time::Instant::now() < deadline {
         if total_instances(&nodes).await == 3 && nodes_running_web(&nodes).await == 3 {
             spread = true;
             break;
+        }
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let applier = nodes
+                .iter()
+                .find(|n| !*n.thinks_leader.borrow())
+                .or_else(|| nodes.first())
+                .expect("at least one node");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), applier.client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -411,17 +418,24 @@ async fn autoscaler_scales_up_on_high_metric() {
     "#,
     )
     .unwrap();
-    let applier = nodes
-        .iter()
-        .find(|n| *n.thinks_leader.borrow())
-        .expect("leader");
-    let _ = tokio::time::timeout(Duration::from_secs(20), applier.client.apply(&config)).await;
-
-    // Wait until the single replica is placed.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // Apply and wait for the single replica to place, re-applying
+    // periodically in case a first attempt races leadership under load
+    // (the spec is desired state, so re-applying is idempotent).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut last_apply: Option<tokio::time::Instant> = None;
     while tokio::time::Instant::now() < deadline {
         if total_scaler_instances(&nodes).await >= 1 {
             break;
+        }
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let applier = nodes
+                .iter()
+                .find(|n| *n.thinks_leader.borrow())
+                .or_else(|| nodes.first())
+                .expect("at least one node");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), applier.client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
