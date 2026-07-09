@@ -321,6 +321,27 @@ Implementation plan: [docs/wiring-plan-2026-07.md](wiring-plan-2026-07.md)
 - [x] Remove dead config or wire it — wired during Stage 4: `[resources]` (W4), `[reconstruction]` (W9), `[gitops]` (W10), `[images]` (W5), `[metrics]` (W4), node `labels` (W6), new `[ingress]`/`[dns]`/`[ebpf]` (W2/W3/W12). Still genuinely dead and **documented, not silently dropped** (out of Stage 4 scope): `[process_workloads]` (M23), `[storage] volumes` (M21), `[logs] max_file_size_mb`
 - [x] Clear each `[lib-only]` tag from the phases above as its subsystem is genuinely wired — the Smoker fault-injection `[lib-only]` tag (Phase 8) is cleared; the eBPF network-fault enforcement + service-map→backend sync gaps were subsequently closed (P0–P3, see the `L8` item)
 
+### Post-Stage-4 audit fixes (July 2026)
+
+A follow-up audit of the wired Stage-4 code surfaced five issues **not** in the
+original review. All fixed on this branch, tests-first (each drives the binary/agent path):
+
+- [x] Redeploy stored `oci_spec: None`, so a replica that crashed after a redeploy could
+  never restart (the crash-restart driver filters on `oci_spec.is_some()`). Redeploy now
+  records the spec — `redeployed_instance_restarts_after_a_crash`.
+- [x] `WorkloadInstance.container_ip` was never populated, leaving the M11 probe fix inert
+  and every service-map/eBPF backend registered as loopback. Added `Grill::container_ip`
+  (runc netns + Apple inspect) and populate it on deploy/redeploy/restart —
+  `deploy_records_the_grills_container_ip_on_instance_and_backend`.
+- [x] Ingress proxy forwarded hop-by-hop headers and copied the upstream's
+  `Transfer-Encoding`/`Content-Length` onto a re-bodied response (framing mismatch). Now
+  filters the RFC 7230 hop-by-hop set both directions — `ingress_reframes_chunked_backend_response`.
+- [x] WebSocket pass-through was a stub (dropped the backend stream, omitted
+  `Sec-WebSocket-Accept`). Now a real `hyper::upgrade` + `copy_bidirectional` splice —
+  `ingress_proxies_websocket_handshake_and_bytes`.
+- [x] Single global `Mutex<RateLimiter>` serialised every rate-limited request; replaced with
+  a 16-way `ShardedRateLimiter`.
+
 ### Beyond Phase 11b — deferred & un-staged review items
 
 The [July 2026 review](review-2026-07.md) staged a specific remediation plan
