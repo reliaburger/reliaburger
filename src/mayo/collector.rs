@@ -86,7 +86,7 @@ impl SystemCollector {
         let mut tx_bytes: u64 = 0;
         let mut rx_packets: u64 = 0;
         let mut tx_packets: u64 = 0;
-        for (_name, data) in self.networks.iter() {
+        for data in self.networks.values() {
             rx_bytes += data.total_received();
             tx_bytes += data.total_transmitted();
             rx_packets += data.total_packets_received();
