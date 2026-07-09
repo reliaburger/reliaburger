@@ -375,11 +375,14 @@ the authoritative post-Phase-11b backlog — nothing silently dropped.
 ## Phase 12: Optimisations
 
 > Detailed implementation plan: [optimisations-plan-2026-07.md](plans/optimisations-plan-2026-07.md)
-> (17 commit-sized steps across 6 slices, verified ground truth, config/endpoint/test inventories, Lima acceptance runbook).
+> (revised 2026-07-09 after the Stage 4 wiring merge: slice B — Pickle catalog via Raft,
+> replication and two-phase GC — landed as-built in #71; 14 remaining implementation steps,
+> refreshed ground truth, config/endpoint/test inventories, Lima acceptance runbook).
 
 - [ ] Wire `SubmitBatch` into the agent (resolve job specs → `schedule_batch` over cluster capacity → dispatch → track completion via `BatchTracker`, `/v1/batch/{id}` status)
-- [ ] Wire `SubmitBuild` into the agent (download context blob from Pickle → spawn buildah build/push → report `BuildResult`)
+- [ ] Wire `SubmitBuild` into the agent — async build tracking, builder selection, signing (the synchronous local-only handler landed with Stage 4)
 - [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
+- [ ] Heal-loop hardening (B5): extract a testable `heal_tick`, rarest-first + per-tick cap, leader-pull-first, auto-heal integration test, loopback `registry_bind` warning
 - [ ] P2P multi-source image downloads (parallel fan-out)
 - [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
 - [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
