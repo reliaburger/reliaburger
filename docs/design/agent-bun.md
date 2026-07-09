@@ -965,7 +965,7 @@ The self-upgrade mechanism replaces the Bun binary on every node in a rolling fa
 
 > **Implementation notes (July 2026, Phase 14).** The shipped implementation
 > deviates from this section in three places, each recorded with its rationale
-> in `docs/self-upgrade-plan-2026-07.md`:
+> in `docs/plans/self-upgrade-plan-2026-07.md`:
 >
 > 1. **Directives travel over the node HTTP API, not the reporting tree.**
 >    The reporting tree is upstream-only (reports and acks); adding a

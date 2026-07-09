@@ -7,7 +7,7 @@
 
 This plan is written to be executed without re-deriving decisions. Every step lists the files to touch, the types to define, the tests to write **first**, the book section to write, and the pitfalls that will otherwise cost a day of debugging. Where this plan deviates from the design docs, the deviation is called out explicitly with a rationale (§3). Follow the plan; if you hit a genuine contradiction with the code, stop and flag it rather than improvising.
 
-Assumption from the project owner: other missing wiring (see `docs/review-2026-07.md`) is being fixed separately. This plan only depends on subsystems that already exist and work: gossip (mustard), Raft (council), the bun HTTP API, ProcessGrill/RunC, and the Pickle blob store. Where Phase 14 would otherwise depend on unwired plumbing, this plan routes around it (see D5, D6).
+Assumption from the project owner: other missing wiring (see `docs/plans/review-2026-07.md`) is being fixed separately. This plan only depends on subsystems that already exist and work: gossip (mustard), Raft (council), the bun HTTP API, ProcessGrill/RunC, and the Pickle blob store. Where Phase 14 would otherwise depend on unwired plumbing, this plan routes around it (see D5, D6).
 
 ---
 

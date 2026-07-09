@@ -7,7 +7,7 @@ network fault injection and egress allowlists actually enforce in the kernel.
 
 ## Why
 
-The [July 2026 review](review-2026-07.md) ran six parallel subsystem audits and
+The [July 2026 review](plans/review-2026-07.md) ran six parallel subsystem audits and
 found that the green test suite was misleading: a large fraction of
 `progress.md`'s "done" items were **library-only** — implemented and unit-tested
 in isolation, but with no production caller. The structural root cause was a
@@ -103,7 +103,7 @@ recorded in `progress.md` → "Beyond Phase 11b" as the authoritative backlog:
 
 - **Deferred by design:** `C5(b)` mTLS on Raft/API listeners, `L17` CRL
   enforcement (both Stage 3b deferrals), `X6` the `relish` TUI (→
-  `tui-plan-2026-07.md`).
+  `docs/plans/tui-plan-2026-07.md`).
 - **Never-staged Mediums:** M3 (blocking I/O), M4 (adjacent-only dedup), M5 (VIP
   collisions), M6 (namespace-blind service map), M7 (crash detection for
   no-health-check apps), M19 (webhook formatting), M20 (S3/GCS export), M21
