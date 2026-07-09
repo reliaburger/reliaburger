@@ -14,10 +14,10 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use super::rate_limit::{RateLimitResult, RateLimiter};
+use super::rate_limit::{RateLimitResult, ShardedRateLimiter};
 use super::routing::RoutingTable;
 use super::types::{WrapperConfig, WrapperError};
 
@@ -27,8 +27,8 @@ pub struct ProxyState {
     pub active_connections: AtomicUsize,
     pub max_connections: usize,
     pub client: reqwest::Client,
-    /// Per-client-IP token buckets, shared across routes.
-    pub rate_limiter: Mutex<RateLimiter>,
+    /// Per-client-IP token buckets, sharded to avoid a single global lock.
+    pub rate_limiter: ShardedRateLimiter,
 }
 
 /// A proxy whose listeners are bound but not yet serving.
@@ -69,7 +69,7 @@ pub async fn bind_proxy(
         active_connections: AtomicUsize::new(0),
         max_connections: config.max_connections,
         client,
-        rate_limiter: Mutex::new(RateLimiter::new()),
+        rate_limiter: ShardedRateLimiter::new(),
     });
 
     let http_listener = bind(config.http_port).await?;
@@ -264,7 +264,7 @@ async fn do_proxy(state: &ProxyState, remote: SocketAddr, req: Request<Body>) ->
     // Rate limit before touching the backend: a limited client gets
     // 429 even when the backend pool is empty or unhealthy.
     if let Some(config) = rate_limit {
-        let result = state.rate_limiter.lock().await.check(remote.ip(), &config);
+        let result = state.rate_limiter.check(remote.ip(), &config).await;
         if let RateLimitResult::Denied { retry_after_secs } = result {
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
@@ -301,11 +301,17 @@ async fn do_proxy(state: &ProxyState, remote: SocketAddr, req: Request<Body>) ->
 
     let mut upstream_req = state.client.request(parts.method, upstream_uri.to_string());
 
-    // Forward headers (skip host — the backend doesn't need it)
+    // Forward end-to-end headers only. Skip `host` (the backend derives its
+    // own) and the hop-by-hop set (RFC 7230 §6.1) plus anything the client
+    // named in its own `Connection` header — these apply to this proxy leg,
+    // not the backend, and forwarding `Transfer-Encoding`/`Connection` can
+    // corrupt request framing at the backend.
+    let conn_tokens = connection_tokens(&parts.headers);
     for (name, value) in &parts.headers {
-        if name != "host" {
-            upstream_req = upstream_req.header(name, value);
+        if name == "host" || is_hop_by_hop(name.as_str()) || conn_tokens.contains(name.as_str()) {
+            continue;
         }
+        upstream_req = upstream_req.header(name, value);
     }
 
     // Forward the body
@@ -325,7 +331,19 @@ async fn do_proxy(state: &ProxyState, remote: SocketAddr, req: Request<Body>) ->
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::builder().status(status);
 
+            // Copy end-to-end response headers only. Drop hop-by-hop headers and
+            // the upstream framing headers (`Content-Length`/`Transfer-Encoding`):
+            // the body is fully buffered below, so hyper sets correct framing for
+            // it — copying the upstream's would mismatch the re-bodied response.
+            let conn_tokens = connection_tokens(resp.headers());
             for (name, value) in resp.headers() {
+                let n = name.as_str();
+                if is_hop_by_hop(n)
+                    || n.eq_ignore_ascii_case("content-length")
+                    || conn_tokens.contains(n)
+                {
+                    continue;
+                }
                 response = response.header(name, value);
             }
 
@@ -338,6 +356,41 @@ async fn do_proxy(state: &ProxyState, remote: SocketAddr, req: Request<Body>) ->
         }
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
+}
+
+/// Hop-by-hop headers that apply to a single transport leg and must not be
+/// forwarded through a proxy (RFC 7230 §6.1). Compared case-insensitively.
+const HOP_BY_HOP: [&str; 8] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Whether a header name is hop-by-hop (case-insensitive).
+fn is_hop_by_hop(name: &str) -> bool {
+    HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// The set of header names listed in a message's `Connection` header. Those
+/// are themselves hop-by-hop for this leg and must also be dropped.
+fn connection_tokens(headers: &axum::http::HeaderMap) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for value in headers.get_all(axum::http::header::CONNECTION) {
+        if let Ok(v) = value.to_str() {
+            for token in v.split(',') {
+                let token = token.trim();
+                if !token.is_empty() {
+                    set.insert(token.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    set
 }
 
 /// Build the upstream URI from the backend address and request URI.
@@ -371,5 +424,27 @@ mod tests {
         let req_uri: Uri = "/".parse().unwrap();
         let upstream = build_upstream_uri(&addr, &req_uri).unwrap();
         assert_eq!(upstream.to_string(), "http://10.0.2.2:30001/");
+    }
+
+    #[test]
+    fn hop_by_hop_headers_recognised_case_insensitively() {
+        assert!(is_hop_by_hop("connection"));
+        assert!(is_hop_by_hop("Transfer-Encoding"));
+        assert!(is_hop_by_hop("UPGRADE"));
+        assert!(!is_hop_by_hop("content-type"));
+        assert!(!is_hop_by_hop("x-forwarded-for"));
+    }
+
+    #[test]
+    fn connection_tokens_are_collected_lowercased() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONNECTION,
+            "keep-alive, X-Custom".parse().unwrap(),
+        );
+        let tokens = connection_tokens(&headers);
+        assert!(tokens.contains("keep-alive"));
+        assert!(tokens.contains("x-custom"));
+        assert!(!tokens.contains("content-type"));
     }
 }

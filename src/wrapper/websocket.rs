@@ -11,8 +11,12 @@ use std::net::SocketAddr;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// Cap on the backend's handshake response head we buffer before giving up.
+const MAX_HANDSHAKE_HEAD: usize = 16 * 1024;
 
 /// Check whether a request is a WebSocket upgrade.
 ///
@@ -34,22 +38,25 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
     has_upgrade_connection && has_websocket_upgrade
 }
 
-/// Handle a WebSocket upgrade by connecting to the backend and
-/// performing bidirectional byte-level proxying.
+/// Handle a WebSocket upgrade by connecting to the backend, relaying the
+/// handshake, and then transparently proxying bytes in both directions.
 ///
-/// Returns a 101 Switching Protocols response if the backend accepts
-/// the upgrade, or an error status otherwise.
-pub async fn handle_websocket_upgrade(req: Request<Body>, backend: SocketAddr) -> Response {
-    // Connect to the backend
+/// Forwards the backend's own `101` response (including its
+/// `Sec-WebSocket-Accept` header) to the client, then splices the client's
+/// upgraded connection to the backend socket with
+/// [`tokio::io::copy_bidirectional`]. Returns `502 Bad Gateway` if the
+/// backend refuses the upgrade or the connection fails.
+pub async fn handle_websocket_upgrade(mut req: Request<Body>, backend: SocketAddr) -> Response {
+    // Capture the client-side upgrade future before consuming the request.
+    // It resolves to the raw client stream once our 101 is written.
+    let client_upgrade = hyper::upgrade::on(&mut req);
+
+    // Connect to the backend and relay the handshake as raw HTTP/1.1.
     let mut backend_stream = match TcpStream::connect(backend).await {
         Ok(s) => s,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-
-    // Build the upgrade request to send to the backend as raw HTTP
     let upgrade_request = build_upgrade_request(&req, backend);
-
-    // Send the upgrade request
     if backend_stream
         .write_all(upgrade_request.as_bytes())
         .await
@@ -58,36 +65,104 @@ pub async fn handle_websocket_upgrade(req: Request<Body>, backend: SocketAddr) -
         return StatusCode::BAD_GATEWAY.into_response();
     }
 
-    // Read the backend's response (enough to check for 101)
-    let mut response_buf = vec![0u8; 4096];
-    let n = match backend_stream.read(&mut response_buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return StatusCode::BAD_GATEWAY.into_response(),
+    // Read the backend's handshake response head (up to the blank line).
+    // `leftover` is any payload the backend sent past the head — it must be
+    // forwarded to the client before the bidirectional splice begins.
+    let (head, leftover) = match read_http_head(&mut backend_stream).await {
+        Some(pair) => pair,
+        None => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let response_str = String::from_utf8_lossy(&response_buf[..n]);
 
-    // Check for 101 Switching Protocols
-    if !response_str.starts_with("HTTP/1.1 101") {
+    let Some(handshake) = parse_handshake(&head) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    if !handshake.is_switching_protocols {
         return StatusCode::BAD_GATEWAY.into_response();
     }
 
-    // The backend accepted the upgrade. Now we need to set up
-    // bidirectional proxying between the client and backend.
-    //
-    // In a full implementation, we'd use axum's upgrade mechanism
-    // to extract the client's underlying TCP connection and
-    // tokio::io::copy_bidirectional between the two streams.
-    //
-    // For now, return the 101 to the client. The actual bidirectional
-    // proxying requires axum's OnUpgrade extractor which needs the
-    // handler to be wired differently. This is the structural
-    // foundation that integration tests will exercise.
-    Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header(header::CONNECTION, "Upgrade")
-        .header(header::UPGRADE, "websocket")
-        .body(Body::empty())
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    // Rebuild the backend's 101 for the client, carrying its handshake
+    // headers (crucially `Sec-WebSocket-Accept`) so the client accepts.
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in &handshake.headers {
+        builder = builder.header(name, value);
+    }
+    let response = match builder.body(Body::empty()) {
+        Ok(r) => r,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    // Once the client connection upgrades, splice it to the backend.
+    tokio::spawn(async move {
+        let upgraded = match client_upgrade.await {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let mut client_io = TokioIo::new(upgraded);
+        if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream).await;
+    });
+
+    response
+}
+
+/// The parsed backend handshake response.
+struct Handshake {
+    is_switching_protocols: bool,
+    headers: Vec<(String, String)>,
+}
+
+/// Parse a raw HTTP/1.1 response head into its status and end-to-end headers.
+///
+/// Drops hop-by-hop framing headers we regenerate (`Connection`/`Upgrade` are
+/// kept — they're part of the WebSocket handshake the client must see).
+fn parse_handshake(head: &str) -> Option<Handshake> {
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next()?;
+    let is_switching_protocols = status_line.starts_with("HTTP/1.1 101");
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    Some(Handshake {
+        is_switching_protocols,
+        headers,
+    })
+}
+
+/// Read from `stream` until the end of the HTTP head (`\r\n\r\n`).
+///
+/// Returns the head as a string and any bytes read past it, or `None` on I/O
+/// error, EOF before the head completes, or an oversized head.
+async fn read_http_head(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None; // EOF before the head completed
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_head_end(&buf) {
+            let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            let leftover = buf[pos + 4..].to_vec();
+            return Some((head, leftover));
+        }
+        if buf.len() > MAX_HANDSHAKE_HEAD {
+            return None;
+        }
+    }
+}
+
+/// Index of the `\r\n\r\n` that terminates an HTTP head, if present.
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 /// Build a raw HTTP/1.1 upgrade request string to send to the backend.

@@ -7,6 +7,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
 use reliaburger::bun::agent::{AgentCommand, BunAgent};
 use reliaburger::bun::api;
 use reliaburger::bun::testapp::{TestApp, TestAppMode};
@@ -265,6 +268,146 @@ async fn ingress_rate_limit_returns_429_with_retry_after() {
     assert!(saw_429, "burst of requests never hit the rate limit");
 
     test_app.shutdown();
+}
+
+/// Read a full HTTP head (`\r\n\r\n`) plus any trailing bytes from a stream.
+async fn read_head(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            return (head, buf[pos + 4..].to_vec());
+        }
+    }
+    (String::from_utf8_lossy(&buf).into_owned(), Vec::new())
+}
+
+#[tokio::test]
+async fn ingress_reframes_chunked_backend_response() {
+    // A raw backend that answers every request with a chunked body. Before
+    // the header-hygiene fix, the proxy copied `Transfer-Encoding: chunked`
+    // onto the re-bodied (buffered) response, corrupting client framing.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let _ = read_head(&mut sock).await;
+            let resp =
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+            let _ = sock.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    let harness = IngressHarness::start_reaching(port).await;
+    let config = Config::parse(&format!(
+        r#"
+        [app.chunk]
+        image = "test:v1"
+        port = {port}
+
+        [app.chunk.ingress]
+        host = "chunk.test"
+    "#
+    ))
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+
+    let http_client = reqwest::Client::new();
+    let response = wait_for_status(&http_client, &harness.http_url("/"), "chunk.test", 200).await;
+    // The client must receive a clean, correctly-framed body.
+    let body = response.text().await.unwrap();
+    assert_eq!(body, "hello", "chunked backend response was mis-framed");
+}
+
+#[tokio::test]
+async fn ingress_proxies_websocket_handshake_and_bytes() {
+    // A raw WebSocket backend: completes the handshake with its own
+    // Sec-WebSocket-Accept, then echoes bytes.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let (head, _) = read_head(&mut sock).await;
+            if !head.to_lowercase().contains("upgrade: websocket") {
+                continue;
+            }
+            let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+            let _ = sock.write_all(resp.as_bytes()).await;
+            // Echo one frameful of bytes back.
+            let mut buf = [0u8; 64];
+            if let Ok(n) = sock.read(&mut buf).await
+                && n > 0
+            {
+                let _ = sock.write_all(&buf[..n]).await;
+            }
+        }
+    });
+
+    let harness = IngressHarness::start_reaching(port).await;
+    let config = Config::parse(&format!(
+        r#"
+        [app.ws]
+        image = "test:v1"
+        port = {port}
+
+        [app.ws.ingress]
+        host = "ws.test"
+        websocket = true
+    "#
+    ))
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait until the route is live (a non-WS GET stops returning 404).
+    let http_client = reqwest::Client::new();
+    for _ in 0..40 {
+        let status = http_client
+            .get(harness.http_url("/"))
+            .header("host", "ws.test")
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0);
+        if status != 404 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Raw client handshake through the proxy.
+    let mut client = TcpStream::connect(harness.http_addr).await.unwrap();
+    let req = format!(
+        "GET /socket HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let (head, _) = read_head(&mut client).await;
+    assert!(
+        head.contains("101"),
+        "expected 101 Switching Protocols, got: {head}"
+    );
+    assert!(
+        head.to_lowercase().contains("sec-websocket-accept"),
+        "proxy dropped Sec-WebSocket-Accept from the handshake: {head}"
+    );
+
+    // Bytes must flow end-to-end through the spliced connection.
+    client.write_all(b"ping").await.unwrap();
+    let mut echo = [0u8; 4];
+    client.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, b"ping", "WebSocket bytes were not proxied back");
 }
 
 #[tokio::test]
