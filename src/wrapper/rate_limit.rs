@@ -107,6 +107,53 @@ impl Default for RateLimiter {
     }
 }
 
+/// Number of independent shards. Unrelated client IPs hash into different
+/// shards, so they don't serialise on a single lock and the periodic GC only
+/// scans one shard's map at a time.
+const SHARDS: usize = 16;
+
+/// A sharded rate limiter: `SHARDS` independent [`RateLimiter`]s, each behind
+/// its own async mutex, selected by client-IP hash. This replaces a single
+/// global mutex so high connection counts don't contend on one lock.
+pub struct ShardedRateLimiter {
+    shards: Vec<tokio::sync::Mutex<RateLimiter>>,
+}
+
+impl ShardedRateLimiter {
+    /// Create a sharded rate limiter with `SHARDS` empty shards.
+    pub fn new() -> Self {
+        let mut shards = Vec::with_capacity(SHARDS);
+        for _ in 0..SHARDS {
+            shards.push(tokio::sync::Mutex::new(RateLimiter::new()));
+        }
+        Self { shards }
+    }
+
+    /// The shard responsible for a given client IP.
+    fn shard_for(&self, ip: IpAddr) -> &tokio::sync::Mutex<RateLimiter> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ip.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.shards.len();
+        &self.shards[idx]
+    }
+
+    /// Check whether a request from `client_ip` is allowed, locking only the
+    /// shard that owns that IP.
+    pub async fn check(&self, client_ip: IpAddr, config: &RateLimitConfig) -> RateLimitResult {
+        self.shard_for(client_ip)
+            .lock()
+            .await
+            .check(client_ip, config)
+    }
+}
+
+impl Default for ShardedRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +256,44 @@ mod tests {
         }
 
         assert_eq!(limiter.bucket_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn sharded_limiter_enforces_per_ip_limit() {
+        let limiter = ShardedRateLimiter::new();
+        let ip: IpAddr = "192.168.1.1".parse().unwrap();
+        let config = RateLimitConfig { rps: 1, burst: 1 };
+
+        assert!(matches!(
+            limiter.check(ip, &config).await,
+            RateLimitResult::Allowed
+        ));
+        assert!(matches!(
+            limiter.check(ip, &config).await,
+            RateLimitResult::Denied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sharded_limiter_keeps_ips_independent() {
+        let limiter = ShardedRateLimiter::new();
+        let config = RateLimitConfig { rps: 1, burst: 1 };
+
+        // Exhaust many distinct IPs; each keeps its own bucket regardless of
+        // which shard it lands in.
+        for i in 1..=50u8 {
+            let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
+            assert!(
+                matches!(limiter.check(ip, &config).await, RateLimitResult::Allowed),
+                "first request from a fresh IP must pass"
+            );
+            assert!(
+                matches!(
+                    limiter.check(ip, &config).await,
+                    RateLimitResult::Denied { .. }
+                ),
+                "second request from the same IP must be denied"
+            );
+        }
     }
 }

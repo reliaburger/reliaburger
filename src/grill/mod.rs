@@ -147,6 +147,20 @@ pub trait Grill: Send + Sync {
         std::future::ready(None)
     }
 
+    /// Get the runtime-assigned IP of a running instance's container, if any.
+    ///
+    /// Runtimes with per-container networking (runc netns, Apple container)
+    /// return the address the workload actually listens on. The default
+    /// returns `None`; callers then fall back to loopback, which is correct
+    /// for process/host-networked runtimes.
+    fn container_ip(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Option<std::net::Ipv4Addr>> + Send {
+        let _ = instance;
+        std::future::ready(None)
+    }
+
     /// Get the exit code of a stopped instance.
     ///
     /// Returns `None` if the instance hasn't exited, doesn't exist,
@@ -312,6 +326,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.pid(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.pid(instance).await,
+        }
+    }
+
+    async fn container_ip(&self, instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
+        match self {
+            AnyGrill::Process(g) => g.container_ip(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.container_ip(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.container_ip(instance).await,
         }
     }
 

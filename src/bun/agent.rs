@@ -2062,6 +2062,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // be recorded on the instance and registered as a backend.
                 let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
                     std::collections::HashMap::new();
+                // Track each new instance's OCI spec so the crash-restart driver
+                // can re-create it. Without this the redeployed instance stored
+                // `oci_spec: None` and could never be restarted after a crash.
+                let mut new_specs: std::collections::HashMap<
+                    InstanceId,
+                    crate::grill::oci::OciSpec,
+                > = std::collections::HashMap::new();
+                // Track the container IP discovered after start, so health probes
+                // and service-map backends use the real per-container address
+                // instead of falling back to loopback.
+                let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
+                    std::collections::HashMap::new();
                 let mut new_failed = false;
                 for i in 0..replica_count {
                     let new_id = crate::grill::InstanceId(format!("{app_name}-g{deploy_gen}-{i}"));
@@ -2137,6 +2149,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.spawn_log_forwarder(&new_id, app_name, namespace);
                     self.persist_instance_record(&new_id).await;
 
+                    // Discover the runtime-assigned container IP (runc/apple track
+                    // it per instance; other runtimes return None → loopback).
+                    let container_ip = self.supervisor.grill.container_ip(&new_id).await;
+
                     // Health check: poll until the process is alive, returning
                     // as soon as it's Running instead of always sleeping the
                     // full window. Bounded by health_wait (capped at 5s).
@@ -2190,6 +2206,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
 
                     new_ports.insert(new_id.clone(), host_port);
+                    new_specs.insert(new_id.clone(), oci_spec);
+                    new_ips.insert(new_id.clone(), container_ip);
                     new_ids.push(new_id);
                 }
 
@@ -2269,13 +2287,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             restart_count: 0,
                             last_restart: None,
                             host_port,
-                            container_ip: None,
+                            container_ip: new_ips.get(new_id).copied().flatten(),
                             created_at: now,
                             restart_policy: crate::bun::restart::RestartPolicy::default(),
                             health_config,
                             is_job: false,
                             image: spec.image.clone().unwrap_or_default(),
-                            oci_spec: None,
+                            oci_spec: new_specs.remove(new_id),
                             identity: None,
                             identity_mount: None,
                         },
@@ -2310,7 +2328,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
                             let backend = crate::onion::types::BackendInstance {
                                 instance_id: new_id.0.clone(),
-                                node_ip: std::net::Ipv4Addr::LOCALHOST,
+                                node_ip: new_ips
+                                    .get(new_id)
+                                    .copied()
+                                    .flatten()
+                                    .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
                                 host_port,
                                 healthy: true,
                             };
@@ -2729,6 +2751,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.grill().start(instance_id).await?;
         self.spawn_log_forwarder(instance_id, app_name, namespace);
         self.persist_instance_record(instance_id).await;
+
+        // Record the runtime-assigned container IP so health probes and the
+        // service-map backend below use the real address instead of loopback.
+        let container_ip = self.supervisor.grill().container_ip(instance_id).await;
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.container_ip = container_ip;
+        }
 
         // Starting → HealthWait, then immediately to Running if no health checks
         {
@@ -3286,10 +3315,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // Re-wire the restarted instance: stream its logs and keep it routable.
             self.spawn_log_forwarder(&id, &app_name, &namespace);
             self.persist_instance_record(&id).await;
+            // A re-created container may get a fresh IP; refresh it before
+            // registering the backend so routing points at the live address.
+            let container_ip = self.supervisor.grill().container_ip(&id).await;
+            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                instance.container_ip = container_ip;
+            }
             if let Some(port) = host_port {
                 let backend = crate::onion::types::BackendInstance {
                     instance_id: id.0.clone(),
-                    node_ip: std::net::Ipv4Addr::LOCALHOST,
+                    node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
                     host_port: port,
                     healthy: true,
                 };
@@ -4147,6 +4182,93 @@ mod tests {
         assert!(
             inst.health_config.is_some(),
             "redeploy dropped the health check"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeployed_instance_restarts_after_a_crash() {
+        let (_tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = crate::grill::process::ProcessGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+
+        let config = Config::parse(
+            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
+        )
+        .unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+
+        // Fresh deploy, then redeploy (existing instances → rolling path).
+        agent.deploy(config.clone(), &ev_tx).await;
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let id = agent
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|i| i.app_name == "web")
+            .expect("no web instance after redeploy")
+            .id
+            .clone();
+
+        // The redeploy must have stored the OCI spec — without it the
+        // crash-restart driver silently skips the instance (it filters on
+        // `oci_spec.is_some()`), wedging it in Pending forever.
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&id)
+                .unwrap()
+                .oci_spec
+                .is_some(),
+            "redeploy left the instance with no OCI spec, so it can never restart"
+        );
+
+        // Simulate a crash and drive one restart cycle.
+        let now = std::time::Instant::now();
+        agent.supervisor.get_instance_mut(&id).unwrap().state =
+            crate::grill::state::ContainerState::Stopped;
+        let _ = agent.supervisor.maybe_restart(&id, now).await;
+        agent.drive_pending_restarts().await;
+
+        let state = agent.supervisor.get_instance(&id).unwrap().state;
+        assert_ne!(
+            state,
+            crate::grill::state::ContainerState::Pending,
+            "redeployed instance stayed wedged in Pending instead of re-creating"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_records_the_grills_container_ip_on_instance_and_backend() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let ip = std::net::Ipv4Addr::new(10, 0, 2, 5);
+        grill.set_container_ip(ip);
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let inst = agent
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|i| i.app_name == "web")
+            .expect("no web instance after deploy");
+        assert_eq!(
+            inst.container_ip,
+            Some(ip),
+            "the runtime's container IP was not recorded on the instance"
+        );
+
+        let entry = agent.service_map.resolve("web").expect("web not in map");
+        assert!(
+            entry.backends.iter().any(|b| b.node_ip == ip),
+            "backend registered with loopback instead of the container IP"
         );
     }
 

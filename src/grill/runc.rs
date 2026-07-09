@@ -468,6 +468,14 @@ impl super::Grill for RuncGrill {
             .or(entry.adopted_pid)
     }
 
+    async fn container_ip(&self, instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
+        // Populated only when a per-container netns was set up (a mapped
+        // port on a rootful runc container); rootless/no-port containers
+        // have no isolated address and fall back to loopback.
+        let networks = self.networks.lock().await;
+        networks.get(instance).map(|n| n.container_ip)
+    }
+
     fn runtime_kind(&self) -> super::records::RuntimeKind {
         super::records::RuntimeKind::Runc
     }

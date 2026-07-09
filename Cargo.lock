@@ -4030,6 +4030,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "hyper",
  "hyper-util",
  "insta",
  "k8s-openapi",
