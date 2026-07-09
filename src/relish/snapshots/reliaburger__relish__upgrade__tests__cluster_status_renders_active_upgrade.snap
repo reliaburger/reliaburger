@@ -1,0 +1,10 @@
+---
+source: src/relish/upgrade.rs
+assertion_line: 588
+expression: render_cluster_status(&cluster)
+---
+upgrade up-1 to v0.2.0 — phase: UpgradingWorkers
+NODE                 ROLE       PHASE        FROM
+n1                   worker     Healthy      v0.1.0
+n2                   worker     Directed     v0.1.0
+n3                   leader     Pending      -

@@ -27,6 +27,7 @@ pub mod k8s_export;
 pub mod k8s_import;
 pub mod output;
 pub mod plan;
+pub mod upgrade;
 
 pub use output::OutputFormat;
 pub use plan::{ApplyPlan, PlanAction, PlanEntry};
@@ -101,4 +102,8 @@ pub enum RelishError {
     /// IO error.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// Upgrade tooling error (key generation, signing).
+    #[error("{0}")]
+    Upgrade(#[from] crate::upgrade::error::UpgradeError),
 }

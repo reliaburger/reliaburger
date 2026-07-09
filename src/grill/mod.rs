@@ -15,6 +15,7 @@ pub mod oci;
 pub mod port;
 pub mod process;
 pub mod process_workload;
+pub mod records;
 #[cfg(target_os = "linux")]
 pub mod rootless;
 #[cfg(target_os = "linux")]
@@ -103,6 +104,39 @@ pub trait Grill: Send + Sync {
         &self,
         instance: &InstanceId,
     ) -> impl std::future::Future<Output = Result<ContainerState, GrillError>> + Send;
+
+    /// Attempt to adopt a previously started instance from its on-disk
+    /// record (after a bun restart or self-upgrade exec).
+    ///
+    /// Returns `Ok(true)` if the instance is live and is now tracked by
+    /// this runtime, `Ok(false)` if it is gone (the caller should delete
+    /// the record and reschedule through the normal path). The default
+    /// declines: runtimes without adoption support never adopt.
+    fn adopt(
+        &self,
+        instance: &InstanceId,
+        record: &records::InstanceRecord,
+    ) -> impl std::future::Future<Output = Result<bool, GrillError>> + Send {
+        let _ = (instance, record);
+        std::future::ready(Ok(false))
+    }
+
+    /// Which runtime kind this grill starts instances with. Recorded in
+    /// instance records so adoption is routed to the right runtime.
+    fn runtime_kind(&self) -> records::RuntimeKind {
+        records::RuntimeKind::Process
+    }
+
+    /// Base path of an instance's on-disk log files (`{stem}.stdout` /
+    /// `{stem}.stderr`), when the runtime captures to files. `None` for
+    /// in-memory capture.
+    fn log_stem(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Option<std::path::PathBuf>> + Send {
+        let _ = instance;
+        std::future::ready(None)
+    }
 
     /// Get the OS process ID for an instance, if available.
     ///
@@ -233,6 +267,41 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.state(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.state(instance).await,
+        }
+    }
+
+    async fn adopt(
+        &self,
+        instance: &InstanceId,
+        record: &records::InstanceRecord,
+    ) -> Result<bool, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.adopt(instance, record).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.adopt(instance, record).await,
+            // TODO(Phase 14 follow-up): Apple Container adoption.
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.adopt(instance, record).await,
+        }
+    }
+
+    fn runtime_kind(&self) -> records::RuntimeKind {
+        match self {
+            AnyGrill::Process(_) => records::RuntimeKind::Process,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(_) => records::RuntimeKind::Runc,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => records::RuntimeKind::Apple,
+        }
+    }
+
+    async fn log_stem(&self, instance: &InstanceId) -> Option<std::path::PathBuf> {
+        match self {
+            AnyGrill::Process(g) => g.log_stem(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.log_stem(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.log_stem(instance).await,
         }
     }
 

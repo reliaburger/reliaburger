@@ -898,6 +898,92 @@ pub async fn clean() -> Result<(), RelishError> {
 }
 
 // ---------------------------------------------------------------------------
+// Release signing tooling (Phase 14)
+// ---------------------------------------------------------------------------
+
+/// Generate an Ed25519 release signing keypair into `out`.
+///
+/// Writes `release.key` (PKCS#8 private key, mode 0600 — keep it outside
+/// any repository) and `release.pub` (`ed25519:` + base64 public key).
+pub fn keygen(out: &std::path::Path) -> Result<(), RelishError> {
+    use crate::upgrade::signing;
+
+    std::fs::create_dir_all(out)?;
+    let key_path = out.join("release.key");
+    let pub_path = out.join("release.pub");
+    if key_path.exists() {
+        return Err(RelishError::FileExists {
+            path: key_path.display().to_string(),
+        });
+    }
+    if pub_path.exists() {
+        return Err(RelishError::FileExists {
+            path: pub_path.display().to_string(),
+        });
+    }
+
+    let (pkcs8, public) = signing::generate_keypair()?;
+    std::fs::write(&key_path, &pkcs8)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let encoded = signing::encode_public_key(&public);
+    std::fs::write(&pub_path, &encoded)?;
+
+    println!(
+        "keygen: private key {} (keep it safe, never commit it)",
+        key_path.display()
+    );
+    println!("keygen: public key  {}", pub_path.display());
+    println!("public key: {encoded}");
+    Ok(())
+}
+
+/// Sign a binary with a release key (and optionally an external key),
+/// writing a detached signature envelope next to it (or to `out`).
+pub fn sign_binary(
+    key: &std::path::Path,
+    binary: &std::path::Path,
+    external_key: Option<&std::path::Path>,
+    out: Option<&std::path::Path>,
+) -> Result<(), RelishError> {
+    use crate::upgrade::signing::{self, SignatureEnvelope};
+
+    let bytes = std::fs::read(binary)?;
+    let pkcs8 = std::fs::read(key)?;
+    let embedded = signing::sign(&pkcs8, &bytes)?;
+    let external = match external_key {
+        Some(path) => Some(signing::sign(&std::fs::read(path)?, &bytes)?),
+        None => None,
+    };
+    let envelope = SignatureEnvelope {
+        schema: 1,
+        sha256: signing::sha256_hex(&bytes),
+        embedded,
+        external,
+    };
+
+    // Default output appends ".sig" (with_extension would eat "0" from
+    // a name like bun-v0.2.0).
+    let sig_path = match out {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let mut name = binary
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            name.push(".sig");
+            binary.with_file_name(name)
+        }
+    };
+    envelope.store(&sig_path)?;
+    println!("sign-binary: wrote {}", sig_path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

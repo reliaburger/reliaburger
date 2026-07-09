@@ -25,4 +25,5 @@ pub mod relish;
 pub mod reporting;
 pub mod sesame;
 pub mod smoker;
+pub mod upgrade;
 pub mod wrapper;

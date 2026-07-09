@@ -46,3 +46,32 @@ jobs:
             RELIABURGER_NETNS_TESTS=1 \
             RELIABURGER_EBPF_TESTS=1 \
             cargo test --features ebpf -- --test-threads=1
+
+  upgrade-tests:
+    # Real-binary self-upgrade tests: each spawns actual bun processes under
+    # a supervisor loop and takes minutes, so they run in their own job
+    # (off the critical path) rather than blocking `ci`/`linux-tests`. They
+    # use the process runtime, so no runc/netns setup is needed.
+    #
+    # Only the SINGLE-NODE suite runs here. The cluster suite
+    # (self_upgrade_cluster) forms a 4-node cluster of real bun processes —
+    # each with its own Raft TCP server and gossip — which does not converge
+    # reliably on a contended 2-core CI runner (the membership-change RPC
+    # times out under load and retries indefinitely). Run it on a real
+    # machine or the Lima dev cluster with `make test-upgrade`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: upgrade-tests
+
+      - name: Run single-node self-upgrade integration tests
+        run: |
+          RELIABURGER_UPGRADE_TESTS=1 \
+            cargo test --test self_upgrade -- --test-threads=1

@@ -28,7 +28,7 @@ use crate::reporting::worker::CollectSnapshotRequest;
 
 use super::BunError;
 use super::probe::probe_health;
-use super::supervisor::WorkloadSupervisor;
+use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 
 /// Maximum time an init container may run before the deploy fails. Bounds the
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
@@ -184,6 +184,27 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         response: oneshot::Sender<Option<AppSpec>>,
+    },
+    /// Apply a node-level upgrade directive (Phase 14). Responds Ok once
+    /// the upgrade is verified + staged; the exec happens just after.
+    UpgradeApply {
+        directive: crate::upgrade::types::UpgradeDirective,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Node-level upgrade status.
+    UpgradeStatus {
+        response: oneshot::Sender<Result<crate::upgrade::types::NodeUpgradeStatus, BunError>>,
+    },
+    /// Revert this node to a previous binary version.
+    UpgradeRollback {
+        version: Option<crate::upgrade::BinaryVersion>,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Post-boot self-verification of a freshly swapped-in version.
+    /// Commits on success; flags revert and exits on failure.
+    UpgradeVerify {
+        marker: crate::upgrade::marker::UpgradeMarker,
+        response: oneshot::Sender<Result<bool, BunError>>,
     },
 }
 
@@ -390,6 +411,17 @@ pub struct BunAgent<G: Grill> {
     /// Pickle-hosted images are gated on a valid signature. Defaults to
     /// permissive so single-node / untrusted setups are unaffected.
     trust_policy: crate::config::node::TrustPolicySection,
+    /// Directory for on-disk instance records ({data_dir}/instances).
+    /// When set, started instances are recorded so a future bun (after a
+    /// crash restart or a self-upgrade exec) can adopt them instead of
+    /// restarting them. `None` disables recording and adoption.
+    records_dir: Option<PathBuf>,
+    /// Self-upgrade manager. `None` when upgrades are not configured
+    /// (upgrade commands then answer with an error).
+    upgrade: Option<crate::upgrade::manager::UpgradeManager>,
+    /// Set while an upgrade is staged/executing: new deploys are refused,
+    /// running workloads are untouched.
+    draining: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -436,6 +468,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
+            records_dir: None,
+            upgrade: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -489,6 +524,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
+            records_dir: None,
+            upgrade: None,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -599,6 +637,220 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     #[cfg(not(feature = "ebpf"))]
     async fn remove_backend_ebpf(&self, _app_name: &str) {}
+
+    /// Enable on-disk instance records under `dir` ({data_dir}/instances).
+    /// Call before deploying anything; also enables `adopt_recorded_instances`.
+    pub fn set_records_dir(&mut self, dir: PathBuf) {
+        self.records_dir = Some(dir);
+    }
+
+    /// Attach the self-upgrade manager (enables the upgrade commands).
+    pub fn set_upgrade_manager(&mut self, manager: crate::upgrade::manager::UpgradeManager) {
+        self.upgrade = Some(manager);
+    }
+
+    /// Snapshot of running (non-job) workloads for the upgrade marker:
+    /// these must all still be alive after the swap for it to commit.
+    async fn upgrade_inventory(&self) -> Vec<crate::upgrade::marker::InstanceInventory> {
+        let mut inventory = Vec::new();
+        for instance in self.supervisor.list_instances() {
+            if instance.is_job || instance.state != ContainerState::Running {
+                continue;
+            }
+            let Some(pid) = self.supervisor.grill().pid(&instance.id).await else {
+                continue;
+            };
+            let replica_index: u32 = instance
+                .id
+                .0
+                .rsplit('-')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            inventory.push(crate::upgrade::marker::InstanceInventory {
+                namespace: instance.namespace.clone(),
+                app_name: instance.app_name.clone(),
+                instance_id: replica_index,
+                pid,
+            });
+        }
+        inventory
+    }
+
+    /// Check that every pre-upgrade workload survived the swap.
+    async fn verify_upgrade_inventory(
+        &self,
+        marker: &crate::upgrade::marker::UpgradeMarker,
+    ) -> Result<(), String> {
+        for item in &marker.pre_upgrade_instances {
+            let id = InstanceId(format!("{}-{}", item.app_name, item.instance_id));
+            match self.supervisor.get_instance(&id) {
+                Some(instance) if instance.state == ContainerState::Running => {}
+                Some(instance) => {
+                    return Err(format!(
+                        "instance {id} is {} (was running before the upgrade)",
+                        instance.state
+                    ));
+                }
+                None => {
+                    return Err(format!("instance {id} was not adopted after the upgrade"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write (or refresh) the instance record used for adoption after a bun
+    /// restart or self-upgrade exec. Best-effort: a failed record write must
+    /// never fail a deploy, but it is logged.
+    async fn persist_instance_record(&self, instance_id: &InstanceId) {
+        let Some(dir) = &self.records_dir else { return };
+        let Some(instance) = self.supervisor.get_instance(instance_id) else {
+            return;
+        };
+        let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
+            return;
+        };
+        let Some(pid_started_at) = crate::grill::records::process_start_time(pid) else {
+            return;
+        };
+        let Some(oci_spec) = instance.oci_spec.clone() else {
+            return;
+        };
+
+        let replica_index: u32 = instance_id
+            .0
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let runtime = self.supervisor.grill().runtime_kind();
+        let record = crate::grill::records::InstanceRecord {
+            schema: 1,
+            instance_id: instance_id.0.clone(),
+            namespace: instance.namespace.clone(),
+            app_name: instance.app_name.clone(),
+            replica_index,
+            is_job: instance.is_job,
+            image: instance.image.clone(),
+            runtime,
+            pid,
+            pid_started_at,
+            // RunC uses the instance id as the container id (see runc.rs).
+            runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
+                .then(|| instance_id.0.clone()),
+            log_stem: self.supervisor.grill().log_stem(instance_id).await,
+            host_port: instance.host_port,
+            app_spec: self
+                .deployed_specs
+                .get(&(instance.app_name.clone(), instance.namespace.clone()))
+                .cloned(),
+            oci_spec,
+        };
+        if let Err(e) = crate::grill::records::write_record(dir, &record) {
+            eprintln!("bun: warning: failed to write instance record for {instance_id}: {e}");
+        }
+    }
+
+    /// Remove an instance's adoption record (instance stopped for good).
+    fn remove_instance_record(&self, instance_id: &InstanceId) {
+        if let Some(dir) = &self.records_dir
+            && let Err(e) = crate::grill::records::remove_record(dir, &instance_id.0)
+        {
+            eprintln!("bun: warning: failed to remove instance record for {instance_id}: {e}");
+        }
+    }
+
+    /// Adopt still-running workloads recorded by a previous bun process.
+    ///
+    /// Called once at startup, BEFORE any reconciliation: adopted instances
+    /// are seeded into the supervisor as Running so they don't get
+    /// double-started. Records whose process is gone are deleted (the
+    /// instance reschedules through the normal path). Returns the number
+    /// of instances adopted.
+    ///
+    /// Restart backoff counters start fresh for adopted instances, and
+    /// cluster routing is rebuilt by the normal reconcile paths.
+    pub async fn adopt_recorded_instances(&mut self) -> usize {
+        let Some(dir) = self.records_dir.clone() else {
+            return 0;
+        };
+        let now = Instant::now();
+        let mut adopted_count = 0;
+
+        for record in crate::grill::records::load_records(&dir) {
+            let instance_id = InstanceId(record.instance_id.clone());
+            // Never clobber an instance the current process already tracks.
+            if self.supervisor.get_instance(&instance_id).is_some() {
+                continue;
+            }
+
+            let adopted = matches!(
+                self.supervisor.grill().adopt(&instance_id, &record).await,
+                Ok(true)
+            );
+            if !adopted {
+                let _ = crate::grill::records::remove_record(&dir, &record.instance_id);
+                continue;
+            }
+
+            // The surviving instance still holds its port.
+            if let Some(port) = record.host_port {
+                let _ = self.supervisor.port_allocator.reserve(port).await;
+            }
+
+            // Rebuild the health check from the recorded app spec.
+            let health_config = record.app_spec.as_ref().and_then(|spec| {
+                let health = spec.health.as_ref()?;
+                let port = spec.port?;
+                Some(super::health::HealthCheckConfig::from_spec(health, port))
+            });
+            if let Some(config) = &health_config {
+                self.supervisor
+                    .register_health(instance_id.clone(), config.clone(), now);
+            }
+
+            let key = (record.app_name.clone(), record.namespace.clone());
+            let instance = WorkloadInstance {
+                id: instance_id.clone(),
+                app_name: record.app_name.clone(),
+                namespace: record.namespace.clone(),
+                state: ContainerState::Running,
+                health_counters: super::health::HealthCounters::new(),
+                restart_count: 0,
+                last_restart: None,
+                host_port: record.host_port,
+                container_ip: None,
+                created_at: now,
+                restart_policy: super::restart::RestartPolicy::default(),
+                health_config,
+                is_job: record.is_job,
+                image: record.image.clone(),
+                oci_spec: Some(record.oci_spec.clone()),
+                identity: None,
+                identity_mount: None,
+            };
+            self.supervisor
+                .instances
+                .insert(instance_id.clone(), instance);
+            self.supervisor
+                .app_instances
+                .entry(key.clone())
+                .or_default()
+                .push(instance_id.clone());
+            if let Some(spec) = record.app_spec {
+                self.deployed_specs.insert(key, spec);
+            }
+            // Keep the adopted instance's output flowing into the log store.
+            self.spawn_log_forwarder(&instance_id, &record.app_name, &record.namespace);
+            adopted_count += 1;
+        }
+
+        if adopted_count > 0 {
+            println!("bun: adopted {adopted_count} running instance(s) from a previous process");
+        }
+        adopted_count
+    }
 
     /// Spawn a background forwarder that streams a started instance's log lines
     /// into the configured log sink. No-op if no sink is set.
@@ -838,6 +1090,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
+                if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: "node is draining for a binary upgrade; retry shortly"
+                                .to_string(),
+                        })
+                        .await;
+                    return;
+                }
                 self.deploy(config, &events).await;
             }
             AgentCommand::Stop {
@@ -1046,6 +1307,179 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let spec = self.deployed_specs.get(&(app_name, namespace)).cloned();
                 let _ = response.send(spec);
+            }
+            AgentCommand::UpgradeApply {
+                directive,
+                response,
+            } => {
+                self.handle_upgrade_apply(directive, response).await;
+            }
+            AgentCommand::UpgradeStatus { response } => {
+                let result = match &self.upgrade {
+                    Some(manager) => Ok(manager.status()),
+                    None => Err(BunError::UpgradesUnavailable),
+                };
+                let _ = response.send(result);
+            }
+            AgentCommand::UpgradeRollback { version, response } => {
+                self.handle_upgrade_rollback(version, response).await;
+            }
+            AgentCommand::UpgradeVerify { marker, response } => {
+                self.handle_upgrade_verify(marker, response).await;
+            }
+        }
+    }
+
+    /// Node-level upgrade: verify + stage, respond, then exec. On any
+    /// failure the node keeps running the current version, undrained.
+    async fn handle_upgrade_apply(
+        &mut self,
+        directive: crate::upgrade::types::UpgradeDirective,
+        response: oneshot::Sender<Result<(), BunError>>,
+    ) {
+        let Some(manager) = self.upgrade.clone() else {
+            let _ = response.send(Err(BunError::UpgradesUnavailable));
+            return;
+        };
+
+        // Stop taking new work while the swap is in progress. Running
+        // workloads are untouched (and survive the exec — see grill).
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let inventory = self.upgrade_inventory().await;
+        let prepared = match manager.prepare(&directive, inventory).await {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => {
+                // Same upgrade already in flight: idempotent OK.
+                let _ = response.send(Ok(()));
+                return;
+            }
+            Err(e) => {
+                self.draining
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = response.send(Err(BunError::Upgrade(e)));
+                return;
+            }
+        };
+
+        println!(
+            "bun: upgrading to {} (upgrade {})",
+            prepared.target_version(),
+            directive.upgrade_id
+        );
+        // Respond before the point of no return, and give the HTTP layer a
+        // moment to flush the response — exec closes every socket.
+        let _ = response.send(Ok(()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Only returns on failure (the symlink is already reverted then).
+        let error = manager.execute(prepared);
+        self.draining
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "bun: upgrade exec failed, still on {}: {error}",
+            manager.running_version()
+        );
+    }
+
+    /// Node-level rollback: same swap machinery, no download or re-verify.
+    async fn handle_upgrade_rollback(
+        &mut self,
+        version: Option<crate::upgrade::BinaryVersion>,
+        response: oneshot::Sender<Result<(), BunError>>,
+    ) {
+        let Some(manager) = self.upgrade.clone() else {
+            let _ = response.send(Err(BunError::UpgradesUnavailable));
+            return;
+        };
+
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let inventory = self.upgrade_inventory().await;
+        let prepared = match manager.prepare_rollback(version, inventory) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.draining
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = response.send(Err(BunError::Upgrade(e)));
+                return;
+            }
+        };
+
+        println!("bun: rolling back to {}", prepared.target_version());
+        let _ = response.send(Ok(()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let error = manager.execute(prepared);
+        self.draining
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "bun: rollback exec failed, still on {}: {error}",
+            manager.running_version()
+        );
+    }
+
+    /// Post-boot verification of a freshly swapped-in version: all
+    /// pre-upgrade workloads must have been adopted and still be Running.
+    /// Commit on success; flag revert and exit on failure (the supervisor
+    /// restarts us, and startup recovery swaps the old binary back).
+    async fn handle_upgrade_verify(
+        &mut self,
+        marker: crate::upgrade::marker::UpgradeMarker,
+        response: oneshot::Sender<Result<bool, BunError>>,
+    ) {
+        let Some(manager) = self.upgrade.clone() else {
+            let _ = response.send(Err(BunError::UpgradesUnavailable));
+            return;
+        };
+
+        // In cluster mode, workload placement is the cluster's decision:
+        // the scheduler may legitimately move an app off this node while it
+        // bounces, so a missing pre-upgrade instance is NOT an upgrade
+        // failure. We surviving the boot-grace period (this command runs on
+        // the new binary) is the liveness proof; genuine boot failures are
+        // caught by the crash-loop budget, which reverts before we ever get
+        // here. Single-node keeps the strict check as a local safety net —
+        // there is no cluster to reschedule, so a vanished workload really
+        // is a failed swap.
+        if self.cluster.is_some() {
+            if let Err(reason) = self.verify_upgrade_inventory(&marker).await {
+                eprintln!("bun: note: {reason} — not reverting (cluster reschedules placements)");
+            }
+            match manager.commit(&marker) {
+                Ok(()) => {
+                    println!(
+                        "bun: upgrade to {} verified and committed",
+                        marker.target_version
+                    );
+                    let _ = response.send(Ok(true));
+                }
+                Err(e) => {
+                    let _ = response.send(Err(BunError::Upgrade(e)));
+                }
+            }
+            return;
+        }
+
+        match self.verify_upgrade_inventory(&marker).await {
+            Ok(()) => match manager.commit(&marker) {
+                Ok(()) => {
+                    println!(
+                        "bun: upgrade to {} verified and committed",
+                        marker.target_version
+                    );
+                    let _ = response.send(Ok(true));
+                }
+                Err(e) => {
+                    let _ = response.send(Err(BunError::Upgrade(e)));
+                }
+            },
+            Err(reason) => {
+                let _ = manager.mark_revert_pending(&marker, &reason);
+                let _ = response.send(Ok(false));
+                eprintln!("bun: exiting so the supervisor can restart into the revert");
+                std::process::exit(1);
             }
         }
     }
@@ -1701,6 +2135,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         break;
                     }
                     self.spawn_log_forwarder(&new_id, app_name, namespace);
+                    self.persist_instance_record(&new_id).await;
 
                     // Health check: poll until the process is alive, returning
                     // as soon as it's Running instead of always sleeping the
@@ -1804,6 +2239,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 self.supervisor.remove_app(app_name, namespace).await;
                 self.remove_backend_ebpf(app_name).await;
+                for old_id in &existing {
+                    self.remove_instance_record(old_id);
+                }
                 let _ = self.service_map.unregister_app(app_name);
 
                 // Register new instances in supervisor tracking
@@ -2290,6 +2728,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Call grill.start()
         self.supervisor.grill().start(instance_id).await?;
         self.spawn_log_forwarder(instance_id, app_name, namespace);
+        self.persist_instance_record(instance_id).await;
 
         // Starting → HealthWait, then immediately to Running if no health checks
         {
@@ -2556,6 +2995,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         self.supervisor.grill().start(instance_id).await?;
         self.spawn_log_forwarder(instance_id, job_name, namespace);
+        self.persist_instance_record(instance_id).await;
 
         // Starting → HealthWait → Running (no health checks for jobs)
         {
@@ -2845,6 +3285,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             // Re-wire the restarted instance: stream its logs and keep it routable.
             self.spawn_log_forwarder(&id, &app_name, &namespace);
+            self.persist_instance_record(&id).await;
             if let Some(port) = host_port {
                 let backend = crate::onion::types::BackendInstance {
                     instance_id: id.0.clone(),
@@ -2908,6 +3349,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance.state = s;
                     });
             }
+        }
+
+        // Stopped for good: nothing left to adopt after a restart.
+        for id in &instances {
+            self.remove_instance_record(id);
         }
 
         // Remove backends and unregister from the service map
@@ -4241,5 +4687,155 @@ mod tests {
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    // ---- workload adoption (Phase 14) ----
+
+    fn adoption_record(
+        instance: &str,
+        app: &str,
+        with_health: bool,
+    ) -> crate::grill::records::InstanceRecord {
+        let spec_toml = if with_health {
+            "image = \"myapp:v1\"\nport = 8080\n[health]\npath = \"/health\"\n"
+        } else {
+            "image = \"myapp:v1\"\n"
+        };
+        let app_spec: AppSpec = toml::from_str(spec_toml).unwrap();
+        crate::grill::records::InstanceRecord {
+            schema: 1,
+            instance_id: instance.to_string(),
+            namespace: "default".to_string(),
+            app_name: app.to_string(),
+            replica_index: 0,
+            is_job: false,
+            image: "myapp:v1".to_string(),
+            runtime: crate::grill::records::RuntimeKind::Process,
+            pid: 4242,
+            pid_started_at: 1000,
+            runc_container_id: None,
+            log_stem: None,
+            host_port: Some(30123),
+            app_spec: Some(app_spec),
+            oci_spec: crate::grill::oci::OciSpec {
+                root: crate::grill::oci::OciRoot {
+                    path: "/tmp/test".to_string(),
+                    readonly: false,
+                },
+                process: crate::grill::oci::OciProcess {
+                    args: vec!["sleep".to_string(), "60".to_string()],
+                    env: vec![],
+                    cwd: "/".to_string(),
+                    user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                },
+                mounts: vec![],
+                linux: crate::grill::oci::OciLinux {
+                    namespaces: vec![],
+                    resources: None,
+                    cgroups_path: None,
+                    uid_mappings: None,
+                    gid_mappings: None,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_adopts_recorded_instances_instead_of_restarting() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        let record = adoption_record("web-0", "web", false);
+        crate::grill::records::write_record(dir.path(), &record).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+
+        let id = InstanceId("web-0".to_string());
+        grill.set_adopt_result(&id, true);
+
+        assert_eq!(agent.adopt_recorded_instances().await, 1);
+
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Running);
+        assert_eq!(instance.app_name, "web");
+        // Adopted, never created or started by this process.
+        let calls = grill.calls();
+        assert!(calls.contains(&("adopt".to_string(), id.clone())));
+        assert!(!calls.contains(&("create".to_string(), id.clone())));
+        assert!(!calls.contains(&("start".to_string(), id)));
+    }
+
+    #[tokio::test]
+    async fn startup_deletes_stale_records_and_reschedules() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        // MockGrill declines adoption by default (dead process).
+        let record = adoption_record("web-0", "web", false);
+        crate::grill::records::write_record(dir.path(), &record).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+
+        assert_eq!(agent.adopt_recorded_instances().await, 0);
+
+        // The stale record is gone and nothing was seeded: the normal
+        // reconcile path is free to reschedule the instance.
+        assert!(crate::grill::records::load_records(dir.path()).is_empty());
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&InstanceId("web-0".to_string()))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_instances_resume_health_checks() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        let record = adoption_record("web-0", "web", true);
+        crate::grill::records::write_record(dir.path(), &record).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+
+        let id = InstanceId("web-0".to_string());
+        grill.set_adopt_result(&id, true);
+        assert_eq!(agent.adopt_recorded_instances().await, 1);
+
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert!(instance.health_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn adopted_instance_port_is_reserved() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        let record = adoption_record("web-0", "web", false);
+        crate::grill::records::write_record(dir.path(), &record).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+
+        let id = InstanceId("web-0".to_string());
+        grill.set_adopt_result(&id, true);
+        assert_eq!(agent.adopt_recorded_instances().await, 1);
+
+        // The adopted instance's port must not be handed out again.
+        assert!(agent.supervisor.port_allocator.is_allocated(30123).await);
+    }
+
+    #[tokio::test]
+    async fn adoption_never_clobbers_a_tracked_instance() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+
+        // Deploy an instance in THIS process, then drop a record for the
+        // same id (as if left behind) — adoption must skip it.
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let id = InstanceId("web-0".to_string());
+        assert!(agent.supervisor.get_instance(&id).is_some());
+        let record = adoption_record("web-0", "web", false);
+        crate::grill::records::write_record(dir.path(), &record).unwrap();
+        grill.set_adopt_result(&id, true);
+
+        assert_eq!(agent.adopt_recorded_instances().await, 0);
     }
 }

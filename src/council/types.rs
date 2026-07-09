@@ -159,6 +159,16 @@ pub enum RaftRequest {
     RevokeCertificate(crate::sesame::types::CrlEntry),
     /// No-op entry (used for leader commit on election).
     Noop,
+    // NOTE: the log is bincode-encoded (variant index on the wire), so new
+    // variants are APPENDED here — never inserted or reordered — or every
+    // existing log entry decodes as the wrong variant.
+    /// Start or advance a cluster-wide rolling binary upgrade (Phase 14).
+    UpgradeUpdate {
+        state: Box<crate::upgrade::types::ClusterUpgradeState>,
+    },
+    /// Finish a cluster upgrade: archive it to history and clear the
+    /// active slot.
+    UpgradeClear { upgrade_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +241,12 @@ pub struct DesiredState {
     /// Contains wrapped (encrypted) private keys — safe to replicate.
     #[serde(default)]
     pub security_state: SecurityState,
+    /// The rolling binary upgrade in progress, if any (at most one).
+    #[serde(default)]
+    pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
+    /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
+    #[serde(default)]
+    pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

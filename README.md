@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (1595 and counting)
+make test                    # run all tests (1880 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -90,13 +90,14 @@ src/
   mayo/                # Time-series metrics (Arrow, DataFusion, Parquet, hierarchical rollups)
   ketchup/             # Log collection (append-only, indexed, queries)
   brioche/             # Web dashboard
+  upgrade/             # Self-upgrade (dual-signed binaries, exec-in-place, rolling orchestration)
 docs/
   README.md            # User documentation (install, build, run)
   whitepaper.md        # Full architectural vision
   roadmap.md           # 9 implementation phases
   progress.md          # What's done, what's next
   design/              # Detailed design docs per component (14 files)
-  book/                # "Building Reliaburger" chapters (preface, 1-11, Rust appendix)
+  book/                # "Building Reliaburger" chapters (preface, 1-11, 14, Rust appendix)
   _quarto/             # PDF build configuration
 examples/              # Example app and job configs
 scripts/               # Test and demo scripts
@@ -107,7 +108,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,703 tests across 11 completed phases** (plus 12 Lima-gated eBPF integration tests run in the dev VM), including the Phase 11b review-and-wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the full eBPF data path (service discovery, kernel connect-rewrite, network fault injection, and egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist and the [branch PR summary](docs/pr-stage-4.md).
+**1,880 tests across 12 completed phases** (plus 12 Lima-gated eBPF integration tests run in the dev VM), including the Phase 11b review-and-wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the full eBPF data path (service discovery, kernel connect-rewrite, network fault injection, and egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist and the [branch PR summary](docs/pr-stage-4.md).
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -122,7 +123,14 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 9. User Experience | Done | 1,271 |
 | 10. Advanced Security | Done | 1,448 |
 | 11. Advanced Observability | Done | 1,595 |
-| 11b. Review & hardening | In progress | 1,675 |
+| 11b. Review & wiring | Done | 1,703 |
+| 14. Self-Upgrade | Done | 1,880 |
+
+Phase 14 (rolling binary upgrades) landed ahead of 12 and 13: `relish
+upgrade start v0.2.0` rolls a live cluster onto a new dual-signed binary —
+workloads survive the swap (same pids, adopted across `exec()`), a
+crash-looping release reverts itself, and the leader upgrades itself last
+(in place, quorum preserved through the sub-second exec bounce).
 
 ## The book
 
@@ -141,6 +149,7 @@ Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rus
 10. [Locking It Down](docs/book/10-locking-it-down.md)
 11. [Eyes Everywhere](docs/book/11-eyes-everywhere.md)
 12. [Squeezing Every Drop](docs/book/12-squeezing-every-drop.md) *(in progress)*
+14. [Changing the Tyres at Full Speed](docs/book/14-changing-the-tyres.md)
 - [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
 
 ## Licence

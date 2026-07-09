@@ -31,7 +31,7 @@ pub struct NodeConfig {
     pub ingress: IngressSection,
     pub dns: DnsSection,
     pub ebpf: EbpfSection,
-    // TODO(Phase 14): upgrades section
+    pub upgrades: UpgradeSection,
 }
 
 impl NodeConfig {
@@ -209,6 +209,49 @@ pub struct SecuritySection {
     pub master_key_path: Option<PathBuf>,
     /// Path to the initial security bootstrap (`{cluster}-security-bootstrap.json`).
     pub bootstrap_path: Option<PathBuf>,
+}
+
+/// Self-upgrade configuration (Phase 14).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpgradeSection {
+    /// External Ed25519 signing key (`ed25519:` + base64 of 32 bytes).
+    /// Required for network upgrades; air-gapped (`--binary`) upgrades
+    /// work without it.
+    pub external_signing_key: Option<String>,
+    /// Number of previous binary versions to retain on disk for rollback.
+    pub retain_versions: u32,
+    /// Release metadata endpoint URL for `relish upgrade check`.
+    pub release_url: String,
+    /// Directory holding the versioned binaries and the entry symlink.
+    /// Defaults to the directory of the resolved current executable.
+    pub binary_dir: Option<PathBuf>,
+    /// Seconds the new binary must survive after an upgrade before the
+    /// swap counts as verified.
+    pub boot_grace_secs: u64,
+    /// Seconds the new binary has to rejoin gossip (cluster mode only).
+    pub gossip_rejoin_secs: u64,
+    /// Boot attempts on the new version before automatic revert.
+    pub max_boot_attempts: u32,
+    /// Debug builds only: replaces the compiled-in release key set so
+    /// integration tests can sign with throwaway keys. Ignored (with a
+    /// warning) in release builds.
+    pub release_keys_override: Option<Vec<String>>,
+}
+
+impl Default for UpgradeSection {
+    fn default() -> Self {
+        Self {
+            external_signing_key: None,
+            retain_versions: 3,
+            release_url: "https://releases.reliaburger.dev/metadata.json".to_string(),
+            binary_dir: None,
+            boot_grace_secs: 30,
+            gossip_rejoin_secs: 60,
+            max_boot_attempts: 2,
+            release_keys_override: None,
+        }
+    }
 }
 
 /// Node identity and labels.

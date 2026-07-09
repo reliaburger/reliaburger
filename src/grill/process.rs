@@ -4,7 +4,17 @@
 /// `tokio::process::Command`. Each "container" is a child process.
 /// Works on macOS and Linux — the cross-platform fallback when
 /// neither `runc` nor Apple's `container` CLI is available.
+///
+/// Two capture modes:
+/// - **In-memory** (default, `new()`): stdout/stderr are piped into
+///   buffers. Simple, but nothing survives a bun restart.
+/// - **File-backed** (`with_log_dir`): stdout/stderr append to
+///   `{log_dir}/{instance}.stdout` / `.stderr`. Workloads keep writing
+///   through a self-upgrade `exec()` (a pipe would go with the old
+///   process's reader tasks — and a SIGPIPE would kill the workload),
+///   and a fresh bun can *adopt* them from their instance records.
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
@@ -12,6 +22,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use super::oci::OciSpec;
+use super::records::InstanceRecord;
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
@@ -19,10 +30,27 @@ use super::{GrillError, InstanceId};
 struct ProcessEntry {
     spec: OciSpec,
     child: Option<tokio::process::Child>,
+    /// Pid of an adopted process (started by a previous bun). Mutually
+    /// exclusive with `child`: adopted processes have no handle, only a pid.
+    adopted_pid: Option<u32>,
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
+    /// Base path for file-backed logs (`{stem}.stdout` / `{stem}.stderr`).
+    log_stem: Option<PathBuf>,
     exit_code: Option<i32>,
+}
+
+use super::records::poll_adopted_process;
+
+fn log_file(stem: &Path, suffix: &str) -> PathBuf {
+    let mut name = stem
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".");
+    name.push(suffix);
+    stem.with_file_name(name)
 }
 
 /// Process-based Grill implementation.
@@ -32,33 +60,56 @@ struct ProcessEntry {
 #[derive(Clone)]
 pub struct ProcessGrill {
     processes: Arc<Mutex<HashMap<InstanceId, ProcessEntry>>>,
+    /// When set, stdout/stderr go to files here instead of pipes.
+    log_dir: Option<PathBuf>,
 }
 
 impl ProcessGrill {
-    /// Create a new ProcessGrill.
+    /// Create a new ProcessGrill with in-memory log capture.
     pub fn new() -> Self {
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
+            log_dir: None,
+        }
+    }
+
+    /// Create a ProcessGrill that writes workload output to files under
+    /// `log_dir`, enabling adoption across bun restarts and upgrades.
+    pub fn with_log_dir(log_dir: PathBuf) -> Self {
+        Self {
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            log_dir: Some(log_dir),
         }
     }
 
     /// Get captured stdout for an instance.
     pub async fn stdout(&self, instance: &InstanceId) -> Result<Vec<u8>, GrillError> {
-        let procs = self.processes.lock().await;
-        let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
-            instance: instance.clone(),
-        })?;
-        let buf = entry.stdout_buf.lock().await;
-        Ok(buf.clone())
+        self.read_stream(instance, true).await
     }
 
     /// Get captured stderr for an instance.
     pub async fn stderr(&self, instance: &InstanceId) -> Result<Vec<u8>, GrillError> {
+        self.read_stream(instance, false).await
+    }
+
+    async fn read_stream(
+        &self,
+        instance: &InstanceId,
+        stdout: bool,
+    ) -> Result<Vec<u8>, GrillError> {
         let procs = self.processes.lock().await;
         let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
             instance: instance.clone(),
         })?;
-        let buf = entry.stderr_buf.lock().await;
+        if let Some(stem) = &entry.log_stem {
+            let path = log_file(stem, if stdout { "stdout" } else { "stderr" });
+            return Ok(std::fs::read(path).unwrap_or_default());
+        }
+        let buf = if stdout {
+            entry.stdout_buf.lock().await
+        } else {
+            entry.stderr_buf.lock().await
+        };
         Ok(buf.clone())
     }
 }
@@ -86,9 +137,11 @@ impl super::Grill for ProcessGrill {
             ProcessEntry {
                 spec: spec.clone(),
                 child: None,
+                adopted_pid: None,
                 state: ContainerState::Pending,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
+                log_stem: None,
                 exit_code: None,
             },
         );
@@ -103,7 +156,7 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
             })?;
 
-        if entry.child.is_some() {
+        if entry.child.is_some() || entry.adopted_pid.is_some() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "already started".to_string(),
@@ -135,15 +188,44 @@ impl super::Grill for ProcessGrill {
             }
         }
 
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+        // File-backed mode: append to log files that outlive this process
+        // (they must survive a self-upgrade exec). In-memory mode: pipes.
+        let log_stem = self.log_dir.as_ref().map(|dir| dir.join(&instance.0));
+        if let Some(stem) = &log_stem {
+            if let Some(dir) = stem.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to create log dir: {e}"),
+                })?;
+            }
+            let open = |suffix: &str| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_file(stem, suffix))
+            };
+            let stdout_file = open("stdout").map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to open stdout log: {e}"),
+            })?;
+            let stderr_file = open("stderr").map_err(|e| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to open stderr log: {e}"),
+            })?;
+            cmd.stdout(std::process::Stdio::from(stdout_file));
+            cmd.stderr(std::process::Stdio::from(stderr_file));
+        } else {
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+        }
 
         let mut child = cmd.spawn().map_err(|e| GrillError::StartFailed {
             instance: instance.clone(),
             reason: e.to_string(),
         })?;
 
-        // Spawn tasks to capture stdout/stderr
+        // Spawn tasks to capture stdout/stderr (in-memory mode only —
+        // file-backed mode has no pipes to read).
         let stdout_buf = entry.stdout_buf.clone();
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(async move {
@@ -181,6 +263,7 @@ impl super::Grill for ProcessGrill {
         }
 
         entry.child = Some(child);
+        entry.log_stem = log_stem;
         entry.state = ContainerState::Running;
         Ok(())
     }
@@ -193,9 +276,12 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
             })?;
 
-        if let Some(ref child) = entry.child
-            && let Some(pid) = child.id()
-        {
+        let pid = entry
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .or(entry.adopted_pid);
+        if let Some(pid) = pid {
             let pid = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
         }
@@ -213,6 +299,9 @@ impl super::Grill for ProcessGrill {
 
         if let Some(ref mut child) = entry.child {
             let _ = child.kill().await;
+        } else if let Some(pid) = entry.adopted_pid {
+            let pid = nix::unistd::Pid::from_raw(pid as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
         }
         entry.state = ContainerState::Stopped;
         Ok(())
@@ -241,15 +330,60 @@ impl super::Grill for ProcessGrill {
                     entry.exit_code = None;
                 }
             }
+        } else if let Some(pid) = entry.adopted_pid {
+            // Adopted process: no handle, poll (and reap) by pid. This
+            // doubles as the zombie reaper — the supervisor polls state
+            // regularly, so exited adoptees get waitpid'd here.
+            if entry.state != ContainerState::Stopped {
+                let (running, exit_code) = poll_adopted_process(pid);
+                if !running {
+                    entry.state = ContainerState::Stopped;
+                    entry.exit_code = exit_code;
+                }
+            }
         }
 
         Ok(entry.state)
     }
 
+    async fn adopt(
+        &self,
+        instance: &InstanceId,
+        record: &InstanceRecord,
+    ) -> Result<bool, GrillError> {
+        if !super::records::is_live(record) {
+            return Ok(false);
+        }
+        let mut procs = self.processes.lock().await;
+        procs.insert(
+            instance.clone(),
+            ProcessEntry {
+                spec: record.oci_spec.clone(),
+                child: None,
+                adopted_pid: Some(record.pid),
+                state: ContainerState::Running,
+                stdout_buf: Arc::new(Mutex::new(Vec::new())),
+                stderr_buf: Arc::new(Mutex::new(Vec::new())),
+                log_stem: record.log_stem.clone(),
+                exit_code: None,
+            },
+        );
+        Ok(true)
+    }
+
     async fn pid(&self, instance: &InstanceId) -> Option<u32> {
         let procs = self.processes.lock().await;
         let entry = procs.get(instance)?;
-        entry.child.as_ref().and_then(|c| c.id())
+        entry
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .or(entry.adopted_pid)
+    }
+
+    async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
+        let procs = self.processes.lock().await;
+        procs.get(instance).and_then(|e| e.log_stem.clone())
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
@@ -311,10 +445,11 @@ impl super::Grill for ProcessGrill {
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<String>,
     ) {
-        let stdout_buf = {
+        // Snapshot how this instance's logs are captured.
+        let (stdout_buf, log_stem) = {
             let procs = self.processes.lock().await;
             match procs.get(instance) {
-                Some(entry) => entry.stdout_buf.clone(),
+                Some(entry) => (entry.stdout_buf.clone(), entry.log_stem.clone()),
                 None => return,
             }
         };
@@ -323,7 +458,17 @@ impl super::Grill for ProcessGrill {
         let mut partial_line = String::new();
 
         loop {
-            let new_data = {
+            // New bytes since the last poll, from the file or the buffer.
+            let new_data = if let Some(stem) = &log_stem {
+                let contents = std::fs::read(log_file(stem, "stdout")).unwrap_or_default();
+                if offset < contents.len() {
+                    let data = contents[offset..].to_vec();
+                    offset = contents.len();
+                    Some(data)
+                } else {
+                    None
+                }
+            } else {
                 let buf = stdout_buf.lock().await;
                 if offset < buf.len() {
                     let data = buf[offset..].to_vec();
@@ -334,6 +479,7 @@ impl super::Grill for ProcessGrill {
                 }
             };
 
+            let no_new_data = new_data.is_none();
             if let Some(data) = new_data {
                 partial_line.push_str(&String::from_utf8_lossy(&data));
 
@@ -347,21 +493,17 @@ impl super::Grill for ProcessGrill {
                 }
             }
 
-            // Check if process has exited and no more data is coming
+            // Check if the process has exited and no more data is coming
             {
                 let procs = self.processes.lock().await;
                 if let Some(entry) = procs.get(instance) {
                     let exited = entry.state == ContainerState::Stopped
                         || entry.state == ContainerState::Stopping;
-                    if exited {
-                        let buf = entry.stdout_buf.lock().await;
-                        if offset >= buf.len() {
-                            // Send any remaining partial line
-                            if !partial_line.is_empty() {
-                                let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
-                            }
-                            return;
+                    if exited && no_new_data {
+                        if !partial_line.is_empty() {
+                            let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
                         }
+                        return;
                     }
                 } else {
                     return;
@@ -378,15 +520,16 @@ mod tests {
     use super::*;
     use crate::grill::Grill;
     use crate::grill::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
+    use crate::grill::records::{self, InstanceRecord, RuntimeKind};
 
-    fn echo_spec(msg: &str) -> OciSpec {
+    fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
             },
             process: OciProcess {
-                args: vec!["echo".to_string(), msg.to_string()],
+                args,
                 env: vec!["TEST_VAR=hello".to_string()],
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
@@ -402,26 +545,31 @@ mod tests {
         }
     }
 
+    fn echo_spec(msg: &str) -> OciSpec {
+        spec_with_args(vec!["echo".to_string(), msg.to_string()])
+    }
+
     fn sleep_spec(secs: &str) -> OciSpec {
-        OciSpec {
-            root: OciRoot {
-                path: "/tmp/test".to_string(),
-                readonly: false,
-            },
-            process: OciProcess {
-                args: vec!["sleep".to_string(), secs.to_string()],
-                env: vec![],
-                cwd: "/".to_string(),
-                user: OciUser { uid: 0, gid: 0 },
-            },
-            mounts: vec![],
-            linux: OciLinux {
-                namespaces: vec![],
-                resources: None,
-                cgroups_path: None,
-                uid_mappings: None,
-                gid_mappings: None,
-            },
+        spec_with_args(vec!["sleep".to_string(), secs.to_string()])
+    }
+
+    fn record_for(instance: &InstanceId, pid: u32, started_at: u64) -> InstanceRecord {
+        InstanceRecord {
+            schema: 1,
+            instance_id: instance.0.clone(),
+            namespace: "default".to_string(),
+            app_name: "test".to_string(),
+            replica_index: 0,
+            is_job: false,
+            image: String::new(),
+            runtime: RuntimeKind::Process,
+            pid,
+            pid_started_at: started_at,
+            runc_container_id: None,
+            log_stem: None,
+            host_port: None,
+            app_spec: None,
+            oci_spec: sleep_spec("60"),
         }
     }
 
@@ -537,5 +685,140 @@ mod tests {
         assert!(matches!(err, GrillError::StartFailed { .. }));
 
         grill.kill(&id).await.unwrap();
+    }
+
+    // ---- file-backed capture and adoption ----
+
+    #[tokio::test]
+    async fn file_backed_mode_writes_logs_to_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("test-0".to_string());
+
+        grill.create(&id, &echo_spec("to file")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let logged = grill.logs(&id).await.unwrap();
+        assert!(logged.contains("to file"), "got {logged:?}");
+        assert!(dir.path().join("test-0.stdout").is_file());
+    }
+
+    #[tokio::test]
+    async fn adopts_live_process_and_reports_running() {
+        // A process spawned outside the grill entirely stands in for a
+        // workload started by a previous bun.
+        let mut external = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = external.id();
+        let started_at = records::process_start_time(pid).unwrap();
+
+        let grill = ProcessGrill::new();
+        let id = InstanceId("adopted-0".to_string());
+        let adopted = grill
+            .adopt(&id, &record_for(&id, pid, started_at))
+            .await
+            .unwrap();
+
+        assert!(adopted);
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(grill.pid(&id).await, Some(pid));
+
+        external.kill().unwrap();
+        external.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn adopt_returns_false_for_dead_pid() {
+        let mut external = std::process::Command::new("true").spawn().unwrap();
+        let pid = external.id();
+        external.wait().unwrap();
+
+        let grill = ProcessGrill::new();
+        let id = InstanceId("adopted-0".to_string());
+        let adopted = grill.adopt(&id, &record_for(&id, pid, 1000)).await.unwrap();
+
+        assert!(!adopted);
+        assert!(grill.state(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_kills_adopted_instance() {
+        let mut external = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = external.id();
+        let started_at = records::process_start_time(pid).unwrap();
+
+        let grill = ProcessGrill::new();
+        let id = InstanceId("adopted-0".to_string());
+        assert!(
+            grill
+                .adopt(&id, &record_for(&id, pid, started_at))
+                .await
+                .unwrap()
+        );
+
+        grill.stop(&id).await.unwrap();
+        // Reap via the parent handle (this test process is the real parent).
+        external.wait().unwrap();
+        assert!(records::process_start_time(pid).is_none());
+    }
+
+    #[tokio::test]
+    async fn state_detects_adopted_instance_exit() {
+        // The adopted process is a child of THIS process, mirroring the
+        // exec() case where adoptees are still children — waitpid reaps.
+        let external = std::process::Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .unwrap();
+        let pid = external.id();
+        let started_at = records::process_start_time(pid).unwrap();
+        // Deliberately do not wait() on `external`: state() must reap it.
+
+        let grill = ProcessGrill::new();
+        let id = InstanceId("adopted-0".to_string());
+        assert!(
+            grill
+                .adopt(&id, &record_for(&id, pid, started_at))
+                .await
+                .unwrap()
+        );
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        assert_eq!(grill.exit_code(&id).await, Some(0));
+        std::mem::forget(external); // already reaped via waitpid
+    }
+
+    #[tokio::test]
+    async fn adopted_instance_reads_logs_from_recorded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = dir.path().join("adopted-0");
+        std::fs::write(log_file(&stem, "stdout"), "written before the swap\n").unwrap();
+
+        let mut external = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = external.id();
+        let started_at = records::process_start_time(pid).unwrap();
+
+        let grill = ProcessGrill::new();
+        let id = InstanceId("adopted-0".to_string());
+        let mut record = record_for(&id, pid, started_at);
+        record.log_stem = Some(stem);
+        assert!(grill.adopt(&id, &record).await.unwrap());
+
+        let logs = grill.logs(&id).await.unwrap();
+        assert!(logs.contains("written before the swap"));
+
+        external.kill().unwrap();
+        external.wait().unwrap();
     }
 }

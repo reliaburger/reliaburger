@@ -1,0 +1,8 @@
+---
+source: src/relish/upgrade.rs
+assertion_line: 615
+expression: render_node_status(&node)
+---
+running: v0.1.0
+no upgrade in flight
+  reverted v0.1.0 -> v0.2.0: reverted after 3 boot attempt(s) on v0.2.0

@@ -27,6 +27,28 @@ pub fn filter_nodes(
         .collect()
 }
 
+/// Cordon nodes that are mid-binary-upgrade (Phase 14): mark them not
+/// ready so `filter_nodes` skips them. Call after populating the cache,
+/// with `active_upgrade` from the Raft `DesiredState`.
+///
+/// TODO(wiring): call from the leader's scheduling path once the binary
+/// populates a `ClusterStateCache` from gossip + reports.
+pub fn apply_upgrade_cordon(
+    cluster: &mut ClusterStateCache,
+    upgrade: Option<&crate::upgrade::types::ClusterUpgradeState>,
+) {
+    let Some(upgrade) = upgrade else { return };
+    let cordoned: Vec<_> = cluster
+        .nodes()
+        .filter(|node| upgrade.is_node_cordoned(&node.node_id.0))
+        .cloned()
+        .collect();
+    for mut node in cordoned {
+        node.ready = false;
+        cluster.set_node(node);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -128,5 +150,48 @@ mod tests {
 
         let result = filter_nodes(&Resources::new(100, 100, 0), &BTreeMap::new(), &cluster);
         assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn scheduler_skips_nodes_mid_upgrade() {
+        use crate::upgrade::types::{
+            ClusterUpgradePhase, ClusterUpgradeState, NodeRole, NodeUpgradePhase,
+            NodeUpgradeRecord, UpgradeDirection,
+        };
+
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(node_state("n1", 2000, 4096, BTreeMap::new(), true));
+        cluster.set_node(node_state("n2", 2000, 4096, BTreeMap::new(), true));
+
+        let record = |node: &str, phase: NodeUpgradePhase| NodeUpgradeRecord {
+            node_id: node.to_string(),
+            address: "127.0.0.1:9117".to_string(),
+            role: NodeRole::Worker,
+            from_version: None,
+            phase,
+            since: None,
+        };
+        let upgrade = ClusterUpgradeState {
+            upgrade_id: "up-1".to_string(),
+            target_version: "v0.2.0".parse().unwrap(),
+            binary_sha256: String::new(),
+            embedded_signature: String::new(),
+            external_signature: None,
+            parallel: 1,
+            direction: UpgradeDirection::Upgrade,
+            phase: ClusterUpgradePhase::UpgradingWorkers,
+            registry_address: String::new(),
+            nodes: vec![
+                record("n1", NodeUpgradePhase::Directed),
+                record("n2", NodeUpgradePhase::Pending),
+            ],
+        };
+
+        apply_upgrade_cordon(&mut cluster, Some(&upgrade));
+
+        let result = filter_nodes(&Resources::new(100, 100, 0), &BTreeMap::new(), &cluster);
+        // n1 is mid-upgrade (Directed) and cordoned; n2 is merely Pending
+        // and keeps taking work until its turn actually comes.
+        assert_eq!(result, vec![NodeId::new("n2")]);
     }
 }

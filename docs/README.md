@@ -144,6 +144,7 @@ Some tests require specific runtimes or network access and are gated behind envi
 | `RELIABURGER_RUNC_TESTS=1` | runc container runtime tests (Linux only) |
 | `RELIABURGER_APPLE_CONTAINER_TESTS=1` | Apple Container tests (macOS only) |
 | `RELIABURGER_IMAGE_PULL_TESTS=1` | OCI image pull tests (requires network) |
+| `RELIABURGER_UPGRADE_TESTS=1` | real-binary self-upgrade tests (slow; also via `make test-upgrade`) |
 
 ### Benchmarks
 
@@ -257,6 +258,44 @@ Commands:
 | `dev stop` | Stop a dev cluster (VMs stay on disk) |
 | `dev start` | Start a stopped dev cluster |
 | `dev destroy` | Destroy a dev cluster (delete all VMs) |
+| `dev keygen --out <dir>` | Generate an Ed25519 release signing keypair |
+| `dev sign-binary --key <key> <binary>` | Sign a binary, producing a detached `.sig` envelope |
+| `upgrade check` | Check the release metadata for available updates |
+| `upgrade start <version>` | Start a rolling binary upgrade (network) |
+| `upgrade start --binary <path>` | Upgrade from a local signed binary (air-gapped) |
+| `upgrade plan <version>` | Preview the rolling order and estimated duration |
+| `upgrade status` | Show upgrade progress (cluster or node) |
+| `upgrade rollback [version]` | Roll back to a previous binary version |
+| `upgrade resume` | Resume a paused upgrade under a fresh attempt id |
+
+### Self-upgrade (Phase 14)
+
+`bun` can replace its own binary in place: the process `exec()`s the new
+version, running workloads are *adopted* by the new binary (same pids, no
+restarts), and a crash-looping upgrade automatically reverts to the previous
+binary. On a cluster the Raft leader rolls the fleet: workers first (with
+`--parallel`), council members one at a time, then the leader upgrades
+itself last (in place; a ≥3-node council keeps quorum through the bounce).
+
+Requirements:
+
+- **A process supervisor.** Run bun under something that restarts it whenever
+  it exits (systemd `Restart=always`, or any `while true; do bun ...; done`
+  loop). Startup-side recovery does the rest — including the automatic
+  symlink revert after a crash-looping upgrade.
+- **Signatures.** Network upgrades need two Ed25519 signatures over the
+  binary: one from the release key set compiled into the running binary, and
+  one from the operator key configured as `upgrades.external_signing_key` in
+  node.toml (generate one with `relish dev keygen`). Air-gapped
+  `upgrade start --binary` needs only the release signature (expects
+  `{binary}.sig` alongside the file — see `relish dev sign-binary`).
+- **A versioned binary directory** (default: the directory of the running
+  executable): `bun` is a symlink to `bun-vX.Y.Z`; previous versions are
+  retained for rollback (`upgrades.retain_versions`, default 3).
+
+The release private key must live outside any repository. The project key's
+public half is compiled into `src/upgrade/keys.rs`; rotating it means shipping
+a release that trusts both old and new keys, then dropping the old one.
 
 ### Dev cluster
 

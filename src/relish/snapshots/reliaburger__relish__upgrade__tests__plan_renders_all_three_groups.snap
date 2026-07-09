@@ -1,0 +1,11 @@
+---
+source: src/relish/upgrade.rs
+assertion_line: 568
+expression: "render_plan(\"v0.2.0\", 5, 2, 1, 2)"
+---
+upgrade plan to v0.2.0 (8 node(s))
+  1. workers: 5 node(s) in 3 batch(es) of up to 2
+  2. council members: 2 node(s), strictly one at a time
+  3. the leader, in place (last)
+estimated duration: ~5 min (assuming 45s per node)
+workloads keep running throughout (adoption across exec)

@@ -170,6 +170,35 @@ impl NodeConfig {
             });
         }
 
+        // Upgrade keys must parse; retention must keep at least one version
+        let upgrade_validation = |field: &str, reason: String| ConfigError::Validation {
+            field: field.to_string(),
+            context: "node config".to_string(),
+            reason,
+        };
+        if let Some(key) = &self.upgrades.external_signing_key {
+            crate::upgrade::signing::parse_public_key(key)
+                .map_err(|e| upgrade_validation("upgrades.external_signing_key", e.to_string()))?;
+        }
+        for key in self.upgrades.release_keys_override.iter().flatten() {
+            crate::upgrade::signing::parse_public_key(key)
+                .map_err(|e| upgrade_validation("upgrades.release_keys_override", e.to_string()))?;
+        }
+        if self.upgrades.retain_versions == 0 {
+            return Err(upgrade_validation(
+                "upgrades.retain_versions",
+                "must retain at least one version".to_string(),
+            ));
+        }
+        if let Some(dir) = &self.upgrades.binary_dir
+            && !dir.is_absolute()
+        {
+            return Err(ConfigError::NonAbsolutePath {
+                field: "upgrades.binary_dir".to_string(),
+                path: dir.clone(),
+            });
+        }
+
         // Reserved resources must parse
         parse_resource_value(&self.resources.reserved_cpu).map_err(|_| {
             ConfigError::Validation {
@@ -293,6 +322,47 @@ mod tests {
     fn validate_valid_node_config_passes() {
         let nc = NodeConfig::default();
         nc.validate().unwrap();
+    }
+
+    #[test]
+    fn upgrades_section_defaults() {
+        let nc = NodeConfig::default();
+        assert_eq!(nc.upgrades.retain_versions, 3);
+        assert_eq!(nc.upgrades.max_boot_attempts, 2);
+        assert!(nc.upgrades.external_signing_key.is_none());
+        assert!(nc.upgrades.release_keys_override.is_none());
+        nc.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_external_signing_key() {
+        let mut nc = NodeConfig::default();
+        nc.upgrades.external_signing_key = Some("not-a-key".to_string());
+        assert!(matches!(nc.validate(), Err(ConfigError::Validation { .. })));
+    }
+
+    #[test]
+    fn release_keys_override_requires_valid_keys() {
+        let mut nc = NodeConfig::default();
+        nc.upgrades.release_keys_override = Some(vec!["ed25519:c2hvcnQ=".to_string()]); // valid base64, wrong length
+        assert!(matches!(nc.validate(), Err(ConfigError::Validation { .. })));
+    }
+
+    #[test]
+    fn upgrades_retain_versions_zero_rejected() {
+        let mut nc = NodeConfig::default();
+        nc.upgrades.retain_versions = 0;
+        assert!(matches!(nc.validate(), Err(ConfigError::Validation { .. })));
+    }
+
+    #[test]
+    fn upgrades_relative_binary_dir_rejected() {
+        let mut nc = NodeConfig::default();
+        nc.upgrades.binary_dir = Some(PathBuf::from("relative/bin"));
+        assert!(matches!(
+            nc.validate(),
+            Err(ConfigError::NonAbsolutePath { .. })
+        ));
     }
 
     #[test]

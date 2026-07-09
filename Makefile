@@ -13,6 +13,15 @@ release: ## Compile all crates (optimised release)
 test: ## Run all tests
 	$(CARGO) test
 
+test-upgrade: ## Run the real-binary self-upgrade integration tests (slow: spawns real bun processes)
+	RELIABURGER_UPGRADE_TESTS=1 $(CARGO) test --test self_upgrade --test self_upgrade_cluster -- --test-threads=1
+
+test-upgrade-node: ## Run only the single-node self-upgrade tests (what CI runs)
+	RELIABURGER_UPGRADE_TESTS=1 $(CARGO) test --test self_upgrade -- --test-threads=1
+
+test-upgrade-cluster: ## Run only the cluster self-upgrade tests (needs a real multi-core machine, not CI)
+	RELIABURGER_UPGRADE_TESTS=1 $(CARGO) test --test self_upgrade_cluster -- --test-threads=1
+
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check
 

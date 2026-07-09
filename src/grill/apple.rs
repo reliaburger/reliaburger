@@ -114,6 +114,12 @@ impl Default for AppleContainerGrill {
 }
 
 impl super::Grill for AppleContainerGrill {
+    // TODO(Phase 14 follow-up): Apple Container adoption. The trait default
+    // declines adopt(), so Apple workloads restart after a self-upgrade.
+    fn runtime_kind(&self) -> super::records::RuntimeKind {
+        super::records::RuntimeKind::Apple
+    }
+
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         // Extract image from OCI root path. The root.path holds the image
         // reference for Apple Container (it's the OCI image, not a rootfs path).

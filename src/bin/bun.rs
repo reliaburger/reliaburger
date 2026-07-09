@@ -162,7 +162,13 @@ async fn refresh_token_store(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    println!("bun: reliaburger node agent v{}", env!("CARGO_PKG_VERSION"));
+    // Resolve the running version from the real executable path (not argv[0]):
+    // in debug builds a `.version` sidecar next to the binary can override it,
+    // which is how self-upgrade integration tests fake old/new versions.
+    let exe_path = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("failed to resolve current executable path: {e}"))?;
+    let running_version = reliaburger::upgrade::resolve_running_version(&exe_path);
+    println!("bun: reliaburger node agent {running_version}");
 
     // Load node config
     let config = if let Some(ref path) = cli.config {
@@ -198,8 +204,80 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Writable base for node-local runtime state (instance records,
+    // upgrade markers). Prefers the configured data dir, falls back to the
+    // user data dir like the metrics/logs stores below.
+    let data_base = if std::fs::create_dir_all(&config.storage.data).is_ok() {
+        config.storage.data.clone()
+    } else {
+        let fallback = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+            .join("reliaburger");
+        std::fs::create_dir_all(&fallback)
+            .map_err(|e| anyhow::anyhow!("failed to create data directory: {e}"))?;
+        fallback
+    };
+
+    // Instance records + process log files ({data}/instances). Started
+    // workloads are recorded here so a future bun process (crash restart or
+    // self-upgrade exec) adopts them instead of restarting them.
+    let instances_dir = data_base.join("instances");
+    std::fs::create_dir_all(&instances_dir)
+        .map_err(|e| anyhow::anyhow!("failed to create instances directory: {e}"))?;
+
+    // Self-upgrade: build the manager and run startup recovery BEFORE any
+    // subsystem starts. A crash-looping new version reverts here; a freshly
+    // swapped-in version gets a verification marker to prove itself against.
+    let original_argv: Vec<String> = std::env::args().collect();
+    let upgrade_manager = match reliaburger::upgrade::manager::UpgradeManager::new(
+        &config.upgrades,
+        &data_base,
+        &exe_path,
+        running_version.clone(),
+        original_argv,
+    ) {
+        Ok(manager) => Some(manager),
+        Err(e) => {
+            eprintln!("bun: warning: self-upgrade unavailable: {e}");
+            None
+        }
+    };
+    let mut upgrade_verify = None;
+    if let Some(manager) = &upgrade_manager {
+        use reliaburger::upgrade::manager::StartupAction;
+        match manager.startup_action() {
+            Ok(StartupAction::Continue { verify }) => upgrade_verify = verify,
+            Ok(StartupAction::ExecPrevious) => {
+                // Only returns on error; on success the process is replaced.
+                let error = manager.exec_current_symlink();
+                anyhow::bail!("failed to exec previous version during revert: {error}");
+            }
+            Err(e) => eprintln!("bun: warning: upgrade startup recovery failed: {e}"),
+        }
+    }
+
+    // Debug-only test hook: a `{exe}.fail-boot` sidecar next to the resolved
+    // binary makes this process exit now, simulating a broken release. It
+    // runs AFTER startup recovery so each failed boot burns an attempt and
+    // the crash-loop revert machinery gets exercised for real. Release
+    // builds never contain this branch.
+    if cfg!(debug_assertions)
+        && let Ok(resolved) = std::fs::canonicalize(&exe_path)
+        && {
+            let mut name = resolved
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_default();
+            name.push(".fail-boot");
+            resolved.with_file_name(name).exists()
+        }
+    {
+        eprintln!("bun: fail-boot sidecar present; exiting (test hook)");
+        std::process::exit(101);
+    }
+
     // Select runtime
-    let runtime = select_runtime(&cli.runtime, container_nameserver).await?;
+    let runtime = select_runtime(&cli.runtime, container_nameserver, &instances_dir).await?;
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -412,6 +490,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Rolling-upgrade orchestrator: dormant unless this node is the Raft
+    // leader with an active upgrade in DesiredState (Phase 14).
+    if let Some(council) = api_council.clone() {
+        let control =
+            reliaburger::upgrade::orchestrator::HttpNodeControl::new(service_token.clone());
+        let orchestrator_cancel = shutdown.clone();
+        let orchestrator_node = node_name.clone();
+        tokio::spawn(async move {
+            reliaburger::upgrade::orchestrator::run_orchestrator(
+                council,
+                control,
+                orchestrator_node,
+                orchestrator_cancel,
+            )
+            .await;
+        });
+    }
+
     // Seed the auth token store from the council's SecurityState and keep it
     // refreshed. The middleware reads this store; without the refresh, a token
     // created after startup would never engage enforcement (the ≤5 s lag is
@@ -438,6 +534,13 @@ async fn main() -> anyhow::Result<()> {
     };
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
+    agent.set_records_dir(instances_dir.clone());
+    if let Some(manager) = upgrade_manager.clone() {
+        agent.set_upgrade_manager(manager);
+    }
+    // Adopt workloads that survived a previous bun process (restart or
+    // self-upgrade exec) BEFORE the agent loop starts reconciling.
+    agent.adopt_recorded_instances().await;
     let deploy_history = agent.deploy_history_handle();
 
     // Onion DNS: start the .internal responder when [dns] enables it,
@@ -754,7 +857,31 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
-    let app = api::router(
+    // A freshly swapped-in version must prove itself: after the boot grace
+    // period, ask the agent to verify that every pre-upgrade workload
+    // survived, then commit (or flag revert and exit).
+    // TODO(Phase 14, orchestration step): in cluster mode, also require
+    // gossip rejoin within upgrades.gossip_rejoin_secs before committing.
+    if let Some(marker) = upgrade_verify.take() {
+        let verify_tx = cmd_tx.clone();
+        let grace_secs = config.upgrades.boot_grace_secs;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if verify_tx
+                .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
+                    marker,
+                    response: tx,
+                })
+                .await
+                .is_ok()
+            {
+                let _ = rx.await;
+            }
+        });
+    }
+
+    let app = api::router_with_upgrade(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
         Some(Arc::clone(&log_store)),
@@ -768,6 +895,7 @@ async fn main() -> anyhow::Result<()> {
         api_membership.clone(),
         gitops_webhook_tx,
         api_port,
+        upgrade_manager.clone().map(Arc::new),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {
@@ -1141,12 +1269,22 @@ async fn main() -> anyhow::Result<()> {
 async fn select_runtime(
     name: &str,
     dns_nameserver: Option<std::net::Ipv4Addr>,
+    instances_dir: &std::path::Path,
 ) -> anyhow::Result<AnyGrill> {
     // Silence the unused warning on platforms without runc.
     let _ = dns_nameserver;
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
+            // Rebuild the process fallback in file-backed mode: workload
+            // output must go to files (not pipes) to survive a self-upgrade
+            // exec and support adoption.
+            let runtime = match runtime {
+                AnyGrill::Process(_) => {
+                    AnyGrill::Process(ProcessGrill::with_log_dir(instances_dir.to_path_buf()))
+                }
+                other => other,
+            };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
                 #[cfg(target_os = "linux")]
@@ -1159,7 +1297,9 @@ async fn select_runtime(
         }
         "process" => {
             println!("bun: using process runtime");
-            Ok(AnyGrill::Process(ProcessGrill::new()))
+            Ok(AnyGrill::Process(ProcessGrill::with_log_dir(
+                instances_dir.to_path_buf(),
+            )))
         }
         #[cfg(target_os = "linux")]
         "runc" => {
