@@ -18,6 +18,7 @@ pub struct MockGrill {
     state_overrides: Arc<Mutex<HashMap<InstanceId, ContainerState>>>,
     exit_codes: Arc<Mutex<HashMap<InstanceId, Option<i32>>>>,
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
+    container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
 }
 
 impl MockGrill {
@@ -58,6 +59,13 @@ impl MockGrill {
             .lock()
             .unwrap()
             .insert(instance.clone(), adopted);
+    }
+
+    /// Make `container_ip()` report `ip` for every instance, simulating a
+    /// runtime with per-container networking.
+    #[allow(dead_code)]
+    pub fn set_container_ip(&self, ip: std::net::Ipv4Addr) {
+        *self.container_ip.lock().unwrap() = Some(ip);
     }
 }
 
@@ -120,6 +128,10 @@ impl super::Grill for MockGrill {
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
         let codes = self.exit_codes.lock().unwrap();
         codes.get(instance).copied().flatten()
+    }
+
+    async fn container_ip(&self, _instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
+        *self.container_ip.lock().unwrap()
     }
 
     async fn adopt(

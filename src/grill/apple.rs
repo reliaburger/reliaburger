@@ -44,16 +44,6 @@ impl AppleContainerGrill {
         }
     }
 
-    /// Get the container's IP address, if known.
-    ///
-    /// The IP is discovered after `start()` by inspecting the container.
-    /// Returns `None` if the container hasn't been started or the IP
-    /// couldn't be determined.
-    pub async fn container_ip(&self, instance: &InstanceId) -> Option<Ipv4Addr> {
-        let entries = self.entries.lock().await;
-        entries.get(instance).and_then(|e| e.container_ip)
-    }
-
     /// Discover a container's IP address from `container inspect`.
     ///
     /// Apple Container VMs get their IP via vmnet. The inspect output
@@ -339,6 +329,12 @@ impl super::Grill for AppleContainerGrill {
             .or_else(|| inspect["state"]["exitCode"].as_i64())
             .or_else(|| inspect["ExitCode"].as_i64())
             .map(|code| code as i32)
+    }
+
+    /// The container IP discovered during `start()` (see `discover_container_ip`).
+    async fn container_ip(&self, instance: &InstanceId) -> Option<Ipv4Addr> {
+        let entries = self.entries.lock().await;
+        entries.get(instance).and_then(|e| e.container_ip)
     }
 }
 
