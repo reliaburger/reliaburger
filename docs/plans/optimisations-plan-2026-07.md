@@ -521,7 +521,7 @@ CLI: `relish batch <file>` now serialises the full `[job.*]` specs into the requ
 1. `docs/book/12-squeezing-every-drop.md`: write the chapter intro ("why optimise now — everything works, now make it not embarrass us at scale") and the closing "Lessons learned" (the M2 TOCTOU, the library-not-wired trap from M21/X1, argv-vs-shell quoting, testing internet features offline). Verify every section from steps A-F landed; fix cross-references; one pass for the style guide (no em-dash spray, no "Notably,", vary sentence length).
 2. `docs/progress.md`: tick every Phase 12 box (lines 321-333), including flipping `[~]` book to `[x]`; clear the `[lib-only]`-style caveats this phase resolved (M21 volumes, L10 pickle, M2, X1); note the batch/build 501s are gone (line 190).
 3. `docs/README.md` + top-level `README.md`: new CLI commands (`relish snapshot ...`, `relish batch-status`), new endpoints table rows (`/v1/capacity`, `/v1/batch*`, `/v1/build*`, `/v1/snapshots*`), the uniform-registry-port constraint, snapshot config example, updated test counts, Phase 12 marked complete.
-4. `docs/review-2026-07.md` stays untouched (it's a point-in-time review) — progress.md is the living tracker.
+4. `docs/plans/review-2026-07.md` stays untouched (it's a point-in-time review) — progress.md is the living tracker.
 
 ## 6. Config additions summary
 

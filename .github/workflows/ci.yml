@@ -19,8 +19,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Format, lint, test
-        run: make ci
+      # Split out from `make ci` so each phase is timed separately in the
+      # Actions UI. Same fail-fast order as `ci: fmt-check lint test`.
+      - name: Format check
+        run: make fmt-check
+
+      - name: Lint (clippy)
+        run: make lint
+
+      - name: Test
+        run: make test
 
   linux-tests:
     runs-on: ubuntu-latest

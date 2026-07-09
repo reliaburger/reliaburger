@@ -52,7 +52,7 @@ From `docs/roadmap.md` §Phase 15 and `docs/design/cli-relish.md` §5:
 
 ### 2.2 The July review and graceful degradation
 
-`docs/review-2026-07.md` found many subsystems are library-only (Smoker enforcement L14/L15, eBPF L8, ingress L7, rollups L11, GitOps L13, egress L16, …). That wiring is being done **separately** and may land before, during, or after this phase.
+`docs/plans/review-2026-07.md` found many subsystems are library-only (Smoker enforcement L14/L15, eBPF L8, ingress L7, rollups L11, GitOps L13, egress L16, …). That wiring is being done **separately** and may land before, during, or after this phase.
 
 **Decision (user-confirmed): graceful skip.** Phase 15 tools detect unavailable subsystems at runtime and report them explicitly instead of failing:
 
@@ -427,7 +427,7 @@ pub enum TraceVerdict {
 
 ## 5. The test catalogue (39 cases)
 
-Names are behaviour sentences (project convention). Each case: apply config → wait → assert via API → runner tears down the namespace. `requires` lists capabilities beyond the implicit ones. If an assertion depends on wiring that hasn't landed (per `docs/review-2026-07.md`), gate it on the capability and skip — never write a test that asserts broken behaviour just to pass.
+Names are behaviour sentences (project convention). Each case: apply config → wait → assert via API → runner tears down the namespace. `requires` lists capabilities beyond the implicit ones. If an assertion depends on wiring that hasn't landed (per `docs/plans/review-2026-07.md`), gate it on the capability and skip — never write a test that asserts broken behaviour just to pass.
 
 **scheduling** (requires: `Cluster`, `MultiNode` for #1)
 1. `schedule_fixed_replicas_across_nodes` — 3 replicas on ≥3 nodes land on ≥2 distinct nodes (guards review item H8), all Running.
