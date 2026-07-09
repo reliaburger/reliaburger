@@ -144,6 +144,7 @@ Some tests require specific runtimes or network access and are gated behind envi
 | `RELIABURGER_RUNC_TESTS=1` | runc container runtime tests (Linux only) |
 | `RELIABURGER_APPLE_CONTAINER_TESTS=1` | Apple Container tests (macOS only) |
 | `RELIABURGER_IMAGE_PULL_TESTS=1` | OCI image pull tests (requires network) |
+| `RELIABURGER_UPGRADE_TESTS=1` | real-binary self-upgrade tests (slow; also via `make test-upgrade`) |
 
 ### Benchmarks
 

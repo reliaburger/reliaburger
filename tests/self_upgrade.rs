@@ -19,6 +19,14 @@ use reliaburger::upgrade::types::{BinarySource, UpgradeDirective};
 /// How long to wait for slow conditions (binary boots, verification).
 const WAIT: Duration = Duration::from_secs(30);
 
+/// These tests spawn the real compiled binary under a supervisor loop and
+/// take minutes; they'd blow the default CI test job's timeout. Gated
+/// behind `RELIABURGER_UPGRADE_TESTS=1` (like the runc/eBPF suites), run
+/// via `make test-upgrade` or the dedicated CI job.
+fn upgrade_tests_enabled() -> bool {
+    std::env::var("RELIABURGER_UPGRADE_TESTS").is_ok()
+}
+
 struct RealNodeHarness {
     _root: tempfile::TempDir,
     bin_dir: PathBuf,
@@ -348,6 +356,10 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn single_node_upgrade_preserves_running_containers() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let mut harness = RealNodeHarness::start().await;
     assert_eq!(harness.version().await.as_deref(), Some("v0.1.0"));
@@ -383,6 +395,10 @@ async fn single_node_upgrade_preserves_running_containers() {
 
 #[tokio::test]
 async fn single_node_rollback_reverts_to_previous_version() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let mut harness = RealNodeHarness::start().await;
     harness.deploy_testapp("web", 46021).await;
@@ -409,6 +425,10 @@ async fn single_node_rollback_reverts_to_previous_version() {
 
 #[tokio::test]
 async fn failed_upgrade_triggers_automatic_rollback() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let mut harness = RealNodeHarness::start().await;
     harness.deploy_testapp("web", 46031).await;
@@ -461,6 +481,10 @@ async fn failed_upgrade_triggers_automatic_rollback() {
 
 #[tokio::test]
 async fn version_retention_gc_keeps_last_three() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let harness = RealNodeHarness::start().await;
 
@@ -489,6 +513,10 @@ async fn version_retention_gc_keeps_last_three() {
 
 #[tokio::test]
 async fn upgrade_rejects_bad_external_signature() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let harness = RealNodeHarness::start().await;
 

@@ -497,7 +497,7 @@ Two practical notes that will save you an afternoon. First, everything binds eph
 
 What we decided not to do: mock the supervisor (its behaviour under exec — *not waking up* — is part of what's under test), and share one harness across tests (isolation is the entire point; 40 seconds per test is the price and it's worth paying).
 
-Run them with `cargo test --test self_upgrade`. Next: teaching the *cluster* about upgrades — state in Raft, and a leader that walks the fleet.
+Run them with `make test-upgrade` (they're gated behind `RELIABURGER_UPGRADE_TESTS=1` — spawning real binaries under a supervisor takes minutes, too slow for the default CI test job, so they live in their own workflow job like the runc and eBPF suites). Next: teaching the *cluster* about upgrades — state in Raft, and a leader that walks the fleet.
 
 ## 14.8 Where upgrade state lives
 

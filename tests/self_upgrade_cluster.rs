@@ -4,14 +4,14 @@
 //! test plays systemd for each of them and drives upgrades through the
 //! same HTTP API relish uses. These are the slowest tests in the repo
 //! (a couple of minutes each) — they earn it by proving the rolling walk,
-//! the leadership transfer, pause/resume, and cluster rollback against
-//! real processes exec'ing themselves.
+//! leader-last in-place upgrade, pause/resume, and cluster rollback
+//! against real processes exec'ing themselves.
 //!
 //! Note on roles: with four nodes the council reconciler makes ALL of
 //! them Raft voters (the cap is seven), so "worker" here is a role in
 //! the upgrade plan, not a Raft status. The ordering mechanics the tests
-//! assert — workers first, council one at a time, leadership transfer,
-//! former leader last — are exactly the mechanics under test.
+//! assert — workers first, council one at a time, leader last (in place)
+//! — are exactly the mechanics under test.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +23,14 @@ use reliaburger::upgrade::signing::{self, encode_public_key};
 
 /// Cluster operations are slow: convergence, four swaps, verification.
 const WAIT: Duration = Duration::from_secs(180);
+
+/// Four real bun processes per test, minutes each — far past the default
+/// CI test job's budget. Gated behind `RELIABURGER_UPGRADE_TESTS=1` (like
+/// the runc/eBPF suites); run via `make test-upgrade` or the dedicated CI
+/// job.
+fn upgrade_tests_enabled() -> bool {
+    std::env::var("RELIABURGER_UPGRADE_TESTS").is_ok()
+}
 
 /// Every test boots a full cluster; running them concurrently starves the
 /// machine. One at a time.
@@ -456,6 +464,10 @@ fn phase_label(value: &serde_json::Value) -> String {
 
 #[tokio::test]
 async fn rolling_upgrade_walks_workers_council_then_leader() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
@@ -504,6 +516,10 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
 
 #[tokio::test]
 async fn upgrade_failure_pauses_cluster_and_reverts_node() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
@@ -575,6 +591,10 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 
 #[tokio::test]
 async fn cluster_rollback_returns_every_node_to_previous_version() {
+    if !upgrade_tests_enabled() {
+        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
+        return;
+    }
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
