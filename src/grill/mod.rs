@@ -13,6 +13,7 @@ pub mod mock;
 pub mod netns;
 pub mod oci;
 pub mod port;
+pub mod portmap;
 pub mod process;
 pub mod process_workload;
 pub mod records;

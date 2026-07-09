@@ -103,6 +103,69 @@ That last test is a direct statistical measurement rather than a property-based 
 
 **Reuse beats reinventing, again.** "Seekable compression" sounded like a new container format with frame boundaries and an index. It turned out to be one line — set the codec to ZSTD — because Parquet's row groups already give random access. The whole storage layer keeps paying off the Chapter 6 decision to stand on Arrow, DataFusion, and Parquet rather than roll our own.
 
+## One rule to map them all
+
+The second pass moves from storage to networking. Here's what happens today when a packet arrives on a published port, say 30017. The kernel enters our `prerouting` chain and starts checking rules. `tcp dport 30001 dnat to 10.0.2.2:8080`? No. `tcp dport 30002 dnat to 10.0.2.3:8080`? No. It keeps going, one rule per container, until it hits the one that matches. Fifty containers, fifty rules, and the unlucky packet checks all of them. That's O(n) in the hot path of every inbound connection, and it's exactly the design kube-proxy got hammered for at scale.
+
+We've already solved this shape of problem once. Chapter 3's eBPF service discovery put backend lookups in a kernel hash map — `(vip, port)` in, backend out, O(1) no matter how many services exist. nftables has the same trick built in, no eBPF required: a **named map**.
+
+```
+nft add map ip reliaburger portmap '{ type inet_service : ipv4_addr . inet_service ; }'
+nft add rule ip reliaburger prerouting dnat ip addr . port to tcp dport map @portmap
+```
+
+The first line declares a typed map: service port in, "address . port" pair out (the `.` builds a concatenation — nftables' way of saying tuple). The second line is the only rule the chain needs, ever. It says: take the packet's TCP destination port, look it up in `@portmap`, and DNAT to whatever the map returns. Adding a container is no longer "append a rule"; it's "insert an element":
+
+```
+nft add element ip reliaburger portmap '{ 30017 : 10.0.2.5 . 8080 }'
+```
+
+One rule, one hash lookup, any number of containers. Removal gets better too, and this is the part I'm happiest about. The old code deleted a rule by running `nft -a list`, grepping the text output for the right rule, and parsing a handle number off the end of the line. Parsing the output of a CLI tool to undo your own change is a smell you learn to flinch at. With a map, deletion is `delete element ... { 30017 }` — keyed by the port we already know. No listing, no parsing, O(1).
+
+### The Rust shape: generate argv, don't build strings
+
+The new module (`src/grill/portmap.rs`) splits the work the same way the firewall chapter did: pure functions that *generate* commands, and a thin executor that *runs* them. The generators return `Vec<String>` — argv, not a shell string:
+
+```rust
+pub fn element_add(entry: &PortMapEntry) -> Vec<String> {
+    ["add", "element", "ip", TABLE, MAP,
+     &format!("{{ {} : {} . {} }}",
+         entry.host_port, entry.container_ip, entry.container_port)]
+    .into_iter().map(String::from).collect()
+}
+```
+
+Why argv? Look at that last element: `{ 30017 : 10.0.2.5 . 8080 }`. In a shell, braces and spaces mean quoting, and quoting means the bug where your test passes and production breaks because something interpolated differently. Passed as a single argv element via `Command::args`, there is no shell and nothing to quote — `nft` receives the block exactly as we built it and joins the arguments itself. (Also note `{{` and `}}` in the `format!` string: that's how you write a literal brace, since `{}` is the placeholder syntax.)
+
+Execution goes behind a trait, and this one introduces a Rust feature we haven't needed before:
+
+```rust
+pub trait NftExecutor: Send + Sync {
+    fn run(&self, args: &[String])
+    -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+```
+
+If you're coming from Go: this is an interface with one method, except the method is async. Rust makes you say that explicitly — an async method really returns a future, and `impl Future<...> + Send` declares "some future type, and it's safe to move across threads" without naming the type. The payoff is the same as in Go: production code plugs in `NftCommandExecutor` (which shells out to `nft`), and the tests plug in a `RecordingExecutor` that appends every argv to a list and can be scripted to fail on the nth call. All the interesting logic becomes testable on a Mac with no nftables in sight.
+
+And there is interesting logic, because batches can fail halfway. A container spec can publish several ports; if the second `add element` fails, we don't want the first one lingering as a half-applied mapping. `PortMapSet::apply` tracks what it added and rolls back on error:
+
+```rust
+if let Err(reason) = executor.run(&element_add(entry)).await {
+    for port in &added_this_call {
+        let _ = executor.run(&element_delete(*port)).await;
+        self.applied.remove(port);
+    }
+    return Err(PortMapError::ApplyFailed { ... });
+}
+```
+
+The same struct makes repeated applies *incremental* — a port that's already mapped is skipped, so re-registering a container's mappings after an agent restart doesn't error on duplicates. Both behaviours have direct unit tests (`apply_rolls_back_on_mid_batch_failure` asserts the exact argv sequence including the rollback delete; `apply_is_incremental` asserts the overlap is skipped), and they run everywhere precisely because the executor is a recording mock.
+
+One design note: `PortMapError` is its own small error enum rather than reusing the netns module's `NetnsError`. Not for purity — for portability. The netns module is `#[cfg(target_os = "linux")]`, and tying portmap to it would have dragged the whole module (tests included) into Linux-only territory. A two-variant enum was the cheaper way to keep the logic testable on every platform. The Linux boundary wraps it at the call site.
+
+Wiring this into the actual container network path — and sweeping away the old per-port rules on upgraded nodes — is the next pass.
+
 ---
 
-*The rest of Phase 12 — nftables maps, peer-to-peer image downloads, the pull-through cache, volume snapshots — lands in later passes, and this chapter will grow to cover them.*
+*Still to come in Phase 12: the map switchover in the network namespace layer, peer-to-peer image downloads, the pull-through cache, volume snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
