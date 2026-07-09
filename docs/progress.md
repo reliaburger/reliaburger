@@ -388,7 +388,7 @@ Implementation plan: [docs/tui-plan-2026-07.md](tui-plan-2026-07.md)
 - [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
 - [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption; pid+start-time fingerprinting; file-backed process logs). `[runc adoption unverified on Linux]`; AppleGrill adoption deferred (TODO in grill/apple.rs)
 - [x] Book chapter 14: "Changing the Tyres at Full Speed"
-- [x] All Phase 14 tests green (unit tests in the default suite; 5 single-node + 3 cluster real-binary integration tests gated behind `RELIABURGER_UPGRADE_TESTS=1` / `make test-upgrade`, run in their own CI job — they spawn real bun processes and are too slow for the default test job)
+- [x] All Phase 14 tests green (unit tests in the default suite; 5 single-node + 3 cluster real-binary integration tests gated behind `RELIABURGER_UPGRADE_TESTS=1`, too slow for the default test job). Single-node runs in the dedicated `upgrade-tests` CI job; the 4-node cluster suite is `make test-upgrade-cluster` on a real multi-core machine — it doesn't converge reliably on a contended 2-core CI runner (Raft membership-change RPC times out under load)
 
 Deferred wiring (seams marked with TODOs): scheduler cordoning awaits an
 in-binary `ClusterStateCache` (`meat::filter::apply_upgrade_cordon` is ready);

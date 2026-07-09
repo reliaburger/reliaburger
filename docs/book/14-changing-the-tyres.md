@@ -628,6 +628,8 @@ The fix has three interlocking parts, and the pattern is worth keeping: **make f
 
 These are the slowest tests in the repository — a couple of minutes each, serialised for the same starvation reasons as §14.7 — and the cheapest confidence per line in the whole phase. When someone asks whether the cluster can really upgrade itself, the answer is a test name.
 
+One honest operational note: they run on a *real* machine (`make test-upgrade-cluster`), not in CI. Four real `bun` processes, each with its own Raft TCP server and gossip, need enough cores to converge; on a contended 2-core shared CI runner the membership-change RPC times out under load and the council never forms. That's a property of *four real processes competing for two cores*, not of the upgrade logic — the single-node real-binary suite (§14.7) does run in CI, and the cluster mechanics are exercised deterministically by the mock-driven `step` unit tests (§14.9). The full-process cluster test is the belt-and-braces layer you point at a dev cluster, not the one that gates every push.
+
 What remains is bookkeeping: progress ticked, READMEs updated, and this chapter closed out with the lessons that only showed up in the doing.
 
 ## 14.12 Lessons learned
