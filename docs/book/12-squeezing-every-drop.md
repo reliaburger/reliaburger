@@ -257,6 +257,53 @@ The heal logic, being a plain function now, gets both kinds of coverage. Unit te
 
 A small fixture lesson from that last test: the shared push helper used constant layer bytes, so three "different" images shared every digest — and therefore one manifest. Content-addressed storage makes "distinct test data" something you must *construct*, not assume. The helper now varies layer content by repository name.
 
+## Rarest first, like BitTorrent
+
+With the catalogue in Raft and the heal loop keeping copies honest, we can finally make *pulls* fast: when a node needs an image, it should fetch layers from several peers at once instead of trickling them one at a time from whoever answers first. The interesting part isn't the downloading — it's deciding *which layer comes from which peer*, and that decision is a pure function.
+
+```rust
+pub fn plan_downloads(
+    needed: &[Digest],
+    local: &HashSet<Digest>,
+    catalog: &ManifestCatalog,
+    peers: &[Peer],
+    self_node: u64,
+) -> DownloadPlan
+```
+
+No I/O, no clock, no network. Everything the planner needs — who holds what — is already in the catalogue that Raft delivered. That's a deliberate design habit from earlier chapters: squeeze the decision-making into pure functions and leave thin I/O shells around them, because a pure function can be tested ten thousand times a second against inputs you'd never think to construct by hand. We'll cash that cheque below.
+
+The plan applies four rules. **Dedup**: a digest listed twice (a config blob doubling as a layer) is fetched once. **Skip local**: anything already in the blob store is excluded. **Rarest first**: layers are ordered by ascending holder count. **Balance**: each layer goes to the holding peer with the fewest assignments so far, ties broken by node id so plans are deterministic.
+
+Why rarest first, for a *download*? It sounds like a replication concern. The answer is what happens when ten nodes pull the same new image simultaneously — a rolling deploy does exactly this. Every completed fetch makes the fetching node a potential source for that layer. If everyone grabs the widely-held layers first, the layer with one copy stays at one copy while its sole holder gets hammered last, by everyone at once. If everyone grabs the scarce layers first, the scarce layers multiply fastest and the swarm feeds itself. BitTorrent figured this out twenty years ago; the copy count *is* the priority.
+
+Layers that no reachable peer holds land in a separate `unavailable` list rather than an error — the caller decides whether to fall back to an external registry (the pull-through cache, next section) or fail honestly.
+
+### Properties, not examples
+
+The example-based tests cover the four rules directly (`plan_orders_rarest_first`, `plan_balances_across_sources`, `plan_dedups_digests`, `plan_skips_local_layers`). But a planner's failure modes live in topologies nobody writes by hand — seven peers, thirty layers, holder sets that overlap in awkward ways. That's proptest territory, and if you know Python's Hypothesis or Go's rapid, it's the same idea: describe the *shape* of valid inputs, let the framework generate hundreds of instances, and assert things that must hold for all of them.
+
+```rust
+fn arbitrary_topology() -> impl Strategy<Value = (Vec<Vec<u64>>, u64)> {
+    (1u64..=8).prop_flat_map(|n_peers| {
+        (
+            proptest::collection::vec(
+                proptest::collection::btree_set(1u64..=n_peers, 0..=n_peers as usize)
+                    .prop_map(|s| s.into_iter().collect::<Vec<u64>>()),
+                1..40,
+            ),
+            Just(n_peers),
+        )
+    })
+}
+```
+
+A `Strategy` is a recipe for generating values — here "pick a peer count, then generate up to forty layers, each held by a random subset of those peers". `prop_flat_map` is how one generated value (the peer count) constrains the next (the subsets). When a property fails, proptest *shrinks*: it re-runs with progressively smaller inputs until it finds the minimal failing case, which is usually so small you can see the bug by staring at it.
+
+Two properties hold for arbitrary topologies: every layer with at least one live holder is assigned exactly once (and holderless layers all land in `unavailable`), and no layer is ever assigned to a peer that doesn't hold it. The third — the balance bound — taught us something during writing. The draft property said "no peer gets more than ⌈layers/peers⌉ + 1". Generate freely and that's simply false: if one peer is the *sole holder* of ten layers, it must serve all ten, and no assignment strategy can help. The bound only holds when layers share the same holder set, so that's what the test generates — a uniform topology, where greedy least-loaded provably stays within ⌈n/k⌉. Property-based testing is good at this: it doesn't just check your code, it audits your *claims*, and it found the false one before a reviewer had to.
+
+The parallel executor that runs these plans — bounded concurrency, retry against an alternate holder — is the next section, where the planner meets the wire.
+
 ---
 
-*Still to come in Phase 12: peer-to-peer image downloads, the pull-through cache, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: the P2P executor and its wiring into image pulls, the pull-through cache, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
