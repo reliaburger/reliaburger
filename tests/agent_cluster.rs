@@ -242,6 +242,7 @@ async fn tcp_reporting_transport_round_trip() {
 
     // Client sends to server
     let report = StateReport {
+        has_buildah: false,
         node_id: NodeId::new("w1"),
         timestamp: SystemTime::now(),
         running_apps: vec![],
