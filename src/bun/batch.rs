@@ -603,6 +603,7 @@ mod tests {
         usage: crate::reporting::types::ResourceUsage,
     ) -> StateReport {
         StateReport {
+            has_buildah: false,
             node_id: node.clone(),
             timestamp: std::time::SystemTime::UNIX_EPOCH,
             running_apps: vec![],

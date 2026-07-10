@@ -97,6 +97,11 @@ pub struct ApiState {
         Option<tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>>,
     /// This node's gossip name, for batch self-dispatch short-circuits.
     pub node_name: Option<String>,
+    /// Async build tracker (Phase 12 F2). Node-local: builds live
+    /// where they were submitted; delegated builds proxy status reads.
+    pub build_registry: Arc<tokio::sync::Mutex<super::build_runner::BuildRegistry>>,
+    /// `[images] build_timeout_secs` — ceiling per buildah stage.
+    pub build_timeout_secs: u64,
 }
 
 /// Build the API router.
@@ -133,6 +138,7 @@ pub fn router(
         None,
         None,
         None,
+        900,
     )
 }
 
@@ -157,6 +163,7 @@ pub fn router_with_upgrade(
         tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>,
     >,
     node_name: Option<String>,
+    build_timeout_secs: u64,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -180,6 +187,10 @@ pub fn router_with_upgrade(
         )),
         aggregated_rx,
         node_name,
+        build_registry: Arc::new(tokio::sync::Mutex::new(
+            super::build_runner::BuildRegistry::default(),
+        )),
+        build_timeout_secs,
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
@@ -283,7 +294,15 @@ pub fn router_with_upgrade(
             post(super::batch::batch_report_handler),
         )
         .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
-        .route("/v1/build", post(build_submit_handler))
+        .route("/v1/build", post(super::build_runner::build_submit_handler))
+        .route(
+            "/v1/build/run",
+            post(super::build_runner::build_run_handler),
+        )
+        .route(
+            "/v1/build/{id}",
+            get(super::build_runner::build_status_handler),
+        )
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
         .route("/v1/token/create", post(token_create_handler))
@@ -2825,155 +2844,6 @@ async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
         })
         .collect();
     Json(serde_json::json!({"images": images}))
-}
-
-/// Submit a batch of jobs.
-///
-/// Not yet wired into the live agent. The batch scheduler (`schedule_batch`)
-/// and `BatchTracker` exist and are unit-tested, but resolving job specs,
-/// dispatching across the cluster, and tracking completion via the reporting
-/// tree are deferred to Phase 12. Returns 501 rather than pretending to accept.
-
-/// Request body for `/v1/build`.
-#[derive(serde::Deserialize)]
-struct BuildSubmitRequest {
-    name: String,
-    context_digest: String,
-    registry_port: u16,
-    spec: crate::config::build::BuildSpec,
-}
-
-/// Submit a build job: fetch the context blob from the local Pickle
-/// registry, run `buildah bud` + `buildah push` against it, and let the
-/// push land the image back in Pickle through the standard endpoints.
-///
-/// Requires `buildah` on PATH (Linux build nodes); without it the
-/// response says so honestly instead of pretending to accept (X1).
-/// The build runs synchronously — minutes-long builds hold the request
-/// open, matching the CLI's 300 s client timeout.
-async fn build_submit_handler(Json(request): Json<BuildSubmitRequest>) -> Response {
-    // Builder present?
-    if tokio::process::Command::new("buildah")
-        .arg("--version")
-        .output()
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "error": "build execution requires `buildah` on PATH \
-                          (available on Linux build nodes; not supported on macOS)"
-            })),
-        )
-            .into_response();
-    }
-
-    let job = match crate::pickle::build::execute_build(
-        &request.spec,
-        &request.context_digest,
-        Some(request.registry_port),
-    ) {
-        Ok(job) => job,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid build spec: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    // Fetch the context blob from the local registry.
-    let context_url =
-        crate::pickle::build::context_download_url(request.registry_port, &request.context_digest);
-    let context = match reqwest::get(&context_url).await {
-        Ok(response) if response.status().is_success() => match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({"error": format!("context read failed: {e}")})),
-                )
-                    .into_response();
-            }
-        },
-        _ => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "context blob {} not found in the registry",
-                        request.context_digest
-                    )
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    // Extract the tarred context (blocking IO off the runtime).
-    let build_dir = std::env::temp_dir()
-        .join("reliaburger-build")
-        .join(request.context_digest.replace(':', "-"));
-    let extract_dir = build_dir.clone();
-    let extracted = tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&extract_dir)?;
-        tar::Archive::new(&context[..]).unpack(&extract_dir)?;
-        Ok::<_, std::io::Error>(())
-    })
-    .await;
-    if !matches!(extracted, Ok(Ok(()))) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "failed to extract build context"})),
-        )
-            .into_response();
-    }
-
-    // Run the build, then the push. Both are external processes; the
-    // push targets the local registry, so the result lands in Pickle
-    // through the same handlers a `docker push` would use (real
-    // holders, catalog persistence, Raft propose — all for free).
-    for (label, cmd) in [("build", &job.build_cmd), ("push", &job.push_cmd)] {
-        let (program, args) = match cmd.split_first() {
-            Some(pair) => pair,
-            None => continue,
-        };
-        let output = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(&build_dir)
-            .output()
-            .await;
-        match output {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("buildah {label} failed for {}: {tail}", request.name)
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("failed to run buildah {label}: {e}")
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    Json(serde_json::json!({
-        "status": format!("built and pushed {}", job.local_tag),
-    }))
-    .into_response()
 }
 
 /// GitOps webhook handler.

@@ -1,0 +1,238 @@
+//! Integration tests for async image builds (Phase 12, F2).
+//!
+//! The async shape is the testable half on any platform: submit
+//! returns 202 or an honest 503, status polling round-trips, unknown
+//! ids 404. The full build (buildah + a real registry push) runs under
+//! `RELIABURGER_BUILDAH_TESTS=1` in the Lima VM.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use reliaburger::bun::agent::BunAgent;
+use reliaburger::bun::api;
+use reliaburger::grill::{PortAllocator, ProcessGrill};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+struct Harness {
+    base_url: String,
+    shutdown: CancellationToken,
+}
+
+impl Harness {
+    async fn start() -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let shutdown = CancellationToken::new();
+        let grill = ProcessGrill::new();
+        let port_allocator = PortAllocator::new(44000, 45000);
+        let agent_shutdown = shutdown.clone();
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let deploy_history = agent.deploy_history_handle();
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = api::router(
+            cmd_tx,
+            None,
+            None,
+            Some(deploy_history),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+        );
+        let server_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
+                .await
+                .ok();
+        });
+
+        let base_url = format!("http://127.0.0.1:{port}");
+        for _ in 0..20 {
+            if reqwest::get(format!("{base_url}/v1/health")).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Self { base_url, shutdown }
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+fn buildah_present() -> bool {
+    std::process::Command::new("buildah")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Without buildah and without peers, a submit is an honest 503 — not
+/// the old 501, and not a hang.
+#[tokio::test]
+async fn submit_without_any_builder_is_503() {
+    if buildah_present() {
+        eprintln!("skipping: this host has buildah, the 503 path can't trigger");
+        return;
+    }
+    let harness = Harness::start().await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "app",
+            "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "registry_port": 5050,
+            "spec": { "context": ".", "destination": "pickle://app:v1" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+}
+
+/// Unknown build ids are 404, not empty objects.
+#[tokio::test]
+async fn unknown_build_id_is_404() {
+    let harness = Harness::start().await;
+    let response = reqwest::get(format!("{}/v1/build/999", harness.base_url))
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+/// Roadmap (Phase 12): a real build — context blob in a real registry,
+/// buildah bud + push, manifest lands in the catalog — through the
+/// async submit/poll API. Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
+#[tokio::test]
+async fn buildah_build_lands_in_the_catalog() {
+    if std::env::var("RELIABURGER_BUILDAH_TESTS").is_err() {
+        eprintln!("skipping buildah test (set RELIABURGER_BUILDAH_TESTS=1 to enable)");
+        return;
+    }
+
+    // A real Pickle registry for the context blob and the pushed image.
+    use reliaburger::pickle::api::{PickleState, router as pickle_router};
+    use reliaburger::pickle::store::BlobStore;
+    use reliaburger::pickle::types::ManifestCatalog;
+    use tokio::sync::RwLock;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pickle_state = PickleState {
+        store: Arc::new(BlobStore::new(dir.path().join("blobs"))),
+        catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+        node_raft_id: 1,
+        council: None,
+        persist_path: None,
+    };
+    let registry_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry_port = registry_listener.local_addr().unwrap().port();
+    let registry_app = pickle_router(pickle_state.clone());
+    let registry_shutdown = CancellationToken::new();
+    let serve_shutdown = registry_shutdown.clone();
+    tokio::spawn(async move {
+        axum::serve(registry_listener, registry_app)
+            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
+
+    // Tar a trivial build context and upload it as the context blob.
+    let context_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context_dir.path().join("hello.txt"),
+        b"hello from the build",
+    )
+    .unwrap();
+    std::fs::write(
+        context_dir.path().join("Dockerfile"),
+        b"FROM scratch\nCOPY hello.txt /hello.txt\n",
+    )
+    .unwrap();
+    let tar_bytes = reliaburger::pickle::build::tar_context(context_dir.path()).unwrap();
+    let digest = reliaburger::pickle::build::digest_of(&tar_bytes);
+    let upload_url = reliaburger::pickle::build::context_upload_url(registry_port, &digest);
+    let response = reqwest::Client::new()
+        .post(&upload_url)
+        .body(tar_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201, "context upload failed");
+
+    // Run the build directly (the handler's spawned body).
+    let registry = Arc::new(tokio::sync::Mutex::new(
+        reliaburger::bun::build_runner::BuildRegistry::default(),
+    ));
+    let build_id = registry
+        .lock()
+        .await
+        .register(reliaburger::bun::build_runner::BuildState::Running);
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // No agent: drain (and fail) any signing request — standalone
+    // builds are unsigned by design.
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            if let reliaburger::bun::agent::AgentCommand::SignImage { response, .. } = cmd {
+                let _ = response.send(Err(reliaburger::bun::BunError::FaultRejected {
+                    reason: "no council in this test".to_string(),
+                }));
+            }
+        }
+    });
+
+    let request = reliaburger::bun::build_runner::BuildSubmitRequest {
+        name: "hello".to_string(),
+        context_digest: digest.clone(),
+        registry_port,
+        spec: toml::from_str(&format!(
+            r#"
+            context = "{}"
+            destination = "pickle://hello:v1"
+            "#,
+            context_dir.path().display()
+        ))
+        .unwrap(),
+    };
+    reliaburger::bun::build_runner::run_build(
+        request,
+        build_id,
+        Arc::clone(&registry),
+        cmd_tx,
+        Some(Arc::clone(&pickle_state.catalog)),
+        Duration::from_secs(600),
+    )
+    .await;
+
+    // The build completed and the image is in the catalog.
+    let state = registry.lock().await.get(build_id).unwrap();
+    assert!(
+        matches!(
+            &state,
+            reliaburger::bun::build_runner::BuildState::Completed { .. }
+        ),
+        "build did not complete: {state:?}"
+    );
+    let catalog = pickle_state.catalog.read().await;
+    assert!(
+        catalog.get_manifest_by_tag("hello", "v1").is_some(),
+        "built image missing from the catalog"
+    );
+
+    registry_shutdown.cancel();
+}

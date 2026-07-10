@@ -995,11 +995,35 @@ pub async fn build(path: &std::path::Path, registry_port: u16) -> Result<(), Rel
         println!("  build:  {}", job.build_cmd.join(" "));
         println!("  push:   {}", job.push_cmd.join(" "));
 
-        // Submit build job to agent
-        let result = client
+        // Submit and poll: builds run async on the builder node —
+        // minutes-long buildah runs must not hold an HTTP request open.
+        let build_id = client
             .submit_build(name, &digest, registry_port, spec)
             .await?;
-        println!("  {result}");
+        println!("  build {build_id} accepted; waiting...");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let status = client.build_status(build_id).await?;
+            match status["status"].as_str() {
+                Some("completed") => {
+                    println!(
+                        "  built and pushed {}",
+                        status["image"].as_str().unwrap_or("?")
+                    );
+                    break;
+                }
+                Some("failed") => {
+                    return Err(RelishError::ApiError {
+                        status: 0,
+                        body: format!(
+                            "build failed: {}",
+                            status["reason"].as_str().unwrap_or("unknown")
+                        ),
+                    });
+                }
+                _ => {} // running / delegated — keep polling
+            }
+        }
     }
 
     Ok(())

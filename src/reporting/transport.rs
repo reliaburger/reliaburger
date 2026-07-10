@@ -338,6 +338,7 @@ mod tests {
 
     fn sample_msg(name: &str) -> ReportingMessage {
         ReportingMessage::Report(StateReport {
+            has_buildah: false,
             node_id: NodeId::new(name),
             timestamp: SystemTime::now(),
             running_apps: vec![],

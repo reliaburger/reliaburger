@@ -919,6 +919,7 @@ async fn main() -> anyhow::Result<()> {
         // Batch capacity (F1): the leader's aggregated worker reports.
         api_aggregated_rx.clone(),
         Some(node_name.clone()),
+        config.images.build_timeout_secs,
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {

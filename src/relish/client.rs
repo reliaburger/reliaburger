@@ -937,7 +937,7 @@ impl BunClient {
         context_digest: &str,
         registry_port: u16,
         spec: &crate::config::build::BuildSpec,
-    ) -> Result<String, RelishError> {
+    ) -> Result<u64, RelishError> {
         let url = format!("{}/v1/build", self.base_url);
         let response = self
             .client
@@ -962,10 +962,25 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })?;
-        Ok(json["message"]
-            .as_str()
-            .unwrap_or("build submitted")
-            .to_string())
+        json["build_id"]
+            .as_u64()
+            .ok_or_else(|| RelishError::ApiError {
+                status,
+                body: format!("no build_id in response: {json}"),
+            })
+    }
+
+    /// Progress of a submitted build (`GET /v1/build/{id}`).
+    pub async fn build_status(&self, build_id: u64) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}/v1/build/{build_id}", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response.json().await.map_err(classify_error)
     }
 
     /// List API tokens from SecurityState.

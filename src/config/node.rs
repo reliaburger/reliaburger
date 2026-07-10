@@ -478,6 +478,8 @@ pub struct ImagesSection {
     /// Credentials for upstream registries the pull-through cache may
     /// authenticate to. Hosts not listed are accessed anonymously.
     pub external_registries: Vec<ExternalRegistrySection>,
+    /// Ceiling (seconds) per buildah stage of an image build.
+    pub build_timeout_secs: u64,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
 }
@@ -525,6 +527,7 @@ impl Default for ImagesSection {
             pull_through: true,
             cache_recheck_secs: 3600,
             external_registries: Vec::new(),
+            build_timeout_secs: 900,
             trust_policy: TrustPolicySection::default(),
         }
     }

@@ -448,6 +448,16 @@ Each running node watches its jobs to a terminal state by polling instance statu
 
 Completion reports are deliberately forgiving: reporting into an unknown batch id is a recorded no-op, not an error, because a leader restart loses the in-memory tracker and late reports from running nodes must not explode. The trade — batch status is best-effort across leader changes — is accepted and written down. `relish batch` now prints the batch id; `relish batch-status <id>` shows the tracker's live summary.
 
+## Building where the tools are
+
+The build endpoint arrived with the wiring merge in a working-but-synchronous form: fetch the context blob, run `buildah bud` and `buildah push`, answer when done. Its own comment admitted the flaw — it "matches the CLI's 300 s client timeout". Real image builds routinely take longer, and a build that outlives the HTTP request strands the client mid-response with the build still running. Client timeouts are a design forcing function: any operation that can exceed them must become *submit-and-poll*, and pretending otherwise just moves the failure to the worst possible moment.
+
+The refactor keeps the handler body — it was correct — and lifts it into a spawned runner behind a registry of build states: `POST /v1/build` answers `202 { build_id }` immediately, `GET /v1/build/{id}` reports `running`, `completed`, or `failed` with the last useful stderr, and each `buildah` stage now sits under `[images] build_timeout_secs` so a hung build terminates instead of squatting forever. `relish build` polls. Note what this tracker is *not*: unlike batches, there's no leader-side registry and no forwarding — a build lives on the node that accepted it, because there's nothing to aggregate.
+
+The second gap was placement. A macOS node — or any node without `buildah` — used to answer 501. Now capability travels with the state reports: each worker probes `buildah --version` once at startup and carries a `has_buildah` flag in every report, and a submit on an incapable node *delegates* — it picks a capable peer from the aggregated reports, forwards the request to that peer's `/v1/build/run`, and records the build locally as `Delegated { url, remote_id }` so status reads proxy through. The client polls one node and never learns the build ran elsewhere. No builder anywhere is an honest 503 naming the actual problem.
+
+Completion closes the trust loop from Phase 10: after the push lands the image in the local registry (real holders, catalog persistence, Raft propose — all through the standard push handlers), the runner looks up the manifest digest and asks the agent to sign it. Best-effort, deliberately: a standalone node has no council to sign with, and the failure mode is a printed warning telling you exactly what won't work (`require_signatures` deploys). The full circle is worth saying out loud: **build → push → replicate (heal loop) → sign → verify at schedule → deploy → serve**, every arrow now a real code path. That was the point of the phase.
+
 ---
 
-*Still to come in Phase 12: build execution. This chapter grows with each.*
+*That's the last construction section of Phase 12. The closing pass — lessons learned — follows.*

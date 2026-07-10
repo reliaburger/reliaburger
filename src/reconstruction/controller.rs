@@ -260,6 +260,7 @@ mod tests {
             reports.insert(
                 node_id.clone(),
                 StateReport {
+                    has_buildah: false,
                     node_id,
                     timestamp: SystemTime::now(),
                     running_apps: vec![],

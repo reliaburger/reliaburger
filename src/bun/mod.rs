@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod api;
 pub mod batch;
+pub mod build_runner;
 pub mod disk_pressure;
 pub mod gpu;
 pub mod health;
