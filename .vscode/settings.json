@@ -1,0 +1,8 @@
+{
+    // Give rust-analyzer its own target directory (target/rust-analyzer)
+    // so it stops invalidating the CLI's build cache — sharing
+    // target/debug caused rebuild ping-pong between check-on-save and
+    // cargo test/clippy runs (see reference_ci_toolchain memory note).
+    // Costs a one-time RA rebuild and duplicate build artifacts on disk.
+    "rust-analyzer.cargo.targetDir": true
+}
