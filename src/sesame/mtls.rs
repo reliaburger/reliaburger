@@ -2,11 +2,31 @@
 //!
 //! Builds rustls `ClientConfig` and `ServerConfig` that require both
 //! sides to present valid node certificates signed by the Node CA.
+//!
+//! Two things distinguish these from stock rustls configs:
+//!
+//! - Node certificates are signed by the **Node CA intermediate**, so both
+//!   sides present `[leaf, node-ca]` — WebPKI needs the intermediate to
+//!   build a path to the Root CA trust anchor.
+//! - Revocation comes from the Raft-replicated [`Crl`], shared through a
+//!   [`CrlHandle`], not from X.509 CRL files. Every handshake re-reads the
+//!   handle, so a `RevokeCertificate` write takes effect on the next
+//!   connection without rebuilding any config.
+//!
+//! Peer node certificates carry no DNS SANs (nodes are addressed by gossip
+//! IPs), so the client side uses [`PinnedChainServerVerifier`], which checks
+//! the chain against the pinned cluster CAs and skips hostname verification.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+
+use super::cert::{self, CertError};
+use super::identity_store::NodeIdentity;
+use super::types::Crl;
 
 /// Errors from mTLS operations.
 #[derive(Debug, thiserror::Error)]
@@ -19,14 +39,209 @@ pub enum MtlsError {
     InvalidKey(String),
 }
 
+/// A shared, updatable view of the cluster CRL.
+///
+/// Verifiers hold a clone and re-read it on every handshake; the owner
+/// (bun's security refresh ticker) replaces the contents whenever the
+/// Raft-replicated `SecurityState.crl` changes.
+#[derive(Debug, Clone, Default)]
+pub struct CrlHandle {
+    inner: Arc<RwLock<Crl>>,
+}
+
+impl CrlHandle {
+    /// Create a handle seeded with the given CRL.
+    pub fn new(crl: Crl) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(crl)),
+        }
+    }
+
+    /// Replace the CRL contents (called from the security refresh ticker).
+    pub fn update(&self, crl: Crl) {
+        // A poisoned lock only means a writer panicked mid-update; the data
+        // is a plain Vec swap, so recover rather than propagate the panic.
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        *guard = crl;
+    }
+
+    /// Check a certificate serial against the CRL.
+    pub fn check(&self, serial: super::types::SerialNumber) -> Result<(), CertError> {
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        cert::check_crl(serial, &guard)
+    }
+
+    /// Check every certificate in a presented chain against the CRL.
+    fn check_chain(&self, chain: &[&CertificateDer<'_>]) -> Result<(), rustls::Error> {
+        for der in chain {
+            let serial = cert::serial_from_der(der).map_err(cert_error_to_rustls)?;
+            self.check(serial).map_err(cert_error_to_rustls)?;
+        }
+        Ok(())
+    }
+}
+
+/// Map our certificate errors onto rustls's error vocabulary.
+fn cert_error_to_rustls(err: CertError) -> rustls::Error {
+    match err {
+        CertError::Revoked { .. } => {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked)
+        }
+        CertError::Expired => rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        CertError::NotYetValid => {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet)
+        }
+        CertError::ParseFailed(_) => {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        }
+        CertError::ChainInvalid(_) => {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)
+        }
+    }
+}
+
+/// A client-certificate verifier that delegates chain building to
+/// `WebPkiClientVerifier` and then rejects revoked certificates.
+#[derive(Debug)]
+pub struct RevocationCheckingClientVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    crl: CrlHandle,
+}
+
+impl ClientCertVerifier for RevocationCheckingClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        let mut chain: Vec<&CertificateDer<'_>> = vec![end_entity];
+        chain.extend(intermediates.iter());
+        self.crl.check_chain(&chain)?;
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// A server-certificate verifier for cluster peers.
+///
+/// Validates the presented certificate against the **pinned** Node CA and
+/// Root CA from this node's identity, checks the CRL, and deliberately
+/// skips hostname verification: peer node certificates carry no SANs and
+/// peers are dialled by gossip IP. The property this verifier establishes
+/// is "the peer holds a valid, unrevoked certificate from our Node CA".
+#[derive(Debug)]
+pub struct PinnedChainServerVerifier {
+    node_ca_der: Vec<u8>,
+    root_ca_der: Vec<u8>,
+    crl: CrlHandle,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl PinnedChainServerVerifier {
+    /// Build a verifier pinned to the given CA certificates.
+    pub fn new(node_ca_der: Vec<u8>, root_ca_der: Vec<u8>, crl: CrlHandle) -> Self {
+        Self {
+            node_ca_der,
+            root_ca_der,
+            crl,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
+
+impl ServerCertVerifier for PinnedChainServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        // Chain checks run against the pinned CAs, not whatever
+        // intermediates the peer chose to present.
+        cert::validate_chain(end_entity, &self.node_ca_der, &self.root_ca_der)
+            .map_err(cert_error_to_rustls)?;
+        self.crl.check_chain(&[end_entity])?;
+        let node_ca_serial =
+            cert::serial_from_der(&self.node_ca_der).map_err(cert_error_to_rustls)?;
+        self.crl
+            .check(node_ca_serial)
+            .map_err(cert_error_to_rustls)?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Build a rustls `ServerConfig` that requires client certificates.
 ///
-/// The server presents its own node certificate and verifies that
-/// connecting clients present a certificate signed by the Root CA.
+/// The server presents `[node cert, node CA]` and verifies that connecting
+/// clients present an unrevoked certificate chaining to the Root CA.
 pub fn build_mtls_server_config(
-    node_cert_der: &[u8],
-    node_key_der: &[u8],
-    root_ca_der: &[u8],
+    identity: &NodeIdentity,
+    crl: CrlHandle,
 ) -> Result<Arc<ServerConfig>, MtlsError> {
     // Install the ring crypto provider (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -34,54 +249,70 @@ pub fn build_mtls_server_config(
     // Build the trust store with the Root CA
     let mut root_store = RootCertStore::empty();
     root_store
-        .add(CertificateDer::from(root_ca_der.to_vec()))
+        .add(CertificateDer::from(identity.root_ca_der.clone()))
         .map_err(|e| MtlsError::InvalidCert(format!("root CA: {e}")))?;
 
-    // Build the client verifier (requires client certs signed by root CA)
-    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+    // Chain building goes through WebPKI; revocation through the CRL handle.
+    let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
         .build()
         .map_err(|e| MtlsError::ConfigFailed(format!("client verifier: {e}")))?;
+    let client_verifier = Arc::new(RevocationCheckingClientVerifier { inner: webpki, crl });
 
-    let cert = CertificateDer::from(node_cert_der.to_vec());
-    let key = PrivateKeyDer::try_from(node_key_der.to_vec())
-        .map_err(|e| MtlsError::InvalidKey(e.to_string()))?;
-
-    let config = ServerConfig::builder()
+    let (chain, key) = identity_chain_and_key(identity)?;
+    let mut config = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
+
+    // Disable session resumption: a resumed session skips client-cert
+    // verification, which would let a freshly revoked node reconnect with
+    // a ticket from before its revocation. Cluster connections are few and
+    // long-lived, so the extra full handshakes are cheap.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
 
     Ok(Arc::new(config))
 }
 
 /// Build a rustls `ClientConfig` for connecting to cluster peers.
 ///
-/// The client presents its own node certificate and verifies that
-/// the server presents a certificate signed by the Root CA.
+/// The client presents `[node cert, node CA]` and verifies the server
+/// against the pinned cluster CAs and the CRL (no hostname check — see
+/// [`PinnedChainServerVerifier`]).
 pub fn build_mtls_client_config(
-    node_cert_der: &[u8],
-    node_key_der: &[u8],
-    root_ca_der: &[u8],
+    identity: &NodeIdentity,
+    crl: CrlHandle,
 ) -> Result<Arc<ClientConfig>, MtlsError> {
     // Install the ring crypto provider (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Build the trust store with the Root CA
-    let mut root_store = RootCertStore::empty();
-    root_store
-        .add(CertificateDer::from(root_ca_der.to_vec()))
-        .map_err(|e| MtlsError::InvalidCert(format!("root CA: {e}")))?;
+    let verifier = Arc::new(PinnedChainServerVerifier::new(
+        identity.node_ca_der.clone(),
+        identity.root_ca_der.clone(),
+        crl,
+    ));
 
-    let cert = CertificateDer::from(node_cert_der.to_vec());
-    let key = PrivateKeyDer::try_from(node_key_der.to_vec())
-        .map_err(|e| MtlsError::InvalidKey(e.to_string()))?;
-
+    let (chain, key) = identity_chain_and_key(identity)?;
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(vec![cert], key)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
 
     Ok(Arc::new(config))
+}
+
+/// The certificate chain this node presents, plus its private key.
+fn identity_chain_and_key(
+    identity: &NodeIdentity,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), MtlsError> {
+    let chain = vec![
+        CertificateDer::from(identity.certificate_der.clone()),
+        CertificateDer::from(identity.node_ca_der.clone()),
+    ];
+    let key = PrivateKeyDer::try_from(identity.private_key_der.clone())
+        .map_err(|e| MtlsError::InvalidKey(e.to_string()))?;
+    Ok((chain, key))
 }
 
 /// Build a server-auth-only TLS config (for join flow before mTLS is established).
@@ -154,50 +385,199 @@ pub mod gossip_hmac {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sesame::ca;
-    use crate::sesame::types::SerialNumber;
+    use crate::sesame::ca::{self, CaHierarchy};
+    use crate::sesame::types::{CrlEntry, SerialNumber};
+    use std::time::SystemTime;
 
-    fn test_hierarchy() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-        let hierarchy = ca::generate_ca_hierarchy("test", b"ikm").unwrap();
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "node-01",
-            SerialNumber(10),
+    fn test_hierarchy(cluster: &str) -> CaHierarchy {
+        ca::generate_ca_hierarchy(cluster, b"ikm").unwrap()
+    }
+
+    fn identity_from(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> NodeIdentity {
+        let (cert_der, key_der, serial) = ca::issue_node_cert(
+            node_id,
+            SerialNumber(serial),
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
         )
         .unwrap();
-        (
-            cert_der,
-            key_der,
-            hierarchy.root.ca.certificate_der.clone(),
-            hierarchy.node.ca.certificate_der.clone(),
-        )
+        let now = SystemTime::now();
+        NodeIdentity {
+            node_id: node_id.to_string(),
+            certificate_der: cert_der,
+            private_key_der: key_der,
+            serial,
+            ca_generation: 0,
+            node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: now,
+            not_after: now + std::time::Duration::from_secs(365 * 24 * 3600),
+        }
     }
 
-    #[test]
-    fn build_mtls_server_config_succeeds() {
-        let (cert, key, root_ca, _) = test_hierarchy();
-        let _config = build_mtls_server_config(&cert, &key, &root_ca).unwrap();
-        // If we get here without error, the mTLS config was built successfully
-        // with a client cert verifier that requires node certs signed by the root CA.
+    fn crl_with(serial: u64) -> Crl {
+        Crl {
+            entries: vec![CrlEntry {
+                serial: SerialNumber(serial),
+                issuer: crate::sesame::types::CaRole::Node,
+                revoked_at: SystemTime::now(),
+                reason: "test revocation".to_string(),
+            }],
+            version: 1,
+            updated_at: SystemTime::now(),
+        }
     }
 
-    #[test]
-    fn build_mtls_client_config_succeeds() {
-        let (cert, key, root_ca, _) = test_hierarchy();
-        let _config = build_mtls_client_config(&cert, &key, &root_ca).unwrap();
+    /// Run a full TLS handshake plus one round trip over an in-memory
+    /// duplex pipe. Returns Ok(()) only if both sides complete.
+    async fn try_handshake(
+        server_config: Arc<ServerConfig>,
+        client_config: Arc<ClientConfig>,
+    ) -> Result<(), String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        // The pinned verifier ignores the name; WebPki-based configs in
+        // these tests never get far enough to check it.
+        let name = ServerName::try_from("peer.internal").unwrap();
+
+        let server = async {
+            let mut tls = acceptor
+                .accept(server_io)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
+            tls.write_all(b"pong").await.map_err(|e| e.to_string())?;
+            tls.shutdown().await.ok();
+            Ok::<(), String>(())
+        };
+        let client = async {
+            let mut tls = connector
+                .connect(name, client_io)
+                .await
+                .map_err(|e| e.to_string())?;
+            tls.write_all(b"ping").await.map_err(|e| e.to_string())?;
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        };
+
+        let (s, c) = tokio::join!(server, client);
+        s?;
+        c?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mtls_handshake_succeeds_between_two_issued_node_certs() {
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+
+        let server = build_mtls_server_config(&server_id, CrlHandle::default()).unwrap();
+        let client = build_mtls_client_config(&client_id, CrlHandle::default()).unwrap();
+
+        try_handshake(server, client).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mtls_server_refuses_a_client_without_a_certificate() {
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let server = build_mtls_server_config(&server_id, CrlHandle::default()).unwrap();
+
+        // A client that trusts the cluster CAs but presents no certificate.
+        let verifier = Arc::new(PinnedChainServerVerifier::new(
+            server_id.node_ca_der.clone(),
+            server_id.root_ca_der.clone(),
+            CrlHandle::default(),
+        ));
+        let client = Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+        );
+
+        let err = try_handshake(server, client).await.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("certificate"),
+            "expected a certificate-required failure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_server_refuses_a_client_cert_from_a_foreign_ca() {
+        let hierarchy = test_hierarchy("test");
+        let foreign = test_hierarchy("intruder");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let mut client_id = identity_from(&foreign, "node-99", 10);
+        // The intruder knows the real cluster's CA certs (they're public)
+        // but its own cert is signed by a different Node CA.
+        client_id.node_ca_der = foreign.node.ca.certificate_der.clone();
+        client_id.root_ca_der = hierarchy.root.ca.certificate_der.clone();
+
+        let server = build_mtls_server_config(&server_id, CrlHandle::default()).unwrap();
+        let client = build_mtls_client_config(&client_id, CrlHandle::default()).unwrap();
+
+        try_handshake(server, client).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn mtls_server_refuses_a_revoked_client_cert() {
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+
+        let server = build_mtls_server_config(&server_id, CrlHandle::new(crl_with(11))).unwrap();
+        let client = build_mtls_client_config(&client_id, CrlHandle::default()).unwrap();
+
+        let err = try_handshake(server, client).await.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("revoked") || err.to_lowercase().contains("certificate"),
+            "expected a revocation failure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_refuses_a_server_whose_cert_is_revoked() {
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+
+        let server = build_mtls_server_config(&server_id, CrlHandle::default()).unwrap();
+        let client = build_mtls_client_config(&client_id, CrlHandle::new(crl_with(10))).unwrap();
+
+        try_handshake(server, client).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn crl_updates_apply_to_new_handshakes_without_rebuilding_configs() {
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+
+        let server_crl = CrlHandle::default();
+        let server = build_mtls_server_config(&server_id, server_crl.clone()).unwrap();
+        let client = build_mtls_client_config(&client_id, CrlHandle::default()).unwrap();
+
+        // First handshake succeeds with an empty CRL.
+        try_handshake(server.clone(), client.clone()).await.unwrap();
+
+        // Revoke the client's serial through the shared handle — the same
+        // ServerConfig must now refuse the same client.
+        server_crl.update(crl_with(11));
+        try_handshake(server, client).await.unwrap_err();
     }
 
     #[test]
     fn build_server_auth_only_config_succeeds() {
-        let (_, _, root_ca, _) = test_hierarchy();
-        let _config = build_server_auth_only_client_config(&root_ca).unwrap();
-    }
-
-    #[test]
-    fn mtls_config_rejects_empty_cert() {
-        let result = build_mtls_server_config(&[], &[], &[]);
-        assert!(result.is_err());
+        let hierarchy = test_hierarchy("test");
+        let _config =
+            build_server_auth_only_client_config(&hierarchy.root.ca.certificate_der).unwrap();
     }
 
     #[test]

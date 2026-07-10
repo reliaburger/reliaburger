@@ -415,6 +415,18 @@ pub fn check_crl(serial: SerialNumber, crl: &Crl) -> Result<(), CertError> {
 
 CRLs are small (one entry per revoked cert, most clusters have few revocations). They propagate through Raft replication, so all council members have the same CRL. Worker nodes read it from their assigned council parent.
 
+### Wiring the CRL into TLS handshakes
+
+For a long time `check_crl()` had exactly one caller: its own tests. Making revocation real meant getting it into the TLS handshake path, and that surfaced three problems worth walking through.
+
+First, a design choice. rustls's `WebPkiClientVerifier` can enforce revocation natively, but it wants DER-encoded X.509 CRL files. We could generate those with rcgen — except every rebuild would need the Node CA private key (an unwrap of Raft-held material), plus a signing and expiry lifecycle for an artifact whose source of truth is already replicated and instantly fresh. So instead the verifiers share a `CrlHandle`, an `Arc<RwLock<Crl>>` that every handshake re-reads and a background ticker refreshes from `SecurityState`. Note it's `std::sync::RwLock`, not tokio's: rustls verifier traits are synchronous, and the critical section is a `Vec` scan. The "never `std::sync::Mutex` in async code" rule is about holding locks across `.await` points; there are none here.
+
+Second, a bug the old tests couldn't see. Our node certificates are signed by the Node CA *intermediate*, but the original config builders presented only the leaf and trusted only the Root CA. WebPKI can't build that path — every real handshake would have failed. The old tests only *constructed* configs, so they passed for months. The rewritten tests run actual handshakes over an in-memory `tokio::io::duplex` pipe, and the builders now present `[leaf, node-ca]`.
+
+There's a related wrinkle on the client side. Peer nodes are dialled by gossip IP and their certificates carry no DNS SANs, so rustls's default hostname verification would reject every peer. The client uses a custom `PinnedChainServerVerifier` instead: validate the presented certificate against the *pinned* cluster CAs, check the CRL, skip the hostname. The property we need is "this peer holds a valid, unrevoked Node CA certificate", and that's exactly what it checks — no more, no less.
+
+Third, the one the new tests caught on their first run. `crl_updates_apply_to_new_handshakes_without_rebuilding_configs` revokes a client's serial through the shared handle, reconnects, and expects a refusal. It got a success. TLS 1.3 session resumption: the client had a ticket from its first connection, and a resumed session skips client-certificate verification entirely. A freshly revoked node could have reconnected forever on old tickets. The server config now disables resumption (`NoServerSessionStorage`, zero tickets) — cluster connections are few and long-lived, so paying for a full handshake each time is nothing next to a revocation that doesn't revoke.
+
 ## Egress DNS resolution
 
 Apps can restrict outbound connections to specific destinations via `[egress] allow = ["api.stripe.com:443"]`. The initial resolution happens at deploy time using synchronous DNS. But hostnames can change IPs.
