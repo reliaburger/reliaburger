@@ -414,6 +414,16 @@ Which backend a volume got matters later — a loop mount must be unmounted, a s
 
 Two test notes. The quota integration test provisions its *own* filesystem — `truncate` a 1 GiB file, `mkfs.btrfs`, loop-mount it in a tempdir — so it assumes nothing about the host's disks, runs under the Lima gate (`RELIABURGER_BTRFS_TESTS=1`), and asserts an 11 MiB write into a 10 MiB volume fails at write *or* sync (Btrfs buffers; enforcement can arrive at either point — check both or flake). And the backend decision function briefly had swapped test arguments — three positional `bool`s in a row is an API that invites exactly that; the truth-table tests caught it before it shipped, which is their whole job.
 
+## Point-in-time for free
+
+Here's the payoff for insisting on subvolumes in the last section. A Btrfs snapshot is not a copy — it's a new subvolume whose metadata points at the same extents as the original, created in constant time regardless of size. Copy-on-write does the rest: as the live volume changes, only the changed blocks diverge. A 50 GiB database snapshots instantly and costs only what subsequently changes. That's why "snapshot" was never going to mean `cp -r` here, and why the non-Btrfs answer is a loud `UnsupportedFilesystem` error rather than a fallback: an rsync masquerading as a snapshot is slow, inconsistent under writes, and teaches operators the wrong expectations. Honest error beats fake feature.
+
+The mechanics are two argv builders away. Create is `btrfs subvolume snapshot -r <live> <dest>` — `-r` for read-only, because a backup you can accidentally write to isn't a backup. Restore is the same command in reverse *without* `-r` (the restored volume must be writable), preceded by `btrfs subvolume delete` of the live volume. Snapshots live under `{volumes_dir}/.snapshots/{ns}/{app}/{volume-slug}/{name}` with a `meta.json` beside each; names default to unix seconds from an injected clock (tests pass a fixed time, so naming is deterministic — no wall-clock in test assertions, ever).
+
+Restore's precondition does not belong to the filesystem layer. Swapping a subvolume under a running container corrupts the workload's view of its own data, so *the agent* — the thing that knows what's running — refuses to restore while any instance of the app is non-terminal, with a 409 at the API. The guard fires before any filesystem check, which has a pleasant testing consequence: the refusal tests on macOS with the mock runtime, no Btrfs required. Layering by knowledge: the snapshot manager knows filesystems, the agent knows workloads.
+
+One design choice worth defending: `snapshot create` with no `--volume` snapshots *every* provisioned volume of the app — discovered from the E1 sidecars on disk, not from the app's spec. The filesystem is the source of truth, which means you can snapshot (and restore) an app that's stopped, deleted from config, or mid-migration. The API is four routes under `/v1/snapshots/`, the CLI is `relish snapshot create|list|restore|delete`, and the roadmap's acceptance test runs verbatim on the Lima loopback-btrfs rig: write `v1`, snapshot, overwrite with garbage, restore, read `v1` back.
+
 ---
 
-*Still to come in Phase 12: volume snapshots, scheduled uploads, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: scheduled snapshot uploads, and batch/build execution. This chapter grows with each.*

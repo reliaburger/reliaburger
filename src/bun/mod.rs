@@ -58,6 +58,11 @@ pub enum BunError {
     #[error("fault rejected: {reason}")]
     FaultRejected { reason: String },
 
+    /// A volume snapshot operation failed (unsupported filesystem,
+    /// missing snapshot, running app on restore, btrfs failure).
+    #[error("snapshot: {0}")]
+    Snapshot(#[from] crate::grill::snapshot::SnapshotError),
+
     /// The workload has exceeded its restart limit.
     #[error(
         "instance {instance_id} exceeded restart limit: {restart_count}/{max_restarts} restarts"

@@ -22,6 +22,7 @@ pub mod records;
 pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
+pub mod snapshot;
 pub mod state;
 pub mod volume;
 

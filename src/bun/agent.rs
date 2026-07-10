@@ -143,6 +143,37 @@ pub enum AgentCommand {
     ChaosStatus {
         response: oneshot::Sender<ChaosState>,
     },
+    /// Snapshot an app's managed volumes (one volume, or all of them).
+    SnapshotCreate {
+        namespace: String,
+        app_name: String,
+        /// Container mount path to snapshot; `None` = every
+        /// provisioned volume of the app.
+        volume: Option<String>,
+        name: Option<String>,
+        response: oneshot::Sender<Result<Vec<crate::grill::snapshot::SnapshotMeta>, BunError>>,
+    },
+    /// List an app's snapshots, newest first.
+    SnapshotList {
+        namespace: String,
+        app_name: String,
+        response: oneshot::Sender<Result<Vec<crate::grill::snapshot::SnapshotMeta>, BunError>>,
+    },
+    /// Restore a snapshot over its live volume. Refused while the app
+    /// has running instances.
+    SnapshotRestore {
+        namespace: String,
+        app_name: String,
+        name: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Delete a snapshot.
+    SnapshotDelete {
+        namespace: String,
+        app_name: String,
+        name: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Resolve a service name to its VIP and backends.
     Resolve {
         app_name: String,
@@ -584,6 +615,68 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The constructors default it; the binary overrides from config.
     pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {
         self.volumes_dir = dir;
+    }
+
+    /// Snapshot one volume of an app — or, with `volume: None`, every
+    /// provisioned volume (discovered from sidecars, so this works for
+    /// stopped apps too). Multi-volume snapshots share one timestamp.
+    fn snapshot_create(
+        &self,
+        namespace: &str,
+        app_name: &str,
+        volume: Option<String>,
+        name: Option<String>,
+    ) -> Result<Vec<crate::grill::snapshot::SnapshotMeta>, BunError> {
+        let volumes = match volume {
+            Some(v) => vec![v],
+            None => {
+                let found = crate::grill::volume::VolumeManager::new(&self.volumes_dir)
+                    .provisioned_volumes(namespace, app_name);
+                if found.is_empty() {
+                    return Err(crate::grill::snapshot::SnapshotError::NoVolumes {
+                        namespace: namespace.to_string(),
+                        app: app_name.to_string(),
+                    }
+                    .into());
+                }
+                found
+            }
+        };
+
+        let manager = crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir);
+        let now = std::time::SystemTime::now();
+        let mut metas = Vec::with_capacity(volumes.len());
+        for volume_path in &volumes {
+            metas.push(manager.create(namespace, app_name, volume_path, name.as_deref(), now)?);
+        }
+        Ok(metas)
+    }
+
+    /// Restore a snapshot — refused while the app has instances that
+    /// aren't terminal, because swapping a subvolume under a live
+    /// workload corrupts both the workload's view and the data.
+    fn snapshot_restore(
+        &self,
+        namespace: &str,
+        app_name: &str,
+        name: &str,
+    ) -> Result<(), BunError> {
+        let running = self.supervisor.list_instances().into_iter().any(|i| {
+            i.app_name == app_name
+                && i.namespace == namespace
+                && !matches!(i.state, ContainerState::Stopped | ContainerState::Failed)
+        });
+        if running {
+            return Err(crate::grill::snapshot::SnapshotError::AppRunning {
+                namespace: namespace.to_string(),
+                app: app_name.to_string(),
+            }
+            .into());
+        }
+
+        crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir)
+            .restore(namespace, app_name, name)
+            .map_err(BunError::from)
     }
 
     /// Enable or disable the perimeter firewall. In-process multi-node tests
@@ -1220,6 +1313,44 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::ChaosStatus { response } => {
                 let state = self.get_chaos_state();
                 let _ = response.send(state);
+            }
+            AgentCommand::SnapshotCreate {
+                namespace,
+                app_name,
+                volume,
+                name,
+                response,
+            } => {
+                let _ = response.send(self.snapshot_create(&namespace, &app_name, volume, name));
+            }
+            AgentCommand::SnapshotList {
+                namespace,
+                app_name,
+                response,
+            } => {
+                let manager = crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir);
+                let _ = response.send(manager.list(&namespace, &app_name).map_err(BunError::from));
+            }
+            AgentCommand::SnapshotRestore {
+                namespace,
+                app_name,
+                name,
+                response,
+            } => {
+                let _ = response.send(self.snapshot_restore(&namespace, &app_name, &name));
+            }
+            AgentCommand::SnapshotDelete {
+                namespace,
+                app_name,
+                name,
+                response,
+            } => {
+                let manager = crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir);
+                let _ = response.send(
+                    manager
+                        .delete(&namespace, &app_name, &name)
+                        .map_err(BunError::from),
+                );
             }
             AgentCommand::InjectFault { request, response } => {
                 // Safety rails first (L14): reject faults that risk
@@ -4105,6 +4236,78 @@ mod tests {
             !volumes_dir.path().join("default").exists(),
             "host-path volumes must not create managed directories"
         );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// Phase 12 E2: restoring a snapshot under a running app is
+    /// refused — the guard fires before any filesystem checks, so this
+    /// tests on every platform.
+    #[tokio::test]
+    async fn snapshot_restore_refused_while_app_runs() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let events = send_deploy(&tx, basic_config()).await;
+        expect_complete(&events);
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::SnapshotRestore {
+            namespace: "default".to_string(),
+            app_name: "web".to_string(),
+            name: "whatever".to_string(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+        let result = resp_rx.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(BunError::Snapshot(
+                    crate::grill::snapshot::SnapshotError::AppRunning { .. }
+                ))
+            ),
+            "expected AppRunning, got {result:?}"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// Phase 12 E2: snapshotting an app with no provisioned volumes is
+    /// an honest NoVolumes error, not an empty success.
+    #[tokio::test]
+    async fn snapshot_create_without_volumes_errors() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::SnapshotCreate {
+            namespace: "default".to_string(),
+            app_name: "ghost".to_string(),
+            volume: None,
+            name: None,
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+        let result = resp_rx.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(BunError::Snapshot(
+                crate::grill::snapshot::SnapshotError::NoVolumes { .. }
+            ))
+        ));
 
         shutdown.cancel();
         let _ = handle.await;

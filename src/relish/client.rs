@@ -344,6 +344,104 @@ impl BunClient {
         Ok(())
     }
 
+    /// Snapshot an app's managed volumes; returns the created
+    /// snapshots' metadata.
+    pub async fn snapshot_create(
+        &self,
+        app: &str,
+        namespace: &str,
+        volume: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}/v1/snapshots/{}/{}", self.base_url, namespace, app);
+        let body = serde_json::json!({ "volume": volume, "name": name });
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response.json().await.map_err(classify_error)
+    }
+
+    /// List an app's snapshots, newest first.
+    pub async fn snapshot_list(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}/v1/snapshots/{}/{}", self.base_url, namespace, app);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response.json().await.map_err(classify_error)
+    }
+
+    /// Restore a snapshot over its live volume. The app must be
+    /// stopped first; a 409 means it isn't.
+    pub async fn snapshot_restore(
+        &self,
+        app: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}/v1/snapshots/{}/{}/restore",
+            self.base_url, namespace, app
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
+    /// Delete a snapshot.
+    pub async fn snapshot_delete(
+        &self,
+        app: &str,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}/v1/snapshots/{}/{}/{}",
+            self.base_url, namespace, app, name
+        );
+        let response = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// Get logs for an app.
     ///
     /// When `follow` is false, returns the (optionally tailed) log output

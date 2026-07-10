@@ -220,6 +220,18 @@ pub fn router_with_upgrade(
         .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
+        .route(
+            "/v1/snapshots/{namespace}/{app}",
+            get(snapshot_list_handler).post(snapshot_create_handler),
+        )
+        .route(
+            "/v1/snapshots/{namespace}/{app}/restore",
+            post(snapshot_restore_handler),
+        )
+        .route(
+            "/v1/snapshots/{namespace}/{app}/{name}",
+            axum::routing::delete(snapshot_delete_handler),
+        )
         .route("/v1/fault", post(fault_inject_handler))
         .route("/v1/fault", axum::routing::delete(fault_clear_all_handler))
         .route("/v1/fault", get(fault_list_handler))
@@ -1640,6 +1652,180 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
 
     match resp_rx.await {
         Ok(status) => Json(serde_json::json!(status)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume snapshots (Phase 12 E2)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+struct SnapshotCreateBody {
+    /// Container mount path; omitted = every provisioned volume.
+    volume: Option<String>,
+    /// Custom snapshot name; omitted = unix-seconds timestamp.
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotRestoreBody {
+    name: String,
+}
+
+/// Map snapshot failures to honest status codes: a running app is a
+/// conflict, missing things are 404, a non-btrfs volume is the
+/// client's setup problem, anything else is ours.
+fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
+    use crate::grill::snapshot::SnapshotError;
+    let status = match error {
+        crate::bun::BunError::Snapshot(SnapshotError::AppRunning { .. }) => StatusCode::CONFLICT,
+        crate::bun::BunError::Snapshot(
+            SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
+        ) => StatusCode::NOT_FOUND,
+        crate::bun::BunError::Snapshot(SnapshotError::UnsupportedFilesystem { .. }) => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+async fn snapshot_create_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app)): Path<(String, String)>,
+    body: Option<Json<SnapshotCreateBody>>,
+) -> Response {
+    let Json(body) = body.unwrap_or_default();
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotCreate {
+            namespace,
+            app_name: app,
+            volume: body.volume,
+            name: body.name,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(metas)) => (StatusCode::CREATED, Json(serde_json::json!(metas))).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn snapshot_list_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app)): Path<(String, String)>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotList {
+            namespace,
+            app_name: app,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(metas)) => Json(serde_json::json!(metas)).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn snapshot_restore_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app)): Path<(String, String)>,
+    Json(body): Json<SnapshotRestoreBody>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotRestore {
+            namespace,
+            app_name: app,
+            name: body.name,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(())) => Json(serde_json::json!({ "restored": true })).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn snapshot_delete_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app, name)): Path<(String, String, String)>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotDelete {
+            namespace,
+            app_name: app,
+            name,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(())) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),

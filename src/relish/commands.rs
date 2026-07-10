@@ -1173,6 +1173,73 @@ pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Snapshot an app's managed volumes.
+pub async fn snapshot_create(
+    app: &str,
+    namespace: &str,
+    volume: Option<&str>,
+    name: Option<&str>,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let metas = client.snapshot_create(app, namespace, volume, name).await?;
+    if let Some(list) = metas.as_array() {
+        for meta in list {
+            println!(
+                "created snapshot {} of {} ({} bytes)",
+                meta["name"].as_str().unwrap_or("?"),
+                meta["volume_path"].as_str().unwrap_or("?"),
+                meta["size_bytes"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// List an app's snapshots, newest first.
+pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let metas = client.snapshot_list(app, namespace).await?;
+    let Some(list) = metas.as_array() else {
+        println!("no snapshots");
+        return Ok(());
+    };
+    if list.is_empty() {
+        println!("no snapshots for {namespace}/{app}");
+        return Ok(());
+    }
+    println!("{:<24} {:<12} {:>12}  UPLOADED", "NAME", "VOLUME", "SIZE");
+    for meta in list {
+        println!(
+            "{:<24} {:<12} {:>12}  {}",
+            meta["name"].as_str().unwrap_or("?"),
+            meta["volume_path"].as_str().unwrap_or("?"),
+            meta["size_bytes"].as_u64().unwrap_or(0),
+            if meta["uploaded"].as_bool().unwrap_or(false) {
+                "yes"
+            } else {
+                "no"
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Restore a snapshot over its live volume (stop the app first).
+pub async fn snapshot_restore(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.snapshot_restore(app, namespace, name).await?;
+    println!("restored {namespace}/{app} from snapshot {name}");
+    Ok(())
+}
+
+/// Delete a snapshot.
+pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.snapshot_delete(app, namespace, name).await?;
+    println!("deleted snapshot {name} of {namespace}/{app}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

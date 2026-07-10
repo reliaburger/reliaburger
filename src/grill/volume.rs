@@ -117,6 +117,37 @@ impl VolumeManager {
         Ok(host_path)
     }
 
+    /// Container mount paths of every provisioned managed volume for
+    /// an app, reconstructed from the `*.volume.json` sidecars — the
+    /// filesystem is the source of truth, so this works without the
+    /// app spec (snapshots of a stopped app, for instance).
+    pub fn provisioned_volumes(&self, namespace: &str, app_name: &str) -> Vec<String> {
+        let root = self.volumes_dir.join(namespace).join(app_name);
+        let mut volumes = Vec::new();
+        Self::walk_sidecars(&root, &root, &mut volumes);
+        volumes.sort();
+        volumes
+    }
+
+    fn walk_sidecars(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk_sidecars(root, &path, out);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && let Some(volume_name) = name.strip_suffix(".volume.json")
+            {
+                let volume_dir = path.with_file_name(volume_name);
+                if let Ok(relative) = volume_dir.strip_prefix(root) {
+                    out.push(format!("/{}", relative.to_string_lossy()));
+                }
+            }
+        }
+    }
+
     /// The recorded backend of a provisioned volume, if any.
     pub fn backend_of(&self, host_path: &Path) -> Option<super::btrfs::VolumeBackend> {
         let bytes = std::fs::read(Self::sidecar_path(host_path)).ok()?;
