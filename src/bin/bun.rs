@@ -1005,6 +1005,13 @@ async fn main() -> anyhow::Result<()> {
     // peers in parallel. Standalone nodes get local-catalog resolution
     // (no peers) — the only way locally-pushed images deploy at all.
     if let Some(image_store) = &cluster_image_store {
+        // Upstream registry credentials come from the environment
+        // (variable named by [images] external_registries
+        // password_secret); unresolvable entries degrade to anonymous.
+        let credentials = reliaburger::pickle::upstream::resolve_credentials(
+            &config.images.external_registries,
+            |name| std::env::var(name).ok(),
+        );
         image_store.set_cluster_source(std::sync::Arc::new(
             reliaburger::pickle::p2p::ClusterSource {
                 state: pickle_state.clone(),
@@ -1012,6 +1019,12 @@ async fn main() -> anyhow::Result<()> {
                 registry_port: config.images.registry_port,
                 concurrency: config.images.p2p_concurrency,
                 client: reqwest::Client::new(),
+                upstream: Some(std::sync::Arc::new(
+                    reliaburger::pickle::upstream::OciUpstream::new(credentials),
+                )),
+                pull_through: config.images.pull_through,
+                cache_recheck_secs: config.images.cache_recheck_secs,
+                fill_lock: tokio::sync::Mutex::new(()),
             },
         ));
     }

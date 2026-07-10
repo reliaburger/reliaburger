@@ -436,6 +436,11 @@ pub struct ImagesSection {
     pub registry_bind: String,
     /// Parallel layer fetches per P2P image pull.
     pub p2p_concurrency: usize,
+    /// Serve external images through the Pickle pull-through cache:
+    /// first pull fetches from upstream and commits under
+    /// `cache/<host>/<repo>`; later pulls anywhere in the cluster are
+    /// served peer-to-peer.
+    pub pull_through: bool,
     /// Seconds a cached upstream image is served without rechecking
     /// whether its (mutable) tag moved upstream.
     pub cache_recheck_secs: u64,
@@ -454,8 +459,11 @@ pub struct ExternalRegistrySection {
     pub host: String,
     /// Username for basic auth; anonymous when omitted.
     pub username: Option<String>,
-    /// Name of the cluster secret holding the password/token. Resolved
-    /// at startup; an unresolvable secret falls back to anonymous.
+    /// Name of the environment variable holding the password/token,
+    /// resolved once at startup. An unset variable falls back to
+    /// anonymous access. (Env, not a cluster secret: registry
+    /// credentials are needed before the secret machinery is up, and
+    /// env-injected credentials are the registry-auth convention.)
     pub password_secret: Option<String>,
 }
 
@@ -483,6 +491,7 @@ impl Default for ImagesSection {
             registry_port: 5050,
             registry_bind: "127.0.0.1".to_string(),
             p2p_concurrency: 4,
+            pull_through: true,
             cache_recheck_secs: 3600,
             external_registries: Vec::new(),
             trust_policy: TrustPolicySection::default(),

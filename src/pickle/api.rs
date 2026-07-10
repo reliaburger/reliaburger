@@ -55,7 +55,7 @@ impl PickleState {
 /// wiring), and a failed propose must not fail the push — the local
 /// catalog is already persisted and the replication loop reconciles
 /// holder sets from it later.
-async fn record_commit(state: &PickleState, manifest: ImageManifest, tag: String) {
+pub(crate) async fn record_commit(state: &PickleState, manifest: ImageManifest, tag: String) {
     let commit = ManifestCommit {
         manifest,
         tag,

@@ -200,6 +200,17 @@ pub struct ClusterSource {
     /// Parallel fetches per image pull (`[images] p2p_concurrency`).
     pub concurrency: usize,
     pub client: reqwest::Client,
+    /// Upstream client for the pull-through cache; `None` disables it.
+    pub upstream: Option<Arc<dyn super::upstream::UpstreamRegistry>>,
+    /// `[images] pull_through` — the cache's master switch.
+    pub pull_through: bool,
+    /// `[images] cache_recheck_secs`.
+    pub cache_recheck_secs: u64,
+    /// Serialises cache fills so two instances of the same new image
+    /// landing at once don't both download it from upstream. One lock
+    /// for all images — the simplest correct thing; per-image locks
+    /// are an optimisation nobody has needed yet.
+    pub fill_lock: tokio::sync::Mutex<()>,
 }
 
 impl ClusterSource {
@@ -274,6 +285,129 @@ impl ClusterSource {
     }
 }
 
+impl ClusterSource {
+    /// Pull-through cache entry point: serve `image` from the cluster
+    /// cache, filling it from upstream on a miss or a moved tag.
+    ///
+    /// `Ok(None)` means the cache is disabled or has no upstream — the
+    /// caller falls through to a direct external pull.
+    pub async fn ensure_external_image(
+        &self,
+        image: &crate::grill::image::ImageReference,
+    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+        let peers = match &self.members {
+            Some(rx) => crate::cluster::identity::pickle_peers(&rx.borrow(), self.registry_port),
+            None => Vec::new(),
+        };
+        self.ensure_external_image_with_peers(image, &peers).await
+    }
+
+    /// [`Self::ensure_external_image`] with an explicit peer list
+    /// (tests: ephemeral ports).
+    pub async fn ensure_external_image_with_peers(
+        &self,
+        image: &crate::grill::image::ImageReference,
+        peers: &[Peer],
+    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+        use super::upstream::{CacheDecision, CacheState, decide, refresh_or_refetch};
+
+        if !self.pull_through {
+            return Ok(None);
+        }
+        let Some(upstream) = &self.upstream else {
+            return Ok(None);
+        };
+
+        let cached_repo = super::upstream::cached_repository(image);
+        let recheck = std::time::Duration::from_secs(self.cache_recheck_secs);
+
+        let catalog = self.state.catalog_snapshot().await;
+        match decide(
+            &catalog,
+            &cached_repo,
+            &image.tag,
+            std::time::SystemTime::now(),
+            recheck,
+        ) {
+            CacheState::Fresh => {
+                return self
+                    .ensure_image_local_with_peers(&cached_repo, &image.tag, peers)
+                    .await;
+            }
+            CacheState::Stale(cached_digest) => {
+                match refresh_or_refetch(upstream.as_ref(), image, &cached_digest).await {
+                    Ok(CacheDecision::Hit) | Err(_) => {
+                        // Same digest — or upstream unreachable, in
+                        // which case a stale cache beats no image:
+                        // availability over freshness, stated plainly.
+                        return self
+                            .ensure_image_local_with_peers(&cached_repo, &image.tag, peers)
+                            .await;
+                    }
+                    Ok(CacheDecision::Refetch) => {}
+                }
+            }
+            CacheState::Miss => {}
+        }
+
+        // Fill from upstream, serialised so concurrent misses don't
+        // double-download. Re-check after acquiring: another task may
+        // have filled while we waited.
+        let _guard = self.fill_lock.lock().await;
+        let catalog = self.state.catalog_snapshot().await;
+        if matches!(
+            decide(
+                &catalog,
+                &cached_repo,
+                &image.tag,
+                std::time::SystemTime::now(),
+                recheck,
+            ),
+            CacheState::Fresh
+        ) {
+            return self
+                .ensure_image_local_with_peers(&cached_repo, &image.tag, peers)
+                .await;
+        }
+
+        let manifest = upstream.fetch_manifest(image).await?;
+        self.state
+            .store
+            .write_blob(&manifest.config_bytes, &manifest.config.digest)?;
+        for layer in &manifest.layers {
+            if self.state.store.has_blob(&layer.digest) {
+                continue;
+            }
+            let bytes = upstream.fetch_blob(image, layer).await?;
+            // write_blob verifies the digest — a lying upstream fails here.
+            self.state.store.write_blob(&bytes, &layer.digest)?;
+        }
+
+        let total_size = manifest.layers.iter().map(|l| l.size).sum();
+        let layer_paths = manifest
+            .layers
+            .iter()
+            .map(|layer| self.state.store.blob_path(&layer.digest))
+            .collect();
+        let image_manifest = super::types::ImageManifest {
+            digest: manifest.digest,
+            config: manifest.config,
+            layers: manifest.layers,
+            repository: cached_repo,
+            tags: std::iter::once(image.tag.clone()).collect(),
+            total_size,
+            pushed_at: std::time::SystemTime::now(),
+            pushed_by: self.state.node_raft_id,
+            // Upstream content was never signable by us; `cache/`
+            // repositories are exempt from require_signatures.
+            signature: None,
+        };
+        super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await;
+
+        Ok(Some(layer_paths))
+    }
+}
+
 impl crate::grill::image::ClusterImageSource for ClusterSource {
     fn fetch_cluster_image<'a>(
         &'a self,
@@ -282,6 +416,17 @@ impl crate::grill::image::ClusterImageSource for ClusterSource {
     ) -> crate::grill::image::ClusterFetchFuture<'a> {
         Box::pin(async move {
             self.ensure_image_local(repository, tag)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn fetch_pull_through<'a>(
+        &'a self,
+        image: &'a crate::grill::image::ImageReference,
+    ) -> crate::grill::image::ClusterFetchFuture<'a> {
+        Box::pin(async move {
+            self.ensure_external_image(image)
                 .await
                 .map_err(|e| e.to_string())
         })

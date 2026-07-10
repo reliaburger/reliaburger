@@ -138,6 +138,16 @@ pub trait ClusterImageSource: Send + Sync {
         repository: &'a str,
         tag: &'a str,
     ) -> ClusterFetchFuture<'a>;
+
+    /// Pull-through cache for external references, consulted after the
+    /// cluster candidates miss. `Ok(None)` = cache disabled or
+    /// unavailable — fall through to a direct external pull. Unlike
+    /// `fetch_cluster_image`, an error here is also a fall-through
+    /// (same image identity upstream, so a direct pull is safe).
+    fn fetch_pull_through<'a>(&'a self, image: &'a ImageReference) -> ClusterFetchFuture<'a> {
+        let _ = image;
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 /// Boxed future returned by [`ClusterImageSource::fetch_cluster_image`]
@@ -177,6 +187,23 @@ impl ImageStore {
     /// subsystems start; later calls are ignored (`OnceLock`).
     pub fn set_cluster_source(&self, source: std::sync::Arc<dyn ClusterImageSource>) {
         let _ = self.cluster_source.set(source);
+    }
+
+    /// Unpack pre-fetched layer blobs into a rootfs (tar extraction is
+    /// CPU-bound, so it runs on a blocking task).
+    async fn unpack_to(
+        &self,
+        layer_paths: Vec<PathBuf>,
+        rootfs: PathBuf,
+    ) -> Result<PathBuf, ImageError> {
+        let rootfs_clone = rootfs.clone();
+        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &rootfs_clone))
+            .await
+            .map_err(|e| ImageError::UnpackFailed {
+                digest: "join".to_string(),
+                reason: e.to_string(),
+            })??;
+        Ok(rootfs)
     }
 
     /// Create a store using the default rootless location.
@@ -234,16 +261,7 @@ impl ImageStore {
             for (repo, tag) in cluster_candidates(&image_ref) {
                 match source.fetch_cluster_image(&repo, &tag).await {
                     Ok(Some(layer_paths)) => {
-                        let rootfs_clone = rootfs.clone();
-                        tokio::task::spawn_blocking(move || {
-                            unpack_layers(&layer_paths, &rootfs_clone)
-                        })
-                        .await
-                        .map_err(|e| ImageError::UnpackFailed {
-                            digest: "join".to_string(),
-                            reason: e.to_string(),
-                        })??;
-                        return Ok(rootfs);
+                        return self.unpack_to(layer_paths, rootfs).await;
                     }
                     Ok(None) => continue,
                     // The catalog knows the image but its layers are
@@ -255,6 +273,22 @@ impl ImageStore {
                             reason,
                         });
                     }
+                }
+            }
+
+            // Not a cluster image — try the pull-through cache. Errors
+            // fall through to the direct pull: the upstream identity is
+            // the same either way, so degrading is safe (and logged).
+            match source.fetch_pull_through(&image_ref).await {
+                Ok(Some(layer_paths)) => {
+                    return self.unpack_to(layer_paths, rootfs).await;
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    eprintln!(
+                        "warning: pull-through cache failed for {image}: {reason} — \
+                         falling back to a direct pull"
+                    );
                 }
             }
         }

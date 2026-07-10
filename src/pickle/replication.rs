@@ -60,6 +60,19 @@ pub fn select_peers(
     candidates.into_iter().take(count).cloned().collect()
 }
 
+/// Flatten a repository name for peer blob-transfer URLs.
+///
+/// Blob endpoints are content-addressed — the receiving registry
+/// ignores the `{name}` segment entirely — but our axum routes only
+/// match a single path segment, so multi-segment names (`library/
+/// nginx`, `cache/<host>/<repo>`) would 404 on routing alone. Peer
+/// transfers therefore flatten the name; manifests never transfer over
+/// these URLs (the catalog travels via Raft), so nothing round-trips
+/// through the flattened form.
+pub(crate) fn peer_blob_repo(repository: &str) -> String {
+    repository.replace('/', "-")
+}
+
 /// The result of a replication attempt.
 #[derive(Debug)]
 pub struct ReplicationResult {
@@ -86,7 +99,7 @@ pub async fn check_peer_has_layers(
         let url = format!(
             "{}/v2/{}/blobs/{}",
             peer.base_url,
-            repository,
+            peer_blob_repo(repository),
             digest.as_str()
         );
         let result = tokio::time::timeout(timeout, client.head(&url).send()).await;
@@ -109,7 +122,11 @@ pub async fn replicate_layer_to_peer(
     timeout: Duration,
 ) -> Result<(), PickleError> {
     // Initiate upload
-    let initiate_url = format!("{}/v2/{}/blobs/uploads/", peer.base_url, repository);
+    let initiate_url = format!(
+        "{}/v2/{}/blobs/uploads/",
+        peer.base_url,
+        peer_blob_repo(repository)
+    );
     let resp = tokio::time::timeout(timeout, client.post(&initiate_url).send())
         .await
         .map_err(|_| {

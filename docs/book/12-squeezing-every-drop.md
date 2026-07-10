@@ -376,8 +376,22 @@ The network side hides behind a three-method trait — `head_manifest_digest`, `
 
 Credentials follow the same resolve-at-startup shape as everything else in Sesame's orbit: `[images] external_registries` lists hosts with a username and a *secret name*; resolution maps names to plaintext through an injected lookup, and anything unresolvable degrades to anonymous access rather than failing the boot. Anonymous is what public registries want anyway.
 
-The wiring — where a cache miss actually fills, the double-download guard, and the signature question for cached images — is the next pass.
+### The fill path
+
+The wiring slots into the seam we built for P2P: `pull_and_unpack` tries the cluster candidates first, and when those miss it asks the source's second method, `fetch_pull_through`. The failure semantics deliberately differ between the two. A cluster image that can't be materialised is a hard error — falling back would fetch a *different* image under the same name. A pull-through failure falls through to a direct external pull, because the identity upstream is the same either way; degrading is safe and gets logged.
+
+Inside, the fill is the read-through shape every cache tutorial draws, with two guards worth naming. First, concurrent misses: a deploy of ten replicas lands ten pulls of the same new image at once, and without care they all download it from upstream. A `tokio::sync::Mutex` serialises fills, and — the part people forget — the winner's followers *re-check the cache after acquiring the lock*, because the image they were queueing to fetch is usually there by the time they hold it. One lock for all images, not per-image locks: the simplest correct thing, and contention is a deploy-time blip.
+
+Second, the degradation rule. A stale entry whose upstream HEAD *fails* (registry down, rate-limited, DNS broken) serves the stale copy rather than failing the deploy. Availability over freshness — stated in the code, not buried in an error path.
+
+Cached images are unsigned — they're upstream content, and we were never in a position to sign them. Under `require_signatures` they must still deploy, and it turns out the exemption needs no code at all: the scheduler's manifest lookup strips an image reference to its last path segment, which can never match a `cache/<host>/<repo>` repository. An exemption by construction is still a policy, though, so a test pins it (`check_image_schedulable_exempts_pull_through_cache`) — the difference between "it happens to work" and "it's guaranteed to keep working". Upstream trust (digest pinning, verifying upstream cosign signatures) is future work, and the code says so.
+
+### What the integration test flushed out
+
+The headline test stands up an in-process registry as the "upstream" with a request counter, fills the cache from node A, copies the catalogue to node B (hand-simulating Raft), and pulls from B with A as the peer — asserting the counter *doesn't move*. First pull caches, second pull is served entirely by the cluster. Two more tests cover the switches: `pull_through = false` is a clean fall-through, and a stale cache with a dead upstream serves stale.
+
+The first run failed, and the failure was a gift: multi-segment repository names. Real OCI names contain slashes (`library/nginx`, and our own `cache/<host>/<repo>` always does), but the registry's axum routes match `/v2/{name}/...` with a *single* path segment — so peer blob transfers for cached images 404'd on routing before any handler ran. The fix leans on content addressing: blob endpoints ignore the name entirely (a blob is its digest), so peer transfer URLs simply flatten the name (`cache/docker.io/library/redis` → one segment) and nothing round-trips through the flattened form — manifests travel via Raft, never over these URLs. Full multi-segment routing in the registry API is real future work; this is the honest minimum that makes the cache correct today.
 
 ---
 
-*Still to come in Phase 12: the pull-through wiring, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
