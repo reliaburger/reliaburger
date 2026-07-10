@@ -2,7 +2,7 @@
 
 Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap.md) for full details on each phase.
 
-> **Review note (July 2026):** a full verification pass ([review-2026-07.md](plans/review-2026-07.md))
+> **Review note (July 2026):** a full verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md))
 > found that many checked items are **library-only** — implemented and unit-tested, but never
 > wired into the `bun`/`relish` binaries. Those are tagged **`[lib-only]`** below with their
 > finding ID (e.g. `L7`, `C5`). `[x]` still means "code exists + tests pass"; `[lib-only]` means
@@ -230,7 +230,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 11b: Review & Tying the Loose Ends
 
-The July 2026 verification pass ([review-2026-07.md](plans/review-2026-07.md)) found that the build
+The July 2026 verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md)) found that the build
 is clean, clippy is silent, and 1590 tests pass — but a large share of the "done" items above
 are **library-only** (unit-tested, never wired into the `bun`/`relish` binaries), plus five
 critical bugs and a long tail of correctness issues in the wired paths. This phase closes them.
@@ -297,7 +297,7 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
-Implementation plan: [docs/plans/wiring-plan-2026-07.md](plans/wiring-plan-2026-07.md)
+Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-plan-wiring.md)
 
 - [x] `L1` Scheduler → placement → remote dispatch: `relish apply` under `--cluster` commits `AppSpec`s to Raft (followers forward to the leader); a leader-only scheduler places replicas and commits `SchedulingDecision`s; every node polls `/v1/placements/{node}` and reconciles its instances (idempotent). `H8` fixed (spread weight 60 > bin-pack 50; test now asserts distinct nodes). Flushed out a latent bug: durable Raft log + council TCP RPC used bincode, which can't drive the config types' `deserialize_any` — both switched to self-describing JSON (matching the snapshot). Binary-driven test in `tests/placement.rs`
 - [x] `L2` / `M16` / `X3` — `M16`: orchestrator no longer leaks a failed step's own half-started instance (regression test asserts it's stopped). `X3`: `relish rollback` actually rolls back — deploy history now carries the full `AppSpec` (every path records it, including the first deploy), `POST /v1/rollback/{app}/{ns}` redeploys the previous successful spec via the apply path (Raft in cluster mode). Note: cluster-wide *staged* rollout (max_unavailable gating across nodes) rides on the W6 desired-state reconciler and the per-node rolling redeploy; the imperative `DeployOrchestrator` stays library-side (correct + unit-tested) rather than duplicated as a parallel cluster driver
@@ -313,7 +313,7 @@ Implementation plan: [docs/plans/wiring-plan-2026-07.md](plans/wiring-plan-2026-
 - [x] `L16` Program egress allowlists — an app's `[egress] allow` list is now enforced in the kernel: on instance start the agent resolves the instance's cgroup id (from `/proc/<pid>/cgroup` → cgroup v2 dir inode), resolves the allowlist (DNS off the event loop via `spawn_blocking`), writes the `egress_map` entries and flips `egress_enabled_map` for that cgroup; on stop it lifts enforcement. A rate-limited event-loop task re-resolves each allowlist and reprograms the delta as DNS changes (P3: `egress_diff` + `re_resolve_egress_async`). Non-eBPF/non-Linux builds warn that egress is unenforced (default-deny is eBPF-only, per D5). Verified in the Lima VM: `egress_denied_by_default_allowed_when_listed` (`tests/ebpf.rs`) loads the real program, allows one destination for the test's own cgroup, and asserts the listed destination connects while an unlisted one is denied with `EPERM`
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
 - [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
-- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [tui-plan-2026-07.md](plans/tui-plan-2026-07.md)
+- [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
 
 ### Throughout
 
@@ -344,7 +344,7 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 
 ### Beyond Phase 11b — deferred & un-staged review items
 
-The [July 2026 review](plans/review-2026-07.md) staged a specific remediation plan
+The [July 2026 review](plans/2026-07-02-review-codebase.md) staged a specific remediation plan
 (Stages 0–4). **Every item in that plan is now done** — including the eBPF
 production-enforcement follow-ups (P0–P3) and three security Mediums pulled
 forward (P4: `M25`, `M1`, `M18`). The findings below were **never part of the
@@ -354,7 +354,7 @@ the authoritative post-Phase-11b backlog — nothing silently dropped.
 **Deferred by design (were carved out of their stage):**
 - `C5(b)` — mTLS on the Raft RPC and agent API listeners (Stage 3b deferral).
 - `L17` — CRL enforcement at connect time (image-signature verification is done; Stage 3b deferral).
-- `X6` — the no-args `relish` TUI → [tui-plan-2026-07.md](plans/tui-plan-2026-07.md).
+- `X6` — the no-args `relish` TUI → [2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md).
 
 **Never-staged Mediums (still open, confirmed in code):**
 - `M3` — whole-blob `std::fs` + SHA-256 run on the async runtime (no `spawn_blocking`); large pushes stall the event loop.
@@ -374,7 +374,7 @@ the authoritative post-Phase-11b backlog — nothing silently dropped.
 
 ## Phase 12: Optimisations
 
-> Detailed implementation plan: [optimisations-plan-2026-07.md](plans/optimisations-plan-2026-07.md)
+> Detailed implementation plan: [2026-07-06-plan-optimisations.md](plans/2026-07-06-plan-optimisations.md)
 > (revised 2026-07-09 after the Stage 4 wiring merge: slice B — Pickle catalog via Raft,
 > replication and two-phase GC — landed as-built in #71; 14 remaining implementation steps,
 > refreshed ground truth, config/endpoint/test inventories, Lima acceptance runbook).
@@ -391,11 +391,11 @@ the authoritative post-Phase-11b backlog — nothing silently dropped.
 - [x] Parquet bloom filters for archive equality pruning — on `app`/`namespace` (1% FPP), not `line` (bloom filters answer equality, not substring LIKE; `bloom_filter_on_read` enabled in remote_query)
 - [x] Zstd compression for archived logs — via Parquet's native per-row-group ZSTD codec (random access preserved; >5x vs flat text), not a separate seekable-frame container
 - [x] Book chapter 12: "Squeezing Every Drop" — complete: logs (zstd + bloom), nftables maps + the wiring discovery, the as-shipped Raft catalog/GC/heal design (M2 TOCTOU), P2P planner + executor, pull-through cache, volumes/quotas/snapshots/scheduled backups, batch + build, and phase-wide lessons
-- [x] All Phase 12 tests green — 1,981 on macOS (`make ci`) + the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](plans/optimisations-plan-2026-07.md)
+- [x] All Phase 12 tests green — 1,981 on macOS (`make ci`) + the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](plans/2026-07-06-plan-optimisations.md)
 
 ## Phase 13: Relish TUI
 
-Implementation plan: [docs/plans/tui-plan-2026-07.md](plans/tui-plan-2026-07.md)
+Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
 
 - [ ] Full interactive terminal UI (ratatui + crossterm)
 - [ ] Dashboard, apps, nodes, jobs, events, logs, routes, search, help views
@@ -404,7 +404,7 @@ Implementation plan: [docs/plans/tui-plan-2026-07.md](plans/tui-plan-2026-07.md)
 
 ## Phase 14: Self-Upgrade
 
-> Detailed implementation plan: [self-upgrade-plan-2026-07.md](plans/self-upgrade-plan-2026-07.md)
+> Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](plans/2026-07-06-plan-self-upgrade.md)
 > (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
 
 - [x] Rolling binary replacement (exec-in-place; workers → council → leadership transfer → former leader; state in Raft; `relish upgrade` command set)
@@ -423,7 +423,7 @@ not yet gossip-rejoin explicitly.
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
-> Detailed implementation plan: [chaos-plan-2026-07.md](plans/chaos-plan-2026-07.md)
+> Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
 > (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
 
 - [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)

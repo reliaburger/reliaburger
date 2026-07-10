@@ -1,12 +1,12 @@
 # Stage 4 Implementation Plan: Wiring the Library-Only Subsystems
 
-**Date:** July 2026. **Executor note:** this plan is prescriptive; follow it sub-stage by sub-stage, in order, on ONE branch. Every sub-stage: tests first (red) → implement (green) → `make ci` → book section → tick progress.md → ask the user → commit. All findings referenced by ID come from [review-2026-07.md](review-2026-07.md). Verified against the codebase as of 2026-07-06.
+**Date:** July 2026. **Executor note:** this plan is prescriptive; follow it sub-stage by sub-stage, in order, on ONE branch. Every sub-stage: tests first (red) → implement (green) → `make ci` → book section → tick progress.md → ask the user → commit. All findings referenced by ID come from [2026-07-02-review-codebase.md](2026-07-02-review-codebase.md). Verified against the codebase as of 2026-07-06.
 
 ## Scope decisions (already made — do not relitigate)
 
 1. One sequential branch; each sub-stage lands green with an integration test that drives the **binary path** (BunAgent + `api::router()` / `cluster::runtime`), never just the library.
 2. Full eBPF wiring (L8) is in scope; Linux-only behaviour is tested through the Lima dev cluster (`relish dev test`). The DNS responder (L9) is wired cross-platform with the complete M8 hardening.
-3. Excluded from this plan: X6 (bare `relish` TUI — see [tui-plan-2026-07.md](tui-plan-2026-07.md)), C5(b) mTLS + L17 CRL (deferred from Stage 3b), X2/X7 (fixed in Stage 3), L12 Ketchup flat-file store (partially addressed by Stage 1 H9/H10; the rest is not a Stage 4 item).
+3. Excluded from this plan: X6 (bare `relish` TUI — see [2026-07-06-plan-tui.md](2026-07-06-plan-tui.md)), C5(b) mTLS + L17 CRL (deferred from Stage 3b), X2/X7 (fixed in Stage 3), L12 Ketchup flat-file store (partially addressed by Stage 1 H9/H10; the rest is not a Stage 4 item).
 4. Book chapters are updated **alongside** each sub-stage in the affected phase's existing chapter (mapping given per sub-stage). British English, no AI-tell transitions.
 
 ## 0. Verified ground truth (trust this; do not re-derive)
@@ -344,7 +344,7 @@ Progress: tick the `L8` half of L8/L9 and `L16`. Commit: `onion+sesame: load eBP
 
 ## 5. Definition of done for Stage 4
 
-- All 14 Stage 4 checklist items in progress.md ticked, with X6 annotated "→ tui-plan-2026-07.md" and X2/X7 already closed by Stage 3.
+- All 14 Stage 4 checklist items in progress.md ticked, with X6 annotated "→ 2026-07-06-plan-tui.md" and X2/X7 already closed by Stage 3.
 - Review IDs closed: L1–L4, L6–L11, L13–L16, H8, H11, H12, M2, M8, M16, M17, X1, X3, X4, X5.
 - All `[lib-only]` tags cleared from progress.md phase sections (or re-tagged with an honest remaining-gap note).
 - Dead-config ledger resolved per §3; remaining dead sections explicitly documented.
