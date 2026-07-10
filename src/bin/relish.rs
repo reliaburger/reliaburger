@@ -136,6 +136,11 @@ enum Command {
         #[command(subcommand)]
         action: FaultAction,
     },
+    /// Manage volume snapshots (Btrfs-backed volumes only).
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
     /// Trigger a rolling deploy for an app.
     Deploy {
         /// Path to a TOML config file.
@@ -214,6 +219,12 @@ enum Command {
     Batch {
         /// Path to a TOML config file with [job.*] sections.
         path: PathBuf,
+    },
+    /// Show the progress of a submitted batch.
+    #[command(name = "batch-status")]
+    BatchStatus {
+        /// Batch id from `relish batch`.
+        id: u64,
     },
     /// Manage secrets (encrypt values for use in app configs).
     Secret {
@@ -439,6 +450,53 @@ enum DevAction {
 }
 
 #[derive(Subcommand)]
+enum SnapshotAction {
+    /// Snapshot an app's managed volumes.
+    Create {
+        /// App name.
+        app: String,
+        /// Namespace (default: "default").
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+        /// Snapshot one volume (container mount path, e.g. /data);
+        /// omitted = every provisioned volume.
+        #[arg(long)]
+        volume: Option<String>,
+        /// Custom snapshot name (default: unix-seconds timestamp).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List an app's snapshots, newest first.
+    List {
+        /// App name.
+        app: String,
+        /// Namespace (default: "default").
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+    },
+    /// Restore a snapshot over its live volume (stop the app first).
+    Restore {
+        /// App name.
+        app: String,
+        /// Snapshot name.
+        name: String,
+        /// Namespace (default: "default").
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+    },
+    /// Delete a snapshot.
+    Delete {
+        /// App name.
+        app: String,
+        /// Snapshot name.
+        name: String,
+        /// Namespace (default: "default").
+        #[arg(short = 'n', long, default_value = "default")]
+        namespace: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum FaultAction {
     /// Add latency to connections to a service.
     Delay {
@@ -648,6 +706,29 @@ async fn main() -> ExitCode {
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Snapshot { ref action } => match action {
+            SnapshotAction::Create {
+                app,
+                namespace,
+                volume,
+                name,
+            } => {
+                commands::snapshot_create(app, namespace, volume.as_deref(), name.as_deref()).await
+            }
+            SnapshotAction::List { app, namespace } => {
+                commands::snapshot_list(app, namespace).await
+            }
+            SnapshotAction::Restore {
+                app,
+                name,
+                namespace,
+            } => commands::snapshot_restore(app, namespace, name).await,
+            SnapshotAction::Delete {
+                app,
+                name,
+                namespace,
+            } => commands::snapshot_delete(app, namespace, name).await,
+        },
         Command::Fault { ref action } => match action {
             FaultAction::Delay {
                 target,
@@ -747,6 +828,7 @@ async fn main() -> ExitCode {
             registry_port,
         } => commands::build(path, registry_port).await,
         Command::Batch { ref path } => commands::batch(path).await,
+        Command::BatchStatus { id } => commands::batch_status(id).await,
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
@@ -1472,6 +1554,37 @@ mod tests {
     fn parse_batch_command() {
         let cli = parse(&["relish", "batch", "jobs.toml"]).unwrap();
         assert!(matches!(cli.command, Command::Batch { .. }));
+    }
+
+    #[test]
+    fn parse_snapshot_commands() {
+        let cli = parse(&[
+            "relish", "snapshot", "create", "db", "-n", "prod", "--volume", "/data",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snapshot {
+                action: SnapshotAction::Create { .. }
+            }
+        ));
+
+        let cli = parse(&["relish", "snapshot", "restore", "db", "1752000000"]).unwrap();
+        match cli.command {
+            Command::Snapshot {
+                action:
+                    SnapshotAction::Restore {
+                        app,
+                        name,
+                        namespace,
+                    },
+            } => {
+                assert_eq!(app, "db");
+                assert_eq!(name, "1752000000");
+                assert_eq!(namespace, "default");
+            }
+            _ => panic!("expected a snapshot restore command"),
+        }
     }
 
     #[test]

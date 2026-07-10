@@ -995,11 +995,35 @@ pub async fn build(path: &std::path::Path, registry_port: u16) -> Result<(), Rel
         println!("  build:  {}", job.build_cmd.join(" "));
         println!("  push:   {}", job.push_cmd.join(" "));
 
-        // Submit build job to agent
-        let result = client
+        // Submit and poll: builds run async on the builder node —
+        // minutes-long buildah runs must not hold an HTTP request open.
+        let build_id = client
             .submit_build(name, &digest, registry_port, spec)
             .await?;
-        println!("  {result}");
+        println!("  build {build_id} accepted; waiting...");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let status = client.build_status(build_id).await?;
+            match status["status"].as_str() {
+                Some("completed") => {
+                    println!(
+                        "  built and pushed {}",
+                        status["image"].as_str().unwrap_or("?")
+                    );
+                    break;
+                }
+                Some("failed") => {
+                    return Err(RelishError::ApiError {
+                        status: 0,
+                        body: format!(
+                            "build failed: {}",
+                            status["reason"].as_str().unwrap_or("unknown")
+                        ),
+                    });
+                }
+                _ => {} // running / delegated — keep polling
+            }
+        }
     }
 
     Ok(())
@@ -1016,9 +1040,48 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
     }
 
     let client = BunClient::default_local();
-    let job_names: Vec<String> = config.job.keys().cloned().collect();
-    let result = client.submit_batch(&job_names).await?;
-    println!("{result}");
+    let result = client.submit_batch(&config.job).await?;
+    println!(
+        "batch {} submitted: {} assigned",
+        result["batch_id"].as_u64().unwrap_or(0),
+        result["assigned"].as_u64().unwrap_or(0),
+    );
+    if let Some(unschedulable) = result["unschedulable"].as_array()
+        && !unschedulable.is_empty()
+    {
+        println!(
+            "unschedulable: {}",
+            unschedulable
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "check progress with: relish batch-status {}",
+        result["batch_id"].as_u64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// Show a batch's progress.
+pub async fn batch_status(batch_id: u64) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let summary = client.batch_status(batch_id).await?;
+    println!(
+        "batch {}: {} total, {} pending, {} completed, {} failed{}",
+        batch_id,
+        summary["total"].as_u64().unwrap_or(0),
+        summary["pending"].as_u64().unwrap_or(0),
+        summary["completed"].as_u64().unwrap_or(0),
+        summary["failed"].as_u64().unwrap_or(0),
+        if summary["done"].as_bool().unwrap_or(false) {
+            " — done"
+        } else {
+            ""
+        },
+    );
     Ok(())
 }
 
@@ -1170,6 +1233,73 @@ pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.token_revoke(name).await?;
     println!("{result}");
+    Ok(())
+}
+
+/// Snapshot an app's managed volumes.
+pub async fn snapshot_create(
+    app: &str,
+    namespace: &str,
+    volume: Option<&str>,
+    name: Option<&str>,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let metas = client.snapshot_create(app, namespace, volume, name).await?;
+    if let Some(list) = metas.as_array() {
+        for meta in list {
+            println!(
+                "created snapshot {} of {} ({} bytes)",
+                meta["name"].as_str().unwrap_or("?"),
+                meta["volume_path"].as_str().unwrap_or("?"),
+                meta["size_bytes"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// List an app's snapshots, newest first.
+pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let metas = client.snapshot_list(app, namespace).await?;
+    let Some(list) = metas.as_array() else {
+        println!("no snapshots");
+        return Ok(());
+    };
+    if list.is_empty() {
+        println!("no snapshots for {namespace}/{app}");
+        return Ok(());
+    }
+    println!("{:<24} {:<12} {:>12}  UPLOADED", "NAME", "VOLUME", "SIZE");
+    for meta in list {
+        println!(
+            "{:<24} {:<12} {:>12}  {}",
+            meta["name"].as_str().unwrap_or("?"),
+            meta["volume_path"].as_str().unwrap_or("?"),
+            meta["size_bytes"].as_u64().unwrap_or(0),
+            if meta["uploaded"].as_bool().unwrap_or(false) {
+                "yes"
+            } else {
+                "no"
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Restore a snapshot over its live volume (stop the app first).
+pub async fn snapshot_restore(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.snapshot_restore(app, namespace, name).await?;
+    println!("restored {namespace}/{app} from snapshot {name}");
+    Ok(())
+}
+
+/// Delete a snapshot.
+pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    client.snapshot_delete(app, namespace, name).await?;
+    println!("deleted snapshot {name} of {namespace}/{app}");
     Ok(())
 }
 

@@ -29,6 +29,11 @@ pub struct StateReport {
     pub resource_usage: ResourceUsage,
     /// Recent event log (bounded to last N events).
     pub event_log: Vec<NodeEvent>,
+    /// Whether this node can run image builds (`buildah` on PATH,
+    /// probed once at worker startup). Build submissions are routed to
+    /// a capable node (Phase 12 F2).
+    #[serde(default)]
+    pub has_buildah: bool,
 }
 
 /// A single running app instance on a worker node.
@@ -156,6 +161,7 @@ mod tests {
 
     fn sample_report(name: &str) -> StateReport {
         StateReport {
+            has_buildah: false,
             node_id: NodeId::new(name),
             timestamp: SystemTime::now(),
             running_apps: vec![RunningApp {

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::image::{ImageStore, looks_like_image_ref};
-use super::netns::{self, ContainerNetwork};
+use super::netns::{self, ContainerNetwork, PortMapHandle};
 use super::oci::OciSpec;
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
@@ -58,6 +58,8 @@ pub struct RuncGrill {
     /// Per-container network namespaces (root mode only).
     /// Rootless mode uses slirp4netns instead.
     networks: Arc<Mutex<HashMap<InstanceId, ContainerNetwork>>>,
+    /// Active host-port publications, torn down with the container.
+    port_handles: Arc<Mutex<HashMap<InstanceId, PortMapHandle>>>,
     /// Node index for IP address assignment (maps to a /23 subnet).
     node_index: u16,
     /// Counter for assigning container indices within the node's subnet.
@@ -91,6 +93,7 @@ impl RuncGrill {
             state_dir,
             entries: Arc::new(Mutex::new(HashMap::new())),
             networks: Arc::new(Mutex::new(HashMap::new())),
+            port_handles: Arc::new(Mutex::new(HashMap::new())),
             node_index,
             next_container_index: Arc::new(Mutex::new(0)),
             dns_nameserver: None,
@@ -105,6 +108,13 @@ impl RuncGrill {
     pub fn with_dns_nameserver(mut self, nameserver: std::net::Ipv4Addr) -> Self {
         self.dns_nameserver = Some(nameserver);
         self
+    }
+
+    /// The image store this runtime pulls through. Clones share the
+    /// cluster-source slot, so installing a source on the returned
+    /// handle affects this grill's pulls.
+    pub fn image_store(&self) -> &ImageStore {
+        &self.image_store
     }
 
     /// Run a runc command and return its output.
@@ -140,6 +150,11 @@ impl RuncGrill {
         let _ = self
             .runc_command(&["delete", "--force", &instance.0], instance)
             .await;
+        if let Some(handle) = self.port_handles.lock().await.remove(instance)
+            && let Err(e) = handle.shutdown().await
+        {
+            eprintln!("warning: port mapping teardown failed for {instance}: {e}");
+        }
         if let Some(network) = self.networks.lock().await.remove(instance)
             && let Err(e) = netns::teardown_container_network(&network).await
         {
@@ -198,6 +213,24 @@ impl super::Grill for RuncGrill {
                     for ns in &mut spec.linux.namespaces {
                         if ns.ns_type == "network" {
                             ns.path = Some(ns_path_str.clone());
+                        }
+                    }
+
+                    // Publish the app's port: host_port on the node
+                    // DNATs (root: map element) or proxies (rootless)
+                    // to the container. Failure is logged, not fatal —
+                    // matching the network-setup stance above.
+                    if let Some(pm) = &spec.port_mapping {
+                        match netns::add_port_mapping(&network, pm.host_port, pm.container_port)
+                            .await
+                        {
+                            Ok(handle) => {
+                                self.port_handles
+                                    .lock()
+                                    .await
+                                    .insert(instance.clone(), handle);
+                            }
+                            Err(e) => eprintln!("warning: port mapping failed for {instance}: {e}"),
                         }
                     }
 
@@ -426,12 +459,19 @@ impl super::Grill for RuncGrill {
             (entry.state, just_exited)
         };
 
-        // Tear down the netns for a naturally-exited container (lock released).
-        if just_exited
-            && let Some(network) = self.networks.lock().await.remove(instance)
-            && let Err(e) = netns::teardown_container_network(&network).await
-        {
-            eprintln!("warning: network teardown failed for {instance}: {e}");
+        // Tear down the port mapping and netns for a naturally-exited
+        // container (lock released).
+        if just_exited {
+            if let Some(handle) = self.port_handles.lock().await.remove(instance)
+                && let Err(e) = handle.shutdown().await
+            {
+                eprintln!("warning: port mapping teardown failed for {instance}: {e}");
+            }
+            if let Some(network) = self.networks.lock().await.remove(instance)
+                && let Err(e) = netns::teardown_container_network(&network).await
+            {
+                eprintln!("warning: network teardown failed for {instance}: {e}");
+            }
         }
         Ok(result_state)
     }
@@ -518,6 +558,17 @@ impl super::Grill for RuncGrill {
                 exit_code: None,
             },
         );
+
+        // Re-track the root-mode port mapping: the map element survived
+        // the agent restart in the kernel, so only the handle (whose
+        // shutdown deletes the element) needs rebuilding.
+        if let Some(pm) = &record.oci_spec.port_mapping {
+            self.port_handles.lock().await.insert(
+                instance.clone(),
+                PortMapHandle::for_adopted(pm.host_port, pm.container_port),
+            );
+        }
+
         Ok(true)
     }
 
@@ -694,6 +745,7 @@ mod tests {
         );
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 // Use a path (not an image ref) to skip the image pull step
                 path: "./rootfs".to_string(),
@@ -750,6 +802,7 @@ mod tests {
         let id = InstanceId("runc-rootless-echo".to_string());
 
         let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "alpine:latest".to_string(),
                 readonly: false,
@@ -805,6 +858,7 @@ mod tests {
         );
         let id = InstanceId("runc-capture".to_string());
         let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "alpine:latest".to_string(),
                 readonly: false,

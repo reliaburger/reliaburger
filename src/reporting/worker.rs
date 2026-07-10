@@ -81,6 +81,9 @@ pub struct ReportWorker<T: ReportingTransport> {
     /// Receives council membership updates as `(NodeId, SocketAddr)` pairs.
     council_rx: watch::Receiver<Vec<(NodeId, SocketAddr)>>,
     shutdown: CancellationToken,
+    /// Whether `buildah` is on PATH, probed once at construction and
+    /// carried in every report (build routing, Phase 12 F2).
+    has_buildah: bool,
 }
 
 impl<T: ReportingTransport> ReportWorker<T> {
@@ -95,6 +98,13 @@ impl<T: ReportingTransport> ReportWorker<T> {
     ) -> Self {
         // Compute initial parent from current council membership
         let parent_address = Self::compute_parent(&node_id, &council_rx.borrow());
+        // One synchronous probe at startup; buildah appearing later
+        // needs an agent restart, which is fine for a build host.
+        let has_buildah = std::process::Command::new("buildah")
+            .arg("--version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
         Self {
             node_id,
             transport,
@@ -103,6 +113,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
             snapshot_tx,
             council_rx,
             shutdown,
+            has_buildah,
         }
     }
 
@@ -235,6 +246,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 memory_total_mb: snapshot.capacity_memory_mb,
             },
             event_log: vec![],
+            has_buildah: self.has_buildah,
         }
     }
 }

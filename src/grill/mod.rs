@@ -5,6 +5,7 @@
 /// port allocation, cgroup configuration, and OCI spec generation.
 #[cfg(target_os = "macos")]
 pub mod apple;
+pub mod btrfs;
 pub mod cgroup;
 pub mod image;
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub mod mock;
 pub mod netns;
 pub mod oci;
 pub mod port;
+pub mod portmap;
 pub mod process;
 pub mod process_workload;
 pub mod records;
@@ -20,6 +22,7 @@ pub mod records;
 pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
+pub mod snapshot;
 pub mod state;
 pub mod volume;
 
@@ -231,6 +234,20 @@ pub enum AnyGrill {
     /// macOS Apple Container runtime.
     #[cfg(target_os = "macos")]
     Apple(apple::AppleContainerGrill),
+}
+
+impl AnyGrill {
+    /// The runtime's image-store handle, when the runtime pulls OCI
+    /// images itself (runc). Lets the binary install the cluster P2P
+    /// image source after the cluster subsystems start — the runtime
+    /// is selected long before the registry and catalog exist.
+    pub fn image_store(&self) -> Option<ImageStore> {
+        match self {
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => Some(g.image_store().clone()),
+            _ => None,
+        }
+    }
 }
 
 impl Grill for AnyGrill {

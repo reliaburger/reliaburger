@@ -145,6 +145,8 @@ Some tests require specific runtimes or network access and are gated behind envi
 | `RELIABURGER_APPLE_CONTAINER_TESTS=1` | Apple Container tests (macOS only) |
 | `RELIABURGER_IMAGE_PULL_TESTS=1` | OCI image pull tests (requires network) |
 | `RELIABURGER_UPGRADE_TESTS=1` | real-binary self-upgrade tests (slow; also via `make test-upgrade`) |
+| `RELIABURGER_BTRFS_TESTS=1` | Btrfs quota + snapshot tests (Linux root; each test provisions its own loopback btrfs) |
+| `RELIABURGER_BUILDAH_TESTS=1` | real `buildah` image-build tests (Linux with buildah installed) |
 
 ### Benchmarks
 
@@ -239,6 +241,14 @@ Commands:
 | `rollback <app>` | Rollback an app to the previous version |
 | `lint <path>` | Validate a config file without deploying |
 | `images` | List images in the local Pickle registry |
+| `build <path>` | Build OCI images from `[build.*]` sections and push to Pickle (async: submits, then polls) |
+| `batch <path>` | Submit `[job.*]` sections as a high-throughput batch across the cluster |
+| `batch-status <id>` | Show a submitted batch's progress (total/pending/completed/failed) |
+| `sign <image>` | Sign an image in the Pickle registry and attach the signature |
+| `snapshot create <app>` | Snapshot an app's managed volumes (Btrfs-backed; `--volume` for one, `--name` to label) |
+| `snapshot list <app>` | List an app's snapshots, newest first |
+| `snapshot restore <app> <name>` | Restore a snapshot over the live volume (stop the app first) |
+| `snapshot delete <app> <name>` | Delete a snapshot |
 | `secret pubkey [dir]` | Print the cluster's age public key |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
 | `fault delay <target> <delay>` | Add latency to connections to a service |
@@ -424,6 +434,51 @@ Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-appl
 | [`container-full-featured.toml`](../examples/phase-1/container-full-featured.toml) | All Phase 1 features |
 | [`container-multi-app.toml`](../examples/phase-1/container-multi-app.toml) | Multiple apps in one config |
 | [`container-volumes.toml`](../examples/phase-1/container-volumes.toml) | Managed and HostPath volumes |
+
+### Images, the pull-through cache, and cluster registries (Phase 12)
+
+External images (`docker.io`, `ghcr.io`, …) are served through a pull-through
+cache by default: the first pull fetches from upstream and commits under a
+`cache/<host>/<repo>` catalog entry; later pulls anywhere in the cluster are
+served peer-to-peer. Cluster-pushed images download from multiple peers in
+parallel (rarest layer first). Two operational constraints to know:
+
+- **`registry_port` must be uniform across the cluster** — peers derive each
+  other's registry URLs from gossip IPs plus the local port setting.
+- **`registry_bind` defaults to loopback**, which disables peer replication
+  and P2P in cluster mode (bun warns at startup). Bind wider only behind the
+  perimeter firewall's cluster-node allowlist: the registry has no auth/TLS yet.
+
+```toml
+[images]
+registry_bind = "0.0.0.0"   # cluster mode; keep firewalled
+pull_through = true          # cache external images in the cluster
+cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
+p2p_concurrency = 4          # parallel layer fetches per image pull
+build_timeout_secs = 900     # ceiling per buildah stage
+
+[[images.external_registries]]
+host = "ghcr.io"
+username = "bot"
+password_secret = "GHCR_TOKEN"   # environment variable, read at startup
+```
+
+### Volume snapshots and scheduled backups (Phase 12)
+
+Managed volumes on a Btrfs-backed `[storage] volumes` directory are created as
+subvolumes (size limits become qgroup quotas) and can be snapshotted — O(1)
+copy-on-write — via `relish snapshot` or on a schedule:
+
+```toml
+[storage.snapshots]
+interval_secs = 86400                 # 0 disables the loop
+retain = 7                            # newest N kept per volume
+upload_url = "s3://backups/burger"    # optional; file:// and gs:// work too
+```
+
+Snapshot archives upload as `.tar.gz` through `object_store`; credentials come
+from each backend's standard environment variables. On non-Btrfs filesystems
+snapshots return a clear error (sized volumes fall back to loop-mounted ext4).
 
 ### Apps
 

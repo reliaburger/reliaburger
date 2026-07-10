@@ -28,10 +28,12 @@ pub async fn pull_layer_from_peer(
         return Ok(()); // Already cached locally
     }
 
+    // Peer blob URLs flatten multi-segment names (see peer_blob_repo):
+    // the blob store is content-addressed and ignores the name anyway.
     let url = format!(
         "{}/v2/{}/blobs/{}",
         peer.base_url,
-        repository,
+        super::replication::peer_blob_repo(repository),
         digest.as_str()
     );
 

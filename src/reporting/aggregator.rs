@@ -161,6 +161,7 @@ mod tests {
 
     fn report(name: &str) -> StateReport {
         StateReport {
+            has_buildah: false,
             node_id: NodeId::new(name),
             timestamp: SystemTime::now(),
             running_apps: vec![],
@@ -172,6 +173,7 @@ mod tests {
 
     fn stale_report(name: &str) -> StateReport {
         StateReport {
+            has_buildah: false,
             node_id: NodeId::new(name),
             // 60 seconds ago — will be stale with 30s timeout
             timestamp: SystemTime::now() - Duration::from_secs(60),

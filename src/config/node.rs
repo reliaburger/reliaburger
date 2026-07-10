@@ -298,6 +298,8 @@ pub struct StorageSection {
     pub logs: PathBuf,
     pub metrics: PathBuf,
     pub volumes: PathBuf,
+    /// Scheduled volume snapshots (`[storage.snapshots]`).
+    pub snapshots: SnapshotsSection,
 }
 
 impl Default for StorageSection {
@@ -308,6 +310,35 @@ impl Default for StorageSection {
             logs: PathBuf::from("/var/lib/reliaburger/logs"),
             metrics: PathBuf::from("/var/lib/reliaburger/metrics"),
             volumes: PathBuf::from("/var/lib/reliaburger/volumes"),
+            snapshots: SnapshotsSection::default(),
+        }
+    }
+}
+
+/// Scheduled volume snapshots and their object-store upload.
+///
+/// Interval-based rather than cron expressions — a scheduled loop
+/// satisfies "snapshots run on a schedule" without dragging in a cron
+/// parser and chrono for a feature nobody asked for by name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotsSection {
+    /// Seconds between snapshot sweeps. `0` disables the loop.
+    pub interval_secs: u64,
+    /// Snapshots retained per volume; older ones are pruned.
+    pub retain: usize,
+    /// Optional object-store destination for snapshot archives
+    /// (`file://`, `s3://`, `gs://`). Credentials come from the
+    /// standard environment variables of each backend.
+    pub upload_url: Option<String>,
+}
+
+impl Default for SnapshotsSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: 0,
+            retain: 7,
+            upload_url: None,
         }
     }
 }
@@ -434,8 +465,39 @@ pub struct ImagesSection {
     /// the registry is not exposed unauthenticated on all interfaces. Set to
     /// `0.0.0.0` once cross-node replication (and auth) are wired.
     pub registry_bind: String,
+    /// Parallel layer fetches per P2P image pull.
+    pub p2p_concurrency: usize,
+    /// Serve external images through the Pickle pull-through cache:
+    /// first pull fetches from upstream and commits under
+    /// `cache/<host>/<repo>`; later pulls anywhere in the cluster are
+    /// served peer-to-peer.
+    pub pull_through: bool,
+    /// Seconds a cached upstream image is served without rechecking
+    /// whether its (mutable) tag moved upstream.
+    pub cache_recheck_secs: u64,
+    /// Credentials for upstream registries the pull-through cache may
+    /// authenticate to. Hosts not listed are accessed anonymously.
+    pub external_registries: Vec<ExternalRegistrySection>,
+    /// Ceiling (seconds) per buildah stage of an image build.
+    pub build_timeout_secs: u64,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
+}
+
+/// Credentials for one upstream registry host.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalRegistrySection {
+    /// Registry host, e.g. `ghcr.io`.
+    pub host: String,
+    /// Username for basic auth; anonymous when omitted.
+    pub username: Option<String>,
+    /// Name of the environment variable holding the password/token,
+    /// resolved once at startup. An unset variable falls back to
+    /// anonymous access. (Env, not a cluster secret: registry
+    /// credentials are needed before the secret machinery is up, and
+    /// env-injected credentials are the registry-auth convention.)
+    pub password_secret: Option<String>,
 }
 
 /// Image trust policy controlling signature requirements.
@@ -461,6 +523,11 @@ impl Default for ImagesSection {
             gc_interval_hours: 1,
             registry_port: 5050,
             registry_bind: "127.0.0.1".to_string(),
+            p2p_concurrency: 4,
+            pull_through: true,
+            cache_recheck_secs: 3600,
+            external_registries: Vec::new(),
+            build_timeout_secs: 900,
             trust_policy: TrustPolicySection::default(),
         }
     }

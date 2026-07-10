@@ -5,11 +5,14 @@
 /// backoff, detecting GPU hardware, and serving a local HTTP API.
 pub mod agent;
 pub mod api;
+pub mod batch;
+pub mod build_runner;
 pub mod disk_pressure;
 pub mod gpu;
 pub mod health;
 pub mod probe;
 pub mod restart;
+pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
 
@@ -57,6 +60,11 @@ pub enum BunError {
     /// this platform / without the eBPF feature).
     #[error("fault rejected: {reason}")]
     FaultRejected { reason: String },
+
+    /// A volume snapshot operation failed (unsupported filesystem,
+    /// missing snapshot, running app on restore, btrfs failure).
+    #[error("snapshot: {0}")]
+    Snapshot(#[from] crate::grill::snapshot::SnapshotError),
 
     /// The workload has exceeded its restart limit.
     #[error(

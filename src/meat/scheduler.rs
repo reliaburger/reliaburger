@@ -229,6 +229,12 @@ pub fn check_image_schedulable(
 /// Parses `repository:tag` (defaulting the tag to `latest`) and strips any
 /// registry prefix (`localhost:5050/myapp:v1` → `myapp`). Returns `None` for
 /// images not in the catalogue — i.e. external-registry images.
+///
+/// Deliberate consequence: pull-through-cached upstream images live under
+/// `cache/<host>/<repo>` and can never match here, so unsigned upstream
+/// content stays deployable under `require_signatures` (it was never
+/// signable by us). Pinned by `check_image_schedulable_exempts_pull_through_cache`.
+/// TODO(Phase 13+): upstream trust policy (digest pinning, cosign).
 fn lookup_pickle_manifest<'a>(
     image_ref: &str,
     catalog: &'a crate::pickle::types::ManifestCatalog,
@@ -632,6 +638,52 @@ mod tests {
 
         let result = super::check_image_schedulable(Some("myapp:v1"), &catalog, true);
         assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
+    }
+
+    /// Phase 12 D2: pull-through-cached upstream images (repository
+    /// `cache/<host>/<repo>`) are unsigned upstream content and must
+    /// pass `require_signatures`. The exemption holds by construction:
+    /// `lookup_pickle_manifest` strips an image reference to its last
+    /// path segment, which can never match a `cache/...` repository —
+    /// this test pins that behaviour so a future lookup change can't
+    /// silently start refusing every cached external image.
+    #[test]
+    fn check_image_schedulable_exempts_pull_through_cache() {
+        use crate::pickle::types::*;
+        use std::collections::BTreeSet;
+
+        let mut catalog = ManifestCatalog::default();
+        let manifest = ImageManifest {
+            digest: Digest::from_sha256_hex(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            ),
+            config: LayerDescriptor {
+                digest: Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                size: 100,
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            },
+            layers: vec![],
+            repository: "cache/docker.io/library/redis".to_string(),
+            tags: BTreeSet::new(),
+            total_size: 100,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: None, // unsigned upstream content
+        };
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "7".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        // The app spec references the upstream name, not the cache repo.
+        let result = super::check_image_schedulable(Some("redis:7"), &catalog, true);
+        assert!(
+            result.is_ok(),
+            "cached upstream images must stay deployable"
+        );
     }
 
     #[test]

@@ -108,7 +108,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**1,888 tests across 12 completed phases** (plus 12 Lima-gated eBPF integration tests run in the dev VM), including the Phase 11b review-and-wiring pass that closed the gap between "implemented" and "wired" — cluster scheduling, rolling/blue-green deploys, autoscaling, GitOps sync, real chaos fault injection, and the full eBPF data path (service discovery, kernel connect-rewrite, network fault injection, and egress allowlists) are now driven end to end, not just unit-tested. See [progress.md](docs/progress.md) for the full checklist.
+**1,981 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -125,12 +125,20 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 11. Advanced Observability | Done | 1,595 |
 | 11b. Review & wiring | Done | 1,703 |
 | 14. Self-Upgrade | Done | 1,880 |
+| 12. Optimisations | Done | 1,981 |
 
 Phase 14 (rolling binary upgrades) landed ahead of 12 and 13: `relish
 upgrade start v0.2.0` rolls a live cluster onto a new dual-signed binary —
 workloads survive the swap (same pids, adopted across `exec()`), a
 crash-looping release reverts itself, and the leader upgrades itself last
 (in place, quorum preserved through the sub-second exec bounce).
+
+Phase 12 (optimisations) followed: port mapping via O(1) nftables named
+maps, parallel rarest-first P2P image pulls between nodes, a pull-through
+cache so external images are fetched from upstream once, Btrfs subvolume
+quotas and instant CoW snapshots (`relish snapshot`, scheduled S3/GCS
+backups), and cluster-wide batch (`relish batch`) and image-build
+(`relish build`) execution with capability-based placement.
 
 ## The book
 

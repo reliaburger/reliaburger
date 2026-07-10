@@ -505,6 +505,7 @@ mod tests {
 
     fn report(cpu_total: u32, cpu_used: u32) -> StateReport {
         StateReport {
+            has_buildah: false,
             node_id: NodeId::new("x"),
             timestamp: SystemTime::now(),
             running_apps: vec![],

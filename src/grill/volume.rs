@@ -33,11 +33,18 @@ impl VolumeManager {
         }
     }
 
-    /// Create a managed volume directory for an app.
+    /// Create a managed volume for an app.
     ///
-    /// If `size_limit` is provided and we're on Linux, creates a
-    /// loop-mounted ext4 filesystem of the specified size. Otherwise
-    /// creates a plain directory.
+    /// Backend by environment ([`super::btrfs::select_backend`]): a
+    /// Btrfs subvolume when the volumes directory is on Btrfs (qgroup
+    /// limit when sized), a loop-mounted ext4 filesystem for sized
+    /// volumes elsewhere on Linux (root), a plain directory otherwise.
+    /// The chosen backend is recorded in a sidecar file so delete and
+    /// snapshot paths know what they're handling.
+    ///
+    /// Idempotent: instance restarts re-drive startup, so a volume
+    /// whose sidecar exists is already provisioned — re-running must
+    /// not stack loop mounts or fail on an existing subvolume.
     pub fn create_managed_volume(
         &self,
         namespace: &str,
@@ -52,30 +59,156 @@ impl VolumeManager {
             .join(app_name)
             .join(relative_path);
 
-        std::fs::create_dir_all(&host_path)?;
+        if self.backend_of(&host_path).is_some() {
+            return Ok(host_path); // already provisioned
+        }
 
-        if let Some(size_str) = size_limit {
-            let size_bytes = parse_resource_value(size_str)
-                .map_err(|e| VolumeError::InvalidSize(format!("{size_str}: {e}")))?;
+        let size_bytes = size_limit
+            .map(|s| {
+                parse_resource_value(s).map_err(|e| VolumeError::InvalidSize(format!("{s}: {e}")))
+            })
+            .transpose()?;
 
-            if cfg!(target_os = "linux") && is_root() {
-                self.setup_loop_mount(&host_path, size_bytes)?;
-            } else if cfg!(target_os = "linux") {
-                eprintln!(
-                    "warning: volume size enforcement requires root; \
-                     size limit {size_str} not enforced for {}",
-                    host_path.display()
-                );
-            } else {
-                eprintln!(
-                    "warning: volume size enforcement requires Linux; \
-                     size limit {size_str} not enforced for {}",
-                    host_path.display()
-                );
+        let backend = super::btrfs::select_backend(
+            super::btrfs::is_btrfs(&self.volumes_dir),
+            cfg!(target_os = "linux") && is_root(),
+            size_bytes.is_some(),
+        );
+
+        // Parents are always plain directories; only the leaf differs.
+        if let Some(parent) = host_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        match backend {
+            super::btrfs::VolumeBackend::BtrfsSubvolume => {
+                super::btrfs::create_subvolume(&host_path, size_bytes, &self.volumes_dir).map_err(
+                    |reason| VolumeError::CreateFailed {
+                        path: host_path.display().to_string(),
+                        reason,
+                    },
+                )?;
+            }
+            super::btrfs::VolumeBackend::LoopMount => {
+                std::fs::create_dir_all(&host_path)?;
+                // select_backend only picks LoopMount when sized.
+                if let Some(bytes) = size_bytes {
+                    self.setup_loop_mount(&host_path, bytes)?;
+                }
+            }
+            super::btrfs::VolumeBackend::Plain => {
+                std::fs::create_dir_all(&host_path)?;
+                if let Some(size_str) = size_limit {
+                    let need = if cfg!(target_os = "linux") {
+                        "root"
+                    } else {
+                        "Linux"
+                    };
+                    eprintln!(
+                        "warning: volume size enforcement requires {need}; \
+                         size limit {size_str} not enforced for {}",
+                        host_path.display()
+                    );
+                }
             }
         }
 
+        self.write_backend(&host_path, backend)?;
         Ok(host_path)
+    }
+
+    /// Container mount paths of every provisioned managed volume for
+    /// an app, reconstructed from the `*.volume.json` sidecars — the
+    /// filesystem is the source of truth, so this works without the
+    /// app spec (snapshots of a stopped app, for instance).
+    pub fn provisioned_volumes(&self, namespace: &str, app_name: &str) -> Vec<String> {
+        let root = self.volumes_dir.join(namespace).join(app_name);
+        let mut volumes = Vec::new();
+        Self::walk_sidecars(&root, &root, &mut volumes);
+        volumes.sort();
+        volumes
+    }
+
+    fn walk_sidecars(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk_sidecars(root, &path, out);
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && let Some(volume_name) = name.strip_suffix(".volume.json")
+            {
+                let volume_dir = path.with_file_name(volume_name);
+                if let Ok(relative) = volume_dir.strip_prefix(root) {
+                    out.push(format!("/{}", relative.to_string_lossy()));
+                }
+            }
+        }
+    }
+
+    /// `(namespace, app)` pairs with at least one provisioned managed
+    /// volume — the scheduled snapshot sweep's work list.
+    pub fn provisioned_apps(&self) -> Vec<(String, String)> {
+        let mut apps = Vec::new();
+        let Ok(namespaces) = std::fs::read_dir(&self.volumes_dir) else {
+            return apps;
+        };
+        for ns_entry in namespaces.flatten() {
+            let ns_name = ns_entry.file_name().to_string_lossy().into_owned();
+            // Skip bookkeeping dirs (.snapshots, .config).
+            if ns_name.starts_with('.') || !ns_entry.path().is_dir() {
+                continue;
+            }
+            let Ok(app_dirs) = std::fs::read_dir(ns_entry.path()) else {
+                continue;
+            };
+            for app_entry in app_dirs.flatten() {
+                if !app_entry.path().is_dir() {
+                    continue;
+                }
+                let app_name = app_entry.file_name().to_string_lossy().into_owned();
+                if !self.provisioned_volumes(&ns_name, &app_name).is_empty() {
+                    apps.push((ns_name.clone(), app_name));
+                }
+            }
+        }
+        apps.sort();
+        apps
+    }
+
+    /// The recorded backend of a provisioned volume, if any.
+    pub fn backend_of(&self, host_path: &Path) -> Option<super::btrfs::VolumeBackend> {
+        let bytes = std::fs::read(Self::sidecar_path(host_path)).ok()?;
+        serde_json::from_slice::<VolumeSidecar>(&bytes)
+            .ok()
+            .map(|s| s.backend)
+    }
+
+    fn write_backend(
+        &self,
+        host_path: &Path,
+        backend: super::btrfs::VolumeBackend,
+    ) -> Result<(), VolumeError> {
+        let sidecar = VolumeSidecar { schema: 1, backend };
+        let json = serde_json::to_vec_pretty(&sidecar).map_err(|e| VolumeError::CreateFailed {
+            path: host_path.display().to_string(),
+            reason: format!("sidecar serialise: {e}"),
+        })?;
+        std::fs::write(Self::sidecar_path(host_path), json)?;
+        Ok(())
+    }
+
+    /// Sidecar sibling of the volume directory:
+    /// `.../data` → `.../data.volume.json`.
+    fn sidecar_path(host_path: &Path) -> PathBuf {
+        let mut name = host_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("volume"))
+            .to_os_string();
+        name.push(".volume.json");
+        host_path.with_file_name(name)
     }
 
     /// Set up a loop-mounted ext4 filesystem (Linux only).
@@ -169,6 +302,13 @@ impl VolumeManager {
     }
 }
 
+/// Sidecar metadata recorded next to each managed volume.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct VolumeSidecar {
+    schema: u32,
+    backend: super::btrfs::VolumeBackend,
+}
+
 /// Check if the current process is running as root.
 fn is_root() -> bool {
     #[cfg(unix)]
@@ -220,6 +360,46 @@ mod tests {
     }
 
     #[test]
+    fn create_records_backend_in_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+
+        let path = vm
+            .create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
+
+        assert_eq!(
+            vm.backend_of(&path),
+            Some(crate::grill::btrfs::VolumeBackend::Plain)
+        );
+        // The sidecar lives NEXT TO the volume, not inside it — it must
+        // not appear as a file in the container's mount.
+        assert!(path.join("data.volume.json").exists() == false);
+        assert!(path.with_file_name("data.volume.json").exists());
+    }
+
+    #[test]
+    fn create_is_idempotent_for_provisioned_volumes() {
+        // Instance restarts re-drive startup: a second create must not
+        // re-provision (loop mounts would stack; subvolume create
+        // would fail) and must not touch the data.
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+
+        let path = vm
+            .create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
+        std::fs::write(path.join("keep-me"), b"data").unwrap();
+
+        let again = vm
+            .create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
+
+        assert_eq!(path, again);
+        assert_eq!(std::fs::read(path.join("keep-me")).unwrap(), b"data");
+    }
+
+    #[test]
     fn create_managed_volume_with_size_without_root() {
         // This test only makes sense when NOT running as root.
         // Under root (e.g. `sudo cargo test` in the dev VM),
@@ -267,5 +447,67 @@ mod tests {
 
         let usage = VolumeManager::check_usage(dir.path()).unwrap();
         assert_eq!(usage, 3);
+    }
+
+    // -- Btrfs integration (Linux, root, RELIABURGER_BTRFS_TESTS=1) ------
+
+    #[cfg(target_os = "linux")]
+    fn run_cmd(program: &str, args: &[&str]) {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .unwrap_or_else(|e| panic!("{program} failed to run: {e}"));
+        assert!(status.success(), "{program} {args:?} failed");
+    }
+
+    /// Roadmap (Phase 12): writing beyond a Btrfs qgroup quota fails.
+    /// The test provisions its own loopback btrfs filesystem — no
+    /// assumptions about the host's disks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn btrfs_quota_blocks_writes_beyond_limit() {
+        if std::env::var("RELIABURGER_BTRFS_TESTS").is_err() {
+            eprintln!("skipping btrfs test (set RELIABURGER_BTRFS_TESTS=1 to enable)");
+            return;
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let img = scratch.path().join("btrfs.img");
+        let mount = scratch.path().join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        run_cmd("truncate", &["-s", "1G", img.to_str().unwrap()]);
+        run_cmd("mkfs.btrfs", &["-q", img.to_str().unwrap()]);
+        run_cmd(
+            "mount",
+            &["-o", "loop", img.to_str().unwrap(), mount.to_str().unwrap()],
+        );
+
+        // Body as a closure so the unmount always runs.
+        let body = || -> Result<(), String> {
+            let vm = VolumeManager::new(&mount);
+            let path = vm
+                .create_managed_volume("default", "db", Path::new("/data"), Some("10Mi"))
+                .map_err(|e| format!("create: {e}"))?;
+            if vm.backend_of(&path) != Some(crate::grill::btrfs::VolumeBackend::BtrfsSubvolume) {
+                return Err("expected the btrfs subvolume backend".to_string());
+            }
+
+            // 11 MiB into a 10 MiB qgroup. Buffered writes can defer
+            // enforcement, so the sync must also be checked.
+            use std::io::Write;
+            let attempt = (|| -> std::io::Result<()> {
+                let mut file = std::fs::File::create(path.join("too-big"))?;
+                file.write_all(&vec![7u8; 11 * 1024 * 1024])?;
+                file.sync_all()
+            })();
+            if attempt.is_ok() {
+                return Err("write beyond the quota unexpectedly succeeded".to_string());
+            }
+            Ok(())
+        };
+        let result = body();
+
+        let _ = std::process::Command::new("umount").arg(&mount).status();
+        result.unwrap();
     }
 }

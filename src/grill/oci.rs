@@ -22,6 +22,21 @@ pub struct OciSpec {
     pub process: OciProcess,
     pub mounts: Vec<OciMount>,
     pub linux: OciLinux,
+    /// Host-port publication for the workload, when the app declares a
+    /// port. Not part of the OCI runtime spec proper — runtimes with
+    /// per-container networking (runc) read it to install the DNAT map
+    /// element alongside the network namespace. `#[serde(default)]`
+    /// keeps instance records written before this field readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_mapping: Option<PortMapping>,
+}
+
+/// A published port: traffic to `host_port` on the node reaches the
+/// workload's `container_port` inside its network namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMapping {
+    pub host_port: u16,
+    pub container_port: u16,
 }
 
 /// The container's root filesystem.
@@ -205,6 +220,10 @@ pub fn generate_oci_spec_with_decryptor(
             uid_mappings: None,
             gid_mappings: None,
         },
+        port_mapping: host_port.zip(spec.port).map(|(hp, cp)| PortMapping {
+            host_port: hp,
+            container_port: cp,
+        }),
     }
 }
 
@@ -509,6 +528,8 @@ pub fn generate_job_oci_spec(
             uid_mappings: None,
             gid_mappings: None,
         },
+        // Jobs run to completion and don't publish ports.
+        port_mapping: None,
     }
 }
 
@@ -549,6 +570,8 @@ pub fn generate_init_oci_spec(
             uid_mappings: None,
             gid_mappings: None,
         },
+        // Init containers run before the app and don't publish ports.
+        port_mapping: None,
     }
 }
 
@@ -570,6 +593,68 @@ mod tests {
         assert_eq!(oci.process.cwd, "/");
         assert_eq!(oci.process.user.uid, 65534);
         assert!(oci.process.env.is_empty());
+    }
+
+    #[test]
+    fn port_mapping_set_when_app_declares_a_port() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec("web", "default", &spec, Some(30017), "/cg", None, None);
+
+        assert_eq!(
+            oci.port_mapping,
+            Some(PortMapping {
+                host_port: 30017,
+                container_port: 8080,
+            })
+        );
+    }
+
+    #[test]
+    fn port_mapping_absent_without_allocated_host_port() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec("web", "default", &spec, None, "/cg", None, None);
+
+        assert_eq!(oci.port_mapping, None);
+    }
+
+    #[test]
+    fn port_mapping_absent_when_app_has_no_port() {
+        let spec = minimal_app();
+        let oci = generate_oci_spec("web", "default", &spec, Some(30017), "/cg", None, None);
+
+        assert_eq!(oci.port_mapping, None);
+    }
+
+    #[test]
+    fn port_mapping_survives_record_round_trip_and_old_records_default() {
+        // New records carry the mapping through serde…
+        let spec: AppSpec = toml::from_str(r#"image = "t:v1""#).unwrap();
+        let mut oci = generate_oci_spec("web", "default", &spec, None, "/cg", None, None);
+        oci.port_mapping = Some(PortMapping {
+            host_port: 30017,
+            container_port: 8080,
+        });
+        let json = serde_json::to_string(&oci).unwrap();
+        let back: OciSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port_mapping, oci.port_mapping);
+
+        // …and records written before the field existed still parse.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("port_mapping");
+        let old: OciSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(old.port_mapping, None);
     }
 
     #[test]

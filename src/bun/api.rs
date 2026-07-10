@@ -87,6 +87,21 @@ pub struct ApiState {
     /// Self-upgrade manager, for the fast dependency-free `/v1/version`
     /// endpoint. Upgrade *operations* go through the agent command channel.
     pub upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
+    /// Batch job tracker (Phase 12 F1). Lives leader-side: submissions
+    /// and status reads leader-forward, so one tracker sees them all.
+    pub batch_tracker: Arc<tokio::sync::Mutex<crate::meat::batch_tracker::BatchTracker>>,
+    /// The leader's aggregated worker reports — batch capacity comes
+    /// from here (the same source the deploy scheduler uses). `None`
+    /// standalone; batch then schedules onto this node only.
+    pub aggregated_rx:
+        Option<tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>>,
+    /// This node's gossip name, for batch self-dispatch short-circuits.
+    pub node_name: Option<String>,
+    /// Async build tracker (Phase 12 F2). Node-local: builds live
+    /// where they were submitted; delegated builds proxy status reads.
+    pub build_registry: Arc<tokio::sync::Mutex<super::build_runner::BuildRegistry>>,
+    /// `[images] build_timeout_secs` — ceiling per buildah stage.
+    pub build_timeout_secs: u64,
 }
 
 /// Build the API router.
@@ -121,6 +136,9 @@ pub fn router(
         gitops_webhook_tx,
         api_port,
         None,
+        None,
+        None,
+        900,
     )
 }
 
@@ -141,6 +159,11 @@ pub fn router_with_upgrade(
     gitops_webhook_tx: Option<mpsc::Sender<()>>,
     api_port: u16,
     upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
+    aggregated_rx: Option<
+        tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>,
+    >,
+    node_name: Option<String>,
+    build_timeout_secs: u64,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -159,6 +182,15 @@ pub fn router_with_upgrade(
         http_client: reqwest::Client::new(),
         api_port,
         upgrade,
+        batch_tracker: Arc::new(tokio::sync::Mutex::new(
+            crate::meat::batch_tracker::BatchTracker::new(),
+        )),
+        aggregated_rx,
+        node_name,
+        build_registry: Arc::new(tokio::sync::Mutex::new(
+            super::build_runner::BuildRegistry::default(),
+        )),
+        build_timeout_secs,
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
@@ -220,6 +252,18 @@ pub fn router_with_upgrade(
         .route("/v1/chaos/partition", post(chaos_partition_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
+        .route(
+            "/v1/snapshots/{namespace}/{app}",
+            get(snapshot_list_handler).post(snapshot_create_handler),
+        )
+        .route(
+            "/v1/snapshots/{namespace}/{app}/restore",
+            post(snapshot_restore_handler),
+        )
+        .route(
+            "/v1/snapshots/{namespace}/{app}/{name}",
+            axum::routing::delete(snapshot_delete_handler),
+        )
         .route("/v1/fault", post(fault_inject_handler))
         .route("/v1/fault", axum::routing::delete(fault_clear_all_handler))
         .route("/v1/fault", get(fault_list_handler))
@@ -243,8 +287,22 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/images", get(images_handler))
-        .route("/v1/batch", post(batch_submit_handler))
-        .route("/v1/build", post(build_submit_handler))
+        .route("/v1/batch", post(super::batch::batch_submit_handler))
+        .route("/v1/batch/run", post(super::batch::batch_run_handler))
+        .route(
+            "/v1/batch/{id}/report",
+            post(super::batch::batch_report_handler),
+        )
+        .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
+        .route("/v1/build", post(super::build_runner::build_submit_handler))
+        .route(
+            "/v1/build/run",
+            post(super::build_runner::build_run_handler),
+        )
+        .route(
+            "/v1/build/{id}",
+            get(super::build_runner::build_status_handler),
+        )
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
         .route("/v1/token/create", post(token_create_handler))
@@ -961,7 +1019,10 @@ async fn cluster_apply(
 /// per-node API addresses); the fallback derives from the leader's
 /// raft IP and this node's own API port, which is correct only when
 /// ports are uniform across the cluster.
-async fn leader_api_url(state: &ApiState, council: &crate::council::CouncilNode) -> Option<String> {
+pub(crate) async fn leader_api_url(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+) -> Option<String> {
     let leader_id = council.current_leader().await?;
     let (leader_name, leader_ip) = {
         let metrics = council.metrics();
@@ -1640,6 +1701,180 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
 
     match resp_rx.await {
         Ok(status) => Json(serde_json::json!(status)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume snapshots (Phase 12 E2)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, Default)]
+struct SnapshotCreateBody {
+    /// Container mount path; omitted = every provisioned volume.
+    volume: Option<String>,
+    /// Custom snapshot name; omitted = unix-seconds timestamp.
+    name: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SnapshotRestoreBody {
+    name: String,
+}
+
+/// Map snapshot failures to honest status codes: a running app is a
+/// conflict, missing things are 404, a non-btrfs volume is the
+/// client's setup problem, anything else is ours.
+fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
+    use crate::grill::snapshot::SnapshotError;
+    let status = match error {
+        crate::bun::BunError::Snapshot(SnapshotError::AppRunning { .. }) => StatusCode::CONFLICT,
+        crate::bun::BunError::Snapshot(
+            SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
+        ) => StatusCode::NOT_FOUND,
+        crate::bun::BunError::Snapshot(SnapshotError::UnsupportedFilesystem { .. }) => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+async fn snapshot_create_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app)): Path<(String, String)>,
+    body: Option<Json<SnapshotCreateBody>>,
+) -> Response {
+    let Json(body) = body.unwrap_or_default();
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotCreate {
+            namespace,
+            app_name: app,
+            volume: body.volume,
+            name: body.name,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(metas)) => (StatusCode::CREATED, Json(serde_json::json!(metas))).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn snapshot_list_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app)): Path<(String, String)>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotList {
+            namespace,
+            app_name: app,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(metas)) => Json(serde_json::json!(metas)).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn snapshot_restore_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app)): Path<(String, String)>,
+    Json(body): Json<SnapshotRestoreBody>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotRestore {
+            namespace,
+            app_name: app,
+            name: body.name,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(())) => Json(serde_json::json!({ "restored": true })).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent dropped response" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn snapshot_delete_handler(
+    State(state): State<ApiState>,
+    Path((namespace, app, name)): Path<(String, String, String)>,
+) -> Response {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::SnapshotDelete {
+            namespace,
+            app_name: app,
+            name,
+            response: resp_tx,
+        })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "agent unavailable" })),
+        )
+            .into_response();
+    }
+    match resp_rx.await {
+        Ok(Ok(())) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(Err(e)) => snapshot_error_response(&e),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
@@ -2609,164 +2844,6 @@ async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
         })
         .collect();
     Json(serde_json::json!({"images": images}))
-}
-
-/// Submit a batch of jobs.
-///
-/// Not yet wired into the live agent. The batch scheduler (`schedule_batch`)
-/// and `BatchTracker` exist and are unit-tested, but resolving job specs,
-/// dispatching across the cluster, and tracking completion via the reporting
-/// tree are deferred to Phase 12. Returns 501 rather than pretending to accept.
-async fn batch_submit_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "batch dispatch is not yet wired into the agent (deferred to Phase 12)"
-        })),
-    )
-        .into_response()
-}
-
-/// Request body for `/v1/build`.
-#[derive(serde::Deserialize)]
-struct BuildSubmitRequest {
-    name: String,
-    context_digest: String,
-    registry_port: u16,
-    spec: crate::config::build::BuildSpec,
-}
-
-/// Submit a build job: fetch the context blob from the local Pickle
-/// registry, run `buildah bud` + `buildah push` against it, and let the
-/// push land the image back in Pickle through the standard endpoints.
-///
-/// Requires `buildah` on PATH (Linux build nodes); without it the
-/// response says so honestly instead of pretending to accept (X1).
-/// The build runs synchronously — minutes-long builds hold the request
-/// open, matching the CLI's 300 s client timeout.
-async fn build_submit_handler(Json(request): Json<BuildSubmitRequest>) -> Response {
-    // Builder present?
-    if tokio::process::Command::new("buildah")
-        .arg("--version")
-        .output()
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "error": "build execution requires `buildah` on PATH \
-                          (available on Linux build nodes; not supported on macOS)"
-            })),
-        )
-            .into_response();
-    }
-
-    let job = match crate::pickle::build::execute_build(
-        &request.spec,
-        &request.context_digest,
-        Some(request.registry_port),
-    ) {
-        Ok(job) => job,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid build spec: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    // Fetch the context blob from the local registry.
-    let context_url =
-        crate::pickle::build::context_download_url(request.registry_port, &request.context_digest);
-    let context = match reqwest::get(&context_url).await {
-        Ok(response) if response.status().is_success() => match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({"error": format!("context read failed: {e}")})),
-                )
-                    .into_response();
-            }
-        },
-        _ => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "context blob {} not found in the registry",
-                        request.context_digest
-                    )
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    // Extract the tarred context (blocking IO off the runtime).
-    let build_dir = std::env::temp_dir()
-        .join("reliaburger-build")
-        .join(request.context_digest.replace(':', "-"));
-    let extract_dir = build_dir.clone();
-    let extracted = tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&extract_dir)?;
-        tar::Archive::new(&context[..]).unpack(&extract_dir)?;
-        Ok::<_, std::io::Error>(())
-    })
-    .await;
-    if !matches!(extracted, Ok(Ok(()))) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "failed to extract build context"})),
-        )
-            .into_response();
-    }
-
-    // Run the build, then the push. Both are external processes; the
-    // push targets the local registry, so the result lands in Pickle
-    // through the same handlers a `docker push` would use (real
-    // holders, catalog persistence, Raft propose — all for free).
-    for (label, cmd) in [("build", &job.build_cmd), ("push", &job.push_cmd)] {
-        let (program, args) = match cmd.split_first() {
-            Some(pair) => pair,
-            None => continue,
-        };
-        let output = tokio::process::Command::new(program)
-            .args(args)
-            .current_dir(&build_dir)
-            .output()
-            .await;
-        match output {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("buildah {label} failed for {}: {tail}", request.name)
-                    })),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("failed to run buildah {label}: {e}")
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    Json(serde_json::json!({
-        "status": format!("built and pushed {}", job.local_tag),
-    }))
-    .into_response()
 }
 
 /// GitOps webhook handler.

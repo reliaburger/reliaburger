@@ -34,6 +34,18 @@ pub struct PickleState {
     pub persist_path: Option<std::path::PathBuf>,
 }
 
+impl PickleState {
+    /// A point-in-time catalog view: the council's Raft-replicated
+    /// catalog when clustered, the local one otherwise. P2P pulls and
+    /// the pull-through cache plan against this.
+    pub async fn catalog_snapshot(&self) -> ManifestCatalog {
+        match &self.council {
+            Some(council) => council.manifest_catalog().await,
+            None => self.catalog.read().await.clone(),
+        }
+    }
+}
+
 /// Record a committed manifest: apply to the local catalog, persist it
 /// to disk, and — when this node is a council member — propose it to
 /// Raft so the cluster-wide catalog tracks the real holder.
@@ -43,7 +55,7 @@ pub struct PickleState {
 /// wiring), and a failed propose must not fail the push — the local
 /// catalog is already persisted and the replication loop reconciles
 /// holder sets from it later.
-async fn record_commit(state: &PickleState, manifest: ImageManifest, tag: String) {
+pub(crate) async fn record_commit(state: &PickleState, manifest: ImageManifest, tag: String) {
     let commit = ManifestCommit {
         manifest,
         tag,

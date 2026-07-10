@@ -119,6 +119,43 @@ fn split_name_tag(s: &str) -> (&str, String) {
     }
 }
 
+/// A cluster-backed layer source consulted before any external
+/// registry (Phase 12 C2). Implemented over the Pickle catalog +
+/// P2P pulls; injected late because the cluster subsystems start
+/// after the runtime is selected.
+///
+/// `fetch_cluster_image` returns:
+/// - `Ok(Some(layer_paths))` — the catalog knows `repository:tag`;
+///   all layer blobs are now local, in manifest order, at these paths.
+/// - `Ok(None)` — not a cluster image; fall through to the external
+///   registry.
+/// - `Err(reason)` — the catalog knows the image but its layers could
+///   not be materialised. The caller must NOT fall back: the same name
+///   on an external registry is a different (wrong) image.
+pub trait ClusterImageSource: Send + Sync {
+    fn fetch_cluster_image<'a>(
+        &'a self,
+        repository: &'a str,
+        tag: &'a str,
+    ) -> ClusterFetchFuture<'a>;
+
+    /// Pull-through cache for external references, consulted after the
+    /// cluster candidates miss. `Ok(None)` = cache disabled or
+    /// unavailable — fall through to a direct external pull. Unlike
+    /// `fetch_cluster_image`, an error here is also a fall-through
+    /// (same image identity upstream, so a direct pull is safe).
+    fn fetch_pull_through<'a>(&'a self, image: &'a ImageReference) -> ClusterFetchFuture<'a> {
+        let _ = image;
+        Box::pin(std::future::ready(Ok(None)))
+    }
+}
+
+/// Boxed future returned by [`ClusterImageSource::fetch_cluster_image`]
+/// (the trait must be `dyn`-safe, so no `impl Future` here).
+pub type ClusterFetchFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<Vec<PathBuf>>, String>> + Send + 'a>,
+>;
+
 /// Content-addressed image store on disk.
 ///
 /// Disk layout:
@@ -131,12 +168,42 @@ fn split_name_tag(s: &str) -> (&str, String) {
 #[derive(Clone)]
 pub struct ImageStore {
     store_root: PathBuf,
+    /// Set once at startup when clustering is enabled; shared across
+    /// clones (the runc grill holds one). A lock-free `OnceLock` read
+    /// sits on every pull, a set happens at most once.
+    cluster_source: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn ClusterImageSource>>>,
 }
 
 impl ImageStore {
     /// Create a new image store at the given root directory.
     pub fn new(store_root: PathBuf) -> Self {
-        Self { store_root }
+        Self {
+            store_root,
+            cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Install the cluster image source. Called once after the cluster
+    /// subsystems start; later calls are ignored (`OnceLock`).
+    pub fn set_cluster_source(&self, source: std::sync::Arc<dyn ClusterImageSource>) {
+        let _ = self.cluster_source.set(source);
+    }
+
+    /// Unpack pre-fetched layer blobs into a rootfs (tar extraction is
+    /// CPU-bound, so it runs on a blocking task).
+    async fn unpack_to(
+        &self,
+        layer_paths: Vec<PathBuf>,
+        rootfs: PathBuf,
+    ) -> Result<PathBuf, ImageError> {
+        let rootfs_clone = rootfs.clone();
+        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &rootfs_clone))
+            .await
+            .map_err(|e| ImageError::UnpackFailed {
+                digest: "join".to_string(),
+                reason: e.to_string(),
+            })??;
+        Ok(rootfs)
     }
 
     /// Create a store using the default rootless location.
@@ -184,6 +251,47 @@ impl ImageStore {
         let oci_ref = image_ref.to_oci_reference()?;
 
         let rootfs = self.rootfs_path(&image_ref);
+
+        // Cluster-first: if the Pickle catalog knows this image, its
+        // layers arrive from peers and unpack from the pickle blob
+        // store. This isn't only a bandwidth win — the external client
+        // below speaks HTTPS only, so cluster-pushed (plain-HTTP)
+        // images can't be deployed any other way.
+        if let Some(source) = self.cluster_source.get() {
+            for (repo, tag) in cluster_candidates(&image_ref) {
+                match source.fetch_cluster_image(&repo, &tag).await {
+                    Ok(Some(layer_paths)) => {
+                        return self.unpack_to(layer_paths, rootfs).await;
+                    }
+                    Ok(None) => continue,
+                    // The catalog knows the image but its layers are
+                    // unreachable. Do NOT fall through: `web:v1` on an
+                    // external registry is a different image.
+                    Err(reason) => {
+                        return Err(ImageError::LayerPull {
+                            digest: format!("{repo}:{tag}"),
+                            reason,
+                        });
+                    }
+                }
+            }
+
+            // Not a cluster image — try the pull-through cache. Errors
+            // fall through to the direct pull: the upstream identity is
+            // the same either way, so degrading is safe (and logged).
+            match source.fetch_pull_through(&image_ref).await {
+                Ok(Some(layer_paths)) => {
+                    return self.unpack_to(layer_paths, rootfs).await;
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    eprintln!(
+                        "warning: pull-through cache failed for {image}: {reason} — \
+                         falling back to a direct pull"
+                    );
+                }
+            }
+        }
 
         // Create the OCI distribution client. The default ClientConfig
         // includes a platform resolver that picks the current host's
@@ -269,6 +377,27 @@ impl ImageStore {
 
         Ok(rootfs)
     }
+}
+
+/// Repository/tag candidates to try against the Pickle catalog for a
+/// parsed image reference.
+///
+/// Parsing normalises `web:v1` to `docker.io/library/web:v1`, but the
+/// catalog stores whatever repository the pusher used in the URL path
+/// (`/v2/web/manifests/v1` → `web`). So for Docker Hub shorthand we
+/// try the bare name first, then the normalised form. Explicit
+/// registries can't be pushed to Pickle under that name — no
+/// candidates (the pull-through cache handles them separately).
+pub fn cluster_candidates(image_ref: &ImageReference) -> Vec<(String, String)> {
+    if image_ref.registry != "docker.io" {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    if let Some(bare) = image_ref.repository.strip_prefix("library/") {
+        candidates.push((bare.to_string(), image_ref.tag.clone()));
+    }
+    candidates.push((image_ref.repository.clone(), image_ref.tag.clone()));
+    candidates
 }
 
 /// Compute the SHA-256 hex digest of some data.
@@ -450,6 +579,35 @@ pub fn looks_like_image_ref(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- cluster_candidates ------------------------------------------------
+
+    #[test]
+    fn cluster_candidates_bare_name_tries_bare_then_normalised() {
+        let r = ImageReference::parse("web:v1").unwrap();
+        assert_eq!(
+            cluster_candidates(&r),
+            vec![
+                ("web".to_string(), "v1".to_string()),
+                ("library/web".to_string(), "v1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cluster_candidates_user_repo_uses_repository_as_is() {
+        let r = ImageReference::parse("team/app:v2").unwrap();
+        assert_eq!(
+            cluster_candidates(&r),
+            vec![("team/app".to_string(), "v2".to_string())]
+        );
+    }
+
+    #[test]
+    fn cluster_candidates_explicit_registry_has_none() {
+        let r = ImageReference::parse("ghcr.io/org/app:v1").unwrap();
+        assert!(cluster_candidates(&r).is_empty());
+    }
 
     // -- ImageReference::parse -------------------------------------------------
 

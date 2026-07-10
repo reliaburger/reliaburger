@@ -110,6 +110,7 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
         reports.insert(
             node_id.clone(),
             StateReport {
+                has_buildah: false,
                 node_id,
                 timestamp: SystemTime::now(),
                 running_apps,

@@ -362,6 +362,7 @@ mod tests {
         let grill = AppleContainerGrill::new();
         let id = InstanceId("apple-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "alpine:latest".to_string(),
                 readonly: false,

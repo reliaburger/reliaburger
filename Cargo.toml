@@ -25,7 +25,7 @@ path = "src/bin/testapp.rs"
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -59,7 +59,8 @@ argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
 datafusion = "45"
-object_store = { version = "0.12", features = ["fs"] }
+object_store = { version = "0.12", features = ["fs", "aws", "gcp"] }
+url = "2"
 sysinfo = "0.33"
 prometheus-parse = "0.2"
 rust-embed = "8"
@@ -92,6 +93,28 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# Content-addressed storage verifies a SHA-256 on every blob write and
+# read-back; unoptimised SHA-256 runs at ~30 MB/s and dominates the
+# image-transfer tests (100 MB P2P pull). Optimise just the hash
+# crates — everything else keeps fast debug builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3
+
+[profile.test.package.digest]
+opt-level = 3
+
+[profile.test.package.block-buffer]
+opt-level = 3
 
 [[bench]]
 name = "gossip"
