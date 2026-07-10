@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use super::InstanceId;
+use super::portmap::{self, NftCommandExecutor, NftExecutor};
 
 /// Errors from network namespace operations.
 #[derive(Debug, thiserror::Error)]
@@ -66,34 +67,50 @@ pub struct ContainerNetwork {
 /// remove the mapping.
 pub struct PortMapHandle {
     /// Cancellation token that stops the TCP proxy (rootless) or
-    /// signals that the nftables rule should be removed (root).
+    /// signals that the map element should be removed (root).
     shutdown: CancellationToken,
-    /// The nftables rule spec, if root mode. Used for cleanup.
-    nft_rule: Option<NftRule>,
+    /// The map element's key, if root mode. Used for cleanup — the
+    /// element is deleted by host port, no rule listing required.
+    nft_element: Option<u16>,
     /// Host port being mapped.
     pub host_port: u16,
     /// Container port being mapped.
     pub container_port: u16,
 }
 
-/// Stored nftables rule details for cleanup.
-struct NftRule {
-    host_port: u16,
-    container_ip: Ipv4Addr,
-    container_port: u16,
-}
-
 impl PortMapHandle {
     /// Shut down this port mapping. For rootless mode, cancels the TCP
-    /// proxy task. For root mode, removes the nftables rule.
+    /// proxy task. For root mode, deletes the map element — O(1),
+    /// keyed by host port.
     pub async fn shutdown(self) -> Result<(), NetnsError> {
         self.shutdown.cancel();
 
-        if let Some(rule) = &self.nft_rule {
-            remove_nft_rule(rule).await?;
+        if let Some(host_port) = self.nft_element {
+            NftCommandExecutor
+                .run(&portmap::element_delete(host_port))
+                .await
+                .map_err(|reason| NetnsError::TeardownFailed {
+                    instance: "nft-map".to_string(),
+                    reason,
+                })?;
         }
 
         Ok(())
+    }
+
+    /// Re-track a root-mode mapping installed by a previous bun
+    /// process. Map elements live in the kernel and survive agent
+    /// restarts, so adoption only needs a handle whose shutdown will
+    /// delete the element — nothing is added here. Rootless proxy
+    /// tasks die with the old process and are not respawned on
+    /// adoption. // TODO(Phase 15): respawn rootless proxies on adopt.
+    pub fn for_adopted(host_port: u16, container_port: u16) -> Self {
+        Self {
+            shutdown: CancellationToken::new(),
+            nft_element: Some(host_port),
+            host_port,
+            container_port,
+        }
     }
 }
 
@@ -373,12 +390,12 @@ pub async fn add_port_mapping(
 
         Ok(PortMapHandle {
             shutdown,
-            nft_rule: None,
+            nft_element: None,
             host_port,
             container_port,
         })
     } else {
-        // Root: nftables DNAT
+        // Root: one element in the DNAT map, O(1) at any scale.
         ensure_nft_table()
             .await
             .map_err(|e| NetnsError::PortMappingFailed {
@@ -388,42 +405,30 @@ pub async fn add_port_mapping(
                 reason: e,
             })?;
 
-        let rule_spec = format!(
-            "tcp dport {} dnat to {}:{}",
-            host_port, network.container_ip, container_port
-        );
-        run_cmd_raw(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "ip",
-                "reliaburger",
-                "prerouting",
-                "tcp",
-                "dport",
-                &host_port.to_string(),
-                "dnat",
-                "to",
-                &format!("{}:{}", network.container_ip, container_port),
-            ],
-            &format!("add nft rule: {rule_spec}"),
-        )
-        .await
-        .map_err(|e| NetnsError::PortMappingFailed {
-            instance: "nft".to_string(),
+        let executor = NftCommandExecutor;
+        let entry = portmap::PortMapEntry {
             host_port,
+            container_ip: network.container_ip,
             container_port,
-            reason: e,
-        })?;
+        };
+
+        // `add element` errors if the key exists. A stale element can
+        // survive an unclean agent death, so delete first (best-effort)
+        // to self-heal rather than fail the container start.
+        let _ = executor.run(&portmap::element_delete(host_port)).await;
+        executor
+            .run(&portmap::element_add(&entry))
+            .await
+            .map_err(|reason| NetnsError::PortMappingFailed {
+                instance: "nft-map".to_string(),
+                host_port,
+                container_port,
+                reason,
+            })?;
 
         Ok(PortMapHandle {
             shutdown,
-            nft_rule: Some(NftRule {
-                host_port,
-                container_ip: network.container_ip,
-                container_port,
-            }),
+            nft_element: Some(host_port),
             host_port,
             container_port,
         })
@@ -496,70 +501,75 @@ async fn ensure_nft_table() -> Result<(), String> {
     )
     .await?;
 
-    // Masquerade outgoing traffic from container subnets
-    run_cmd_raw(
-        "nft",
-        &[
-            "add",
-            "rule",
-            "ip",
-            "reliaburger",
-            "postrouting",
-            "ip",
-            "saddr",
-            "10.0.0.0/8",
-            "masquerade",
-        ],
-        "add masquerade rule",
-    )
-    .await?;
+    // Masquerade outgoing traffic from container subnets. `add rule`
+    // is not idempotent (it appends duplicates), so probe first.
+    let postrouting = list_chain("postrouting").await?;
+    if !postrouting.contains("masquerade") {
+        run_cmd_raw(
+            "nft",
+            &[
+                "add",
+                "rule",
+                "ip",
+                "reliaburger",
+                "postrouting",
+                "ip",
+                "saddr",
+                "10.0.0.0/8",
+                "masquerade",
+            ],
+            "add masquerade rule",
+        )
+        .await?;
+    }
+
+    // The named port map (`add map` is idempotent, like table/chain).
+    NftCommandExecutor
+        .run(&portmap::portmap_definition())
+        .await?;
+
+    // The single lookup rule that consults the map, guarded the same
+    // way — and a one-time sweep of legacy per-port DNAT rules left by
+    // the pre-map scheme, which would otherwise match ahead of it.
+    let prerouting = list_chain("prerouting").await?;
+    if !prerouting.contains("@portmap") {
+        NftCommandExecutor.run(&portmap::map_rule()).await?;
+    }
+    for handle in portmap::legacy_rule_handles(&prerouting) {
+        let _ = run_cmd_raw(
+            "nft",
+            &[
+                "delete",
+                "rule",
+                "ip",
+                "reliaburger",
+                "prerouting",
+                "handle",
+                &handle.to_string(),
+            ],
+            "sweep legacy dnat rule",
+        )
+        .await;
+    }
 
     Ok(())
 }
 
-/// Remove an nftables DNAT rule.
-async fn remove_nft_rule(rule: &NftRule) -> Result<(), NetnsError> {
-    // List rules to find the handle, then delete by handle.
-    // This is simpler than tracking rule handles at creation time.
+/// List a chain with rule handles (`nft -a list chain`). Used to guard
+/// one-shot rules and to sweep legacy per-port DNAT rules.
+async fn list_chain(chain: &str) -> Result<String, String> {
     let output = tokio::process::Command::new("nft")
-        .args(["-a", "list", "chain", "ip", "reliaburger", "prerouting"])
+        .args(["-a", "list", "chain", "ip", "reliaburger", chain])
         .output()
         .await
-        .map_err(|e| NetnsError::TeardownFailed {
-            instance: "nft".to_string(),
-            reason: format!("failed to list nft rules: {e}"),
-        })?;
+        .map_err(|e| format!("failed to list chain {chain}: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let search = format!("dnat to {}:{}", rule.container_ip, rule.container_port);
-
-    for line in stdout.lines() {
-        if line.contains(&search) && line.contains(&format!("dport {}", rule.host_port)) {
-            // Extract handle number from "# handle N"
-            if let Some(handle) = line
-                .rsplit("# handle ")
-                .next()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-            {
-                let _ = run_cmd_raw(
-                    "nft",
-                    &[
-                        "delete",
-                        "rule",
-                        "ip",
-                        "reliaburger",
-                        "prerouting",
-                        "handle",
-                        &handle.to_string(),
-                    ],
-                    "delete nft rule",
-                )
-                .await;
-            }
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("nft list chain {chain} failed: {stderr}"));
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -646,18 +656,6 @@ async fn run_cmd_raw(program: &str, args: &[&str], description: &str) -> Result<
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// nftables rule generation (for testing)
-// ---------------------------------------------------------------------------
-
-/// Generate the nftables DNAT rule string for a port mapping.
-///
-/// This is a pure function used in tests to verify rule formatting
-/// without needing root or nftables installed.
-pub fn nft_dnat_rule(host_port: u16, container_ip: Ipv4Addr, container_port: u16) -> String {
-    format!("tcp dport {host_port} dnat to {container_ip}:{container_port}")
 }
 
 // ---------------------------------------------------------------------------
@@ -800,19 +798,9 @@ mod tests {
         assert!(name.len() <= 15, "veth name too long: {name}");
     }
 
-    // -- nftables rule generation ---------------------------------------------
-
-    #[test]
-    fn nft_dnat_rule_format() {
-        let rule = nft_dnat_rule(8080, Ipv4Addr::new(10, 0, 2, 2), 80);
-        assert_eq!(rule, "tcp dport 8080 dnat to 10.0.2.2:80");
-    }
-
-    #[test]
-    fn nft_dnat_rule_high_port() {
-        let rule = nft_dnat_rule(30000, Ipv4Addr::new(10, 39, 16, 11), 3000);
-        assert_eq!(rule, "tcp dport 30000 dnat to 10.39.16.11:3000");
-    }
+    // Argv generation for map elements is unit-tested in
+    // `grill::portmap` (cross-platform); only the live nftables
+    // behaviour is tested here, behind the netns gate.
 
     // -- Integration tests (Linux only, root required) ------------------------
 
@@ -911,13 +899,79 @@ mod tests {
         assert_eq!(handle.host_port, 18080);
         assert_eq!(handle.container_port, 80);
 
+        // The mapping is a map element, not a per-port rule.
+        let listing = list_map_elements().await;
+        assert!(
+            listing.contains("18080"),
+            "map should contain the element: {listing}"
+        );
+
         // Clean up
         handle
             .shutdown()
             .await
             .expect("failed to remove port mapping");
+
+        let listing = list_map_elements().await;
+        assert!(
+            !listing.contains("18080"),
+            "shutdown should delete the element: {listing}"
+        );
+
         teardown_container_network(&network)
             .await
             .expect("failed to tear down");
+    }
+
+    async fn list_map_elements() -> String {
+        let output = tokio::process::Command::new("nft")
+            .args(["list", "map", "ip", "reliaburger", "portmap"])
+            .output()
+            .await
+            .expect("nft list map failed to run");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn portmap_map_handles_1000_ports() {
+        if !netns_tests_enabled() {
+            eprintln!("skipping netns test (set RELIABURGER_NETNS_TESTS=1 to enable)");
+            return;
+        }
+
+        ensure_nft_table().await.expect("failed to ensure table");
+        let executor = NftCommandExecutor;
+        let container_ip = Ipv4Addr::new(10, 0, 2, 2);
+
+        for host_port in 40000..41000u16 {
+            let entry = portmap::PortMapEntry {
+                host_port,
+                container_ip,
+                container_port: 8080,
+            };
+            // Best-effort pre-clean in case a previous run died midway.
+            let _ = executor.run(&portmap::element_delete(host_port)).await;
+            executor
+                .run(&portmap::element_add(&entry))
+                .await
+                .expect("failed to add element");
+        }
+
+        let listing = list_map_elements().await;
+        let count = listing.matches(": 10.0.2.2 . 8080").count();
+        assert!(count >= 1000, "expected 1000 elements, found {count}");
+
+        for host_port in 40000..41000u16 {
+            executor
+                .run(&portmap::element_delete(host_port))
+                .await
+                .expect("failed to delete element");
+        }
+
+        let listing = list_map_elements().await;
+        assert!(
+            !listing.contains("40500"),
+            "elements should be gone after deletion: {listing}"
+        );
     }
 }

@@ -130,6 +130,25 @@ pub fn element_delete(host_port: u16) -> Vec<String> {
     .collect()
 }
 
+/// Extract the handles of legacy per-port DNAT rules from an
+/// `nft -a list chain` listing.
+///
+/// The pre-map scheme added one `tcp dport N dnat to IP:PORT` rule per
+/// container. On upgrade those linger ahead of the map rule and win,
+/// so the one-time sweep deletes them by handle. The map's own lookup
+/// rule (`... map @portmap`) prints as `dnat ip addr . port to ...`,
+/// which never contains the literal `dnat to`, and map *elements*
+/// don't appear in chain listings at all — neither can match here.
+pub fn legacy_rule_handles(listing: &str) -> Vec<u64> {
+    listing
+        .lines()
+        .filter(|line| {
+            line.contains("dnat to") && line.contains("dport") && !line.contains("@portmap")
+        })
+        .filter_map(|line| line.rsplit("# handle ").next()?.trim().parse().ok())
+        .collect()
+}
+
 /// Tracks which host ports are currently mapped, so repeated applies
 /// are incremental and a mid-batch failure can be rolled back.
 #[derive(Debug, Default)]
@@ -319,6 +338,42 @@ pub(crate) mod tests {
         let args = element_add(&entry(30001));
         assert_eq!(args.last().unwrap(), "{ 30001 : 10.0.2.2 . 8080 }");
         assert_eq!(element_delete(30001).last().unwrap(), "{ 30001 }");
+    }
+
+    // -- legacy sweep parsing ----------------------------------------------
+
+    const CHAIN_LISTING: &str = "\
+table ip reliaburger {
+\tchain prerouting { # handle 1
+\t\ttype nat hook prerouting priority dstnat; policy accept;
+\t\ttcp dport 30001 dnat to 10.0.2.2:8080 # handle 42
+\t\tdnat ip addr . port to tcp dport map @portmap # handle 44
+\t\ttcp dport 30002 dnat to 10.0.2.3:9090 # handle 57
+\t}
+}";
+
+    #[test]
+    fn legacy_handles_found_for_per_port_rules() {
+        assert_eq!(legacy_rule_handles(CHAIN_LISTING), vec![42, 57]);
+    }
+
+    #[test]
+    fn legacy_handles_skip_the_map_rule() {
+        let listing = "\tdnat ip addr . port to tcp dport map @portmap # handle 44\n";
+        assert!(legacy_rule_handles(listing).is_empty());
+    }
+
+    #[test]
+    fn legacy_handles_empty_chain() {
+        assert!(legacy_rule_handles("table ip reliaburger {\n}\n").is_empty());
+    }
+
+    #[test]
+    fn legacy_handles_ignore_lines_without_handles() {
+        // A matching rule line with no trailing handle comment parses
+        // to nothing rather than panicking or inventing a handle.
+        let listing = "tcp dport 30001 dnat to 10.0.2.2:8080\n";
+        assert!(legacy_rule_handles(listing).is_empty());
     }
 
     // -- apply/rollback ---------------------------------------------------

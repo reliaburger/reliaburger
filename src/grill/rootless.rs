@@ -258,6 +258,7 @@ mod tests {
 
     fn sample_spec() -> OciSpec {
         OciSpec {
+            port_mapping: None,
             root: OciRoot {
                 path: "rootfs".to_string(),
                 readonly: false,

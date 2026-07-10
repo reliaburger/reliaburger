@@ -58,6 +58,7 @@ Six work slices, ordered:
 ### 3.1 Port mapping today
 
 - `src/grill/netns.rs:356-431` `add_port_mapping()`: root mode runs `nft add rule ip reliaburger prerouting tcp dport {hp} dnat to {ip}:{cp}` — **one rule per container port**, O(n) chain traversal. Rootless mode spawns a tokio TCP proxy (untouched by this plan).
+- **Discovered during A2:** `add_port_mapping` had **no production callers** — only the gated netns test used it (the M21 pattern again). A2 therefore also wires it: the port pair rides on a new `OciSpec.port_mapping` field (`#[serde(default)]` for pre-existing instance records), `RuncGrill::create` installs the mapping next to the netns setup, teardown/adoption handle it symmetrically. Out of scope and recorded honestly: prerouting DNAT covers host-inbound traffic only; locally-originated traffic to `container_ip:host_port` and the cross-node container-IP story are part of the node-local control-plane gap in `docs/plans/design-discrepancies-2026-07-09.md`.
 - Rule removal (`netns.rs:521-563`) lists all rules with `nft -a list`, parses handles from text. Fragile and O(n); the map design removes it entirely.
 - `ensure_nft_table()` (`netns.rs:460-517`) creates table `ip reliaburger`, chains `prerouting` (NAT hook, priority -100) and `postrouting` (masquerade). Idempotent.
 - `nft` is invoked via `tokio::process::Command::new("nft")` (`netns.rs:524`); pure rule-text helper `nft_dnat_rule()` at `netns.rs:659` with unit tests at 806/812.

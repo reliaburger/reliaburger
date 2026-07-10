@@ -4840,6 +4840,7 @@ mod tests {
             host_port: Some(30123),
             app_spec: Some(app_spec),
             oci_spec: crate::grill::oci::OciSpec {
+                port_mapping: None,
                 root: crate::grill::oci::OciRoot {
                     path: "/tmp/test".to_string(),
                     readonly: false,

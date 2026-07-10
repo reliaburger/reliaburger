@@ -164,7 +164,35 @@ The same struct makes repeated applies *incremental* — a port that's already m
 
 One design note: `PortMapError` is its own small error enum rather than reusing the netns module's `NetnsError`. Not for purity — for portability. The netns module is `#[cfg(target_os = "linux")]`, and tying portmap to it would have dragged the whole module (tests included) into Linux-only territory. A two-variant enum was the cheaper way to keep the logic testable on every platform. The Linux boundary wraps it at the call site.
 
-Wiring this into the actual container network path — and sweeping away the old per-port rules on upgraded nodes — is the next pass.
+### The switchover, and the surprise underneath it
+
+Flipping `netns.rs` over was supposed to be mechanical: `ensure_nft_table` grows the map and the single lookup rule, `add_port_mapping` becomes an `add element`, teardown becomes `delete element`, and the forty lines of handle-parsing removal code get deleted with some satisfaction. All of that happened. But while tracing the call sites, a question wouldn't go away: who actually *calls* `add_port_mapping`?
+
+The answer was: nobody. One integration test. The production runc path sets up the network namespace and the veth pair, but the DNAT rule that makes an allocated host port reach the container was never installed by any deploy. The whole per-rule mechanism we came to optimise was a well-tested library with no caller — the same trap we'll hit again with volumes later in this chapter, and the single most consistent lesson of the July review. An optimisation pass turned into a wiring fix.
+
+So how do you get the port pair to where the network is created? The supervisor allocates the host port; the app spec declares the container port; runc creates the netns. Rather than threading a new method through the agent's four start paths, the pair rides along on data that already makes the journey — the OCI spec:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMapping {
+    pub host_port: u16,
+    pub container_port: u16,
+}
+
+// on OciSpec:
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub port_mapping: Option<PortMapping>,
+```
+
+`generate_oci_spec` already receives the allocated host port (it uses it for mounts), so populating the field is a `zip` of two `Option`s. RuncGrill installs the element right where it creates the namespace, stores the handle, and tears it down when the container dies or is deleted. The `#[serde(default)]` matters more than it looks: OCI specs are persisted in instance records for Phase 14's self-upgrade adoption, and records written by an older binary simply don't have the field. `default` makes them deserialise to `None` instead of failing — the difference between an upgrade that adopts running workloads and one that orphans them. (There's a test that literally deletes the field from the JSON and asserts the record still parses.)
+
+Adoption has one more wrinkle worth savouring: when bun restarts under a self-upgrade, the containers keep running, and the kernel keeps their map elements. Nothing needs re-adding. But the *handle* — the Rust value whose shutdown deletes the element — died with the old process. So adoption rebuilds just the handle from the record, touching nftables not at all. Kernel state and process state have different lifetimes, and the adopt path is where you feel it.
+
+Two smaller notes from the switchover. First, upgraded nodes still carry per-port rules from the old scheme, sitting ahead of the map rule and matching first. `ensure_nft_table` now lists the chain once, deletes any legacy `dnat to` rules by handle (the map's own rule prints as `dnat ip addr . port to ...` and can't match the filter — checked by a unit test with a canned listing), and that's the last handle-parsing this codebase does. Second, listing the chain gave us a guard for free: it turns out `nft add rule` happily appends duplicates, so the masquerade rule had been quietly duplicating on every port mapping since Phase 3. Probing before adding fixed that too.
+
+And the C4 rule still stands: everything here lives in the `reliaburger` table, and nothing touches `reliaburger_fw`. The perimeter firewall reconcile deletes *its own* table wholesale; the day those two tables were one, a firewall refresh silently wiped every container's NAT. The guard test that keeps them separate stays green.
+
+What the map deliberately doesn't fix: DNAT in `prerouting` only rewrites traffic *arriving at the node from outside*. A connection made from the node itself (or from a local container) to `container_ip:host_port` never traverses prerouting, and the cross-node story for container IPs is part of a bigger, known control-plane gap tracked in the July discrepancy register. This section made published ports genuinely reachable from outside the node, in O(1). It did not redesign the dataplane — and saying which is which out loud is half the value of a register like that.
 
 ---
 

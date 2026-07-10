@@ -524,6 +524,7 @@ mod tests {
 
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
+            port_mapping: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
