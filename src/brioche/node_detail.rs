@@ -87,6 +87,7 @@ mod tests {
             app_count: 2,
             apps: vec![
                 InstanceStatus {
+                    exit_code: None,
                     id: "web-1".to_string(),
                     app_name: "web".to_string(),
                     namespace: "default".to_string(),
@@ -96,6 +97,7 @@ mod tests {
                     pid: Some(1234),
                 },
                 InstanceStatus {
+                    exit_code: None,
                     id: "api-1".to_string(),
                     app_name: "api".to_string(),
                     namespace: "prod".to_string(),

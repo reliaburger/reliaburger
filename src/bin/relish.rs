@@ -220,6 +220,12 @@ enum Command {
         /// Path to a TOML config file with [job.*] sections.
         path: PathBuf,
     },
+    /// Show the progress of a submitted batch.
+    #[command(name = "batch-status")]
+    BatchStatus {
+        /// Batch id from `relish batch`.
+        id: u64,
+    },
     /// Manage secrets (encrypt values for use in app configs).
     Secret {
         #[command(subcommand)]
@@ -822,6 +828,7 @@ async fn main() -> ExitCode {
             registry_port,
         } => commands::build(path, registry_port).await,
         Command::Batch { ref path } => commands::batch(path).await,
+        Command::BatchStatus { id } => commands::batch_status(id).await,
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),

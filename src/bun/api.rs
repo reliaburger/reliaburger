@@ -87,6 +87,16 @@ pub struct ApiState {
     /// Self-upgrade manager, for the fast dependency-free `/v1/version`
     /// endpoint. Upgrade *operations* go through the agent command channel.
     pub upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
+    /// Batch job tracker (Phase 12 F1). Lives leader-side: submissions
+    /// and status reads leader-forward, so one tracker sees them all.
+    pub batch_tracker: Arc<tokio::sync::Mutex<crate::meat::batch_tracker::BatchTracker>>,
+    /// The leader's aggregated worker reports — batch capacity comes
+    /// from here (the same source the deploy scheduler uses). `None`
+    /// standalone; batch then schedules onto this node only.
+    pub aggregated_rx:
+        Option<tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>>,
+    /// This node's gossip name, for batch self-dispatch short-circuits.
+    pub node_name: Option<String>,
 }
 
 /// Build the API router.
@@ -121,6 +131,8 @@ pub fn router(
         gitops_webhook_tx,
         api_port,
         None,
+        None,
+        None,
     )
 }
 
@@ -141,6 +153,10 @@ pub fn router_with_upgrade(
     gitops_webhook_tx: Option<mpsc::Sender<()>>,
     api_port: u16,
     upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
+    aggregated_rx: Option<
+        tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>,
+    >,
+    node_name: Option<String>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -159,6 +175,11 @@ pub fn router_with_upgrade(
         http_client: reqwest::Client::new(),
         api_port,
         upgrade,
+        batch_tracker: Arc::new(tokio::sync::Mutex::new(
+            crate::meat::batch_tracker::BatchTracker::new(),
+        )),
+        aggregated_rx,
+        node_name,
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
@@ -255,7 +276,13 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/images", get(images_handler))
-        .route("/v1/batch", post(batch_submit_handler))
+        .route("/v1/batch", post(super::batch::batch_submit_handler))
+        .route("/v1/batch/run", post(super::batch::batch_run_handler))
+        .route(
+            "/v1/batch/{id}/report",
+            post(super::batch::batch_report_handler),
+        )
+        .route("/v1/batch/{id}", get(super::batch::batch_status_handler))
         .route("/v1/build", post(build_submit_handler))
         .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
@@ -973,7 +1000,10 @@ async fn cluster_apply(
 /// per-node API addresses); the fallback derives from the leader's
 /// raft IP and this node's own API port, which is correct only when
 /// ports are uniform across the cluster.
-async fn leader_api_url(state: &ApiState, council: &crate::council::CouncilNode) -> Option<String> {
+pub(crate) async fn leader_api_url(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+) -> Option<String> {
     let leader_id = council.current_leader().await?;
     let (leader_name, leader_ip) = {
         let metrics = council.metrics();
@@ -2803,15 +2833,6 @@ async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
 /// and `BatchTracker` exist and are unit-tested, but resolving job specs,
 /// dispatching across the cluster, and tracking completion via the reporting
 /// tree are deferred to Phase 12. Returns 501 rather than pretending to accept.
-async fn batch_submit_handler() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "batch dispatch is not yet wired into the agent (deferred to Phase 12)"
-        })),
-    )
-        .into_response()
-}
 
 /// Request body for `/v1/build`.
 #[derive(serde::Deserialize)]

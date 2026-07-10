@@ -1111,12 +1111,26 @@ impl BunClient {
     }
 
     /// Submit a batch of jobs for high-throughput scheduling.
-    pub async fn submit_batch(&self, job_names: &[String]) -> Result<String, RelishError> {
+    /// Submit a batch: full job specs travel with the request, so the
+    /// cluster needs no prior deploy of them. Returns the response
+    /// JSON (`batch_id`, `assigned`, `unschedulable`).
+    pub async fn submit_batch(
+        &self,
+        jobs: &std::collections::BTreeMap<String, crate::config::job::JobSpec>,
+    ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch", self.base_url);
+        let payload = serde_json::json!({
+            "jobs": jobs
+                .iter()
+                .map(|(name, spec)| {
+                    serde_json::json!({ "name": name, "spec": spec })
+                })
+                .collect::<Vec<_>>(),
+        });
         let response = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "jobs": job_names }))
+            .json(&payload)
             .send()
             .await
             .map_err(classify_error)?;
@@ -1127,14 +1141,23 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+        response.json().await.map_err(|e| RelishError::ApiError {
             status: 0,
             body: format!("failed to parse response: {e}"),
-        })?;
-        Ok(json["message"]
-            .as_str()
-            .unwrap_or("batch submitted")
-            .to_string())
+        })
+    }
+
+    /// Progress of a submitted batch (`GET /v1/batch/{id}`).
+    pub async fn batch_status(&self, batch_id: u64) -> Result<serde_json::Value, RelishError> {
+        let url = format!("{}/v1/batch/{batch_id}", self.base_url);
+        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response.json().await.map_err(classify_error)
     }
 
     // ---- self-upgrade (Phase 14) ----

@@ -283,6 +283,12 @@ pub struct InstanceStatus {
     pub restart_count: u32,
     /// Allocated host port, if any.
     pub host_port: Option<u16>,
+    /// Exit code of a stopped instance, when the runtime tracks it.
+    /// `stopped` alone is ambiguous for jobs — a failing job passes
+    /// through `stopped` between retries — so batch watchers (F1) need
+    /// this to tell success from failure-in-backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
     /// OS process ID, if available.
     pub pid: Option<u32>,
 }
@@ -3895,6 +3901,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut statuses = Vec::new();
         for instance in self.supervisor.list_instances() {
             let pid = self.supervisor.grill().pid(&instance.id).await;
+            let exit_code = self.supervisor.grill().exit_code(&instance.id).await;
             statuses.push(InstanceStatus {
                 id: instance.id.0.clone(),
                 app_name: instance.app_name.clone(),
@@ -3902,6 +3909,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 state: instance.state.to_string(),
                 restart_count: instance.restart_count,
                 host_port: instance.host_port,
+                exit_code,
                 pid,
             });
         }

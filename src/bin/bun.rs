@@ -367,6 +367,9 @@ async fn main() -> anyhow::Result<()> {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
+    // Batch scheduling (F1) reads capacities from the same aggregated
+    // view the deploy scheduler uses; None standalone.
+    let api_aggregated_rx = orchestration.as_ref().map(|(_, _, rx)| rx.clone());
 
     // Report real schedulable capacity to the cluster (L6: StateReports
     // used to carry zeroes).
@@ -913,6 +916,9 @@ async fn main() -> anyhow::Result<()> {
         gitops_webhook_tx,
         api_port,
         upgrade_manager.clone().map(Arc::new),
+        // Batch capacity (F1): the leader's aggregated worker reports.
+        api_aggregated_rx.clone(),
+        Some(node_name.clone()),
     );
     let server_shutdown = shutdown.clone();
     let server_handle = tokio::spawn(async move {

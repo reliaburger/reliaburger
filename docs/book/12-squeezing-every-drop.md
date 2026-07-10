@@ -434,6 +434,20 @@ The nicest design element is the smallest: each snapshot's metadata has an `uplo
 
 Failures accumulate into the tick's report rather than aborting it — one app's broken volume must not stop another app's backup — and the tests exercise exactly that: a sweep over unsnapshotable volumes (every macOS dev machine) reports errors and carries on.
 
+## A thousand jobs, fifty envelopes
+
+The `/v1/batch` endpoint has returned 501 since Phase 8, with the batch scheduler and tracker sitting library-complete beside it. Wiring it forced the one design question this chapter had left open: *how does the leader tell another node to run something?*
+
+The obvious answer is "the same way deploys do". Stage 4 gave deploys a Raft-placements pipeline: the leader writes desired assignments into the replicated log, and every node runs a reconciler that polls its assignments and converges — starts what should run, **stops what shouldn't**. That machinery is exactly wrong for run-to-completion jobs, and the reasons are worth spelling out. A finished job looks like *drift* to a reconciler ("assignment says run, node says stopped — restart it!"). A rebalanced assignment means *stopping* the workload on the old node — which for a job means killing work half-done, not gracefully moving a stateless replica. Reconciliation is the right tool for "keep this running"; it is the wrong tool for "run this once". So batch dispatch is direct HTTP: the leader POSTs each node's job group to `/v1/batch/run` (service-token authenticated), and running nodes post per-job completion reports back to a callback URL. Same crate, two dispatch idioms, each matching its workload's semantics — that contrast is the section's real lesson.
+
+The rest reuses what earlier phases built. Submissions carry *full job specs* (the old CLI sent only names, which required the cluster to already know the jobs — a genuine design bug found by wiring). Followers forward submissions to the leader with the same proxy shape as `/v1/apply`. Capacity comes from the reporting pipeline's aggregated worker reports — the very data the deploy scheduler uses — mapped into the bin-packer's `NodeCapacity`; a standalone node falls back to a single effectively-unbounded local entry, which is also what makes the integration tests run without a cluster. The `BatchTracker` lives leader-side, and a target node runs its share by synthesising a `Config` containing just those jobs and pushing it through the ordinary deploy path — retries, records, and all.
+
+### The watcher, and an ambiguous "stopped"
+
+Each running node watches its jobs to a terminal state by polling instance status. The first version of that watcher had a bug the failure-path test caught immediately: it treated `stopped` as success. But the runtime maps *any* process exit to `Stopped` — the exit code is tracked separately — so a job that exits non-zero shows as `stopped` while it waits out its retry backoff, and the watcher happily reported it completed. The fix exposes the exit code in `InstanceStatus` (long overdue; the TUI will want it too) and makes the predicate honest: `failed` is failure, `stopped` with exit 0 is success, `stopped` with a non-zero code is *backoff, keep waiting* — the agent will mark it `failed` once retries exhaust. States that look terminal and aren't are a classic distributed-systems trap; this one was two feet from home.
+
+Completion reports are deliberately forgiving: reporting into an unknown batch id is a recorded no-op, not an error, because a leader restart loses the in-memory tracker and late reports from running nodes must not explode. The trade — batch status is best-effort across leader changes — is accepted and written down. `relish batch` now prints the batch id; `relish batch-status <id>` shows the tracker's live summary.
+
 ---
 
-*Still to come in Phase 12: batch and build execution. This chapter grows with each.*
+*Still to come in Phase 12: build execution. This chapter grows with each.*

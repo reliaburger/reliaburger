@@ -168,6 +168,7 @@ mod tests {
             state: "running".to_string(),
             instances: vec![
                 InstanceStatus {
+                    exit_code: None,
                     id: "web-1".to_string(),
                     app_name: "web".to_string(),
                     namespace: "default".to_string(),
@@ -177,6 +178,7 @@ mod tests {
                     pid: Some(1234),
                 },
                 InstanceStatus {
+                    exit_code: None,
                     id: "web-2".to_string(),
                     app_name: "web".to_string(),
                     namespace: "default".to_string(),

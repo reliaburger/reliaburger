@@ -1016,9 +1016,48 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
     }
 
     let client = BunClient::default_local();
-    let job_names: Vec<String> = config.job.keys().cloned().collect();
-    let result = client.submit_batch(&job_names).await?;
-    println!("{result}");
+    let result = client.submit_batch(&config.job).await?;
+    println!(
+        "batch {} submitted: {} assigned",
+        result["batch_id"].as_u64().unwrap_or(0),
+        result["assigned"].as_u64().unwrap_or(0),
+    );
+    if let Some(unschedulable) = result["unschedulable"].as_array()
+        && !unschedulable.is_empty()
+    {
+        println!(
+            "unschedulable: {}",
+            unschedulable
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!(
+        "check progress with: relish batch-status {}",
+        result["batch_id"].as_u64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// Show a batch's progress.
+pub async fn batch_status(batch_id: u64) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let summary = client.batch_status(batch_id).await?;
+    println!(
+        "batch {}: {} total, {} pending, {} completed, {} failed{}",
+        batch_id,
+        summary["total"].as_u64().unwrap_or(0),
+        summary["pending"].as_u64().unwrap_or(0),
+        summary["completed"].as_u64().unwrap_or(0),
+        summary["failed"].as_u64().unwrap_or(0),
+        if summary["done"].as_bool().unwrap_or(false) {
+            " — done"
+        } else {
+            ""
+        },
+    );
     Ok(())
 }
 
