@@ -246,6 +246,149 @@ pub async fn replicate_manifest(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The heal loop (Phase 12 B5)
+// ---------------------------------------------------------------------------
+
+/// A manifest that needs more copies, and the nodes currently holding
+/// *all* of its layers. Produced by [`plan_heal`], consumed by
+/// [`heal_tick`].
+#[derive(Debug)]
+pub struct HealCandidate<'a> {
+    pub manifest: &'a super::types::ImageManifest,
+    pub full_holders: BTreeSet<u64>,
+}
+
+/// Find under-replicated manifests, rarest first.
+///
+/// "Rarest first" means ascending holder count: the manifests closest
+/// to loss are healed before merely under-replicated ones. The result
+/// is capped at `max_per_tick`, so a freshly joined empty node cannot
+/// trigger a cluster-wide replication storm — the loop catches up a
+/// slice at a time.
+pub fn plan_heal<'a>(
+    catalog: &'a super::types::ManifestCatalog,
+    redundancy: u32,
+    max_per_tick: usize,
+) -> Vec<HealCandidate<'a>> {
+    let mut candidates: Vec<HealCandidate<'a>> = catalog
+        .manifests
+        .iter()
+        .filter_map(|(_, manifest)| {
+            let mut full_holders: Option<BTreeSet<u64>> = None;
+            for digest in manifest.all_digests() {
+                let holders = catalog.layer_holders(digest.as_str());
+                full_holders = Some(match full_holders {
+                    Some(acc) => acc.intersection(&holders).copied().collect(),
+                    None => holders,
+                });
+            }
+            let full_holders = full_holders.unwrap_or_default();
+            (full_holders.len() < redundancy as usize).then_some(HealCandidate {
+                manifest,
+                full_holders,
+            })
+        })
+        .collect();
+
+    candidates.sort_by_key(|c| c.full_holders.len());
+    candidates.truncate(max_per_tick);
+    candidates
+}
+
+/// What one heal pass did: holder updates to propose to Raft, and the
+/// per-manifest failures (the caller logs them; a failure on one
+/// manifest never aborts the pass).
+#[derive(Debug, Default)]
+pub struct HealOutcome {
+    pub updates: Vec<super::types::UpdateLayerLocations>,
+    pub errors: Vec<String>,
+}
+
+/// One heal pass over the catalog.
+///
+/// For each under-replicated manifest (rarest first, capped at
+/// `max_per_tick`): first pull any layers this node lacks from a
+/// holder — so manifests pushed to, or cache-filled on, *other* nodes
+/// still gain redundancy — then replicate to peers that lack them.
+/// Returns the holder updates for the caller to propose to Raft.
+#[allow(clippy::too_many_arguments)]
+pub async fn heal_tick(
+    catalog: &super::types::ManifestCatalog,
+    store: &BlobStore,
+    self_node: u64,
+    peers: &[Peer],
+    redundancy: u32,
+    max_per_tick: usize,
+    client: &reqwest::Client,
+) -> HealOutcome {
+    let config = ReplicationConfig {
+        redundancy,
+        peer_timeout: Duration::from_secs(30),
+    };
+    let mut outcome = HealOutcome::default();
+
+    for candidate in plan_heal(catalog, redundancy, max_per_tick) {
+        let manifest = candidate.manifest;
+        let mut full_holders = candidate.full_holders;
+        let digests: Vec<Digest> = manifest.all_digests().into_iter().cloned().collect();
+
+        // Pull-first: become a holder before replicating onward.
+        if !digests.iter().all(|d| store.has_blob(d))
+            && let Err(e) = super::pull::pull_manifest_layers(
+                &digests,
+                &manifest.repository,
+                catalog,
+                peers,
+                store,
+                client,
+                config.peer_timeout,
+            )
+            .await
+        {
+            outcome
+                .errors
+                .push(format!("cannot pull {}: {e}", manifest.repository));
+            continue;
+        }
+        let self_is_new_holder = full_holders.insert(self_node);
+
+        let mut new_holders: BTreeSet<u64> = BTreeSet::new();
+        if self_is_new_holder {
+            new_holders.insert(self_node);
+        }
+
+        let needed = (redundancy as usize).saturating_sub(full_holders.len());
+        let targets = select_peers(peers, self_node, &full_holders, needed);
+        if !targets.is_empty() {
+            match replicate_manifest(manifest, store, &targets, &config, client).await {
+                Ok(result) => new_holders.extend(result.successful_nodes),
+                Err(e) => outcome.errors.push(format!(
+                    "replication of {} failed: {e}",
+                    manifest.repository
+                )),
+            }
+        }
+
+        if new_holders.is_empty() {
+            continue;
+        }
+        let updates = digests
+            .iter()
+            .map(|d| {
+                let mut holders = catalog.layer_holders(d.as_str());
+                holders.extend(new_holders.iter().copied());
+                (d.clone(), holders)
+            })
+            .collect();
+        outcome
+            .updates
+            .push(super::types::UpdateLayerLocations { updates });
+    }
+
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +470,82 @@ mod tests {
         let config = ReplicationConfig::default();
         assert_eq!(config.redundancy, 2);
         assert_eq!(config.peer_timeout, Duration::from_secs(30));
+    }
+
+    // -- plan_heal ----------------------------------------------------------
+
+    use super::super::types::{ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
+
+    /// A digest whose hex encodes the suffix, so each manifest gets
+    /// distinct layers.
+    fn heal_digest(suffix: u8) -> Digest {
+        Digest::new(&format!("sha256:{:064x}", suffix as u128)).unwrap()
+    }
+
+    fn heal_manifest(repo: &str, suffix: u8) -> ImageManifest {
+        let layer = |s: u8| LayerDescriptor {
+            digest: heal_digest(s),
+            size: 100,
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+        };
+        ImageManifest {
+            digest: heal_digest(suffix),
+            config: layer(suffix + 1),
+            layers: vec![layer(suffix + 2)],
+            repository: repo.to_string(),
+            tags: BTreeSet::new(),
+            total_size: 200,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: None,
+        }
+    }
+
+    /// Catalog with three manifests holding 2, 0-ish (1), and 3 full
+    /// copies respectively.
+    fn heal_catalog() -> ManifestCatalog {
+        let mut catalog = ManifestCatalog::default();
+        for (repo, suffix, holders) in [
+            ("two-copies", 10u8, vec![1u64, 2]),
+            ("one-copy", 20, vec![1]),
+            ("three-copies", 30, vec![1, 2, 3]),
+        ] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                manifest: heal_manifest(repo, suffix),
+                tag: "v1".to_string(),
+                holder_nodes: holders.into_iter().collect(),
+            });
+        }
+        catalog
+    }
+
+    #[test]
+    fn audit_orders_rarest_first() {
+        let catalog = heal_catalog();
+        let candidates = plan_heal(&catalog, 3, 10);
+
+        // three-copies is already at redundancy; the other two come
+        // back rarest first.
+        let repos: Vec<&str> = candidates
+            .iter()
+            .map(|c| c.manifest.repository.as_str())
+            .collect();
+        assert_eq!(repos, vec!["one-copy", "two-copies"]);
+        assert_eq!(candidates[0].full_holders, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn plan_heal_caps_work_per_tick() {
+        let catalog = heal_catalog();
+        let candidates = plan_heal(&catalog, 3, 1);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].manifest.repository, "one-copy");
+    }
+
+    #[test]
+    fn plan_heal_empty_when_redundancy_met() {
+        let catalog = heal_catalog();
+        assert!(plan_heal(&catalog, 1, 10).is_empty());
     }
 }

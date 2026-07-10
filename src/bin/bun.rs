@@ -999,6 +999,22 @@ async fn main() -> anyhow::Result<()> {
     let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
     println!("bun: Pickle registry listening on {registry_addr}");
 
+    // In cluster mode a loopback-bound registry silently disables peer
+    // replication, healing, and P2P image pulls — peers address us as
+    // http://<gossip-ip>:<registry_port>. Warn loudly rather than fail:
+    // single-node-with-council setups are legitimate. Note the flip
+    // side before changing the bind: the registry has no auth/TLS yet,
+    // so a wider bind should stay behind the perimeter firewall's
+    // cluster-node allowlist. TODO(Phase 13+): registry auth/mTLS.
+    if api_council.is_some() && config.images.registry_bind == "127.0.0.1" {
+        eprintln!(
+            "bun: WARNING: [images] registry_bind is 127.0.0.1 in cluster mode — \
+             image replication and P2P pulls between nodes will not work; \
+             set registry_bind to a peer-reachable address (the registry has \
+             no auth/TLS, so keep it firewalled to cluster nodes)"
+        );
+    }
+
     let pickle_shutdown = shutdown.clone();
     let pickle_handle = tokio::spawn(async move {
         axum::serve(pickle_listener, pickle_app)
@@ -1110,17 +1126,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Pickle replication (L10): leader-only loop that keeps every
-    // manifest's layers on at least `[images] redundancy` nodes.
+    // Pickle heal loop (L10 + Phase 12 B5): leader-only loop that keeps
+    // every manifest's layers on at least `[images] redundancy` nodes.
+    // The tick body lives in `pickle::replication::heal_tick` — rarest
+    // first, capped per tick, pulling layers the leader lacks before
+    // replicating onward — so it is testable without a running binary.
     if let (Some(council), Some(membership_rx)) = (api_council.clone(), replication_membership) {
-        use reliaburger::pickle::replication::{
-            Peer, ReplicationConfig, replicate_manifest, select_peers,
-        };
-
         let repl_store = Arc::clone(&blob_store);
         let repl_shutdown = shutdown.clone();
         let redundancy = config.images.redundancy.max(1);
         let registry_port = config.images.registry_port;
+        let self_node = node_raft_id;
 
         tokio::spawn(async move {
             let client = reqwest::Client::new();
@@ -1136,93 +1152,36 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let catalog = council.manifest_catalog().await;
-                let peers: Vec<Peer> = membership_rx
-                    .borrow()
-                    .iter()
-                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                    .map(|m| Peer {
-                        node_id: reliaburger::cluster::identity::raft_id_from_name(&m.node_id.0),
-                        base_url: format!("http://{}:{registry_port}", m.address.ip()),
-                    })
-                    .collect();
+                let peers = {
+                    let members = membership_rx.borrow();
+                    reliaburger::cluster::identity::pickle_peers(&members, registry_port)
+                };
                 if peers.len() < 2 {
                     continue; // nobody to replicate to
                 }
 
-                for (_, manifest) in &catalog.manifests {
-                    // Nodes that hold EVERY layer of this manifest.
-                    let mut full_holders: Option<std::collections::BTreeSet<u64>> = None;
-                    for digest in manifest.all_digests() {
-                        let holders = catalog.layer_holders(digest.as_str());
-                        full_holders = Some(match full_holders {
-                            Some(acc) => acc.intersection(&holders).copied().collect(),
-                            None => holders,
-                        });
-                    }
-                    let full_holders = full_holders.unwrap_or_default();
-                    if full_holders.len() >= redundancy as usize {
-                        continue;
-                    }
+                let outcome = reliaburger::pickle::replication::heal_tick(
+                    &catalog,
+                    &repl_store,
+                    self_node,
+                    &peers,
+                    redundancy,
+                    10,
+                    &client,
+                )
+                .await;
 
-                    // The leader replicates from its own blobs; skip
-                    // manifests it doesn't hold (their holder pushes
-                    // will be reconciled once forwarding lands in W6).
-                    if !manifest
-                        .all_digests()
-                        .iter()
-                        .all(|d| repl_store.has_blob(d))
-                    {
-                        continue;
-                    }
-
-                    let needed = redundancy as usize - full_holders.len();
-                    let targets = select_peers(&peers, 0, &full_holders, needed);
-                    if targets.is_empty() {
-                        continue;
-                    }
-
-                    let config = ReplicationConfig {
-                        redundancy,
-                        peer_timeout: std::time::Duration::from_secs(30),
-                    };
-                    match replicate_manifest(manifest, &repl_store, &targets, &config, &client)
+                for error in &outcome.errors {
+                    eprintln!("bun: pickle heal: {error}");
+                }
+                for update in outcome.updates {
+                    if let Err(e) = council
+                        .write(
+                            reliaburger::council::types::RaftRequest::UpdateLayerLocations(update),
+                        )
                         .await
                     {
-                        Ok(result) => {
-                            let updates = manifest
-                                .all_digests()
-                                .iter()
-                                .map(|d| {
-                                    let mut holders = catalog.layer_holders(d.as_str());
-                                    holders.extend(result.successful_nodes.iter().copied());
-                                    ((*d).clone(), holders)
-                                })
-                                .collect();
-                            let update =
-                                reliaburger::pickle::types::UpdateLayerLocations { updates };
-                            if let Err(e) = council
-                                .write(
-                                    reliaburger::council::types::RaftRequest::UpdateLayerLocations(
-                                        update,
-                                    ),
-                                )
-                                .await
-                            {
-                                eprintln!("bun: replication holder update failed: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "bun: replication of {}:{} failed: {e}",
-                                manifest.repository,
-                                manifest
-                                    .tags
-                                    .iter()
-                                    .next()
-                                    .map(String::as_str)
-                                    .unwrap_or("?")
-                            );
-                        }
+                        eprintln!("bun: replication holder update failed: {e}");
                     }
                 }
             }

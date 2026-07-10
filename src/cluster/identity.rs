@@ -42,6 +42,25 @@ pub fn council_info(snapshot: &MembershipSnapshot, port_offset: i32) -> (u64, Co
     )
 }
 
+/// Derive the Pickle registry peers from a membership snapshot: every
+/// alive node's gossip IP with the cluster-uniform `registry_port`
+/// (gossip doesn't carry per-node registry ports — a documented
+/// constraint). Shared by the heal loop, P2P image pulls, and the
+/// pull-through cache, so all three address peers identically.
+pub fn pickle_peers(
+    members: &[MembershipSnapshot],
+    registry_port: u16,
+) -> Vec<crate::pickle::replication::Peer> {
+    members
+        .iter()
+        .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
+        .map(|m| crate::pickle::replication::Peer {
+            node_id: raft_id_from_name(&m.node_id.0),
+            base_url: format!("http://{}:{registry_port}", m.address.ip()),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

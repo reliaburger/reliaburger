@@ -76,7 +76,11 @@ async fn push_test_image(base_url: &str, repo: &str, tag: &str) -> (Digest, Dige
     let client = reqwest::Client::new();
 
     let config_bytes = br#"{"architecture":"arm64"}"#.to_vec();
-    let layer_bytes = b"layer-bytes-for-test".to_vec();
+    // Layer content varies by repo so distinct images get distinct
+    // digests (and therefore distinct manifest digests).
+    let layer_bytes = format!("layer-bytes-for-test-{repo}").into_bytes();
+    let config_size = config_bytes.len();
+    let layer_size = layer_bytes.len();
     let config_digest = compute_sha256(&config_bytes);
     let layer_digest = compute_sha256(&layer_bytes);
 
@@ -98,12 +102,12 @@ async fn push_test_image(base_url: &str, repo: &str, tag: &str) -> (Digest, Dige
         "config": {
             "mediaType": "application/vnd.oci.image.config.v1+json",
             "digest": config_digest.as_str(),
-            "size": 24,
+            "size": config_size,
         },
         "layers": [{
             "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
             "digest": layer_digest.as_str(),
-            "size": 20,
+            "size": layer_size,
         }],
     });
     let response = client
@@ -254,4 +258,153 @@ async fn pull_fetches_missing_layers_from_peer() {
         &catalog,
         &local_store
     ));
+}
+
+/// Roadmap (Phase 12): an under-replicated image auto-heals when a new
+/// node joins — one heal tick replicates it and records the holder.
+#[tokio::test]
+async fn heal_tick_replicates_to_new_peer() {
+    use reliaburger::pickle::replication::heal_tick;
+
+    // Node 1 pushed an image; it is the sole holder.
+    let leader = Registry::start(1, false).await;
+    push_test_image(&leader.base_url(), "app", "v1").await;
+    let catalog = leader.state.catalog.read().await.clone();
+
+    // Node 2 joins, empty.
+    let joiner = Registry::start(2, false).await;
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: leader.base_url(),
+        },
+        Peer {
+            node_id: 2,
+            base_url: joiner.base_url(),
+        },
+    ];
+
+    let outcome = heal_tick(
+        &catalog,
+        &leader.state.store,
+        1,
+        &peers,
+        2,
+        10,
+        &reqwest::Client::new(),
+    )
+    .await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "heal errors: {:?}",
+        outcome.errors
+    );
+    assert_eq!(outcome.updates.len(), 1);
+    for (_, holders) in &outcome.updates[0].updates {
+        assert_eq!(holders, &BTreeSet::from([1, 2]));
+    }
+
+    let manifest = catalog.get_manifest_by_tag("app", "v1").unwrap().clone();
+    for digest in manifest.all_digests() {
+        assert!(
+            joiner.state.store.has_blob(digest),
+            "joiner missing healed blob {digest}"
+        );
+    }
+}
+
+/// Phase 12 B5: the leader pulls layers it lacks from a holder before
+/// replicating onward, so images pushed to non-leader nodes still gain
+/// redundancy — and the leader records itself as a new holder.
+#[tokio::test]
+async fn heal_tick_pulls_missing_layers_first() {
+    use reliaburger::pickle::replication::heal_tick;
+
+    // The image lives only on node 2; the leader (node 1) lacks it.
+    let holder = Registry::start(2, false).await;
+    push_test_image(&holder.base_url(), "remote", "v1").await;
+    let catalog = holder.state.catalog.read().await.clone();
+
+    let leader_dir = tempfile::tempdir().unwrap();
+    let leader_store = BlobStore::new(leader_dir.path());
+    let peers = vec![Peer {
+        node_id: 2,
+        base_url: holder.base_url(),
+    }];
+
+    let outcome = heal_tick(
+        &catalog,
+        &leader_store,
+        1,
+        &peers,
+        2,
+        10,
+        &reqwest::Client::new(),
+    )
+    .await;
+
+    assert!(
+        outcome.errors.is_empty(),
+        "heal errors: {:?}",
+        outcome.errors
+    );
+
+    // The leader pulled every layer locally…
+    let manifest = catalog.get_manifest_by_tag("remote", "v1").unwrap().clone();
+    for digest in manifest.all_digests() {
+        assert!(
+            leader_store.has_blob(digest),
+            "leader missing pulled blob {digest}"
+        );
+    }
+
+    // …and the proposed update records it as a holder alongside node 2.
+    assert_eq!(outcome.updates.len(), 1);
+    for (_, holders) in &outcome.updates[0].updates {
+        assert_eq!(holders, &BTreeSet::from([1, 2]));
+    }
+}
+
+/// The heal loop caps its work per tick: with three under-replicated
+/// images and a cap of one, exactly one is healed per pass.
+#[tokio::test]
+async fn heal_tick_respects_per_tick_cap() {
+    use reliaburger::pickle::replication::heal_tick;
+
+    let leader = Registry::start(1, false).await;
+    push_test_image(&leader.base_url(), "app-a", "v1").await;
+    push_test_image(&leader.base_url(), "app-b", "v1").await;
+    push_test_image(&leader.base_url(), "app-c", "v1").await;
+    let catalog = leader.state.catalog.read().await.clone();
+
+    let joiner = Registry::start(2, false).await;
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: leader.base_url(),
+        },
+        Peer {
+            node_id: 2,
+            base_url: joiner.base_url(),
+        },
+    ];
+
+    let outcome = heal_tick(
+        &catalog,
+        &leader.state.store,
+        1,
+        &peers,
+        2,
+        1,
+        &reqwest::Client::new(),
+    )
+    .await;
+
+    assert!(outcome.errors.is_empty());
+    assert_eq!(
+        outcome.updates.len(),
+        1,
+        "cap of 1 means one manifest per tick"
+    );
 }

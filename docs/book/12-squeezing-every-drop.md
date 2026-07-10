@@ -194,6 +194,69 @@ And the C4 rule still stands: everything here lives in the `reliaburger` table, 
 
 What the map deliberately doesn't fix: DNAT in `prerouting` only rewrites traffic *arriving at the node from outside*. A connection made from the node itself (or from a local container) to `container_ip:host_port` never traverses prerouting, and the cross-node story for container IPs is part of a bigger, known control-plane gap tracked in the July discrepancy register. This section made published ports genuinely reachable from outside the node, in O(1). It did not redesign the dataplane — and saying which is which out loud is half the value of a register like that.
 
+## Deleting data without losing it
+
+Before this chapter's peer-to-peer downloads can exist, the registry needs three things it didn't have at the end of Phase 5: a catalogue every node agrees on, more than one copy of each image, and a garbage collector that can't destroy the last copy. All three landed with the big wiring pass, and the design that shipped differs from what we'd sketched in ways worth studying. This section describes what's actually in the tree, then hardens its weakest part.
+
+### The catalogue lives in Raft; the blobs don't
+
+The split is the whole design. An image is two very different kinds of data. The *manifest* — which layers, which tags, who holds them — is tiny, changes rarely, and everyone must agree on it: that's a Raft value. The *blobs* are big, immutable, and self-verifying (their name is their SHA-256): those stay on local disk, because pushing gigabytes through a consensus log would be absurd, and because a corrupted blob can't lie about itself anyway.
+
+So a push stores blobs locally and then calls one function (`src/pickle/api.rs`):
+
+```rust
+// record_commit: apply locally, persist, propose.
+state.catalog.write().await.apply_manifest_commit(&commit);
+if let Some(path) = &state.persist_path {
+    // catalog.json — survives restarts even without a cluster
+}
+if let Some(council) = &state.council {
+    let _ = council.write(RaftRequest::ManifestCommit(commit)).await;
+}
+```
+
+Standalone nodes get a JSON file; clustered nodes get consensus; the code path is the same either way, with `Option` as the seam. The commit records `holder_nodes = {this node}` — one copy, honestly labelled.
+
+### Replication is a loop, not a promise
+
+The original design said a push replicates to N peers *synchronously* before returning success. What shipped is asynchronous: the push returns once the local copy is durable, and a leader-side loop finds under-replicated manifests and fixes them. (The whitepaper still describes the synchronous version — that's discrepancy D11 in the July register, and reconciling the docs is separate work. The book describes reality.)
+
+Is async worse? It trades a durability promise for availability: a push succeeds even when every peer is down, and the system converges later. For a cluster whose images are also sitting in a git-driven build pipeline, that's the right trade — but it makes the *heal loop* the load-bearing component, which is why it deserved better than the version that shipped. Three gaps:
+
+1. It processed manifests in catalogue order, so the image one failure away from loss waited behind twenty that were merely one copy short of policy.
+2. It healed at most... whatever it could reach that tick, with no cap — a fresh empty node joining a full cluster would trigger replication of *everything* at once.
+3. It only replicated manifests the leader itself fully held. An image pushed to a worker node never gained a second copy. Ever.
+
+And a fourth, quieter problem: the whole loop was an inline closure in `main()`, which is why none of the above had a failing test to its name. You can't test what you can't call. So the fix starts with extraction — the tick body becomes `pickle::replication::heal_tick(...)`, a function taking the catalogue, the blob store, the peer list, and returning the holder updates to propose to Raft. `main()` keeps the schedule, the leadership check, and the proposing; the logic becomes something an integration test can call with two in-process registries.
+
+The gaps then close almost mechanically. `plan_heal` sorts candidates by ascending holder count — **rarest first**, the same instinct BitTorrent uses, because the copy count *is* the risk ranking — and truncates to ten per tick, so catching up is a controlled drip rather than a storm. And the leader learns to **pull before it pushes**:
+
+```rust
+// Pull-first: become a holder before replicating onward.
+if !digests.iter().all(|d| store.has_blob(d)) {
+    pull_manifest_layers(&digests, &manifest.repository, catalog,
+                         peers, store, client, timeout).await?;
+}
+```
+
+If the image lives only on a worker, the leader fetches it, records *itself* as a holder, and carries on. Images pushed anywhere now converge to redundancy — the integration test for the roadmap's "under-replicated image auto-heals when a new node joins" is finally writable, and written.
+
+One operational trap surfaced while wiring this: the registry binds to `127.0.0.1` by default, which is exactly right for a laptop and silently fatal for a cluster — every peer addresses you as `http://<your-ip>:<registry-port>`, connects to nothing, and the heal loop logs failures forever. Bun now warns loudly at startup in cluster mode. The warning also says why we don't just flip the default: the registry speaks plain HTTP with no authentication yet, so a wider bind belongs behind the perimeter firewall's cluster-node allowlist.
+
+### Two-phase GC, or: the check-then-act bug across machines
+
+Garbage collection is where "delete unused blobs" meets "never delete the last copy", and the naive version has a beautiful failure mode. Say an image has two copies, on nodes A and B, and both nodes run GC at the same moment. Each checks the catalogue: "two holders — safe to drop mine." Both delete. Zero copies. Each node behaved correctly against the state it read; the *interleaving* destroyed the data. C programmers know this as TOCTOU — time-of-check-to-time-of-use — and adding machines just gives the race more room.
+
+Locks fix this on one machine. Across machines, the shipped design routes the *decision* through the one place that already serialises decisions: the Raft state machine. GC becomes two-phase. A node *nominates* — `gc_candidates` builds the list of blobs it wants to drop, protecting tagged manifests, active deployments, sole copies, and anything younger than an hour (a mid-push blob has no holders yet and looks exactly like garbage) — and proposes a `GcReport`. The state machine, applying reports one at a time in log order, is the *approver*, and its rule is one line of arithmetic: a removal that would leave a layer with zero holders is refused. In the A/B race, both reports enter the log; whichever applies second finds one holder left and keeps it. Only after commit does a node physically delete what was approved.
+
+Notice what did *not* need to change: the nodes still check first and act later. The race is still there. It's just that the "act" now passes through a total order, and the invariant is enforced at the single point where the order exists. That's the general shape of the fix for any distributed TOCTOU, and it's worth keeping in your pocket.
+
+### Tests
+
+The heal logic, being a plain function now, gets both kinds of coverage. Unit tests drive `plan_heal` against a fabricated catalogue: `audit_orders_rarest_first` (one-copy heals before two-copies; at-redundancy doesn't appear), `plan_heal_caps_work_per_tick`, `plan_heal_empty_when_redundancy_met`. Integration tests in `tests/pickle_cluster.rs` run real registries on ephemeral ports: `heal_tick_replicates_to_new_peer` is the roadmap's auto-heal scenario end to end (push to node 1, node 2 appears, one tick, both hold everything and the proposed update says so); `heal_tick_pulls_missing_layers_first` proves the leader-pull path (image only on node 2; after one tick the leader holds it locally and the update records `{1, 2}`); `heal_tick_respects_per_tick_cap` pushes three images and asserts a cap of one heals exactly one.
+
+A small fixture lesson from that last test: the shared push helper used constant layer bytes, so three "different" images shared every digest — and therefore one manifest. Content-addressed storage makes "distinct test data" something you must *construct*, not assume. The helper now varies layer content by repository name.
+
 ---
 
-*Still to come in Phase 12: the map switchover in the network namespace layer, peer-to-peer image downloads, the pull-through cache, volume snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: peer-to-peer image downloads, the pull-through cache, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*

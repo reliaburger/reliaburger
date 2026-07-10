@@ -382,7 +382,7 @@ the authoritative post-Phase-11b backlog — nothing silently dropped.
 - [ ] Wire `SubmitBatch` into the agent (resolve job specs → `schedule_batch` over cluster capacity → dispatch → track completion via `BatchTracker`, `/v1/batch/{id}` status)
 - [ ] Wire `SubmitBuild` into the agent — async build tracking, builder selection, signing (the synchronous local-only handler landed with Stage 4)
 - [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
-- [ ] Heal-loop hardening (B5): extract a testable `heal_tick`, rarest-first + per-tick cap, leader-pull-first, auto-heal integration test, loopback `registry_bind` warning
+- [x] Heal-loop hardening (B5): `pickle::replication::heal_tick` extracted from the bun binary (testable; `cluster::identity::pickle_peers` shared helper), rarest-first ordering + 10-manifest per-tick cap, leader-pull-first (non-leader pushes now gain redundancy), roadmap auto-heal integration test + 2 more, loopback `registry_bind` startup warning (registry has no auth/TLS — keep firewalled)
 - [ ] P2P multi-source image downloads (parallel fan-out)
 - [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
 - [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
