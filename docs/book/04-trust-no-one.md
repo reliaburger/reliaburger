@@ -131,6 +131,25 @@ Phase 4 builds the token machinery: generation, hashing, and storage in Raft. Th
 
 After that, every connection between cluster nodes uses mutual TLS. Both sides present their certificates, both sides verify against the Root CA trust anchor. A plain TCP connection to a cluster port gets rejected immediately.
 
+### Where the node's certificate actually lives
+
+For a long time, the honest answer was: nowhere. `initialize_cluster()` issued the first node's certificate and returned it, and the caller printed a summary and dropped it on the floor. The join path was worse — the council issued a certificate for the new node and then threw it away. All the PKI machinery worked; the output just never landed anywhere a listener could load it from. We only noticed when we sat down to wire mTLS into the Raft listener and asked the obvious question: which file do I read the key from?
+
+The fix is `sesame::identity_store`, a small module that owns one directory:
+
+```text
+{data_dir}/identity/
+  node.crt      # this node's certificate (PEM)
+  node.key      # this node's private key (PEM, mode 0600)
+  node-ca.crt   # the intermediate that signed it
+  root-ca.crt   # the trust anchor
+  meta.json     # node_id, serial, CA generation, validity window
+```
+
+`relish init` now writes this for the bootstrap node, and fills the `[security]` section of the generated `reliaburger.toml` so `bun` knows where to look. Two details are worth stealing for your own projects. First, the private key is written with `atomic_write_mode(path, data, Some(0o600))` — the permission is set on the temp file *before* the rename, so there is never a moment when the key sits at its final path world-readable. Second, `load()` returns `Result<Option<NodeIdentity>, _>`, not a bare `Result`. A missing identity isn't an error; it's a state ("this node hasn't enrolled yet") that the caller matches on explicitly. Rust makes the three outcomes — loaded, absent, corrupt — impossible to conflate, which is exactly what you want for a file that decides whether your listeners speak TLS.
+
+`init` also prints the root CA fingerprint (`sha256:...`). Keep it. When a joiner enrols later, `relish join` prints the fingerprint of the root CA it received, and those two strings matching is your defence against handing a node's trust to the wrong cluster.
+
 ## Gossip HMAC
 
 Gossip uses UDP, which can't do TLS. Instead, we authenticate gossip messages with HMAC-SHA256. The HMAC key is derived from the Root CA certificate (which all cluster members share). This proves the sender is a cluster member without the overhead of TLS on every UDP datagram.

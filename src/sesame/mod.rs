@@ -11,6 +11,7 @@ pub mod crypto;
 pub mod egress;
 pub mod firewall;
 pub mod identity;
+pub mod identity_store;
 pub mod init;
 pub mod join;
 pub mod mtls;
