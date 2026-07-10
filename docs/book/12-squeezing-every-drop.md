@@ -1,8 +1,10 @@
 # Squeezing Every Drop
 
-Phases 1 through 11 built a complete orchestrator. It works, it's tested, it ships containers and watches them and recovers when they fall over. Phase 12 is different in character: nothing here adds a feature you can point at. Every change makes something already working use less disk, less bandwidth, or less CPU. It's the phase where you stop asking "does it work?" and start asking "what's it costing me?"
+Phases 1 through 11 built a complete orchestrator. It works, it's tested, it ships containers and watches them and recovers when they fall over. Phase 12 is different in character: on paper, nothing here adds a feature you can point at. Every change makes something already working use less disk, less bandwidth, or less CPU. It's the phase where you stop asking "does it work?" and start asking "what's it costing me?"
 
-That's a lot of separate optimisations across a lot of subsystems — nftables maps for port forwarding, peer-to-peer image downloads, a pull-through cache, volume snapshots, log compression. We'll build them up over several passes, and this chapter grows with them. This first pass is about **log storage**: making archived logs small, and making archive queries skip work they don't need to do.
+That framing turned out to be half true, and the half that's false is the chapter's recurring plot twist. Optimisation work forces you to trace real data paths end to end — and untraced paths are where the gaps hide. Chasing O(1) port lookups uncovered that port mappings were never installed at all. Making image pulls faster uncovered that cluster-pushed images couldn't be deployed on other nodes, full stop. Wiring volume snapshots uncovered that managed volumes had never mounted. Again and again, "make it faster" became "make it exist".
+
+The sections build up in the order the work happened: log storage first (compression and query pruning), then port mapping, the registry's replication and healing, peer-to-peer image distribution, the pull-through cache, volumes and snapshots, and finally batch and build execution.
 
 ## Where the bytes actually are
 
@@ -95,7 +97,7 @@ All of this is pure Parquet and DataFusion — no Linux, no root, no network —
 
 That last test is a direct statistical measurement rather than a property-based one. Proptest is the right tool for exploring an input space; a false-positive *rate* is better pinned down by one large, fixed sample than by many small generated ones.
 
-## What we learned
+### What the logs work taught us
 
 **Optimise the copy that's actually cold.** The reflex was to compress "the logs". Half a minute reading `log_store.rs` showed the live queries never touch the Parquet at all — they run on in-memory batches. Compression and bloom filters only ever pay off on the archived, exported copy. Always confirm which copy of the data your optimisation touches before you write it; the obvious target and the real one diverge more often than you'd think.
 
@@ -458,6 +460,16 @@ The second gap was placement. A macOS node — or any node without `buildah` —
 
 Completion closes the trust loop from Phase 10: after the push lands the image in the local registry (real holders, catalog persistence, Raft propose — all through the standard push handlers), the runner looks up the manifest digest and asks the agent to sign it. Best-effort, deliberately: a standalone node has no council to sign with, and the failure mode is a printed warning telling you exactly what won't work (`require_signatures` deploys). The full circle is worth saying out loud: **build → push → replicate (heal loop) → sign → verify at schedule → deploy → serve**, every arrow now a real code path. That was the point of the phase.
 
----
+## Lessons from the phase
 
-*That's the last construction section of Phase 12. The closing pass — lessons learned — follows.*
+**Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.
+
+**Route distributed decisions through the place that already has an order.** The GC couldn't safely delete "one of two copies" until the *decision* went through Raft — not the deletion, the decision. The same shape appears in the heal loop's holder updates and the catalogue commits. Check-then-act across machines is always a race; a total order is the only fix, and you usually already have one.
+
+**Match the dispatch idiom to the workload's lifecycle.** Deploys reconcile (converge on desired state, forever); jobs dispatch (run once, report, done). Stage 4's placements machinery is exactly right for the first and destructively wrong for the second — a completed job looks like drift, a moved assignment kills running work. One crate, two idioms, both correct.
+
+**States that look terminal and aren't.** `stopped` meant "success", except when it meant "failing job between retries". `cache/redis:7` meant the same image as upstream, except when the tag had moved. A snapshot named like a directory was one, except it needed `subvolume delete`. Every one of these was caught by a test that checked the *unhappy* path — and the failing-job watcher bug went from written to caught to fixed inside an hour because the failure test existed before the fix.
+
+**Say what you didn't do.** Cached upstream images are unsigned and exempt from trust policy — written at the exemption. The registry has no auth, so the loopback warning explains the firewall posture. Rootless proxies don't survive adoption; local-origin traffic bypasses the DNAT map; the whitepaper still describes synchronous replication. Each gap is recorded where a maintainer will trip over it. Honest edges are cheaper than surprises.
+
+The roadmap's milestone for this phase reads: port mapping uses O(1) nftables maps, images download from multiple peers in parallel, logs compress 5× with random-access reads. All true. The truer summary: the paths those words describe now actually exist, end to end, with tests standing on each one.
