@@ -434,6 +434,8 @@ pub struct ImagesSection {
     /// the registry is not exposed unauthenticated on all interfaces. Set to
     /// `0.0.0.0` once cross-node replication (and auth) are wired.
     pub registry_bind: String,
+    /// Parallel layer fetches per P2P image pull.
+    pub p2p_concurrency: usize,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
 }
@@ -461,6 +463,7 @@ impl Default for ImagesSection {
             gc_interval_hours: 1,
             registry_port: 5050,
             registry_bind: "127.0.0.1".to_string(),
+            p2p_concurrency: 4,
             trust_policy: TrustPolicySection::default(),
         }
     }

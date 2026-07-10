@@ -93,6 +93,28 @@ debug = "line-tables-only"
 [profile.test]
 debug = "line-tables-only"
 
+# Content-addressed storage verifies a SHA-256 on every blob write and
+# read-back; unoptimised SHA-256 runs at ~30 MB/s and dominates the
+# image-transfer tests (100 MB P2P pull). Optimise just the hash
+# crates — everything else keeps fast debug builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3
+
+[profile.test.package.digest]
+opt-level = 3
+
+[profile.test.package.block-buffer]
+opt-level = 3
+
 [[bench]]
 name = "gossip"
 harness = false

@@ -366,6 +366,286 @@ async fn heal_tick_pulls_missing_layers_first() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P2P parallel pulls (Phase 12 C2)
+// ---------------------------------------------------------------------------
+
+/// Build a manifest over the given blob digests and record it in a
+/// catalog with the given holders. Returns (manifest, catalog).
+fn manifest_with_holders(
+    repo: &str,
+    config_digest: &Digest,
+    layer_digests: &[Digest],
+    layer_sizes: &[u64],
+    holders: &[u64],
+) -> (reliaburger::pickle::types::ImageManifest, ManifestCatalog) {
+    use reliaburger::pickle::types::{ImageManifest, LayerDescriptor, ManifestCommit};
+
+    let manifest = ImageManifest {
+        digest: compute_sha256(repo.as_bytes()),
+        config: LayerDescriptor {
+            digest: config_digest.clone(),
+            size: 24,
+            media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+        },
+        layers: layer_digests
+            .iter()
+            .zip(layer_sizes)
+            .map(|(d, size)| LayerDescriptor {
+                digest: d.clone(),
+                size: *size,
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            })
+            .collect(),
+        repository: repo.to_string(),
+        tags: std::iter::once("v1".to_string()).collect(),
+        total_size: layer_sizes.iter().sum(),
+        pushed_at: std::time::SystemTime::UNIX_EPOCH,
+        pushed_by: holders.first().copied().unwrap_or(1),
+        signature: None,
+    };
+    let mut catalog = ManifestCatalog::default();
+    catalog.apply_manifest_commit(&ManifestCommit {
+        manifest: manifest.clone(),
+        tag: "v1".to_string(),
+        holder_nodes: holders.iter().copied().collect(),
+    });
+    (manifest, catalog)
+}
+
+fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterSource {
+    reliaburger::pickle::p2p::ClusterSource {
+        state: registry.state.clone(),
+        members: None,
+        registry_port: 0,
+        concurrency: 4,
+        client: reqwest::Client::new(),
+    }
+}
+
+/// Roadmap (Phase 12): a multi-layer 100 MB image pulls from a peer in
+/// parallel in under five seconds, and the blobs land locally.
+#[tokio::test]
+async fn p2p_pull_100mb_image_under_5s() {
+    use rand::RngCore;
+
+    // Node 1 holds five 20 MB layers of incompressible bytes.
+    let holder = Registry::start(1, false).await;
+    let mut rng = rand::thread_rng();
+    let mut layer_digests = Vec::new();
+    let config_bytes = br#"{"architecture":"arm64"}"#.to_vec();
+    let config_digest = compute_sha256(&config_bytes);
+    holder
+        .state
+        .store
+        .write_blob(&config_bytes, &config_digest)
+        .unwrap();
+    for _ in 0..5 {
+        let mut bytes = vec![0u8; 20 * 1024 * 1024];
+        rng.fill_bytes(&mut bytes);
+        let digest = compute_sha256(&bytes);
+        holder.state.store.write_blob(&bytes, &digest).unwrap();
+        layer_digests.push(digest);
+    }
+    let (_, catalog) = manifest_with_holders(
+        "big",
+        &config_digest,
+        &layer_digests,
+        &[20 * 1024 * 1024; 5],
+        &[1],
+    );
+
+    // Node 3 pulls it via the cluster source.
+    let puller = Registry::start(3, false).await;
+    *puller.state.catalog.write().await = catalog;
+    let source = cluster_source_for(&puller);
+    let peers = vec![Peer {
+        node_id: 1,
+        base_url: holder.base_url(),
+    }];
+
+    let started = std::time::Instant::now();
+    let paths = source
+        .ensure_image_local_with_peers("big", "v1", &peers)
+        .await
+        .unwrap()
+        .expect("catalog should know the image");
+    let elapsed = started.elapsed();
+
+    assert_eq!(paths.len(), 5);
+    for digest in &layer_digests {
+        assert!(puller.state.store.has_blob(digest), "missing {digest}");
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "100 MB P2P pull took {elapsed:?} (roadmap target: < 5s)"
+    );
+}
+
+/// C2: with two holders, the plan spreads fetches across both, and the
+/// pull completes.
+#[tokio::test]
+async fn p2p_pull_spreads_across_holders() {
+    use reliaburger::pickle::p2p::plan_downloads;
+    use std::collections::HashSet;
+
+    let holder_a = Registry::start(1, false).await;
+    let holder_b = Registry::start(2, false).await;
+
+    let config_bytes = br#"{"architecture":"arm64"}"#.to_vec();
+    let config_digest = compute_sha256(&config_bytes);
+    let mut layer_digests = Vec::new();
+    for i in 0..4u8 {
+        let bytes = vec![i; 4096];
+        let digest = compute_sha256(&bytes);
+        for registry in [&holder_a, &holder_b] {
+            registry.state.store.write_blob(&bytes, &digest).unwrap();
+        }
+        layer_digests.push(digest);
+    }
+    for registry in [&holder_a, &holder_b] {
+        registry
+            .state
+            .store
+            .write_blob(&config_bytes, &config_digest)
+            .unwrap();
+    }
+    let (manifest, catalog) = manifest_with_holders(
+        "spread",
+        &config_digest,
+        &layer_digests,
+        &[4096; 4],
+        &[1, 2],
+    );
+
+    let puller = Registry::start(3, false).await;
+    *puller.state.catalog.write().await = catalog.clone();
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: holder_a.base_url(),
+        },
+        Peer {
+            node_id: 2,
+            base_url: holder_b.base_url(),
+        },
+    ];
+
+    // The plan uses both sources…
+    let digests: Vec<Digest> = manifest.all_digests().into_iter().cloned().collect();
+    let plan = plan_downloads(&digests, &HashSet::new(), &catalog, &peers, 3);
+    let used: HashSet<u64> = plan.fetches.iter().map(|f| f.peer.node_id).collect();
+    assert_eq!(used, [1u64, 2].into_iter().collect());
+
+    // …and the pull completes.
+    let source = cluster_source_for(&puller);
+    source
+        .ensure_image_local_with_peers("spread", "v1", &peers)
+        .await
+        .unwrap()
+        .expect("catalog should know the image");
+    for digest in &layer_digests {
+        assert!(puller.state.store.has_blob(digest));
+    }
+}
+
+/// C2: a fetch that fails against its planned peer retries against an
+/// alternate holder and succeeds.
+#[tokio::test]
+async fn p2p_pull_retries_alternate_holder() {
+    // A dead peer: bind, take the port, drop the listener.
+    let dead_port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let real = Registry::start(2, false).await;
+    let config_bytes = br#"{"architecture":"arm64"}"#.to_vec();
+    let config_digest = compute_sha256(&config_bytes);
+    let layer_bytes = vec![7u8; 4096];
+    let layer_digest = compute_sha256(&layer_bytes);
+    real.state
+        .store
+        .write_blob(&config_bytes, &config_digest)
+        .unwrap();
+    real.state
+        .store
+        .write_blob(&layer_bytes, &layer_digest)
+        .unwrap();
+
+    // Catalog claims both node 1 (dead) and node 2 hold everything.
+    let (_, catalog) = manifest_with_holders(
+        "flaky",
+        &config_digest,
+        &[layer_digest.clone()],
+        &[4096],
+        &[1, 2],
+    );
+
+    let puller = Registry::start(3, false).await;
+    *puller.state.catalog.write().await = catalog;
+    let source = cluster_source_for(&puller);
+    let peers = vec![
+        Peer {
+            node_id: 1,
+            base_url: format!("http://127.0.0.1:{dead_port}"),
+        },
+        Peer {
+            node_id: 2,
+            base_url: real.base_url(),
+        },
+    ];
+
+    source
+        .ensure_image_local_with_peers("flaky", "v1", &peers)
+        .await
+        .unwrap()
+        .expect("catalog should know the image");
+    assert!(puller.state.store.has_blob(&layer_digest));
+}
+
+/// C2: when every holder is unreachable, the pull fails — it must NOT
+/// fall back silently (the caller decides).
+#[tokio::test]
+async fn p2p_pull_fails_when_all_holders_unreachable() {
+    let dead_port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let config_bytes = br#"{"architecture":"arm64"}"#.to_vec();
+    let config_digest = compute_sha256(&config_bytes);
+    let layer_digest = compute_sha256(b"unreachable-layer");
+    let (_, catalog) = manifest_with_holders("lost", &config_digest, &[layer_digest], &[17], &[1]);
+
+    let puller = Registry::start(3, false).await;
+    *puller.state.catalog.write().await = catalog;
+    let source = cluster_source_for(&puller);
+    let peers = vec![Peer {
+        node_id: 1,
+        base_url: format!("http://127.0.0.1:{dead_port}"),
+    }];
+
+    let result = source
+        .ensure_image_local_with_peers("lost", "v1", &peers)
+        .await;
+    assert!(result.is_err(), "expected failure, got {result:?}");
+}
+
+/// C2: a catalog miss returns `None` — the caller falls through to the
+/// external registry path.
+#[tokio::test]
+async fn p2p_catalog_miss_returns_none() {
+    let puller = Registry::start(3, false).await;
+    let source = cluster_source_for(&puller);
+
+    let result = source
+        .ensure_image_local_with_peers("unknown", "v1", &[])
+        .await
+        .unwrap();
+    assert!(result.is_none());
+}
+
 /// The heal loop caps its work per tick: with three under-replicated
 /// images and a cap of one, exactly one is healed per pass.
 #[tokio::test]

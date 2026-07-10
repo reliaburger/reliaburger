@@ -278,6 +278,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Select runtime
     let runtime = select_runtime(&cli.runtime, container_nameserver, &instances_dir).await?;
+    // Image-store handle for installing the cluster P2P image source
+    // once the registry and catalog exist — the runtime is selected
+    // long before them, so the source is injected late via a OnceLock
+    // slot shared by ImageStore clones.
+    let cluster_image_store = runtime.image_store();
 
     // Create command channel
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -995,6 +1000,22 @@ async fn main() -> anyhow::Result<()> {
         council: api_council.clone(),
         persist_path: Some(catalog_path.clone()),
     };
+    // Cluster-first image pulls (Phase 12 C2): the grill consults the
+    // Pickle catalog before any external registry, filling layers from
+    // peers in parallel. Standalone nodes get local-catalog resolution
+    // (no peers) — the only way locally-pushed images deploy at all.
+    if let Some(image_store) = &cluster_image_store {
+        image_store.set_cluster_source(std::sync::Arc::new(
+            reliaburger::pickle::p2p::ClusterSource {
+                state: pickle_state.clone(),
+                members: replication_membership.clone(),
+                registry_port: config.images.registry_port,
+                concurrency: config.images.p2p_concurrency,
+                client: reqwest::Client::new(),
+            },
+        ));
+    }
+
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
     let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
     println!("bun: Pickle registry listening on {registry_addr}");

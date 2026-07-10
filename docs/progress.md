@@ -383,7 +383,7 @@ the authoritative post-Phase-11b backlog — nothing silently dropped.
 - [ ] Wire `SubmitBuild` into the agent — async build tracking, builder selection, signing (the synchronous local-only handler landed with Stage 4)
 - [ ] Switch port mapping from nftables rules to nftables maps (O(1) lookup at scale)
 - [x] Heal-loop hardening (B5): `pickle::replication::heal_tick` extracted from the bun binary (testable; `cluster::identity::pickle_peers` shared helper), rarest-first ordering + 10-manifest per-tick cap, leader-pull-first (non-leader pushes now gain redundancy), roadmap auto-heal integration test + 2 more, loopback `registry_bind` startup warning (registry has no auth/TLS — keep firewalled)
-- [ ] P2P multi-source image downloads (parallel fan-out)
+- [x] P2P multi-source image downloads — pure `pickle::p2p::plan_downloads` planner (rarest-first, least-loaded balancing, dedup, skip-local; proptested over arbitrary topologies) + bounded-`JoinSet` executor with alternate-holder retry, wired into `ImageStore::pull_and_unpack` via a late-injected `ClusterImageSource` (which also fixes cluster-pushed HTTP-only images being undeployable on other nodes — the external client is HTTPS-only); catalog-known images never fall back to external registries; 100MB/5-layer peer pull verified < 5s
 - [ ] Pull-through cache full wiring (upstream → Pickle → Raft)
 - [ ] Volume snapshots (CoW, scheduled jobs, S3/GCS upload)
 - [ ] Btrfs subvolume quotas (alternative to loop mount)

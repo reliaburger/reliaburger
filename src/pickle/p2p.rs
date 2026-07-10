@@ -7,9 +7,13 @@
 //! planner across arbitrary topologies.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::replication::Peer;
-use super::types::{Digest, ManifestCatalog};
+use super::store::BlobStore;
+use super::types::{Digest, ManifestCatalog, PickleError};
 
 /// One planned fetch: this digest, from this peer.
 #[derive(Debug, Clone)]
@@ -95,6 +99,192 @@ pub fn plan_downloads(
     DownloadPlan {
         fetches,
         unavailable,
+    }
+}
+
+/// Execute a download plan with bounded concurrency.
+///
+/// At most `concurrency` fetches run at once in a `JoinSet`; each
+/// failed fetch is retried (sequentially, after the parallel pass)
+/// against the digest's other holders. A digest that exhausts its
+/// holders fails the whole call — the caller decides what a partial
+/// image means, not this function.
+#[allow(clippy::too_many_arguments)]
+pub async fn pull_layers_parallel(
+    plan: DownloadPlan,
+    repository: &str,
+    catalog: &ManifestCatalog,
+    peers: &[Peer],
+    store: &Arc<BlobStore>,
+    client: &reqwest::Client,
+    concurrency: usize,
+    timeout: Duration,
+) -> Result<(), PickleError> {
+    let concurrency = concurrency.max(1);
+    let mut queue = plan.fetches.into_iter();
+    let mut in_flight = tokio::task::JoinSet::new();
+    let mut failed: Vec<(Digest, u64)> = Vec::new();
+
+    loop {
+        // Keep the window full, then wait for one completion.
+        while in_flight.len() < concurrency {
+            let Some(fetch) = queue.next() else { break };
+            let repository = repository.to_string();
+            let store = Arc::clone(store);
+            let client = client.clone();
+            in_flight.spawn(async move {
+                let result = super::pull::pull_layer_from_peer(
+                    &fetch.peer,
+                    &repository,
+                    &fetch.digest,
+                    &store,
+                    &client,
+                    timeout,
+                )
+                .await;
+                (fetch, result)
+            });
+        }
+        let Some(joined) = in_flight.join_next().await else {
+            break; // queue drained and nothing in flight
+        };
+        match joined {
+            Ok((_, Ok(()))) => {}
+            Ok((fetch, Err(_))) => failed.push((fetch.digest, fetch.peer.node_id)),
+            Err(e) => {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "layer fetch task failed: {e}"
+                )));
+            }
+        }
+    }
+
+    // Retry pass: each failure tries the digest's remaining holders.
+    for (digest, tried_node) in failed {
+        if store.has_blob(&digest) {
+            continue;
+        }
+        let holders = catalog.layer_holders(digest.as_str());
+        let mut recovered = false;
+        for peer in peers
+            .iter()
+            .filter(|p| p.node_id != tried_node && holders.contains(&p.node_id))
+        {
+            if super::pull::pull_layer_from_peer(peer, repository, &digest, store, client, timeout)
+                .await
+                .is_ok()
+            {
+                recovered = true;
+                break;
+            }
+        }
+        if !recovered {
+            return Err(PickleError::ReplicationFailed(format!(
+                "layer {digest} unavailable from any holder"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Cluster-backed image source: the Pickle catalog plus P2P layer
+/// pulls, installed into the grill's `ImageStore` in cluster mode (and
+/// standalone too — it resolves locally-pushed images without peers).
+pub struct ClusterSource {
+    pub state: super::api::PickleState,
+    /// Live gossip membership; `None` standalone (local blobs only).
+    pub members:
+        Option<tokio::sync::watch::Receiver<Vec<crate::mustard::membership::MembershipSnapshot>>>,
+    pub registry_port: u16,
+    /// Parallel fetches per image pull (`[images] p2p_concurrency`).
+    pub concurrency: usize,
+    pub client: reqwest::Client,
+}
+
+impl ClusterSource {
+    /// Resolve `repository:tag` in the catalog and materialise every
+    /// blob locally, fetching missing layers from peers in parallel.
+    ///
+    /// Returns the layer blob paths in manifest order (ready to
+    /// unpack), or `None` when the catalog doesn't know the image.
+    pub async fn ensure_image_local(
+        &self,
+        repository: &str,
+        tag: &str,
+    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+        let peers = match &self.members {
+            Some(rx) => crate::cluster::identity::pickle_peers(&rx.borrow(), self.registry_port),
+            None => Vec::new(),
+        };
+        self.ensure_image_local_with_peers(repository, tag, &peers)
+            .await
+    }
+
+    /// [`Self::ensure_image_local`] with an explicit peer list. Tests
+    /// call this directly: in-process registries sit on ephemeral
+    /// ports, which the uniform-`registry_port` derivation can't
+    /// address.
+    pub async fn ensure_image_local_with_peers(
+        &self,
+        repository: &str,
+        tag: &str,
+        peers: &[Peer],
+    ) -> Result<Option<Vec<PathBuf>>, PickleError> {
+        let catalog = self.state.catalog_snapshot().await;
+        let Some(manifest) = catalog.get_manifest_by_tag(repository, tag).cloned() else {
+            return Ok(None);
+        };
+
+        let digests: Vec<Digest> = manifest.all_digests().into_iter().cloned().collect();
+        let local: HashSet<Digest> = digests
+            .iter()
+            .filter(|d| self.state.store.has_blob(d))
+            .cloned()
+            .collect();
+
+        let plan = plan_downloads(&digests, &local, &catalog, peers, self.state.node_raft_id);
+        if !plan.unavailable.is_empty() {
+            let missing: Vec<String> = plan.unavailable.iter().map(|d| d.to_string()).collect();
+            return Err(PickleError::ReplicationFailed(format!(
+                "no reachable holder for layers: {}",
+                missing.join(", ")
+            )));
+        }
+
+        pull_layers_parallel(
+            plan,
+            repository,
+            &catalog,
+            peers,
+            &self.state.store,
+            &self.client,
+            self.concurrency,
+            Duration::from_secs(30),
+        )
+        .await?;
+
+        Ok(Some(
+            manifest
+                .layers
+                .iter()
+                .map(|layer| self.state.store.blob_path(&layer.digest))
+                .collect(),
+        ))
+    }
+}
+
+impl crate::grill::image::ClusterImageSource for ClusterSource {
+    fn fetch_cluster_image<'a>(
+        &'a self,
+        repository: &'a str,
+        tag: &'a str,
+    ) -> crate::grill::image::ClusterFetchFuture<'a> {
+        Box::pin(async move {
+            self.ensure_image_local(repository, tag)
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 }
 

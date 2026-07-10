@@ -304,6 +304,60 @@ Two properties hold for arbitrary topologies: every layer with at least one live
 
 The parallel executor that runs these plans — bounded concurrency, retry against an alternate holder — is the next section, where the planner meets the wire.
 
+### The executor: a JoinSet with a window
+
+Running the plan is a classic bounded-concurrency loop, and it introduces `tokio::task::JoinSet` — the structured way to run a family of tasks. If you know Go's `errgroup` or Python's `asyncio.gather`, a `JoinSet` is the same social contract with one addition: tasks are *owned* by the set, so dropping it cancels everything still running. No leaked downloads.
+
+```rust
+loop {
+    // Keep the window full, then wait for one completion.
+    while in_flight.len() < concurrency {
+        let Some(fetch) = queue.next() else { break };
+        let store = Arc::clone(store);
+        let client = client.clone();
+        in_flight.spawn(async move { /* pull one layer */ });
+    }
+    let Some(joined) = in_flight.join_next().await else { break };
+    // record success or push (digest, failed_peer) for the retry pass
+}
+```
+
+Why a window (default four, `[images] p2p_concurrency`) instead of spawning everything? Backpressure. Fifty layers fired at two peers simultaneously is a self-inflicted denial of service; four in flight keeps the pipes full without the stampede. Note also what gets cloned into each task: an `Arc` of the blob store and a `reqwest::Client` (which is itself an `Arc` around a connection pool internally). Channels and tasks take ownership — cloning handles across that boundary is the normal cost of doing business, not a smell.
+
+Failures don't abort the window; they accumulate, and a sequential retry pass afterwards tries each failed digest against its *other* holders. A digest that exhausts every holder fails the whole pull — which brings us to the most important line of the wiring.
+
+### The seam, and the bug it turned out to fix
+
+Where does the cluster path plug into the runtime? Inside `ImageStore::pull_and_unpack`, *before* the external registry client is built. The store gets an optional `ClusterImageSource` — a one-method trait implemented over the Pickle catalogue + planner + executor — and consults it first. Catalogue hit: layers arrive P2P, unpack, done. Miss: the existing external path runs untouched.
+
+Except this "optimisation" turned out to be a correctness fix. Look at the external client's configuration:
+
+```rust
+let client_config = oci_distribution::client::ClientConfig {
+    protocol: oci_distribution::client::ClientProtocol::Https,
+    ..Default::default()
+};
+```
+
+HTTPS only. Pickle registries speak plain HTTP inside the cluster. Which means an image pushed to the cluster registry *could not be deployed on any other node at all* — the pull had no path that could reach it. The P2P seam isn't making cluster deploys faster; it's making them exist. That's the second time this phase an optimisation task has flushed out a wiring hole (the port-mapping DNAT was the first), and it's worth pausing on why: optimisation work forces you to trace the *actual* data path end to end, and untraced paths are where the gaps hide.
+
+One rule at the seam matters more than the rest. If the catalogue *knows* the image but its layers are unreachable, the pull **fails** — it must not fall through to the external path. `web:v1` in the cluster catalogue and `web:v1` on Docker Hub are different images that happen to share a name; silently substituting one for the other is how you deploy someone else's code. Errors are for when the truth is unavailable, not an excuse to guess.
+
+Two mechanical notes. Name matching: parsing normalises `web:v1` to `docker.io/library/web:v1`, but the catalogue stores whatever the pusher put in the URL path (`web`), so the seam tries the bare name first, then the normalised one (`cluster_candidates`, unit-tested). Injection: the runtime is selected long before the registry or catalogue exist, so the source is installed *late* through a `OnceLock` slot shared by `ImageStore` clones — set once at startup, lock-free reads on every pull, and the standalone binary simply never sets it.
+
+### Testing it, and a lesson about debug-mode crypto
+
+The integration tests run two or three real registries on ephemeral ports: the roadmap's 100 MB five-layer pull lands in under five seconds with all blobs local; a plan against two holders provably uses both; a fetch whose planned peer is dead (a bound-then-dropped port) recovers via the alternate holder; a catalogue image with no reachable holder fails loudly; a catalogue miss returns `None` for the fall-through.
+
+The 100 MB test failed on its first run — at 6.5 seconds, all of it CPU. Content-addressed storage verifies a SHA-256 on every write, and unoptimised debug-build SHA-256 crawls at roughly 30 MB/s; hashing dominated a localhost transfer several times over. The fix is a Cargo trick worth knowing: per-package profile overrides.
+
+```toml
+[profile.test.package.sha2]
+opt-level = 3
+```
+
+Just the hash crates get compiled with optimisations; everything else keeps fast debug builds. The suite got faster across the board — every blob test was quietly paying the same tax.
+
 ---
 
-*Still to come in Phase 12: the P2P executor and its wiring into image pulls, the pull-through cache, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: the pull-through cache, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*

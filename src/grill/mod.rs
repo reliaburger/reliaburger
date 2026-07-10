@@ -234,6 +234,20 @@ pub enum AnyGrill {
     Apple(apple::AppleContainerGrill),
 }
 
+impl AnyGrill {
+    /// The runtime's image-store handle, when the runtime pulls OCI
+    /// images itself (runc). Lets the binary install the cluster P2P
+    /// image source after the cluster subsystems start — the runtime
+    /// is selected long before the registry and catalog exist.
+    pub fn image_store(&self) -> Option<ImageStore> {
+        match self {
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => Some(g.image_store().clone()),
+            _ => None,
+        }
+    }
+}
+
 impl Grill for AnyGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         match self {

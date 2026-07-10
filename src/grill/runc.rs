@@ -110,6 +110,13 @@ impl RuncGrill {
         self
     }
 
+    /// The image store this runtime pulls through. Clones share the
+    /// cluster-source slot, so installing a source on the returned
+    /// handle affects this grill's pulls.
+    pub fn image_store(&self) -> &ImageStore {
+        &self.image_store
+    }
+
     /// Run a runc command and return its output.
     ///
     /// Always passes `--root {state_dir}` so runc uses a writable
