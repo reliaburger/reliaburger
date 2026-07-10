@@ -148,6 +148,36 @@ impl VolumeManager {
         }
     }
 
+    /// `(namespace, app)` pairs with at least one provisioned managed
+    /// volume — the scheduled snapshot sweep's work list.
+    pub fn provisioned_apps(&self) -> Vec<(String, String)> {
+        let mut apps = Vec::new();
+        let Ok(namespaces) = std::fs::read_dir(&self.volumes_dir) else {
+            return apps;
+        };
+        for ns_entry in namespaces.flatten() {
+            let ns_name = ns_entry.file_name().to_string_lossy().into_owned();
+            // Skip bookkeeping dirs (.snapshots, .config).
+            if ns_name.starts_with('.') || !ns_entry.path().is_dir() {
+                continue;
+            }
+            let Ok(app_dirs) = std::fs::read_dir(ns_entry.path()) else {
+                continue;
+            };
+            for app_entry in app_dirs.flatten() {
+                if !app_entry.path().is_dir() {
+                    continue;
+                }
+                let app_name = app_entry.file_name().to_string_lossy().into_owned();
+                if !self.provisioned_volumes(&ns_name, &app_name).is_empty() {
+                    apps.push((ns_name.clone(), app_name));
+                }
+            }
+        }
+        apps.sort();
+        apps
+    }
+
     /// The recorded backend of a provisioned volume, if any.
     pub fn backend_of(&self, host_path: &Path) -> Option<super::btrfs::VolumeBackend> {
         let bytes = std::fs::read(Self::sidecar_path(host_path)).ok()?;

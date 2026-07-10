@@ -59,7 +59,8 @@ argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
 datafusion = "45"
-object_store = { version = "0.12", features = ["fs"] }
+object_store = { version = "0.12", features = ["fs", "aws", "gcp"] }
+url = "2"
 sysinfo = "0.33"
 prometheus-parse = "0.2"
 rust-embed = "8"

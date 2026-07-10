@@ -376,6 +376,15 @@ async fn main() -> anyhow::Result<()> {
     // left the config key dead (review M21's second half).
     agent.set_volumes_dir(config.storage.volumes.clone());
 
+    // Scheduled volume snapshots ([storage.snapshots], Phase 12 E3).
+    if config.storage.snapshots.interval_secs > 0 {
+        tokio::spawn(reliaburger::bun::snapshot_worker::run_snapshot_loop(
+            config.storage.volumes.clone(),
+            config.storage.snapshots.clone(),
+            shutdown.clone(),
+        ));
+    }
+
     // L8: load and attach the eBPF data path (Onion connect rewrite,
     // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.
     // A load failure is logged and the node continues without kernel

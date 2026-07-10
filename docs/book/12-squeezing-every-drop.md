@@ -424,6 +424,16 @@ Restore's precondition does not belong to the filesystem layer. Swapping a subvo
 
 One design choice worth defending: `snapshot create` with no `--volume` snapshots *every* provisioned volume of the app — discovered from the E1 sidecars on disk, not from the app's spec. The filesystem is the source of truth, which means you can snapshot (and restore) an app that's stopped, deleted from config, or mid-migration. The API is four routes under `/v1/snapshots/`, the CLI is `relish snapshot create|list|restore|delete`, and the roadmap's acceptance test runs verbatim on the Lima loopback-btrfs rig: write `v1`, snapshot, overwrite with garbage, restore, read `v1` back.
 
+### Scheduled sweeps, and the checkpoint that is also the retry policy
+
+Manual snapshots are for the moment before a risky migration; backups are a *schedule*. The scheduler here is deliberately boring: `[storage.snapshots] interval_secs` drives a `tokio::time::interval` loop, the same house pattern as every other background worker in Bun. The roadmap said "cron", and we considered a real cron-expression parser — and rejected it, because it drags in a date-time stack for expressiveness nobody asked for by name. An interval loop satisfies "snapshots happen on a schedule"; if someone ever needs "3 a.m. on Sundays", that's the day the dependency earns its place. Write the trade-off down and move on.
+
+The loop's tick is a plain async function taking the volumes directory, the retention count, an optional uploader, and — as always — `now` as a parameter. Three phases. *Snapshot* every provisioned volume (discovered from sidecars). *Prune* to the newest `retain` per volume — the plan for which is a pure function, tested with fabricated metadata. *Upload* anything not yet shipped: tar + gzip the snapshot directory on a `spawn_blocking` thread (compression is CPU work; the runtime's threads are for I/O), then `put` it through `object_store` — one trait over `file://`, `s3://`, and `gs://`, which is why the integration test can prove the whole upload path against a tempdir URL and the production S3 path differs only in configuration.
+
+The nicest design element is the smallest: each snapshot's metadata has an `uploaded: bool`, flipped after a successful put. That single flag is simultaneously the **checkpoint** (a sweep never re-ships what's shipped — asserted by running the sweep twice and counting), the **retry policy** (a failed upload leaves it false, so next tick tries again — no retry queue, no backoff state machine), and the **audit trail** (`relish snapshot list` shows an UPLOADED column). When one bit of state can serve three masters, the design is probably right.
+
+Failures accumulate into the tick's report rather than aborting it — one app's broken volume must not stop another app's backup — and the tests exercise exactly that: a sweep over unsnapshotable volumes (every macOS dev machine) reports errors and carries on.
+
 ---
 
-*Still to come in Phase 12: scheduled snapshot uploads, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: batch and build execution. This chapter grows with each.*

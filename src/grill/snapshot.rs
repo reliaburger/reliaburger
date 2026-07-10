@@ -226,7 +226,7 @@ impl SnapshotManager {
                 }
             }
         }
-        snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        snapshots.sort_by_key(|meta| std::cmp::Reverse(meta.created_at));
         Ok(snapshots)
     }
 
@@ -294,6 +294,36 @@ impl SnapshotManager {
     pub fn snapshot_path(&self, meta: &SnapshotMeta) -> PathBuf {
         self.snapshot_dir(&meta.namespace, &meta.app, &meta.volume_path)
             .join(&meta.name)
+    }
+
+    /// `(namespace, app)` pairs that have snapshots on disk. The sweep
+    /// prunes and uploads from here rather than from live volumes, so
+    /// snapshots of since-deleted apps still age out and ship.
+    pub fn apps(&self) -> Vec<(String, String)> {
+        let mut apps = Vec::new();
+        let root = self.volumes_dir.join(".snapshots");
+        let Ok(namespaces) = std::fs::read_dir(&root) else {
+            return apps;
+        };
+        for ns_entry in namespaces.flatten() {
+            if !ns_entry.path().is_dir() {
+                continue;
+            }
+            let ns_name = ns_entry.file_name().to_string_lossy().into_owned();
+            let Ok(app_dirs) = std::fs::read_dir(ns_entry.path()) else {
+                continue;
+            };
+            for app_entry in app_dirs.flatten() {
+                if app_entry.path().is_dir() {
+                    apps.push((
+                        ns_name.clone(),
+                        app_entry.file_name().to_string_lossy().into_owned(),
+                    ));
+                }
+            }
+        }
+        apps.sort();
+        apps
     }
 }
 

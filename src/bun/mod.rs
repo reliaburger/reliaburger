@@ -10,6 +10,7 @@ pub mod gpu;
 pub mod health;
 pub mod probe;
 pub mod restart;
+pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
 

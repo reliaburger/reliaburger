@@ -298,6 +298,8 @@ pub struct StorageSection {
     pub logs: PathBuf,
     pub metrics: PathBuf,
     pub volumes: PathBuf,
+    /// Scheduled volume snapshots (`[storage.snapshots]`).
+    pub snapshots: SnapshotsSection,
 }
 
 impl Default for StorageSection {
@@ -308,6 +310,35 @@ impl Default for StorageSection {
             logs: PathBuf::from("/var/lib/reliaburger/logs"),
             metrics: PathBuf::from("/var/lib/reliaburger/metrics"),
             volumes: PathBuf::from("/var/lib/reliaburger/volumes"),
+            snapshots: SnapshotsSection::default(),
+        }
+    }
+}
+
+/// Scheduled volume snapshots and their object-store upload.
+///
+/// Interval-based rather than cron expressions — a scheduled loop
+/// satisfies "snapshots run on a schedule" without dragging in a cron
+/// parser and chrono for a feature nobody asked for by name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnapshotsSection {
+    /// Seconds between snapshot sweeps. `0` disables the loop.
+    pub interval_secs: u64,
+    /// Snapshots retained per volume; older ones are pruned.
+    pub retain: usize,
+    /// Optional object-store destination for snapshot archives
+    /// (`file://`, `s3://`, `gs://`). Credentials come from the
+    /// standard environment variables of each backend.
+    pub upload_url: Option<String>,
+}
+
+impl Default for SnapshotsSection {
+    fn default() -> Self {
+        Self {
+            interval_secs: 0,
+            retain: 7,
+            upload_url: None,
         }
     }
 }
