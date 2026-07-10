@@ -372,6 +372,9 @@ async fn main() -> anyhow::Result<()> {
     // used to carry zeroes).
     let (capacity_cpu, capacity_memory) = node_capacity(&config);
     agent.set_node_capacity(capacity_cpu, capacity_memory);
+    // Wire [storage] volumes — the agent constructors default it, which
+    // left the config key dead (review M21's second half).
+    agent.set_volumes_dir(config.storage.volumes.clone());
 
     // L8: load and attach the eBPF data path (Onion connect rewrite,
     // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.

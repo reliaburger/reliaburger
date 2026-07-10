@@ -580,6 +580,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.capacity_memory_mb = memory_mb;
     }
 
+    /// Set the base directory for managed volumes (`[storage] volumes`).
+    /// The constructors default it; the binary overrides from config.
+    pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {
+        self.volumes_dir = dir;
+    }
+
     /// Enable or disable the perimeter firewall. In-process multi-node tests
     /// run several agents on one host and must not spawn `nft` against the
     /// shared host firewall (`with_cluster` enables it by default on Linux).
@@ -2658,6 +2664,48 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .to_string(),
             });
         }
+        // Managed volumes (no explicit `source`): create the host
+        // directories — and size-enforced loop mounts — BEFORE the
+        // spec's bind mounts reference them; runc fails create on a
+        // nonexistent bind source (review M21). Host-path volumes are
+        // the operator's responsibility. Never deleted on Stop: the
+        // placements reconciler stops instances on routine rebalances
+        // and Phase 14 adoption re-attaches them across upgrades —
+        // deletion here would destroy data on a rebalance.
+        // TODO(Phase 15): explicit volume cleanup (`relish volume rm`).
+        let managed: Vec<crate::config::types::VolumeSpec> = spec
+            .volumes
+            .iter()
+            .filter(|v| v.source.is_none())
+            .cloned()
+            .collect();
+        if !managed.is_empty() {
+            let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
+            let volume_ns = namespace.to_string();
+            let volume_app = app_name.to_string();
+            // Blocking: fs + (on Linux) fallocate/mkfs/mount commands.
+            tokio::task::spawn_blocking(move || {
+                for vol in &managed {
+                    manager.create_managed_volume(
+                        &volume_ns,
+                        &volume_app,
+                        &vol.path,
+                        vol.size.as_deref(),
+                    )?;
+                }
+                Ok::<(), crate::grill::volume::VolumeError>(())
+            })
+            .await
+            .map_err(|e| BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("volume preparation task failed: {e}"),
+            })?
+            .map_err(|e| BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("managed volume: {e}"),
+            })?;
+        }
+
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
@@ -3985,6 +4033,81 @@ mod tests {
             require_signatures: true,
             keys: vec![],
         }
+    }
+
+    /// Phase 12 E0 (review M21): deploying an app with a managed
+    /// volume creates the host directory before the container starts —
+    /// runc fails create on a bind mount whose source doesn't exist.
+    #[tokio::test]
+    async fn deploy_creates_managed_volume_directories() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let config = Config::parse(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+
+            [[app.web.volumes]]
+            path = "/data"
+        "#,
+        )
+        .unwrap();
+        let events = send_deploy(&tx, config).await;
+        let (created, _) = expect_complete(&events);
+        assert_eq!(created, 1);
+
+        assert!(
+            volumes_dir
+                .path()
+                .join("default")
+                .join("web")
+                .join("data")
+                .is_dir(),
+            "managed volume host directory must exist after deploy"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// Host-path volumes are the operator's responsibility — deploys
+    /// must not create anything under the managed volumes directory.
+    #[tokio::test]
+    async fn deploy_leaves_hostpath_volumes_alone() {
+        let volumes_dir = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_volumes_dir(volumes_dir.path().to_path_buf());
+        let handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let toml = format!(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+
+            [[app.web.volumes]]
+            source = "{}"
+            path = "/data"
+        "#,
+            source_dir.path().display()
+        );
+        let events = send_deploy(&tx, Config::parse(&toml).unwrap()).await;
+        expect_complete(&events);
+
+        assert!(
+            !volumes_dir.path().join("default").exists(),
+            "host-path volumes must not create managed directories"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     #[tokio::test]

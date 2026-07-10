@@ -392,6 +392,16 @@ The headline test stands up an in-process registry as the "upstream" with a requ
 
 The first run failed, and the failure was a gift: multi-segment repository names. Real OCI names contain slashes (`library/nginx`, and our own `cache/<host>/<repo>` always does), but the registry's axum routes match `/v2/{name}/...` with a *single* path segment — so peer blob transfers for cached images 404'd on routing before any handler ran. The fix leans on content addressing: blob endpoints ignore the name entirely (a blob is its digest), so peer transfer URLs simply flatten the name (`cache/docker.io/library/redis` → one segment) and nothing round-trips through the flattened form — manifests travel via Raft, never over these URLs. Full multi-segment routing in the registry API is real future work; this is the honest minimum that makes the cache correct today.
 
+## Volumes that actually mount
+
+This section is short and slightly embarrassing, which is exactly why it's in the book. Since Phase 1, Reliaburger has had a `VolumeManager`: it creates a managed volume's host directory, and on Linux it can wrap it in a size-enforced loop-mounted ext4 filesystem. Well-designed, unit-tested. The July review found it had **no callers**. The OCI spec generator computed the bind-mount *paths* for managed volumes, runc dutifully tried to mount them — and failed with ENOENT, because nothing had ever created the directories. Every containerised app with a managed volume had been failing to start, forever, while eight unit tests passed.
+
+The fix is a dozen lines in the agent's startup path: before the OCI spec is generated, filter the app's volumes to the managed ones (no explicit `source` — host-path volumes are the operator's own business), and run `create_managed_volume` for each inside `spawn_blocking` (it does filesystem work and, on Linux, shells out to `fallocate`/`mkfs`/`mount`). Failure fails the deploy closed — a container without its volume shouldn't limp up and write data into an unmounted path. And the `[storage] volumes` config key, parsed-but-ignored until now, finally reaches the agent instead of a hardcoded default.
+
+The deliberate *non*-feature deserves more words than the feature. Volumes are **never deleted on Stop**. It's tempting — create on start, delete on stop, symmetric and tidy. But look at who sends Stop: users, yes, and also the placements reconciler every time an assignment moves between nodes during a routine rebalance, and the self-upgrade machinery around a binary swap. Delete-on-stop turns "the scheduler moved your database replica" into "the scheduler deleted your database". Orphaned volume trees are the cost, an explicit `relish volume rm` (future work) is the answer, and the asymmetry is the point: creating data automatically is safe, destroying it automatically is not.
+
+What actually catches a library-not-wired bug? Not more unit tests of the library. The new tests drive the *agent*: deploy a config with a managed volume through the real command channel and assert the host directory exists afterwards; deploy a host-path volume and assert nothing appeared under the managed root. The test that would have caught M21 on day one is the one that starts from the user's artefact — the config file — and checks the world, not the code.
+
 ---
 
-*Still to come in Phase 12: volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: Btrfs quotas and snapshots, and batch/build execution. This chapter grows with each.*
