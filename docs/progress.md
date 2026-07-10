@@ -342,35 +342,60 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 - [x] Single global `Mutex<RateLimiter>` serialised every rate-limited request; replaced with
   a 16-way `ShardedRateLimiter`.
 
-### Beyond Phase 11b — deferred & un-staged review items
+### Stage 5 — Multi-Node Correctness & Security (July 2026 reviews)
 
-The [July 2026 review](plans/2026-07-02-review-codebase.md) staged a specific remediation plan
-(Stages 0–4). **Every item in that plan is now done** — including the eBPF
-production-enforcement follow-ups (P0–P3) and three security Mediums pulled
-forward (P4: `M25`, `M1`, `M18`). The findings below were **never part of the
-review's Stages 0–4** (or were explicitly deferred). They are recorded here as
-the authoritative post-Phase-11b backlog — nothing silently dropped.
+> Consolidated write-up: [2026-07-10-review-past-phase-12.md](plans/2026-07-10-review-past-phase-12.md),
+> synthesising the [codebase walkthrough](plans/2026-07-09-review-codex.md) (H1–H8, M1–M5),
+> the [design discrepancy register](plans/2026-07-09-review-design-discrepancies.md) (D1–D22),
+> and the former "Beyond Phase 11b" backlog (fully absorbed below — the write-up has the
+> item-by-item mapping). Phase 12 already closed `M7`, `M20`, `M21`/codex-`M2`, and the
+> batch/build parts of codex `M5`. `X6` (the no-args TUI) stays in Phase 13.
 
-**Deferred by design (were carved out of their stage):**
-- `C5(b)` — mTLS on the Raft RPC and agent API listeners (Stage 3b deferral).
-- `L17` — CRL enforcement at connect time (image-signature verification is done; Stage 3b deferral).
-- `X6` — the no-args `relish` TUI → [2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md).
+Each item below is one PR-sized theme, tests-first, ordered: cluster correctness →
+security enforcement → correctness under failure → features & docs.
 
-**Never-staged Mediums (still open, confirmed in code):**
-- `M3` — whole-blob `std::fs` + SHA-256 run on the async runtime (no `spawn_blocking`); large pushes stall the event loop.
-- `M4` — log/metric dedup only removes *adjacent* duplicates, so cross-node dupes survive.
-- `M5` — VIP collisions unchecked (SipHash into 65,534 slots; ~50% odds near ~300 apps).
-- `M6` — service map keyed by app name only; the same name in two namespaces collides.
-- `M7` — a crashed app with no health check stays `Running` forever (only jobs are exit-monitored).
-- `M19` — alert webhooks build only a generic payload; Slack/PagerDuty formats are never applied.
-- `M20` — log export is filesystem-only (`object_store` has only the `fs` feature); an `s3://`/`gs://` target is treated as a local dir.
-- `M21` — managed volumes: mount entries generated but the host dir is never created (`[storage] volumes` dead config).
-- `M22` — rootless: resource limits silently dropped; slirp4netns has no callers (empty netns).
-- `M23` — process-workload allowlist + `mount_isolation` never enforced (`[process_workloads]` dead config).
-- `M24` — `KetchupStore::today()` calendar math can emit month 13 (dead path today).
-- `X8` — `relish logs-export` copies files directly, racing the agent's export checkpoint (never contacts the agent).
-
-**All ~24 Low findings** remain open (review §Low): container blob-cache re-verify, `parse_num` overflow, weak `raft_id_from_name` djb2 hash, non-constant-time join-token compare, `verify_jwt` skips `aud`/`iss`, keyless verify ignores cert validity/SPIFFE, `manifest_put` doesn't verify referenced blobs, upload sessions never expire, fan-out swallows node failures / doesn't URL-encode params, IPv6 Host-header mangling, git arg-injection (`--` separator), diff engine re-adds every job per sync, and the rest. None were staged for Phase 11b.
+- [ ] **Leader discovery beyond the council** — publish the leader's API/reporting endpoints
+  through a gossip-visible control-plane record; placement reconciler + reporting use it
+  instead of local Raft metrics; 8+ node test through a leader failover (`H1`/`D1`)
+- [ ] **Council self-healing** — leader-safe voter removal/replacement (learner → catch-up →
+  promote → joint-consensus remove); quorum-recovery test with healthy spares (`H2`/`D2`)
+- [ ] **Namespaced global service catalogue** — `ServiceId { namespace, name }` through Onion,
+  DNS, eBPF, Wrapper and firewall; collision-aware VIP allocation; cluster-replicated service
+  endpoints feeding local read caches; cross-node resolve/ingress test
+  (`H3`/codex-`M1`/`D3`/`D5`/`D7`-routes, backlog `M5`/`M6`)
+- [ ] **Deployment controller correctness** — terminal deploy outcomes reconciled against
+  `Supervisor` state (not applied-on-send), retry with backoff, failure reporting to the
+  leader; move deploy I/O off the agent event loop (`H7`/`D10`, codex-`M3`)
+- [ ] **AuthZ enforcement & bootstrap lockdown** — scope checks in reusable extractors
+  (namespace/app-scoped tokens actually constrain); refuse non-loopback API binds until
+  bootstrap completes; scoped-token integration tests (`H4`/`D8`, part of `H5`)
+- [ ] **Transport security** — mTLS on Raft, reporting and API listeners; registry auth/TLS;
+  CRL/expiry checks at connect time (`H5`/`D4`, `C5(b)`, `L17` — the Stage 3b deferrals)
+- [ ] **Dashboard security boundary** — authenticate Brioche or make it an explicitly redacted
+  status surface; never render plain env values; browser token flow for logs/metrics panels;
+  real node-detail data (`H6`/`D19`)
+- [ ] **Process-workload policy enforcement** — pass the configured `[process_workloads]`
+  policy into the supervisor; enforce allowlist + `mount_isolation` before OCI spec
+  generation (`H8`/`D17`, backlog `M23`)
+- [ ] **Observability storage engine** — DataFusion Parquet tables with predicate pushdown +
+  bounded recent buffer; `spawn_blocking` for flushes and Pickle blob hashing; cross-node
+  dedup (codex-`M4`/`D13`, backlog `M3`/`M4`)
+- [ ] **Observability & CLI small fixes** — Slack/PagerDuty webhook payload formats (`M19`),
+  `KetchupStore::today()` month-13 fix (`M24`), `relish logs-export` via the agent (`X8`)
+- [ ] **GitOps atomicity** — don't advance the commit marker on partial apply; handle or
+  explicitly reject jobs/namespaces/permissions; machine-readable partial results (`D12`)
+- [ ] **Pickle durability semantics** — synchronous catalogue-commit + peer-ack on push, or an
+  explicit "locally accepted, replication pending" status (`D11`)
+- [ ] **Feature completeness or explicit re-scope** — GPU detector (`D15`), Apple adoption,
+  CIDR egress, rootless resource limits (`M22`): implement each or document it as
+  unsupported next to the feature claim
+- [ ] **Recovery story** — full-council-loss recovery, backups, disk-pressure council
+  resignation: implement or downgrade whitepaper §8.2–8.3 to a labelled proposal (`D21`)
+- [ ] **Docs truth pass** — replace superseded designs (in-kernel DNS, containerd, bincode,
+  old upgrade sequence: `D6`/`D20`/`D22`); qualify deferred features in whitepaper/README
+  (`D14`/`D15`/`D18`/`D21`); "implemented as of" markers per design chapter
+- [ ] **Low-findings sweep** — the ~24 Lows from the [2 July review §Low](plans/2026-07-02-review-codebase.md)
+  as one batch PR, each fix with a test
 
 ## Phase 12: Optimisations
 
