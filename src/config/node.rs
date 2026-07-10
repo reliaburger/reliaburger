@@ -436,8 +436,27 @@ pub struct ImagesSection {
     pub registry_bind: String,
     /// Parallel layer fetches per P2P image pull.
     pub p2p_concurrency: usize,
+    /// Seconds a cached upstream image is served without rechecking
+    /// whether its (mutable) tag moved upstream.
+    pub cache_recheck_secs: u64,
+    /// Credentials for upstream registries the pull-through cache may
+    /// authenticate to. Hosts not listed are accessed anonymously.
+    pub external_registries: Vec<ExternalRegistrySection>,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
+}
+
+/// Credentials for one upstream registry host.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalRegistrySection {
+    /// Registry host, e.g. `ghcr.io`.
+    pub host: String,
+    /// Username for basic auth; anonymous when omitted.
+    pub username: Option<String>,
+    /// Name of the cluster secret holding the password/token. Resolved
+    /// at startup; an unresolvable secret falls back to anonymous.
+    pub password_secret: Option<String>,
 }
 
 /// Image trust policy controlling signature requirements.
@@ -464,6 +483,8 @@ impl Default for ImagesSection {
             registry_port: 5050,
             registry_bind: "127.0.0.1".to_string(),
             p2p_concurrency: 4,
+            cache_recheck_secs: 3600,
+            external_registries: Vec::new(),
             trust_policy: TrustPolicySection::default(),
         }
     }

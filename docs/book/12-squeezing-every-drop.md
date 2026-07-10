@@ -358,6 +358,26 @@ opt-level = 3
 
 Just the hash crates get compiled with optimisations; everything else keeps fast debug builds. The suite got faster across the board — every blob test was quietly paying the same tax.
 
+## Caching other people's registries
+
+A ten-node cluster deploying `redis:7` pulls the same 40 MB from Docker Hub ten times. That's rude to Docker Hub (which rate-limits you for it), slow for you, and pointless — the P2P machinery we just built can fan an image across the cluster from a single copy. The missing piece is getting that single copy *into* Pickle transparently: a pull-through cache. First external pull fetches from upstream and commits to the catalogue under `cache/<host>/<repo>`; every later pull anywhere in the cluster is a catalogue hit served peer-to-peer.
+
+The entire difficulty of a pull-through cache is one fact: **tags move**. `redis:7` today and `redis:7` next month are different images under the same name. Cache it forever and you serve stale software; recheck it on every pull and you've rebuilt the rate-limit problem you came to solve. The middle path is a recheck window (`[images] cache_recheck_secs`, default an hour), and the state machine is small enough to be one pure function:
+
+```rust
+pub enum CacheState { Miss, Fresh, Stale(Digest) }
+
+pub fn decide(catalog, cached_repo, tag, now, recheck) -> CacheState
+```
+
+`Miss` → fetch everything. `Fresh` (committed less than an hour ago) → serve the cache, touch nothing. `Stale` → the cheap move: a HEAD request for the manifest digest — a few hundred bytes — and compare with what we cached. Same digest: the tag hasn't moved, it's a `Hit`. New digest: `Refetch`. Note what `decide` takes: `now` is a *parameter*, not a call to the system clock. Time is an input like any other, which is why every path of this logic tests deterministically — no sleeps, no flaky windows.
+
+The network side hides behind a three-method trait — `head_manifest_digest`, `fetch_manifest`, `fetch_blob` — with two implementations from day one. `OciUpstream` wraps the `oci-distribution` client we already ship (with an `insecure_http` constructor so integration tests can point it at an in-process registry). The test mock scripts digests and *counts calls* with an `AtomicUsize`, which is how you prove statements like "a stale check makes exactly one HEAD and zero blob fetches" — the pattern for testing internet-facing code with no internet.
+
+Credentials follow the same resolve-at-startup shape as everything else in Sesame's orbit: `[images] external_registries` lists hosts with a username and a *secret name*; resolution maps names to plaintext through an injected lookup, and anything unresolvable degrades to anonymous access rather than failing the boot. Anonymous is what public registries want anyway.
+
+The wiring — where a cache miss actually fills, the double-download guard, and the signature question for cached images — is the next pass.
+
 ---
 
-*Still to come in Phase 12: the pull-through cache, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: the pull-through wiring, volume wiring, snapshots and Btrfs quotas, and batch/build execution. This chapter grows with each.*

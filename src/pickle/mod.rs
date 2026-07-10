@@ -13,3 +13,4 @@ pub mod replication;
 pub mod signing;
 pub mod store;
 pub mod types;
+pub mod upstream;
