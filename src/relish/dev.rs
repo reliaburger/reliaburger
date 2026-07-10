@@ -270,7 +270,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap
+      apt-get install -y -qq runc uidmap btrfs-progs
       mkdir -p /etc/reliaburger
 "#
     )
@@ -723,7 +723,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap slirp4netns curl buildah build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
+      apt-get install -y -qq runc uidmap slirp4netns curl buildah btrfs-progs build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
   - mode: user
     script: |
       #!/bin/bash
@@ -787,6 +787,8 @@ pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishErro
          RELIABURGER_RUNC_TESTS=1 \
          RELIABURGER_NETNS_TESTS=1 \
          RELIABURGER_EBPF_TESTS=1 \
+         RELIABURGER_BTRFS_TESTS=1 \
+         RELIABURGER_BUILDAH_TESTS=1 \
          cargo test -j 2 --features ebpf"
     );
 

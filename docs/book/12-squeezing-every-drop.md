@@ -402,6 +402,18 @@ The deliberate *non*-feature deserves more words than the feature. Volumes are *
 
 What actually catches a library-not-wired bug? Not more unit tests of the library. The new tests drive the *agent*: deploy a config with a managed volume through the real command channel and assert the host directory exists afterwards; deploy a host-path volume and assert nothing appeared under the managed root. The test that would have caught M21 on day one is the one that starts from the user's artefact — the config file — and checks the world, not the code.
 
+## Quotas without loop devices
+
+How do you give a directory a size limit? Filesystems don't do that — a directory is just a namespace. The loop-mount trick from Phase 1 answers by making the directory *its own filesystem*: `fallocate` a sparse 10 GiB file, `mkfs.ext4` it, `mount -o loop` it over the directory. Writes past the limit fail with ENOSPC because the filesystem is genuinely full. It works, and it's clunky: three shelled commands, a `.img` file to manage, a mount to remember to unmount, and a filesystem-in-a-file's overhead.
+
+Btrfs makes the whole trick unnecessary, because Btrfs directories *can* be filesystems, almost. A **subvolume** looks like a directory, costs nothing to create, and is independently snapshottable; a **qgroup limit** bounds how much data it can reference. Volume creation becomes `btrfs subvolume create` plus `btrfs qgroup limit 10485760 <path>` — no image file, no mkfs, no mount table entry. Writes past the limit fail with EDQUOT instead of ENOSPC; same kernel-level enforcement, cleaner mechanics.
+
+The code follows the pattern this chapter keeps using: pure argv generators and one pure decision function, with a thin Linux shell layer. The decision is a three-bool truth table — is the volumes directory on Btrfs, are we Linux root, is there a size limit — and Btrfs wins *even without a size limit*, because only subvolumes can be snapshotted and the next section needs that. `is_btrfs` asks the kernel directly: `statfs` returns a filesystem type id, and `0x9123_683E` is Btrfs's magic number. That's the nix crate wrapping a syscall — the first time this book has read a filesystem's identity rather than its contents.
+
+Which backend a volume got matters later — a loop mount must be unmounted, a subvolume needs `btrfs subvolume delete`, and `rm -rf` is wrong for both — so creation records it in a sidecar file *next to* the volume (inside it would leak a stray file into the container's mount). The sidecar bought an unplanned fix: creation is now **idempotent**. Instance restarts re-drive the startup path, so `create_managed_volume` runs again on every restart — and until now a restarted sized volume would loop-mount *again*, stacking mounts on each restart. Sidecar present → already provisioned → return. The bug predates this phase; the refactor surfaced it.
+
+Two test notes. The quota integration test provisions its *own* filesystem — `truncate` a 1 GiB file, `mkfs.btrfs`, loop-mount it in a tempdir — so it assumes nothing about the host's disks, runs under the Lima gate (`RELIABURGER_BTRFS_TESTS=1`), and asserts an 11 MiB write into a 10 MiB volume fails at write *or* sync (Btrfs buffers; enforcement can arrive at either point — check both or flake). And the backend decision function briefly had swapped test arguments — three positional `bool`s in a row is an API that invites exactly that; the truth-table tests caught it before it shipped, which is their whole job.
+
 ---
 
-*Still to come in Phase 12: Btrfs quotas and snapshots, and batch/build execution. This chapter grows with each.*
+*Still to come in Phase 12: volume snapshots, scheduled uploads, and batch/build execution. This chapter grows with each.*

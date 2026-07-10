@@ -5,6 +5,7 @@
 /// port allocation, cgroup configuration, and OCI spec generation.
 #[cfg(target_os = "macos")]
 pub mod apple;
+pub mod btrfs;
 pub mod cgroup;
 pub mod image;
 #[cfg(test)]
