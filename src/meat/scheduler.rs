@@ -261,6 +261,7 @@ pub fn verify_image_signature(
     catalog: &crate::pickle::types::ManifestCatalog,
     trust_policy: &crate::config::node::TrustPolicySection,
     root_ca_der: Option<&[u8]>,
+    crl: Option<&crate::sesame::types::Crl>,
 ) -> Result<(), ScheduleError> {
     if !trust_policy.require_signatures {
         return Ok(());
@@ -280,11 +281,17 @@ pub fn verify_image_signature(
         });
     };
 
-    crate::pickle::signing::verify_signature(signature, &manifest.digest, trust_policy, root_ca_der)
-        .map_err(|e| ScheduleError::InvalidSignature {
-            image: image_ref.to_string(),
-            reason: e.to_string(),
-        })
+    crate::pickle::signing::verify_signature(
+        signature,
+        &manifest.digest,
+        trust_policy,
+        root_ca_der,
+        crl,
+    )
+    .map_err(|e| ScheduleError::InvalidSignature {
+        image: image_ref.to_string(),
+        reason: e.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -819,7 +826,9 @@ mod tests {
     fn verify_image_signature_allows_any_image_when_signatures_not_required() {
         let catalog = catalog_with(None);
         let policy = TrustPolicySection::default();
-        assert!(super::verify_image_signature(Some("myapp:v1"), &catalog, &policy, None).is_ok());
+        assert!(
+            super::verify_image_signature(Some("myapp:v1"), &catalog, &policy, None, None).is_ok()
+        );
     }
 
     #[test]
@@ -830,6 +839,7 @@ mod tests {
             &catalog,
             &require_signatures(),
             None,
+            None,
         );
         assert!(result.is_ok());
     }
@@ -837,8 +847,13 @@ mod tests {
     #[test]
     fn verify_image_signature_rejects_a_pickle_image_with_no_signature() {
         let catalog = catalog_with(None);
-        let result =
-            super::verify_image_signature(Some("myapp:v1"), &catalog, &require_signatures(), None);
+        let result = super::verify_image_signature(
+            Some("myapp:v1"),
+            &catalog,
+            &require_signatures(),
+            None,
+            None,
+        );
         assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
     }
 
@@ -851,6 +866,7 @@ mod tests {
             &catalog,
             &require_signatures(),
             Some(&root_ca),
+            None,
         );
         assert!(result.is_ok(), "valid signature should verify: {result:?}");
     }
@@ -866,10 +882,39 @@ mod tests {
             &catalog,
             &require_signatures(),
             Some(&root_ca),
+            None,
         );
         assert!(matches!(
             result,
             Err(ScheduleError::InvalidSignature { .. })
         ));
+    }
+
+    #[test]
+    fn verify_image_signature_rejects_a_revoked_signing_cert() {
+        let (sig, root_ca) = real_keyless_signature();
+        let catalog = catalog_with(Some(sig));
+        // The signing leaf cert has serial 100; revoke it.
+        let crl = crate::sesame::types::Crl {
+            entries: vec![crate::sesame::types::CrlEntry {
+                serial: crate::sesame::types::SerialNumber(100),
+                issuer: crate::sesame::types::CaRole::Workload,
+                revoked_at: std::time::SystemTime::now(),
+                reason: "key leaked".to_string(),
+            }],
+            version: 1,
+            updated_at: std::time::SystemTime::now(),
+        };
+        let result = super::verify_image_signature(
+            Some("myapp:v1"),
+            &catalog,
+            &require_signatures(),
+            Some(&root_ca),
+            Some(&crl),
+        );
+        assert!(
+            matches!(result, Err(ScheduleError::InvalidSignature { .. })),
+            "a revoked signing cert must be refused: {result:?}"
+        );
     }
 }

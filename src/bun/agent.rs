@@ -2711,6 +2711,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &catalog,
             &self.trust_policy,
             root_ca.as_deref(),
+            Some(&security_state.crl),
         )
         .map_err(|e| e.to_string())
     }

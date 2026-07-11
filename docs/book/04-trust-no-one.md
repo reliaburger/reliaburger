@@ -530,6 +530,8 @@ for (app_name, spec) in &config.app {
 
 `enforce_image_signature` reaches the root CA the same way secret decryption already did (through the council), looks the image up in the replicated manifest catalogue, and — for a Pickle-hosted image — verifies the signature against that CA. External-registry images (nginx from Docker Hub) aren't ours to vouch for, so they pass. A local image with no signature, or a tampered one, is refused. This is deliberately *local* enforcement: each node vouches for what it runs, which is exactly the right guarantee until a central scheduler exists to vouch cluster-wide.
 
+One more thing had to travel with the root CA to make this honest: the CRL. Chaining a signature to the cluster CA proves the signer *was* trusted when the certificate was issued, not that it still is. If a signing key leaks and you revoke its certificate, images it signed before the revocation must stop deploying. So `enforce_image_signature` passes the council's CRL alongside the root CA, and the keyless verifier checks the leaf and every intermediate against it before it even looks at the signature bytes. A revoked certificate anywhere in the chain fails the deploy closed. Revocation that doesn't reach every trust decision isn't revocation; it's a suggestion.
+
 Two different domains — gossip integrity and registry trust — one theme. The primitive was always there; the enforcement point was the missing piece.
 
 ## What Rust taught us
