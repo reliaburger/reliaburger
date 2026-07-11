@@ -495,6 +495,10 @@ pub struct ImagesSection {
     pub external_registries: Vec<ExternalRegistrySection>,
     /// Ceiling (seconds) per buildah stage of an image build.
     pub build_timeout_secs: u64,
+    /// Ceiling (bytes) on an extracted build context. The build runner
+    /// streams the context download to disk and aborts past this cap,
+    /// so a giant or sparse-bomb context cannot fill the build node.
+    pub max_context_bytes: u64,
     /// Image trust policy (signature requirements).
     pub trust_policy: TrustPolicySection,
 }
@@ -543,6 +547,7 @@ impl Default for ImagesSection {
             cache_recheck_secs: 3600,
             external_registries: Vec::new(),
             build_timeout_secs: 900,
+            max_context_bytes: 256 * 1024 * 1024,
             trust_policy: TrustPolicySection::default(),
         }
     }
@@ -890,6 +895,18 @@ mod tests {
         let nc = NodeConfig::parse("").unwrap();
         assert_eq!(nc.images.registry_bind, "127.0.0.1");
         assert_eq!(nc.images.registry_port, 5050);
+    }
+
+    #[test]
+    fn max_context_bytes_defaults_to_256_mib() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(nc.images.max_context_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_context_bytes_is_configurable() {
+        let nc = NodeConfig::parse("[images]\nmax_context_bytes = 1048576\n").unwrap();
+        assert_eq!(nc.images.max_context_bytes, 1024 * 1024);
     }
 
     #[test]

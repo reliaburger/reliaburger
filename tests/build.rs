@@ -14,6 +14,11 @@ use reliaburger::grill::{PortAllocator, ProcessGrill};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// The internal `/v1/build/run` endpoint requires the cluster service
+/// token; the harness configures one so the delegation path can be
+/// exercised as the system principal.
+const TEST_SERVICE_TOKEN: &str = "rbrg_test_service_token";
+
 struct Harness {
     base_url: String,
     shutdown: CancellationToken,
@@ -43,7 +48,7 @@ impl Harness {
             None,
             None,
             None,
-            None,
+            Some(TEST_SERVICE_TOKEN.to_string()),
             None,
             None,
             None,
@@ -97,13 +102,33 @@ async fn submit_without_any_builder_is_503() {
         .json(&serde_json::json!({
             "name": "app",
             "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "registry_port": 5050,
             "spec": { "context": ".", "destination": "pickle://app:v1" },
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 503);
+}
+
+/// JOB2 residual: the registry destination is server-owned. A request
+/// that smuggles a `registry_port` (trying to point a privileged Bun at
+/// an arbitrary localhost service) is rejected as a bad request, not
+/// silently honoured.
+#[tokio::test]
+async fn build_submit_rejects_a_smuggled_registry_port() {
+    let harness = Harness::start().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "app",
+            "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "registry_port": 5050,
+            "spec": { "context": ".", "destination": "pickle://app:v1" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
 }
 
 /// JOB2: `/v1/build/run` (the peer-delegation path) rejects a context digest
@@ -125,7 +150,6 @@ async fn build_run_rejects_a_traversal_context_digest() {
             .json(&serde_json::json!({
                 "name": "app",
                 "context_digest": bad,
-                "registry_port": 5050,
                 "spec": { "context": ".", "destination": "pickle://app:v1" },
             }))
             .send()
@@ -150,13 +174,43 @@ async fn build_run_requires_the_system_principal() {
         .json(&serde_json::json!({
             "name": "app",
             "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            "registry_port": 5050,
             "spec": { "context": ".", "destination": "pickle://app:v1" },
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 403);
+}
+
+/// JOB6: a build spec whose Dockerfile path tries to escape the context
+/// (`../../outside`) is rejected before Buildah runs. Driven through the
+/// system-principal `/v1/build/run` path so it exercises the real
+/// handler, not just the pure validator.
+#[tokio::test]
+async fn build_run_rejects_a_dockerfile_escape() {
+    let harness = Harness::start().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build/run", harness.base_url))
+        .bearer_auth(TEST_SERVICE_TOKEN)
+        .json(&serde_json::json!({
+            "name": "app",
+            "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "spec": {
+                "context": ".",
+                "dockerfile": "../../outside",
+                "destination": "pickle://app:v1",
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    // The build never starts: an escaping Dockerfile is a 503 (no
+    // buildah on this host) or a rejected build, never a 202 that runs.
+    assert_ne!(
+        response.status().as_u16(),
+        202,
+        "an escaping Dockerfile must not start a build"
+    );
 }
 
 /// Unknown build ids are 404, not empty objects.
@@ -252,7 +306,6 @@ async fn buildah_build_lands_in_the_catalog() {
     let request = reliaburger::bun::build_runner::BuildSubmitRequest {
         name: "hello".to_string(),
         context_digest: digest.clone(),
-        registry_port,
         spec: toml::from_str(&format!(
             r#"
             context = "{}"
@@ -269,6 +322,8 @@ async fn buildah_build_lands_in_the_catalog() {
         cmd_tx,
         Some(Arc::clone(&pickle_state.catalog)),
         Duration::from_secs(600),
+        registry_port,
+        256 * 1024 * 1024,
     )
     .await;
 

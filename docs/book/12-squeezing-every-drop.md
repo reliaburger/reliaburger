@@ -466,6 +466,60 @@ The fix has two layers. First, these are node-to-node routes, so they now requir
 
 Completion closes the trust loop from Phase 10: after the push lands the image in the local registry (real holders, catalog persistence, Raft propose — all through the standard push handlers), the runner looks up the manifest digest and asks the agent to sign it. Best-effort, deliberately: a standalone node has no council to sign with, and the failure mode is a printed warning telling you exactly what won't work (`require_signatures` deploys). The full circle is worth saying out loud: **build → push → replicate (heal loop) → sign → verify at schedule → deploy → serve**, every arrow now a real code path. That was the point of the phase.
 
+### Hardening the builder: server-owned destinations and a tar you don't trust
+
+The digest fix above was the first half of the trust story. The second half came out of a harder look at the same handler, and it's a nice case study in what "the server owns the truth" means in practice.
+
+Look at what the build request used to carry: a `registry_port`. The caller picked the port, and the node fetched the context from `localhost:<that-port>` and pushed the result there. Think about what that hands an attacker who can reach the endpoint. A privileged process, told to go connect to any port on the loopback interface and unpack whatever tar it finds there. That's a server-side request forgery primitive wearing a config field's clothes. The port was never the caller's to choose. Every node already knows its own registry port from `[images] registry_port`, so the fix is to delete the field and read the config. To make sure nobody sneaks it back in through a stale client, the request struct gets one serde attribute:
+
+```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildSubmitRequest {
+    pub name: String,
+    pub context_digest: String,
+    pub spec: crate::config::build::BuildSpec,
+}
+```
+
+`deny_unknown_fields` tells serde to reject any JSON key it doesn't recognise instead of quietly ignoring it. A body that still carries `registry_port` is now a `400`, not a silently-dropped field. The principle generalises: for anything that names a destination the server already knows — a port, a callback URL, a registry address — the request body is the wrong place to learn it. Server-owned beats caller-supplied every time a credential or a privileged action is downstream.
+
+Then there's the tar. The old code did the most natural thing in the world:
+
+```rust
+tar::Archive::new(&context[..]).unpack(&extract_dir)?;
+```
+
+One line, and every one of its assumptions is wrong for input you got over the network. It buffers the whole body in memory first (a multi-gigabyte context is a multi-gigabyte allocation). It trusts entry paths, so an entry named `../../etc/cron.d/x` writes outside the directory. It follows the archive's idea of symlinks, so a link to `/` plus a later write walks straight out of the sandbox. It honours the mode bits, so a `04755 root` file lands as a setuid binary. And a sparse-file entry can claim to be a few kilobytes in its header while expanding to fill the disk. None of that matters for a tar *you* wrote. All of it matters for a tar a stranger sent you.
+
+The replacement, `unpack_context`, treats the archive as hostile. It streams the download to disk against a hard byte cap (`[images] max_context_bytes`, default 256 MiB) so memory stays bounded whatever the body claims. It walks entries by hand and, for each one, rejects anything that isn't a plain file or a directory — no symlinks, no hard links, no devices, no FIFOs. It maps each path through a function that keeps only "normal" components and throws out anything absolute or containing `..`. It counts the bytes it actually *writes* (not the sizes the headers advertise, which is what defeats the sparse-file trick) and stops at the cap. It caps the entry count. And on Unix it masks the mode down to the `rwx` bits, so the setuid bit can't survive the trip. The Dockerfile gets the same suspicion: `confine_dockerfile` canonicalises the resolved path and asserts it still starts with the context directory, which catches both a literal `../../outside` and the sneakier "swap a subdirectory for a symlink" version.
+
+One more thing had to change, and it's the sort of bug you only see when you think about failure. Each `buildah` stage runs under a timeout:
+
+```rust
+tokio::time::timeout(timeout, child.output()).await
+```
+
+When that timer fires, the future is dropped. Dropping a future does not kill the process it was waiting on. And even if it did, `buildah` spawns children of its own, which would be orphaned and reparented to init, still chewing CPU. So a build that hangs past its timeout used to leave a little colony of runaway processes behind. Two changes fix it. The child is spawned in its own **process group** — on Unix, `command.process_group(0)` makes the child the leader of a fresh group, and its descendants inherit that group id. On timeout we send `SIGKILL` to the *negative* pid, which POSIX defines as "signal every process in the group", so `buildah` and its children die together. As a backstop, `kill_on_drop(true)` guarantees the direct child dies even if we never reach the explicit kill. Testing this needs no real `buildah`: a shell shim that backgrounds a `sleep`, records the grandchild's pid, and waits is enough — after the timeout fires, the test polls until that grandchild is gone, proving the whole group went down and not just the parent.
+
+The self-cleaning directory is a small thing that pays off on every error path. Rust has no `finally` block and no manual destructor call; instead the `Drop` trait runs code the instant a value leaves scope, on *every* exit — a normal return, an early `return`, a `?` that bails, or a panic unwinding the stack. Wrap the temp directory in a type whose `Drop` removes it, and a build that succeeds, fails, times out, or panics all leave nothing behind:
+
+```rust
+impl Drop for ScopedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+```
+
+This is RAII — Resource Acquisition Is Initialisation, the same idiom C++ uses — and in Rust it's the *default* way to manage a resource, not a pattern you reach for. The directory also gets a random suffix now (`<build_id>-<random>`), because the old path was derived from the context digest, so two concurrent builds of the same context fought over one directory. Distinct directories, cleaned on every path: two bugs closed by one type.
+
+### One table for "who may call this?"
+
+The batch/build authorization fixes above were done handler by handler, each route growing its own `require_system` or `authorize(Deployer)` line. That works, but it leaves the answer to a basic security question — *which principal may call this route?* — scattered across four thousand lines. That kind of rule drifts: add a route, forget the check, and nobody notices until a review, if then.
+
+So the role requirements now live in one table, `ROUTE_MATRIX`, mapping every mounted route to the principal it needs — `Public`, `AnyToken`, `Deployer`, `Admin` or `System`. It doesn't add enforcement (the per-handler checks still do that, and token *scopes* are a later theme); it makes the current rules auditable in one place. The guard that keeps it honest is a test: it scans the router's source for every `.route("…")` and asserts each path appears in the matrix. Add a route without a matrix entry and the test goes red. The point isn't the table — it's that a security-relevant list can no longer fall silently out of date with the code it describes.
+
 ## Lessons from the phase
 
 **Optimisation is an audit with a deliverable.** The single most consistent finding of this phase wasn't a speed-up. It was library-not-wired: `add_port_mapping` with no production callers, `VolumeManager` with no production callers, an HTTPS-only pull client that made cluster images undeployable, a CLI that sent job names to a cluster that had never heard of the jobs. Well-tested libraries pass review; only tracing the live path from the user's artefact to the kernel finds the missing arrow. If you take one habit from this chapter: when you're asked to optimise something, first prove it runs.

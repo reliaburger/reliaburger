@@ -1082,9 +1082,7 @@ pub async fn build(path: &std::path::Path, registry_port: u16) -> Result<(), Rel
 
         // Submit and poll: builds run async on the builder node —
         // minutes-long buildah runs must not hold an HTTP request open.
-        let build_id = client
-            .submit_build(name, &digest, registry_port, spec)
-            .await?;
+        let build_id = client.submit_build(name, &digest, spec).await?;
         println!("  build {build_id} accepted; waiting...");
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;

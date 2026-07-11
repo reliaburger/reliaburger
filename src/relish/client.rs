@@ -951,11 +951,14 @@ impl BunClient {
     }
 
     /// Submit a build job to the agent.
+    ///
+    /// The registry destination is server-owned (JOB2): the node uses
+    /// its own `[images] registry_port`, so the CLI does not (and must
+    /// not) send one in the body.
     pub async fn submit_build(
         &self,
         name: &str,
         context_digest: &str,
-        registry_port: u16,
         spec: &crate::config::build::BuildSpec,
     ) -> Result<u64, RelishError> {
         let url = format!("{}/v1/build", self.base_url);
@@ -965,7 +968,6 @@ impl BunClient {
             .json(&serde_json::json!({
                 "name": name,
                 "context_digest": context_digest,
-                "registry_port": registry_port,
                 "spec": spec,
             }))
             .send()

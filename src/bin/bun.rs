@@ -1073,6 +1073,8 @@ async fn main() -> anyhow::Result<()> {
         Some(node_name.clone()),
         config.images.build_timeout_secs,
         cluster_http.clone(),
+        config.images.registry_port,
+        config.images.max_context_bytes,
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener

@@ -103,6 +103,13 @@ pub struct ApiState {
     pub build_registry: Arc<tokio::sync::Mutex<super::build_runner::BuildRegistry>>,
     /// `[images] build_timeout_secs` — ceiling per buildah stage.
     pub build_timeout_secs: u64,
+    /// `[images] registry_port` — the local Pickle registry the build
+    /// runner fetches context from and pushes to. Server-owned: never
+    /// taken from a build request body (JOB2).
+    pub registry_port: u16,
+    /// `[images] max_context_bytes` — hard cap on an extracted build
+    /// context (JOB6).
+    pub max_context_bytes: u64,
 }
 
 /// Build the API router.
@@ -141,6 +148,8 @@ pub fn router(
         None,
         900,
         crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        256 * 1024 * 1024,
     )
 }
 
@@ -167,6 +176,8 @@ pub fn router_with_upgrade(
     node_name: Option<String>,
     build_timeout_secs: u64,
     cluster_http: crate::cluster::ClusterHttp,
+    registry_port: u16,
+    max_context_bytes: u64,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -194,6 +205,8 @@ pub fn router_with_upgrade(
             super::build_runner::BuildRegistry::default(),
         )),
         build_timeout_secs,
+        registry_port,
+        max_context_bytes,
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
