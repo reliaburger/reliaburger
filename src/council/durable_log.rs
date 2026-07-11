@@ -78,10 +78,20 @@ impl DurableLogStore {
     ///
     /// The bootstrap guard uses this: only a genuinely fresh node initialises a
     /// new cluster; a restarted node has a populated store and must resume.
-    pub async fn is_fresh(&self) -> bool {
-        let vote = self.get_vote().unwrap_or(None);
-        let last = self.last_log_index().unwrap_or(None);
-        vote.is_none() && last.is_none()
+    /// Read errors propagate: a store we cannot read is unknown, not fresh —
+    /// re-bootstrapping on top of a damaged store is the exact split-brain
+    /// the durable log exists to prevent (C3/CP3).
+    pub fn is_fresh(&self) -> Result<bool, StorageError<u64>> {
+        Ok(self.get_vote()?.is_none() && self.last_log_index()?.is_none())
+    }
+
+    /// The last log id compacted away, `None` if nothing was ever purged.
+    ///
+    /// Startup validation compares this against the loaded snapshot's
+    /// `last_applied`: a purge past what the snapshot covers means the state
+    /// cannot be reconstructed.
+    pub fn last_purged_log_id(&self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+        self.last_purged()
     }
 
     // -- redb helpers ------------------------------------------------------
@@ -290,12 +300,14 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
         let wtx = self.db.begin_write().map_err(write_err)?;
         {
             let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
-            // Remove everything from log_id.index onward.
-            let keys: Vec<u64> = t
-                .range::<u64>(log_id.index..)
-                .map_err(write_err)?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
+            // Remove everything from log_id.index onward. A row read error
+            // propagates: silently skipping a key would leave a stale entry
+            // that a later election could resurrect.
+            let mut keys = Vec::new();
+            for row in t.range::<u64>(log_id.index..).map_err(write_err)? {
+                let (k, _) = row.map_err(write_err)?;
+                keys.push(k.value());
+            }
             for k in keys {
                 t.remove(k).map_err(write_err)?;
             }
@@ -312,11 +324,12 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
             meta.insert(PURGED_KEY, bytes.as_slice())
                 .map_err(write_err)?;
             let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
-            let keys: Vec<u64> = t
-                .range::<u64>(..=log_id.index)
-                .map_err(write_err)?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                .collect();
+            // Same as truncate: propagate row errors instead of skipping keys.
+            let mut keys = Vec::new();
+            for row in t.range::<u64>(..=log_id.index).map_err(write_err)? {
+                let (k, _) = row.map_err(write_err)?;
+                keys.push(k.value());
+            }
             for k in keys {
                 t.remove(k).map_err(write_err)?;
             }
@@ -351,7 +364,7 @@ mod tests {
         // First "run": write vote, entries, committed.
         {
             let mut store = DurableLogStore::open(&path).unwrap();
-            assert!(store.is_fresh().await);
+            assert!(store.is_fresh().unwrap());
 
             store.save_vote(&Vote::new(3, 42)).await.unwrap();
             store
@@ -359,7 +372,7 @@ mod tests {
                 .unwrap();
             store.save_committed(Some(log_id(2, 3))).await.unwrap();
 
-            assert!(!store.is_fresh().await);
+            assert!(!store.is_fresh().unwrap());
         }
 
         // Second "run": reopen the same path; everything must have survived.
@@ -376,6 +389,32 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].log_id.index, 1);
         assert_eq!(entries[2].log_id.index, 3);
+    }
+
+    #[test]
+    fn is_fresh_errors_when_the_vote_is_unreadable() {
+        // A vote that exists but cannot be decoded must NOT read as "fresh".
+        // Treating an unreadable store as fresh would re-bootstrap a new
+        // single-node cluster on top of a damaged one — the exact
+        // split-brain the durable store exists to prevent (C3/CP3).
+        let dir = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        store.put_meta(VOTE_KEY, &[]).unwrap();
+        assert!(
+            store.is_fresh().is_err(),
+            "an unreadable vote must propagate as an error, not read as fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_purged_log_id_reports_the_purge_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        assert_eq!(store.last_purged_log_id().unwrap(), None);
+
+        store.write_entries(vec![entry(1, 1), entry(1, 2)]).unwrap();
+        store.purge(log_id(1, 2)).await.unwrap();
+        assert_eq!(store.last_purged_log_id().unwrap(), Some(log_id(1, 2)));
     }
 
     #[tokio::test]
