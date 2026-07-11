@@ -2255,11 +2255,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             // Gate on image signature before doing anything: an unsigned or
             // invalidly-signed Pickle image is refused, but other apps in the
-            // same config still deploy.
-            if let Err(reason) = self.enforce_image_signature(spec).await {
-                let _ = events.send(ApplyEvent::Error { message: reason }).await;
-                continue;
-            }
+            // same config still deploy. A verified image comes back pinned to
+            // its manifest digest, and the pinned spec shadows the original
+            // for the rest of this iteration so the runtime pulls exactly the
+            // verified bytes (IMG1).
+            let pinned_spec;
+            let spec = match self.enforce_image_signature(spec).await {
+                Ok(None) => spec,
+                Ok(Some(pinned_image)) => {
+                    let mut with_pin = spec.clone();
+                    with_pin.image = Some(pinned_image);
+                    pinned_spec = with_pin;
+                    &pinned_spec
+                }
+                Err(reason) => {
+                    let _ = events.send(ApplyEvent::Error { message: reason }).await;
+                    continue;
+                }
+            };
 
             // Store the spec so the Brioche UI can display env vars safely.
             self.deployed_specs
@@ -2807,31 +2820,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// the ciphertext into the container environment.
     /// Enforce the image trust policy for a workload before deploying it.
     ///
-    /// Returns `Err(reason)` to reject the deploy. It's a no-op (`Ok`) when the
-    /// policy doesn't require signatures, in single-node mode (no council), or
-    /// for external-registry images not in the Pickle catalogue. For a
-    /// Pickle-hosted image it verifies the signature against the cluster root
-    /// CA.
-    async fn enforce_image_signature(&self, spec: &AppSpec) -> Result<(), String> {
+    /// Returns `Err(reason)` to reject the deploy. It's a no-op (`Ok(None)`)
+    /// when the policy doesn't require signatures, in single-node mode (no
+    /// council), or for external-registry images not in the Pickle catalogue.
+    /// For a Pickle-hosted image it verifies the signature against the cluster
+    /// root CA and returns the digest-pinned reference (`repo@sha256:…`) the
+    /// deploy must use, so the runtime pulls exactly the verified bytes — a
+    /// tag can move between verify and pull (IMG1).
+    async fn enforce_image_signature(&self, spec: &AppSpec) -> Result<Option<String>, String> {
         if !self.trust_policy.require_signatures {
-            return Ok(());
+            return Ok(None);
         }
         let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
-            return Ok(());
+            return Ok(None);
         };
         let catalog = council.manifest_catalog().await;
         let security_state = council.security_state().await;
         let root_ca = security_state
             .get_ca(crate::sesame::types::CaRole::Root)
             .map(|ca| ca.certificate_der.clone());
-        crate::meat::scheduler::verify_image_signature(
+        let verified = crate::meat::scheduler::verify_image_signature(
             spec.image.as_deref(),
             &catalog,
             &self.trust_policy,
             root_ca.as_deref(),
             Some(&security_state.crl),
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        Ok(match (spec.image.as_deref(), verified) {
+            (Some(image), Some(digest)) => {
+                Some(crate::meat::scheduler::pin_image_reference(image, &digest))
+            }
+            _ => None,
+        })
     }
 
     /// Every age identity that could decrypt this namespace's secrets, newest

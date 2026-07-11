@@ -66,9 +66,10 @@ pub fn select_peers(
 /// ignores the `{name}` segment entirely — but our axum routes only
 /// match a single path segment, so multi-segment names (`library/
 /// nginx`, `cache/<host>/<repo>`) would 404 on routing alone. Peer
-/// transfers therefore flatten the name; manifests never transfer over
-/// these URLs (the catalog travels via Raft), so nothing round-trips
-/// through the flattened form.
+/// transfers therefore flatten the name. Manifest *blobs* travel over
+/// these URLs like any layer (REG1), but always by digest; the
+/// catalogue itself travels via Raft, so nothing round-trips through
+/// the flattened form.
 pub(crate) fn peer_blob_repo(repository: &str) -> String {
     repository.replace('/', "-")
 }
@@ -196,7 +197,9 @@ pub async fn replicate_manifest(
     config: &ReplicationConfig,
     client: &reqwest::Client,
 ) -> Result<ReplicationResult, PickleError> {
-    let all_digests: Vec<&Digest> = manifest.all_digests();
+    // Everything the tag pins travels — the manifest blob included
+    // (REG1), so a peer can serve the manifest GET after a pull.
+    let all_digests: Vec<&Digest> = manifest.referenced_digests();
     let mut successful = BTreeSet::new();
     let mut failed = Vec::new();
 
@@ -293,7 +296,7 @@ pub fn plan_heal<'a>(
         .iter()
         .filter_map(|(_, manifest)| {
             let mut full_holders: Option<BTreeSet<u64>> = None;
-            for digest in manifest.all_digests() {
+            for digest in manifest.referenced_digests() {
                 let holders = catalog.layer_holders(digest.as_str());
                 full_holders = Some(match full_holders {
                     Some(acc) => acc.intersection(&holders).copied().collect(),
@@ -348,7 +351,7 @@ pub async fn heal_tick(
     for candidate in plan_heal(catalog, redundancy, max_per_tick) {
         let manifest = candidate.manifest;
         let mut full_holders = candidate.full_holders;
-        let digests: Vec<Digest> = manifest.all_digests().into_iter().cloned().collect();
+        let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
 
         // Pull-first: become a holder before replicating onward.
         if !digests.iter().all(|d| store.has_blob(d))
@@ -564,5 +567,27 @@ mod tests {
     fn plan_heal_empty_when_redundancy_met() {
         let catalog = heal_catalog();
         assert!(plan_heal(&catalog, 1, 10).is_empty());
+    }
+
+    /// REG1 upgrade path: a catalogue persisted before manifest blobs
+    /// joined holder tracking has layers at full redundancy but no
+    /// holder entry for the manifest blob itself. The heal loop must
+    /// see that as under-replicated (and go fix it), not report the
+    /// image healthy.
+    #[test]
+    fn plan_heal_treats_missing_manifest_blob_holders_as_under_replicated() {
+        let mut catalog = heal_catalog();
+        let manifest_digest = heal_digest(30); // "three-copies", holders {1,2,3}
+        catalog
+            .layer_locations
+            .retain(|(d, _)| d != manifest_digest.as_str());
+
+        let candidates = plan_heal(&catalog, 3, 10);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.manifest.repository == "three-copies" && c.full_holders.is_empty()),
+            "a manifest blob with no recorded holders must be healed"
+        );
     }
 }

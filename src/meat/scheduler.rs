@@ -224,55 +224,107 @@ pub fn check_image_schedulable(
     Ok(())
 }
 
+/// Split an image name into `(name, tag)`, defaulting the tag to
+/// `latest`. Only a colon *after* the last `/` starts a tag, so a
+/// registry port (`localhost:5050/myapp`) is not mistaken for one.
+fn split_repo_tag(name: &str) -> (&str, &str) {
+    let tail_start = name.rfind('/').map(|i| i + 1).unwrap_or(0);
+    match name[tail_start..].rfind(':') {
+        Some(i) => (&name[..tail_start + i], &name[tail_start + i + 1..]),
+        None => (name, "latest"),
+    }
+}
+
+/// Canonical repository path for trust-policy lookups: strip a leading
+/// registry host (a first segment containing `.` or `:`, or exactly
+/// `localhost`) and keep the *whole* remaining path.
+///
+/// Basename stripping was the IMG1 bug: `team/app` collapsed to `app`
+/// and missed its own policy, while an unrelated `docker.io/library/
+/// app` matched a check meant for the local `app`.
+fn canonical_repository(name: &str) -> &str {
+    match name.split_once('/') {
+        Some((first, rest))
+            if first.contains('.') || first.contains(':') || first == "localhost" =>
+        {
+            rest
+        }
+        _ => name,
+    }
+}
+
 /// Look up a Pickle-hosted manifest for an image reference.
 ///
-/// Parses `repository:tag` (defaulting the tag to `latest`) and strips any
-/// registry prefix (`localhost:5050/myapp:v1` → `myapp`). Returns `None` for
-/// images not in the catalogue — i.e. external-registry images.
+/// A digest-pinned reference (`repo@sha256:…`) resolves content-
+/// addressed; otherwise the canonical repository path (see
+/// [`canonical_repository`]) and tag are looked up. Returns `None`
+/// for images not in the catalogue — i.e. external-registry images.
 ///
-/// Deliberate consequence: pull-through-cached upstream images live under
-/// `cache/<host>/<repo>` and can never match here, so unsigned upstream
-/// content stays deployable under `require_signatures` (it was never
-/// signable by us). Pinned by `check_image_schedulable_exempts_pull_through_cache`.
+/// Pull-through-cached upstream images live under `cache/<host>/
+/// <repo>` and are exempt by construction: unsigned upstream content
+/// stays deployable under `require_signatures` (it was never signable
+/// by us). Pinned by `check_image_schedulable_exempts_pull_through_cache`.
 /// TODO(Phase 13+): upstream trust policy (digest pinning, cosign).
 fn lookup_pickle_manifest<'a>(
     image_ref: &str,
     catalog: &'a crate::pickle::types::ManifestCatalog,
 ) -> Option<&'a crate::pickle::types::ImageManifest> {
-    let (repo, tag) = image_ref.rsplit_once(':').unwrap_or((image_ref, "latest"));
-    let repo = repo.rsplit_once('/').map(|(_, name)| name).unwrap_or(repo);
-    catalog.get_manifest_by_tag(repo, tag)
+    let manifest = match image_ref.split_once('@') {
+        Some((_, digest)) => catalog.get_manifest(digest),
+        None => {
+            let (name, tag) = split_repo_tag(image_ref);
+            catalog.get_manifest_by_tag(canonical_repository(name), tag)
+        }
+    }?;
+    (!manifest.repository.starts_with("cache/")).then_some(manifest)
+}
+
+/// Pin an image reference to a verified manifest digest, producing the
+/// immutable `name@sha256:…` form the runtime should pull. A reference
+/// that is already pinned is returned unchanged.
+pub fn pin_image_reference(image_ref: &str, digest: &crate::pickle::types::Digest) -> String {
+    if image_ref.contains('@') {
+        return image_ref.to_string();
+    }
+    let (name, _tag) = split_repo_tag(image_ref);
+    format!("{name}@{}", digest.as_str())
 }
 
 /// Verify an image's signature under the trust policy, for enforcement.
 ///
 /// Unlike [`check_image_schedulable`] (presence only), this actually verifies
 /// the signature bytes. Semantics:
-/// - `require_signatures == false` → always allowed;
-/// - no image (process workload) → allowed;
+/// - `require_signatures == false` → allowed, nothing to pin (`Ok(None)`);
+/// - no image (process workload) → allowed (`Ok(None)`);
 /// - external image (not in the Pickle catalogue) → allowed (out of scope of
-///   cluster trust);
+///   cluster trust, `Ok(None)`);
 /// - Pickle image with no signature → [`ScheduleError::UnsignedImage`];
 /// - Pickle image with a signature → verified via
 ///   [`crate::pickle::signing::verify_signature`], mapping failure to
 ///   [`ScheduleError::InvalidSignature`].
+///
+/// On success the *verified manifest digest* comes back (`Ok(Some(digest))`).
+/// The caller must deploy that digest-pinned identity (see
+/// [`pin_image_reference`]) rather than the tag it verified: a tag can move
+/// between verification and pull, and the signature only covers the digest
+/// (IMG1).
 pub fn verify_image_signature(
     image: Option<&str>,
     catalog: &crate::pickle::types::ManifestCatalog,
     trust_policy: &crate::config::node::TrustPolicySection,
     root_ca_der: Option<&[u8]>,
     crl: Option<&crate::sesame::types::Crl>,
-) -> Result<(), ScheduleError> {
+) -> Result<Option<crate::pickle::types::Digest>, ScheduleError> {
     if !trust_policy.require_signatures {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(image_ref) = image else {
-        return Ok(());
+        return Ok(None);
     };
 
     let Some(manifest) = lookup_pickle_manifest(image_ref, catalog) else {
-        return Ok(()); // external image
+        return Ok(None); // external image
     };
 
     let Some(signature) = &manifest.signature else {
@@ -291,7 +343,9 @@ pub fn verify_image_signature(
     .map_err(|e| ScheduleError::InvalidSignature {
         image: image_ref.to_string(),
         reason: e.to_string(),
-    })
+    })?;
+
+    Ok(Some(manifest.digest.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -650,10 +704,10 @@ mod tests {
     /// Phase 12 D2: pull-through-cached upstream images (repository
     /// `cache/<host>/<repo>`) are unsigned upstream content and must
     /// pass `require_signatures`. The exemption holds by construction:
-    /// `lookup_pickle_manifest` strips an image reference to its last
-    /// path segment, which can never match a `cache/...` repository —
-    /// this test pins that behaviour so a future lookup change can't
-    /// silently start refusing every cached external image.
+    /// `lookup_pickle_manifest` refuses to match any `cache/...`
+    /// repository — this test pins that behaviour so a future lookup
+    /// change can't silently start refusing every cached external
+    /// image.
     #[test]
     fn check_image_schedulable_exempts_pull_through_cache() {
         use crate::pickle::types::*;
@@ -888,6 +942,156 @@ mod tests {
             result,
             Err(ScheduleError::InvalidSignature { .. })
         ));
+    }
+
+    /// Build a catalogue holding an unsigned manifest under `repo`.
+    fn catalog_with_repo(repo: &str) -> crate::pickle::types::ManifestCatalog {
+        use crate::pickle::types::*;
+        use std::collections::BTreeSet;
+
+        let mut catalog = ManifestCatalog::default();
+        let manifest = ImageManifest {
+            digest: Digest::from_sha256_hex(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            ),
+            config: LayerDescriptor {
+                digest: Digest::from_sha256_hex(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                size: 100,
+                media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+            },
+            layers: vec![],
+            repository: repo.to_string(),
+            tags: BTreeSet::new(),
+            total_size: 100,
+            pushed_at: std::time::SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: None,
+        };
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "v1".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        catalog
+    }
+
+    /// IMG1: `team/app` must resolve to the policy for `team/app`, not
+    /// be stripped to `app` and miss it.
+    #[test]
+    fn nested_repository_reference_hits_its_own_policy() {
+        let catalog = catalog_with_repo("team/app");
+        let result = super::verify_image_signature(
+            Some("team/app:v1"),
+            &catalog,
+            &require_signatures(),
+            None,
+            None,
+        );
+        assert!(
+            matches!(result, Err(ScheduleError::UnsignedImage { .. })),
+            "an unsigned nested local repository must be refused: {result:?}"
+        );
+    }
+
+    /// IMG1: an unrelated external image whose basename matches a local
+    /// repository must not be checked against the local one.
+    #[test]
+    fn external_image_does_not_alias_a_local_basename() {
+        let catalog = catalog_with_repo("app");
+        let result = super::verify_image_signature(
+            Some("docker.io/library/app:v1"),
+            &catalog,
+            &require_signatures(),
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "an external image is out of scope of cluster trust"
+        );
+    }
+
+    /// A registry-host prefix (as docker requires for pushes) still
+    /// resolves to the local repository behind it.
+    #[test]
+    fn registry_prefixed_local_reference_still_matches_policy() {
+        let catalog = catalog_with_repo("myapp");
+        let result = super::verify_image_signature(
+            Some("localhost:5050/myapp:v1"),
+            &catalog,
+            &require_signatures(),
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(ScheduleError::UnsignedImage { .. })));
+    }
+
+    /// An explicit `cache/...` reference is exempt like the shorthand:
+    /// upstream content was never signable by us.
+    #[test]
+    fn explicit_cache_repository_reference_is_exempt() {
+        let catalog = catalog_with_repo("cache/docker.io/library/redis");
+        let result = super::verify_image_signature(
+            Some("cache/docker.io/library/redis:v1"),
+            &catalog,
+            &require_signatures(),
+            None,
+            None,
+        );
+        assert_eq!(result.unwrap(), None);
+    }
+
+    /// IMG1: successful verification returns the manifest digest, and a
+    /// digest-pinned reference resolves content-addressed.
+    #[test]
+    fn verification_returns_the_pinned_digest() {
+        let (sig, root_ca) = real_keyless_signature();
+        let catalog = catalog_with(Some(sig));
+        let expected = crate::pickle::types::Digest::from_sha256_hex(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
+
+        let pinned = super::verify_image_signature(
+            Some("myapp:v1"),
+            &catalog,
+            &require_signatures(),
+            Some(&root_ca),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pinned, Some(expected.clone()));
+
+        // The pinned form verifies too — re-driving a deploy from a
+        // stored digest reference hits the same policy.
+        let repinned = super::verify_image_signature(
+            Some(&super::pin_image_reference("myapp:v1", &expected)),
+            &catalog,
+            &require_signatures(),
+            Some(&root_ca),
+            None,
+        )
+        .unwrap();
+        assert_eq!(repinned, Some(expected));
+    }
+
+    #[test]
+    fn pin_image_reference_replaces_the_tag() {
+        let digest = crate::pickle::types::Digest::from_sha256_hex(&"a".repeat(64));
+        assert_eq!(
+            super::pin_image_reference("myapp:v1", &digest),
+            format!("myapp@sha256:{}", "a".repeat(64))
+        );
+        // Registry ports are not tags.
+        assert_eq!(
+            super::pin_image_reference("localhost:5050/myapp", &digest),
+            format!("localhost:5050/myapp@sha256:{}", "a".repeat(64))
+        );
+        // Already pinned references pass through untouched.
+        let pinned = format!("myapp@sha256:{}", "b".repeat(64));
+        assert_eq!(super::pin_image_reference(&pinned, &digest), pinned);
     }
 
     #[test]

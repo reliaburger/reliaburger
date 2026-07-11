@@ -129,6 +129,7 @@ async fn push_test_image(base_url: &str, repo: &str, tag: &str) -> (Digest, Dige
 
     let manifest = serde_json::json!({
         "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
         "config": {
             "mediaType": "application/vnd.oci.image.config.v1+json",
             "digest": config_digest.as_str(),
@@ -236,7 +237,7 @@ async fn replication_copies_layers_to_peer() {
         .unwrap();
 
     assert_eq!(result.successful_nodes, BTreeSet::from([2]));
-    for digest in manifest.all_digests() {
+    for digest in manifest.referenced_digests() {
         assert!(
             target.state.store.has_blob(digest),
             "peer missing replicated blob {digest}"
@@ -269,7 +270,8 @@ async fn pull_fetches_missing_layers_from_peer() {
         node_id: 1,
         base_url: holder.base_url(),
     }];
-    let digests: Vec<Digest> = manifest.all_digests().into_iter().cloned().collect();
+    // Everything the tag pins, the manifest's own blob included (REG1).
+    let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
     pull_manifest_layers(
         &digests,
         "shared",
@@ -336,7 +338,7 @@ async fn heal_tick_replicates_to_new_peer() {
     }
 
     let manifest = catalog.get_manifest_by_tag("app", "v1").unwrap().clone();
-    for digest in manifest.all_digests() {
+    for digest in manifest.referenced_digests() {
         assert!(
             joiner.state.store.has_blob(digest),
             "joiner missing healed blob {digest}"
@@ -380,9 +382,9 @@ async fn heal_tick_pulls_missing_layers_first() {
         outcome.errors
     );
 
-    // The leader pulled every layer locally…
+    // The leader pulled every blob locally, the manifest's own included…
     let manifest = catalog.get_manifest_by_tag("remote", "v1").unwrap().clone();
-    for digest in manifest.all_digests() {
+    for digest in manifest.referenced_digests() {
         assert!(
             leader_store.has_blob(digest),
             "leader missing pulled blob {digest}"
@@ -402,6 +404,11 @@ async fn heal_tick_pulls_missing_layers_first() {
 
 /// Build a manifest over the given blob digests and record it in a
 /// catalog with the given holders. Returns (manifest, catalog).
+///
+/// The pseudo-manifest's own blob is the repository name's bytes —
+/// holder registries must also store those (see
+/// [`write_manifest_blob`]) now that the manifest blob is part of
+/// reachability (REG1).
 fn manifest_with_holders(
     repo: &str,
     config_digest: &Digest,
@@ -441,6 +448,16 @@ fn manifest_with_holders(
         holder_nodes: holders.iter().copied().collect(),
     });
     (manifest, catalog)
+}
+
+/// Store the pseudo-manifest blob (`repo` bytes) on a holder registry,
+/// matching the digest `manifest_with_holders` records.
+fn write_manifest_blob(registry: &Registry, repo: &str) {
+    registry
+        .state
+        .store
+        .write_blob(repo.as_bytes(), &compute_sha256(repo.as_bytes()))
+        .unwrap();
 }
 
 fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterSource {
@@ -498,6 +515,7 @@ async fn p2p_pull_100mb_image_under_5s() {
         &[20 * 1024 * 1024; 5],
         &[1],
     );
+    write_manifest_blob(&holder, "big");
 
     // Node 3 pulls it via the cluster source.
     let puller = Registry::start(3, false).await;
@@ -561,6 +579,8 @@ async fn p2p_pull_spreads_across_holders() {
         &[4096; 4],
         &[1, 2],
     );
+    write_manifest_blob(&holder_a, "spread");
+    write_manifest_blob(&holder_b, "spread");
 
     let puller = Registry::start(3, false).await;
     *puller.state.catalog.write().await = catalog.clone();
@@ -625,6 +645,7 @@ async fn p2p_pull_retries_alternate_holder() {
         &[4096],
         &[1, 2],
     );
+    write_manifest_blob(&real, "flaky");
 
     let puller = Registry::start(3, false).await;
     *puller.state.catalog.write().await = catalog;
@@ -807,6 +828,7 @@ async fn pull_through_serves_stale_when_upstream_down() {
         &[2048],
         &[1],
     );
+    write_manifest_blob(&node_a, &cached_repo);
 
     // Node B pulls it: stale → HEAD fails → serve stale via P2P.
     let node_b = Registry::start(2, false).await;

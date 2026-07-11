@@ -89,9 +89,15 @@ impl ImageReference {
         })
     }
 
-    /// Format as a full reference string.
+    /// Format as a full reference string. A digest in the tag position
+    /// formats as `registry/repository@sha256:…`, which the OCI client
+    /// parses as a digest reference.
     pub fn full_reference(&self) -> String {
-        format!("{}/{}:{}", self.registry, self.repository, self.tag)
+        if self.tag.starts_with("sha256:") {
+            format!("{}/{}@{}", self.registry, self.repository, self.tag)
+        } else {
+            format!("{}/{}:{}", self.registry, self.repository, self.tag)
+        }
     }
 
     /// Convert to an `oci_distribution::Reference` for the client.
@@ -105,7 +111,15 @@ impl ImageReference {
 }
 
 /// Split an image name into (name, tag). Defaults tag to "latest".
+///
+/// A digest-pinned reference (`name@sha256:…`) carries the digest in
+/// the tag position — content addressing makes a tag redundant, and
+/// downstream code recognises the `sha256:` prefix.
 fn split_name_tag(s: &str) -> (&str, String) {
+    if let Some((name, digest)) = s.split_once('@') {
+        return (name, digest.to_string());
+    }
+
     // Find the last `/` to separate the path from the potential tag
     let after_last_slash = s.rfind('/').map(|i| i + 1).unwrap_or(0);
     let tail = &s[after_last_slash..];
@@ -655,6 +669,22 @@ mod tests {
     fn parse_empty_string_errors() {
         assert!(ImageReference::parse("").is_err());
         assert!(ImageReference::parse("   ").is_err());
+    }
+
+    /// IMG1: a digest-pinned reference carries the digest in the tag
+    /// position and round-trips through the OCI reference parser.
+    #[test]
+    fn parse_digest_pinned_reference() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let r = ImageReference::parse(&format!("myapp@{digest}")).unwrap();
+        assert_eq!(r.registry, "docker.io");
+        assert_eq!(r.repository, "library/myapp");
+        assert_eq!(r.tag, digest);
+        assert_eq!(
+            r.full_reference(),
+            format!("docker.io/library/myapp@{digest}")
+        );
+        assert!(r.to_oci_reference().is_ok());
     }
 
     // -- Store path construction -----------------------------------------------

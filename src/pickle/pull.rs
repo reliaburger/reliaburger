@@ -121,8 +121,12 @@ pub fn image_available_locally(
         return false;
     };
 
-    // Check that all layers are available locally
-    manifest.all_digests().iter().all(|d| store.has_blob(d))
+    // Everything the tag pins must be local — the manifest blob too
+    // (REG1), or this node cannot serve the manifest GET.
+    manifest
+        .referenced_digests()
+        .iter()
+        .all(|d| store.has_blob(d))
 }
 
 #[cfg(test)]
@@ -193,8 +197,8 @@ mod tests {
 
         let manifest = test_manifest("myapp");
 
-        // Write all blobs
-        for digest in manifest.all_digests() {
+        // Write all blobs, including the manifest's own (REG1)
+        for digest in manifest.referenced_digests() {
             // Write dummy data with matching digest structure
             let path = store.blob_path(digest);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -216,6 +220,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
         let catalog = ManifestCatalog::default();
+
+        assert!(!image_available_locally(
+            "myapp", "latest", &catalog, &store
+        ));
+    }
+
+    /// REG1: without its own manifest blob a node cannot serve the
+    /// manifest GET, so the image is not fully available.
+    #[test]
+    fn image_available_locally_false_when_manifest_blob_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+
+        let manifest = test_manifest("myapp");
+
+        // Config and layers present; the manifest blob itself missing.
+        for digest in manifest.all_digests() {
+            let path = store.blob_path(digest);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"data").unwrap();
+        }
+
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
 
         assert!(!image_available_locally(
             "myapp", "latest", &catalog, &store
