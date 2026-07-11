@@ -319,4 +319,36 @@ mod tests {
         let unsealed = unseal_with_age(&sealed, &identity).unwrap();
         assert_eq!(unsealed, data);
     }
+
+    /// PKI8: a secret sealed under generation N must still decrypt after a
+    /// rotation adds generation N+1 and retires N. The agent decrypts by
+    /// trying every live identity newest-first, so both the old and the new
+    /// secret open; a node that only holds the new key cannot read the old
+    /// secret — which is why finalize must wait until every workload has
+    /// re-sealed.
+    #[test]
+    fn secrets_decrypt_under_any_live_generation() {
+        fn try_all(encrypted: &str, identities: &[age::x25519::Identity]) -> Option<String> {
+            identities
+                .iter()
+                .find_map(|id| decrypt_secret(encrypted, id).ok())
+        }
+
+        let ikm = b"test-wrapping-material";
+        let (kp0, id0) = generate_age_keypair(AgeKeyScope::ClusterWide, ikm, 0).unwrap();
+        let (kp1, id1) = generate_age_keypair(AgeKeyScope::ClusterWide, ikm, 1).unwrap();
+
+        // A secret sealed before the rotation, and one sealed after.
+        let old_secret = encrypt_secret("db-password", &kp0.public_key).unwrap();
+        let new_secret = encrypt_secret("api-key", &kp1.public_key).unwrap();
+
+        // The agent holds both generations, newest first.
+        let live = [id1, id0];
+        assert_eq!(try_all(&old_secret, &live).as_deref(), Some("db-password"));
+        assert_eq!(try_all(&new_secret, &live).as_deref(), Some("api-key"));
+
+        // Holding only the new key can't open the pre-rotation secret — the
+        // data loss PKI8 guards against.
+        assert!(try_all(&old_secret, &live[..1]).is_none());
+    }
 }

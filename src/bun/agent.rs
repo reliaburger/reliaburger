@@ -2255,8 +2255,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                     // Fail closed on encrypted secrets we can't decrypt (see
                     // drive_instance_startup).
-                    let identity = self.decrypt_identity(namespace).await;
-                    if identity.is_none() && spec.env.values().any(|v| v.is_encrypted()) {
+                    let identities = self.decrypt_identities(namespace).await;
+                    if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
                         let _ = events
                             .send(ApplyEvent::Error {
                                 message: format!(
@@ -2277,7 +2277,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             .to_string_lossy(),
                         None,
                         None,
-                        identity,
+                        identities,
                     );
 
                     if let Err(e) = self.supervisor.grill.create(&new_id, &oci_spec).await {
@@ -2716,15 +2716,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .map_err(|e| e.to_string())
     }
 
-    async fn decrypt_identity(&self, namespace: &str) -> Option<age::x25519::Identity> {
-        let cluster = self.cluster.as_ref()?;
-        let ikm = cluster.wrapping_ikm?;
-        let council = cluster.council.as_ref()?;
+    /// Every age identity that could decrypt this namespace's secrets, newest
+    /// generation first: the namespace-scoped keys then the cluster-wide keys.
+    ///
+    /// Returning all live generations (not just the active one) is what makes a
+    /// secret survive a rotation window — a value encrypted under the retiring
+    /// key still decrypts until it is retired, and a value re-encrypted under
+    /// the new key decrypts immediately (PKI8).
+    async fn decrypt_identities(&self, namespace: &str) -> Vec<age::x25519::Identity> {
+        let Some(cluster) = self.cluster.as_ref() else {
+            return Vec::new();
+        };
+        let Some(ikm) = cluster.wrapping_ikm else {
+            return Vec::new();
+        };
+        let Some(council) = cluster.council.as_ref() else {
+            return Vec::new();
+        };
         let security_state = council.security_state().await;
-        let keypair = security_state
-            .namespace_age_keypair(namespace)
-            .or_else(|| security_state.cluster_age_keypair())?;
-        crate::sesame::secret::unwrap_age_identity(keypair, &ikm).ok()
+
+        let ns_scope = crate::sesame::types::AgeKeyScope::Namespace(namespace.to_string());
+        security_state
+            .age_keypairs_for_scope(&ns_scope)
+            .into_iter()
+            .chain(
+                security_state
+                    .age_keypairs_for_scope(&crate::sesame::types::AgeKeyScope::ClusterWide),
+            )
+            .filter_map(|kp| crate::sesame::secret::unwrap_age_identity(kp, &ikm).ok())
+            .collect()
     }
 
     /// Build an OCI spec, decrypting `ENC[AGE:...]` env values with `identity`.
@@ -2741,13 +2761,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         cgroup_str: &str,
         volumes_dir: Option<&std::path::Path>,
         netns_path: Option<&str>,
-        identity: Option<age::x25519::Identity>,
+        identities: Vec<age::x25519::Identity>,
     ) -> crate::grill::oci::OciSpec {
-        let decryptor: Option<crate::grill::oci::SecretDecryptor> = identity.map(|id| {
-            Box::new(move |encrypted: &str| {
-                crate::sesame::secret::decrypt_secret(encrypted, &id).map_err(|e| e.to_string())
-            }) as crate::grill::oci::SecretDecryptor
-        });
+        // Try each live generation's identity until one decrypts the value, so
+        // a secret encrypted under any still-present key is readable across a
+        // rotation window (PKI8).
+        let decryptor: Option<crate::grill::oci::SecretDecryptor> = if identities.is_empty() {
+            None
+        } else {
+            Some(Box::new(move |encrypted: &str| {
+                let mut last_err = String::from("no age identity could decrypt the value");
+                for id in &identities {
+                    match crate::sesame::secret::decrypt_secret(encrypted, id) {
+                        Ok(plain) => return Ok(plain),
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+                Err(last_err)
+            }) as crate::grill::oci::SecretDecryptor)
+        };
         crate::grill::oci::generate_oci_spec_with_decryptor(
             app_name,
             namespace,
@@ -2803,8 +2835,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Decrypt `ENC[AGE:...]` secrets if we have the key material. If the
         // spec carries encrypted secrets but we can't decrypt them, fail closed
         // rather than pass ciphertext into the container environment.
-        let identity = self.decrypt_identity(namespace).await;
-        if identity.is_none() && spec.env.values().any(|v| v.is_encrypted()) {
+        let identities = self.decrypt_identities(namespace).await;
+        if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: "encrypted secrets require cluster security state (unavailable here)"
@@ -2861,7 +2893,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &cgroup_str,
             Some(&self.volumes_dir),
             netns_path.as_deref(),
-            identity,
+            identities,
         );
 
         self.supervisor

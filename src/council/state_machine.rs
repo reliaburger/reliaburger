@@ -206,11 +206,25 @@ impl StateMachineInner {
                     .push(new_keypair.clone());
             }
             RaftRequest::FinalizeSecretRotation { scope } => {
-                // Remove read-only keypairs with the same scope
-                self.state
+                // Retire the old (read-only) keys for this scope, but only if an
+                // active replacement exists — never leave a scope with no
+                // usable key, which would make its secrets permanently
+                // undecryptable (PKI8). Re-encrypting existing ciphertext with
+                // the active key before finalising is the operator's two-step
+                // flow (`relish secret rotate` → re-encrypt → `--finalize`),
+                // which now works because encryption selects the active key.
+                let has_active = self
+                    .state
                     .security_state
                     .age_keypairs
-                    .retain(|kp| kp.scope != *scope || !kp.read_only);
+                    .iter()
+                    .any(|kp| kp.scope == *scope && !kp.read_only);
+                if has_active {
+                    self.state
+                        .security_state
+                        .age_keypairs
+                        .retain(|kp| kp.scope != *scope || !kp.read_only);
+                }
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -1129,6 +1143,74 @@ mod tests {
         inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(ss)));
 
         assert_eq!(inner.state.security_state.next_serial, 42);
+    }
+
+    fn test_age_keypair(
+        scope: crate::sesame::types::AgeKeyScope,
+        generation: u64,
+        read_only: bool,
+    ) -> crate::sesame::types::AgeKeypair {
+        crate::sesame::types::AgeKeypair {
+            scope,
+            public_key: format!("pub-{generation}"),
+            private_key_wrapped: crate::sesame::types::WrappedKey {
+                ciphertext: Vec::new(),
+                nonce: [0u8; 12],
+                hkdf_salt: [0u8; 32],
+                hkdf_info: "test".to_string(),
+            },
+            generation,
+            read_only,
+        }
+    }
+
+    #[test]
+    fn finalize_secret_rotation_retires_old_keys_once_a_replacement_exists() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        // The rotation flow: mark gen 0 read-only, add the active gen 1.
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, true));
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 1, false));
+
+        inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+
+        let remaining = &inner.state.security_state.age_keypairs;
+        assert_eq!(remaining.len(), 1, "the retiring gen 0 key is dropped");
+        assert_eq!(remaining[0].generation, 1);
+        assert!(!remaining[0].read_only);
+    }
+
+    #[test]
+    fn finalize_secret_rotation_keeps_keys_when_no_active_replacement() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        // A stray finalize with only read-only keys must NOT wipe the scope —
+        // that would make every secret sealed under it undecryptable (PKI8).
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, true));
+
+        inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+
+        assert_eq!(
+            inner.state.security_state.age_keypairs.len(),
+            1,
+            "no active key means nothing is retired"
+        );
     }
 
     #[test]

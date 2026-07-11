@@ -409,6 +409,55 @@ FinalizeSecretRotation { scope }          // delete read-only keypairs
 
 This dual-key window means rotation is never a cliff. You start it, re-encrypt your secrets at your own pace, then finalise when ready.
 
+### Three invariants that keep the window safe
+
+The dual-key idea is simple, but it only holds if three things are true at once. Getting any one of them wrong turns rotation from "never a cliff" into a data-loss bug.
+
+**Encryption picks the *active* key, not the first one.** After step 1 the vector holds two cluster-wide keypairs: generation N (read-only) and generation N+1. A naïve "find the keypair for this scope" returns whichever comes first, which after a `push` is still the old, retiring key. New secrets would then be sealed under a key you are about to delete. So `active_age_keypair` filters out the read-only keys and takes the highest generation, falling back to the newest of any generation only if every key is read-only:
+
+```rust
+pub fn active_age_keypair(&self, scope: &AgeKeyScope) -> Option<&AgeKeypair> {
+    self.age_keypairs
+        .iter()
+        .filter(|kp| &kp.scope == scope && !kp.read_only)
+        .max_by_key(|kp| kp.generation)
+        .or_else(|| {
+            self.age_keypairs
+                .iter()
+                .filter(|kp| &kp.scope == scope)
+                .max_by_key(|kp| kp.generation)
+        })
+}
+```
+
+`filter` keeps only the matching keys, `max_by_key` picks the newest generation, and `or_else` runs the fallback closure only when the first search found nothing. The `&kp.scope == scope` compares two references; Rust dereferences both sides for you when the type derives `PartialEq`.
+
+**Decryption tries every live generation.** A workload sealed under generation N must still open during the window, even though the cluster now encrypts under N+1. The agent asks for *all* keypairs of the scope, newest first, and tries each until one decrypts:
+
+```rust
+identities
+    .iter()
+    .find_map(|id| decrypt_secret(encrypted, id).ok())
+```
+
+`find_map` returns the first `Some` and stops. `decrypt_secret(...).ok()` turns a `Result` into an `Option`, so a wrong-key failure just moves on to the next identity instead of aborting. Newest-first ordering means the common case (a freshly re-encrypted secret) matches on the first try.
+
+**Finalise refuses to empty a scope.** `FinalizeSecretRotation` deletes the read-only keys, but only after checking that an active replacement survives:
+
+```rust
+let has_active = self.state.security_state.age_keypairs
+    .iter()
+    .any(|kp| kp.scope == *scope && !kp.read_only);
+if has_active {
+    self.state.security_state.age_keypairs
+        .retain(|kp| kp.scope != *scope || !kp.read_only);
+}
+```
+
+Without the guard, a stray finalise on a scope that only holds read-only keys would `retain` nothing and leave the scope with no usable key, making every secret sealed under it permanently undecryptable. The guard makes finalise a no-op in that case rather than a shredder.
+
+The API mirrors the same fail-safe instinct: a malformed body to `/v1/secret/rotate` returns `400`, never a silent default rotation. Mutating cluster key state should take a deliberate request, not a typo.
+
 ## Certificate revocation
 
 Sometimes you need to revoke a certificate before it expires. A node gets compromised, a workload's key leaks, or you rotate a CA. The Certificate Revocation List (CRL) tracks which serial numbers are no longer trusted.

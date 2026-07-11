@@ -428,18 +428,48 @@ impl SecurityState {
             .find(|ca| ca.role == role)
     }
 
-    /// Get the cluster-wide age keypair.
-    pub fn cluster_age_keypair(&self) -> Option<&AgeKeypair> {
+    /// The **active** keypair for a scope — the one new secrets should be
+    /// encrypted with. That is the highest-generation key that is *not*
+    /// read-only. During a rotation the vector holds the retiring key (marked
+    /// read-only) plus the new one, so a plain `.find()` returns the retiring
+    /// key and encrypts under the key that is about to be deleted (PKI8). Only
+    /// if every key for the scope is read-only (a scope mid-retirement with no
+    /// replacement) does this fall back to the newest of those, so it never
+    /// returns nothing when a key exists.
+    pub fn active_age_keypair(&self, scope: &AgeKeyScope) -> Option<&AgeKeypair> {
         self.age_keypairs
             .iter()
-            .find(|kp| kp.scope == AgeKeyScope::ClusterWide)
+            .filter(|kp| &kp.scope == scope && !kp.read_only)
+            .max_by_key(|kp| kp.generation)
+            .or_else(|| {
+                self.age_keypairs
+                    .iter()
+                    .filter(|kp| &kp.scope == scope)
+                    .max_by_key(|kp| kp.generation)
+            })
     }
 
-    /// Get a namespace-scoped age keypair.
-    pub fn namespace_age_keypair(&self, namespace: &str) -> Option<&AgeKeypair> {
-        self.age_keypairs
+    /// Every keypair for a scope, newest generation first — the set to try
+    /// when *decrypting*, so a secret encrypted under any still-present
+    /// generation (active or retiring) can be read during a rotation window.
+    pub fn age_keypairs_for_scope(&self, scope: &AgeKeyScope) -> Vec<&AgeKeypair> {
+        let mut kps: Vec<&AgeKeypair> = self
+            .age_keypairs
             .iter()
-            .find(|kp| kp.scope == AgeKeyScope::Namespace(namespace.to_string()))
+            .filter(|kp| &kp.scope == scope)
+            .collect();
+        kps.sort_by_key(|kp| std::cmp::Reverse(kp.generation));
+        kps
+    }
+
+    /// The active cluster-wide age keypair (for encrypting new secrets).
+    pub fn cluster_age_keypair(&self) -> Option<&AgeKeypair> {
+        self.active_age_keypair(&AgeKeyScope::ClusterWide)
+    }
+
+    /// The active namespace-scoped age keypair (for encrypting new secrets).
+    pub fn namespace_age_keypair(&self, namespace: &str) -> Option<&AgeKeypair> {
+        self.active_age_keypair(&AgeKeyScope::Namespace(namespace.to_string()))
     }
 
     /// Allocate the next serial number.
@@ -493,6 +523,58 @@ mod tests {
     fn token_scope_allows_unrestricted() {
         let scope = TokenScope::default();
         assert!(scope.allows("any-app", "any-namespace"));
+    }
+
+    fn age_kp(scope: AgeKeyScope, generation: u64, read_only: bool) -> AgeKeypair {
+        AgeKeypair {
+            scope,
+            public_key: format!("pub-{generation}"),
+            private_key_wrapped: WrappedKey {
+                ciphertext: Vec::new(),
+                nonce: [0u8; 12],
+                hkdf_salt: [0u8; 32],
+                hkdf_info: "test".to_string(),
+            },
+            generation,
+            read_only,
+        }
+    }
+
+    #[test]
+    fn active_age_keypair_prefers_the_newest_non_read_only_key() {
+        // Mid-rotation: gen 0 is read-only (retiring), gen 1 is the new active
+        // key. Encryption must pick gen 1, not the first-in-vec gen 0 (PKI8).
+        let state = SecurityState {
+            age_keypairs: vec![
+                age_kp(AgeKeyScope::ClusterWide, 0, true),
+                age_kp(AgeKeyScope::ClusterWide, 1, false),
+            ],
+            ..SecurityState::default()
+        };
+        assert_eq!(state.cluster_age_keypair().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn age_keypairs_for_scope_are_newest_first() {
+        let state = SecurityState {
+            age_keypairs: vec![
+                age_kp(AgeKeyScope::ClusterWide, 0, true),
+                age_kp(AgeKeyScope::ClusterWide, 2, false),
+                age_kp(AgeKeyScope::Namespace("other".into()), 5, false),
+                age_kp(AgeKeyScope::ClusterWide, 1, true),
+            ],
+            ..SecurityState::default()
+        };
+        let gens: Vec<u64> = state
+            .age_keypairs_for_scope(&AgeKeyScope::ClusterWide)
+            .iter()
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(
+            gens,
+            vec![2, 1, 0],
+            "decryption tries newest generation first"
+        );
     }
 
     #[test]
