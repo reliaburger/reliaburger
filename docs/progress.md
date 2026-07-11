@@ -384,7 +384,7 @@ whole theme lands.
 
 ### 12b.1 — Stop the bleeding
 
-- [ ] **Internal API trust boundary** — central route/role/scope matrix; require node
+- [x] **Internal API trust boundary** — central route/role/scope matrix; require node
   identity for batch/build run and report endpoints; make callback and registry
   destinations server-owned; never forward the service token to request data; strictly
   parse build digests/Dockerfile paths and bound, sandbox and clean archive extraction.
@@ -395,6 +395,26 @@ whole theme lands.
     no longer forwarded to caller-controlled URLs (JOB1); build `context_digest` validated as a
     well-formed OCI digest before it becomes a temp path, killing the `sha256:../../x` traversal
     (JOB2).
+  - [x] Server-owned registry destination (JOB2 residual): `registry_port` removed from
+    `BuildSubmitRequest`, `#[serde(deny_unknown_fields)]` makes a smuggled port a 400, and the
+    build runner reads `[images] registry_port` from its own config — a caller can no longer
+    point a privileged Bun at an arbitrary localhost service.
+  - [x] Bounded, sandboxed, self-cleaning context extraction (JOB6): `pickle::build::unpack_context`
+    streams the download to disk under `[images] max_context_bytes` (default 256 MiB), rejects
+    absolute/`..`/symlink/hardlink/device/FIFO entries, counts *written* bytes to defeat sparse
+    bombs, caps the entry count and strips setuid/setgid bits; per-build `ScopedDir` (RAII `Drop`)
+    with a random suffix gives concurrent same-digest builds distinct dirs and cleans up on every
+    exit path.
+  - [x] Dockerfile path confinement (JOB6): `validate_dockerfile_path` rejects absolute/`..`
+    paths in `validate_build`, and `confine_dockerfile` canonicalises the resolved path inside
+    the extracted context (catches symlink-directory escapes) before Buildah reads it.
+  - [x] Kill Buildah on timeout (JOB6): each stage runs via `run_bounded` in its own Unix process
+    group with `kill_on_drop`; on timeout the whole group gets SIGKILL, so Buildah's children die
+    with it instead of orphaning — proven by a process-group shim test.
+  - [x] Central route→principal matrix (H4/D8 groundwork): `bun::authz::ROUTE_MATRIX` maps every
+    mounted route to `Public | AnyToken | Deployer | Admin | System`; a source-scan test asserts
+    every `.route(…)` the router mounts has a matrix entry, so the auditable role list can't drift
+    from the code. (Scope enforcement stays in 12b.3.)
 - [ ] **Secret and workload-identity safety** — make rotation generation-aware:
   encrypt with the newest key, decrypt with active generations, re-encrypt and acknowledge
   every stored secret before retiring the old key, and reject malformed/concurrent

@@ -10,10 +10,15 @@
 //! filesystem — Pickle (which every node already talks to) handles
 //! the transfer.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::build::{BuildSpec, PickleDestination, parse_pickle_destination};
 use crate::config::error::ConfigError;
+
+/// Ceiling on the number of entries a context archive may contain.
+/// Generous for any real build context; small enough that an
+/// entry-bomb archive cannot exhaust inodes or directory entries.
+pub const MAX_CONTEXT_ENTRIES: usize = 65_536;
 
 /// Default Pickle registry port.
 ///
@@ -77,6 +82,18 @@ pub enum BuildError {
     #[error("push to pickle failed: {reason}")]
     PushFailed { reason: String },
 
+    #[error("dockerfile path {path:?} escapes the build context")]
+    DockerfileOutsideContext { path: String },
+
+    #[error("build context exceeds the {limit_bytes} byte limit")]
+    ContextTooLarge { limit_bytes: u64 },
+
+    #[error("build context entry {path:?} rejected: {reason}")]
+    UnsafeContextEntry { path: String, reason: String },
+
+    #[error("build context has more than {limit} entries")]
+    ContextTooManyEntries { limit: usize },
+
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -84,6 +101,7 @@ pub enum BuildError {
 /// Validate a build spec before execution.
 pub fn validate_build(spec: &BuildSpec) -> Result<PickleDestination, BuildError> {
     let dest = parse_pickle_destination(&spec.destination)?;
+    validate_dockerfile_path(&spec.dockerfile)?;
 
     if spec.context.is_absolute() && !spec.context.exists() {
         return Err(BuildError::ContextNotFound {
@@ -224,6 +242,14 @@ pub fn context_download_url(pickle_port: u16, digest: &str) -> String {
     format!("http://localhost:{pickle_port}/v2/_buildcontext/blobs/{digest}")
 }
 
+/// Build the URL to download a context blob from a specific node's
+/// Pickle registry (`address` is `host:port`). Used by a delegated
+/// builder to fetch the context from the entry node — the address is
+/// derived from cluster membership, never from the request body (JOB2).
+pub fn context_download_url_at(address: &str, digest: &str) -> String {
+    format!("http://{address}/v2/_buildcontext/blobs/{digest}")
+}
+
 /// Build the URL to upload a context blob to Pickle.
 ///
 /// The CLI uploads the tarred context here before scheduling the build.
@@ -269,6 +295,154 @@ pub fn build_args_to_env(spec: &BuildSpec) -> Vec<String> {
 /// Resolve the full Dockerfile path from the build spec.
 pub fn resolve_dockerfile(spec: &BuildSpec) -> PathBuf {
     spec.context.join(&spec.dockerfile)
+}
+
+/// Check that a Dockerfile path is a plain relative path — no absolute
+/// prefix, no `..` — so joining it onto a context directory can never
+/// resolve outside that directory (JOB6).
+pub fn validate_dockerfile_path(dockerfile: &str) -> Result<(), BuildError> {
+    let path = Path::new(dockerfile);
+    let confined = !dockerfile.is_empty()
+        && path.is_relative()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if confined {
+        Ok(())
+    } else {
+        Err(BuildError::DockerfileOutsideContext {
+            path: dockerfile.to_string(),
+        })
+    }
+}
+
+/// Resolve a Dockerfile inside an extracted context directory and prove
+/// it stays inside it. Canonicalises both sides, so even a path that
+/// sneaks past the component check (or a directory swapped for a
+/// symlink) cannot point Buildah at a file outside the context.
+pub fn confine_dockerfile(context_dir: &Path, dockerfile: &str) -> Result<PathBuf, BuildError> {
+    validate_dockerfile_path(dockerfile)?;
+    let context = context_dir.canonicalize()?;
+    let resolved =
+        context
+            .join(dockerfile)
+            .canonicalize()
+            .map_err(|_| BuildError::DockerfileNotFound {
+                path: dockerfile.to_string(),
+            })?;
+    if resolved.starts_with(&context) {
+        Ok(resolved)
+    } else {
+        Err(BuildError::DockerfileOutsideContext {
+            path: dockerfile.to_string(),
+        })
+    }
+}
+
+/// Map a tar entry path to a safe relative path under the extraction
+/// root: only normal components (and `.`) survive; absolute paths and
+/// `..` are rejected outright.
+fn sanitise_entry_path(path: &Path) -> Result<PathBuf, BuildError> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => safe.push(part),
+            Component::CurDir => {}
+            _ => {
+                return Err(BuildError::UnsafeContextEntry {
+                    path: path.display().to_string(),
+                    reason: "path escapes the extraction directory".to_string(),
+                });
+            }
+        }
+    }
+    Ok(safe)
+}
+
+/// Copy at most `budget` bytes from `reader` to `writer`, returning the
+/// number written. Counting *written* bytes (not header sizes) is what
+/// stops a sparse-file bomb: the archive can claim any size it likes,
+/// but the bytes that actually land on disk are bounded.
+fn copy_capped<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    budget: u64,
+    limit_bytes: u64,
+) -> Result<u64, BuildError> {
+    let mut written = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(written);
+        }
+        written += n as u64;
+        if written > budget {
+            return Err(BuildError::ContextTooLarge { limit_bytes });
+        }
+        writer.write_all(&buffer[..n])?;
+    }
+}
+
+/// Unpack a build-context tar into `dest` with hard bounds (JOB6).
+///
+/// Only regular files and directories are extracted — symlinks, hard
+/// links, devices and FIFOs are rejected, so nothing inside the context
+/// can point outside it. Entry paths must stay under `dest`, cumulative
+/// *written* bytes are capped at `max_bytes`, the entry count is capped
+/// at [`MAX_CONTEXT_ENTRIES`], and setuid/setgid/sticky bits are
+/// stripped from file modes.
+pub fn unpack_context<R: std::io::Read>(
+    reader: R,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<(), BuildError> {
+    std::fs::create_dir_all(dest)?;
+    let mut archive = tar::Archive::new(reader);
+    let mut budget = max_bytes;
+    let mut entries_seen = 0usize;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        entries_seen += 1;
+        if entries_seen > MAX_CONTEXT_ENTRIES {
+            return Err(BuildError::ContextTooManyEntries {
+                limit: MAX_CONTEXT_ENTRIES,
+            });
+        }
+
+        let raw_path = entry.path()?.into_owned();
+        let safe_path = sanitise_entry_path(&raw_path)?;
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {
+                std::fs::create_dir_all(dest.join(&safe_path))?;
+            }
+            tar::EntryType::Regular => {
+                let out_path = dest.join(&safe_path);
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut out = std::fs::File::create(&out_path)?;
+                let written = copy_capped(&mut entry, &mut out, budget, max_bytes)?;
+                budget -= written;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    // Keep rwx bits only: a context must never install a
+                    // setuid binary onto the build node.
+                    let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
+                    std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+            other => {
+                return Err(BuildError::UnsafeContextEntry {
+                    path: raw_path.display().to_string(),
+                    reason: format!("entry type {other:?} is not allowed in a build context"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -570,6 +744,197 @@ mod tests {
         assert_eq!(env.len(), 2);
         assert!(env.contains(&"BUILD_ARG_FEATURES=ebpf".to_string()));
         assert!(env.contains(&"BUILD_ARG_VERSION=1.78".to_string()));
+    }
+
+    // --- dockerfile confinement (JOB6) ---
+
+    #[test]
+    fn dockerfile_path_accepts_plain_relative_paths() {
+        assert!(validate_dockerfile_path("Dockerfile").is_ok());
+        assert!(validate_dockerfile_path("docker/Dockerfile.prod").is_ok());
+        assert!(validate_dockerfile_path("./Dockerfile").is_ok());
+    }
+
+    #[test]
+    fn dockerfile_path_rejects_traversal_and_absolute() {
+        for bad in ["../../outside", "a/../../b", "/etc/passwd", ""] {
+            assert!(
+                matches!(
+                    validate_dockerfile_path(bad),
+                    Err(BuildError::DockerfileOutsideContext { .. })
+                ),
+                "dockerfile {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_build_rejects_a_traversal_dockerfile() {
+        let mut spec = spec_with_destination("pickle://app:v1");
+        spec.dockerfile = "../../outside".into();
+        assert!(matches!(
+            validate_build(&spec),
+            Err(BuildError::DockerfileOutsideContext { .. })
+        ));
+    }
+
+    #[test]
+    fn confine_dockerfile_accepts_a_file_inside_the_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let resolved = confine_dockerfile(dir.path(), "Dockerfile").unwrap();
+        assert!(resolved.starts_with(dir.path().canonicalize().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_dockerfile_rejects_a_symlink_escape() {
+        // A symlinked directory inside the context pointing outside it:
+        // the component check passes, canonicalisation catches it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        assert!(matches!(
+            confine_dockerfile(dir.path(), "sub/Dockerfile"),
+            Err(BuildError::DockerfileOutsideContext { .. })
+        ));
+    }
+
+    // --- bounded, sandboxed extraction (JOB6) ---
+
+    /// Build an in-memory tar of (path, mode, content) regular files.
+    fn tar_of(files: &[(&str, u32, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            for (path, mode, content) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(*mode);
+                header.set_cksum();
+                builder.append_data(&mut header, path, *content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        archive
+    }
+
+    #[test]
+    fn unpack_context_extracts_files_and_dirs() {
+        let tar = tar_of(&[
+            ("Dockerfile", 0o644, b"FROM scratch\n"),
+            ("src/main.py", 0o644, b"print('hi')\n"),
+        ]);
+        let dest = tempfile::tempdir().unwrap();
+        unpack_context(tar.as_slice(), dest.path(), 1024 * 1024).unwrap();
+        assert!(dest.path().join("Dockerfile").is_file());
+        assert!(dest.path().join("src/main.py").is_file());
+    }
+
+    #[test]
+    fn unpack_context_rejects_parent_traversal_entries() {
+        // tar::Builder refuses `..` in set_path, so write the raw GNU
+        // header name bytes the way an attacker's tar writer would.
+        let mut tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar);
+            let content = b"pwned";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            let name = b"../evil";
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_context(tar.as_slice(), dest.path(), 1024 * 1024),
+            Err(BuildError::UnsafeContextEntry { .. })
+        ));
+        assert!(!dest.path().parent().unwrap().join("evil").exists());
+    }
+
+    #[test]
+    fn unpack_context_rejects_symlink_entries() {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "link", "/etc/passwd")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_context(archive.as_slice(), dest.path(), 1024 * 1024),
+            Err(BuildError::UnsafeContextEntry { .. })
+        ));
+    }
+
+    #[test]
+    fn unpack_context_stops_at_the_byte_cap() {
+        let big = vec![0u8; 8 * 1024];
+        let tar = tar_of(&[("a", 0o644, &big), ("b", 0o644, &big)]);
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_context(tar.as_slice(), dest.path(), 10 * 1024),
+            Err(BuildError::ContextTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn unpack_context_stops_at_the_entry_cap() {
+        let mut archive = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut archive);
+            for i in 0..=MAX_CONTEXT_ENTRIES {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("f{i}"), &b""[..])
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let dest = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            unpack_context(archive.as_slice(), dest.path(), u64::MAX),
+            Err(BuildError::ContextTooManyEntries { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpack_context_strips_setuid_and_setgid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let tar = tar_of(&[("tool", 0o6755, b"#!/bin/sh\n")]);
+        let dest = tempfile::tempdir().unwrap();
+        unpack_context(tar.as_slice(), dest.path(), 1024 * 1024).unwrap();
+        let mode = std::fs::metadata(dest.path().join("tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky bits must be gone");
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[test]
+    fn context_download_url_at_targets_the_given_node() {
+        let url = context_download_url_at("10.0.0.7:5050", "sha256:abc");
+        assert_eq!(
+            url,
+            "http://10.0.0.7:5050/v2/_buildcontext/blobs/sha256:abc"
+        );
     }
 
     #[test]

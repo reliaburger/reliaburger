@@ -456,6 +456,7 @@ pull_through = true          # cache external images in the cluster
 cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
 p2p_concurrency = 4          # parallel layer fetches per image pull
 build_timeout_secs = 900     # ceiling per buildah stage
+max_context_bytes = 268435456 # 256 MiB cap on an extracted build context
 
 [[images.external_registries]]
 host = "ghcr.io"

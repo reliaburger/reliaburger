@@ -22,11 +22,16 @@ use super::agent::AgentCommand;
 use super::api::ApiState;
 
 /// Request body for `/v1/build` and `/v1/build/run`.
+///
+/// `deny_unknown_fields` (JOB2): the registry destination is now
+/// server-owned — a caller that smuggles a `registry_port` (or any
+/// other unexpected field) to point a privileged Bun at an arbitrary
+/// localhost service gets a 400, not a silently-ignored field.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildSubmitRequest {
     pub name: String,
     pub context_digest: String,
-    pub registry_port: u16,
     pub spec: crate::config::build::BuildSpec,
 }
 
@@ -69,6 +74,141 @@ impl BuildRegistry {
     }
 }
 
+/// An owned build directory that deletes itself on drop (JOB6).
+///
+/// Rust has no destructors you call by hand; instead the `Drop` trait
+/// runs code the moment a value goes out of scope, on *every* exit path
+/// — normal return, early `return`, `?`, or a panic unwinding the
+/// stack. Wrapping the temp dir in one of these means a build that
+/// fails, times out, or panics still leaves nothing behind. This is the
+/// RAII pattern (Resource Acquisition Is Initialisation) that C++ calls
+/// the same name; Rust makes it the default way to manage resources.
+struct ScopedDir {
+    path: std::path::PathBuf,
+}
+
+impl ScopedDir {
+    /// Create a unique per-build directory under `base`. The random
+    /// suffix means two concurrent builds of the *same* context digest
+    /// never share a directory (the old digest-derived path did).
+    fn new(base: &std::path::Path, build_id: u64) -> std::io::Result<Self> {
+        use rand::Rng as _;
+        let suffix: u64 = rand::thread_rng().r#gen();
+        let path = base.join(format!("{build_id}-{suffix:016x}"));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ScopedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Why a capped context download stopped short.
+enum DownloadError {
+    /// The body exceeded the configured byte cap.
+    TooLarge,
+    /// A transport or disk error.
+    Io(String),
+}
+
+/// Stream a context download to `path`, aborting once more than
+/// `max_bytes` have arrived (JOB6). Counting bytes as they stream keeps
+/// peak memory bounded — the whole body is never buffered.
+async fn download_to_file_capped(
+    response: reqwest::Response,
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(), DownloadError> {
+    use futures_util::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| DownloadError::Io(e.to_string()))?;
+    let mut stream = response.bytes_stream();
+    let mut written = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| DownloadError::Io(e.to_string()))?;
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            return Err(DownloadError::TooLarge);
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| DownloadError::Io(e.to_string()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| DownloadError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Why a bounded subprocess run failed to produce output.
+enum BoundedError {
+    /// The process outlived its timeout and was killed.
+    Timeout,
+    /// The process could not be spawned or waited on.
+    Spawn(std::io::Error),
+}
+
+/// SIGKILL an entire process group by its leader pid (JOB6). Buildah
+/// spawns children; killing only the parent orphans them. We put the
+/// build in its own process group and signal the whole group.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    // A negative pid signals the process group whose id is `pid`.
+    let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+}
+
+/// Run a subprocess in `dir`, bounded by `timeout`. On Unix the child
+/// leads its own process group and `kill_on_drop` is a backstop, so a
+/// timeout kills Buildah *and its children*, not just the parent (JOB6).
+async fn run_bounded(
+    program: &str,
+    args: &[String],
+    dir: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, BoundedError> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = command.spawn().map_err(BoundedError::Spawn)?;
+    #[cfg(unix)]
+    let pid = child.id();
+
+    // Take stdout/stderr so we can collect them while waiting.
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(BoundedError::Spawn(e)),
+        Err(_) => {
+            // Dropping the wait future here also drops `child`, so
+            // `kill_on_drop` SIGKILLs the direct child; the group kill
+            // reaches its grandchildren too.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                kill_process_group(pid);
+            }
+            Err(BoundedError::Timeout)
+        }
+    }
+}
+
 /// Whether this node can build (probed per call — cheap, and the
 /// submit path is rare).
 pub async fn local_buildah_available() -> bool {
@@ -105,6 +245,7 @@ pub fn find_peer_builder(
 /// `[images] build_timeout_secs`), then sign the pushed manifest when
 /// a cluster is available. Every failure lands in the registry with a
 /// reason; nothing is reported over HTTP from here.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_build(
     request: BuildSubmitRequest,
     build_id: u64,
@@ -112,6 +253,8 @@ pub async fn run_build(
     cmd_tx: tokio::sync::mpsc::Sender<AgentCommand>,
     pickle_catalog: Option<Arc<tokio::sync::RwLock<crate::pickle::types::ManifestCatalog>>>,
     timeout: std::time::Duration,
+    registry_port: u16,
+    max_context_bytes: u64,
 ) {
     let fail = |reason: String| async {
         eprintln!("bun: build {build_id} ({}) failed: {reason}", request.name);
@@ -121,23 +264,38 @@ pub async fn run_build(
             .set(build_id, BuildState::Failed { reason });
     };
 
+    // The registry destination is the node's own config, never the
+    // request (JOB2): a caller cannot point this privileged process at
+    // an arbitrary localhost service.
     let job = match crate::pickle::build::execute_build(
         &request.spec,
         &request.context_digest,
-        Some(request.registry_port),
+        Some(registry_port),
     ) {
         Ok(job) => job,
         Err(e) => return fail(format!("invalid build spec: {e}")).await,
     };
 
-    // Fetch the context blob from the local registry.
+    // A unique, self-cleaning build directory. `ScopedDir::drop` removes
+    // it on every exit path below, so no failure leaves a stray context.
+    let base = std::env::temp_dir().join("reliaburger-build");
+    let build_dir = match ScopedDir::new(&base, build_id) {
+        Ok(dir) => dir,
+        Err(e) => return fail(format!("failed to create build directory: {e}")).await,
+    };
+    // The tar lands beside the context, not inside it, so `context.tar`
+    // never becomes part of the build.
+    let tar_path = build_dir.path().join("context.tar");
+    let ctx_dir = build_dir.path().join("ctx");
+
+    // Stream the context blob to disk with a hard byte cap (no whole-body
+    // buffer), then extract through the hardened unpacker (bounds
+    // size/entries, rejects traversal/symlinks, strips setuid) off the
+    // async runtime.
     let context_url =
-        crate::pickle::build::context_download_url(request.registry_port, &request.context_digest);
-    let context = match reqwest::get(&context_url).await {
-        Ok(response) if response.status().is_success() => match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(e) => return fail(format!("context read failed: {e}")).await,
-        },
+        crate::pickle::build::context_download_url(registry_port, &request.context_digest);
+    let response = match reqwest::get(&context_url).await {
+        Ok(response) if response.status().is_success() => response,
         _ => {
             return fail(format!(
                 "context blob {} not found in the registry",
@@ -146,20 +304,36 @@ pub async fn run_build(
             .await;
         }
     };
+    match download_to_file_capped(response, &tar_path, max_context_bytes).await {
+        Ok(()) => {}
+        Err(DownloadError::TooLarge) => {
+            return fail(format!(
+                "build context exceeds the {max_context_bytes} byte limit"
+            ))
+            .await;
+        }
+        Err(DownloadError::Io(e)) => return fail(format!("context read failed: {e}")).await,
+    }
 
-    // Extract the tarred context (blocking IO off the runtime).
-    let build_dir = std::env::temp_dir()
-        .join("reliaburger-build")
-        .join(request.context_digest.replace(':', "-"));
-    let extract_dir = build_dir.clone();
+    let extract_path = ctx_dir.clone();
+    let dockerfile = request.spec.dockerfile.clone();
     let extracted = tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&extract_dir)?;
-        tar::Archive::new(&context[..]).unpack(&extract_dir)?;
-        Ok::<_, std::io::Error>(())
+        let file = std::fs::File::open(&tar_path)?;
+        crate::pickle::build::unpack_context(
+            std::io::BufReader::new(file),
+            &extract_path,
+            max_context_bytes,
+        )?;
+        // Prove the Dockerfile resolves inside the extracted context
+        // before Buildah ever reads it (JOB6).
+        crate::pickle::build::confine_dockerfile(&extract_path, &dockerfile)?;
+        Ok::<_, crate::pickle::build::BuildError>(())
     })
     .await;
-    if !matches!(extracted, Ok(Ok(()))) {
-        return fail("failed to extract build context".to_string()).await;
+    match extracted {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return fail(format!("failed to prepare build context: {e}")).await,
+        Err(e) => return fail(format!("context extraction task failed: {e}")).await,
     }
 
     // Build, then push. The push targets the local registry, so the
@@ -170,28 +344,22 @@ pub async fn run_build(
             Some(pair) => pair,
             None => continue,
         };
-        let output = tokio::time::timeout(
-            timeout,
-            tokio::process::Command::new(program)
-                .args(args)
-                .current_dir(&build_dir)
-                .output(),
-        )
-        .await;
-        match output {
-            Ok(Ok(out)) if out.status.success() => {}
-            Ok(Ok(out)) => {
+        match run_bounded(program, args, &ctx_dir, timeout).await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
                 return fail(format!("buildah {label} failed: {tail}")).await;
             }
-            Ok(Err(e)) => return fail(format!("failed to run buildah {label}: {e}")).await,
-            Err(_) => {
+            Err(BoundedError::Timeout) => {
                 return fail(format!(
                     "buildah {label} exceeded build_timeout_secs ({}s)",
                     timeout.as_secs()
                 ))
                 .await;
+            }
+            Err(BoundedError::Spawn(e)) => {
+                return fail(format!("failed to run buildah {label}: {e}")).await;
             }
         }
     }
@@ -236,12 +404,27 @@ pub async fn run_build(
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Parse a build request body, returning a 400 response on malformed
+/// JSON or any unexpected field. `deny_unknown_fields` on the struct
+/// means a smuggled `registry_port` (JOB2) is a 400, not a silent
+/// no-op.
+#[allow(clippy::result_large_err)]
+fn parse_build_request(body: &str) -> Result<BuildSubmitRequest, Response> {
+    serde_json::from_str(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid build request: {e}") })),
+        )
+            .into_response()
+    })
+}
+
 /// `POST /v1/build`: run locally when buildah is present, else
 /// delegate to a peer that reported the capability, else 503.
 pub async fn build_submit_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    Json(request): Json<BuildSubmitRequest>,
+    body: String,
 ) -> Response {
     // Submitting a build is a Deployer action (AUTH2).
     if let Err(resp) =
@@ -249,6 +432,10 @@ pub async fn build_submit_handler(
     {
         return resp;
     }
+    let request = match parse_build_request(&body) {
+        Ok(request) => request,
+        Err(resp) => return resp,
+    };
     if local_buildah_available().await {
         return accept_build(&state, request).await;
     }
@@ -333,8 +520,12 @@ pub async fn build_submit_handler(
 pub async fn build_run_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
-    Json(request): Json<BuildSubmitRequest>,
+    body: String,
 ) -> Response {
+    let request = match parse_build_request(&body) {
+        Ok(request) => request,
+        Err(resp) => return resp,
+    };
     // Reject a malformed context digest first (JOB2) — an unconditional shape
     // check with no side effects. This endpoint is reached by a delegating
     // peer, and the digest is later used to build a temp path; `Digest::new`
@@ -380,6 +571,17 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
             .into_response();
     }
 
+    // Validate the spec synchronously so a bad destination or an
+    // escaping Dockerfile path (JOB6) is a 400 here, not a build that
+    // 202s and then fails asynchronously.
+    if let Err(e) = crate::pickle::build::validate_build(&request.spec) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid build spec: {e}") })),
+        )
+            .into_response();
+    }
+
     let build_id = state
         .build_registry
         .lock()
@@ -392,6 +594,8 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
         state.cmd_tx.clone(),
         state.pickle_catalog.clone(),
         std::time::Duration::from_secs(state.build_timeout_secs),
+        state.registry_port,
+        state.max_context_bytes,
     ));
     (
         StatusCode::ACCEPTED,
@@ -448,6 +652,87 @@ mod tests {
     use super::*;
     use crate::reporting::aggregator::AggregatedState;
     use crate::reporting::types::{ResourceUsage, StateReport};
+
+    #[test]
+    fn build_request_rejects_unknown_fields() {
+        // A smuggled registry destination (JOB2) fails to deserialise.
+        let body = r#"{
+            "name": "app",
+            "context_digest": "sha256:abc",
+            "registry_port": 5050,
+            "spec": { "context": ".", "destination": "pickle://app:v1" }
+        }"#;
+        assert!(serde_json::from_str::<BuildSubmitRequest>(body).is_err());
+    }
+
+    #[test]
+    fn scoped_dir_removes_itself_on_drop() {
+        let base = std::env::temp_dir().join("reliaburger-build-test");
+        let path = {
+            let dir = ScopedDir::new(&base, 42).unwrap();
+            let path = dir.path().to_path_buf();
+            assert!(path.is_dir());
+            path
+        };
+        assert!(!path.exists(), "ScopedDir should delete itself on drop");
+    }
+
+    #[test]
+    fn scoped_dir_gives_concurrent_builds_distinct_paths() {
+        let base = std::env::temp_dir().join("reliaburger-build-test");
+        let a = ScopedDir::new(&base, 7).unwrap();
+        let b = ScopedDir::new(&base, 7).unwrap();
+        assert_ne!(a.path(), b.path(), "same build id must not share a dir");
+    }
+
+    /// JOB6: a Buildah run that outlives its timeout is killed along with
+    /// its children. A shell shim backgrounds a long `sleep` (a
+    /// grandchild), records its pid, and waits; after `run_bounded`
+    /// times out, that grandchild must be gone — proving the whole
+    /// process group was signalled, not just the direct child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bounded_kills_the_whole_process_group_on_timeout() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let script = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
+        let args = vec!["-c".to_string(), script];
+
+        let result = run_bounded("sh", &args, dir.path(), Duration::from_millis(300)).await;
+        assert!(matches!(result, Err(BoundedError::Timeout)));
+
+        // Read the grandchild pid the shim recorded.
+        let mut child_pid = None;
+        for _ in 0..50 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                child_pid = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid = child_pid.expect("shim never recorded its child pid");
+
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        // Poll until the grandchild is gone (reaped after the group kill).
+        // `kill` with `None` sends no signal, only an existence check.
+        let mut gone = false;
+        for _ in 0..100 {
+            if kill(Pid::from_raw(pid), None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if !gone {
+            let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
+        }
+        assert!(gone, "grandchild sleep survived the process-group kill");
+    }
 
     #[test]
     fn registry_tracks_lifecycle() {
