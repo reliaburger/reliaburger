@@ -6,9 +6,14 @@
 
 use std::time::{Duration, SystemTime};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use serde::{Deserialize, Serialize};
+
 use super::ca;
 use super::crypto;
-use super::types::{CaRole, NodeCertificate, SecurityState};
+use super::identity_store::NodeIdentity;
+use super::types::{CaRole, NodeCertificate, SecurityState, SerialNumber};
 
 /// Errors from join operations.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +46,140 @@ pub struct JoinResult {
     pub root_ca_der: Vec<u8>,
     /// DER-encoded Node CA certificate (for verifying peer nodes).
     pub node_ca_der: Vec<u8>,
+}
+
+/// The join response sent over the wire to a joining node.
+///
+/// DER material is base64-encoded so the bundle is plain JSON. The private
+/// key is included because the issuer generates the keypair (a CSR-based
+/// flow that keeps the key on the joiner is a future refinement); the whole
+/// exchange is protected by the one-time join token and TLS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinBundle {
+    /// The node id the certificate was issued for.
+    pub node_id: String,
+    /// The serial the Node CA assigned.
+    pub serial: u64,
+    /// The Node CA generation that signed the certificate.
+    pub ca_generation: u64,
+    /// Base64 DER node certificate.
+    pub certificate_b64: String,
+    /// Base64 DER private key.
+    pub private_key_b64: String,
+    /// Base64 DER Node CA certificate.
+    pub node_ca_b64: String,
+    /// Base64 DER root CA certificate.
+    pub root_ca_b64: String,
+}
+
+/// Errors from the joiner side of the ceremony.
+#[derive(Debug, thiserror::Error)]
+pub enum JoinClientError {
+    #[error("failed to reach cluster member: {0}")]
+    Transport(String),
+    #[error("cluster member rejected the join: {0}")]
+    Rejected(String),
+    #[error("malformed join bundle: {0}")]
+    Malformed(String),
+    #[error(
+        "root CA fingerprint mismatch: member offered {offered}, expected {expected} — refusing to trust"
+    )]
+    FingerprintMismatch { offered: String, expected: String },
+}
+
+impl JoinBundle {
+    /// Build a wire bundle from an issuer-side [`JoinResult`].
+    pub fn from_result(result: &JoinResult) -> Self {
+        let cert = &result.node_certificate;
+        Self {
+            node_id: cert.node_id.clone(),
+            serial: cert.serial.0,
+            ca_generation: cert.ca_generation,
+            certificate_b64: BASE64.encode(&cert.certificate_der),
+            private_key_b64: BASE64.encode(&cert.private_key_der),
+            node_ca_b64: BASE64.encode(&result.node_ca_der),
+            root_ca_b64: BASE64.encode(&result.root_ca_der),
+        }
+    }
+
+    /// Decode the bundle into an on-disk [`NodeIdentity`].
+    pub fn into_identity(self) -> Result<NodeIdentity, JoinClientError> {
+        let decode = |field: &str, s: &str| {
+            BASE64
+                .decode(s)
+                .map_err(|e| JoinClientError::Malformed(format!("{field}: {e}")))
+        };
+        let certificate_der = decode("certificate", &self.certificate_b64)?;
+        let private_key_der = decode("private_key", &self.private_key_b64)?;
+        let node_ca_der = decode("node_ca", &self.node_ca_b64)?;
+        let root_ca_der = decode("root_ca", &self.root_ca_b64)?;
+        let now = SystemTime::now();
+        Ok(NodeIdentity {
+            node_id: self.node_id,
+            certificate_der,
+            private_key_der,
+            serial: SerialNumber(self.serial),
+            ca_generation: self.ca_generation,
+            node_ca_der,
+            root_ca_der,
+            not_before: now,
+            not_after: now + Duration::from_secs(365 * 24 * 3600),
+        })
+    }
+
+    /// The `sha256:` fingerprint of the root CA in this bundle.
+    pub fn root_ca_fingerprint(&self) -> Result<String, JoinClientError> {
+        let root = BASE64
+            .decode(&self.root_ca_b64)
+            .map_err(|e| JoinClientError::Malformed(format!("root_ca: {e}")))?;
+        Ok(super::identity_store::root_ca_fingerprint(&root))
+    }
+}
+
+/// Request a certificate from an existing cluster member and return the
+/// identity to persist.
+///
+/// `member_url` is the member's join endpoint, e.g.
+/// `https://10.0.1.5:9117/v1/cluster/join`. The connection is trust-on-
+/// first-use: a joiner has no CA yet, so the returned root CA fingerprint
+/// is the anchor to verify out of band. If `expected_fingerprint` is set,
+/// a mismatch is refused before the identity is ever written to disk.
+pub async fn request_join(
+    client: &reqwest::Client,
+    member_url: &str,
+    token: &str,
+    node_id: &str,
+    expected_fingerprint: Option<&str>,
+) -> Result<NodeIdentity, JoinClientError> {
+    let response = client
+        .post(member_url)
+        .json(&serde_json::json!({ "token": token, "node_id": node_id }))
+        .send()
+        .await
+        .map_err(|e| JoinClientError::Transport(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(JoinClientError::Rejected(format!("{status}: {body}")));
+    }
+
+    let bundle: JoinBundle = response
+        .json()
+        .await
+        .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
+
+    if let Some(expected) = expected_fingerprint {
+        let offered = bundle.root_ca_fingerprint()?;
+        if offered != expected {
+            return Err(JoinClientError::FingerprintMismatch {
+                offered,
+                expected: expected.to_string(),
+            });
+        }
+    }
+
+    bundle.into_identity()
 }
 
 /// Validate a join token and issue a node certificate.
@@ -224,6 +363,44 @@ mod tests {
         assert!(!result.node_certificate.private_key_der.is_empty());
         assert!(!result.root_ca_der.is_empty());
         assert!(!result.node_ca_der.is_empty());
+    }
+
+    #[test]
+    fn join_bundle_round_trips_a_result_into_an_identity() {
+        let (mut state, token, master_secret) = setup_with_known_key();
+        let result = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
+
+        let bundle = JoinBundle::from_result(&result);
+        // Survives a JSON hop.
+        let json = serde_json::to_string(&bundle).unwrap();
+        let decoded: JoinBundle = serde_json::from_str(&json).unwrap();
+
+        let identity = decoded.into_identity().unwrap();
+        assert_eq!(identity.node_id, "node-02");
+        assert_eq!(
+            identity.certificate_der,
+            result.node_certificate.certificate_der
+        );
+        assert_eq!(
+            identity.private_key_der,
+            result.node_certificate.private_key_der
+        );
+        crate::sesame::cert::validate_chain(
+            &identity.certificate_der,
+            &identity.node_ca_der,
+            &identity.root_ca_der,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn join_bundle_fingerprint_matches_the_root_ca() {
+        let (mut state, token, master_secret) = setup_with_known_key();
+        let result = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
+
+        let bundle = JoinBundle::from_result(&result);
+        let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
+        assert_eq!(bundle.root_ca_fingerprint().unwrap(), expected);
     }
 
     #[test]

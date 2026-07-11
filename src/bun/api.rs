@@ -216,6 +216,9 @@ pub fn router_with_upgrade(
         )
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
         .route("/ui/static/{*path}", get(static_asset_handler))
+        // The join endpoint authenticates the caller by the one-time join
+        // token it carries, not by a bearer token — a joiner has none yet.
+        .route("/v1/cluster/join", post(join_handler))
         .with_state(state.clone());
 
     // Everything else sits behind the auth layer. `route_layer` runs the
@@ -237,7 +240,6 @@ pub fn router_with_upgrade(
         .route("/v1/exec/{app}/{namespace}", post(exec_handler))
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
-        .route("/v1/cluster/join", post(join_handler))
         .route("/v1/upgrade/apply", post(upgrade_apply_handler))
         .route("/v1/upgrade/status", get(upgrade_status_handler))
         .route("/v1/upgrade/rollback", post(upgrade_rollback_handler))
@@ -1547,21 +1549,24 @@ async fn council_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
-/// Request body for cluster join.
+/// Request body for cluster join: a one-time token plus the joiner's node id.
 #[derive(Deserialize)]
 struct JoinRequest {
     token: String,
-    addr: String,
+    node_id: String,
 }
 
-/// Join an existing cluster.
+/// Issue a certificate bundle to a joining node (issuer side).
+///
+/// Public route: the join token is the credential. Returns the bundle the
+/// joiner persists as its identity.
 async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
-        .send(AgentCommand::Join {
+        .send(AgentCommand::JoinIssue {
             token: body.token,
-            addr: body.addr,
+            node_id: body.node_id,
             response: resp_tx,
         })
         .await
@@ -1575,7 +1580,7 @@ async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinReques
     }
 
     match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Ok(bundle)) => Json(bundle).into_response(),
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -3967,13 +3972,37 @@ mod tests {
                     .method("POST")
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"token":"abc123","addr":"10.0.1.5:9443"}"#))
+                    .body(Body::from(r#"{"token":"abc123","node_id":"node-02"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         // Without a council, join validation fails with a 400
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn join_route_is_reachable_without_a_bearer_token() {
+        // The join route is public: a joiner has no bearer token yet, only a
+        // join token in the body. It must not 401 — it reaches the handler
+        // (and here fails validation at 400 because there is no council).
+        let (app, shutdown) = test_setup();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/cluster/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"token":"whatever","node_id":"node-09"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         shutdown.cancel();
     }

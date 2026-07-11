@@ -113,11 +113,23 @@ enum Command {
     Council,
     /// Join an existing cluster.
     Join {
-        /// Join token (validated in Phase 4).
+        /// Join token issued by `relish init` or `relish token create`.
         #[arg(long)]
         token: String,
-        /// Address of an existing cluster member (gossip endpoint).
+        /// API address of an existing cluster member, e.g.
+        /// `https://10.0.1.5:9117` (bare host:port assumes https).
         addr: String,
+        /// This node's identifier (the certificate's common name).
+        #[arg(long)]
+        node_id: String,
+        /// Directory to write the received identity into. Defaults to
+        /// `identity` in the current directory (matching `relish init`).
+        #[arg(long)]
+        identity_dir: Option<std::path::PathBuf>,
+        /// Pin the cluster's root CA fingerprint (`sha256:...`). When set,
+        /// a member offering a different root CA is refused.
+        #[arg(long)]
+        ca_fingerprint: Option<String>,
     },
     /// Resolve a service name to its VIP and backends.
     Resolve {
@@ -702,7 +714,19 @@ async fn main() -> ExitCode {
         Command::Join {
             ref token,
             ref addr,
-        } => commands::join(token, addr).await,
+            ref node_id,
+            ref identity_dir,
+            ref ca_fingerprint,
+        } => {
+            commands::join(
+                token,
+                addr,
+                node_id,
+                identity_dir.as_deref(),
+                ca_fingerprint.as_deref(),
+            )
+            .await
+        }
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
         Command::Chaos { ref action } => commands::chaos(action).await,
@@ -1089,11 +1113,29 @@ mod tests {
 
     #[test]
     fn parse_join_command() {
-        let cli = parse(&["relish", "join", "--token", "abc123", "10.0.1.5:9443"]).unwrap();
+        let cli = parse(&[
+            "relish",
+            "join",
+            "--token",
+            "abc123",
+            "--node-id",
+            "node-02",
+            "https://10.0.1.5:9117",
+        ])
+        .unwrap();
         match cli.command {
-            Command::Join { token, addr } => {
+            Command::Join {
+                token,
+                addr,
+                node_id,
+                identity_dir,
+                ca_fingerprint,
+            } => {
                 assert_eq!(token, "abc123");
-                assert_eq!(addr, "10.0.1.5:9443");
+                assert_eq!(addr, "https://10.0.1.5:9117");
+                assert_eq!(node_id, "node-02");
+                assert!(identity_dir.is_none());
+                assert!(ca_fingerprint.is_none());
             }
             _ => panic!("expected Join command"),
         }

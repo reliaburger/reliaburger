@@ -106,4 +106,9 @@ pub enum RelishError {
     /// Upgrade tooling error (key generation, signing).
     #[error("{0}")]
     Upgrade(#[from] crate::upgrade::error::UpgradeError),
+
+    /// Joining the cluster failed (token rejected, member unreachable,
+    /// fingerprint mismatch, or the identity could not be persisted).
+    #[error("join failed: {0}")]
+    JoinFailed(String),
 }

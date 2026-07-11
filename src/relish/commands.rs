@@ -4,7 +4,7 @@
 /// Commands try to reach the live Bun agent first. If the agent is
 /// unreachable, `apply` falls back to a dry-run plan.
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
@@ -533,15 +533,57 @@ pub async fn chaos(action: &str) -> Result<(), RelishError> {
     }
 }
 
-/// Join an existing cluster.
-pub async fn join(token: &str, addr: &str) -> Result<(), RelishError> {
-    join_with_client(token, addr, &BunClient::default_local()).await
+/// Join an existing cluster: fetch a certificate from a member and persist it.
+///
+/// Contacts `addr` (an existing member's API address) with the join token,
+/// receives the certificate bundle, and writes it into the identity
+/// directory. The node then restarts to bring up mTLS with its new identity.
+pub async fn join(
+    token: &str,
+    addr: &str,
+    node_id: &str,
+    identity_dir: Option<&Path>,
+    ca_fingerprint: Option<&str>,
+) -> Result<(), RelishError> {
+    let member_url = format!("{}/v1/cluster/join", normalise_member_base(addr));
+    let dir = identity_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("identity"));
+
+    // Trust-on-first-use: a joiner has no CA yet, so it cannot verify the
+    // member's certificate on this first contact. The returned root CA
+    // fingerprint is the anchor to check out of band (or pin via
+    // --ca-fingerprint).
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
+
+    let identity =
+        crate::sesame::join::request_join(&client, &member_url, token, node_id, ca_fingerprint)
+            .await
+            .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
+
+    let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
+    crate::sesame::identity_store::save(&dir, &identity)
+        .map_err(|e| RelishError::JoinFailed(format!("failed to persist identity: {e}")))?;
+
+    println!("joined as {node_id}: identity written to {}", dir.display());
+    println!("  cluster root CA: {fingerprint}");
+    println!("  restart bun to bring up mTLS with the new identity.");
+    Ok(())
 }
 
-async fn join_with_client(token: &str, addr: &str, client: &BunClient) -> Result<(), RelishError> {
-    let message = client.join(token, addr).await?;
-    println!("{message}");
-    Ok(())
+/// Normalise a member address into a base URL. A bare `host:port` assumes
+/// `https`; an explicit scheme is left untouched.
+fn normalise_member_base(addr: &str) -> String {
+    let trimmed = addr.trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
 }
 
 /// Show council (Raft) composition and status.
