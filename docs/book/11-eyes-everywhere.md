@@ -548,6 +548,24 @@ pub fn safe_env(env: &BTreeMap<String, EnvValue>) -> Vec<SafeEnvValue> {
 
 A test verifies the invariant: serialise the output to JSON and assert it never contains `ENC[AGE:`. The masking happens at the API layer, not the UI layer — even a direct `curl` to the env endpoint gets masked values.
 
+### Locking the dashboard behind a session
+
+When we first shipped the dashboard, every UI route was public. That was fine while the API itself was open, but the moment you create the first token and the API starts enforcing auth, the dashboard breaks in an ugly way: the page loads, but its `hx-get` polls and its uPlot chart fetches all hit protected `/v1/metrics` and `/v1/logs` endpoints and come back `401`. Half a dashboard.
+
+The obvious fix is to make the dashboard send a token too. But a browser can't. An `EventSource` — which is how the live log stream works — has no API for setting an `Authorization` header, and baking a CLI token into page JavaScript is exactly the kind of thing you regret later. Browsers do have one credential they attach to same-origin requests automatically: cookies. So the browser authenticates with a cookie, and the CLI keeps using its bearer token. Same middleware, two credentials.
+
+The flow is a single exchange. The operator visits the dashboard, gets redirected to a small login page, and pastes a token. `POST /ui/session` validates it against the same token store the bearer path uses, and on success sets a cookie:
+
+```
+Set-Cookie: rb_session=<256-bit hex>; HttpOnly; SameSite=Strict; Path=/
+```
+
+The session id is opaque — it is not the token, just a random handle into an in-memory `SessionStore` with a 12-hour TTL. `HttpOnly` keeps page JavaScript from reading it; `SameSite=Strict` keeps it off cross-site requests. From then on the `hx-get` fragments, the metrics fetches and the `EventSource` all carry the cookie without a line of JavaScript changing, because the browser sends it for us.
+
+There is one deliberate asymmetry worth calling out. A session is **always read-only**, even if the token you logged in with is an Admin token. The dashboard only ever reads, so a session never needs write permission — and withholding it contains the blast radius of a forged request. If someone tricks your browser into POSTing to `/v1/apply` while your cookie rides along, the worst they achieve is a `403`. The test that pins this logs in with an Admin token and asserts that an apply through the cookie is still forbidden. Authentication and authorisation are different questions; a cookie answers the first, not the second.
+
+The middleware change is small: after the bearer check, if there's no token, look for the session cookie and, if it names a live session, attach a read-only context. If neither is present, a browser navigation (one that says `Accept: text/html`) gets a `303` to the login page instead of a bare `401` — because a human staring at a JSON error is a worse experience than a form. Public routes stay public: health, version, JWKS, the static assets, and the login page itself.
+
 ### Node detail page
 
 Navigate to `/ui/node/node-01` for per-node resource charts (system CPU and memory from Mayo) and a table of all running instances on that node. App names link back to their detail pages.

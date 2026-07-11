@@ -198,13 +198,33 @@ pub fn router_with_upgrade(
         service_token,
     );
 
-    // Public routes need no token: liveness, the browser dashboard + UI, and
-    // the JWKS endpoint (public keys are meant to be readable).
+    // Public routes need no token: liveness, static assets, the JWKS
+    // endpoint (public keys are meant to be readable), and the join endpoint
+    // (authenticated by the one-time join token it carries, not a bearer
+    // token — a joiner has none yet).
     let public = Router::new()
-        .route("/", get(dashboard_handler))
         .route("/v1/health", get(health_handler))
         .route("/v1/version", get(version_handler))
         .route("/v1/identity/jwks", get(identity_jwks_handler))
+        .route("/ui/static/{*path}", get(static_asset_handler))
+        .route("/v1/cluster/join", post(join_handler))
+        .with_state(state.clone());
+
+    // The login page and session exchange carry `AuthState` so they can
+    // validate a pasted token and mint a session cookie. They are public (a
+    // logged-out browser must reach them) but live on their own router
+    // because they need a different state type.
+    let auth_routes = Router::new()
+        .route("/ui/login", get(login_handler))
+        .route("/ui/session", post(ui_session_handler))
+        .route("/ui/logout", post(ui_logout_handler))
+        .with_state(auth_state.clone());
+
+    // The dashboard and UI now sit behind auth: a bearer token or a session
+    // cookie. Unauthenticated HTML navigations are redirected to /ui/login by
+    // the middleware.
+    let protected = Router::new()
+        .route("/", get(dashboard_handler))
         .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
         .route("/ui/node/{name}", get(node_detail_handler))
         .route("/ui/fragment/apps", get(fragment_apps_handler))
@@ -215,15 +235,6 @@ pub fn router_with_upgrade(
             get(fragment_instances_handler),
         )
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
-        .route("/ui/static/{*path}", get(static_asset_handler))
-        // The join endpoint authenticates the caller by the one-time join
-        // token it carries, not by a bearer token — a joiner has none yet.
-        .route("/v1/cluster/join", post(join_handler))
-        .with_state(state.clone());
-
-    // Everything else sits behind the auth layer. `route_layer` runs the
-    // middleware only for matched routes, so a 404 doesn't demand a token.
-    let protected = Router::new()
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
@@ -317,7 +328,7 @@ pub fn router_with_upgrade(
         ))
         .with_state(state);
 
-    public.merge(protected)
+    public.merge(auth_routes).merge(protected)
 }
 
 /// Liveness check.
@@ -1547,6 +1558,86 @@ async fn council_handler(State(state): State<ApiState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Render the dashboard login page.
+async fn login_handler() -> Response {
+    axum::response::Html(crate::brioche::login::render_login(None)).into_response()
+}
+
+/// Form body for the login/session exchange.
+#[derive(Deserialize)]
+struct SessionForm {
+    token: String,
+}
+
+/// Exchange an API token for a read-only session cookie.
+///
+/// The browser posts a token once; on success it receives an `HttpOnly`,
+/// `SameSite=Strict` cookie and is redirected to the dashboard. The session
+/// is read-only regardless of the token's role.
+async fn ui_session_handler(
+    State(auth): State<crate::sesame::auth::AuthState>,
+    axum::Form(form): axum::Form<SessionForm>,
+) -> Response {
+    let tokens = auth.tokens.read().await;
+    // Accept the internal service token or any valid user token.
+    let name = if auth
+        .service_token
+        .as_deref()
+        .is_some_and(|s| crate::sesame::auth::tokens_equal(&form.token, s))
+    {
+        Some(crate::sesame::auth::SYSTEM_PRINCIPAL.to_string())
+    } else {
+        crate::sesame::auth::authenticate(&form.token, &tokens)
+            .ok()
+            .map(|ctx| ctx.token_name)
+    };
+    drop(tokens);
+
+    let Some(name) = name else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::response::Html(crate::brioche::login::render_login(Some(
+                "invalid or expired token",
+            ))),
+        )
+            .into_response();
+    };
+
+    let id = auth.sessions.create(&name).await;
+    let cookie = format!(
+        "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
+        crate::sesame::session::SESSION_COOKIE
+    );
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        axum::response::Redirect::to("/"),
+    )
+        .into_response()
+}
+
+/// Clear the current session (logout).
+async fn ui_logout_handler(
+    State(auth): State<crate::sesame::auth::AuthState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(id) = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::sesame::session::session_id_from_cookie_header)
+    {
+        auth.sessions.remove(id).await;
+    }
+    let cleared = format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        crate::sesame::session::SESSION_COOKIE
+    );
+    (
+        [(axum::http::header::SET_COOKIE, cleared)],
+        axum::response::Redirect::to("/ui/login"),
+    )
+        .into_response()
 }
 
 /// Request body for cluster join: a one-time token plus the joiner's node id.
@@ -4004,6 +4095,184 @@ mod tests {
 
         assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        shutdown.cancel();
+    }
+
+    // --- UI auth (sessions + route lockdown) ---
+
+    /// A router whose token store holds one user token of the given role.
+    /// Returns the router, its shutdown handle, and the plaintext token.
+    fn ui_setup(role: crate::sesame::types::ApiRole) -> (Router, CancellationToken, String) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(31000, 32000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let created = crate::sesame::token::create_token(
+            "dash",
+            role,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let plaintext = created.plaintext.clone();
+        let store = crate::sesame::auth::new_token_store();
+        // `store` starts non-empty so the bootstrap-open window is closed.
+        store.try_write().unwrap().push(created.token);
+
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+        );
+        (app, shutdown, plaintext)
+    }
+
+    async fn ui_get(app: &Router, uri: &str, headers: &[(&str, &str)]) -> Response {
+        let mut req = axum::http::Request::builder().method("GET").uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// POST a token to /ui/session and return the `rb_session` id from the
+    /// Set-Cookie header.
+    async fn login(app: &Router, token: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/ui/session")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("token={token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "login should redirect"
+        );
+        let cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("session cookie set")
+            .to_str()
+            .unwrap();
+        assert!(
+            cookie.contains("HttpOnly"),
+            "cookie must be HttpOnly: {cookie}"
+        );
+        assert!(
+            cookie.contains("SameSite=Strict"),
+            "cookie must be SameSite=Strict"
+        );
+        crate::sesame::session::session_id_from_cookie_header(cookie)
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn dashboard_requires_auth_once_user_tokens_exist() {
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        // A browser navigation with no cookie is redirected to the login page.
+        let resp = ui_get(&app, "/", &[("accept", "text/html")]).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "/ui/login");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn dashboard_stays_open_during_the_bootstrap_window() {
+        // test_setup has an empty token store → bootstrap-open.
+        let (app, shutdown) = test_setup();
+        let resp = ui_get(&app, "/", &[("accept", "text/html")]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_grants_read_only_access_to_fragments() {
+        let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let id = login(&app, &token).await;
+        let cookie = format!("rb_session={id}");
+        let resp = ui_get(&app, "/ui/fragment/apps", &[("cookie", &cookie)]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_never_grants_write_access_even_for_an_admin_token() {
+        // Even an Admin token, exchanged for a session, only reads: the session
+        // context is always ReadOnly, so a write endpoint is forbidden.
+        let (app, shutdown, token) = ui_setup(crate::sesame::types::ApiRole::Admin);
+        let id = login(&app, &token).await;
+        let cookie = format!("rb_session={id}");
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/apply")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_invalid_token_is_refused_at_the_session_route() {
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/ui/session")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("token=rbrg_nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn static_assets_and_health_stay_public() {
+        let (app, shutdown, _t) = ui_setup(crate::sesame::types::ApiRole::ReadOnly);
+        // Health needs no cookie even with tokens configured.
+        let health = ui_get(&app, "/v1/health", &[]).await;
+        assert_eq!(health.status(), StatusCode::OK);
+        // The login page itself must be reachable while logged out.
+        let login_page = ui_get(&app, "/ui/login", &[("accept", "text/html")]).await;
+        assert_eq!(login_page.status(), StatusCode::OK);
         shutdown.cancel();
     }
 }
