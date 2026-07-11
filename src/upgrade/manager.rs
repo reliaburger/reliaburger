@@ -456,14 +456,26 @@ impl UpgradeManager {
             detail: format!("verified after {} boot attempt(s)", marker.boot_attempts),
             recorded_at: std::time::SystemTime::now(),
         })?;
-        UpgradeMarker::remove(&self.marker_path)?;
-        let deleted = self.store.garbage_collect(
+        // Prune old binaries *before* clearing the in-flight marker.
+        // `upgrade_in_flight` is a single stat on the marker file, so a node
+        // reports "settled" the instant the marker is gone. If GC ran after
+        // that, an observer could catch the store mid-prune — a binary
+        // already removed but its `.sig` sidecar not yet — which is exactly
+        // the race the retention test hit on a loaded runner. Retention GC is
+        // best-effort: failing to prune an old binary must never fail an
+        // otherwise-verified upgrade.
+        match self.store.garbage_collect(
             self.retain_versions,
             std::slice::from_ref(&marker.previous_version),
-        )?;
-        for version in deleted {
-            println!("bun: retention gc removed binary {version}");
+        ) {
+            Ok(deleted) => {
+                for version in deleted {
+                    println!("bun: retention gc removed binary {version}");
+                }
+            }
+            Err(e) => eprintln!("bun: warning: retention gc failed: {e}"),
         }
+        UpgradeMarker::remove(&self.marker_path)?;
         Ok(())
     }
 
