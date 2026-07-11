@@ -3259,8 +3259,23 @@ async fn secret_rotate_handler(
         finalize: bool,
     }
 
-    let req: RotateRequest =
-        serde_json::from_str(&body).unwrap_or(RotateRequest { finalize: false });
+    // A malformed body must not silently become a (non-finalise) rotation —
+    // that mutates cluster key state on a typo (PKI8). An empty body keeps the
+    // convenient default; anything present must parse.
+    let req: RotateRequest = if body.trim().is_empty() {
+        RotateRequest { finalize: false }
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(req) => req,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("invalid rotate request: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
 
     let Some(ref council) = state.council else {
         return (
@@ -3614,6 +3629,29 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn secret_rotate_rejects_a_malformed_body() {
+        // PKI8: a garbage body must not silently default to a (non-finalise)
+        // rotation and mutate cluster key state on a typo. The admin passes the
+        // role guard, so a 400 here is the parse gate, not authorisation.
+        let (app, shutdown, tok) =
+            setup_with_role("rotate-malformed", crate::sesame::types::ApiRole::Admin).await;
+        let status = post_status(app, "/v1/secret/rotate", &tok, "not json at all").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn secret_rotate_accepts_an_empty_body_as_a_rotation() {
+        // The convenience default: no body means "rotate" (not finalise). It
+        // must reach the council, so it is anything but a 400.
+        let (app, shutdown, tok) =
+            setup_with_role("rotate-empty", crate::sesame::types::ApiRole::Admin).await;
+        let status = post_status(app, "/v1/secret/rotate", &tok, "").await;
+        assert_ne!(status, StatusCode::BAD_REQUEST);
         shutdown.cancel();
     }
 
