@@ -31,6 +31,8 @@ pub enum SigningError {
     UntrustedKey,
     #[error("invalid signature format")]
     InvalidFormat,
+    #[error("signing certificate revoked: {0}")]
+    Revoked(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -124,19 +126,21 @@ pub fn create_external_key_signature(
 /// Verify an image signature against the trust policy.
 ///
 /// Dispatches to keyless or external key verification based on the
-/// signing method.
+/// signing method. `crl` is the cluster revocation list: a keyless
+/// signature whose chain contains a revoked certificate fails closed.
 pub fn verify_signature(
     sig: &ImageSignature,
     digest: &Digest,
     trust_policy: &TrustPolicySection,
     root_ca_cert_der: Option<&[u8]>,
+    crl: Option<&crate::sesame::types::Crl>,
 ) -> Result<(), SigningError> {
     match &sig.method {
         SigningMethod::Keyless { .. } => {
             let root = root_ca_cert_der.ok_or_else(|| {
                 SigningError::ChainVerifyFailed("no root CA provided".to_string())
             })?;
-            verify_keyless(sig, digest, root)
+            verify_keyless(sig, digest, root, crl)
         }
         SigningMethod::ExternalKey { .. } => verify_external_key(sig, digest, &trust_policy.keys),
     }
@@ -148,6 +152,7 @@ fn verify_keyless(
     sig: &ImageSignature,
     digest: &Digest,
     root_ca_cert_der: &[u8],
+    crl: Option<&crate::sesame::types::Crl>,
 ) -> Result<(), SigningError> {
     let chain = match &sig.verification_material {
         VerificationMaterial::CertificateChain(chain) => chain,
@@ -175,6 +180,17 @@ fn verify_keyless(
         crate::sesame::cert::verify_signature(last_cert, root_ca_cert_der).map_err(|e| {
             SigningError::ChainVerifyFailed(format!("chain does not chain to root CA: {e}"))
         })?;
+    }
+
+    // Revocation: a signature is only as trustworthy as the certificate that
+    // made it. If any cert in the chain has been revoked, fail closed (L17).
+    if let Some(crl) = crl {
+        for cert_der in chain.iter() {
+            let serial = crate::sesame::cert::serial_from_der(cert_der)
+                .map_err(|e| SigningError::VerifyFailed(format!("failed to read serial: {e}")))?;
+            crate::sesame::cert::check_crl(serial, crl)
+                .map_err(|e| SigningError::Revoked(e.to_string()))?;
+        }
     }
 
     // Extract public key from leaf certificate
@@ -289,7 +305,7 @@ mod tests {
         assert!(matches!(sig.method, SigningMethod::Keyless { .. }));
 
         // Verify against root CA
-        verify_keyless(&sig, &digest, &hierarchy.root.ca.certificate_der).unwrap();
+        verify_keyless(&sig, &digest, &hierarchy.root.ca.certificate_der, None).unwrap();
     }
 
     #[test]
@@ -341,7 +357,12 @@ mod tests {
         let wrong_digest = Digest::from_sha256_hex(
             "0000000000000000000000000000000000000000000000000000000000000000",
         );
-        let result = verify_keyless(&sig, &wrong_digest, &hierarchy.root.ca.certificate_der);
+        let result = verify_keyless(
+            &sig,
+            &wrong_digest,
+            &hierarchy.root.ca.certificate_der,
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -371,8 +392,89 @@ mod tests {
 
         // Verify with a different root CA — should fail
         let other_hierarchy = ca::generate_ca_hierarchy("other", wrapping_ikm).unwrap();
-        let result = verify_keyless(&sig, &digest, &other_hierarchy.root.ca.certificate_der);
+        let result = verify_keyless(
+            &sig,
+            &digest,
+            &other_hierarchy.root.ca.certificate_der,
+            None,
+        );
         assert!(result.is_err());
+    }
+
+    /// Build a keyless signature over `test_digest()` whose leaf has the given
+    /// serial, returning `(sig, root_ca_der, workload_ca_serial)`.
+    fn keyless_sig_with_leaf_serial(
+        leaf_serial: u64,
+    ) -> (ImageSignature, Vec<u8>, crate::sesame::types::SerialNumber) {
+        let wrapping_ikm = b"test-wrapping-material-32bytes!";
+        let hierarchy = ca::generate_ca_hierarchy("test", wrapping_ikm).unwrap();
+        let (cert_der, key_der, _) = ca::issue_node_cert(
+            "test-workload",
+            crate::sesame::types::SerialNumber(leaf_serial),
+            &hierarchy.workload.signing_keypair,
+            &hierarchy.workload.certificate_params,
+        )
+        .unwrap();
+        let digest = test_digest();
+        let sig = create_keyless_signature(
+            &digest,
+            &cert_der,
+            &key_der,
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
+            "https://test.reliaburger.dev",
+            "spiffe://test/ns/ci/job/build",
+        )
+        .unwrap();
+        let workload_ca_serial =
+            crate::sesame::cert::serial_from_der(&hierarchy.workload.ca.certificate_der).unwrap();
+        (
+            sig,
+            hierarchy.root.ca.certificate_der.clone(),
+            workload_ca_serial,
+        )
+    }
+
+    fn crl_revoking(serial: crate::sesame::types::SerialNumber) -> crate::sesame::types::Crl {
+        crate::sesame::types::Crl {
+            entries: vec![crate::sesame::types::CrlEntry {
+                serial,
+                issuer: crate::sesame::types::CaRole::Workload,
+                revoked_at: std::time::SystemTime::now(),
+                reason: "test".to_string(),
+            }],
+            version: 1,
+            updated_at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn revoked_leaf_certificate_fails_keyless_verification() {
+        let (sig, root, _) = keyless_sig_with_leaf_serial(100);
+        let crl = crl_revoking(crate::sesame::types::SerialNumber(100));
+        let result = verify_keyless(&sig, &test_digest(), &root, Some(&crl));
+        assert!(
+            matches!(result, Err(SigningError::Revoked(_))),
+            "got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_intermediate_certificate_fails_keyless_verification() {
+        let (sig, root, workload_ca_serial) = keyless_sig_with_leaf_serial(100);
+        // Revoke the intermediate (workload CA), not the leaf.
+        let crl = crl_revoking(workload_ca_serial);
+        let result = verify_keyless(&sig, &test_digest(), &root, Some(&crl));
+        assert!(
+            matches!(result, Err(SigningError::Revoked(_))),
+            "got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_crl_passes_keyless_verification() {
+        let (sig, root, _) = keyless_sig_with_leaf_serial(100);
+        let empty = crate::sesame::types::Crl::default();
+        verify_keyless(&sig, &test_digest(), &root, Some(&empty)).unwrap();
     }
 
     #[test]
@@ -439,6 +541,7 @@ mod tests {
             &digest,
             &policy,
             Some(&hierarchy.root.ca.certificate_der),
+            None,
         )
         .unwrap();
     }
@@ -462,7 +565,7 @@ mod tests {
             require_signatures: true,
             keys: vec![pub_b64],
         };
-        verify_signature(&sig, &digest, &policy, None).unwrap();
+        verify_signature(&sig, &digest, &policy, None, None).unwrap();
     }
 
     #[test]

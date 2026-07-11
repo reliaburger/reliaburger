@@ -94,9 +94,27 @@ fn classify_error(e: reqwest::Error) -> RelishError {
 /// The `--token` CLI override, set once from `main` before any client is built.
 static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// The `--ca-cert` CLI override (path to the cluster CA PEM), set once from
+/// `main`. When present, the CLI reaches the agent API over HTTPS trusting
+/// this CA.
+static CLI_CA_CERT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
 /// Record the `--token` CLI flag. Call once, in `main`, before dispatch.
 pub fn set_cli_token(token: Option<String>) {
     let _ = CLI_TOKEN.set(token);
+}
+
+/// Record the `--ca-cert` CLI flag. Call once, in `main`, before dispatch.
+pub fn set_cli_ca_cert(path: Option<std::path::PathBuf>) {
+    let _ = CLI_CA_CERT.set(path);
+}
+
+/// Resolve the CA cert path: `--ca-cert` flag, else `RELIABURGER_CA_CERT`.
+fn resolve_ca_cert() -> Option<std::path::PathBuf> {
+    match CLI_CA_CERT.get() {
+        Some(Some(p)) => Some(p.clone()),
+        _ => std::env::var_os("RELIABURGER_CA_CERT").map(std::path::PathBuf::from),
+    }
 }
 
 /// Resolve the auth token: the `--token` flag takes precedence over the
@@ -134,6 +152,27 @@ impl BunClient {
                 builder = builder.default_headers(headers);
             }
         }
+        // Under mTLS the API cert is issued for the node id, not "127.0.0.1",
+        // so trust the cluster CA and skip the hostname check (the CA pin is
+        // the real guarantee).
+        if let Some(ca_path) = resolve_ca_cert() {
+            match std::fs::read(&ca_path).and_then(|pem| {
+                reqwest::Certificate::from_pem(&pem)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            }) {
+                Ok(cert) => {
+                    builder = builder
+                        .add_root_certificate(cert)
+                        .danger_accept_invalid_hostnames(true);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "relish: warning — could not load --ca-cert {}: {e}",
+                        ca_path.display()
+                    );
+                }
+            }
+        }
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: builder.build().expect("failed to create HTTP client"),
@@ -145,9 +184,15 @@ impl BunClient {
         &self.base_url
     }
 
-    /// Create a client pointing at the default local agent.
+    /// Create a client pointing at the default local agent. Uses HTTPS when a
+    /// cluster CA cert is configured (`--ca-cert` / `RELIABURGER_CA_CERT`).
     pub fn default_local() -> Self {
-        Self::new("http://127.0.0.1:9117")
+        let scheme = if resolve_ca_cert().is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        Self::new(&format!("{scheme}://127.0.0.1:9117"))
     }
 
     /// Check if the agent is reachable.
@@ -651,31 +696,6 @@ impl BunClient {
         })?;
 
         Ok(nodes)
-    }
-
-    /// Join an existing cluster.
-    pub async fn join(&self, token: &str, addr: &str) -> Result<String, RelishError> {
-        let url = format!("{}/v1/cluster/join", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({ "token": token, "addr": addr }))
-            .send()
-            .await
-            .map_err(classify_error)?;
-
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-
-        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
-            status: 0,
-            body: format!("failed to parse response: {e}"),
-        })?;
-
-        Ok(json["message"].as_str().unwrap_or("joined").to_string())
     }
 
     /// Get council (Raft) status.

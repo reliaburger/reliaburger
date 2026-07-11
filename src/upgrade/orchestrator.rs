@@ -394,20 +394,23 @@ pub fn resume(mut state: ClusterUpgradeState) -> ClusterUpgradeState {
 /// HTTP implementation of [`NodeControl`], talking to each node's bun API.
 #[derive(Clone)]
 pub struct HttpNodeControl {
-    client: reqwest::Client,
+    /// Scheme + client for peer API calls (HTTPS + CA trust under mTLS).
+    http: crate::cluster::ClusterHttp,
     /// Cluster service token, presented so peers accept us as the system
     /// principal. `None` when the cluster runs without API auth.
     service_token: Option<String>,
 }
 
 impl HttpNodeControl {
+    /// Plaintext control plane (mTLS off).
     pub fn new(service_token: Option<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
+        Self::with_http(service_token, crate::cluster::ClusterHttp::plaintext())
+    }
+
+    /// Control plane over the given scheme/client (HTTPS under mTLS).
+    pub fn with_http(service_token: Option<String>, http: crate::cluster::ClusterHttp) -> Self {
         Self {
-            client,
+            http,
             service_token,
         }
     }
@@ -423,8 +426,9 @@ impl HttpNodeControl {
 impl NodeControl for HttpNodeControl {
     async fn probe(&self, address: &str) -> Option<NodeProbe> {
         let version_response = self
-            .client
-            .get(format!("http://{address}/v1/version"))
+            .http
+            .client()
+            .get(self.http.url(address, "/v1/version"))
             .send()
             .await
             .ok()?;
@@ -441,8 +445,9 @@ impl NodeControl for HttpNodeControl {
             .unwrap_or_default();
 
         let healthy = matches!(
-            self.client
-                .get(format!("http://{address}/v1/health"))
+            self.http
+                .client()
+                .get(self.http.url(address, "/v1/health"))
                 .send()
                 .await,
             Ok(response) if response.status().is_success()
@@ -463,8 +468,9 @@ impl NodeControl for HttpNodeControl {
     ) -> Result<(), String> {
         let response = self
             .with_auth(
-                self.client
-                    .post(format!("http://{address}/v1/upgrade/apply"))
+                self.http
+                    .client()
+                    .post(self.http.url(address, "/v1/upgrade/apply"))
                     .json(directive),
             )
             .send()
@@ -482,8 +488,9 @@ impl NodeControl for HttpNodeControl {
     async fn direct_rollback(&self, address: &str, version: &BinaryVersion) -> Result<(), String> {
         let response = self
             .with_auth(
-                self.client
-                    .post(format!("http://{address}/v1/upgrade/rollback"))
+                self.http
+                    .client()
+                    .post(self.http.url(address, "/v1/upgrade/rollback"))
                     .json(&serde_json::json!({ "version": version })),
             )
             .send()

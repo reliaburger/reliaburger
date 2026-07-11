@@ -381,9 +381,10 @@ pub fn spawn_placement_reconciler(
     service_token: Option<String>,
     cmd_tx: mpsc::Sender<AgentCommand>,
     shutdown: CancellationToken,
+    cluster_http: crate::cluster::ClusterHttp,
 ) {
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = cluster_http.client().clone();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         // (name, namespace) → serialized assignment we last applied.
         let mut applied: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -407,7 +408,7 @@ pub fn spawn_placement_reconciler(
                         .get_node(&leader_id)
                         .map(|info| {
                             let api_port = (info.addr.port() as i32 + raft_to_api_offset) as u16;
-                            format!("http://{}:{api_port}", info.addr.ip())
+                            cluster_http.url(&format!("{}:{api_port}", info.addr.ip()), "")
                         })
                 })
             };

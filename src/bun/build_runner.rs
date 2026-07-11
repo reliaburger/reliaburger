@@ -86,6 +86,7 @@ pub fn find_peer_builder(
     members: &[super::api::NodeMembershipInfo],
     aggregated: &crate::reporting::aggregator::AggregatedState,
     self_name: Option<&str>,
+    cluster_http: &crate::cluster::ClusterHttp,
 ) -> Option<String> {
     members
         .iter()
@@ -96,7 +97,7 @@ pub fn find_peer_builder(
                 .get(&m.node_id)
                 .is_some_and(|report| report.has_buildah)
         })
-        .map(|m| format!("http://{}", m.address))
+        .map(|m| cluster_http.url(&m.address.to_string(), ""))
 }
 
 /// The lifted build body: fetch the context blob from the local
@@ -253,6 +254,7 @@ pub async fn build_submit_handler(
                 &members,
                 &aggregated_rx.borrow(),
                 state.node_name.as_deref(),
+                &state.cluster_http,
             )
         }
         _ => None,
@@ -269,7 +271,8 @@ pub async fn build_submit_handler(
     };
 
     let mut proxied = state
-        .http_client
+        .cluster_http
+        .client()
         .post(format!("{peer_url}/v1/build/run"))
         .json(&request);
     if let Some(token) = &state.service_token {
@@ -367,7 +370,10 @@ pub async fn build_status_handler(
     let entry = state.build_registry.lock().await.get(build_id);
     match entry {
         Some(BuildState::Delegated { url, remote_id }) => {
-            let mut request = state.http_client.get(format!("{url}/v1/build/{remote_id}"));
+            let mut request = state
+                .cluster_http
+                .client()
+                .get(format!("{url}/v1/build/{remote_id}"));
             if let Some(token) = &state.service_token {
                 request = request.bearer_auth(token);
             }
@@ -468,11 +474,12 @@ mod tests {
             },
         ];
 
-        let url = find_peer_builder(&members, &aggregated, Some("plain"));
+        let http = crate::cluster::ClusterHttp::plaintext();
+        let url = find_peer_builder(&members, &aggregated, Some("plain"), &http);
         assert_eq!(url.as_deref(), Some("http://10.0.0.2:9117"));
 
         // The capable node itself is excluded — "peer" means peer.
-        let url = find_peer_builder(&members, &aggregated, Some("builder"));
+        let url = find_peer_builder(&members, &aggregated, Some("builder"), &http);
         assert!(url.is_none());
     }
 }

@@ -117,6 +117,10 @@ $ relish join --token rbrg_join_1_a7f3b9c2... 10.0.1.5:9443
 
 The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, and hasn't been consumed, the council marks it as consumed and issues a node certificate.
 
+There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs the token and the node's chosen id to that member's `/v1/cluster/join` endpoint, which validates the token, issues the certificate, and returns a bundle: the new cert, its private key, and the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
+
+That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
+
 But that first token is single-use. It expires after 15 minutes, and once one node has used it, it's gone. How do you add a second node? A tenth?
 
 Any admin with an existing token can generate more:
@@ -130,6 +134,25 @@ The council writes a new join token to Raft via `generate_new_join_token()`, whi
 Phase 4 builds the token machinery: generation, hashing, and storage in Raft. The full lifecycle around it — enforcing single-use and expiry inside the agent, plus `relish token list` and `relish token revoke` — needs `SecurityState` to live in the Raft state machine, which doesn't arrive until Chapter 10. So treat this section as the foundation; we close the loop on token validation and revocation there.
 
 After that, every connection between cluster nodes uses mutual TLS. Both sides present their certificates, both sides verify against the Root CA trust anchor. A plain TCP connection to a cluster port gets rejected immediately.
+
+### Where the node's certificate actually lives
+
+For a long time, the honest answer was: nowhere. `initialize_cluster()` issued the first node's certificate and returned it, and the caller printed a summary and dropped it on the floor. The join path was worse — the council issued a certificate for the new node and then threw it away. All the PKI machinery worked; the output just never landed anywhere a listener could load it from. We only noticed when we sat down to wire mTLS into the Raft listener and asked the obvious question: which file do I read the key from?
+
+The fix is `sesame::identity_store`, a small module that owns one directory:
+
+```text
+{data_dir}/identity/
+  node.crt      # this node's certificate (PEM)
+  node.key      # this node's private key (PEM, mode 0600)
+  node-ca.crt   # the intermediate that signed it
+  root-ca.crt   # the trust anchor
+  meta.json     # node_id, serial, CA generation, validity window
+```
+
+`relish init` now writes this for the bootstrap node, and fills the `[security]` section of the generated `reliaburger.toml` so `bun` knows where to look. Two details are worth stealing for your own projects. First, the private key is written with `atomic_write_mode(path, data, Some(0o600))` — the permission is set on the temp file *before* the rename, so there is never a moment when the key sits at its final path world-readable. Second, `load()` returns `Result<Option<NodeIdentity>, _>`, not a bare `Result`. A missing identity isn't an error; it's a state ("this node hasn't enrolled yet") that the caller matches on explicitly. Rust makes the three outcomes — loaded, absent, corrupt — impossible to conflate, which is exactly what you want for a file that decides whether your listeners speak TLS.
+
+`init` also prints the root CA fingerprint (`sha256:...`). Keep it. When a joiner enrols later, `relish join` prints the fingerprint of the root CA it received, and those two strings matching is your defence against handing a node's trust to the wrong cluster.
 
 ## Gossip HMAC
 
@@ -506,6 +529,8 @@ for (app_name, spec) in &config.app {
 ```
 
 `enforce_image_signature` reaches the root CA the same way secret decryption already did (through the council), looks the image up in the replicated manifest catalogue, and — for a Pickle-hosted image — verifies the signature against that CA. External-registry images (nginx from Docker Hub) aren't ours to vouch for, so they pass. A local image with no signature, or a tampered one, is refused. This is deliberately *local* enforcement: each node vouches for what it runs, which is exactly the right guarantee until a central scheduler exists to vouch cluster-wide.
+
+One more thing had to travel with the root CA to make this honest: the CRL. Chaining a signature to the cluster CA proves the signer *was* trusted when the certificate was issued, not that it still is. If a signing key leaks and you revoke its certificate, images it signed before the revocation must stop deploying. So `enforce_image_signature` passes the council's CRL alongside the root CA, and the keyless verifier checks the leaf and every intermediate against it before it even looks at the signature bytes. A revoked certificate anywhere in the chain fails the deploy closed. Revocation that doesn't reach every trust decision isn't revocation; it's a suggestion.
 
 Two different domains — gossip integrity and registry trust — one theme. The primitive was always there; the enforcement point was the missing piece.
 

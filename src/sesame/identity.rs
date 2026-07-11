@@ -218,7 +218,7 @@ pub fn write_identity_to_tmpfs(
 }
 
 /// Write data to a temp file then atomically rename.
-fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     atomic_write_mode(path, data, None)
 }
 
@@ -226,7 +226,11 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 ///
 /// The mode is applied to the temp file before the rename so the file is
 /// never briefly world-readable at its final path (M25).
-fn atomic_write_mode(path: &Path, data: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+pub(crate) fn atomic_write_mode(
+    path: &Path,
+    data: &[u8],
+    mode: Option<u32>,
+) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
     #[cfg(unix)]

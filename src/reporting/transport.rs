@@ -2,8 +2,10 @@
 ///
 /// Follows the same pattern as `MustardTransport`: a trait for
 /// dependency injection with an in-memory implementation for testing.
-/// The real TCP transport will be added when this is wired into the
-/// agent. mTLS is deferred to Phase 4.
+/// The TCP transport optionally runs over mTLS: when the node has an
+/// identity, the accept loop requires a client certificate and sends dial
+/// peers over TLS, using the same verifiers and CRL handle as the Raft RPC
+/// transport.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -157,15 +159,29 @@ pub struct TcpReportingTransport {
     address: SocketAddr,
     inbound_rx: Mutex<mpsc::Receiver<(SocketAddr, ReportingMessage)>>,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    /// When set, peers are dialled over mTLS. `None` keeps plaintext TCP.
+    tls_connector: Option<tokio_rustls::TlsConnector>,
 }
 
 impl TcpReportingTransport {
-    /// Create a TCP reporting transport bound to the given address.
-    ///
-    /// Spawns a background accept loop to receive inbound messages.
+    /// Create a plaintext TCP reporting transport bound to the given address.
     pub async fn bind(
         addr: SocketAddr,
         shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<Self, ReportingError> {
+        Self::bind_tls(addr, shutdown, None, None).await
+    }
+
+    /// Create a TCP reporting transport, optionally over mTLS.
+    ///
+    /// When `acceptor` is set the accept loop requires a client certificate;
+    /// when `connector` is set, sends dial peers over TLS. Spawns a background
+    /// accept loop to receive inbound messages.
+    pub async fn bind_tls(
+        addr: SocketAddr,
+        shutdown: tokio_util::sync::CancellationToken,
+        acceptor: Option<tokio_rustls::TlsAcceptor>,
+        connector: Option<tokio_rustls::TlsConnector>,
     ) -> Result<Self, ReportingError> {
         let listener =
             tokio::net::TcpListener::bind(addr)
@@ -182,7 +198,7 @@ impl TcpReportingTransport {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
 
         // Spawn accept loop
-        tokio::spawn(Self::accept_loop(listener, inbound_tx, shutdown));
+        tokio::spawn(Self::accept_loop(listener, inbound_tx, shutdown, acceptor));
 
         Ok(Self {
             address: bound_addr,
@@ -190,6 +206,7 @@ impl TcpReportingTransport {
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            tls_connector: connector,
         })
     }
 
@@ -210,6 +227,7 @@ impl TcpReportingTransport {
         listener: tokio::net::TcpListener,
         tx: mpsc::Sender<(SocketAddr, ReportingMessage)>,
         shutdown: tokio_util::sync::CancellationToken,
+        acceptor: Option<tokio_rustls::TlsAcceptor>,
     ) {
         loop {
             tokio::select! {
@@ -218,7 +236,20 @@ impl TcpReportingTransport {
                     match result {
                         Ok((stream, peer)) => {
                             let tx = tx.clone();
-                            tokio::spawn(Self::handle_connection(stream, peer, tx));
+                            match acceptor.clone() {
+                                Some(acceptor) => {
+                                    tokio::spawn(async move {
+                                        // A refused/failed handshake is dropped
+                                        // silently; a rejected peer learns nothing.
+                                        if let Ok(tls) = acceptor.accept(stream).await {
+                                            Self::handle_connection(tls, peer, tx).await;
+                                        }
+                                    });
+                                }
+                                None => {
+                                    tokio::spawn(Self::handle_connection(stream, peer, tx));
+                                }
+                            }
                         }
                         Err(_) => continue,
                     }
@@ -227,9 +258,9 @@ impl TcpReportingTransport {
         }
     }
 
-    /// Read one framed message from a TCP connection.
-    async fn handle_connection(
-        mut stream: tokio::net::TcpStream,
+    /// Read one framed message from any byte stream (plain TCP or TLS).
+    async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(
+        mut stream: S,
         peer: SocketAddr,
         tx: mpsc::Sender<(SocketAddr, ReportingMessage)>,
     ) {
@@ -257,13 +288,12 @@ impl TcpReportingTransport {
         }
     }
 
-    /// Send a length-prefixed bincode message over a new TCP connection.
+    /// Send a length-prefixed bincode message over a new connection.
     async fn send_framed(
         target: SocketAddr,
         message: &ReportingMessage,
+        connector: Option<&tokio_rustls::TlsConnector>,
     ) -> Result<(), ReportingError> {
-        use tokio::io::AsyncWriteExt;
-
         let payload = bincode::serialize(message)
             .map_err(|e| ReportingError::Serialisation(e.to_string()))?;
         if payload.len() > MAX_REPORT_SIZE {
@@ -273,7 +303,7 @@ impl TcpReportingTransport {
             });
         }
 
-        let mut stream = tokio::time::timeout(
+        let tcp = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::net::TcpStream::connect(target),
         )
@@ -285,6 +315,32 @@ impl TcpReportingTransport {
             reason: format!("TCP connect to {target}: {e}"),
         })?;
 
+        match connector {
+            Some(connector) => {
+                // The pinned server verifier ignores the name; rustls still
+                // requires a valid one.
+                let name = rustls::pki_types::ServerName::IpAddress(target.ip().into());
+                let tls =
+                    connector
+                        .connect(name, tcp)
+                        .await
+                        .map_err(|e| ReportingError::SendFailed {
+                            reason: format!("TLS connect to {target}: {e}"),
+                        })?;
+                Self::write_framed(tls, &payload, target).await
+            }
+            None => Self::write_framed(tcp, &payload, target).await,
+        }
+    }
+
+    /// Write a length-prefixed payload over an established stream.
+    async fn write_framed<S: tokio::io::AsyncWrite + Unpin>(
+        mut stream: S,
+        payload: &[u8],
+        target: SocketAddr,
+    ) -> Result<(), ReportingError> {
+        use tokio::io::AsyncWriteExt;
+
         let len_bytes = (payload.len() as u32).to_be_bytes();
         stream
             .write_all(&len_bytes)
@@ -293,12 +349,18 @@ impl TcpReportingTransport {
                 reason: format!("TCP write to {target}: {e}"),
             })?;
         stream
-            .write_all(&payload)
+            .write_all(payload)
             .await
             .map_err(|e| ReportingError::SendFailed {
                 reason: format!("TCP write to {target}: {e}"),
             })?;
-
+        // TLS buffers until flushed; harmless on plain TCP.
+        stream
+            .flush()
+            .await
+            .map_err(|e| ReportingError::SendFailed {
+                reason: format!("TCP flush to {target}: {e}"),
+            })?;
         Ok(())
     }
 }
@@ -312,7 +374,7 @@ impl ReportingTransport for TcpReportingTransport {
         if self.blocklist.read().await.contains(&target) {
             return Ok(()); // silently drop for chaos testing
         }
-        Self::send_framed(target, message).await
+        Self::send_framed(target, message, self.tls_connector.as_ref()).await
     }
 
     async fn recv(&self) -> Option<(SocketAddr, ReportingMessage)> {

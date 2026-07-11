@@ -303,6 +303,36 @@ The master key file is the crown jewel. Lose it and you can't unwrap any CA priv
 
 The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON, writes a `SecurityStateInit` command to Raft, and deletes the file. After that, SecurityState lives in Raft and replicates to every council node automatically.
 
+### Turning mTLS on: the mode matrix
+
+Persisting identities and building handshake-true configs is nothing until a real listener uses them. The Raft RPC transport is the first to get wrapped. Whether it does is decided by a small matrix, evaluated once at startup, driven by two inputs: is there an identity on disk, and is `[security] require_mtls` set?
+
+| `require_mtls` | identity on disk | what happens |
+|---|---|---|
+| false | absent | plaintext, as before |
+| false | present | plaintext, with a warning to set `require_mtls` |
+| true | present | Raft RPC requires client certs; peers dialled over mTLS |
+| true | absent, bootstrap node | refuse to start — run `relish init` |
+| true | absent, joiner | refuse to start — run `relish join`, then restart |
+
+The two "refuse to start" rows are the important ones. A node that is told to require mTLS but has no certificate cannot speak the internal transport, so rather than limp along in a half-secured state it stops with the exact command that fixes it. This is the deliberate cost of the restart-after-join model: a joiner enrols (writes its identity to disk), then restarts, and on the second boot the identity is present and the matrix lands on the mTLS row. One extra restart per node, once, in exchange for never running in an ambiguous partial-TLS state.
+
+Wiring it through the runtime is mechanical once the pieces from earlier in the chapter exist. `cluster::runtime::start` builds a `TlsAcceptor` from `build_mtls_server_config` and a `TlsConnector` from `build_mtls_client_config`, both sharing one `CrlHandle`. The acceptor goes to `serve_raft_rpc`; the connector goes to the network factory via `new_tls`. The frame read/write functions became generic over `AsyncRead + AsyncWrite` so the exact same code serves a plain `TcpStream` or a `tokio_rustls` stream — the only fork is one `match` on whether TLS is configured. And the `CrlHandle` is handed back to `bun`, whose existing token-refresh ticker now also copies the latest CRL from Raft into it every five seconds, so a `RevokeCertificate` takes effect on a peer's next handshake without anyone restarting anything.
+
+The reporting transport is the second internal listener, and because it was built to the same shape as the Raft transport, extending it is almost copy-paste: `TcpReportingTransport::bind_tls` takes the same optional acceptor and connector, its accept loop and framing became generic over the stream type exactly as the Raft codec did, and `cluster::runtime` hands it the identical acceptor and connector it built for Raft. One `CrlHandle`, one identity, three listeners all revoking in lockstep. The lesson worth keeping: when two transports share a shape, securing the second is a fraction of the work of securing the first. It pays to make your byte-shovelling code generic over the stream before you have a second stream type, not after.
+
+### The third listener is a different animal
+
+The agent API is the third listener, and it does not fit the Raft mould. Raft and reporting are node-to-node: both ends are cluster members with certificates, so requiring a client cert is exactly right. But the API is also reached by the `relish` CLI and by browsers, and neither of those has a node certificate. Require a client cert there and you've locked out every human operator.
+
+So the API gets its own server config, `build_api_server_config`, built with `WebPkiClientVerifier::builder(...).allow_unauthenticated()`: it *offers* client-cert auth (a peer node that presents one is verified and CRL-checked exactly as on the Raft transport) but does not *require* it. A connection with no client cert completes the handshake and falls through to the bearer-token / session-cookie layer from the previous chapter. One subtlety cost a test run: wrapping `WebPkiClientVerifier` in our own `RevocationCheckingClientVerifier` silently reverted the "optional" part, because the `ClientCertVerifier` trait defaults `client_auth_mandatory()` to `true` and our wrapper hadn't overridden it. The fix is to delegate that method (and `offer_client_auth`) to the inner verifier so the API config's "unauthenticated is fine" and the Raft config's "cert required" both flow through. The lesson: when you wrap a trait object, audit *every* defaulted method, not just the ones you meant to change.
+
+Serving axum over TLS needs a hand-rolled accept loop — `axum::serve` takes a plain listener — but it's the same shape the ingress proxy already uses: accept, hand the TCP stream to a per-connection task, run the TLS handshake there (so a slow handshaker can't wedge the accept loop), then feed the decrypted stream to hyper.
+
+The other half is the clients. Turning on API TLS breaks the cluster instantly if the callers keep dialling `http://peer:9117` — placement reconcilers, metric and log fan-out, batch dispatch, build delegation, upgrade directives all talk to peer APIs. Rather than scatter scheme-and-client logic across five subsystems, they share one `ClusterHttp` value: a scheme (`http` or `https`) plus a reqwest client that trusts the cluster CA. `bun` builds it once from the identity at startup — `ClusterHttp::secure(...)` when mTLS is on, `ClusterHttp::plaintext()` otherwise — and hands it to the API state, the reconciler and the upgrade orchestrator. Every peer URL is now `cluster_http.url(authority, path)`, so the scheme is decided in exactly one place. The clients present no client certificate: node-to-node calls still authenticate with the service token, which now simply rides inside TLS instead of over the wire in the clear. And because a node cert's SAN is the node id rather than its IP, that CA-trusting client (like the CLI's `--ca-cert` mode) skips hostname verification — the CA pin is the guarantee, not the name.
+
+The Pickle registry is deliberately *not* on this list. It's a fourth listener with its own exposure story — it serves content-addressed blobs and needs an auth story of its own — so it stays plaintext-and-firewalled for now, tracked as a separate piece of work. Three of the four internal listeners speak mTLS; the fourth is honest about not yet doing so.
+
 ### How it fits into Raft
 
 `SecurityState` is a field on `DesiredState`, the struct that the Raft state machine maintains:
@@ -414,6 +444,18 @@ pub fn check_crl(serial: SerialNumber, crl: &Crl) -> Result<(), CertError> {
 ```
 
 CRLs are small (one entry per revoked cert, most clusters have few revocations). They propagate through Raft replication, so all council members have the same CRL. Worker nodes read it from their assigned council parent.
+
+### Wiring the CRL into TLS handshakes
+
+For a long time `check_crl()` had exactly one caller: its own tests. Making revocation real meant getting it into the TLS handshake path, and that surfaced three problems worth walking through.
+
+First, a design choice. rustls's `WebPkiClientVerifier` can enforce revocation natively, but it wants DER-encoded X.509 CRL files. We could generate those with rcgen — except every rebuild would need the Node CA private key (an unwrap of Raft-held material), plus a signing and expiry lifecycle for an artifact whose source of truth is already replicated and instantly fresh. So instead the verifiers share a `CrlHandle`, an `Arc<RwLock<Crl>>` that every handshake re-reads and a background ticker refreshes from `SecurityState`. Note it's `std::sync::RwLock`, not tokio's: rustls verifier traits are synchronous, and the critical section is a `Vec` scan. The "never `std::sync::Mutex` in async code" rule is about holding locks across `.await` points; there are none here.
+
+Second, a bug the old tests couldn't see. Our node certificates are signed by the Node CA *intermediate*, but the original config builders presented only the leaf and trusted only the Root CA. WebPKI can't build that path — every real handshake would have failed. The old tests only *constructed* configs, so they passed for months. The rewritten tests run actual handshakes over an in-memory `tokio::io::duplex` pipe, and the builders now present `[leaf, node-ca]`.
+
+There's a related wrinkle on the client side. Peer nodes are dialled by gossip IP and their certificates carry no DNS SANs, so rustls's default hostname verification would reject every peer. The client uses a custom `PinnedChainServerVerifier` instead: validate the presented certificate against the *pinned* cluster CAs, check the CRL, skip the hostname. The property we need is "this peer holds a valid, unrevoked Node CA certificate", and that's exactly what it checks — no more, no less.
+
+Third, the one the new tests caught on their first run. `crl_updates_apply_to_new_handshakes_without_rebuilding_configs` revokes a client's serial through the shared handle, reconnects, and expects a refusal. It got a success. TLS 1.3 session resumption: the client had a ticket from its first connection, and a resumed session skips client-certificate verification entirely. A freshly revoked node could have reconnected forever on old tickets. The server config now disables resumption (`NoServerSessionStorage`, zero tickets) — cluster connections are few and long-lived, so paying for a full handshake each time is nothing next to a revocation that doesn't revoke.
 
 ## Egress DNS resolution
 

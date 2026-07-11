@@ -200,7 +200,7 @@ impl RaftNetwork<TypeConfig> for InMemoryRaftNetwork {
 // ---------------------------------------------------------------------------
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Maximum Raft RPC payload size (64 MiB — snapshots can be large).
 const MAX_RAFT_RPC_SIZE: usize = 64 * 1024 * 1024;
@@ -221,8 +221,8 @@ pub enum RaftRpcResponse {
     InstallSnapshot(InstallSnapshotResponse<u64>),
 }
 
-/// Read a length-prefixed bincode frame from a TCP stream.
-async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+/// Read a length-prefixed frame from any byte stream (plain TCP or TLS).
+async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.ok()?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -235,26 +235,31 @@ async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
     Some(payload)
 }
 
-/// Write a length-prefixed bincode frame to a TCP stream.
-async fn write_frame(stream: &mut tokio::net::TcpStream, data: &[u8]) -> Result<(), String> {
+/// Write a length-prefixed frame to any byte stream (plain TCP or TLS).
+async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<(), String> {
     let len_bytes = (data.len() as u32).to_be_bytes();
     stream
         .write_all(&len_bytes)
         .await
         .map_err(|e| e.to_string())?;
     stream.write_all(data).await.map_err(|e| e.to_string())?;
+    // TLS buffers until flushed; a plain TCP stream flushes on write.
+    stream.flush().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Serve Raft RPCs over TCP.
+/// Serve Raft RPCs over TCP, optionally wrapped in mTLS.
 ///
 /// Accepts connections on `listener`, reads one RPC per connection,
 /// dispatches to the local `raft` instance, and writes the response.
+/// When `tls` is `Some`, every connection must complete an mTLS handshake
+/// (the peer presents a client certificate) before its frame is read.
 /// Runs until `shutdown` is cancelled.
 pub async fn serve_raft_rpc(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
     shutdown: tokio_util::sync::CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) {
     loop {
         tokio::select! {
@@ -263,7 +268,21 @@ pub async fn serve_raft_rpc(
                 match result {
                     Ok((stream, _peer)) => {
                         let raft = raft.clone();
-                        tokio::spawn(handle_raft_rpc(stream, raft));
+                        match tls.clone() {
+                            Some(acceptor) => {
+                                tokio::spawn(async move {
+                                    // A failed handshake (no/invalid/revoked
+                                    // client cert) is dropped silently — a
+                                    // rejected peer must not learn why.
+                                    if let Ok(tls_stream) = acceptor.accept(stream).await {
+                                        handle_raft_rpc(tls_stream, raft).await;
+                                    }
+                                });
+                            }
+                            None => {
+                                tokio::spawn(handle_raft_rpc(stream, raft));
+                            }
+                        }
                     }
                     Err(_) => continue,
                 }
@@ -272,8 +291,8 @@ pub async fn serve_raft_rpc(
     }
 }
 
-/// Handle a single Raft RPC connection.
-async fn handle_raft_rpc(mut stream: tokio::net::TcpStream, raft: Raft<TypeConfig>) {
+/// Handle a single Raft RPC connection over any byte stream.
+async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, raft: Raft<TypeConfig>) {
     let Some(payload) = read_frame(&mut stream).await else {
         return;
     };
@@ -314,24 +333,39 @@ pub struct TcpRaftNetworkFactory {
     #[allow(dead_code)]
     source_id: u64,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    /// When set, peers are dialled over mTLS. `None` keeps plaintext TCP.
+    tls: Option<tokio_rustls::TlsConnector>,
 }
 
 impl fmt::Debug for TcpRaftNetworkFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TcpRaftNetworkFactory")
             .field("source_id", &self.source_id)
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
 
 impl TcpRaftNetworkFactory {
-    /// Create a new factory for a specific source node.
+    /// Create a new plaintext factory for a specific source node.
     pub fn new(source_id: u64) -> Self {
         Self {
             source_id,
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            tls: None,
+        }
+    }
+
+    /// Create a factory that dials peers over mTLS.
+    pub fn new_tls(source_id: u64, connector: tokio_rustls::TlsConnector) -> Self {
+        Self {
+            source_id,
+            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            tls: Some(connector),
         }
     }
 
@@ -350,14 +384,16 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
         TcpRaftNetwork {
             target_addr: node.addr,
             blocklist: std::sync::Arc::clone(&self.blocklist),
+            tls: self.tls.clone(),
         }
     }
 }
 
-/// A single TCP connection to a Raft peer.
+/// A single connection to a Raft peer (plain TCP or mTLS).
 pub struct TcpRaftNetwork {
     target_addr: SocketAddr,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    tls: Option<tokio_rustls::TlsConnector>,
 }
 
 impl fmt::Debug for TcpRaftNetwork {
@@ -393,11 +429,32 @@ impl TcpRaftNetwork {
         let payload = serde_json::to_vec(&rpc)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
 
-        let mut stream = tokio::net::TcpStream::connect(self.target_addr)
+        let tcp = tokio::net::TcpStream::connect(self.target_addr)
             .await
             .map_err(|e| Unreachable::new(&RouterError(format!("connect: {e}"))))?;
 
-        write_frame(&mut stream, &payload)
+        match &self.tls {
+            Some(connector) => {
+                // The pinned server verifier ignores the name, but rustls
+                // still requires a syntactically valid one.
+                let server_name =
+                    rustls::pki_types::ServerName::IpAddress(self.target_addr.ip().into());
+                let stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| Unreachable::new(&RouterError(format!("tls: {e}"))))?;
+                Self::exchange(stream, &payload).await
+            }
+            None => Self::exchange(tcp, &payload).await,
+        }
+    }
+
+    /// Write one frame and read the response over an established stream.
+    async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        payload: &[u8],
+    ) -> Result<RaftRpcResponse, Unreachable> {
+        write_frame(&mut stream, payload)
             .await
             .map_err(|e| Unreachable::new(&RouterError(format!("write: {e}"))))?;
 

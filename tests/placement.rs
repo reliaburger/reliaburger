@@ -70,6 +70,7 @@ async fn start_node(
             data_dir,
             mayo: Some(mayo),
             rollup_interval: Duration::from_millis(500),
+            identity: None,
         },
         shutdown.clone(),
     )
@@ -163,6 +164,7 @@ async fn start_node(
             None,
             cmd_tx.clone(),
             shutdown.clone(),
+            reliaburger::cluster::ClusterHttp::plaintext(),
         );
     }
 
@@ -230,6 +232,7 @@ async fn start_node(
             snapshot_rx: mpsc::channel(1).1,
             wrapping_ikm: None,
             partition_blocklists: Default::default(),
+            crl_handle: Default::default(),
         },
         thinks_leader: leader_rx,
         rollup_store,

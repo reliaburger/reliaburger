@@ -369,11 +369,24 @@ security enforcement → correctness under failure → features & docs.
 - [ ] **AuthZ enforcement & bootstrap lockdown** — scope checks in reusable extractors
   (namespace/app-scoped tokens actually constrain); refuse non-loopback API binds until
   bootstrap completes; scoped-token integration tests (`H4`/`D8`, part of `H5`)
-- [ ] **Transport security** — mTLS on Raft, reporting and API listeners; registry auth/TLS;
-  CRL/expiry checks at connect time (`H5`/`D4`, `C5(b)`, `L17` — the Stage 3b deferrals)
-- [ ] **Dashboard security boundary** — authenticate Brioche or make it an explicitly redacted
+- [~] **Transport security** — mTLS on Raft, reporting and API listeners; registry auth/TLS;
+  CRL/expiry checks at connect time (`H5`/`D4`, `C5(b)`, `L17` — the Stage 3b deferrals).
+  **Mostly done** (Jul 2026, 9 commits): node identity persisted (`sesame::identity_store`,
+  written by `relish init`, delivered to joiners via a `JoinBundle` with TOFU fingerprint);
+  handshake-true mTLS configs with Node-CA-pinned client verifier (PKI2) + live `CrlHandle`;
+  **mTLS on Raft RPC, reporting and the agent API** (API optional client auth so relish/browsers
+  use bearer/cookie over TLS; peer calls via a shared `ClusterHttp`); `[security] require_mtls`
+  mode matrix; `relish --ca-cert`. `L17` CRL enforced in `verify_keyless` (image signatures).
+  **Remaining:** Pickle registry auth/TLS (separate listener/theme); connection-time cert-expiry
+  checks; per-node-id binding on peer certs (PKI3). Design plan in the session plan file.
+- [~] **Dashboard security boundary** — authenticate Brioche or make it an explicitly redacted
   status surface; never render plain env values; browser token flow for logs/metrics panels;
-  real node-detail data (`H6`/`D19`)
+  real node-detail data (`H6`/`D19`). **Mostly done** (Jul 2026): read-only session cookies
+  (`sesame::session`, `POST /ui/session` → HttpOnly/SameSite=Strict; a session is always
+  ReadOnly even for an admin token); `/` + `/ui/*` moved behind auth with a login page; browser
+  cookie flow covers HTMX fragments + metrics + SSE logs; encrypted env values already masked.
+  **Remaining:** replace hard-coded node-detail data with authoritative values; env-value XSS
+  in single-quoted chart attrs (AUTH8).
 - [ ] **Process-workload policy enforcement** — pass the configured `[process_workloads]`
   policy into the supervisor; enforce allowlist + `mount_isolation` before OCI spec
   generation (`H8`/`D17`, backlog `M23`)

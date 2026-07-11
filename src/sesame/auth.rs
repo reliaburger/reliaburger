@@ -38,6 +38,9 @@ pub struct AuthState {
     /// The cluster's internal service token, accepted as the system principal.
     /// `None` in single-node mode (no master key).
     pub service_token: Option<String>,
+    /// Browser sessions, exchanged for a token at `POST /ui/session`. A valid
+    /// session cookie authenticates a request as a read-only principal.
+    pub sessions: super::session::SessionStore,
 }
 
 impl AuthState {
@@ -46,6 +49,7 @@ impl AuthState {
         Self {
             tokens,
             service_token,
+            sessions: super::session::SessionStore::new(),
         }
     }
 }
@@ -130,7 +134,7 @@ fn system_context() -> AuthContext {
 /// token byte-by-byte through response timing. The length is not secret (all
 /// tokens share the fixed `rbrg_` + 64-hex shape), so an early length check is
 /// fine; the byte comparison itself is constant-time.
-fn tokens_equal(a: &str, b: &str) -> bool {
+pub(crate) fn tokens_equal(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;
@@ -178,17 +182,59 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let Some(bearer_token) = bearer else {
-        return (StatusCode::UNAUTHORIZED, "missing authorization header").into_response();
-    };
-
-    match authenticate(bearer_token, &tokens) {
-        Ok(ctx) => {
-            request.extensions_mut().insert(ctx);
-            next.run(request).await
-        }
-        Err((status, msg)) => (status, msg).into_response(),
+    if let Some(bearer_token) = bearer {
+        return match authenticate(bearer_token, &tokens) {
+            Ok(ctx) => {
+                request.extensions_mut().insert(ctx);
+                next.run(request).await
+            }
+            Err((status, msg)) => (status, msg).into_response(),
+        };
     }
+
+    // No bearer: fall back to a browser session cookie. A valid session
+    // authenticates as a read-only principal (see `session` module).
+    let session_id = request
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(super::session::session_id_from_cookie_header)
+        .map(str::to_string);
+    if let Some(id) = session_id
+        && let Some(token_name) = state.sessions.validate(&id).await
+    {
+        request
+            .extensions_mut()
+            .insert(readonly_session_context(&token_name));
+        return next.run(request).await;
+    }
+
+    // Unauthenticated. A browser navigating to a page gets redirected to the
+    // login form; an API client gets a plain 401.
+    if wants_html(&request) {
+        return axum::response::Redirect::to("/ui/login").into_response();
+    }
+    (StatusCode::UNAUTHORIZED, "missing authorization header").into_response()
+}
+
+/// The `AuthContext` for a browser session: always read-only, so a request
+/// riding a stolen or forged cookie can read the dashboard but never mutate.
+fn readonly_session_context(token_name: &str) -> AuthContext {
+    AuthContext {
+        token_name: token_name.to_string(),
+        role: ApiRole::ReadOnly,
+        scoped_apps: None,
+        scoped_namespaces: None,
+    }
+}
+
+/// Whether the request prefers an HTML response (a browser navigation).
+fn wants_html(request: &Request) -> bool {
+    request
+        .headers()
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"))
 }
 
 /// Role check for handlers that receive an optional `AuthContext`.
@@ -361,6 +407,18 @@ mod tests {
             .status()
     }
 
+    /// Send a request with the given headers, returning the whole response.
+    async fn respond(router: Router, headers: &[(&str, &str)]) -> Response {
+        let mut req = axum::http::Request::builder().uri("/x");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        router
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn middleware_bypasses_when_no_user_tokens() {
         let state = AuthState::new(new_token_store(), Some("rbrg_service".to_string()));
@@ -386,6 +444,46 @@ mod tests {
         let state = AuthState::new(store, Some("rbrg_service".to_string()));
         let status = status_of(guarded_router(state), Some("Bearer rbrg_nope")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_valid_session_cookie_authenticates_when_a_token_exists() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store, Some("rbrg_service".to_string()));
+        let id = state.sessions.create("u").await;
+
+        let cookie = format!("rb_session={id}");
+        let status = respond(guarded_router(state), &[("cookie", &cookie)])
+            .await
+            .status();
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_session_cookie_is_rejected() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store, Some("rbrg_service".to_string()));
+
+        let status = respond(guarded_router(state), &[("cookie", "rb_session=deadbeef")])
+            .await
+            .status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_html_request_redirects_to_login() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store, Some("rbrg_service".to_string()));
+
+        let resp = respond(guarded_router(state), &[("accept", "text/html")]).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(resp.headers().get("location").unwrap(), "/ui/login");
     }
 
     #[test]

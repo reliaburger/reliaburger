@@ -91,6 +91,10 @@ pub struct ClusterParams {
     pub mayo: Option<Arc<tokio::sync::RwLock<crate::mayo::store::MayoStore>>>,
     /// How often the rollup worker pushes (from `[metrics] rollup_interval_secs`).
     pub rollup_interval: Duration,
+    /// This node's mTLS identity. When set, the Raft RPC listener requires
+    /// client certificates and peers are dialled over mTLS. `None` keeps the
+    /// internal transports plaintext (the caller enforces `require_mtls`).
+    pub identity: Option<Arc<crate::sesame::identity_store::NodeIdentity>>,
 }
 
 /// Start gossip + the Raft council and return a `ClusterHandle` plus a
@@ -162,7 +166,37 @@ pub async fn start(
     let state_machine = CouncilStateMachine::with_store(snapshot_db)
         .map_err(|e| std::io::Error::other(format!("raft snapshot store load failed: {e}")))?;
 
-    let factory = TcpRaftNetworkFactory::new(raft_id);
+    // Build the shared CRL handle (seeded from the bootstrap security state
+    // if present) and, when this node has an identity, the mTLS acceptor and
+    // connector for the internal transports. bun's security refresh ticker
+    // updates `crl_handle` as `RevokeCertificate` entries replicate.
+    let crl_handle = crate::sesame::mtls::CrlHandle::new(
+        params
+            .bootstrap_security_state
+            .as_ref()
+            .map(|s| s.crl.clone())
+            .unwrap_or_default(),
+    );
+    let (raft_acceptor, raft_connector) = match &params.identity {
+        Some(identity) => {
+            let server =
+                crate::sesame::mtls::build_mtls_server_config(identity, crl_handle.clone())
+                    .map_err(|e| std::io::Error::other(format!("mTLS server config: {e}")))?;
+            let client =
+                crate::sesame::mtls::build_mtls_client_config(identity, crl_handle.clone())
+                    .map_err(|e| std::io::Error::other(format!("mTLS client config: {e}")))?;
+            (
+                Some(tokio_rustls::TlsAcceptor::from(server)),
+                Some(tokio_rustls::TlsConnector::from(client)),
+            )
+        }
+        None => (None, None),
+    };
+
+    let factory = match raft_connector.clone() {
+        Some(connector) => TcpRaftNetworkFactory::new_tls(raft_id, connector),
+        None => TcpRaftNetworkFactory::new(raft_id),
+    };
     // Same for the Raft RPC blocklist — a partition must cut both the
     // gossip and Raft transports or SWIM half-detects the peer.
     let raft_blocklist = factory.blocklist();
@@ -221,8 +255,9 @@ pub async fn start(
     let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
     let raft = council.raft().clone();
     let rpc_shutdown = shutdown.clone();
+    let rpc_acceptor = raft_acceptor.clone();
     tokio::spawn(async move {
-        serve_raft_rpc(raft_listener, raft, rpc_shutdown).await;
+        serve_raft_rpc(raft_listener, raft, rpc_shutdown, rpc_acceptor).await;
     });
 
     // Bootstrap ONLY a genuinely new cluster: no seeds AND a fresh durable
@@ -266,9 +301,14 @@ pub async fn start(
     // Aggregator: every node listens, but only the leader actually receives
     // reports (workers target the leader), so a leadership change needs no
     // start/stop dance — the new leader's aggregator is already running.
-    let agg_transport = TcpReportingTransport::bind(reporting_addr, shutdown.clone())
-        .await
-        .map_err(|e| std::io::Error::other(format!("reporting bind failed: {e}")))?;
+    let agg_transport = TcpReportingTransport::bind_tls(
+        reporting_addr,
+        shutdown.clone(),
+        raft_acceptor.clone(),
+        raft_connector.clone(),
+    )
+    .await
+    .map_err(|e| std::io::Error::other(format!("reporting bind failed: {e}")))?;
     // The rollup store lives on every node (cheap when empty) so a
     // leadership change needs no start/stop dance — only the leader's
     // aggregator actually receives rollups to ingest into it.
@@ -296,9 +336,11 @@ pub async fn start(
     // Worker: snapshots this node's state (via the agent) and sends it to the
     // leader. Binds an ephemeral port — it only sends; replies are ignored.
     let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
-    let worker_transport = TcpReportingTransport::bind(
+    let worker_transport = TcpReportingTransport::bind_tls(
         SocketAddr::new(params.gossip_addr.ip(), 0),
         shutdown.clone(),
+        raft_acceptor.clone(),
+        raft_connector.clone(),
     )
     .await
     .map_err(|e| std::io::Error::other(format!("reporting worker bind failed: {e}")))?;
@@ -316,9 +358,11 @@ pub async fn start(
     // Rollup worker: pushes this node's metric rollups to the leader,
     // where the aggregator ingests them into the rollup store.
     if let Some(mayo) = params.mayo.clone() {
-        let rollup_transport = TcpReportingTransport::bind(
+        let rollup_transport = TcpReportingTransport::bind_tls(
             SocketAddr::new(params.gossip_addr.ip(), 0),
             shutdown.clone(),
+            raft_acceptor.clone(),
+            raft_connector.clone(),
         )
         .await
         .map_err(|e| std::io::Error::other(format!("rollup worker bind failed: {e}")))?;
@@ -344,6 +388,7 @@ pub async fn start(
             raft: Some(raft_blocklist),
             raft_port_offset: port_offset,
         },
+        crl_handle,
     };
 
     Ok((

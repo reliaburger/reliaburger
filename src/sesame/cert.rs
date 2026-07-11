@@ -172,6 +172,15 @@ pub fn check_crl(
     Ok(())
 }
 
+/// Extract the serial number from a DER certificate.
+///
+/// Reliaburger serials come from `SecurityState.next_serial`, a monotonic
+/// `u64` allocator, so the big-endian fold in `parse_certificate` is lossless.
+pub fn serial_from_der(der: &[u8]) -> Result<SerialNumber, CertError> {
+    let parsed = parse_certificate(der)?;
+    Ok(SerialNumber(parsed.serial))
+}
+
 /// Encode a DER certificate to PEM format.
 pub fn der_to_pem(der: &[u8], label: &str) -> String {
     let p = ::pem::Pem::new(label, der.to_vec());
@@ -251,6 +260,21 @@ mod tests {
     fn check_validity_on_fresh_cert() {
         let root = ca::generate_root_ca("test", SerialNumber(1)).unwrap();
         check_validity(&root.ca.certificate_der).unwrap();
+    }
+
+    #[test]
+    fn serial_from_der_reads_the_serial_rcgen_wrote() {
+        let hierarchy = ca::generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (cert_der, _key_der, serial) = ca::issue_node_cert(
+            "node-01",
+            SerialNumber(42),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+
+        assert_eq!(serial, SerialNumber(42));
+        assert_eq!(serial_from_der(&cert_der).unwrap(), SerialNumber(42));
     }
 
     #[test]

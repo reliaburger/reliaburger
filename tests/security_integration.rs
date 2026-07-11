@@ -223,3 +223,123 @@ fn crl_empty_allows_all() {
     let result = cert::check_crl(SerialNumber(1), &crl);
     assert!(result.is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Join ceremony over HTTP: a joiner fetches and persists its identity
+// ---------------------------------------------------------------------------
+
+/// A minimal issuer endpoint: it mirrors the agent's `handle_join_issue`
+/// core — validate the token, issue a cert, return the bundle as JSON.
+async fn spawn_issuer(
+    state: SecurityState,
+    ikm: [u8; 32],
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, extract::State, routing::post};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Issuer {
+        state: Arc<Mutex<SecurityState>>,
+        ikm: [u8; 32],
+    }
+
+    async fn issue(
+        State(issuer): State<Issuer>,
+        Json(body): Json<serde_json::Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let token = body["token"].as_str().unwrap_or_default();
+        let node_id = body["node_id"].as_str().unwrap_or_default();
+        let mut state = issuer.state.lock().unwrap();
+        match join::validate_and_issue(token, node_id, &mut state, &issuer.ikm) {
+            Ok(result) => Json(join::JoinBundle::from_result(&result)).into_response(),
+            Err(e) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+        }
+    }
+
+    let issuer = Issuer {
+        state: Arc::new(Mutex::new(state)),
+        ikm,
+    };
+    let app = Router::new()
+        .route("/v1/cluster/join", post(issue))
+        .with_state(issuer);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}/v1/cluster/join"), handle)
+}
+
+#[tokio::test]
+async fn joiner_persists_the_identity_returned_by_a_remote_member() {
+    let (state, token, ikm) = bootstrap_security_state();
+    let (url, server) = spawn_issuer(state, ikm).await;
+
+    let client = reqwest::Client::new();
+    let identity = join::request_join(&client, &url, &token, "node-02", None)
+        .await
+        .expect("join should succeed");
+    assert_eq!(identity.node_id, "node-02");
+
+    // Persist and reload, proving the round trip lands on disk usable.
+    let dir = tempfile::tempdir().unwrap();
+    reliaburger::sesame::identity_store::save(dir.path(), &identity).unwrap();
+    let loaded = reliaburger::sesame::identity_store::load(dir.path())
+        .unwrap()
+        .unwrap();
+    cert::validate_chain(
+        &loaded.certificate_der,
+        &loaded.node_ca_der,
+        &loaded.root_ca_der,
+    )
+    .unwrap();
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn joiner_refuses_a_member_with_the_wrong_root_ca_fingerprint() {
+    let (state, token, ikm) = bootstrap_security_state();
+    let (url, server) = spawn_issuer(state, ikm).await;
+
+    let client = reqwest::Client::new();
+    let err = join::request_join(
+        &client,
+        &url,
+        &token,
+        "node-02",
+        Some("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
+    )
+    .await
+    .expect_err("a fingerprint mismatch must be refused");
+    assert!(
+        matches!(err, join::JoinClientError::FingerprintMismatch { .. }),
+        "got: {err:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn joiner_rejects_a_bad_join_token() {
+    let (state, _token, ikm) = bootstrap_security_state();
+    let (url, server) = spawn_issuer(state, ikm).await;
+
+    let client = reqwest::Client::new();
+    let err = join::request_join(&client, &url, "not-a-real-token", "node-02", None)
+        .await
+        .expect_err("a bad token must be rejected");
+    assert!(
+        matches!(err, join::JoinClientError::Rejected(_)),
+        "got: {err:?}"
+    );
+
+    server.abort();
+}

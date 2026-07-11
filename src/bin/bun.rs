@@ -110,6 +110,16 @@ fn cluster_params_from_config(
         })
         .transpose()?;
 
+    // Only feed the identity into the runtime when mTLS is actually
+    // requested. Otherwise a node that merely has an identity on disk would
+    // silently run mTLS transports while the mode-matrix warning says it is
+    // plaintext. The identity is still loaded separately for that warning.
+    let identity = if config.security.require_mtls {
+        load_node_identity(config)?
+    } else {
+        None
+    };
+
     Ok(reliaburger::cluster::runtime::ClusterParams {
         node_name,
         gossip_addr,
@@ -124,7 +134,94 @@ fn cluster_params_from_config(
         // caller sets it before starting the runtime.
         mayo: None,
         rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
+        identity,
     })
+}
+
+/// The directory this node reads/writes its identity from: the configured
+/// `[security] identity_dir`, or `{storage.data}/identity` by default.
+fn node_identity_dir(config: &NodeConfig) -> std::path::PathBuf {
+    config
+        .security
+        .identity_dir
+        .clone()
+        .unwrap_or_else(|| reliaburger::sesame::identity_store::identity_dir(&config.storage.data))
+}
+
+/// Load this node's mTLS identity from disk, if one has been installed.
+fn load_node_identity(
+    config: &NodeConfig,
+) -> anyhow::Result<Option<std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>>> {
+    use anyhow::Context;
+    let dir = node_identity_dir(config);
+    let identity = reliaburger::sesame::identity_store::load(&dir)
+        .with_context(|| format!("failed to load node identity from {}", dir.display()))?;
+    Ok(identity.map(std::sync::Arc::new))
+}
+
+/// Serve an axum router over TLS, handshaking each connection in its own task
+/// (a slow handshaker never blocks the accept loop). Mirrors the wrapper's
+/// ingress TLS loop; runs until `shutdown` is cancelled.
+async fn serve_api_over_tls(
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    router: axum::Router,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use tower::Service;
+    let mut make_service = router.into_make_service();
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            accepted = listener.accept() => {
+                let Ok((tcp, _peer)) = accepted else { continue };
+                let acceptor = acceptor.clone();
+                let service = match make_service.call(()).await {
+                    Ok(service) => service,
+                    Err(infallible) => match infallible {},
+                };
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    let hyper_service = hyper_util::service::TowerToHyperService::new(service);
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection_with_upgrades(
+                        hyper_util::rt::TokioIo::new(tls),
+                        hyper_service,
+                    )
+                    .await;
+                });
+            }
+        }
+    }
+}
+
+/// Enforce the `require_mtls` mode matrix before the cluster starts.
+///
+/// With `require_mtls` set and no identity on disk, the node cannot speak the
+/// internal transports, so it refuses to start. The message differs by role:
+/// a bootstrap node (no seeds) needs `relish init`; a joiner (seeds set) needs
+/// `relish join` and a restart.
+fn enforce_mtls_mode(
+    config: &NodeConfig,
+    params: &reliaburger::cluster::runtime::ClusterParams,
+) -> anyhow::Result<()> {
+    if !config.security.require_mtls || params.identity.is_some() {
+        return Ok(());
+    }
+    let dir = node_identity_dir(config).display().to_string();
+    if params.seeds.is_empty() {
+        anyhow::bail!(
+            "[security] require_mtls is set but no identity was found at {dir}: \
+             run `relish init` on the bootstrap node first"
+        );
+    }
+    anyhow::bail!(
+        "[security] require_mtls is set but this node has no identity yet at {dir}: \
+         run `relish join --token <token> --node-id {} <member-api-url>` to enrol, then restart bun",
+        params.node_name
+    );
 }
 
 /// Schedulable node capacity: system totals minus the `[resources]`
@@ -329,6 +426,13 @@ async fn main() -> anyhow::Result<()> {
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
     let mut api_council: Option<Arc<reliaburger::council::CouncilNode>> = None;
+    // Shared CRL for the internal mTLS verifiers, refreshed from Raft state.
+    let mut crl_refresh: Option<reliaburger::sesame::mtls::CrlHandle> = None;
+    // This node's mTLS identity, when the cluster runs mTLS. Drives the API
+    // listener TLS and the cluster HTTP client (peer calls over https).
+    let mut api_identity: Option<
+        std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>,
+    > = None;
     // The leader-side rollup store, exposed at /v1/metrics/cluster.
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
@@ -342,6 +446,27 @@ async fn main() -> anyhow::Result<()> {
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
+
+        // Mode matrix: with require_mtls set, a node must have an identity on
+        // disk before it can speak the internal transports. Refuse to start
+        // otherwise, with the command that fixes it.
+        enforce_mtls_mode(&config, &params)?;
+        api_identity = params.identity.clone();
+        if params.identity.is_some() {
+            println!("bun: mTLS enabled on the Raft RPC, reporting and API transports");
+        } else if config.security.require_mtls {
+            unreachable!("enforce_mtls_mode rejects require_mtls without an identity");
+        } else if reliaburger::sesame::identity_store::load(&node_identity_dir(&config))
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            eprintln!(
+                "bun: warning — a node identity is present but [security] require_mtls is false; \
+                 internal transports stay plaintext. Set require_mtls = true to enable mTLS."
+            );
+        }
+
         println!(
             "bun: cluster mode — gossip on {}, {} seed(s)",
             params.gossip_addr,
@@ -353,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
+        crl_refresh = Some(handle.crl_handle.clone());
         // Cloned before the handle moves into the agent: the pickle
         // replication loop derives its peer list from gossip.
         replication_membership = Some(handle.membership_rx.clone());
@@ -367,6 +493,17 @@ async fn main() -> anyhow::Result<()> {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
     };
+    // How this node reaches peer agent APIs: https + CA trust under mTLS,
+    // plain http otherwise. Shared by the API fan-out, batch/build dispatch,
+    // placement reconciler and upgrade orchestrator.
+    let cluster_http = match &api_identity {
+        Some(identity) => reliaburger::cluster::ClusterHttp::secure(
+            reliaburger::sesame::mtls::build_cluster_http_client(identity)
+                .map_err(|e| anyhow::anyhow!("failed to build cluster HTTP client: {e}"))?,
+        ),
+        None => reliaburger::cluster::ClusterHttp::plaintext(),
+    };
+
     // Batch scheduling (F1) reads capacities from the same aggregated
     // view the deploy scheduler uses; None standalone.
     let api_aggregated_rx = orchestration.as_ref().map(|(_, _, rx)| rx.clone());
@@ -506,6 +643,7 @@ async fn main() -> anyhow::Result<()> {
                 service_token.clone(),
                 cmd_tx.clone(),
                 shutdown.clone(),
+                cluster_http.clone(),
             );
         }
     }
@@ -513,8 +651,10 @@ async fn main() -> anyhow::Result<()> {
     // Rolling-upgrade orchestrator: dormant unless this node is the Raft
     // leader with an active upgrade in DesiredState (Phase 14).
     if let Some(council) = api_council.clone() {
-        let control =
-            reliaburger::upgrade::orchestrator::HttpNodeControl::new(service_token.clone());
+        let control = reliaburger::upgrade::orchestrator::HttpNodeControl::with_http(
+            service_token.clone(),
+            cluster_http.clone(),
+        );
         let orchestrator_cancel = shutdown.clone();
         let orchestrator_node = node_name.clone();
         tokio::spawn(async move {
@@ -535,16 +675,27 @@ async fn main() -> anyhow::Result<()> {
     let api_token_store = if let Some(council) = &api_council {
         let store = reliaburger::sesame::auth::new_token_store();
         refresh_token_store(&store, council).await;
+        if let Some(crl) = &crl_refresh {
+            crl.update(council.security_state().await.crl);
+        }
 
         let refresh_store = Arc::clone(&store);
         let refresh_council = Arc::clone(council);
         let refresh_shutdown = shutdown.clone();
+        let refresh_crl = crl_refresh.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = refresh_shutdown.cancelled() => break,
-                    _ = ticker.tick() => refresh_token_store(&refresh_store, &refresh_council).await,
+                    _ = ticker.tick() => {
+                        refresh_token_store(&refresh_store, &refresh_council).await;
+                        // Same tick refreshes the CRL so a revoked peer is
+                        // refused on its next handshake (≤5 s lag).
+                        if let Some(crl) = &refresh_crl {
+                            crl.update(refresh_council.security_state().await.crl);
+                        }
+                    }
                 }
             }
         });
@@ -920,15 +1071,34 @@ async fn main() -> anyhow::Result<()> {
         api_aggregated_rx.clone(),
         Some(node_name.clone()),
         config.images.build_timeout_secs,
+        cluster_http.clone(),
     );
     let server_shutdown = shutdown.clone();
+    // Serve the API over TLS when this node has an mTLS identity; the listener
+    // accepts client certs optionally, so relish and browsers connect with a
+    // bearer token / cookie over TLS while node-to-node calls may present a
+    // node cert.
+    let api_acceptor = match &api_identity {
+        Some(identity) => {
+            let crl = crl_refresh.clone().unwrap_or_default();
+            let cfg = reliaburger::sesame::mtls::build_api_server_config(identity, crl)
+                .map_err(|e| anyhow::anyhow!("failed to build API TLS config: {e}"))?;
+            Some(tokio_rustls::TlsAcceptor::from(cfg))
+        }
+        None => None,
+    };
     let server_handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                server_shutdown.cancelled().await;
-            })
-            .await
-            .ok();
+        match api_acceptor {
+            Some(acceptor) => serve_api_over_tls(listener, acceptor, app, server_shutdown).await,
+            None => {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        server_shutdown.cancelled().await;
+                    })
+                    .await
+                    .ok();
+            }
+        }
     });
 
     // Spawn alert evaluation + webhook dispatch task
@@ -1417,5 +1587,53 @@ mod tests {
         let tokens = store.read().await;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].name, "ci");
+    }
+
+    /// A config with require_mtls but no identity on disk.
+    fn mtls_config_without_identity() -> (NodeConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.security.require_mtls = true;
+        // Point the data dir at an empty temp dir so no identity is found.
+        config.storage.data = dir.path().to_path_buf();
+        (config, dir)
+    }
+
+    #[test]
+    fn require_mtls_without_identity_refuses_to_bootstrap() {
+        let (config, _dir) = mtls_config_without_identity();
+        let params = cluster_params_from_config(&config).unwrap();
+        assert!(params.identity.is_none());
+        assert!(params.seeds.is_empty(), "bootstrap node has no seeds");
+
+        let err = enforce_mtls_mode(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("relish init"),
+            "bootstrap error should point at `relish init`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn require_mtls_without_identity_tells_a_joiner_to_enrol() {
+        let (mut config, _dir) = mtls_config_without_identity();
+        config.cluster.join = vec!["127.0.0.1:9443".to_string()];
+        let params = cluster_params_from_config(&config).unwrap();
+        assert!(!params.seeds.is_empty(), "joiner has a seed");
+
+        let err = enforce_mtls_mode(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("relish join"),
+            "joiner error should point at `relish join`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_mode_accepts_a_bootstrap_node_without_mtls_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = dir.path().to_path_buf();
+        // require_mtls defaults to false — plaintext is allowed.
+        let params = cluster_params_from_config(&config).unwrap();
+        assert!(enforce_mtls_mode(&config, &params).is_ok());
     }
 }

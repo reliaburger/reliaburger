@@ -123,3 +123,124 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
 
     shutdown.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// mTLS reporting
+// ---------------------------------------------------------------------------
+
+use reliaburger::sesame::ca::{self, CaHierarchy};
+use reliaburger::sesame::identity_store::NodeIdentity;
+use reliaburger::sesame::mtls::CrlHandle;
+use reliaburger::sesame::types::SerialNumber;
+
+fn identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> NodeIdentity {
+    let (cert_der, key_der, serial) = ca::issue_node_cert(
+        node_id,
+        SerialNumber(serial),
+        &hierarchy.node.signing_keypair,
+        &hierarchy.node.certificate_params,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now();
+    NodeIdentity {
+        node_id: node_id.to_string(),
+        certificate_der: cert_der,
+        private_key_der: key_der,
+        serial,
+        ca_generation: 0,
+        node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+        root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+        not_before: now,
+        not_after: now + Duration::from_secs(365 * 24 * 3600),
+    }
+}
+
+fn tls_pair(id: &NodeIdentity) -> (tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector) {
+    let crl = CrlHandle::default();
+    let server = reliaburger::sesame::mtls::build_mtls_server_config(id, crl.clone()).unwrap();
+    let client = reliaburger::sesame::mtls::build_mtls_client_config(id, crl).unwrap();
+    (
+        tokio_rustls::TlsAcceptor::from(server),
+        tokio_rustls::TlsConnector::from(client),
+    )
+}
+
+/// Spawn an aggregator + one worker and return whether the aggregator sees the
+/// worker's report within the deadline. `worker_tls` being `None` means the
+/// worker dials plaintext.
+async fn report_arrives(
+    agg_tls: Option<(tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector)>,
+    worker_tls: Option<(tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector)>,
+    deadline: Duration,
+) -> bool {
+    let shutdown = CancellationToken::new();
+
+    let (agg_acc, agg_con) = match agg_tls {
+        Some((a, c)) => (Some(a), Some(c)),
+        None => (None, None),
+    };
+    let agg_transport =
+        TcpReportingTransport::bind_tls(local(0), shutdown.clone(), agg_acc, agg_con)
+            .await
+            .unwrap();
+    let agg_addr = agg_transport.local_addr();
+    let (mut aggregator, watch_rx) =
+        ReportAggregator::new(agg_transport, fast_config(), shutdown.clone(), None);
+    tokio::spawn(async move { aggregator.run().await });
+
+    let (w_acc, w_con) = match worker_tls {
+        Some((a, c)) => (Some(a), Some(c)),
+        None => (None, None),
+    };
+    let transport = TcpReportingTransport::bind_tls(local(0), shutdown.clone(), w_acc, w_con)
+        .await
+        .unwrap();
+    let (snap_tx, snap_rx) = mpsc::channel(16);
+    spawn_fake_agent(snap_rx, shutdown.clone());
+    let council = vec![(NodeId::new("agg"), agg_addr)];
+    let (_council_tx, council_rx) = watch::channel(council);
+    let mut worker = ReportWorker::new(
+        NodeId::new("w1"),
+        transport,
+        fast_config(),
+        snap_tx,
+        council_rx,
+        shutdown.clone(),
+    );
+    tokio::spawn(async move { worker.run().await });
+
+    let end = tokio::time::Instant::now() + deadline;
+    let mut arrived = false;
+    while tokio::time::Instant::now() < end {
+        if watch_rx.borrow().reports.contains_key(&NodeId::new("w1")) {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    shutdown.cancel();
+    arrived
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reporting_round_trips_over_mtls() {
+    let hierarchy = ca::generate_ca_hierarchy("reporting-test", b"ikm").unwrap();
+    let agg = tls_pair(&identity(&hierarchy, "agg", 10));
+    let worker = tls_pair(&identity(&hierarchy, "w1", 11));
+
+    assert!(
+        report_arrives(Some(agg), Some(worker), Duration::from_secs(10)).await,
+        "an mTLS worker's report should reach the mTLS aggregator"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reporting_listener_refuses_a_plaintext_worker_when_mtls_is_required() {
+    let hierarchy = ca::generate_ca_hierarchy("reporting-test", b"ikm").unwrap();
+    let agg = tls_pair(&identity(&hierarchy, "agg", 10));
+
+    assert!(
+        !report_arrives(Some(agg), None, Duration::from_secs(3)).await,
+        "a plaintext worker must not report to an mTLS aggregator"
+    );
+}

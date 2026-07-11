@@ -123,11 +123,16 @@ pub enum AgentCommand {
     Council {
         response: oneshot::Sender<CouncilStatus>,
     },
-    /// Join an existing cluster.
-    Join {
+    /// Issue a node certificate for a joining node (issuer side).
+    ///
+    /// An existing cluster member receives this when a new node presents a
+    /// join token. It validates the token against the replicated security
+    /// state, consumes it via Raft, and returns the certificate bundle for
+    /// the joiner to persist. `node_id` is supplied by the joiner.
+    JoinIssue {
         token: String,
-        addr: String,
-        response: oneshot::Sender<Result<String, BunError>>,
+        node_id: String,
+        response: oneshot::Sender<Result<crate::sesame::join::JoinBundle, BunError>>,
     },
     /// Inject a network partition (chaos testing).
     InjectPartition {
@@ -360,6 +365,10 @@ pub struct ClusterHandle {
     /// these to drop traffic to specific peers). Empty in tests that
     /// don't exercise partitions.
     pub partition_blocklists: PartitionBlocklists,
+    /// Shared CRL used by the internal mTLS verifiers. bun's security refresh
+    /// ticker updates it as `RevokeCertificate` entries replicate, so a
+    /// revoked peer is refused on its next handshake without a restart.
+    pub crl_handle: crate::sesame::mtls::CrlHandle,
 }
 
 /// The transport blocklists a chaos partition manipulates, plus the
@@ -1267,12 +1276,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let status = self.get_council_status().await;
                 let _ = response.send(status);
             }
-            AgentCommand::Join {
+            AgentCommand::JoinIssue {
                 token,
-                addr,
+                node_id,
                 response,
             } => {
-                let result = self.handle_join(&token, &addr).await;
+                let result = self.handle_join_issue(&token, &node_id).await;
                 let _ = response.send(result);
             }
             AgentCommand::InjectPartition {
@@ -2702,6 +2711,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &catalog,
             &self.trust_policy,
             root_ca.as_deref(),
+            Some(&security_state.crl),
         )
         .map_err(|e| e.to_string())
     }
@@ -3731,8 +3741,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Handle a join request: validate the token, issue a node certificate.
-    async fn handle_join(&self, token: &str, addr: &str) -> Result<String, BunError> {
+    /// Issue a certificate bundle for a joining node.
+    ///
+    /// Runs on an existing cluster member. Validates the token against the
+    /// replicated security state, consumes it via Raft, and returns the
+    /// bundle (certificate, private key, CA chain) for the joiner to persist.
+    /// The joiner supplies its own `node_id`.
+    async fn handle_join_issue(
+        &self,
+        token: &str,
+        node_id: &str,
+    ) -> Result<crate::sesame::join::JoinBundle, BunError> {
         let cluster = self
             .cluster
             .as_ref()
@@ -3754,10 +3773,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Read security state and validate token
         let mut security_state = council.security_state().await;
-        let node_id = format!("node-{addr}");
 
         let join_result =
-            crate::sesame::join::validate_and_issue(token, &node_id, &mut security_state, ikm)
+            crate::sesame::join::validate_and_issue(token, node_id, &mut security_state, ikm)
                 .map_err(|e| BunError::SecurityError {
                     reason: format!("join validation failed: {e}"),
                 })?;
@@ -3780,10 +3798,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reason: format!("failed to persist token consumption: {e}"),
             })?;
 
-        Ok(format!(
-            "join accepted: node {} issued cert serial {}",
-            join_result.node_certificate.node_id, join_result.node_certificate.serial
-        ))
+        Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
     }
 
     /// Handle a SignImage command: sign a manifest digest and attach via Raft.

@@ -209,6 +209,15 @@ pub struct SecuritySection {
     pub master_key_path: Option<PathBuf>,
     /// Path to the initial security bootstrap (`{cluster}-security-bootstrap.json`).
     pub bootstrap_path: Option<PathBuf>,
+    /// Directory holding this node's identity (certificate, private key and
+    /// CA chain). Defaults to `{storage.data}/identity`. Written by
+    /// `relish init` on the bootstrap node and by `relish join` on joiners.
+    pub identity_dir: Option<PathBuf>,
+    /// Require mTLS on the internal listeners (Raft RPC, agent API,
+    /// reporting). With this set a node refuses to bootstrap without an
+    /// identity on disk, and a joiner starts in enrollment mode until
+    /// `relish join` installs one.
+    pub require_mtls: bool,
 }
 
 /// Self-upgrade configuration (Phase 14).
@@ -925,6 +934,8 @@ mod tests {
         let nc = NodeConfig::parse("").unwrap();
         assert!(nc.security.master_key_path.is_none());
         assert!(nc.security.bootstrap_path.is_none());
+        assert!(nc.security.identity_dir.is_none());
+        assert!(!nc.security.require_mtls);
     }
 
     #[test]
@@ -943,6 +954,21 @@ mod tests {
             nc.security.bootstrap_path,
             Some(PathBuf::from("/etc/reliaburger/security-bootstrap.json"))
         );
+    }
+
+    #[test]
+    fn parse_security_section_identity_and_mtls() {
+        let toml_str = r#"
+            [security]
+            identity_dir = "/var/lib/reliaburger/data/identity"
+            require_mtls = true
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(
+            nc.security.identity_dir,
+            Some(PathBuf::from("/var/lib/reliaburger/data/identity"))
+        );
+        assert!(nc.security.require_mtls);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 /// Commands try to reach the live Bun agent first. If the agent is
 /// unreachable, `apply` falls back to a dry-run plan.
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
@@ -384,18 +384,33 @@ pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishE
         .map_err(|e| RelishError::InitFailed(format!("failed to serialise security state: {e}")))?;
     fs::write(&bootstrap_path, &bootstrap_json)?;
 
+    // Persist the first node's identity (certificate, key, CA chain) so bun
+    // can serve mTLS. Joiners get theirs through the join ceremony instead.
+    let identity_dir = dir.join("identity");
+    let node_identity = node_identity_from_init(&init_result)?;
+    crate::sesame::identity_store::save(&identity_dir, &node_identity)
+        .map_err(|e| RelishError::InitFailed(format!("failed to persist node identity: {e}")))?;
+    let root_fingerprint =
+        crate::sesame::identity_store::root_ca_fingerprint(&node_identity.root_ca_der);
+
     // Output the init summary to stderr (join token is sensitive)
     let output = crate::sesame::init::format_init_output(&init_result);
     eprint!("{output}");
     eprintln!("  Master secret:   {}", secret_path.display());
     eprintln!("  Security state:  {}", bootstrap_path.display());
+    eprintln!("  Node identity:   {}", identity_dir.display());
+    eprintln!("  Root CA:         {root_fingerprint}");
     eprintln!();
     eprintln!(
         "  Back up {}-master.key alongside the sealed root CA key.",
         cluster_name
     );
+    eprintln!("  Joiners must see the same root CA fingerprint from `relish join`.");
 
-    let node_config = crate::config::node::NodeConfig::default();
+    let mut node_config = crate::config::node::NodeConfig::default();
+    node_config.security.master_key_path = Some(secret_path.clone());
+    node_config.security.bootstrap_path = Some(bootstrap_path.clone());
+    node_config.security.identity_dir = Some(identity_dir.clone());
     let node_toml = format!(
         "# Reliaburger node configuration.\n\
          # See docs/README.md for full reference.\n\n{}",
@@ -421,6 +436,34 @@ path = \"/\"
     println!("created {}", app_path.display());
 
     Ok(())
+}
+
+/// Assemble the first node's on-disk identity from the init result.
+fn node_identity_from_init(
+    init_result: &crate::sesame::init::InitResult,
+) -> Result<crate::sesame::identity_store::NodeIdentity, RelishError> {
+    use crate::sesame::types::CaRole;
+
+    let state = &init_result.security_state;
+    let node_ca = state.get_ca(CaRole::Node).ok_or_else(|| {
+        RelishError::InitFailed("security state is missing the Node CA".to_string())
+    })?;
+    let root_ca = state.get_ca(CaRole::Root).ok_or_else(|| {
+        RelishError::InitFailed("security state is missing the root CA".to_string())
+    })?;
+
+    let cert = &init_result.node_certificate;
+    Ok(crate::sesame::identity_store::NodeIdentity {
+        node_id: cert.node_id.clone(),
+        certificate_der: cert.certificate_der.clone(),
+        private_key_der: cert.private_key_der.clone(),
+        serial: cert.serial,
+        ca_generation: cert.ca_generation,
+        node_ca_der: node_ca.certificate_der.clone(),
+        root_ca_der: root_ca.certificate_der.clone(),
+        not_before: cert.not_before,
+        not_after: cert.not_after,
+    })
 }
 
 /// List cluster nodes and their gossip state.
@@ -490,15 +533,57 @@ pub async fn chaos(action: &str) -> Result<(), RelishError> {
     }
 }
 
-/// Join an existing cluster.
-pub async fn join(token: &str, addr: &str) -> Result<(), RelishError> {
-    join_with_client(token, addr, &BunClient::default_local()).await
+/// Join an existing cluster: fetch a certificate from a member and persist it.
+///
+/// Contacts `addr` (an existing member's API address) with the join token,
+/// receives the certificate bundle, and writes it into the identity
+/// directory. The node then restarts to bring up mTLS with its new identity.
+pub async fn join(
+    token: &str,
+    addr: &str,
+    node_id: &str,
+    identity_dir: Option<&Path>,
+    ca_fingerprint: Option<&str>,
+) -> Result<(), RelishError> {
+    let member_url = format!("{}/v1/cluster/join", normalise_member_base(addr));
+    let dir = identity_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("identity"));
+
+    // Trust-on-first-use: a joiner has no CA yet, so it cannot verify the
+    // member's certificate on this first contact. The returned root CA
+    // fingerprint is the anchor to check out of band (or pin via
+    // --ca-fingerprint).
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
+
+    let identity =
+        crate::sesame::join::request_join(&client, &member_url, token, node_id, ca_fingerprint)
+            .await
+            .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
+
+    let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
+    crate::sesame::identity_store::save(&dir, &identity)
+        .map_err(|e| RelishError::JoinFailed(format!("failed to persist identity: {e}")))?;
+
+    println!("joined as {node_id}: identity written to {}", dir.display());
+    println!("  cluster root CA: {fingerprint}");
+    println!("  restart bun to bring up mTLS with the new identity.");
+    Ok(())
 }
 
-async fn join_with_client(token: &str, addr: &str, client: &BunClient) -> Result<(), RelishError> {
-    let message = client.join(token, addr).await?;
-    println!("{message}");
-    Ok(())
+/// Normalise a member address into a base URL. A bare `host:port` assumes
+/// `https`; an explicit scheme is left untouched.
+fn normalise_member_base(addr: &str) -> String {
+    let trimmed = addr.trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
 }
 
 /// Show council (Raft) composition and status.
@@ -1537,6 +1622,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path(), "mycluster", "node-01").unwrap();
         assert!(dir.path().join("mycluster-root-ca.age").exists());
+    }
+
+    #[test]
+    fn init_persists_the_first_nodes_identity_next_to_the_master_key() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path(), "mycluster", "node-01").unwrap();
+
+        let identity = crate::sesame::identity_store::load(&dir.path().join("identity"))
+            .unwrap()
+            .expect("init should persist the first node's identity");
+        assert_eq!(identity.node_id, "node-01");
+        assert!(!identity.private_key_der.is_empty());
+        crate::sesame::cert::validate_chain(
+            &identity.certificate_der,
+            &identity.node_ca_der,
+            &identity.root_ca_der,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn init_writes_security_paths_into_the_generated_node_config() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path(), "mycluster", "node-01").unwrap();
+
+        let node_content = std::fs::read_to_string(dir.path().join("reliaburger.toml")).unwrap();
+        let nc: crate::config::node::NodeConfig = toml::from_str(&node_content).unwrap();
+        assert_eq!(
+            nc.security.master_key_path,
+            Some(dir.path().join("mycluster-master.key"))
+        );
+        assert_eq!(
+            nc.security.bootstrap_path,
+            Some(dir.path().join("mycluster-security-bootstrap.json"))
+        );
+        assert_eq!(nc.security.identity_dir, Some(dir.path().join("identity")));
     }
 
     #[tokio::test]
