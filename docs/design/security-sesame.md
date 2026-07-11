@@ -884,16 +884,16 @@ On each council node:
 6. During the transition period, both old and new root CAs are trusted.
 7. The new root CA key is sealed and backed up. The old root CA key is discarded.
 
-### 5.9 Egress Allowlist DNS Resolution
+### 5.9 Egress Allowlist Processing
 
 When Bun processes an app's `[app.NAME.egress]` block:
 
-1. For each hostname in the `allow` list, Bun resolves it via multiple upstream DNS servers.
-2. Bun compares responses across DNS servers. If responses diverge, a security event is logged (possible DNS poisoning).
-3. The resolved IP addresses are inserted into the per-app nftables set (e.g., `egress_api`).
-4. Bun refreshes DNS resolution every 10 seconds.
-5. When a hostname's resolved IP changes, the nftables set is updated and an audit event is logged.
-6. CIDR-based entries are inserted directly without DNS resolution.
+1. Each entry is parsed: exact IPv4/IPv6 destinations (`1.2.3.4:443`, `[2001:db8::1]:443`), CIDRs (`10.0.0.0/8:443`, `[2001:db8::/32]:443` — host bits rejected), or hostnames resolved via DNS keeping both A and AAAA records.
+2. On runtimes that honour the OCI `cgroupsPath` (root-mode runc), Bun creates the instance's cgroup directory itself and programs the eBPF maps against its inode *before* the workload starts (create → program → start). There is no window in which the process runs ahead of its policy; if programming fails, the created container is removed and the deploy fails closed. Runtimes that do not place workloads into the cgroup path (ProcessGrill, Apple Container) are programmed post-start from the pid — a documented ordering gap on those runtimes.
+3. Exact destinations go into per-family hash maps (`egress_map`, `egress6_map`); CIDRs into per-family LPM tries with the ports of enclosing prefixes folded into more specific entries.
+4. Enforcement requires both connect hooks: if `cgroup/connect6` is unavailable, deploys with an allowlist are refused — a v4-only policy is bypassable over IPv6.
+5. Bun re-resolves DNS-based entries periodically (about every 5 minutes) and reprograms the maps when a hostname's addresses change.
+6. A kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) deletes map state whose cgroup no longer maps to a live instance and reinstalls entries a live instance lost (e.g. after a Bun restart with adopted workloads).
 
 ---
 

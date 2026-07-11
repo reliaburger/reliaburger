@@ -241,6 +241,22 @@ mod maps {
         let _ = map.remove(&cgroup_id);
         Ok(())
     }
+
+    /// List every cgroup id currently recorded in `cgroup_namespace_map`
+    /// — the kernel truth the periodic sweep compares against the ids the
+    /// reconcile pass last wrote, so entries for departed cgroups get
+    /// deleted even after a Bun restart lost the in-memory bookkeeping.
+    pub fn list_cgroup_namespace_keys(
+        bpf: &mut aya::Ebpf,
+    ) -> Result<std::collections::HashSet<u64>, FirewallMapError> {
+        let map: HashMap<_, u64, u32> = HashMap::try_from(
+            bpf.map_mut("cgroup_namespace_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "cgroup_namespace_map",
+                })?,
+        )?;
+        Ok(map.keys().filter_map(|k| k.ok()).collect())
+    }
 }
 
 #[cfg(feature = "ebpf")]

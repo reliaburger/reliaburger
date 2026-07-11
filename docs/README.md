@@ -147,6 +147,7 @@ Some tests require specific runtimes or network access and are gated behind envi
 | `RELIABURGER_UPGRADE_TESTS=1` | real-binary self-upgrade tests (slow; also via `make test-upgrade`) |
 | `RELIABURGER_BTRFS_TESTS=1` | Btrfs quota + snapshot tests (Linux root; each test provisions its own loopback btrfs) |
 | `RELIABURGER_BUILDAH_TESTS=1` | real `buildah` image-build tests (Linux with buildah installed) |
+| `RELIABURGER_EBPF_TESTS=1` | eBPF connect-hook, egress (IPv4/IPv6/CIDR) and kernel-sweep tests (Linux root, kernel 5.7+, `--features ebpf`; run via `relish dev test ebpf`) |
 
 ### Benchmarks
 

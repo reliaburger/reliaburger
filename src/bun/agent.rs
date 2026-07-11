@@ -390,8 +390,9 @@ struct EgressBinding {
     cgroup_id: u64,
     /// The raw `[egress] allow` list, re-resolved periodically.
     allow: Vec<String>,
-    /// The destinations currently programmed into the egress map.
-    resolved: Vec<(std::net::Ipv4Addr, u16)>,
+    /// The destinations currently programmed into the egress maps
+    /// (exact v4/v6 and CIDR).
+    resolved: Vec<crate::sesame::egress::EgressDestination>,
 }
 
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
@@ -416,6 +417,15 @@ pub struct BunAgent<G: Grill> {
     /// Ticks since the last egress re-resolution (the event loop runs at 1s).
     #[cfg(feature = "ebpf")]
     egress_reresolve_ticks: u32,
+    /// Kernel-truth sweep interval in seconds (`[ebpf] sweep_interval_secs`,
+    /// 0 disables). The sweep deletes egress/namespace map entries whose
+    /// cgroup no longer maps to a live instance and reinstalls entries a
+    /// live instance lost.
+    #[cfg(feature = "ebpf")]
+    ebpf_sweep_interval_secs: u64,
+    /// Ticks since the last kernel-truth sweep.
+    #[cfg(feature = "ebpf")]
+    ebpf_sweep_ticks: u64,
     /// `firewall_map` keys last written to the kernel, so the next reconcile
     /// deletes entries for departed cgroups (NET5). eBPF only.
     #[cfg(feature = "ebpf")]
@@ -500,6 +510,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             egress_reresolve_ticks: 0,
             #[cfg(feature = "ebpf")]
+            ebpf_sweep_interval_secs: 60,
+            #[cfg(feature = "ebpf")]
+            ebpf_sweep_ticks: 0,
+            #[cfg(feature = "ebpf")]
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(feature = "ebpf")]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
@@ -553,6 +567,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_bindings: std::collections::HashMap::new(),
             #[cfg(feature = "ebpf")]
             egress_reresolve_ticks: 0,
+            #[cfg(feature = "ebpf")]
+            ebpf_sweep_interval_secs: 60,
+            #[cfg(feature = "ebpf")]
+            ebpf_sweep_ticks: 0,
             #[cfg(feature = "ebpf")]
             firewall_bpf_keys: std::collections::HashSet::new(),
             #[cfg(feature = "ebpf")]
@@ -728,6 +746,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.onion_ebpf = Some(ebpf);
     }
 
+    /// Configure the kernel-truth sweep interval (`[ebpf]
+    /// sweep_interval_secs`); 0 disables the sweep.
+    #[cfg(feature = "ebpf")]
+    pub fn set_ebpf_sweep_interval(&mut self, secs: u64) {
+        self.ebpf_sweep_interval_secs = secs;
+    }
+
+    /// No-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
+
     /// Mirror an app's current service-map entry into the kernel
     /// `backend_map` so the eBPF connect hook rewrites its VIP to live
     /// backends (L8 completeness). Called after every service-map add /
@@ -742,7 +771,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
-        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry);
+        if let Err(e) = bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry) {
+            eprintln!("onion: backend map sync failed for {app_name}: {e}");
+        }
     }
 
     #[cfg(not(feature = "ebpf"))]
@@ -762,7 +793,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let vip = crate::onion::vip::VirtualIP::from_app_name(app_name);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
-        bpf.remove_backends_bpf(&mut ebpf, vip, port);
+        if let Err(e) = bpf.remove_backends_bpf(&mut ebpf, vip, port) {
+            eprintln!("onion: backend map removal failed for {app_name}: {e}");
+        }
     }
 
     #[cfg(not(feature = "ebpf"))]
@@ -1131,6 +1164,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.expire_faults().await;
                     self.reconcile_firewall().await;
                     self.reresolve_egress().await;
+                    self.sweep_kernel_networking().await;
                     self.check_identity_rotation().await;
                 }
             }
@@ -2385,13 +2419,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         new_failed = true;
                         break;
                     }
+                    let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
                     let oci_spec = Self::oci_spec_with_secrets(
                         app_name,
                         namespace,
                         spec,
                         host_port,
-                        &crate::grill::cgroup::cgroup_path(namespace, app_name, i)
-                            .to_string_lossy(),
+                        &cgroup_path.to_string_lossy(),
                         None,
                         None,
                         identities,
@@ -2406,12 +2440,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         new_failed = true;
                         break;
                     }
+                    // Same create → program → start ordering as the fresh
+                    // path: the replacement instance must never run ahead
+                    // of its egress policy. On failure, delete the created
+                    // container and roll back to the old instances.
+                    if let Err(e) = self
+                        .apply_egress_pre_start(&new_id, app_name, spec, &cgroup_path)
+                        .await
+                    {
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!("failed to program egress for {}: {e}", new_id.0),
+                            })
+                            .await;
+                        let _ = self.supervisor.grill.stop(&new_id).await;
+                        new_failed = true;
+                        break;
+                    }
                     if let Err(e) = self.supervisor.grill.start(&new_id).await {
                         let _ = events
                             .send(ApplyEvent::Error {
                                 message: format!("failed to start {}: {e}", new_id.0),
                             })
                             .await;
+                        // Lift the egress state programmed pre-start.
+                        self.clear_egress(&new_id).await;
                         new_failed = true;
                         break;
                     }
@@ -2459,6 +2512,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                                 .await;
                             // Kill the failed new instance
                             let _ = self.supervisor.grill.kill(&new_id).await;
+                            self.clear_egress(&new_id).await;
                             new_failed = true;
                             break;
                         }
@@ -2469,6 +2523,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                                 })
                                 .await;
                             let _ = self.supervisor.grill.kill(&new_id).await;
+                            self.clear_egress(&new_id).await;
                             new_failed = true;
                             break;
                         }
@@ -2483,9 +2538,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if new_failed {
                     // Rollback: kill any new instances we started, keep old ones.
                     // These were grill-created but never inserted into supervisor
-                    // tracking, so release their ports here directly.
-                    for new_id in &new_ids {
+                    // tracking, so release their ports here directly. Their
+                    // pre-start egress state goes with them — a recycled cgroup
+                    // id must inherit nothing (NET6).
+                    let rollback_ids = new_ids.clone();
+                    for new_id in &rollback_ids {
                         let _ = self.supervisor.grill.kill(new_id).await;
+                        self.clear_egress(new_id).await;
                         if let Some(port) = new_ports.get(new_id).copied().flatten() {
                             let _ = self.supervisor.port_allocator.release(port).await;
                         }
@@ -3045,6 +3104,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instance.oci_spec = Some(oci_spec);
         }
 
+        // Program egress before anything runs in the cgroup — init
+        // containers included. Without this there is a window between
+        // start and the post-start programming during which the connect
+        // hook, seeing no enforcement flag, allows everything. On failure
+        // the created container is removed and the deploy fails closed:
+        // no half-started workload.
+        if let Err(e) = self
+            .apply_egress_pre_start(instance_id, app_name, spec, &cgroup_path)
+            .await
+        {
+            if let Some(instance) = self.supervisor.get_instance_mut(instance_id)
+                && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
+            {
+                instance.state = state;
+            }
+            let _ = self.supervisor.grill().stop(instance_id).await;
+            return Err(e);
+        }
+
         // Run init containers if any
         if !spec.init.is_empty() {
             // Preparing → Initialising
@@ -3181,16 +3259,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Program an instance's egress allowlist into the eBPF maps (L16).
     ///
-    /// With an `[egress] allow` list, only the listed destinations are
-    /// permitted from the instance's cgroup; everything else is denied at
-    /// the kernel. A no-op without an allowlist (all egress permitted) or
-    /// when the eBPF data path isn't loaded — in which case it warns, per
-    /// the default-deny-is-unenforced contract, rather than pretending.
+    /// This is the *post-start* path: it resolves the cgroup from the
+    /// live pid, so runtimes that ignore the OCI `cgroupsPath`
+    /// (ProcessGrill, Apple) still get enforcement — just with a window
+    /// between start and here. Runtimes that honour the path are handled
+    /// by `apply_egress_pre_start` instead, and skip this (the binding
+    /// already exists). A no-op without an allowlist (all egress
+    /// permitted); warns loudly when eBPF isn't loaded, per the
+    /// default-deny-is-unenforced contract, rather than pretending.
     #[cfg(feature = "ebpf")]
     async fn apply_egress(&mut self, instance_id: &InstanceId, spec: &AppSpec) {
         let Some(egress) = spec.egress.as_ref().filter(|e| !e.allow.is_empty()) else {
             return;
         };
+
+        // Programmed before start (create → program → start): done.
+        if self.egress_bindings.contains_key(instance_id) {
+            return;
+        }
 
         // eBPF absent: egress is documented-unenforced (D5), not a failure.
         let Some(handle) = self.onion_ebpf.clone() else {
@@ -3213,10 +3299,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         // From here we FAIL CLOSED (NET6): egress is configured and eBPF is
-        // loaded, so any failure to resolve or program the allowlist must leave
-        // the cgroup denying *all* egress, never running unenforced. DNS
-        // resolution can block — do it off the event loop.
+        // loaded, so any failure to resolve or program the allowlist must
+        // leave the cgroup denying *all* egress, never running unenforced.
         let allow = egress.allow.clone();
+
+        // The connect4 hook alone cannot enforce this policy — anything
+        // dual-stack walks around it over IPv6 (NET7). Deny everything.
+        if !handle.lock().await.connect6_attached() {
+            eprintln!(
+                "sesame: connect6 hook unavailable; denying all egress for {}",
+                instance_id.0
+            );
+            self.deny_all_egress(&handle, instance_id, cgroup_id, allow)
+                .await;
+            return;
+        }
+
+        // DNS resolution can block — do it off the event loop.
         let allow_for_resolve = allow.clone();
         let resolved = match tokio::task::spawn_blocking(move || {
             crate::sesame::egress::resolve_egress_entries(&allow_for_resolve)
@@ -3240,6 +3339,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
+        // CIDR entries that cannot be represented in the kernel value
+        // (too many ports on one prefix) are a config problem: deny all.
+        let merged = match crate::sesame::egress::merge_cidr_ports(&resolved) {
+            Ok(merged) => merged,
+            Err(e) => {
+                eprintln!(
+                    "sesame: egress CIDR merge failed for {}; denying all egress: {e}",
+                    instance_id.0
+                );
+                self.deny_all_egress(&handle, instance_id, cgroup_id, allow)
+                    .await;
+                return;
+            }
+        };
+
         let mut ebpf = handle.lock().await;
         // Enable enforcement first: the baseline is deny-all, and each written
         // entry then opens exactly one destination. If we can't even enable it
@@ -3251,27 +3365,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             );
             return;
         }
-        // Program each destination individually so a single failed write leaves
-        // that destination denied (fail closed) rather than dropping straight
-        // out with the allowlist half-applied and unenforced.
-        let mut programmed: Vec<(std::net::Ipv4Addr, u16)> = Vec::new();
-        for dest in &resolved {
-            for (key, value) in crate::sesame::egress::egress_to_bpf_entries(
-                &[cgroup_id],
-                std::slice::from_ref(dest),
-            ) {
-                match crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value) {
-                    Ok(()) => programmed.push(*dest),
-                    Err(e) => eprintln!(
-                        "sesame: egress map write failed for {} (destination stays denied): {e}",
-                        instance_id.0
-                    ),
-                }
+        // A failed write leaves that destination denied (fail closed); the
+        // sweep rewrites the full set periodically to fill transient gaps.
+        let programmed = match crate::sesame::egress::write_egress_destinations(
+            &mut ebpf.bpf,
+            cgroup_id,
+            &resolved,
+            &merged,
+        ) {
+            Ok(()) => resolved,
+            Err(e) => {
+                eprintln!(
+                    "sesame: egress map write failed for {} (unwritten destinations stay denied): {e}",
+                    instance_id.0
+                );
+                Vec::new()
             }
-        }
+        };
         drop(ebpf);
         // Record only what we actually programmed, so the periodic re-resolve
-        // diffs against reality and fills any gap a transient failure left.
+        // and the sweep diff against reality and fill any gap a transient
+        // failure left.
         self.egress_bindings.insert(
             instance_id.clone(),
             EgressBinding {
@@ -3280,6 +3394,217 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 resolved: programmed,
             },
         );
+    }
+
+    /// Program an instance's egress *before* its process starts, closing
+    /// the window during which a fresh workload could connect anywhere
+    /// (the connect hook allows everything for a cgroup with no
+    /// `egress_enforced` flag). Only possible when the runtime honours
+    /// the OCI `cgroupsPath` (root-mode runc): the agent creates the
+    /// cgroup directory itself, programs the maps against its inode, and
+    /// only then lets the runtime start the workload into it.
+    ///
+    /// Returns an error — failing the deploy closed — when enforcement is
+    /// required but cannot be guaranteed (connect6 missing, cgroup id
+    /// unresolvable, map programming failed).
+    #[cfg(feature = "ebpf")]
+    async fn apply_egress_pre_start(
+        &mut self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        spec: &AppSpec,
+        cgroup_path: &std::path::Path,
+    ) -> Result<(), BunError> {
+        use crate::sesame::egress::{self, PreStartEgress};
+
+        let has_allowlist = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+        let (ebpf_loaded, connect6_attached) = match self.onion_ebpf.as_ref() {
+            Some(handle) => (true, handle.lock().await.connect6_attached()),
+            None => (false, false),
+        };
+        let honours = self.supervisor.grill().honours_cgroup_path();
+
+        // Create the cgroup directory before the runtime does, so its
+        // inode — the id `bpf_get_current_cgroup_id()` will report — is
+        // known before the process exists. runc joins an existing
+        // `cgroupsPath` directory untouched, keeping the inode stable.
+        let cgroup_id = if has_allowlist && ebpf_loaded && connect6_attached && honours {
+            let _ = tokio::fs::create_dir_all(cgroup_path).await;
+            egress::cgroup_id_of_path(cgroup_path)
+        } else {
+            None
+        };
+
+        match egress::plan_pre_start_egress(
+            has_allowlist,
+            ebpf_loaded,
+            connect6_attached,
+            honours,
+            cgroup_id,
+        ) {
+            PreStartEgress::NoPolicy | PreStartEgress::Deferred => Ok(()),
+            PreStartEgress::Unenforced => {
+                eprintln!(
+                    "sesame: [egress] set for {} but eBPF is not loaded; egress is NOT enforced",
+                    instance_id.0
+                );
+                Ok(())
+            }
+            PreStartEgress::Refuse { reason } => Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("egress enforcement for {}: {reason}", instance_id.0),
+            }),
+            PreStartEgress::Program { cgroup_id } => {
+                self.program_egress_pre_start(instance_id, app_name, spec, cgroup_id)
+                    .await
+            }
+        }
+    }
+
+    /// No-op without the eBPF data path (the post-start warning covers
+    /// the documented-unenforced contract).
+    #[cfg(not(feature = "ebpf"))]
+    async fn apply_egress_pre_start(
+        &mut self,
+        _instance_id: &InstanceId,
+        _app_name: &str,
+        _spec: &AppSpec,
+        _cgroup_path: &std::path::Path,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
+
+    /// The programming half of the pre-start path. Deploy-failure
+    /// semantics: a transient DNS failure denies all egress and lets the
+    /// instance start (the re-resolve loop fills the allowlist in later),
+    /// but a programming or representation error fails the deploy — a
+    /// workload must never start ahead of a policy we could not install.
+    #[cfg(feature = "ebpf")]
+    async fn program_egress_pre_start(
+        &mut self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        spec: &AppSpec,
+        cgroup_id: u64,
+    ) -> Result<(), BunError> {
+        use crate::sesame::egress;
+
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return Ok(());
+        };
+        let Some(egress_spec) = spec.egress.as_ref().filter(|e| !e.allow.is_empty()) else {
+            return Ok(());
+        };
+
+        // A previous life of this instance (crash restart) programmed a
+        // different cgroup id — the directory was recreated. Scrub it.
+        self.clear_egress(instance_id).await;
+
+        let allow = egress_spec.allow.clone();
+        let allow_for_resolve = allow.clone();
+        let resolved = match tokio::task::spawn_blocking(move || {
+            egress::resolve_egress_entries(&allow_for_resolve)
+        })
+        .await
+        {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "sesame: egress resolution failed for {}; starting deny-all: {e}",
+                    instance_id.0
+                );
+                return self
+                    .deny_all_pre_start(&handle, instance_id, app_name, cgroup_id, allow)
+                    .await;
+            }
+            Err(_) => {
+                return self
+                    .deny_all_pre_start(&handle, instance_id, app_name, cgroup_id, allow)
+                    .await;
+            }
+        };
+
+        // Representation errors (too many ports on one CIDR) are permanent
+        // config problems, not transient failures: fail the deploy.
+        let merged = match egress::merge_cidr_ports(&resolved) {
+            Ok(merged) => merged,
+            Err(e) => {
+                return Err(BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!(
+                        "egress allowlist for {} cannot be programmed: {e}",
+                        instance_id.0
+                    ),
+                });
+            }
+        };
+
+        let mut ebpf = handle.lock().await;
+        if let Err(e) = egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!(
+                    "could not enable egress enforcement for {}: {e}",
+                    instance_id.0
+                ),
+            });
+        }
+        if let Err(e) =
+            egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &resolved, &merged)
+        {
+            // Fail the deploy and leave nothing half-programmed behind.
+            let _ = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id);
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("egress map programming failed for {}: {e}", instance_id.0),
+            });
+        }
+        drop(ebpf);
+
+        self.egress_bindings.insert(
+            instance_id.clone(),
+            EgressBinding {
+                cgroup_id,
+                allow,
+                resolved,
+            },
+        );
+        Ok(())
+    }
+
+    /// Pre-start deny-all: enforcement on, no allow entries. Unlike the
+    /// post-start variant, a failure here fails the deploy — the process
+    /// has not started yet, so refusing is still possible.
+    #[cfg(feature = "ebpf")]
+    async fn deny_all_pre_start(
+        &mut self,
+        handle: &std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
+        instance_id: &InstanceId,
+        app_name: &str,
+        cgroup_id: u64,
+        allow: Vec<String>,
+    ) -> Result<(), BunError> {
+        {
+            let mut ebpf = handle.lock().await;
+            if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
+                return Err(BunError::DeployFailed {
+                    app_name: app_name.to_string(),
+                    reason: format!(
+                        "could not enable egress enforcement for {}: {e}",
+                        instance_id.0
+                    ),
+                });
+            }
+        }
+        self.egress_bindings.insert(
+            instance_id.clone(),
+            EgressBinding {
+                cgroup_id,
+                allow,
+                resolved: Vec::new(),
+            },
+        );
+        Ok(())
     }
 
     /// Fail-closed helper: enable egress enforcement for `cgroup_id` with no
@@ -3328,29 +3653,82 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Deletes the allow entries as well as the enable flag: cgroup ids are
     /// recycled by the kernel, and a stale allowlist left behind could open
     /// destinations for whatever workload next lands on that cgroup id (NET6).
+    /// Goes through `reprogram_cgroup_egress` because instances can share a
+    /// cgroup path — deleting one instance's entries directly would wipe a
+    /// co-tenant's policy.
     #[cfg(feature = "ebpf")]
     async fn clear_egress(&mut self, instance_id: &InstanceId) {
         let Some(binding) = self.egress_bindings.remove(instance_id) else {
             return;
         };
-        if let Some(handle) = self.onion_ebpf.as_ref() {
-            let mut ebpf = handle.lock().await;
-            for (key, _) in crate::sesame::egress::egress_to_bpf_entries(
-                &[binding.cgroup_id],
-                &binding.resolved,
-            ) {
-                let _ = crate::sesame::egress::delete_egress_entry(&mut ebpf.bpf, key);
-            }
-            let _ = crate::sesame::egress::clear_egress_enforced(&mut ebpf.bpf, binding.cgroup_id);
-        }
+        self.reprogram_cgroup_egress(binding.cgroup_id).await;
     }
 
     /// No-op without the eBPF data path.
     #[cfg(not(feature = "ebpf"))]
     async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
 
+    /// Rebuild the kernel egress state for one cgroup id from the current
+    /// bindings: delete every entry for the cgroup, then write the union
+    /// of what the surviving bindings allow (and the enforcement flag).
+    /// With no surviving binding the cgroup is scrubbed completely.
+    /// Failures leave the cgroup denying more than intended, never less.
+    #[cfg(feature = "ebpf")]
+    async fn reprogram_cgroup_egress(&mut self, cgroup_id: u64) {
+        use crate::sesame::egress;
+
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return;
+        };
+        let union: Vec<egress::EgressDestination> = {
+            let mut set = std::collections::BTreeSet::new();
+            for binding in self
+                .egress_bindings
+                .values()
+                .filter(|b| b.cgroup_id == cgroup_id)
+            {
+                set.extend(binding.resolved.iter().copied());
+            }
+            set.into_iter().collect()
+        };
+        let survivors = self
+            .egress_bindings
+            .values()
+            .any(|b| b.cgroup_id == cgroup_id);
+
+        let mut ebpf = handle.lock().await;
+        if !survivors {
+            if let Err(e) = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id) {
+                eprintln!("sesame: could not scrub egress state for cgroup {cgroup_id}: {e}");
+            }
+            return;
+        }
+
+        if let Err(e) = egress::delete_cgroup_egress_entries(&mut ebpf.bpf, cgroup_id) {
+            eprintln!("sesame: could not clear egress entries for cgroup {cgroup_id}: {e}");
+        }
+        match egress::merge_cidr_ports(&union) {
+            Ok(merged) => {
+                if let Err(e) =
+                    egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &union, &merged)
+                {
+                    eprintln!(
+                        "sesame: egress rewrite failed for cgroup {cgroup_id} \
+                         (unwritten destinations stay denied): {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("sesame: egress CIDR merge failed for cgroup {cgroup_id}: {e}");
+            }
+        }
+        if let Err(e) = egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
+            eprintln!("sesame: could not re-enable egress enforcement for cgroup {cgroup_id}: {e}");
+        }
+    }
+
     /// Periodically re-resolve DNS-based egress allowlists and reprogram the
-    /// eBPF egress map when an app's destination IPs change (L16). Rate-
+    /// eBPF egress maps when an app's destination IPs change (L16). Rate-
     /// limited to roughly once every five minutes; a no-op while nothing
     /// enforces egress.
     #[cfg(feature = "ebpf")]
@@ -3363,9 +3741,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.egress_reresolve_ticks = 0;
 
-        let Some(handle) = self.onion_ebpf.clone() else {
+        if self.onion_ebpf.is_none() {
             return;
-        };
+        }
         // Snapshot so we don't hold a borrow of self across the DNS awaits.
         let bindings: Vec<(InstanceId, EgressBinding)> = self
             .egress_bindings
@@ -3391,28 +3769,144 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
-            let adds = crate::sesame::egress::egress_to_bpf_entries(&[binding.cgroup_id], &to_add);
-            let removes =
-                crate::sesame::egress::egress_to_bpf_entries(&[binding.cgroup_id], &to_remove);
-            {
-                let mut ebpf = handle.lock().await;
-                for (key, value) in adds {
-                    let _ = crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value);
-                }
-                for (key, _) in removes {
-                    let _ = crate::sesame::egress::delete_egress_entry(&mut ebpf.bpf, key);
-                }
-            }
-            // Record the new set so the next diff is against reality.
+            // Record the new set, then rebuild the cgroup's kernel state
+            // from all bindings — CIDR values are merged per cgroup, so a
+            // delta write can't be applied entry by entry.
             if let Some(b) = self.egress_bindings.get_mut(&instance_id) {
                 b.resolved = new_resolved;
             }
+            self.reprogram_cgroup_egress(binding.cgroup_id).await;
         }
     }
 
     /// No-op without the eBPF data path.
     #[cfg(not(feature = "ebpf"))]
     async fn reresolve_egress(&mut self) {}
+
+    /// Reconcile kernel truth against live instances (the sweep half of
+    /// the network-policy theme): rebuild bindings live instances lost
+    /// (adopted workloads after a Bun restart), scrub egress state whose
+    /// cgroup no longer maps to a live instance, rewrite every live
+    /// binding (idempotent — repairs entries lost to transient write
+    /// failures), and prune stale `cgroup_namespace_map` keys. A no-op
+    /// sweep logs nothing.
+    #[cfg(feature = "ebpf")]
+    async fn sweep_kernel_networking(&mut self) {
+        use crate::sesame::egress;
+
+        if self.ebpf_sweep_interval_secs == 0 || self.onion_ebpf.is_none() {
+            return;
+        }
+        self.ebpf_sweep_ticks += 1;
+        if self.ebpf_sweep_ticks < self.ebpf_sweep_interval_secs {
+            return;
+        }
+        self.ebpf_sweep_ticks = 0;
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return;
+        };
+
+        // 1. Live instances with an allowlist but no binding: adopted
+        //    workloads after a Bun restart. Rebuild via the post-start
+        //    (pid-based) path.
+        let missing: Vec<(InstanceId, AppSpec)> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| {
+                !matches!(
+                    i.state,
+                    crate::grill::state::ContainerState::Stopped
+                        | crate::grill::state::ContainerState::Failed
+                )
+            })
+            .filter(|i| !self.egress_bindings.contains_key(&i.id))
+            .filter_map(|i| {
+                self.deployed_specs
+                    .get(&(i.app_name.clone(), i.namespace.clone()))
+                    .filter(|s| s.egress.as_ref().is_some_and(|e| !e.allow.is_empty()))
+                    .map(|s| (i.id.clone(), s.clone()))
+            })
+            .collect();
+        for (id, spec) in &missing {
+            eprintln!(
+                "sesame: sweep reinstalling egress for {} (no binding)",
+                id.0
+            );
+            self.apply_egress(id, spec).await;
+        }
+
+        // 2. Kernel truth vs expected cgroups.
+        let expected: std::collections::HashSet<u64> =
+            self.egress_bindings.values().map(|b| b.cgroup_id).collect();
+        let (kernel_enforced, kernel_entries) = {
+            let mut ebpf = handle.lock().await;
+            let enforced = match egress::list_enforced_cgroups(&mut ebpf.bpf) {
+                Ok(set) => set,
+                Err(e) => {
+                    eprintln!("sesame: sweep could not list enforced cgroups: {e}");
+                    return;
+                }
+            };
+            let entries = match egress::list_egress_entry_cgroups(&mut ebpf.bpf) {
+                Ok(set) => set,
+                Err(e) => {
+                    eprintln!("sesame: sweep could not list egress entries: {e}");
+                    return;
+                }
+            };
+            (enforced, entries)
+        };
+        let plan = egress::plan_egress_sweep(&expected, &kernel_enforced, &kernel_entries);
+        if !plan.stale.is_empty() {
+            let mut ebpf = handle.lock().await;
+            for cgroup_id in &plan.stale {
+                eprintln!(
+                    "sesame: sweep deleting kernel egress state for departed cgroup {cgroup_id}"
+                );
+                if let Err(e) = egress::delete_cgroup_egress_state(&mut ebpf.bpf, *cgroup_id) {
+                    eprintln!("sesame: sweep scrub failed for cgroup {cgroup_id}: {e}");
+                }
+            }
+        }
+        for cgroup_id in &plan.repair {
+            eprintln!("sesame: sweep restoring egress enforcement for cgroup {cgroup_id}");
+        }
+        // Rewrite every live cgroup's entries: idempotent inserts, and the
+        // only way lost entries (as opposed to a lost flag) come back.
+        let live_cgroups: std::collections::HashSet<u64> = expected;
+        for cgroup_id in live_cgroups {
+            self.reprogram_cgroup_egress(cgroup_id).await;
+        }
+
+        // 3. Namespace map: delete kernel keys no reconcile pass wrote,
+        //    then rebuild the desired state.
+        let desired_ns = self.cgroup_ns_bpf_keys.clone();
+        {
+            let mut ebpf = handle.lock().await;
+            match crate::sesame::firewall::list_cgroup_namespace_keys(&mut ebpf.bpf) {
+                Ok(kernel_ns) => {
+                    for cgroup_id in kernel_ns.difference(&desired_ns) {
+                        eprintln!(
+                            "sesame: sweep deleting stale cgroup-namespace entry {cgroup_id}"
+                        );
+                        let _ = crate::sesame::firewall::delete_cgroup_namespace_entry(
+                            &mut ebpf.bpf,
+                            *cgroup_id,
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sesame: sweep could not list cgroup-namespace keys: {e}");
+                }
+            }
+        }
+        self.sync_firewall_ebpf().await;
+    }
+
+    /// No-op without the eBPF data path.
+    #[cfg(not(feature = "ebpf"))]
+    async fn sweep_kernel_networking(&mut self) {}
 
     /// Drive a job instance through startup: Pending → Preparing → Starting → Running.
     ///
@@ -3745,6 +4239,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
+            // Close the restart window too: the recreated cgroup gets its
+            // egress programmed before start (the crash gave the instance a
+            // fresh cgroup id). The AppSpec comes from the stored deploy
+            // record, the cgroup path from the stored OCI spec. On failure
+            // the created container is removed and the restart refused —
+            // fail closed, same as a fresh deploy.
+            if let Some(spec) = self
+                .deployed_specs
+                .get(&(app_name.clone(), namespace.clone()))
+                .cloned()
+                && let Some(cgroup_str) = oci_spec.linux.cgroups_path.clone()
+                && let Err(e) = self
+                    .apply_egress_pre_start(
+                        &id,
+                        &app_name,
+                        &spec,
+                        std::path::Path::new(&cgroup_str),
+                    )
+                    .await
+            {
+                eprintln!("bun: restart of {} refused: {e}", id.0);
+                let _ = self.supervisor.grill().stop(&id).await;
+                if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                    && let Ok(state) = instance.state.transition_to(ContainerState::Failed)
+                {
+                    instance.state = state;
+                }
+                continue;
+            }
+
             // Preparing → Starting
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
                 match instance.state.transition_to(ContainerState::Starting) {
@@ -3891,8 +4415,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
 
-        let ruleset =
-            crate::firewall::rules::generate_ruleset(&self.perimeter_config, &cluster_nodes);
+        let ruleset = match crate::firewall::rules::generate_ruleset(
+            &self.perimeter_config,
+            &cluster_nodes,
+        ) {
+            Ok(ruleset) => ruleset,
+            Err(e) => {
+                // A malformed admin CIDR never reaches nft (NET8); the
+                // previous ruleset stays in force.
+                eprintln!("warning: firewall ruleset generation failed: {e}");
+                return;
+            }
+        };
 
         if let Err(e) = crate::firewall::rules::apply_ruleset(&ruleset).await {
             eprintln!("warning: firewall reconciliation failed: {e}");

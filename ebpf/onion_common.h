@@ -89,6 +89,42 @@ struct egress_value {
     __u32 action;          /* 1 = allow */
 };
 
+/* ---------- egress6_map (exact IPv6 destinations) ------------------------ */
+
+struct egress6_key {
+    __u64 src_cgroup_id;   /* cgroup of the connecting app */
+    __u32 dst_ip[4];       /* destination IPv6, network byte order */
+    __u16 dst_port;        /* destination port, network byte order */
+    __u16 _pad;
+    __u32 _pad2;
+};
+
+/* ---------- egress CIDR maps (LPM tries) --------------------------------- */
+
+/* An LPM trie key is { u32 prefixlen; u8 data[] } with the data starting
+ * at byte offset 4. The first 8 data bytes are the cgroup id in big-endian
+ * byte order (always fully matched: prefixlen includes all 64 bits), the
+ * rest is the destination address in network byte order. */
+
+#define CIDR_CGROUP_PREFIX_BITS  64
+#define MAX_CIDR_PORTS           8
+
+struct egress_cidr4_key {
+    __u32 prefixlen;       /* 64 (cgroup) + IPv4 prefix length */
+    __u8  data[12];        /* cgroup id (big-endian) + IPv4 (network order) */
+};
+
+struct egress_cidr6_key {
+    __u32 prefixlen;       /* 64 (cgroup) + IPv6 prefix length */
+    __u8  data[24];        /* cgroup id (big-endian) + IPv6 (network order) */
+};
+
+struct egress_cidr_value {
+    __u16 ports[MAX_CIDR_PORTS];  /* allowed ports, network byte order */
+    __u16 count;                  /* how many entries in ports[] are valid */
+    __u16 _pad;
+};
+
 /* ---------- dns_pending_map (internal, sendmsg -> recvmsg) -------------- */
 
 struct pending_dns_response {

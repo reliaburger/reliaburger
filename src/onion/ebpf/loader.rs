@@ -8,25 +8,59 @@ use std::path::{Path, PathBuf};
 
 use super::super::types::OnionError;
 
+/// Every map the loaded `onion_connect.bpf.o` object must define. A
+/// missing map used to surface as a panic at first use, deep inside the
+/// agent (NET8); now the load fails up front with the full list.
+pub const REQUIRED_MAPS: [&str; 9] = [
+    "backend_map",
+    "firewall_map",
+    "cgroup_namespace_map",
+    "egress_map",
+    "egress6_map",
+    "egress_cidr4_map",
+    "egress_cidr6_map",
+    "egress_enabled_map",
+    "fault_connect_map",
+];
+
+/// Every program the object must define.
+pub const REQUIRED_PROGRAMS: [&str; 2] = ["onion_connect", "onion_connect6"];
+
+/// Which required names are absent from the loaded object? Pure, so the
+/// validation logic is testable without a kernel.
+pub fn missing_names(required: &[&'static str], present: &[String]) -> Vec<&'static str> {
+    required
+        .iter()
+        .filter(|name| !present.iter().any(|p| p == *name))
+        .copied()
+        .collect()
+}
+
 /// Handle to loaded eBPF programs.
 pub struct OnionEbpf {
     _cgroup_path: PathBuf,
     #[cfg(feature = "ebpf")]
     _connect_link_id: aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId,
     #[cfg(feature = "ebpf")]
+    _connect6_link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
+    #[cfg(feature = "ebpf")]
     pub bpf: aya::Ebpf,
     attached: bool,
+    connect6_attached: bool,
 }
 
 impl OnionEbpf {
-    /// Load and attach the connect rewrite eBPF program.
+    /// Load and attach the connect eBPF programs.
     ///
-    /// Loads `onion_connect.bpf.o` from `program_dir` and attaches
-    /// the `onion_connect` program to the root cgroup v2.
+    /// Loads `onion_connect.bpf.o` from `program_dir`, validates that
+    /// every required map and program exists in the object, and attaches
+    /// the `onion_connect` (IPv4) and `onion_connect6` (IPv6) programs
+    /// to the root cgroup v2. A kernel that refuses the connect6 attach
+    /// is logged and reported via `connect6_attached()` — deploys with
+    /// an egress allowlist then fail closed rather than run a policy
+    /// that IPv6 walks straight past.
     #[cfg(feature = "ebpf")]
     pub fn load(program_dir: &Path, cgroup_path: &Path) -> Result<Self, OnionError> {
-        use aya::programs::CgroupSockAddr;
-
         check_prerequisites()?;
 
         let obj_path = program_dir.join("onion_connect.bpf.o");
@@ -40,38 +74,82 @@ impl OnionEbpf {
             reason: format!("failed to load eBPF program: {e}"),
         })?;
 
-        // Attach the connect4 program to the root cgroup
-        let prog: &mut CgroupSockAddr = bpf
-            .program_mut("onion_connect")
-            .ok_or_else(|| OnionError::EbpfLoadFailed {
-                reason: "onion_connect program not found in object file".to_string(),
-            })?
-            .try_into()
-            .map_err(|e| OnionError::EbpfLoadFailed {
-                reason: format!("wrong program type: {e}"),
-            })?;
-
-        prog.load().map_err(|e| OnionError::EbpfLoadFailed {
-            reason: format!("failed to load program into kernel: {e}"),
-        })?;
+        // Validate the object in one place instead of panicking at first
+        // map use later (NET8).
+        let map_names: Vec<String> = bpf.maps().map(|(name, _)| name.to_string()).collect();
+        let program_names: Vec<String> = bpf.programs().map(|(name, _)| name.to_string()).collect();
+        let mut missing = missing_names(&REQUIRED_MAPS, &map_names);
+        missing.extend(missing_names(&REQUIRED_PROGRAMS, &program_names));
+        if !missing.is_empty() {
+            return Err(OnionError::EbpfLoadFailed {
+                reason: format!(
+                    "loaded object {} is missing required maps/programs: {}",
+                    obj_path.display(),
+                    missing.join(", ")
+                ),
+            });
+        }
 
         let cgroup_fd =
             std::fs::File::open(cgroup_path).map_err(|e| OnionError::EbpfLoadFailed {
                 reason: format!("failed to open cgroup {}: {e}", cgroup_path.display()),
             })?;
 
-        let link_id = prog
-            .attach(cgroup_fd, aya::programs::CgroupAttachMode::Single)
-            .map_err(|e| OnionError::EbpfLoadFailed {
-                reason: format!("failed to attach to cgroup: {e}"),
-            })?;
+        // Attach the connect4 program to the root cgroup.
+        let link_id = Self::attach_connect_program(&mut bpf, "onion_connect", &cgroup_fd)?;
+
+        // Attach connect6 wherever connect4 attaches. An old kernel
+        // refusing the hook keeps the log-and-continue load policy; the
+        // agent then refuses deploys that need egress enforcement.
+        let (connect6_link_id, connect6_attached) =
+            match Self::attach_connect_program(&mut bpf, "onion_connect6", &cgroup_fd) {
+                Ok(id) => (Some(id), true),
+                Err(e) => {
+                    eprintln!(
+                        "onion: connect6 attach failed ({e}); IPv6 egress policy unavailable \
+                         — deploys with an egress allowlist will be refused"
+                    );
+                    (None, false)
+                }
+            };
 
         Ok(Self {
             _cgroup_path: cgroup_path.to_path_buf(),
             _connect_link_id: link_id,
+            _connect6_link_id: connect6_link_id,
             bpf,
             attached: true,
+            connect6_attached,
         })
+    }
+
+    /// Load and attach one `cgroup/connect*` program by name.
+    #[cfg(feature = "ebpf")]
+    fn attach_connect_program(
+        bpf: &mut aya::Ebpf,
+        name: &str,
+        cgroup_fd: &std::fs::File,
+    ) -> Result<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId, OnionError> {
+        use aya::programs::CgroupSockAddr;
+
+        let prog: &mut CgroupSockAddr = bpf
+            .program_mut(name)
+            .ok_or_else(|| OnionError::EbpfLoadFailed {
+                reason: format!("{name} program not found in object file"),
+            })?
+            .try_into()
+            .map_err(|e| OnionError::EbpfLoadFailed {
+                reason: format!("wrong program type for {name}: {e}"),
+            })?;
+
+        prog.load().map_err(|e| OnionError::EbpfLoadFailed {
+            reason: format!("failed to load {name} into kernel: {e}"),
+        })?;
+
+        prog.attach(cgroup_fd, aya::programs::CgroupAttachMode::Single)
+            .map_err(|e| OnionError::EbpfLoadFailed {
+                reason: format!("failed to attach {name} to cgroup: {e}"),
+            })
     }
 
     /// Stub loader when eBPF feature is not enabled.
@@ -88,6 +166,7 @@ impl OnionEbpf {
         Ok(Self {
             _cgroup_path: cgroup_path.to_path_buf(),
             attached: false,
+            connect6_attached: false,
         })
     }
 
@@ -96,9 +175,16 @@ impl OnionEbpf {
         self.attached
     }
 
+    /// Whether the IPv6 connect hook is attached. Without it, an egress
+    /// allowlist is decorative — anything dual-stack bypasses it.
+    pub fn connect6_attached(&self) -> bool {
+        self.connect6_attached
+    }
+
     /// Detach eBPF programs from the cgroup.
     pub fn detach(&mut self) {
         self.attached = false;
+        self.connect6_attached = false;
         // Links are dropped when self is dropped, which detaches the program
     }
 }
@@ -162,6 +248,28 @@ fn check_cgroup_v2() -> Result<(), OnionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_names_reports_absent_maps() {
+        let present = vec!["backend_map".to_string(), "egress_map".to_string()];
+        let missing = missing_names(&REQUIRED_MAPS, &present);
+        assert!(missing.contains(&"egress6_map"));
+        assert!(missing.contains(&"egress_cidr4_map"));
+        assert!(missing.contains(&"egress_cidr6_map"));
+        assert!(!missing.contains(&"backend_map"));
+    }
+
+    #[test]
+    fn missing_names_empty_when_all_present() {
+        let present: Vec<String> = REQUIRED_MAPS.iter().map(|s| s.to_string()).collect();
+        assert!(missing_names(&REQUIRED_MAPS, &present).is_empty());
+    }
+
+    #[test]
+    fn required_programs_include_both_connect_hooks() {
+        assert!(REQUIRED_PROGRAMS.contains(&"onion_connect"));
+        assert!(REQUIRED_PROGRAMS.contains(&"onion_connect6"));
+    }
 
     #[test]
     fn check_kernel_version_on_test_host() {

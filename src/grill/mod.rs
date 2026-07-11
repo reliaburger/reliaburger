@@ -8,7 +8,10 @@ pub mod apple;
 pub mod btrfs;
 pub mod cgroup;
 pub mod image;
-#[cfg(test)]
+// Also exposed under the `ebpf` feature: the Lima-gated integration
+// tests drive the agent's pre-start egress programming through a mock
+// grill (a runtime whose `pid()` is `None`), which unit tests can't.
+#[cfg(any(test, feature = "ebpf"))]
 pub mod mock;
 #[cfg(target_os = "linux")]
 pub mod netns;
@@ -128,6 +131,16 @@ pub trait Grill: Send + Sync {
     /// instance records so adoption is routed to the right runtime.
     fn runtime_kind(&self) -> records::RuntimeKind {
         records::RuntimeKind::Process
+    }
+
+    /// Whether this runtime places workloads into the cgroup v2 path in
+    /// the OCI spec (`cgroupsPath`). When true, the agent can create the
+    /// cgroup directory itself, program the eBPF egress maps against its
+    /// inode *before* `start`, and close the start-window during which a
+    /// workload would otherwise run unpoliced. The default declines:
+    /// process/VM runtimes run workloads elsewhere.
+    fn honours_cgroup_path(&self) -> bool {
+        false
     }
 
     /// Base path of an instance's on-disk log files (`{stem}.stdout` /
@@ -323,6 +336,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(_) => records::RuntimeKind::Runc,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => records::RuntimeKind::Apple,
+        }
+    }
+
+    fn honours_cgroup_path(&self) -> bool {
+        match self {
+            AnyGrill::Process(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.honours_cgroup_path(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
         }
     }
 

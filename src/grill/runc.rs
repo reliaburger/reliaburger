@@ -520,6 +520,13 @@ impl super::Grill for RuncGrill {
         super::records::RuntimeKind::Runc
     }
 
+    /// Root-mode runc joins the exact cgroup v2 path from the OCI spec's
+    /// `cgroupsPath`, so the agent can program egress before `start`.
+    /// Rootless runc may not own the cgroup tree — decline there.
+    fn honours_cgroup_path(&self) -> bool {
+        !self.rootless
+    }
+
     async fn adopt(
         &self,
         instance: &InstanceId,
