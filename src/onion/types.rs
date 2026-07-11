@@ -105,7 +105,7 @@ pub struct BackendValue {
 
 /// Key for the `firewall_map` BPF hash map.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FirewallKey {
     /// cgroup ID of the calling process.
     pub src_cgroup_id: u64,

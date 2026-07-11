@@ -416,6 +416,14 @@ pub struct BunAgent<G: Grill> {
     /// Ticks since the last egress re-resolution (the event loop runs at 1s).
     #[cfg(feature = "ebpf")]
     egress_reresolve_ticks: u32,
+    /// `firewall_map` keys last written to the kernel, so the next reconcile
+    /// deletes entries for departed cgroups (NET5). eBPF only.
+    #[cfg(feature = "ebpf")]
+    firewall_bpf_keys: std::collections::HashSet<crate::onion::types::FirewallKey>,
+    /// `cgroup_namespace_map` keys (cgroup ids) last written, for the same
+    /// reconcile-and-prune reason (NET5). eBPF only.
+    #[cfg(feature = "ebpf")]
+    cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Publisher for service-map snapshots (DNS responder subscribes).
@@ -491,6 +499,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_bindings: std::collections::HashMap::new(),
             #[cfg(feature = "ebpf")]
             egress_reresolve_ticks: 0,
+            #[cfg(feature = "ebpf")]
+            firewall_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(feature = "ebpf")]
+            cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -541,6 +553,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_bindings: std::collections::HashMap::new(),
             #[cfg(feature = "ebpf")]
             egress_reresolve_ticks: 0,
+            #[cfg(feature = "ebpf")]
+            firewall_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(feature = "ebpf")]
+            cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -751,6 +767,94 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     #[cfg(not(feature = "ebpf"))]
     async fn remove_backend_ebpf(&self, _app_name: &str) {}
+
+    /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
+    ///
+    /// Writes `cgroup_namespace_map` (cgroup → namespace) for every running
+    /// instance — which is what makes the connect hook enforce cross-namespace
+    /// isolation at all: with the source's namespace unknown the hook lets
+    /// every connection through. Writes `firewall_map` for each explicit
+    /// cross-namespace `allow_from` rule. Both maps are rebuilt from scratch
+    /// each call (a new instance of app A changes rules wherever A is a
+    /// *source*), deleting keys no longer desired. A no-op without eBPF.
+    #[cfg(feature = "ebpf")]
+    async fn sync_firewall_ebpf(&mut self) {
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return;
+        };
+
+        // cgroup id(s) per app, from currently-running instances. Collect the
+        // (app, id) pairs first so the `list_instances` borrow is released
+        // before the async `pid` lookups.
+        let pairs: Vec<(String, InstanceId)> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|i| (i.app_name.clone(), i.id.clone()))
+            .collect();
+        let mut cgroup_ids: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (app, id) in pairs {
+            if let Some(pid) = self.supervisor.grill().pid(&id).await
+                && let Some(cg) = crate::sesame::egress::cgroup_id_of_pid(pid)
+            {
+                cgroup_ids.entry(app).or_default().push(cg);
+            }
+        }
+
+        let services: Vec<crate::onion::types::ServiceEntry> = self
+            .service_map
+            .resolve_all()
+            .into_iter()
+            .cloned()
+            .collect();
+        let ns_entries =
+            crate::sesame::firewall::resolve_cgroup_namespace_entries(&services, &cgroup_ids);
+        let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
+            &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
+        );
+
+        let desired_ns_keys: std::collections::HashSet<u64> =
+            ns_entries.iter().map(|e| e.cgroup_id).collect();
+        let desired_fw_keys: std::collections::HashSet<crate::onion::types::FirewallKey> =
+            fw_entries.iter().map(|(k, _)| *k).collect();
+        let ns_to_delete =
+            crate::sesame::firewall::keys_to_delete(&self.cgroup_ns_bpf_keys, &desired_ns_keys);
+        let fw_to_delete =
+            crate::sesame::firewall::keys_to_delete(&self.firewall_bpf_keys, &desired_fw_keys);
+
+        {
+            let mut ebpf = handle.lock().await;
+            for entry in &ns_entries {
+                if let Err(e) = crate::sesame::firewall::write_cgroup_namespace_entry(
+                    &mut ebpf.bpf,
+                    entry.cgroup_id,
+                    entry.namespace_id,
+                ) {
+                    eprintln!("sesame: cgroup-namespace map write failed: {e}");
+                }
+            }
+            for (key, value) in &fw_entries {
+                if let Err(e) =
+                    crate::sesame::firewall::write_firewall_entry(&mut ebpf.bpf, *key, *value)
+                {
+                    eprintln!("sesame: firewall map write failed: {e}");
+                }
+            }
+            for cg in &ns_to_delete {
+                let _ = crate::sesame::firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, *cg);
+            }
+            for key in &fw_to_delete {
+                let _ = crate::sesame::firewall::delete_firewall_entry(&mut ebpf.bpf, *key);
+            }
+        }
+
+        self.cgroup_ns_bpf_keys = desired_ns_keys;
+        self.firewall_bpf_keys = desired_fw_keys;
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    async fn sync_firewall_ebpf(&mut self) {}
 
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
@@ -2492,6 +2596,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         }
                     }
                     self.sync_backend_ebpf(app_name).await;
+                    self.sync_firewall_ebpf().await;
                 }
                 if let Some(ref ingress) = spec.ingress {
                     self.ingress_configs
@@ -2557,6 +2662,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .service_map
                     .register_app(app_name, namespace, port, firewall);
                 self.sync_backend_ebpf(app_name).await;
+                self.sync_firewall_ebpf().await;
             }
 
             // Store ingress config for routing table
@@ -3018,6 +3124,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // L8: mirror the freshly-registered backend into the eBPF backend_map.
         self.sync_backend_ebpf(app_name).await;
+        // NET5: reconcile the namespace-firewall maps for the new cgroup.
+        self.sync_firewall_ebpf().await;
 
         // L16: program the egress allowlist for this instance's cgroup.
         self.apply_egress(instance_id, spec).await;
@@ -3558,6 +3666,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = self.service_map.add_backend(&app_name, backend);
             }
             self.sync_backend_ebpf(&app_name).await;
+            self.sync_firewall_ebpf().await;
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -3625,6 +3734,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.remove_backend_ebpf(app_name).await;
         let _ = self.service_map.unregister_app(app_name);
+        // NET5: prune this app's cgroup-namespace + firewall entries now it's
+        // gone, so a reused cgroup inode can't inherit its isolation identity.
+        self.sync_firewall_ebpf().await;
         self.ingress_configs.remove(app_name);
         self.rebuild_routing_table().await;
 
