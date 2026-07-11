@@ -310,11 +310,11 @@ Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-pla
 - [x] `L6` / `L11` Reporting + rollups wired: `RollupWorker` spawned per node, aggregator gets a real rollup store, `/v1/metrics/cluster` serves from it; StateReports carry real capacity (`[resources]` now read) and requested-resource usage. Flat-star kept by design (tree deferred, see ch. 11); fixed a latent DataFusion overflow (`unwrap_or(u64::MAX)` time ranges, 4 handlers)
 - [x] `L7` Bind the Wrapper ingress listener — `[ingress]` node-config section (off by default), HTTP + HTTPS listeners (self-signed or disk certs), per-client rate limiting wired into the proxy path, WebSocket pass-through; drain-on-deploy integration lands with `L2` (W7)
 - [x] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility) — **`L9`+`M8` done**: `[dns]` config section (off by default), responder spawned from bun, full hardening (recv errors non-fatal, per-query spawned forwards behind a semaphore, connected sockets + transaction-ID checks, NXDOMAIN for unmatched `.internal` with no upstream leak, QTYPE honoured, SERVFAIL on dead upstream), runc containers get `resolv.conf` pointed at the responder. **`L8` done**: `[ebpf]` config section (off by default; `program_dir` defaults to the build-time `OUT_DIR` baked in via `build.rs` `RELIABURGER_BPF_DIR`, so dev/Lima builds self-locate their `.bpf.o`), `bun` loads + attaches `OnionEbpf` at startup (load failure logs and continues without enforcement; non-`ebpf` builds warn that enforcement is off). Verified in the `reliaburger-test` Lima VM: `cargo build --features ebpf` compiles the objects and all 9 `tests/ebpf.rs` integration tests pass (load/attach, backend-map read/write/remove, connect→VIP rewrite, no-backend deny `EPERM`, non-VIP passthrough, `.internal` DNS). Not covered by `make ci` (needs root + kernel 5.7+ + cgroup v2)
-  - **Backend/fault/egress eBPF wiring landed** (Phase 11b follow-up, P0–P3): the agent writes the live `backend_map`, fault maps and DNS-refresh egress entries. **Post-Phase-12 correction:** namespace firewall maps still have no production writer, rolling deploy skips egress, IPv6 bypasses policy and map failures can fail open; Phase 12b owns those gaps.
+  - **Backend/fault/egress eBPF wiring landed** (Phase 11b follow-up, P0–P3): the agent writes the live `backend_map`, fault maps and DNS-refresh egress entries. Namespace firewall maps and rolling-deploy egress (with fail-closed programming) are closed in Phase 12b (NET5/NET6); IPv6/CIDR enforcement remains under the 12b network-policy theme.
 - [x] `L10` / `M2` Pickle wired: catalog persists to disk + loads at boot; pushes record real raft-id holders and propose to Raft on council nodes (worker proposal forwarding lands with W6); leader replication loop keeps layers at `[images] redundancy`; scheduled two-phase GC — nominate → Raft-arbitrated approval (`CouncilResponse::GcApproved`) → delete, with an orphan grace window for in-flight pushes. `X1` fixed: `relish build` targets the registry port, `/v1/build` executes buildah for real (honest 501 without it)
 - [x] `L13` / `H12` GitOps wired: new `src/lettuce/runner.rs` spawns a leader-only sync loop (clone → poll/webhook → `execute_sync` in `spawn_blocking` → apply changes as `AppSpec`/`AppDelete` Raft writes). Webhook endpoint gets a real channel (was unconditional 503); `[gitops]` config now read. `H12`: `is_key_trusted` no longer falls through to `true` — a valid signature from an unlisted key is rejected. Fixed a latent first-sync bug (a fresh clone has nothing to fetch but nothing applied either → now syncs when HEAD ≠ last-applied). Integration tests in `tests/gitops.rs` (real git repo → Raft; webhook triggers sync)
 - [x] `L14` / `L15` Smoker safety context, process/network plumbing and chaos transport blocklists wired; Kill/Pause/Resume, eBPF network faults and partitions have binary-driven tests. **Post-Phase-12 audit:** several advertised resource/node faults are no-ops that return success, CPU stress runs in Bun's cgroup and clear/expiry does not reverse every effect; the measurable-effect/cleanup work is Phase 12b.
-- [x] `L16` Initial IPv4 egress allowlist programming and DNS refresh wired and Lima-tested. **Post-Phase-12 audit:** policy is installed after fresh start, omitted on rolling deploy, warning-only on required-map failure, leaves stale destinations on stop and has no IPv6/CIDR enforcement; Phase 12b makes it fail closed.
+- [x] `L16` Initial IPv4 egress allowlist programming and DNS refresh wired and Lima-tested. Phase 12b (NET6) made it fail closed, extended it to rolling deploy and crash-restart, and deletes per-cgroup entries on stop; IPv6/CIDR enforcement remains under the 12b network-policy theme.
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
 - [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
 - [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
@@ -378,7 +378,9 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 
 Every top-level checkbox below is one PR-sized theme. Write the binary-driven
 acceptance test first, update the relevant book chapter in the same PR, and check
-the theme only after default and platform-gated tests pass.
+the theme only after default and platform-gated tests pass. Done findings within a
+theme are ticked as nested `- [x]` items; a theme's own box is checked only when the
+whole theme lands.
 
 ### 12b.1 — Stop the bleeding
 
@@ -388,12 +390,21 @@ the theme only after default and platform-gated tests pass.
   parse build digests/Dockerfile paths and bound, sandbox and clean archive extraction.
   Reject anonymous and ReadOnly execution, callback SSRF, path traversal, sparse/oversized
   contexts and a Buildah process that survives timeout (new JOB1-JOB2, H4/D8).
+  - [x] `require_system` on `/v1/batch/run|report` and `/v1/build/run`, `authorize(Deployer)`
+    on the submit endpoints, callback bounded to known members, and the cluster service token
+    no longer forwarded to caller-controlled URLs (JOB1); build `context_digest` validated as a
+    well-formed OCI digest before it becomes a temp path, killing the `sha256:../../x` traversal
+    (JOB2).
 - [ ] **Secret and workload-identity safety** — make rotation generation-aware:
   encrypt with the newest key, decrypt with active generations, re-encrypt and acknowledge
   every stored secret before retiring the old key, and reject malformed/concurrent
   rotations. Issue exact validity windows, rebuild SANs server-side, store identity in
   per-instance tmpfs, preserve it through rolling/adoption and clean it on removal
   (new PKI6-PKI8, D9).
+  - [x] Generation-aware secret rotation: encryption picks the newest non-read-only key,
+    decryption tries every live generation, finalize refuses to empty a scope, and a malformed
+    rotate body is rejected — so a secret sealed under generation N survives the rotation window
+    (PKI8).
 - [ ] **Pickle reference integrity** — include raw manifest/index blobs in holder,
   replication and GC reachability; validate JSON, media types, descriptor digest/size and
   referenced blob existence before returning Created; use canonical repository identity
@@ -405,10 +416,19 @@ the theme only after default and platform-gated tests pass.
   closed when required policy cannot be installed; reconcile kernel truth and delete every
   per-cgroup entry. Add IPv6/connect6 and CIDR enforcement, safe nftables input, required-map
   validation and IPv4/IPv6 perimeter rules with timeouts (new NET5-NET8, D5, old BPF/nft Lows).
+  - [x] Namespace-firewall maps (`cgroup_namespace_map` + `firewall_map`) written and
+    reconciled on every deploy/redeploy/restart/stop, so the connect hook actually enforces
+    cross-namespace isolation instead of failing open on empty maps (NET5); egress programmed on
+    rolling redeploy and crash-restart through one shared `finish_instance_networking` helper,
+    failing closed (deny-all) on any programming error, with stop/redeploy deleting the allow
+    entries so a recycled cgroup id inherits nothing (NET6).
 - [ ] **Consensus persistence safety** — version and checksum snapshots, validate the
   snapshot/log boundary, propagate vote/log/initialisation errors and refuse startup when
   compacted state cannot be reconstructed. Test compact → corrupt → restart returns an
   error instead of an empty cluster state (new CP3).
+  - [x] A present-but-undecodable Raft snapshot is now a hard startup error instead of a silent
+    empty-state boot after log compaction; a genuinely absent snapshot still loads an empty
+    default (CP3).
 
 ### 12b.2 — Make the cluster converge
 
@@ -511,6 +531,8 @@ the theme only after default and platform-gated tests pass.
   export, one Bun-owned checkpoint, durable object IDs, provider webhook payloads and final
   shutdown flush; remove/consolidate legacy Ketchup calendar/config (codex-M4/D13,
   old M3/M4/M19/M20/M24/X8, OBS1-OBS8).
+  - [x] Cluster rollup metric-name queries escaped via `escape_sql_literal`, closing the
+    `/v1/metrics/rollup` SQL injection where `params.name` was interpolated raw (OBS1).
 - [ ] **GitOps convergence and webhook security** — expose a signature-validated HMAC
   webhook route with replay/rate controls; make diff namespace-aware and deterministic;
   apply every resource through the unified desired-state path; never advance last_applied
