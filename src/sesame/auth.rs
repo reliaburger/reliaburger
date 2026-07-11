@@ -252,6 +252,27 @@ pub fn authorize(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Res
     }
 }
 
+/// Require the internal **system principal** — the caller must have presented
+/// the cluster service token.
+///
+/// This guards node-to-node endpoints (batch/build run and report) that only
+/// another cluster node should ever call. Unlike [`authorize`], it does **not**
+/// pass through on `None`: a request that arrives with no authenticated
+/// context (including the bootstrap window) is refused, because these routes
+/// are never part of first-run setup — they exist only once a cluster, and its
+/// service token, exist.
+#[allow(clippy::result_large_err)]
+pub fn require_system(ctx: Option<&AuthContext>) -> Result<(), Response> {
+    match ctx {
+        Some(ctx) if ctx.token_name == SYSTEM_PRINCIPAL => Ok(()),
+        _ => Err((
+            StatusCode::FORBIDDEN,
+            "internal endpoint: cluster node identity required",
+        )
+            .into_response()),
+    }
+}
+
 /// Build a GET request builder, attaching a `Bearer` token when present.
 ///
 /// Cross-node fan-out uses this to present the internal service token to peers,
@@ -444,6 +465,23 @@ mod tests {
         let state = AuthState::new(store, Some("rbrg_service".to_string()));
         let status = status_of(guarded_router(state), Some("Bearer rbrg_nope")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_system_accepts_only_the_system_principal() {
+        // The system principal passes.
+        assert!(require_system(Some(&system_context())).is_ok());
+        // A normal Admin user does not (it is not the internal principal).
+        let admin = AuthContext {
+            token_name: "alice".to_string(),
+            role: ApiRole::Admin,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        assert!(require_system(Some(&admin)).is_err());
+        // The bootstrap window (no context) is refused too — internal
+        // endpoints are never part of first-run setup.
+        assert!(require_system(None).is_err());
     }
 
     #[tokio::test]

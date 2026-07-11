@@ -139,6 +139,26 @@ async fn build_run_rejects_a_traversal_context_digest() {
     }
 }
 
+/// JOB1: `/v1/build/run` requires the system principal — a valid digest from a
+/// caller without the cluster service token is refused (403) before any build
+/// runs. (A malformed digest is rejected earlier with 400 by the test above.)
+#[tokio::test]
+async fn build_run_requires_the_system_principal() {
+    let harness = Harness::start().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build/run", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "app",
+            "context_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "registry_port": 5050,
+            "spec": { "context": ".", "destination": "pickle://app:v1" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 403);
+}
+
 /// Unknown build ids are 404, not empty objects.
 #[tokio::test]
 async fn unknown_build_id_is_404() {
