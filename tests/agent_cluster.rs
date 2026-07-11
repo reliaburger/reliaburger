@@ -89,6 +89,7 @@ async fn agent_nodes_returns_membership() {
         snapshot_rx,
         wrapping_ikm: None,
         partition_blocklists: Default::default(),
+        crl_handle: Default::default(),
     };
 
     let grill = ProcessGrill::new();
@@ -171,6 +172,7 @@ async fn agent_council_returns_raft_state() {
         snapshot_rx,
         wrapping_ikm: None,
         partition_blocklists: Default::default(),
+        crl_handle: Default::default(),
     };
 
     let grill = ProcessGrill::new();
@@ -318,6 +320,7 @@ async fn agent_snapshot_request_returns_instances() {
         snapshot_rx,
         wrapping_ikm: None,
         partition_blocklists: Default::default(),
+        crl_handle: Default::default(),
     };
 
     let grill = ProcessGrill::new();

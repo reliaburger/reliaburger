@@ -110,6 +110,8 @@ fn cluster_params_from_config(
         })
         .transpose()?;
 
+    let identity = load_node_identity(config)?;
+
     Ok(reliaburger::cluster::runtime::ClusterParams {
         node_name,
         gossip_addr,
@@ -124,7 +126,56 @@ fn cluster_params_from_config(
         // caller sets it before starting the runtime.
         mayo: None,
         rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
+        identity,
     })
+}
+
+/// The directory this node reads/writes its identity from: the configured
+/// `[security] identity_dir`, or `{storage.data}/identity` by default.
+fn node_identity_dir(config: &NodeConfig) -> std::path::PathBuf {
+    config
+        .security
+        .identity_dir
+        .clone()
+        .unwrap_or_else(|| reliaburger::sesame::identity_store::identity_dir(&config.storage.data))
+}
+
+/// Load this node's mTLS identity from disk, if one has been installed.
+fn load_node_identity(
+    config: &NodeConfig,
+) -> anyhow::Result<Option<std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>>> {
+    use anyhow::Context;
+    let dir = node_identity_dir(config);
+    let identity = reliaburger::sesame::identity_store::load(&dir)
+        .with_context(|| format!("failed to load node identity from {}", dir.display()))?;
+    Ok(identity.map(std::sync::Arc::new))
+}
+
+/// Enforce the `require_mtls` mode matrix before the cluster starts.
+///
+/// With `require_mtls` set and no identity on disk, the node cannot speak the
+/// internal transports, so it refuses to start. The message differs by role:
+/// a bootstrap node (no seeds) needs `relish init`; a joiner (seeds set) needs
+/// `relish join` and a restart.
+fn enforce_mtls_mode(
+    config: &NodeConfig,
+    params: &reliaburger::cluster::runtime::ClusterParams,
+) -> anyhow::Result<()> {
+    if !config.security.require_mtls || params.identity.is_some() {
+        return Ok(());
+    }
+    let dir = node_identity_dir(config).display().to_string();
+    if params.seeds.is_empty() {
+        anyhow::bail!(
+            "[security] require_mtls is set but no identity was found at {dir}: \
+             run `relish init` on the bootstrap node first"
+        );
+    }
+    anyhow::bail!(
+        "[security] require_mtls is set but this node has no identity yet at {dir}: \
+         run `relish join --token <token> --node-id {} <member-api-url>` to enrol, then restart bun",
+        params.node_name
+    );
 }
 
 /// Schedulable node capacity: system totals minus the `[resources]`
@@ -329,6 +380,8 @@ async fn main() -> anyhow::Result<()> {
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
     let mut api_council: Option<Arc<reliaburger::council::CouncilNode>> = None;
+    // Shared CRL for the internal mTLS verifiers, refreshed from Raft state.
+    let mut crl_refresh: Option<reliaburger::sesame::mtls::CrlHandle> = None;
     // The leader-side rollup store, exposed at /v1/metrics/cluster.
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
@@ -342,6 +395,26 @@ async fn main() -> anyhow::Result<()> {
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
+
+        // Mode matrix: with require_mtls set, a node must have an identity on
+        // disk before it can speak the internal transports. Refuse to start
+        // otherwise, with the command that fixes it.
+        enforce_mtls_mode(&config, &params)?;
+        if params.identity.is_some() {
+            println!("bun: mTLS enabled on the Raft RPC transport");
+        } else if config.security.require_mtls {
+            unreachable!("enforce_mtls_mode rejects require_mtls without an identity");
+        } else if reliaburger::sesame::identity_store::load(&node_identity_dir(&config))
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            eprintln!(
+                "bun: warning — a node identity is present but [security] require_mtls is false; \
+                 internal transports stay plaintext. Set require_mtls = true to enable mTLS."
+            );
+        }
+
         println!(
             "bun: cluster mode — gossip on {}, {} seed(s)",
             params.gossip_addr,
@@ -353,6 +426,7 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
+        crl_refresh = Some(handle.crl_handle.clone());
         // Cloned before the handle moves into the agent: the pickle
         // replication loop derives its peer list from gossip.
         replication_membership = Some(handle.membership_rx.clone());
@@ -535,16 +609,27 @@ async fn main() -> anyhow::Result<()> {
     let api_token_store = if let Some(council) = &api_council {
         let store = reliaburger::sesame::auth::new_token_store();
         refresh_token_store(&store, council).await;
+        if let Some(crl) = &crl_refresh {
+            crl.update(council.security_state().await.crl);
+        }
 
         let refresh_store = Arc::clone(&store);
         let refresh_council = Arc::clone(council);
         let refresh_shutdown = shutdown.clone();
+        let refresh_crl = crl_refresh.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = refresh_shutdown.cancelled() => break,
-                    _ = ticker.tick() => refresh_token_store(&refresh_store, &refresh_council).await,
+                    _ = ticker.tick() => {
+                        refresh_token_store(&refresh_store, &refresh_council).await;
+                        // Same tick refreshes the CRL so a revoked peer is
+                        // refused on its next handshake (≤5 s lag).
+                        if let Some(crl) = &refresh_crl {
+                            crl.update(refresh_council.security_state().await.crl);
+                        }
+                    }
                 }
             }
         });
@@ -1417,5 +1502,53 @@ mod tests {
         let tokens = store.read().await;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].name, "ci");
+    }
+
+    /// A config with require_mtls but no identity on disk.
+    fn mtls_config_without_identity() -> (NodeConfig, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.security.require_mtls = true;
+        // Point the data dir at an empty temp dir so no identity is found.
+        config.storage.data = dir.path().to_path_buf();
+        (config, dir)
+    }
+
+    #[test]
+    fn require_mtls_without_identity_refuses_to_bootstrap() {
+        let (config, _dir) = mtls_config_without_identity();
+        let params = cluster_params_from_config(&config).unwrap();
+        assert!(params.identity.is_none());
+        assert!(params.seeds.is_empty(), "bootstrap node has no seeds");
+
+        let err = enforce_mtls_mode(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("relish init"),
+            "bootstrap error should point at `relish init`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn require_mtls_without_identity_tells_a_joiner_to_enrol() {
+        let (mut config, _dir) = mtls_config_without_identity();
+        config.cluster.join = vec!["127.0.0.1:9443".to_string()];
+        let params = cluster_params_from_config(&config).unwrap();
+        assert!(!params.seeds.is_empty(), "joiner has a seed");
+
+        let err = enforce_mtls_mode(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("relish join"),
+            "joiner error should point at `relish join`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mtls_mode_accepts_a_bootstrap_node_without_mtls_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.storage.data = dir.path().to_path_buf();
+        // require_mtls defaults to false — plaintext is allowed.
+        let params = cluster_params_from_config(&config).unwrap();
+        assert!(enforce_mtls_mode(&config, &params).is_ok());
     }
 }

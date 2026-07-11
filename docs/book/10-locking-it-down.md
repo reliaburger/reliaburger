@@ -303,6 +303,22 @@ The master key file is the crown jewel. Lose it and you can't unwrap any CA priv
 
 The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON, writes a `SecurityStateInit` command to Raft, and deletes the file. After that, SecurityState lives in Raft and replicates to every council node automatically.
 
+### Turning mTLS on: the mode matrix
+
+Persisting identities and building handshake-true configs is nothing until a real listener uses them. The Raft RPC transport is the first to get wrapped. Whether it does is decided by a small matrix, evaluated once at startup, driven by two inputs: is there an identity on disk, and is `[security] require_mtls` set?
+
+| `require_mtls` | identity on disk | what happens |
+|---|---|---|
+| false | absent | plaintext, as before |
+| false | present | plaintext, with a warning to set `require_mtls` |
+| true | present | Raft RPC requires client certs; peers dialled over mTLS |
+| true | absent, bootstrap node | refuse to start — run `relish init` |
+| true | absent, joiner | refuse to start — run `relish join`, then restart |
+
+The two "refuse to start" rows are the important ones. A node that is told to require mTLS but has no certificate cannot speak the internal transport, so rather than limp along in a half-secured state it stops with the exact command that fixes it. This is the deliberate cost of the restart-after-join model: a joiner enrols (writes its identity to disk), then restarts, and on the second boot the identity is present and the matrix lands on the mTLS row. One extra restart per node, once, in exchange for never running in an ambiguous partial-TLS state.
+
+Wiring it through the runtime is mechanical once the pieces from earlier in the chapter exist. `cluster::runtime::start` builds a `TlsAcceptor` from `build_mtls_server_config` and a `TlsConnector` from `build_mtls_client_config`, both sharing one `CrlHandle`. The acceptor goes to `serve_raft_rpc`; the connector goes to the network factory via `new_tls`. The frame read/write functions became generic over `AsyncRead + AsyncWrite` so the exact same code serves a plain `TcpStream` or a `tokio_rustls` stream — the only fork is one `match` on whether TLS is configured. And the `CrlHandle` is handed back to `bun`, whose existing token-refresh ticker now also copies the latest CRL from Raft into it every five seconds, so a `RevokeCertificate` takes effect on a peer's next handshake without anyone restarting anything.
+
 ### How it fits into Raft
 
 `SecurityState` is a field on `DesiredState`, the struct that the Raft state machine maintains:

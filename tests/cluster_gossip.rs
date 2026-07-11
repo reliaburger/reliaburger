@@ -100,6 +100,7 @@ async fn start_node_with_mayo(
             mayo,
             // Fast rollups so tests observe delivery quickly.
             rollup_interval: Duration::from_millis(300),
+            identity: None,
         },
         shutdown.clone(),
     )

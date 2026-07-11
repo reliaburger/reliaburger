@@ -365,6 +365,10 @@ pub struct ClusterHandle {
     /// these to drop traffic to specific peers). Empty in tests that
     /// don't exercise partitions.
     pub partition_blocklists: PartitionBlocklists,
+    /// Shared CRL used by the internal mTLS verifiers. bun's security refresh
+    /// ticker updates it as `RevokeCertificate` entries replicate, so a
+    /// revoked peer is refused on its next handshake without a restart.
+    pub crl_handle: crate::sesame::mtls::CrlHandle,
 }
 
 /// The transport blocklists a chaos partition manipulates, plus the
