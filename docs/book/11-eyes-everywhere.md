@@ -180,6 +180,8 @@ And here's the lesson that pays for the whole exercise. The moment the wired pat
 
 No unit test ever caught it because unit tests pass polite little timestamps like `1000`, and nothing exercised the open-ended default until a real endpoint served a real store. "Library-only" doesn't just mean features you can't use — it means bugs that haven't been allowed to happen yet.
 
+The same "polite little inputs" blind spot hid a nastier one. Those cluster-metric queries build their SQL with `format!`, dropping the caller's metric name straight into `WHERE metric_name = '{name}'`. The name arrives from `/v1/metrics/rollup?name=…` — attacker-controlled — so `x' OR '1'='1` turns a scoped lookup into a full-table scan across every tenant's metrics, and worse constructions are possible. The fix is the boring one: the same `escape_sql_literal` that doubles quotes for the per-node store now guards the rollup queries too. The lesson is that a query engine you drive with string concatenation is a SQL-injection surface whether the strings come from a user form or a metrics label — parameterise or escape every interpolated value, not just the ones that look dangerous.
+
 ### Capacity, honestly
 
 The same wiring pass fixed the other zeroed field: `StateReport.resource_usage` used to be all zeroes, which would have made the Phase-2 scheduler's bin-packing arithmetic an elaborate way of dividing by zero. Reports now carry the node's schedulable capacity (system totals from `sysinfo`, minus the `[resources]` reservation — a config section that was parsed and ignored until now) and per-instance usage.

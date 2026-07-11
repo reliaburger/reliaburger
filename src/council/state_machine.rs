@@ -279,12 +279,19 @@ impl CouncilStateMachine {
             let t = rtx.open_table(SNAPSHOT)?;
             if let Some(data) = t.get(SNAP_DATA_KEY)? {
                 let bytes = data.value().to_vec();
-                // A corrupt/incompatible snapshot is treated as absent rather
-                // than fatal — the log can still replay from the start.
-                if let Ok(state) = serde_json::from_slice::<DesiredState>(&bytes) {
-                    inner.state = state;
-                    inner.snapshot_data = Some(bytes);
-                }
+                // A snapshot blob that EXISTS but won't decode is corruption,
+                // not absence. Fail closed (CP3): after log compaction the
+                // entries this snapshot covers are gone, so silently booting an
+                // empty state here would destroy the cluster's desired and
+                // security state (app specs, CA material, tokens). Refuse to
+                // start so an operator can restore from backup instead.
+                let state = serde_json::from_slice::<DesiredState>(&bytes).map_err(|e| {
+                    redb::StorageError::Corrupted(format!(
+                        "council snapshot present but failed to decode: {e}"
+                    ))
+                })?;
+                inner.state = state;
+                inner.snapshot_data = Some(bytes);
             }
             if let Some(idx) = t.get(SNAP_INDEX_KEY)? {
                 let v = idx.value();
@@ -544,6 +551,45 @@ mod tests {
         assert_eq!(state.apps.get(&app_id).unwrap().image, spec.image);
         let (last_applied, _) = sm.applied_state().await.unwrap();
         assert_eq!(last_applied.map(|l| l.index), Some(1));
+    }
+
+    #[tokio::test]
+    async fn with_store_on_an_absent_snapshot_loads_empty_state() {
+        // No snapshot written: a fresh store opens with the default state.
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Database::create(dir.path().join("fresh.redb")).unwrap());
+        let sm = CouncilStateMachine::with_store(db).expect("fresh store opens");
+        assert!(sm.desired_state().await.apps.is_empty());
+    }
+
+    #[test]
+    fn with_store_fails_closed_on_a_corrupt_snapshot() {
+        // CP3: a snapshot blob that exists but won't decode must abort startup,
+        // not silently boot an empty desired/security state.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            let wtx = db.begin_write().unwrap();
+            {
+                let mut t = wtx.open_table(SNAPSHOT).unwrap();
+                t.insert(
+                    SNAP_DATA_KEY,
+                    b"this is not valid DesiredState json".as_slice(),
+                )
+                .unwrap();
+                t.insert(SNAP_INDEX_KEY, 7u64.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let result = CouncilStateMachine::with_store(db);
+        assert!(
+            result.is_err(),
+            "a present-but-corrupt snapshot must fail closed, not load empty"
+        );
     }
 
     #[tokio::test]

@@ -240,8 +240,15 @@ pub async fn run_build(
 /// delegate to a peer that reported the capability, else 503.
 pub async fn build_submit_handler(
     State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     Json(request): Json<BuildSubmitRequest>,
 ) -> Response {
+    // Submitting a build is a Deployer action (AUTH2).
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     if local_buildah_available().await {
         return accept_build(&state, request).await;
     }
@@ -325,8 +332,26 @@ pub async fn build_submit_handler(
 /// `POST /v1/build/run`: the builder-node endpoint — always local.
 pub async fn build_run_handler(
     State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     Json(request): Json<BuildSubmitRequest>,
 ) -> Response {
+    // Reject a malformed context digest first (JOB2) — an unconditional shape
+    // check with no side effects. This endpoint is reached by a delegating
+    // peer, and the digest is later used to build a temp path; `Digest::new`
+    // allows only `sha256:` + 64 hex, which cannot contain `.`/`/`.
+    if let Err(e) = crate::pickle::types::Digest::new(&request.context_digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid context digest: {e}") })),
+        )
+            .into_response();
+    }
+    // Node-to-node delegation only (JOB1): a build runs an arbitrary Buildah
+    // context as a privileged process, so only a cluster node (system
+    // principal) may drive it.
+    if let Err(resp) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return resp;
+    }
     if !local_buildah_available().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -341,6 +366,20 @@ pub async fn build_run_handler(
 
 /// Register + spawn a local build; answer 202 with the id.
 async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response {
+    // Validate the context digest before it is ever used to build a path
+    // (JOB2): `context_digest` reaches `run_build` from a peer over
+    // `/v1/build/run` and is interpolated into a temp directory. A digest
+    // like `sha256:../../x` would escape the build sandbox and the tar
+    // unpack would run as a privileged process. `Digest::new` enforces
+    // `sha256:` + 64 hex, so `.`/`/` can never appear.
+    if let Err(e) = crate::pickle::types::Digest::new(&request.context_digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid context digest: {e}") })),
+        )
+            .into_response();
+    }
+
     let build_id = state
         .build_registry
         .lock()

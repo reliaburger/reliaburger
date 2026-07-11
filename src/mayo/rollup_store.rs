@@ -248,6 +248,10 @@ impl RollupStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        // Escape the caller-supplied name: it reaches here from `/v1/metrics/rollup`
+        // and is interpolated into SQL. Without this a crafted name could drop the
+        // time/name predicates (OBS1).
+        let metric_name = crate::mayo::store::escape_sql_literal(metric_name);
         let sql = format!(
             "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
              FROM rollups \
@@ -269,6 +273,8 @@ impl RollupStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<ClusterAggregate>, MayoError> {
+        // Escape the caller-supplied name before interpolation (OBS1).
+        let metric_name = crate::mayo::store::escape_sql_literal(metric_name);
         let sql = format!(
             "SELECT timestamp, metric_name, labels, \
              MIN(min_val) as cluster_min, MAX(max_val) as cluster_max, \
@@ -616,6 +622,30 @@ mod tests {
         let results = store.query_cluster_metric("cpu", 0, 9999).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].3, 30.0);
+    }
+
+    #[tokio::test]
+    async fn cluster_metric_query_neutralises_sql_injection() {
+        // OBS1: a crafted metric name must not drop the predicate and leak
+        // every metric. With escaping, the injected string is looked up
+        // literally (matching nothing), not executed as SQL.
+        let (mut store, _dir) = test_store();
+        store.ingest(&make_rollup("n1", 1000, "cpu", 10.0));
+        store.ingest(&make_rollup("n1", 1000, "secret_metric", 99.0));
+        store.flush().await.unwrap();
+
+        let injected = store
+            .query_cluster_metric("x' OR '1'='1", 0, 9999)
+            .await
+            .unwrap();
+        assert!(
+            injected.is_empty(),
+            "injection must match nothing, got {injected:?}"
+        );
+
+        // The benign path still works.
+        let ok = store.query_cluster_metric("cpu", 0, 9999).await.unwrap();
+        assert_eq!(ok.len(), 1);
     }
 
     #[tokio::test]

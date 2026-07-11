@@ -16,6 +16,11 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// The internal node-to-node endpoints (`/v1/batch/run`, `/report`) require the
+/// cluster service token; the harness configures one so the dispatch path (and
+/// the direct tests below) can present it.
+const TEST_SERVICE_TOKEN: &str = "rbrg_test_service_token";
+
 struct Harness {
     client: BunClient,
     base_url: String,
@@ -48,7 +53,7 @@ impl Harness {
             None,
             None,
             None,
-            None,
+            Some(TEST_SERVICE_TOKEN.to_string()),
             None,
             None,
             None,
@@ -194,6 +199,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
     });
     let response = http
         .post(format!("{}/v1/batch/run", runner.base_url))
+        .bearer_auth(TEST_SERVICE_TOKEN)
         .json(&run)
         .send()
         .await
@@ -222,9 +228,54 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
     // restart must not turn late reports into errors).
     let report = http
         .post(format!("{}/v1/batch/424242/report", submitter.base_url))
+        .bearer_auth(TEST_SERVICE_TOKEN)
         .json(&serde_json::json!({ "job_name": "remote-1", "status": "completed" }))
         .send()
         .await
         .unwrap();
     assert_eq!(report.status().as_u16(), 200);
+}
+
+/// JOB1: the internal `/v1/batch/run` and `/report` endpoints reject a caller
+/// that is not the system principal, so a ReadOnly/anonymous caller cannot run
+/// work or forge completion (and never reaches the service-token callback).
+#[tokio::test]
+async fn batch_internal_endpoints_require_the_system_principal() {
+    let runner = Harness::start().await;
+    let http = reqwest::Client::new();
+    let run = serde_json::json!({
+        "batch_id": 1,
+        "jobs": [{
+            "name": "x",
+            "spec": { "image": "proc-grill:image-ignored", "command": ["echo", "x"] },
+        }],
+    });
+
+    // No token at all → not the system principal → 403.
+    let no_token = http
+        .post(format!("{}/v1/batch/run", runner.base_url))
+        .json(&run)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status().as_u16(), 403);
+
+    // A non-service bearer token is also refused.
+    let wrong = http
+        .post(format!("{}/v1/batch/run", runner.base_url))
+        .bearer_auth("rbrg_not_the_service_token")
+        .json(&run)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status().as_u16(), 403);
+
+    // The report endpoint is equally guarded.
+    let report = http
+        .post(format!("{}/v1/batch/1/report", runner.base_url))
+        .json(&serde_json::json!({ "job_name": "x", "status": "completed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(report.status().as_u16(), 403);
 }

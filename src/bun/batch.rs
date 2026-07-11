@@ -299,7 +299,17 @@ pub async fn run_jobs_and_watch(
 // ---------------------------------------------------------------------------
 
 /// `POST /v1/batch` — leader-forwarded submission.
-pub async fn batch_submit_handler(State(state): State<ApiState>, body: String) -> Response {
+pub async fn batch_submit_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    body: String,
+) -> Response {
+    // Submitting work is a Deployer action (AUTH2 — it used to take no auth).
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
     // Followers forward the raw body to the leader (the tracker and
     // the aggregated capacity view live there).
     if let Some(council) = &state.council
@@ -428,14 +438,35 @@ pub async fn batch_submit_handler(State(state): State<ApiState>, body: String) -
 /// `POST /v1/batch/run` — a node receives its share of a batch.
 pub async fn batch_run_handler(
     State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     Json(run): Json<BatchRunRequest>,
 ) -> Response {
+    // Node-to-node only: reject anything that isn't the system principal
+    // (JOB1). Without this a ReadOnly or bootstrap-window caller could run
+    // arbitrary jobs and — via the callback below — steal the service token.
+    if let Err(resp) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return resp;
+    }
     let reporter = match run.callback_base_url {
-        Some(base_url) => Reporter::Callback {
-            base_url,
-            client: state.cluster_http.client().clone(),
-            service_token: state.service_token.clone(),
-        },
+        Some(base_url) => {
+            // Only send our service token to a callback that is a real cluster
+            // member (defence in depth against a compromised node picking an
+            // attacker URL).
+            if !callback_is_allowed(&state, &base_url).await {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "callback_base_url is not a known cluster member"
+                    })),
+                )
+                    .into_response();
+            }
+            Reporter::Callback {
+                base_url,
+                client: state.cluster_http.client().clone(),
+                service_token: state.service_token.clone(),
+            }
+        }
         // No callback: the submitter is this process (or doesn't care).
         None => Reporter::Local(Arc::clone(&state.batch_tracker)),
     };
@@ -455,9 +486,15 @@ pub async fn batch_run_handler(
 /// `POST /v1/batch/{id}/report` — a completion callback.
 pub async fn batch_report_handler(
     State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     AxumPath(batch_id): AxumPath<u64>,
     Json(report): Json<BatchReportRequest>,
 ) -> Response {
+    // Node-to-node only (JOB1): a forged report from an untrusted caller must
+    // not be able to mark batch jobs completed/failed.
+    if let Err(resp) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return resp;
+    }
     let mut tracker = state.batch_tracker.lock().await;
     if report.status == "completed" {
         tracker.mark_completed(batch_id, &report.job_name);
@@ -553,6 +590,24 @@ async fn proxy_response(result: Result<reqwest::Response, reqwest::Error>) -> Re
         )
             .into_response(),
     }
+}
+
+/// Whether it is safe to send our service token to `base_url` as a batch
+/// callback. When a membership table exists, the URL must match a known
+/// member (keeps the token from going to an attacker-chosen callback if a
+/// node is compromised). With no membership table (standalone / single-node),
+/// there are no peers to validate against, so the `require_system` gate on the
+/// caller is the guarantee and any callback is accepted.
+async fn callback_is_allowed(state: &ApiState, base_url: &str) -> bool {
+    let Some(membership) = state.membership.as_ref() else {
+        return true;
+    };
+    let base = base_url.trim_end_matches('/');
+    membership
+        .read()
+        .await
+        .iter()
+        .any(|m| state.cluster_http.url(&m.address.to_string(), "") == base)
 }
 
 /// The API URL peers use to reach a node, from the membership table.
