@@ -274,6 +274,8 @@ When `require_signatures` is `true`, the scheduler calls `check_image_schedulabl
 
 This design means pushes never fail due to missing signatures. Your CI pipeline keeps working. But unsigned images sit in Pickle, waiting. They're visible in `relish images` but unschedulable until signed. The separation is clean: the registry accepts everything; the scheduler enforces trust.
 
+Two details of the lookup were tightened in Phase 12b (finding IMG1). First, the policy key is the canonical repository path as pushed — `team/app` matches `team/app`, not a basename-stripped `app` — so a nested repository can't slip past its own policy, and an external image whose last path segment happens to match a signed local name isn't checked against the wrong entry. Second, verification returns the manifest *digest* it verified, and the agent deploys that digest-pinned reference (`myapp@sha256:…`) instead of the tag. A tag is mutable; someone can re-point it between the moment you verify and the moment the runtime pulls. The signature covers the digest, so the digest is what runs.
+
 ### Raft integration
 
 Signatures attach to manifests via an `AttachSignature` Raft command. This is a separate operation from `ManifestCommit` because signing happens after push (the build job pushes first, then signs). The state machine adds the signature to the existing manifest entry:

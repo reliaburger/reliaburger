@@ -405,12 +405,34 @@ whole theme lands.
     decryption tries every live generation, finalize refuses to empty a scope, and a malformed
     rotate body is rejected — so a secret sealed under generation N survives the rotation window
     (PKI8).
-- [ ] **Pickle reference integrity** — include raw manifest/index blobs in holder,
+- [x] **Pickle reference integrity** — include raw manifest/index blobs in holder,
   replication and GC reachability; validate JSON, media types, descriptor digest/size and
   referenced blob existence before returning Created; use canonical repository identity
   and immutable digests through policy, scheduling and runtime pull. Test
   push → GC → peer pull and reject the existing missing-layer Created behaviour
   (new REG1/REG3/IMG1, old Low manifest check).
+  - [x] `ImageManifest::referenced_digests()` is the one authoritative "everything this
+    tag pins" set (manifest blob + config + layers); holder commits, GC protection, the
+    heal loop, replication, peer/P2P pulls and `image_available_locally` all use it, so a
+    tagged manifest's own blob is never orphaned and heals to `[images] redundancy` like
+    any layer; the pull-through fill stores the raw upstream manifest bytes too (REG1).
+    Old persisted catalogues (no manifest-blob holders) load unchanged, GC keeps the blob
+    and one heal tick restores redundancy — fixture-tested, no migration needed.
+  - [x] `manifest_put` validates before Created: JSON parse, known media type (body or
+    Content-Type header; OCI/Docker manifests and indexes), well-formed descriptor
+    digests, descriptor sizes matching stored blobs, referenced blobs present (config +
+    layers, or sub-manifests for an index), digest-reference PUTs matching the body —
+    each rejection an OCI error body (`MANIFEST_INVALID`/`MANIFEST_BLOB_UNKNOWN`/
+    `DIGEST_INVALID`), nothing stored or tagged on rejection; the misleading
+    missing-layer test now asserts rejection, and manifest GET stays byte-identical
+    (REG3, old Low manifest check).
+  - [x] Trust lookups use the canonical repository path (no basename stripping: `team/app`
+    hits its own policy, external `docker.io/library/app` can't alias a local `app`,
+    `cache/…` exempt by construction); `verify_image_signature` returns the verified
+    manifest digest and the agent deploys the digest-pinned `repo@sha256:…` reference,
+    which parses through `ImageReference`/`ClusterSource` content-addressed — a tag moved
+    between verify and pull cannot swap the image (IMG1). Acceptance test drives push →
+    GC past grace → manifest GET 200 → peer pull in `tests/pickle_integrity.rs`.
 - [ ] **Network policy enforcement** — write namespace/cgroup firewall maps for every
   instance; program egress before process start and on rolling deploy; fail deployment
   closed when required policy cannot be installed; reconcile kernel truth and delete every

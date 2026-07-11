@@ -333,13 +333,13 @@ async fn blob_upload_complete(
 // Manifest operations
 // ---------------------------------------------------------------------------
 
-/// OCI manifest JSON as received from the client (single-platform).
+/// OCI manifest JSON as received from the client.
 #[derive(Debug, Deserialize)]
 struct OciManifestJson {
     #[serde(rename = "schemaVersion", default)]
     _schema_version: Option<u32>,
     #[serde(rename = "mediaType", default)]
-    _media_type: Option<String>,
+    media_type: Option<String>,
     config: Option<OciDescriptor>,
     #[serde(default)]
     layers: Vec<OciDescriptor>,
@@ -356,20 +356,209 @@ struct OciDescriptor {
     media_type: Option<String>,
 }
 
+/// Media types accepted for single-platform manifests.
+const MANIFEST_MEDIA_TYPES: [&str; 2] = [
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+];
+
+/// Media types accepted for image indexes / manifest lists.
+const INDEX_MEDIA_TYPES: [&str; 2] = [
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+];
+
+/// An OCI Distribution error body: `{"errors": [{code, message}]}` —
+/// the shape real clients (docker, podman, buildah) know how to print.
+fn oci_error(status: StatusCode, code: &str, message: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "errors": [{ "code": code, "message": message }]
+        })),
+    )
+        .into_response()
+}
+
+/// Validate one manifest descriptor against the local blob store:
+/// well-formed digest, blob present (OCI push order puts blobs before
+/// the manifest), and size matching what's actually on disk.
+///
+/// The rejection `Response` is boxed to keep the `Err` variant small
+/// (clippy::result_large_err) — rejections are the cold path.
+fn check_descriptor(
+    store: &BlobStore,
+    what: &str,
+    descriptor: &OciDescriptor,
+) -> Result<LayerDescriptor, Box<Response>> {
+    let digest = Digest::new(&descriptor.digest).map_err(|e| {
+        Box::new(oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            format!("{what} digest {:?} is invalid: {e}", descriptor.digest),
+        ))
+    })?;
+    if !store.has_blob(&digest) {
+        return Err(Box::new(oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_BLOB_UNKNOWN",
+            format!("{what} blob {digest} is not present in the registry"),
+        )));
+    }
+    let actual_size = store.blob_size(&digest).unwrap_or(0);
+    if actual_size != descriptor.size {
+        return Err(Box::new(oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            format!(
+                "{what} blob {digest} size mismatch: descriptor says {}, stored blob is {actual_size}",
+                descriptor.size
+            ),
+        )));
+    }
+    Ok(LayerDescriptor {
+        digest,
+        size: descriptor.size,
+        media_type: descriptor.media_type.clone().unwrap_or_default(),
+    })
+}
+
 /// `PUT /v2/{name}/manifests/{reference}` — push a manifest.
 ///
-/// Accepts both single-platform manifests (with `config` + `layers`)
-/// and manifest lists/OCI indexes (with `manifests`). In both cases,
-/// the raw bytes are stored as a blob. For single-platform manifests
-/// the catalog is updated with layer info. For manifest lists we just
-/// store the blob and tag.
+/// Validates before storing or committing anything (REG3): the body
+/// must parse as JSON, carry a known media type (in the body or the
+/// `Content-Type` header), and every referenced blob — config and
+/// layers for a single-platform manifest, sub-manifests for an image
+/// index — must already exist locally with a matching size. Rejections
+/// use OCI Distribution error bodies, so real clients print something
+/// sensible. Only then are the raw bytes stored as a content-addressed
+/// blob and the catalogue commit recorded.
 async fn manifest_put(
     State(state): State<PickleState>,
     Path((name, reference)): Path<(String, String)>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // Compute manifest digest and store the raw bytes
     let manifest_digest = compute_sha256(&body);
+
+    // A digest in the reference position (docker pushes sub-manifests
+    // as `PUT …/manifests/sha256:…`) must name the bytes it carries.
+    if let Ok(reference_digest) = Digest::new(&reference)
+        && reference_digest != manifest_digest
+    {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            format!(
+                "reference digest {reference_digest} does not match body digest {manifest_digest}"
+            ),
+        );
+    }
+
+    let manifest_json: OciManifestJson = match serde_json::from_slice(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                format!("manifest is not valid json: {e}"),
+            );
+        }
+    };
+
+    // Media type from the body, falling back to Content-Type (the OCI
+    // spec lets clients omit the embedded field and set the header).
+    let media_type = manifest_json.media_type.clone().or_else(|| {
+        headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    });
+    let Some(media_type) = media_type else {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "manifest has no mediaType and the request has no content-type header".to_string(),
+        );
+    };
+
+    let manifest = if INDEX_MEDIA_TYPES.contains(&media_type.as_str()) {
+        // Image index / manifest list: every sub-manifest must already
+        // be in the store (docker pushes them by digest first). The
+        // catalogue entry pins the index blob (as its own config
+        // descriptor) plus each sub-manifest, so GC keeps them all.
+        if manifest_json.manifests.is_empty() {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                "image index has no manifests".to_string(),
+            );
+        }
+        let mut sub_manifests = Vec::new();
+        for descriptor in &manifest_json.manifests {
+            match check_descriptor(&state.store, "sub-manifest", descriptor) {
+                Ok(layer) => sub_manifests.push(layer),
+                Err(response) => return *response,
+            }
+        }
+        let total_size = body.len() as u64 + sub_manifests.iter().map(|l| l.size).sum::<u64>();
+        ImageManifest {
+            digest: manifest_digest.clone(),
+            config: LayerDescriptor {
+                digest: manifest_digest.clone(),
+                size: body.len() as u64,
+                media_type: media_type.clone(),
+            },
+            layers: sub_manifests,
+            repository: name.clone(),
+            tags: std::collections::BTreeSet::new(),
+            total_size,
+            pushed_at: std::time::SystemTime::now(),
+            pushed_by: state.node_raft_id,
+            signature: None,
+        }
+    } else if MANIFEST_MEDIA_TYPES.contains(&media_type.as_str()) {
+        let Some(config) = &manifest_json.config else {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                "manifest has no config descriptor".to_string(),
+            );
+        };
+        let config = match check_descriptor(&state.store, "config", config) {
+            Ok(layer) => layer,
+            Err(response) => return *response,
+        };
+        let mut layers = Vec::new();
+        for descriptor in &manifest_json.layers {
+            match check_descriptor(&state.store, "layer", descriptor) {
+                Ok(layer) => layers.push(layer),
+                Err(response) => return *response,
+            }
+        }
+        let total_size = config.size + layers.iter().map(|l| l.size).sum::<u64>();
+        ImageManifest {
+            digest: manifest_digest.clone(),
+            config,
+            layers,
+            repository: name.clone(),
+            tags: std::collections::BTreeSet::new(),
+            total_size,
+            pushed_at: std::time::SystemTime::now(),
+            pushed_by: state.node_raft_id,
+            signature: None,
+        }
+    } else {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            format!("unsupported manifest mediaType: {media_type}"),
+        );
+    };
+
+    // Validation passed: store the exact bytes (content addressing
+    // must see what the client sent, not a re-serialisation) and
+    // commit.
     if let Err(e) = state.store.write_blob(&body, &manifest_digest) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -377,140 +566,6 @@ async fn manifest_put(
         )
             .into_response();
     }
-
-    // Try to parse as JSON
-    let manifest_json: OciManifestJson = match serde_json::from_slice(&body) {
-        Ok(m) => m,
-        Err(_) => {
-            // Not valid JSON — still store as blob and tag it
-            let manifest = ImageManifest {
-                digest: manifest_digest.clone(),
-                config: LayerDescriptor {
-                    digest: manifest_digest.clone(),
-                    size: body.len() as u64,
-                    media_type: String::new(),
-                },
-                layers: vec![],
-                repository: name.clone(),
-                tags: std::collections::BTreeSet::new(),
-                total_size: body.len() as u64,
-                pushed_at: std::time::SystemTime::now(),
-                pushed_by: 0,
-                signature: None,
-            };
-            record_commit(&state, manifest, reference.clone()).await;
-
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "docker-content-digest",
-                manifest_digest
-                    .as_str()
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            return (StatusCode::CREATED, headers).into_response();
-        }
-    };
-
-    // Manifest list / OCI index: just store + tag (all sub-manifests
-    // are pushed separately by Docker before the index).
-    if !manifest_json.manifests.is_empty() {
-        let manifest = ImageManifest {
-            digest: manifest_digest.clone(),
-            config: LayerDescriptor {
-                digest: manifest_digest.clone(),
-                size: body.len() as u64,
-                media_type: String::new(),
-            },
-            layers: vec![],
-            repository: name.clone(),
-            tags: std::collections::BTreeSet::new(),
-            total_size: body.len() as u64,
-            pushed_at: std::time::SystemTime::now(),
-            pushed_by: 0,
-            signature: None,
-        };
-        record_commit(&state, manifest, reference.clone()).await;
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "docker-content-digest",
-            manifest_digest
-                .as_str()
-                .parse()
-                .expect("ASCII header value"),
-        );
-        return (StatusCode::CREATED, headers).into_response();
-    }
-
-    // Single-platform manifest: verify referenced blobs exist
-    let config = match &manifest_json.config {
-        Some(c) => c,
-        None => {
-            // No config and no manifests — accept anyway
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "docker-content-digest",
-                manifest_digest
-                    .as_str()
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            return (StatusCode::CREATED, headers).into_response();
-        }
-    };
-
-    let config_digest = match Digest::new(&config.digest) {
-        Ok(d) => d,
-        Err(_) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "docker-content-digest",
-                manifest_digest
-                    .as_str()
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            return (StatusCode::CREATED, headers).into_response();
-        }
-    };
-
-    let mut layers = Vec::new();
-    for layer in &manifest_json.layers {
-        match Digest::new(&layer.digest) {
-            Ok(d) => {
-                layers.push(LayerDescriptor {
-                    digest: d,
-                    size: layer.size,
-                    media_type: layer.media_type.clone().unwrap_or_default(),
-                });
-            }
-            Err(e) => {
-                eprintln!(
-                    "pickle: skipping layer with invalid digest {:?}: {e}",
-                    layer.digest
-                );
-            }
-        }
-    }
-
-    let total_size = config.size + layers.iter().map(|l| l.size).sum::<u64>();
-    let manifest = ImageManifest {
-        digest: manifest_digest.clone(),
-        config: LayerDescriptor {
-            digest: config_digest,
-            size: config.size,
-            media_type: config.media_type.clone().unwrap_or_default(),
-        },
-        layers,
-        repository: name.clone(),
-        tags: std::collections::BTreeSet::new(),
-        total_size,
-        pushed_at: std::time::SystemTime::now(),
-        pushed_by: 0,
-        signature: None,
-    };
-
     record_commit(&state, manifest, reference.clone()).await;
 
     let mut headers = HeaderMap::new();
@@ -820,6 +875,31 @@ mod tests {
         assert_eq!(blob_body, layer_data);
     }
 
+    /// Push a manifest body and return the response.
+    async fn put_manifest(app: &Router, uri: &str, body: Vec<u8>) -> Response {
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Assert an OCI error body carries the expected error code.
+    async fn assert_oci_error(resp: Response, code: &str) {
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["errors"][0]["code"], code, "body: {json}");
+    }
+
+    /// REG3: a manifest referencing a blob the registry never received
+    /// is rejected with `MANIFEST_BLOB_UNKNOWN` — the previous version
+    /// of this test asserted Created, encoding the bug.
     #[tokio::test]
     async fn push_manifest_with_missing_layer_returns_400() {
         let (state, _dir) = test_state();
@@ -829,9 +909,10 @@ mod tests {
         let config_data = b"config";
         let config_digest = push_blob(&app, "myapp", config_data).await;
 
-        let missing_digest =
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let missing_digest = format!("sha256:{}", "a".repeat(64));
         let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
                 "digest": config_digest.as_str(),
                 "size": config_data.len()
@@ -842,19 +923,293 @@ mod tests {
             }]
         });
 
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_oci_error(resp, "MANIFEST_BLOB_UNKNOWN").await;
+    }
+
+    #[tokio::test]
+    async fn push_manifest_with_invalid_json_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            b"not json at all {{{".to_vec(),
+        )
+        .await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn push_manifest_without_media_type_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": config_digest.as_str(), "size": config_data.len() },
+            "layers": []
+        });
+
+        // No embedded mediaType and no Content-Type header.
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn push_manifest_with_unknown_media_type_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.example.made-up.v1+json",
+            "config": { "digest": "sha256:0", "size": 1 },
+        });
+
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn push_manifest_with_content_type_header_media_type_is_accepted() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        // Embedded mediaType omitted; carried in the header instead.
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": config_digest.as_str(), "size": config_data.len() },
+            "layers": []
+        });
+
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
                     .method("PUT")
                     .uri("/v2/myapp/manifests/latest")
+                    .header("content-type", "application/vnd.oci.image.manifest.v1+json")
                     .body(Body::from(serde_json::to_vec(&manifest_json).unwrap()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        // Pickle now accepts manifests permissively (for manifest lists/indexes)
-        // so missing layers don't cause rejection — the manifest is stored as-is.
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn push_manifest_with_size_mismatch_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": config_digest.as_str(),
+                "size": config_data.len() + 5, // lies about the size
+            },
+            "layers": []
+        });
+
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
+    }
+
+    #[tokio::test]
+    async fn push_manifest_with_malformed_descriptor_digest_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": config_digest.as_str(), "size": config_data.len() },
+            "layers": [{ "digest": "md5:definitely-not-a-digest", "size": 4 }]
+        });
+
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_oci_error(resp, "MANIFEST_INVALID").await;
+    }
+
+    /// REG3: a rejected manifest leaves no trace — no blob, no tag.
+    #[tokio::test]
+    async fn rejected_manifest_is_not_stored_or_tagged() {
+        let (state, _dir) = test_state();
+        let store = Arc::clone(&state.store);
+        let catalog = Arc::clone(&state.catalog);
+        let app = test_router(state);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "digest": format!("sha256:{}", "b".repeat(64)),
+                "size": 4
+            },
+            "layers": []
+        }))
+        .unwrap();
+        let manifest_digest = compute_sha256(&body);
+
+        let resp = put_manifest(&app, "/v2/myapp/manifests/latest", body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!store.has_blob(&manifest_digest));
+        assert!(
+            catalog
+                .read()
+                .await
+                .get_manifest_by_tag("myapp", "latest")
+                .is_none()
+        );
+    }
+
+    /// The manifest GET must return the exact bytes that were pushed:
+    /// content addressing sees the client's bytes, not a re-serialise.
+    #[tokio::test]
+    async fn manifest_get_returns_byte_identical_body() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config bytes";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        // Deliberately quirky formatting: whitespace and key order
+        // must survive the round trip.
+        let body = format!(
+            "{{\"schemaVersion\": 2,\n  \"layers\": [],\n  \"config\": {{\"size\": {}, \"digest\": \"{}\"}},\n  \"mediaType\": \"application/vnd.oci.image.manifest.v1+json\"}}",
+            config_data.len(),
+            config_digest.as_str()
+        )
+        .into_bytes();
+
+        let resp = put_manifest(&app, "/v2/myapp/manifests/latest", body.clone()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/myapp/manifests/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, body);
+    }
+
+    /// Multi-arch push order: sub-manifests by digest, then the index.
+    #[tokio::test]
+    async fn push_image_index_after_sub_manifests_succeeds() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        let sub_manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": config_digest.as_str(), "size": config_data.len() },
+            "layers": []
+        }))
+        .unwrap();
+        let sub_digest = compute_sha256(&sub_manifest);
+
+        // Sub-manifest pushed by digest reference, like docker does.
+        let resp = put_manifest(
+            &app,
+            &format!("/v2/myapp/manifests/{}", sub_digest.as_str()),
+            sub_manifest.clone(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "digest": sub_digest.as_str(),
+                "size": sub_manifest.len(),
+                "platform": { "architecture": "arm64", "os": "linux" }
+            }]
+        }))
+        .unwrap();
+        let resp = put_manifest(&app, "/v2/myapp/manifests/latest", index).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// REG3: an index whose sub-manifest was never pushed is refused.
+    #[tokio::test]
+    async fn push_image_index_with_missing_sub_manifest_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 100
+            }]
+        }))
+        .unwrap();
+        let resp = put_manifest(&app, "/v2/myapp/manifests/latest", index).await;
+        assert_oci_error(resp, "MANIFEST_BLOB_UNKNOWN").await;
+    }
+
+    /// A digest reference must name the bytes it carries.
+    #[tokio::test]
+    async fn push_manifest_by_mismatched_digest_reference_returns_400() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": config_digest.as_str(), "size": config_data.len() },
+            "layers": []
+        }))
+        .unwrap();
+
+        let wrong = format!("sha256:{}", "d".repeat(64));
+        let resp = put_manifest(&app, &format!("/v2/myapp/manifests/{wrong}"), body).await;
+        assert_oci_error(resp, "DIGEST_INVALID").await;
     }
 
     #[tokio::test]

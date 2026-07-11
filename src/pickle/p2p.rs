@@ -243,11 +243,21 @@ impl ClusterSource {
         peers: &[Peer],
     ) -> Result<Option<Vec<PathBuf>>, PickleError> {
         let catalog = self.state.catalog_snapshot().await;
-        let Some(manifest) = catalog.get_manifest_by_tag(repository, tag).cloned() else {
+        // A digest in the tag position (`repo@sha256:…` references put
+        // it there) resolves content-addressed, so the bytes verified
+        // at admission are the bytes pulled — a tag moved between
+        // verify and pull changes nothing (IMG1).
+        let manifest = match Digest::new(tag) {
+            Ok(digest) => catalog.get_manifest(digest.as_str()).cloned(),
+            Err(_) => catalog.get_manifest_by_tag(repository, tag).cloned(),
+        };
+        let Some(manifest) = manifest else {
             return Ok(None);
         };
 
-        let digests: Vec<Digest> = manifest.all_digests().into_iter().cloned().collect();
+        // Fetch everything the tag pins — the manifest blob included
+        // (REG1), so this node can serve the manifest GET afterwards.
+        let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
         let local: HashSet<Digest> = digests
             .iter()
             .filter(|d| self.state.store.has_blob(d))
@@ -371,6 +381,11 @@ impl ClusterSource {
         }
 
         let manifest = upstream.fetch_manifest(image).await?;
+        // The raw manifest bytes are a pinned blob like any layer
+        // (REG1): the cache serves the manifest GET and peers pull it.
+        self.state
+            .store
+            .write_blob(&manifest.manifest_bytes, &manifest.digest)?;
         self.state
             .store
             .write_blob(&manifest.config_bytes, &manifest.config.digest)?;

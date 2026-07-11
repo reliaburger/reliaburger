@@ -89,11 +89,14 @@ pub async fn refresh_or_refetch(
 }
 
 /// A manifest fetched from upstream, reduced to what the cache fill
-/// needs: the manifest digest, the config blob (content included —
-/// upstream returns it alongside the manifest), and the layers.
+/// needs: the manifest digest, the raw manifest bytes (stored as a
+/// content-addressed blob so the cache can serve the manifest GET —
+/// REG1), the config blob (content included — upstream returns it
+/// alongside the manifest), and the layers.
 #[derive(Debug, Clone)]
 pub struct UpstreamManifest {
     pub digest: Digest,
+    pub manifest_bytes: Vec<u8>,
     pub config: LayerDescriptor,
     pub config_bytes: Vec<u8>,
     pub layers: Vec<LayerDescriptor>,
@@ -256,10 +259,40 @@ impl UpstreamRegistry for OciUpstream {
                 })
                 .collect::<Result<Vec<_>, PickleError>>()?;
 
+            let digest = Digest::new(&digest).map_err(|e| {
+                PickleError::ReplicationFailed(format!("upstream manifest digest: {e}"))
+            })?;
+
+            // Re-fetch the resolved manifest raw, pinned by digest.
+            // `pull_manifest_and_config` hands back a parsed struct;
+            // re-serialising it would hash to a different digest, and
+            // the cache must store the exact bytes the digest names.
+            let raw_reference = oci_distribution::Reference::with_digest(
+                image.registry.clone(),
+                image.repository.clone(),
+                digest.as_str().to_string(),
+            );
+            let (manifest_bytes, _) = self
+                .client
+                .pull_manifest_raw(
+                    &raw_reference,
+                    &auth,
+                    &[
+                        oci_distribution::manifest::OCI_IMAGE_MEDIA_TYPE,
+                        oci_distribution::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    PickleError::ReplicationFailed(format!(
+                        "upstream raw manifest {} failed: {e}",
+                        image.full_reference()
+                    ))
+                })?;
+
             Ok(UpstreamManifest {
-                digest: Digest::new(&digest).map_err(|e| {
-                    PickleError::ReplicationFailed(format!("upstream manifest digest: {e}"))
-                })?,
+                digest,
+                manifest_bytes,
                 config,
                 config_bytes,
                 layers,

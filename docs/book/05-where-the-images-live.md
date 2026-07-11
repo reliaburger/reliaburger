@@ -81,6 +81,21 @@ pub async fn complete_upload(
 
 The rename is atomic on the same filesystem. No partial reads, no corruption.
 
+## Say no before you say Created
+
+Step 3 of the push flow claims the server "verifies all referenced blobs exist". For a long time that was a lie. The first version of `manifest_put` parsed the body on a best-effort basis and returned 201 Created for almost anything: invalid JSON, made-up media types, descriptors pointing at blobs nobody had ever uploaded. Worse, we had a test called `push_manifest_with_missing_layer_returns_400` that asserted *Created* — the test name described the contract we wanted, and the assertion pinned the bug in place. When the Phase 12b review re-read the registry (finding REG3), the fix started by flipping that assertion. Tests first cuts both ways: a wrong test is a bug with a seatbelt on.
+
+The validated contract is short. Before storing or committing anything, a manifest PUT must:
+
+1. Parse as JSON.
+2. Carry a known media type — an OCI image manifest, a Docker schema 2 manifest, or an image index / manifest list. The media type can be embedded in the body or arrive in the `Content-Type` header (the spec allows either; buildah tends to use the header).
+3. Reference only blobs the registry already holds, with sizes matching what's actually on disk. The OCI push order guarantees blobs land before the manifest, so a missing blob means a broken or malicious client, not bad timing.
+4. If pushed by digest (docker pushes the sub-manifests of a multi-arch image as `PUT …/manifests/sha256:…`), the digest must match the bytes.
+
+Each rejection returns an OCI Distribution error body, `{"errors": [{"code": …, "message": …}]}`, because that's the shape docker and podman know how to print. `MANIFEST_BLOB_UNKNOWN` for a missing blob, `MANIFEST_INVALID` for everything malformed. A rejected manifest leaves no trace: no blob written, no tag created — there's a test asserting exactly that, because "validate, then store" is easy to get backwards and the original code did (it wrote the blob first, then looked at the body).
+
+One subtlety worth keeping: the registry stores the manifest's *raw bytes*, not a re-serialisation of what it parsed. Content addressing demands it. If you parse JSON and print it back, key order and whitespace change, the SHA-256 changes, and every client that pulls by digest gets a mismatch. The `manifest_get_returns_byte_identical_body` test pushes a manifest with deliberately quirky formatting and asserts the GET returns it byte for byte.
+
 ## Replication
 
 When you push an image, Pickle doesn't just store it locally. It replicates the layers to N peer nodes (default: 2 total copies) before returning success. If a node dies, the image is still available elsewhere.
@@ -114,6 +129,34 @@ Disk space isn't infinite. Pickle runs a periodic GC sweep that deletes unrefere
 3. **Retention window.** Recently pushed images are kept for `gc_retain_days` (default 7) even if no tags reference them. This gives you time to notice and re-tag.
 
 After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete.
+
+## Reachability is the whole game
+
+In a content-addressed store, garbage collection has exactly one job: compute the set of blobs reachable from the roots, and delete the rest. That's it. There's no reference counting, no ownership, no "who allocated this". If a digest is reachable from something that matters, it stays; if not, it goes. Which means the entire correctness of GC hangs on one question: did you enumerate the roots completely?
+
+We didn't. For over six phases, `ImageManifest::all_digests()` returned the config digest and the layer digests — the blobs you need to *run* the image. But `manifest_put` also stores the manifest's own raw bytes as a content-addressed blob, because `docker pull` fetches the manifest by digest and content addressing wants the exact bytes back. That blob was in GC's swept set (it's on disk, `list_blobs` finds it) but never in the protected set. Holder tracking skipped it too, so the replication loop never copied it anywhere, and to the arbiter it looked like an untracked orphan. The one-hour orphan grace window kept it alive between sweeps on a busy registry, which is why nobody noticed. Wait past the grace window, run GC, and the tagged manifest's own bytes vanish. The catalogue still lists the tag; the GET returns 404. Every layer perfectly preserved, image unpullable. (Finding REG1 in the Phase 12b review — the only P0 the re-validation confirmed at full strength.)
+
+The fix is one authoritative definition of "everything this tag pins":
+
+```rust
+/// Every digest this catalogue entry pins in the blob store: the
+/// manifest's own blob, then the config and layers.
+pub fn referenced_digests(&self) -> Vec<&Digest> {
+    let mut digests = vec![&self.digest];
+    for digest in self.all_digests() {
+        if !digests.contains(&digest) {
+            digests.push(digest);
+        }
+    }
+    digests
+}
+```
+
+Then an audit of every `all_digests()` call site, asking each one: do you mean "blobs to unpack" or "blobs this tag keeps alive"? GC protection, holder commits, the heal loop, peer pulls and "is this image fully local" all mean the latter and moved over; unpacking a rootfs still means the former and didn't. The audit is the real lesson. The bug wasn't a clever race — it was a set with one missing element, duplicated informally across five call sites. When one notion ("what does a tag pin?") lives in many places, they *will* drift; give it a name and a single function, and the compiler keeps the call sites honest.
+
+There's an upgrade wrinkle. Catalogues persisted before the fix have no holder entry for manifest blobs — on disk they still look like orphans. Two properties make the old data safe without a migration. GC protection is computed from the catalogue's manifests, not from holder entries, so the manifest digest is protected the moment the new code loads an old catalogue. And the heal loop treats "no recorded holders" as "zero copies", the most urgent rarest-first case, so the next tick replicates the manifest blob and records real holders. Heal, don't collect: when old state is ambiguous, converge it towards safety rather than assuming the worst interpretation. A fixture test pins this — it rewrites a freshly persisted catalogue into the old shape, reloads it, and asserts GC keeps the blob while one heal tick restores redundancy.
+
+The acceptance test for the whole story reads like the incident report we never had to write: push an image, run GC with the grace window at zero, assert the manifest GET still returns the exact pushed bytes, then have a second node pull the image from the first — manifest blob included — and serve the manifest itself.
 
 ## Peer pull, and a note on the pull-through cache
 
@@ -285,8 +328,8 @@ The 104 tests in `src/pickle/` cover:
 
 - **Digest and manifest** — `Digest::new` accepts well-formed digests and rejects everything else; manifests round-trip through serde unchanged.
 - **Blob store** — write/read, upload sessions, and the digest-mismatch rejection path (`PickleError::DigestMismatch`).
-- **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes.
-- **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer.
+- **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
+- **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
 
 ### Gated tests — anything that touches a real image or runtime
 

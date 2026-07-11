@@ -129,10 +129,33 @@ pub struct ImageManifest {
 
 impl ImageManifest {
     /// All digests referenced by this manifest (config + layers).
+    ///
+    /// These are the blobs needed to *run* the image. For everything a
+    /// catalogued tag pins in the blob store — including the manifest's
+    /// own raw bytes — use [`Self::referenced_digests`].
     pub fn all_digests(&self) -> Vec<&Digest> {
         let mut digests = vec![&self.config.digest];
         for layer in &self.layers {
             digests.push(&layer.digest);
+        }
+        digests
+    }
+
+    /// Every digest this catalogue entry pins in the blob store: the
+    /// manifest's own blob, then the config and layers (deduplicated —
+    /// an index entry's config descriptor points back at the index
+    /// blob itself).
+    ///
+    /// Holder tracking, replication, GC reachability and peer pulls
+    /// must all agree on this set. The manifest blob used to be left
+    /// out (REG1): GC would sweep it as an orphan after the grace
+    /// window and the catalogue would point at a 404.
+    pub fn referenced_digests(&self) -> Vec<&Digest> {
+        let mut digests = vec![&self.digest];
+        for digest in self.all_digests() {
+            if !digests.contains(&digest) {
+                digests.push(digest);
+            }
         }
         digests
     }
@@ -247,8 +270,10 @@ impl ManifestCatalog {
             self.manifests.push((digest_str.clone(), manifest));
         }
 
-        // Update layer locations for all layers in this manifest
-        for layer in commit.manifest.all_digests() {
+        // Update holder locations for everything this tag pins — the
+        // manifest's own blob included (REG1), or GC and the heal loop
+        // treat it as an orphan.
+        for layer in commit.manifest.referenced_digests() {
             let layer_str = layer.0.clone();
             if let Some((_, holders)) = self
                 .layer_locations
@@ -643,6 +668,50 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
         let digests = m.all_digests();
         assert_eq!(digests.len(), 3); // config + 2 layers
+    }
+
+    #[test]
+    fn referenced_digests_include_the_manifest_blob() {
+        let m = test_manifest("myapp", "mfst1");
+        let digests = m.referenced_digests();
+        assert_eq!(digests.len(), 4); // manifest + config + 2 layers
+        assert!(digests.contains(&&m.digest));
+    }
+
+    /// REG1: an index pseudo-manifest uses its own blob as the config
+    /// descriptor — the digest must not be pinned twice.
+    #[test]
+    fn referenced_digests_deduplicate_self_referencing_config() {
+        let mut m = test_manifest("myapp", "mfst1");
+        m.config = LayerDescriptor {
+            digest: m.digest.clone(),
+            size: 100,
+            media_type: "application/vnd.oci.image.index.v1+json".to_string(),
+        };
+        m.layers.clear();
+        assert_eq!(m.referenced_digests(), vec![&m.digest]);
+    }
+
+    /// REG1: committing a manifest must record the pusher as a holder
+    /// of the manifest's own blob, not just its config and layers —
+    /// otherwise GC sees it as an orphan and the heal loop never
+    /// replicates it.
+    #[test]
+    fn manifest_commit_records_holders_for_the_manifest_blob() {
+        let mut catalog = ManifestCatalog::default();
+        let m = test_manifest("myapp", "mfst1");
+
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest: m.clone(),
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+
+        assert_eq!(
+            catalog.layer_holders(m.digest.as_str()),
+            BTreeSet::from([1, 2]),
+            "the manifest's own blob must have holders"
+        );
     }
 
     #[test]

@@ -101,8 +101,10 @@ pub fn gc_candidates(
         let within_retention = manifest.pushed_at >= retention_cutoff;
 
         if is_tagged || is_active || within_retention {
-            // Protect all layers in this manifest
-            for layer_digest in manifest.all_digests() {
+            // Protect everything this manifest pins, its own blob
+            // included (REG1) — the catalogue must keep serving the
+            // manifest bytes, not just the layers.
+            for layer_digest in manifest.referenced_digests() {
                 protected_digests.insert(layer_digest.0.clone());
             }
             if is_active {
@@ -260,6 +262,40 @@ mod tests {
         assert!(result.candidates.is_empty());
         assert_eq!(result.orphan_grace_protected, 1);
         assert!(store.has_blob(&inflight));
+    }
+
+    /// REG1: the manifest's own blob is part of the image. Before the
+    /// fix it was never in the protected set (only config + layers
+    /// were), so after the orphan grace window GC deleted it and the
+    /// catalogue pointed at a 404.
+    #[test]
+    fn gc_never_nominates_a_catalogued_manifests_own_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let mut catalog = ManifestCatalog::default();
+
+        let manifest = test_manifest("myapp", "m1", SystemTime::UNIX_EPOCH);
+        for d in manifest.referenced_digests() {
+            write_fake_blob(&store, d);
+        }
+        let manifest_digest = manifest.digest.clone();
+
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+        // Simulate a catalogue persisted before the fix: no holder
+        // entry for the manifest blob, so it looks like an orphan.
+        catalog
+            .layer_locations
+            .retain(|(d, _)| d != manifest_digest.as_str());
+
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert!(
+            !result.candidates.contains(&manifest_digest),
+            "a tagged manifest's own blob must never be nominated"
+        );
     }
 
     #[test]
