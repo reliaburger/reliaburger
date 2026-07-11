@@ -13,9 +13,14 @@
 //!   handle, so a `RevokeCertificate` write takes effect on the next
 //!   connection without rebuilding any config.
 //!
-//! Peer node certificates carry no DNS SANs (nodes are addressed by gossip
-//! IPs), so the client side uses [`PinnedChainServerVerifier`], which checks
-//! the chain against the pinned cluster CAs and skips hostname verification.
+//! The client side uses [`PinnedChainServerVerifier`], which checks the chain
+//! against the pinned cluster CAs and skips hostname verification. Node certs
+//! do carry the node id as a CN SAN (for DNS-valid ids), but peers are dialled
+//! by gossip IP, so binding the connection to an expected node id is a
+//! separate hardening step (it needs per-target names threaded through the
+//! connector; tracked as PKI3). Today the guarantee is "a valid, unrevoked
+//! Node-CA certificate", which stops outsiders but not one compromised node
+//! impersonating another.
 
 use std::sync::{Arc, RwLock};
 
@@ -155,9 +160,10 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
 ///
 /// Validates the presented certificate against the **pinned** Node CA and
 /// Root CA from this node's identity, checks the CRL, and deliberately
-/// skips hostname verification: peer node certificates carry no SANs and
-/// peers are dialled by gossip IP. The property this verifier establishes
-/// is "the peer holds a valid, unrevoked certificate from our Node CA".
+/// skips hostname verification (peers are dialled by gossip IP, not by the
+/// node id in the cert). The property this verifier establishes is "the peer
+/// holds a valid, unrevoked certificate from our Node CA" — not "the peer is
+/// the specific node I meant to reach" (see PKI3).
 #[derive(Debug)]
 pub struct PinnedChainServerVerifier {
     node_ca_der: Vec<u8>,
@@ -246,11 +252,16 @@ pub fn build_mtls_server_config(
     // Install the ring crypto provider (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Build the trust store with the Root CA
+    // Pin the trust anchor to the **Node CA**, not the Root CA. Node certs
+    // and workload certs are both signed under the Root, and node certs carry
+    // ClientAuth EKU — so trusting the Root would let a workload certificate
+    // authenticate as a node. Anchoring on the Node CA admits only certs it
+    // issued directly (PKI2). The peer presents [leaf, node-ca]; webpki finds
+    // the node-ca anchor and verifies the leaf against it.
     let mut root_store = RootCertStore::empty();
     root_store
-        .add(CertificateDer::from(identity.root_ca_der.clone()))
-        .map_err(|e| MtlsError::InvalidCert(format!("root CA: {e}")))?;
+        .add(CertificateDer::from(identity.node_ca_der.clone()))
+        .map_err(|e| MtlsError::InvalidCert(format!("node CA: {e}")))?;
 
     // Chain building goes through WebPKI; revocation through the CRL handle.
     let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
@@ -415,6 +426,38 @@ mod tests {
         }
     }
 
+    /// A client identity whose leaf is a **workload** certificate (issued by
+    /// the Workload CA, with ClientAuth EKU) presenting `[wl-leaf, workload-ca]`.
+    /// It chains to the same Root as node certs — the trap PKI2 guards against.
+    fn workload_client_identity(hierarchy: &CaHierarchy) -> NodeIdentity {
+        let (cert_der, key_der, serial) = ca::issue_end_entity_cert(
+            "spiffe-workload",
+            SerialNumber(99),
+            std::time::Duration::from_secs(3600),
+            &[],
+            &[
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            ],
+            &hierarchy.workload.signing_keypair,
+            &hierarchy.workload.certificate_params,
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        NodeIdentity {
+            node_id: "spiffe-workload".to_string(),
+            certificate_der: cert_der,
+            private_key_der: key_der,
+            serial,
+            ca_generation: 0,
+            // Presents the Workload CA as its chain intermediate.
+            node_ca_der: hierarchy.workload.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: now,
+            not_after: now + std::time::Duration::from_secs(3600),
+        }
+    }
+
     fn crl_with(serial: u64) -> Crl {
         Crl {
             entries: vec![CrlEntry {
@@ -524,6 +567,23 @@ mod tests {
         let client = build_mtls_client_config(&client_id, CrlHandle::default()).unwrap();
 
         try_handshake(server, client).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn mtls_server_refuses_a_workload_cert_presented_as_a_node() {
+        // PKI2: a workload certificate chains to the same Root and carries
+        // ClientAuth EKU. Pinning the client verifier to the Node CA (not the
+        // Root) must reject it — a workload identity is not a node identity.
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let workload_id = workload_client_identity(&hierarchy);
+
+        let server = build_mtls_server_config(&server_id, CrlHandle::default()).unwrap();
+        let client = build_mtls_client_config(&workload_id, CrlHandle::default()).unwrap();
+
+        try_handshake(server, client)
+            .await
+            .expect_err("a workload cert must not authenticate as a node");
     }
 
     #[tokio::test]
