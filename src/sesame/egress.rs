@@ -320,6 +320,30 @@ mod maps {
         let _ = map.remove(&key);
         Ok(())
     }
+
+    /// Whether a destination is currently allowed for a cgroup (reads
+    /// `egress_map`). For tests and diagnostics.
+    pub fn egress_allowed(bpf: &mut aya::Ebpf, key: EgressKey) -> Result<bool, EgressMapError> {
+        let map: HashMap<_, EgressKey, EgressValue> = HashMap::try_from(
+            bpf.map_mut("egress_map")
+                .ok_or(EgressMapError::MapNotFound {
+                    map_name: "egress_map",
+                })?,
+        )?;
+        Ok(map.get(&key, 0).is_ok())
+    }
+
+    /// Whether egress enforcement is enabled for a cgroup (reads
+    /// `egress_enabled_map`). For tests and diagnostics.
+    pub fn egress_enforced(bpf: &mut aya::Ebpf, cgroup_id: u64) -> Result<bool, EgressMapError> {
+        let map: HashMap<_, u64, u32> = HashMap::try_from(
+            bpf.map_mut("egress_enabled_map")
+                .ok_or(EgressMapError::MapNotFound {
+                    map_name: "egress_enabled_map",
+                })?,
+        )?;
+        Ok(map.get(&cgroup_id, 0).is_ok())
+    }
 }
 
 #[cfg(feature = "ebpf")]

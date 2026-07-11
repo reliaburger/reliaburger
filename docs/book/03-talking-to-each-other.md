@@ -351,7 +351,9 @@ The eBPF programs don't call back to Bun. They read from kernel-resident hash ma
 
 **`firewall_map`**: Maps `(source_cgroup_id, destination_app_id)` to allow/deny. This is how we enforce namespace isolation and per-app firewall rules at the connection level.
 
-All three are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
+**`cgroup_namespace_map`**: The supplementary map — `cgroup_id → namespace_id`. It's the quiet load-bearing one. The connect hook only runs the isolation check when it can find the *source's* namespace here; if the lookup misses, it lets the connection through. So an empty `cgroup_namespace_map` doesn't fail safe, it fails *open* — every cross-namespace connection is allowed. Populating it is what turns isolation on, and `firewall_map` then carries the explicit exceptions. We learned this the hard way: for a while the resolver that computed these entries had no production caller at all (the same "parsed but never wired" trap we hit with port mappings in Chapter 1). Both maps were empty in every running cluster, so namespace isolation was advertised but inert. The fix is a reconcile in Bun that, on every deploy, redeploy and stop, rebuilds both maps from the live service map and the running instances' cgroup ids — writing what should exist and deleting what shouldn't, so a departed workload's isolation identity can't linger on a cgroup id the kernel later reuses.
+
+All four are `BPF_MAP_TYPE_HASH` — kernel hash tables with O(1) lookup. The structs use `#[repr(C)]` so their memory layout matches exactly between the Rust code that writes the maps and the C eBPF code that reads them:
 
 ```rust
 #[repr(C)]

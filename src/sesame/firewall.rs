@@ -4,7 +4,8 @@
 //! from app configuration `allow_from` rules. The eBPF connect hook
 //! (already implemented in Onion) checks these maps on every `connect()`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use crate::onion::types::{FirewallKey, FirewallValue, ServiceEntry};
 
@@ -143,6 +144,108 @@ pub fn rules_to_bpf_entries(rules: &[ResolvedFirewallRule]) -> Vec<(FirewallKey,
         .collect()
 }
 
+/// Keys present in a previous reconcile but no longer desired — the entries
+/// the agent must delete from a BPF map to converge it to `desired`. Used for
+/// both `firewall_map` and `cgroup_namespace_map`, which the agent rebuilds
+/// from scratch on every service-map mutation (NET5).
+pub fn keys_to_delete<K: Eq + Hash + Copy>(previous: &HashSet<K>, desired: &HashSet<K>) -> Vec<K> {
+    previous.difference(desired).copied().collect()
+}
+
+/// Errors from writing the eBPF firewall maps.
+#[derive(Debug, thiserror::Error)]
+pub enum FirewallMapError {
+    #[error("firewall eBPF maps require Linux with --features ebpf")]
+    Unsupported,
+
+    #[cfg(feature = "ebpf")]
+    #[error("firewall map operation failed: {0}")]
+    MapError(#[from] aya::maps::MapError),
+
+    #[error("firewall map {map_name:?} not found in the loaded program")]
+    MapNotFound { map_name: &'static str },
+}
+
+/// eBPF firewall map writers. With the `ebpf` feature these write the
+/// `firewall_map` (per (src_cgroup, dst_app) allow entries) and the
+/// `cgroup_namespace_map` (cgroup → namespace, which makes the connect
+/// hook enforce cross-namespace isolation at all); without it they are
+/// absent. The connect hook is already implemented in `ebpf/onion_connect.bpf.c`.
+#[cfg(feature = "ebpf")]
+mod maps {
+    use super::{FirewallKey, FirewallMapError, FirewallValue};
+    use aya::maps::HashMap;
+
+    /// Allow a single `(src_cgroup, dst_app)` cross-namespace connection.
+    pub fn write_firewall_entry(
+        bpf: &mut aya::Ebpf,
+        key: FirewallKey,
+        value: FirewallValue,
+    ) -> Result<(), FirewallMapError> {
+        let mut map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
+            bpf.map_mut("firewall_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "firewall_map",
+                })?,
+        )?;
+        map.insert(key, value, 0)?;
+        Ok(())
+    }
+
+    /// Remove a previously written firewall allow entry.
+    pub fn delete_firewall_entry(
+        bpf: &mut aya::Ebpf,
+        key: FirewallKey,
+    ) -> Result<(), FirewallMapError> {
+        let mut map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
+            bpf.map_mut("firewall_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "firewall_map",
+                })?,
+        )?;
+        let _ = map.remove(&key);
+        Ok(())
+    }
+
+    /// Record which namespace a cgroup belongs to. Once this is set the
+    /// connect hook compares the source's namespace against the destination
+    /// service's and denies a cross-namespace connect unless `firewall_map`
+    /// allows it — so populating this map is what turns isolation *on*.
+    pub fn write_cgroup_namespace_entry(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+        namespace_id: u32,
+    ) -> Result<(), FirewallMapError> {
+        let mut map: HashMap<_, u64, u32> = HashMap::try_from(
+            bpf.map_mut("cgroup_namespace_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "cgroup_namespace_map",
+                })?,
+        )?;
+        map.insert(cgroup_id, namespace_id, 0)?;
+        Ok(())
+    }
+
+    /// Forget a cgroup's namespace (on instance stop), so a reused cgroup
+    /// inode never inherits a departed workload's isolation identity.
+    pub fn delete_cgroup_namespace_entry(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+    ) -> Result<(), FirewallMapError> {
+        let mut map: HashMap<_, u64, u32> = HashMap::try_from(
+            bpf.map_mut("cgroup_namespace_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "cgroup_namespace_map",
+                })?,
+        )?;
+        let _ = map.remove(&cgroup_id);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ebpf")]
+pub use maps::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +354,24 @@ mod tests {
         assert_eq!(entries.len(), 3);
         // All should map to namespace_id 100
         assert!(entries.iter().all(|e| e.namespace_id == 100));
+    }
+
+    #[test]
+    fn keys_to_delete_returns_only_departed_keys() {
+        // A reconcile where cgroup 2001 went away and 3001 arrived: only the
+        // departed key is deleted; the surviving one is left in place and the
+        // new one is a write, not a delete.
+        let previous: HashSet<u64> = [1001, 2001].into();
+        let desired: HashSet<u64> = [1001, 3001].into();
+        let mut deletes = keys_to_delete(&previous, &desired);
+        deletes.sort();
+        assert_eq!(deletes, vec![2001]);
+    }
+
+    #[test]
+    fn keys_to_delete_is_empty_when_nothing_departed() {
+        let previous: HashSet<u64> = [1001].into();
+        let desired: HashSet<u64> = [1001, 2001].into();
+        assert!(keys_to_delete(&previous, &desired).is_empty());
     }
 }

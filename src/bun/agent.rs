@@ -416,6 +416,14 @@ pub struct BunAgent<G: Grill> {
     /// Ticks since the last egress re-resolution (the event loop runs at 1s).
     #[cfg(feature = "ebpf")]
     egress_reresolve_ticks: u32,
+    /// `firewall_map` keys last written to the kernel, so the next reconcile
+    /// deletes entries for departed cgroups (NET5). eBPF only.
+    #[cfg(feature = "ebpf")]
+    firewall_bpf_keys: std::collections::HashSet<crate::onion::types::FirewallKey>,
+    /// `cgroup_namespace_map` keys (cgroup ids) last written, for the same
+    /// reconcile-and-prune reason (NET5). eBPF only.
+    #[cfg(feature = "ebpf")]
+    cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
     /// Publisher for service-map snapshots (DNS responder subscribes).
@@ -491,6 +499,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_bindings: std::collections::HashMap::new(),
             #[cfg(feature = "ebpf")]
             egress_reresolve_ticks: 0,
+            #[cfg(feature = "ebpf")]
+            firewall_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(feature = "ebpf")]
+            cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -541,6 +553,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             egress_bindings: std::collections::HashMap::new(),
             #[cfg(feature = "ebpf")]
             egress_reresolve_ticks: 0,
+            #[cfg(feature = "ebpf")]
+            firewall_bpf_keys: std::collections::HashSet::new(),
+            #[cfg(feature = "ebpf")]
+            cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -751,6 +767,94 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     #[cfg(not(feature = "ebpf"))]
     async fn remove_backend_ebpf(&self, _app_name: &str) {}
+
+    /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
+    ///
+    /// Writes `cgroup_namespace_map` (cgroup → namespace) for every running
+    /// instance — which is what makes the connect hook enforce cross-namespace
+    /// isolation at all: with the source's namespace unknown the hook lets
+    /// every connection through. Writes `firewall_map` for each explicit
+    /// cross-namespace `allow_from` rule. Both maps are rebuilt from scratch
+    /// each call (a new instance of app A changes rules wherever A is a
+    /// *source*), deleting keys no longer desired. A no-op without eBPF.
+    #[cfg(feature = "ebpf")]
+    async fn sync_firewall_ebpf(&mut self) {
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return;
+        };
+
+        // cgroup id(s) per app, from currently-running instances. Collect the
+        // (app, id) pairs first so the `list_instances` borrow is released
+        // before the async `pid` lookups.
+        let pairs: Vec<(String, InstanceId)> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|i| (i.app_name.clone(), i.id.clone()))
+            .collect();
+        let mut cgroup_ids: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (app, id) in pairs {
+            if let Some(pid) = self.supervisor.grill().pid(&id).await
+                && let Some(cg) = crate::sesame::egress::cgroup_id_of_pid(pid)
+            {
+                cgroup_ids.entry(app).or_default().push(cg);
+            }
+        }
+
+        let services: Vec<crate::onion::types::ServiceEntry> = self
+            .service_map
+            .resolve_all()
+            .into_iter()
+            .cloned()
+            .collect();
+        let ns_entries =
+            crate::sesame::firewall::resolve_cgroup_namespace_entries(&services, &cgroup_ids);
+        let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
+            &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
+        );
+
+        let desired_ns_keys: std::collections::HashSet<u64> =
+            ns_entries.iter().map(|e| e.cgroup_id).collect();
+        let desired_fw_keys: std::collections::HashSet<crate::onion::types::FirewallKey> =
+            fw_entries.iter().map(|(k, _)| *k).collect();
+        let ns_to_delete =
+            crate::sesame::firewall::keys_to_delete(&self.cgroup_ns_bpf_keys, &desired_ns_keys);
+        let fw_to_delete =
+            crate::sesame::firewall::keys_to_delete(&self.firewall_bpf_keys, &desired_fw_keys);
+
+        {
+            let mut ebpf = handle.lock().await;
+            for entry in &ns_entries {
+                if let Err(e) = crate::sesame::firewall::write_cgroup_namespace_entry(
+                    &mut ebpf.bpf,
+                    entry.cgroup_id,
+                    entry.namespace_id,
+                ) {
+                    eprintln!("sesame: cgroup-namespace map write failed: {e}");
+                }
+            }
+            for (key, value) in &fw_entries {
+                if let Err(e) =
+                    crate::sesame::firewall::write_firewall_entry(&mut ebpf.bpf, *key, *value)
+                {
+                    eprintln!("sesame: firewall map write failed: {e}");
+                }
+            }
+            for cg in &ns_to_delete {
+                let _ = crate::sesame::firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, *cg);
+            }
+            for key in &fw_to_delete {
+                let _ = crate::sesame::firewall::delete_firewall_entry(&mut ebpf.bpf, *key);
+            }
+        }
+
+        self.cgroup_ns_bpf_keys = desired_ns_keys;
+        self.firewall_bpf_keys = desired_fw_keys;
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    async fn sync_firewall_ebpf(&mut self) {}
 
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
     /// Call before deploying anything; also enables `adopt_recorded_instances`.
@@ -2406,6 +2510,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             message: format!("stopping old instance {}", old_id.0),
                         })
                         .await;
+                    // NET6: lift the retiring instance's egress enforcement and
+                    // delete its allow entries, so nothing lingers for a reused
+                    // cgroup id. Old and new instances have distinct cgroups, so
+                    // this never touches the just-programmed new instance.
+                    self.clear_egress(old_id).await;
                 }
                 self.supervisor.remove_app(app_name, namespace).await;
                 self.remove_backend_ebpf(app_name).await;
@@ -2491,7 +2600,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             let _ = self.service_map.add_backend(app_name, backend);
                         }
                     }
-                    self.sync_backend_ebpf(app_name).await;
+                }
+
+                // NET6: finish kernel networking for each new instance. The
+                // fresh path runs this in drive_instance_startup; the rolling
+                // redeploy creates instances inline and previously skipped
+                // egress entirely, leaving redeployed workloads unenforced.
+                for new_id in &new_ids {
+                    self.finish_instance_networking(new_id, app_name, spec)
+                        .await;
                 }
                 if let Some(ref ingress) = spec.ingress {
                     self.ingress_configs
@@ -2557,6 +2674,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .service_map
                     .register_app(app_name, namespace, port, firewall);
                 self.sync_backend_ebpf(app_name).await;
+                self.sync_firewall_ebpf().await;
             }
 
             // Store ingress config for routing table
@@ -3016,13 +3134,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = self.service_map.add_backend(app_name, backend);
         }
 
-        // L8: mirror the freshly-registered backend into the eBPF backend_map.
-        self.sync_backend_ebpf(app_name).await;
-
-        // L16: program the egress allowlist for this instance's cgroup.
-        self.apply_egress(instance_id, spec).await;
+        // Program this instance's kernel networking via the shared helper the
+        // rolling-redeploy path also uses (NET6), so the two can't drift.
+        self.finish_instance_networking(instance_id, app_name, spec)
+            .await;
 
         Ok(())
+    }
+
+    /// Program a freshly-started instance's kernel networking: mirror its
+    /// backend into `backend_map` (L8), reconcile the namespace-firewall maps
+    /// (NET5), and program the egress allowlist (L16). Both the fresh-deploy
+    /// and rolling-redeploy paths call this, so a step the fresh path performs
+    /// can't be silently skipped on redeploy — the NET6 bug.
+    async fn finish_instance_networking(
+        &mut self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        spec: &AppSpec,
+    ) {
+        self.sync_backend_ebpf(app_name).await;
+        self.sync_firewall_ebpf().await;
+        self.apply_egress(instance_id, spec).await;
     }
 
     /// Program an instance's egress allowlist into the eBPF maps (L16).
@@ -3038,6 +3171,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
+        // eBPF absent: egress is documented-unenforced (D5), not a failure.
+        let Some(handle) = self.onion_ebpf.clone() else {
+            eprintln!(
+                "sesame: [egress] set for {} but eBPF is not loaded; egress is NOT enforced",
+                instance_id.0
+            );
+            return;
+        };
+
         let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
             return;
         };
@@ -3049,7 +3191,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
-        // DNS resolution can block — do it off the event loop.
+        // From here we FAIL CLOSED (NET6): egress is configured and eBPF is
+        // loaded, so any failure to resolve or program the allowlist must leave
+        // the cgroup denying *all* egress, never running unenforced. DNS
+        // resolution can block — do it off the event loop.
         let allow = egress.allow.clone();
         let allow_for_resolve = allow.clone();
         let resolved = match tokio::task::spawn_blocking(move || {
@@ -3060,30 +3205,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Ok(Ok(entries)) => entries,
             Ok(Err(e)) => {
                 eprintln!(
-                    "sesame: egress resolution failed for {}: {e}",
+                    "sesame: egress resolution failed for {}; denying all egress: {e}",
                     instance_id.0
                 );
+                self.deny_all_egress(&handle, instance_id, cgroup_id, allow)
+                    .await;
                 return;
             }
-            Err(_) => return,
+            Err(_) => {
+                self.deny_all_egress(&handle, instance_id, cgroup_id, allow)
+                    .await;
+                return;
+            }
         };
 
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            eprintln!(
-                "sesame: [egress] set for {} but eBPF is not loaded; egress is NOT enforced",
-                instance_id.0
-            );
-            return;
-        };
-
-        let entries = crate::sesame::egress::egress_to_bpf_entries(&[cgroup_id], &resolved);
         let mut ebpf = handle.lock().await;
-        for (key, value) in entries {
-            if let Err(e) = crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value) {
-                eprintln!("sesame: egress map write failed for {}: {e}", instance_id.0);
-                return;
-            }
-        }
+        // Enable enforcement first: the baseline is deny-all, and each written
+        // entry then opens exactly one destination. If we can't even enable it
+        // there is nothing to fail closed *to* — log and bail.
         if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
             eprintln!(
                 "sesame: enabling egress enforcement failed for {}: {e}",
@@ -3091,13 +3230,64 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             );
             return;
         }
+        // Program each destination individually so a single failed write leaves
+        // that destination denied (fail closed) rather than dropping straight
+        // out with the allowlist half-applied and unenforced.
+        let mut programmed: Vec<(std::net::Ipv4Addr, u16)> = Vec::new();
+        for dest in &resolved {
+            for (key, value) in crate::sesame::egress::egress_to_bpf_entries(
+                &[cgroup_id],
+                std::slice::from_ref(dest),
+            ) {
+                match crate::sesame::egress::write_egress_entry(&mut ebpf.bpf, key, value) {
+                    Ok(()) => programmed.push(*dest),
+                    Err(e) => eprintln!(
+                        "sesame: egress map write failed for {} (destination stays denied): {e}",
+                        instance_id.0
+                    ),
+                }
+            }
+        }
         drop(ebpf);
+        // Record only what we actually programmed, so the periodic re-resolve
+        // diffs against reality and fills any gap a transient failure left.
         self.egress_bindings.insert(
             instance_id.clone(),
             EgressBinding {
                 cgroup_id,
                 allow,
-                resolved,
+                resolved: programmed,
+            },
+        );
+    }
+
+    /// Fail-closed helper: enable egress enforcement for `cgroup_id` with no
+    /// allow entries, so every destination is denied. Used when egress is
+    /// required but its allowlist can't be resolved (NET6).
+    #[cfg(feature = "ebpf")]
+    async fn deny_all_egress(
+        &mut self,
+        handle: &std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
+        instance_id: &InstanceId,
+        cgroup_id: u64,
+        allow: Vec<String>,
+    ) {
+        {
+            let mut ebpf = handle.lock().await;
+            if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
+                eprintln!(
+                    "sesame: could not deny-all egress for {}: {e}",
+                    instance_id.0
+                );
+                return;
+            }
+        }
+        self.egress_bindings.insert(
+            instance_id.clone(),
+            EgressBinding {
+                cgroup_id,
+                allow,
+                resolved: Vec::new(),
             },
         );
     }
@@ -3114,9 +3304,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Lift egress enforcement for a stopped instance's cgroup (L16).
     ///
-    /// Enforcement is keyed by the cgroup id, which is unique per
-    /// instance, so clearing the enable flag is enough; stale allow
-    /// entries become inert once nothing enforces against them.
+    /// Deletes the allow entries as well as the enable flag: cgroup ids are
+    /// recycled by the kernel, and a stale allowlist left behind could open
+    /// destinations for whatever workload next lands on that cgroup id (NET6).
     #[cfg(feature = "ebpf")]
     async fn clear_egress(&mut self, instance_id: &InstanceId) {
         let Some(binding) = self.egress_bindings.remove(instance_id) else {
@@ -3124,6 +3314,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         if let Some(handle) = self.onion_ebpf.as_ref() {
             let mut ebpf = handle.lock().await;
+            for (key, _) in crate::sesame::egress::egress_to_bpf_entries(
+                &[binding.cgroup_id],
+                &binding.resolved,
+            ) {
+                let _ = crate::sesame::egress::delete_egress_entry(&mut ebpf.bpf, key);
+            }
             let _ = crate::sesame::egress::clear_egress_enforced(&mut ebpf.bpf, binding.cgroup_id);
         }
     }
@@ -3557,7 +3753,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 let _ = self.service_map.add_backend(&app_name, backend);
             }
-            self.sync_backend_ebpf(&app_name).await;
+            // Re-program the restarted instance's kernel networking. A restart
+            // gives it a fresh cgroup, so egress must be re-applied too or a
+            // crash-restart silently drops enforcement (same class as NET6);
+            // the AppSpec comes from the stored deploy record.
+            if let Some(spec) = self
+                .deployed_specs
+                .get(&(app_name.clone(), namespace.clone()))
+                .cloned()
+            {
+                self.finish_instance_networking(&id, &app_name, &spec).await;
+            } else {
+                self.sync_backend_ebpf(&app_name).await;
+                self.sync_firewall_ebpf().await;
+            }
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -3625,6 +3834,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.remove_backend_ebpf(app_name).await;
         let _ = self.service_map.unregister_app(app_name);
+        // NET5: prune this app's cgroup-namespace + firewall entries now it's
+        // gone, so a reused cgroup inode can't inherit its isolation identity.
+        self.sync_firewall_ebpf().await;
         self.ingress_configs.remove(app_name);
         self.rebuild_routing_table().await;
 

@@ -636,6 +636,173 @@ async fn egress_denied_by_default_allowed_when_listed() {
     ebpf.detach();
 }
 
+/// NET6: clearing a cgroup's egress must delete its allow entries, not just
+/// flip the enable flag — otherwise a recycled cgroup id inherits a departed
+/// instance's destinations. This drives the exact map operations `clear_egress`
+/// performs (a `delete_egress_entry` per destination, then
+/// `clear_egress_enforced`) and asserts nothing survives.
+#[tokio::test]
+async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // A synthetic cgroup id (well outside the real range) with two allowed
+    // destinations and enforcement enabled.
+    let cgroup_id: u64 = 0xDEAD_BEEF_CAFE_6006;
+    let dests = [
+        (Ipv4Addr::new(10, 0, 0, 1), 443u16),
+        (Ipv4Addr::new(10, 0, 0, 2), 80u16),
+    ];
+    let keys: Vec<EgressKey> = dests
+        .iter()
+        .map(|(ip, port)| EgressKey {
+            src_cgroup_id: cgroup_id,
+            dst_ip: u32::from(*ip).to_be(),
+            dst_port: port.to_be(),
+            _pad: 0,
+        })
+        .collect();
+    for key in &keys {
+        egress::write_egress_entry(
+            &mut ebpf.bpf,
+            *key,
+            EgressValue {
+                action: EGRESS_ALLOW,
+            },
+        )
+        .expect("write egress entry");
+    }
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+
+    // Programmed: both destinations allowed, enforcement on.
+    assert!(egress::egress_enforced(&mut ebpf.bpf, cgroup_id).unwrap());
+    for key in &keys {
+        assert!(
+            egress::egress_allowed(&mut ebpf.bpf, *key).unwrap(),
+            "destination should be allowed after write"
+        );
+    }
+
+    // The cleanup clear_egress now performs: delete each destination, then the
+    // enable flag.
+    for key in &keys {
+        egress::delete_egress_entry(&mut ebpf.bpf, *key).expect("delete egress entry");
+    }
+    egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("clear enforcement");
+
+    // Nothing lingers for a future cgroup that reuses this id.
+    assert!(
+        !egress::egress_enforced(&mut ebpf.bpf, cgroup_id).unwrap(),
+        "enforcement flag should be cleared"
+    );
+    for key in &keys {
+        assert!(
+            !egress::egress_allowed(&mut ebpf.bpf, *key).unwrap(),
+            "destination should be gone after delete (NET6)"
+        );
+    }
+
+    ebpf.detach();
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2c: Namespace isolation (NET5)
+// ---------------------------------------------------------------------------
+
+/// NET5: the connect hook only enforces namespace isolation once the source
+/// cgroup's namespace is recorded in `cgroup_namespace_map`. With that written,
+/// a connect to a service in a *different* namespace is denied (EPERM) unless
+/// `firewall_map` carries an explicit `(src_cgroup, dst_app)` allow. This is
+/// the userspace half NET5 was missing — the C hook already implemented the
+/// check. We enforce against the *test's own* cgroup so
+/// `bpf_get_current_cgroup_id()` matches what we program.
+#[tokio::test]
+async fn namespace_isolation_denies_cross_namespace_by_default() {
+    use reliaburger::onion::ebpf::maps::BpfServiceMap;
+    use reliaburger::sesame::firewall::{
+        self, FIREWALL_ALLOW, ResolvedFirewallRule, rules_to_bpf_entries,
+    };
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // A destination service in "backend-ns" with one real backend, mirrored
+    // into backend_map so the VIP resolves (count >= 1) and the hook reaches
+    // the firewall check rather than the no-backend early-out.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let mut map = ServiceMap::new();
+    map.register_app("dest", "backend-ns", backend_port, None)
+        .unwrap();
+    map.add_backend(
+        "dest",
+        BackendInstance {
+            instance_id: "dest-0".to_string(),
+            node_ip: Ipv4Addr::LOCALHOST,
+            host_port: backend_port,
+            healthy: true,
+        },
+    )
+    .unwrap();
+    let entry = map.resolve("dest").unwrap().clone();
+    BpfServiceMap::new().update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry);
+
+    // Put the test process's cgroup in a *different* namespace than the
+    // destination service. Any id that differs from the service's forces the
+    // hook's cross-namespace branch.
+    let src_cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(std::process::id())
+        .expect("failed to resolve own cgroup id");
+    let src_ns = entry.namespace_id.wrapping_add(1);
+    firewall::write_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup, src_ns)
+        .expect("write cgroup-namespace entry");
+
+    let vip_dst = SocketAddr::new(entry.vip.0.into(), entry.port);
+
+    // Cross-namespace, no allow entry → denied with EPERM.
+    let blocked = TcpStream::connect_timeout(&vip_dst, Duration::from_secs(2));
+    assert!(
+        matches!(
+            blocked.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "cross-namespace connect should be denied with EPERM, got {blocked:?}"
+    );
+
+    // Add the explicit allow → the same connect is now rewritten to the live
+    // backend and succeeds. Only the firewall entry changed between the two.
+    for (key, value) in rules_to_bpf_entries(&[ResolvedFirewallRule {
+        src_cgroup_id: src_cgroup,
+        dst_app_id: entry.app_id,
+        action: FIREWALL_ALLOW,
+    }]) {
+        firewall::write_firewall_entry(&mut ebpf.bpf, key, value).expect("write firewall entry");
+    }
+    let allowed = TcpStream::connect_timeout(&vip_dst, Duration::from_secs(2));
+    assert!(
+        allowed.is_ok(),
+        "allowed cross-namespace connect should reach the backend: {allowed:?}"
+    );
+
+    // Forget the namespace mapping so the harness's own connections aren't
+    // caught by a lingering isolation identity on a reused cgroup.
+    firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup).ok();
+    ebpf.detach();
+}
+
 // ---------------------------------------------------------------------------
 // Tier 3: DNS responder
 // ---------------------------------------------------------------------------
