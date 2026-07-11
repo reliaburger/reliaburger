@@ -380,6 +380,14 @@ Every top-level checkbox below is one PR-sized theme. Write the binary-driven
 acceptance test first, update the relevant book chapter in the same PR, and check
 the theme only after default and platform-gated tests pass.
 
+**P0 wave (landed, pending merge).** The seven confirmed P0s — JOB1, JOB2 (internal API
+trust boundary), OBS1 (rollup SQL injection), CP3 (corrupt-snapshot fail-closed), PKI8 (secret
+rotation), NET5, NET6 (network policy) — are fixed on the stacked `p0-stop-the-bleeding` →
+`pki8-secret-rotation` → `network-policy-enforcement` branches: one commit each, tests-first,
+book updated, `make ci` green (and the Lima eBPF suite for NET5/NET6). They are recorded as
+nested `- [x]` sub-bullets under their themes below; each parent theme stays open because it
+covers more than its P0.
+
 ### 12b.1 — Stop the bleeding
 
 - [ ] **Internal API trust boundary** — central route/role/scope matrix; require node
@@ -388,12 +396,21 @@ the theme only after default and platform-gated tests pass.
   parse build digests/Dockerfile paths and bound, sandbox and clean archive extraction.
   Reject anonymous and ReadOnly execution, callback SSRF, path traversal, sparse/oversized
   contexts and a Buildah process that survives timeout (new JOB1-JOB2, H4/D8).
+  - [x] `require_system` on `/v1/batch/run|report` and `/v1/build/run`, `authorize(Deployer)`
+    on the submit endpoints, callback bounded to known members, and the cluster service token
+    no longer forwarded to caller-controlled URLs (JOB1); build `context_digest` validated as a
+    well-formed OCI digest before it becomes a temp path, killing the `sha256:../../x` traversal
+    (JOB2). P0 wave.
 - [ ] **Secret and workload-identity safety** — make rotation generation-aware:
   encrypt with the newest key, decrypt with active generations, re-encrypt and acknowledge
   every stored secret before retiring the old key, and reject malformed/concurrent
   rotations. Issue exact validity windows, rebuild SANs server-side, store identity in
   per-instance tmpfs, preserve it through rolling/adoption and clean it on removal
   (new PKI6-PKI8, D9).
+  - [x] Generation-aware secret rotation: encryption picks the newest non-read-only key,
+    decryption tries every live generation, finalize refuses to empty a scope, and a malformed
+    rotate body is rejected — so a secret sealed under generation N survives the rotation window
+    (PKI8). P0 wave.
 - [ ] **Pickle reference integrity** — include raw manifest/index blobs in holder,
   replication and GC reachability; validate JSON, media types, descriptor digest/size and
   referenced blob existence before returning Created; use canonical repository identity
@@ -405,10 +422,22 @@ the theme only after default and platform-gated tests pass.
   closed when required policy cannot be installed; reconcile kernel truth and delete every
   per-cgroup entry. Add IPv6/connect6 and CIDR enforcement, safe nftables input, required-map
   validation and IPv4/IPv6 perimeter rules with timeouts (new NET5-NET8, D5, old BPF/nft Lows).
+  - [x] Namespace-firewall maps (`cgroup_namespace_map` + `firewall_map`) written and
+    reconciled on every deploy/redeploy/restart/stop, so the connect hook actually enforces
+    cross-namespace isolation instead of failing open on empty maps (NET5); egress programmed on
+    rolling redeploy and crash-restart through one shared `finish_instance_networking` helper,
+    failing closed (deny-all) on any programming error, with stop/redeploy deleting the allow
+    entries so a recycled cgroup id inherits nothing (NET6). Lima eBPF suite green (14/14). P0 wave.
+    **Still open in this theme:** IPv6/connect6 + CIDR enforcement, nftables-input safety and the
+    perimeter rules (NET7/NET8).
 - [ ] **Consensus persistence safety** — version and checksum snapshots, validate the
   snapshot/log boundary, propagate vote/log/initialisation errors and refuse startup when
   compacted state cannot be reconstructed. Test compact → corrupt → restart returns an
   error instead of an empty cluster state (new CP3).
+  - [x] A present-but-undecodable Raft snapshot is now a hard startup error instead of a silent
+    empty-state boot after log compaction; a genuinely absent snapshot still loads an empty
+    default (CP3). P0 wave. **Still open:** snapshot versioning/checksums and propagating the
+    remaining vote/log/init errors.
 
 ### 12b.2 — Make the cluster converge
 
@@ -511,6 +540,8 @@ the theme only after default and platform-gated tests pass.
   export, one Bun-owned checkpoint, durable object IDs, provider webhook payloads and final
   shutdown flush; remove/consolidate legacy Ketchup calendar/config (codex-M4/D13,
   old M3/M4/M19/M20/M24/X8, OBS1-OBS8).
+  - [x] Cluster rollup metric-name queries escaped via `escape_sql_literal`, closing the
+    `/v1/metrics/rollup` SQL injection where `params.name` was interpolated raw (OBS1). P0 wave.
 - [ ] **GitOps convergence and webhook security** — expose a signature-validated HMAC
   webhook route with replay/rate controls; make diff namespace-aware and deterministic;
   apply every resource through the unified desired-state path; never advance last_applied
