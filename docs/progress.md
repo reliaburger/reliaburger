@@ -182,7 +182,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 8: Advanced
 
-- [x] Smoker fault injection (safety rails, fault registry, process/resource/node faults, eBPF network fault types + maps, scripted scenarios, chaos test suite) — wired in Stage 4 W11: `InjectFault` builds a live `SafetyContext` and calls `evaluate_safety`; approved faults are applied for real (Kill/Pause/Resume via PIDs, CpuStress via burn loops, memory/disk-IO via Linux cgroups); network faults rejected honestly without eBPF; partitions drive real transport blocklists. eBPF network-fault *enforcement* (delay/drop/dns/bandwidth) still lands with W12
+- [x] Smoker fault injection (safety rails, registry, process/network fault plumbing, scripted scenarios and chaos tests) — **post-Phase-12 audit: Kill/Pause/Resume and eBPF faults have live paths, but memory, disk, drain and node-kill can still report success without an effect; CPU stress targets Bun rather than the workload and cleanup is incomplete. Phase 12b owns the correction.**
 - [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation) — **`[lib-only]` `L16` egress resolvers never called; supervisor sets `egress: None`**
 - [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation) — **`M23` allowlist + `mount_isolation` never enforced (`with_process_config` no callers)**
 - [x] High-throughput batch scheduling (greedy bin-packing `schedule_batch`, `BatchTracker`, 100K jobs in <1s)
@@ -223,7 +223,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Hierarchical metrics aggregation via council (cluster-wide queries) — **`[lib-only]` `L11` `RollupWorker` never spawned; aggregator gets `rollup_store: None`; `/v1/metrics/cluster` returns "no rollup store configured" forever**
 - [x] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts) — **partial: nodes table hardcoded empty, node detail hardcodes `alive` and lists all apps, per-app charts permanently empty (no per-process metrics collected)**
 - [x] Alert webhooks (Slack, PagerDuty, generic HTTP) — **`M19` generic payload only; Slack/PagerDuty formats never applied (would be rejected). Dispatch loop is wired.**
-- [x] Log export to S3/GCS (scheduled Parquet, `relish logs-search` for remote SQL) — **`M20` filesystem-only; `object_store` has only the `fs` feature, an `s3://` dest is treated as a local dir; `X8` `logs-export` races the agent's checkpoint**
+- [x] Log export to S3/GCS (scheduled Parquet, `relish logs-search` for remote SQL) — **`M20` behaviour is still open: AWS/GCP `object_store` features are enabled, but `ketchup::export` still converts `s3://`/`gs://` to a `PathBuf` and calls `std::fs::copy`; `X8` `logs-export` also races the agent's checkpoint**
 - [x] Cross-node log queries via Raft (leader fan-out, merge-sort) — **`[lib-only]` production always takes the single-node path (`ApiState.council`/`membership` are `None`); direct HTTP, not "via Raft"; `M4` dedup flaw**
 - [x] Book chapter 11: "Eyes Everywhere"
 - [x] All Phase 11 tests green (1595 tests)
@@ -291,9 +291,13 @@ each wiring item lands with an integration test that drives the **binary**, not 
 
 - [x] `C5(c)` Sign + verify the gossip HMAC — key derived from the master secret (every node has it, nothing new distributed); UDP transport signs on send, drops unverified datagrams on recv
 - [x] `L17` (signatures) Enforce image-signature **verification** at deploy time — `verify_image_signature` actually verifies the bytes against the cluster root CA (not just presence); gated on the node trust policy, refuses unsigned/invalid Pickle images. Enforced locally in `deploy` (no central scheduler exists yet — that's Stage 4 L1)
-- [ ] `C5(b)` mTLS on the Raft RPC and agent API listeners (needs node-identity on-disk persistence — certs are never persisted and joiners never receive theirs)
-- [ ] `L17` (CRL) Enforce CRL / cert-revocation checks in `verify_keyless` (naturally rides with mTLS peer certs)
-- [ ] Brioche UI / dashboard auth (`/`, `/ui/*` left public in Stage 3b auth)
+The Stage 5 work (PR #77, merged) closed most of this: node identity is persisted and
+delivered to joiners, and **mTLS runs on the Raft RPC, reporting and agent-API listeners**
+with a Node-CA-pinned client verifier, a Raft-refreshed CRL, keyless-signature CRL checks
+and read-only Brioche session auth. The remaining `C5(b)`/PKI items — Pickle registry
+auth/TLS, API scope enforcement + bootstrap lockdown, atomic CSR-based join and
+expected-peer binding — live in **Phase 12b** below (Themes "API authorisation and
+Brioche", "Node PKI, join and mTLS", "Pickle storage and replication durability").
 
 ### Stage 4 — Wire the remaining library-only subsystems (one at a time, binary-driven test each)
 
@@ -302,15 +306,15 @@ Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-pla
 - [x] `L1` Scheduler → placement → remote dispatch: `relish apply` under `--cluster` commits `AppSpec`s to Raft (followers forward to the leader); a leader-only scheduler places replicas and commits `SchedulingDecision`s; every node polls `/v1/placements/{node}` and reconciles its instances (idempotent). `H8` fixed (spread weight 60 > bin-pack 50; test now asserts distinct nodes). Flushed out a latent bug: durable Raft log + council TCP RPC used bincode, which can't drive the config types' `deserialize_any` — both switched to self-describing JSON (matching the snapshot). Binary-driven test in `tests/placement.rs`
 - [x] `L2` / `M16` / `X3` — `M16`: orchestrator no longer leaks a failed step's own half-started instance (regression test asserts it's stopped). `X3`: `relish rollback` actually rolls back — deploy history now carries the full `AppSpec` (every path records it, including the first deploy), `POST /v1/rollback/{app}/{ns}` redeploys the previous successful spec via the apply path (Raft in cluster mode). Note: cluster-wide *staged* rollout (max_unavailable gating across nodes) rides on the W6 desired-state reconciler and the per-node rolling redeploy; the imperative `DeployOrchestrator` stays library-side (correct + unit-tested) rather than duplicated as a parallel cluster driver
 - [x] `L3` Autoscale loop wired: leader-only task drives the tested pure functions (`evaluate`/`AutoscaleTracker`/`AutoscaleConfig::from_spec` — the library's sync `app_provider` closure can't read async Raft/rollup state), reads each `[autoscale]` app's metric from the rollup store, and commits `AutoscaleOverride` to Raft. The scheduler now targets *effective* replicas (override ∨ spec), so a scale flows through the same placement→reconcile path as apply. End-to-end test: high metric → override → grows to `max`
-- [x] `L4` State reconstruction wired into the leader scheduler loop: on the leadership edge it calls `on_leader_elected`, runs a learning period (feeding reports through `on_report_received`/`check_timeout`), and **gates scheduling** until phase == Active — so a fresh leader never re-places apps that are running but haven't reported yet. `MissingApp`/`ExtraApp` corrections are realised by the loop's ordinary placement reconciliation; `UnknownNode` exclusion was deliberately dropped (it blacklisted slow-reporting nodes and caused churn). `[reconstruction]` config now read (dead-config cleared)
+- [x] `L4` State reconstruction wired into the leader scheduler loop: on the leadership edge it calls `on_leader_elected`, runs a learning period (feeding reports through `on_report_received`/`check_timeout`), and **gates scheduling** until phase == Active. **Post-Phase-12 audit:** the returned `MissingApp`/`ExtraApp` corrections are discarded, the diff loses colocated replica counts and stale reports can satisfy coverage; correction is Phase 12b.
 - [x] `L6` / `L11` Reporting + rollups wired: `RollupWorker` spawned per node, aggregator gets a real rollup store, `/v1/metrics/cluster` serves from it; StateReports carry real capacity (`[resources]` now read) and requested-resource usage. Flat-star kept by design (tree deferred, see ch. 11); fixed a latent DataFusion overflow (`unwrap_or(u64::MAX)` time ranges, 4 handlers)
 - [x] `L7` Bind the Wrapper ingress listener — `[ingress]` node-config section (off by default), HTTP + HTTPS listeners (self-signed or disk certs), per-client rate limiting wired into the proxy path, WebSocket pass-through; drain-on-deploy integration lands with `L2` (W7)
 - [x] `L8` / `L9` Load the Onion eBPF programs in production; start the DNS responder (fix `M8` fragility) — **`L9`+`M8` done**: `[dns]` config section (off by default), responder spawned from bun, full hardening (recv errors non-fatal, per-query spawned forwards behind a semaphore, connected sockets + transaction-ID checks, NXDOMAIN for unmatched `.internal` with no upstream leak, QTYPE honoured, SERVFAIL on dead upstream), runc containers get `resolv.conf` pointed at the responder. **`L8` done**: `[ebpf]` config section (off by default; `program_dir` defaults to the build-time `OUT_DIR` baked in via `build.rs` `RELIABURGER_BPF_DIR`, so dev/Lima builds self-locate their `.bpf.o`), `bun` loads + attaches `OnionEbpf` at startup (load failure logs and continues without enforcement; non-`ebpf` builds warn that enforcement is off). Verified in the `reliaburger-test` Lima VM: `cargo build --features ebpf` compiles the objects and all 9 `tests/ebpf.rs` integration tests pass (load/attach, backend-map read/write/remove, connect→VIP rewrite, no-backend deny `EPERM`, non-VIP passthrough, `.internal` DNS). Not covered by `make ci` (needs root + kernel 5.7+ + cgroup v2)
-  - **eBPF production enforcement now complete** (Phase 11b follow-up, P0–P3): the agent syncs its live service map into the kernel `backend_map` at every mutation (`agent_deploy_populates_backend_map`), the fault-map writers write real `fault_connect_map`/`fault_dns_map`/`fault_bw_map` entries with CLOCK_MONOTONIC expiry that matches the kernel (`agent_drop_fault_refuses_vip_with_eperm`), and egress allowlists re-resolve periodically. All verified in the Lima VM.
+  - **Backend/fault/egress eBPF wiring landed** (Phase 11b follow-up, P0–P3): the agent writes the live `backend_map`, fault maps and DNS-refresh egress entries. **Post-Phase-12 correction:** namespace firewall maps still have no production writer, rolling deploy skips egress, IPv6 bypasses policy and map failures can fail open; Phase 12b owns those gaps.
 - [x] `L10` / `M2` Pickle wired: catalog persists to disk + loads at boot; pushes record real raft-id holders and propose to Raft on council nodes (worker proposal forwarding lands with W6); leader replication loop keeps layers at `[images] redundancy`; scheduled two-phase GC — nominate → Raft-arbitrated approval (`CouncilResponse::GcApproved`) → delete, with an orphan grace window for in-flight pushes. `X1` fixed: `relish build` targets the registry port, `/v1/build` executes buildah for real (honest 501 without it)
 - [x] `L13` / `H12` GitOps wired: new `src/lettuce/runner.rs` spawns a leader-only sync loop (clone → poll/webhook → `execute_sync` in `spawn_blocking` → apply changes as `AppSpec`/`AppDelete` Raft writes). Webhook endpoint gets a real channel (was unconditional 503); `[gitops]` config now read. `H12`: `is_key_trusted` no longer falls through to `true` — a valid signature from an unlisted key is rejected. Fixed a latent first-sync bug (a fresh clone has nothing to fetch but nothing applied either → now syncs when HEAD ≠ last-applied). Integration tests in `tests/gitops.rs` (real git repo → Raft; webhook triggers sync)
-- [x] `L14` / `L15` Real Smoker fault injection + chaos transport blocklists: `InjectFault` now builds a live `SafetyContext` (council size + alive nodes from Raft/membership, replica counts from the supervisor, active node-faults from the registry — no more hardcoded zeros) and runs `evaluate_safety`; approved faults are actually applied (Kill/Pause/Resume via real PIDs, CpuStress via `spawn_blocking` burn loops, memory/disk-IO via cgroups on Linux). Network faults (delay/drop/dns/bandwidth) are **rejected honestly** without eBPF, and **injected for real** when the eBPF data path is loaded (P2: `write_fault_bpf_entry` writes `fault_connect_map`/`fault_dns_map`/`fault_bw_map`, expiry on CLOCK_MONOTONIC to match the kernel; `agent_drop_fault_refuses_vip_with_eperm`). `L15`: partitions populate the real gossip + Raft transport blocklists (both directions), so an isolated node is marked Dead by SWIM and rejoins on heal. Integration tests drive the binary path: `kill_fault_actually_kills_the_instance`, `network_fault_without_ebpf_is_rejected_not_faked` (`tests/integration.rs`); `partition_isolates_a_node_for_real`, `fault_injection_rejected_when_quorum_at_risk` (`tests/placement.rs`)
-- [x] `L16` Program egress allowlists — an app's `[egress] allow` list is now enforced in the kernel: on instance start the agent resolves the instance's cgroup id (from `/proc/<pid>/cgroup` → cgroup v2 dir inode), resolves the allowlist (DNS off the event loop via `spawn_blocking`), writes the `egress_map` entries and flips `egress_enabled_map` for that cgroup; on stop it lifts enforcement. A rate-limited event-loop task re-resolves each allowlist and reprograms the delta as DNS changes (P3: `egress_diff` + `re_resolve_egress_async`). Non-eBPF/non-Linux builds warn that egress is unenforced (default-deny is eBPF-only, per D5). Verified in the Lima VM: `egress_denied_by_default_allowed_when_listed` (`tests/ebpf.rs`) loads the real program, allows one destination for the test's own cgroup, and asserts the listed destination connects while an unlisted one is denied with `EPERM`
+- [x] `L14` / `L15` Smoker safety context, process/network plumbing and chaos transport blocklists wired; Kill/Pause/Resume, eBPF network faults and partitions have binary-driven tests. **Post-Phase-12 audit:** several advertised resource/node faults are no-ops that return success, CPU stress runs in Bun's cgroup and clear/expiry does not reverse every effect; the measurable-effect/cleanup work is Phase 12b.
+- [x] `L16` Initial IPv4 egress allowlist programming and DNS refresh wired and Lima-tested. **Post-Phase-12 audit:** policy is installed after fresh start, omitted on rolling deploy, warning-only on required-map failure, leaves stale destinations on stop and has no IPv6/CIDR enforcement; Phase 12b makes it fail closed.
 - [x] `M17` K8s import fidelity (`command`/`args` concatenated, `env.valueFrom` warned not dropped, namespace preserved, same-name-two-namespaces no longer overwrites)
 - [x] `H11` Fix `relish fmt` for nested-table configs — recursive section emission + a round-trip guard that refuses to write output that re-parses differently
 - [x] `X1`/`X3`/`X4`/`X5`/`X6` CLI mismatches: `X1` (build → registry port + real buildah execution), `X4` (logs `--grep`/`--since`/`--json-field` wired, server + client side) and `X5` (unreachable agent exits non-zero; explicit `--dry-run` flag added) done; `X3` rollback done (W7); `X6` no-args TUI is out of Stage 4 scope by design → [2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
@@ -318,7 +322,7 @@ Implementation plan: [docs/plans/2026-07-07-plan-wiring.md](plans/2026-07-07-pla
 ### Throughout
 
 - [x] Fix the misleading tests — `L15` "worker isolation" (was a no-op) replaced with `chaos_isolated_member_misses_writes_until_healed`, which really partitions a council member and asserts the isolated node misses writes until healed. `H1` restart tests now assert real post-restart behaviour, not just a counter bump: `health_check_triggers_restart` checks the instance reached a live re-created state (`running`/`health-wait`/`unhealthy`, never stuck in `Preparing`), and `job_failed_retries_then_fails` asserts the terminal `failed` state after retries exhaust
-- [x] Remove dead config or wire it — wired during Stage 4: `[resources]` (W4), `[reconstruction]` (W9), `[gitops]` (W10), `[images]` (W5), `[metrics]` (W4), node `labels` (W6), new `[ingress]`/`[dns]`/`[ebpf]` (W2/W3/W12). Still genuinely dead and **documented, not silently dropped** (out of Stage 4 scope): `[process_workloads]` (M23), `[logs] max_file_size_mb`. `[storage] volumes` (M21) was wired in Phase 12 E0.
+- [x] Remove dead config or wire it — wired during Stage 4: `[resources]` (W4), `[reconstruction]` (W9), `[gitops]` (W10), `[images]` (W5), `[metrics]` (W4), new `[ingress]`/`[dns]`/`[ebpf]` (W2/W3/W12). **Post-Phase-12 correction:** node `labels` parse but never travel in gossip, `[process_workloads]` and `[logs] max_file_size_mb` remain dead, and several newer fields are unused; Phase 12b owns them. `[storage] volumes` (M21) was wired in Phase 12 E0.
 - [x] Clear each `[lib-only]` tag from the phases above as its subsystem is genuinely wired — the Smoker fault-injection `[lib-only]` tag (Phase 8) is cleared; the eBPF network-fault enforcement + service-map→backend sync gaps were subsequently closed (P0–P3, see the `L8` item)
 
 ### Post-Stage-4 audit fixes (July 2026)
@@ -342,74 +346,6 @@ original review. All fixed on this branch, tests-first (each drives the binary/a
 - [x] Single global `Mutex<RateLimiter>` serialised every rate-limited request; replaced with
   a 16-way `ShardedRateLimiter`.
 
-### Stage 5 — Multi-Node Correctness & Security (July 2026 reviews)
-
-> Consolidated write-up: [2026-07-10-review-past-phase-12.md](plans/2026-07-10-review-past-phase-12.md),
-> synthesising the [codebase walkthrough](plans/2026-07-09-review-codex.md) (H1–H8, M1–M5),
-> the [design discrepancy register](plans/2026-07-09-review-design-discrepancies.md) (D1–D22),
-> and the former "Beyond Phase 11b" backlog (fully absorbed below — the write-up has the
-> item-by-item mapping). Phase 12 already closed `M7`, `M20`, `M21`/codex-`M2`, and the
-> batch/build parts of codex `M5`. `X6` (the no-args TUI) stays in Phase 13.
-
-Each item below is one PR-sized theme, tests-first, ordered: cluster correctness →
-security enforcement → correctness under failure → features & docs.
-
-- [ ] **Leader discovery beyond the council** — publish the leader's API/reporting endpoints
-  through a gossip-visible control-plane record; placement reconciler + reporting use it
-  instead of local Raft metrics; 8+ node test through a leader failover (`H1`/`D1`)
-- [ ] **Council self-healing** — leader-safe voter removal/replacement (learner → catch-up →
-  promote → joint-consensus remove); quorum-recovery test with healthy spares (`H2`/`D2`)
-- [ ] **Namespaced global service catalogue** — `ServiceId { namespace, name }` through Onion,
-  DNS, eBPF, Wrapper and firewall; collision-aware VIP allocation; cluster-replicated service
-  endpoints feeding local read caches; cross-node resolve/ingress test
-  (`H3`/codex-`M1`/`D3`/`D5`/`D7`-routes, backlog `M5`/`M6`)
-- [ ] **Deployment controller correctness** — terminal deploy outcomes reconciled against
-  `Supervisor` state (not applied-on-send), retry with backoff, failure reporting to the
-  leader; move deploy I/O off the agent event loop (`H7`/`D10`, codex-`M3`)
-- [ ] **AuthZ enforcement & bootstrap lockdown** — scope checks in reusable extractors
-  (namespace/app-scoped tokens actually constrain); refuse non-loopback API binds until
-  bootstrap completes; scoped-token integration tests (`H4`/`D8`, part of `H5`)
-- [~] **Transport security** — mTLS on Raft, reporting and API listeners; registry auth/TLS;
-  CRL/expiry checks at connect time (`H5`/`D4`, `C5(b)`, `L17` — the Stage 3b deferrals).
-  **Mostly done** (Jul 2026, 9 commits): node identity persisted (`sesame::identity_store`,
-  written by `relish init`, delivered to joiners via a `JoinBundle` with TOFU fingerprint);
-  handshake-true mTLS configs with Node-CA-pinned client verifier (PKI2) + live `CrlHandle`;
-  **mTLS on Raft RPC, reporting and the agent API** (API optional client auth so relish/browsers
-  use bearer/cookie over TLS; peer calls via a shared `ClusterHttp`); `[security] require_mtls`
-  mode matrix; `relish --ca-cert`. `L17` CRL enforced in `verify_keyless` (image signatures).
-  **Remaining:** Pickle registry auth/TLS (separate listener/theme); connection-time cert-expiry
-  checks; per-node-id binding on peer certs (PKI3). Design plan in the session plan file.
-- [~] **Dashboard security boundary** — authenticate Brioche or make it an explicitly redacted
-  status surface; never render plain env values; browser token flow for logs/metrics panels;
-  real node-detail data (`H6`/`D19`). **Mostly done** (Jul 2026): read-only session cookies
-  (`sesame::session`, `POST /ui/session` → HttpOnly/SameSite=Strict; a session is always
-  ReadOnly even for an admin token); `/` + `/ui/*` moved behind auth with a login page; browser
-  cookie flow covers HTMX fragments + metrics + SSE logs; encrypted env values already masked.
-  **Remaining:** replace hard-coded node-detail data with authoritative values; env-value XSS
-  in single-quoted chart attrs (AUTH8).
-- [ ] **Process-workload policy enforcement** — pass the configured `[process_workloads]`
-  policy into the supervisor; enforce allowlist + `mount_isolation` before OCI spec
-  generation (`H8`/`D17`, backlog `M23`)
-- [ ] **Observability storage engine** — DataFusion Parquet tables with predicate pushdown +
-  bounded recent buffer; `spawn_blocking` for flushes and Pickle blob hashing; cross-node
-  dedup (codex-`M4`/`D13`, backlog `M3`/`M4`)
-- [ ] **Observability & CLI small fixes** — Slack/PagerDuty webhook payload formats (`M19`),
-  `KetchupStore::today()` month-13 fix (`M24`), `relish logs-export` via the agent (`X8`)
-- [ ] **GitOps atomicity** — don't advance the commit marker on partial apply; handle or
-  explicitly reject jobs/namespaces/permissions; machine-readable partial results (`D12`)
-- [ ] **Pickle durability semantics** — synchronous catalogue-commit + peer-ack on push, or an
-  explicit "locally accepted, replication pending" status (`D11`)
-- [ ] **Feature completeness or explicit re-scope** — GPU detector (`D15`), Apple adoption,
-  CIDR egress, rootless resource limits (`M22`): implement each or document it as
-  unsupported next to the feature claim
-- [ ] **Recovery story** — full-council-loss recovery, backups, disk-pressure council
-  resignation: implement or downgrade whitepaper §8.2–8.3 to a labelled proposal (`D21`)
-- [ ] **Docs truth pass** — replace superseded designs (in-kernel DNS, containerd, bincode,
-  old upgrade sequence: `D6`/`D20`/`D22`); qualify deferred features in whitepaper/README
-  (`D14`/`D15`/`D18`/`D21`); "implemented as of" markers per design chapter
-- [ ] **Low-findings sweep** — the ~24 Lows from the [2 July review §Low](plans/2026-07-02-review-codebase.md)
-  as one batch PR, each fix with a test
-
 ## Phase 12: Optimisations
 
 > Detailed implementation plan: [2026-07-06-plan-optimisations.md](plans/2026-07-06-plan-optimisations.md)
@@ -431,6 +367,184 @@ security enforcement → correctness under failure → features & docs.
 - [x] Book chapter 12: "Squeezing Every Drop" — complete: logs (zstd + bloom), nftables maps + the wiring discovery, the as-shipped Raft catalog/GC/heal design (M2 TOCTOU), P2P planner + executor, pull-through cache, volumes/quotas/snapshots/scheduled backups, batch + build, and phase-wide lessons
 - [x] All Phase 12 tests green — 1,981 on macOS (`make ci`) + the full Lima gated run (`relish dev test`: netns map DNAT + 1000-port stress, btrfs quota ENOSPC, snapshot create/corrupt/restore, real buildah build into the catalog, plus the existing runc/eBPF suites). Remaining acceptance: the live 3-node runbook in [the plan §10](plans/2026-07-06-plan-optimisations.md)
 
+## Phase 12b: Correctness, Security & Convergence
+
+> Consolidated review: [2026-07-10-review-past-phase-12.md](plans/2026-07-10-review-past-phase-12.md).
+> It reconciles the renamed [code walkthrough](plans/2026-07-09-review-codex.md),
+> [design discrepancy register](plans/2026-07-09-review-design-discrepancies.md),
+> the former "Beyond Phase 11b" backlog and the 24 Low findings. M7 and M21/codex-M2
+> are fixed. M20 is still open: object-store features are compiled, but Ketchup export
+> still uses PathBuf plus std::fs::copy. X6 remains only in Phase 13.
+
+Every top-level checkbox below is one PR-sized theme. Write the binary-driven
+acceptance test first, update the relevant book chapter in the same PR, and check
+the theme only after default and platform-gated tests pass.
+
+### 12b.1 — Stop the bleeding
+
+- [ ] **Internal API trust boundary** — central route/role/scope matrix; require node
+  identity for batch/build run and report endpoints; make callback and registry
+  destinations server-owned; never forward the service token to request data; strictly
+  parse build digests/Dockerfile paths and bound, sandbox and clean archive extraction.
+  Reject anonymous and ReadOnly execution, callback SSRF, path traversal, sparse/oversized
+  contexts and a Buildah process that survives timeout (new JOB1-JOB2, H4/D8).
+- [ ] **Secret and workload-identity safety** — make rotation generation-aware:
+  encrypt with the newest key, decrypt with active generations, re-encrypt and acknowledge
+  every stored secret before retiring the old key, and reject malformed/concurrent
+  rotations. Issue exact validity windows, rebuild SANs server-side, store identity in
+  per-instance tmpfs, preserve it through rolling/adoption and clean it on removal
+  (new PKI6-PKI8, D9).
+- [ ] **Pickle reference integrity** — include raw manifest/index blobs in holder,
+  replication and GC reachability; validate JSON, media types, descriptor digest/size and
+  referenced blob existence before returning Created; use canonical repository identity
+  and immutable digests through policy, scheduling and runtime pull. Test
+  push → GC → peer pull and reject the existing missing-layer Created behaviour
+  (new REG1/REG3/IMG1, old Low manifest check).
+- [ ] **Network policy enforcement** — write namespace/cgroup firewall maps for every
+  instance; program egress before process start and on rolling deploy; fail deployment
+  closed when required policy cannot be installed; reconcile kernel truth and delete every
+  per-cgroup entry. Add IPv6/connect6 and CIDR enforcement, safe nftables input, required-map
+  validation and IPv4/IPv6 perimeter rules with timeouts (new NET5-NET8, D5, old BPF/nft Lows).
+- [ ] **Consensus persistence safety** — version and checksum snapshots, validate the
+  snapshot/log boundary, propagate vote/log/initialisation errors and refuse startup when
+  compacted state cannot be reconstructed. Test compact → corrupt → restart returns an
+  error instead of an empty cluster state (new CP3).
+
+### 12b.2 — Make the cluster converge
+
+- [ ] **Control-plane directory and reporting robustness** — publish authenticated leader
+  API/reporting endpoints to every gossip member; make non-voters follow leader failover;
+  replace weak/version-dependent node and parent hashes; evict departed/stale nodes; filter
+  terminal workloads from running/capacity; stop closed-channel spins and supervise
+  long-lived task failures. Acceptance: an 8+ node cluster reconciles and reports through
+  leader failover (H1/D1, CP1/CP5/CP6/CP10).
+- [ ] **Council membership self-healing** — add replacement as learner, wait for catch-up,
+  promote, transfer/avoid leadership as needed and remove the dead or unsuitable voter via
+  joint consensus. Prove quorum recovers with healthy spares and never removes the active
+  leader mid-change (H2/D2).
+- [ ] **Council disaster recovery** — implement full-council-loss recovery, encrypted
+  external backup/restore, explicit reconstruction thresholds and disk-pressure council
+  resignation. Exercise black-box loss/recovery rather than only candidate-selection helpers
+  (D21/CP12).
+- [ ] **Scheduler truth, labels, quotas and autoscaling** — advertise authenticated node
+  labels/resources; use one mutable reservation cache per planning pass; revalidate
+  generation, resources, labels, readiness and cordon; converge daemon workloads against
+  eligible nodes; wire namespace quotas. Validate autoscale bounds/durations, use structured
+  namespace/app metrics and configured windows, commit before cooldown and clear stale
+  overrides. Reject numeric overflow (CP7-CP8, DEP8-DEP9, D13).
+- [ ] **Transactional desired state and deployment** — make instance identity include
+  namespace/generation/ordinal; apply AppDelete through Raft on cluster stop; consume
+  count/generation-aware reconstruction corrections; wait for terminal deploy/stop outcome,
+  retry/reschedule failures and rebuild applied state after restart. Move image/init/runtime/
+  health waits outside Bun's command loop and honour surge, unavailable, drain and rollback
+  semantics (H7/D10, DEP1-DEP6, codex-M3).
+- [ ] **Complete declarative resources** — validate and apply apps, jobs, builds, namespaces
+  and permissions through the same local/Raft/GitOps path; enforce namespace and permission
+  resources plus build scope; reject or remove every parsed field that cannot affect the
+  binary. Acceptance: one configuration containing every resource kind converges identically
+  through manual apply and GitOps (DEP7/D12).
+- [ ] **Durable batch and build execution** — use one authoritative namespace; persist
+  monotonic IDs, trackers and terminal state; include unschedulable jobs; bound and retry
+  dispatch/callbacks; make duplicate reports idempotent and run GC. Transfer build context
+  to the chosen builder, derive registry endpoints from node config, isolate/clean tempdirs,
+  bound CLI polling, retry another builder and make required signing part of terminal
+  success. Test leader restart, lost callback and delegation from a non-builder entry node
+  (D18, JOB3-JOB7, old batch-order Low).
+
+### 12b.3 — Secure every boundary
+
+- [ ] **API authorisation and Brioche** — enforce app/namespace scopes in reusable
+  extractors; cover every mutation endpoint; refuse unsafe non-loopback bootstrap; replace
+  the shared cluster-Admin service token with route-limited per-node capabilities; index and
+  verify one Argon2 token in spawn_blocking under a concurrency bound; use real dashboard/node
+  state and escape each HTML/attribute context including apostrophes (H4, D8, AUTH1-AUTH5, AUTH7-AUTH8).
+  - [x] Authenticated read-only browser sessions + `/`+`/ui/*` route lockdown; env values
+    masked (Stage 5, PR #77 — closes H6/AUTH6).
+  - [ ] Scope enforcement (AUTH1/H4), fail-closed bootstrap / non-loopback refusal (AUTH3),
+    per-node internal capabilities vs the shared Admin service token (AUTH2/AUTH4),
+    off-lock bounded Argon2 (AUTH5), real dashboard data (AUTH7), attribute-context XSS (AUTH8).
+- [ ] **Node PKI, join and mTLS** — the listener/identity half landed with Stage 5; what
+  remains is the join hardening, peer binding and registry security below.
+  - [x] Persist the bootstrap node leaf/key/Node CA/root CA + config paths; deliver a bundle
+    to joiners with TOFU fingerprint (Stage 5 — PKI1).
+  - [x] Handshake-true, CRL-aware mTLS builders with live-update tests, Node-CA-pinned client
+    verifier, and **mTLS wired onto the Raft, reporting and agent-API listeners** behind the
+    `require_mtls` mode matrix (Stage 5 — PKI1/PKI2, C5(b) listeners, L17 peer-CRL refresh).
+  - [ ] CSR-based, atomic compare-consume-and-serial join keeping the key on the joiner
+    (PKI4/PKI5); expected-peer node-id binding (PKI3); secure temp-file modes + transactional
+    bundle install/validation (PKI9); per-connection handshake/read deadlines + frame bounds
+    (CP11); registry auth/TLS + connection semaphores (moves to "Pickle storage" theme).
+- [ ] **Image trust policy** — distribute authoritative trust state to workers and
+  standalone mode and fail closed; validate every intermediate, time, revocation, EKU,
+  issuer and SPIFFE/OIDC identity; enforce issuer/audience/algorithm/kid; use a persistent
+  configured or workload key for build signing and require the signature write to apply.
+  Use constant-time join-token comparison (IMG1-IMG3, PKI10, old keyless/OIDC Lows).
+
+### 12b.4 — Finish the data plane
+
+- [ ] **Global namespaced service catalogue and DNS** — introduce ServiceId { namespace,
+  name } through Onion, DNS, eBPF, Wrapper, firewall and APIs; replicate healthy endpoints;
+  allocate VIP/container IPs with collision, exhaustion and release handling; bind DNS on
+  a container-reachable address and fail startup/deploy if unavailable. Add DNS TCP and
+  source ACLs, and either provide a portable non-eBPF VIP path or reject that configuration
+  up front (H3/codex-M1, D3/D5/D6/D7-routes, old M5/M6).
+- [ ] **Ingress transport and draining** — carry per-route TLS mode into routing; implement
+  ACME/cluster-CA or the documented explicit certificate contract; redirect HTTP except
+  challenges; stream request/response bodies with limits/backpressure; hold connection
+  permits through TLS/WebSocket lifetime; add handshake/idle timeouts. Replace untrusted
+  forwarded headers, use boundary-correct deterministic route/rate keys, parse IPv6 Host
+  correctly and wire deployment draining (D7/D10, ING1-ING5).
+- [ ] **Pickle storage and replication durability** — stream/hash off the async runtime;
+  add authenticated principal/repository quotas and upload expiry; write unique temp files,
+  fsync and rename; reverify cache and isolate immutable rootfs generations; constrain
+  redirects to same-origin relative paths and bound peer reads. Recheck references at
+  deletion, report degraded redundancy honestly, define acknowledged push semantics and
+  support multi-segment repositories (D11, REG2/REG4-REG8, old cache/upload Lows).
+
+### 12b.5 — Make automation and observability truthful
+
+- [ ] **Metrics, logs and object storage** — parameterise every DataFusion query; add
+  typed/bounded raw-log access; push predicates into Parquet and move flush/compaction off
+  async locks. Persist/prune epoch-aligned idempotent rollups; collect per-app/scraped
+  metrics; distinguish stale telemetry in alerts; URL-encode fan-out and return partial
+  failures; deduplicate by stable node/instance/event identity. Implement real S3/GCS log
+  export, one Bun-owned checkpoint, durable object IDs, provider webhook payloads and final
+  shutdown flush; remove/consolidate legacy Ketchup calendar/config (codex-M4/D13,
+  old M3/M4/M19/M20/M24/X8, OBS1-OBS8).
+- [ ] **GitOps convergence and webhook security** — expose a signature-validated HMAC
+  webhook route with replay/rate controls; make diff namespace-aware and deterministic;
+  apply every resource through the unified desired-state path; never advance last_applied
+  after skip, partial result or failed write; keep jobs stable. Verify reused clone
+  remote/branch, terminate Git options safely and wire coordinator/backoff semantics
+  (D12, GIT1-GIT4, old Git/Jobs Lows).
+
+### 12b.6 — Platform, upgrades and documentation
+
+- [ ] **Process workloads and platform capabilities** — pass [process_workloads] into the
+  supervisor; default-deny host exec/script; enforce executable allowlists and mount
+  isolation before runtime creation. Implement or explicitly reject rootless networking/
+  resource limits, GPU detection/device isolation and unsupported Apple/runtime adoption;
+  make gpu_enabled effective (H8/D15/D17, old M22/M23).
+- [ ] **Smoker effects and cleanup** — stop returning success for no-op memory, disk,
+  drain and node-kill faults; apply CPU stress to the target workload cgroup; make every
+  persistent effect reversible on clear/expiry, including pause/resume. Acceptance measures
+  each advertised effect and its removal (CHAOS1).
+- [ ] **Self-upgrade convergence and adoption** — wire scheduler cordon; calculate quorum
+  headroom from live voters; derive roles/addresses server-side; prove gossip rejoin and
+  finish Apple/rootless adoption. Make progress/book describe the implemented in-place or
+  leadership-transfer sequence consistently (D20, UPG1-UPG2).
+- [ ] **Documentation and book truth pass** — correct userspace DNS, Grill/container
+  runtime, JSON compatibility, ingress topology, security and upgrade prose; remove
+  contradictory historical designs; qualify TUI, GPU, scale, automatic TLS and recovery
+  until acceptance tests exist. Reconcile stale earlier progress annotations and test
+  counts. X6 stays in Phase 13 (D6/D14-D15/D18/D20-D22).
+- [ ] **Phase 12b acceptance gate** — cargo fmt; clippy with warnings denied; complete
+  default suite; 8+ node/leader-failover and council-recovery tests; Linux eBPF/runc/Btrfs/
+  rootless/Buildah suites; macOS Apple runtime suite; real mTLS/auth matrix; registry
+  push-GC-peer-pull; GitOps partial failure; Smoker effect/clear; upgrade failed-voter/
+  rejoin/adoption tests. Record exact counts and platform skips in README, docs/README and
+  the relevant book chapters.
+
 ## Phase 13: Relish TUI
 
 Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
@@ -445,7 +559,7 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 > Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](plans/2026-07-06-plan-self-upgrade.md)
 > (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
 
-- [x] Rolling binary replacement (exec-in-place; workers → council → leadership transfer → former leader; state in Raft; `relish upgrade` command set)
+- [x] Rolling binary replacement (exec-in-place; workers → council → leader-last; state in Raft; `relish upgrade` command set) — **post-Phase-12 audit: production does not perform the leadership-transfer sequence previously claimed; cordon, live-quorum headroom and gossip-rejoin verification remain Phase 12b**
 - [x] Dual-signature verification (embedded Ed25519 release key set + external operator key from node.toml; air-gapped `--binary` needs embedded only)
 - [x] Automatic rollback on failure (crash-loop boot budget reverts the symlink; nodes refuse previously-reverted upgrade ids; leader pauses the run; `upgrade resume` retries with a fresh id)
 - [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
