@@ -106,6 +106,39 @@ async fn submit_without_any_builder_is_503() {
     assert_eq!(response.status().as_u16(), 503);
 }
 
+/// JOB2: `/v1/build/run` (the peer-delegation path) rejects a context digest
+/// that isn't a well-formed OCI digest — before the buildah check and before
+/// the digest is ever turned into a temp path. `sha256:../../x` must not be
+/// able to escape the build sandbox.
+#[tokio::test]
+async fn build_run_rejects_a_traversal_context_digest() {
+    let harness = Harness::start().await;
+
+    for bad in [
+        "sha256:../../etc/passwd",
+        "sha256:../evil",
+        "not-a-digest",
+        "sha256:short",
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/build/run", harness.base_url))
+            .json(&serde_json::json!({
+                "name": "app",
+                "context_digest": bad,
+                "registry_port": 5050,
+                "spec": { "context": ".", "destination": "pickle://app:v1" },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "digest {bad:?} should be rejected with 400"
+        );
+    }
+}
+
 /// Unknown build ids are 404, not empty objects.
 #[tokio::test]
 async fn unknown_build_id_is_404() {

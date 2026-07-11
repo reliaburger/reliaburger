@@ -327,6 +327,17 @@ pub async fn build_run_handler(
     State(state): State<ApiState>,
     Json(request): Json<BuildSubmitRequest>,
 ) -> Response {
+    // Reject a malformed context digest before anything else (JOB2). This
+    // endpoint is reached by a delegating peer, so the digest is untrusted
+    // and is later used to build a temp path; `Digest::new` allows only
+    // `sha256:` + 64 hex, which cannot contain `.`/`/`.
+    if let Err(e) = crate::pickle::types::Digest::new(&request.context_digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid context digest: {e}") })),
+        )
+            .into_response();
+    }
     if !local_buildah_available().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -341,6 +352,20 @@ pub async fn build_run_handler(
 
 /// Register + spawn a local build; answer 202 with the id.
 async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response {
+    // Validate the context digest before it is ever used to build a path
+    // (JOB2): `context_digest` reaches `run_build` from a peer over
+    // `/v1/build/run` and is interpolated into a temp directory. A digest
+    // like `sha256:../../x` would escape the build sandbox and the tar
+    // unpack would run as a privileged process. `Digest::new` enforces
+    // `sha256:` + 64 hex, so `.`/`/` can never appear.
+    if let Err(e) = crate::pickle::types::Digest::new(&request.context_digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("invalid context digest: {e}") })),
+        )
+            .into_response();
+    }
+
     let build_id = state
         .build_registry
         .lock()
