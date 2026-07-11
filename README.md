@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (2033 and counting)
+make test                    # run all tests (2073 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -108,7 +108,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**2,033 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. See [progress.md](docs/progress.md) for the full checklist.
+**2,073 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
