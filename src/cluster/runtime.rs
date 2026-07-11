@@ -97,6 +97,56 @@ pub struct ClusterParams {
     pub identity: Option<Arc<crate::sesame::identity_store::NodeIdentity>>,
 }
 
+/// Open and validate the durable Raft stores under `raft_dir`.
+///
+/// This is the startup gate for consensus persistence (CP3). Everything
+/// suspicious is fatal here, before Raft starts: an unreadable log store is
+/// an error rather than "fresh" (re-bootstrapping would split-brain), a
+/// present snapshot must pass its checksum and version check, and the
+/// snapshot must cover everything the log has purged. Returns the log store,
+/// whether the durable store is genuinely fresh (drives the bootstrap
+/// guard), and the loaded state machine.
+pub async fn open_raft_storage(
+    raft_dir: &std::path::Path,
+) -> std::io::Result<(
+    crate::council::durable_log::DurableLogStore,
+    bool,
+    CouncilStateMachine,
+)> {
+    std::fs::create_dir_all(raft_dir)?;
+    let log_path = raft_dir.join("log.redb");
+    let log_store = crate::council::durable_log::DurableLogStore::open(&log_path)
+        .map_err(|e| std::io::Error::other(format!("raft log store open failed: {e}")))?;
+    let store_fresh = log_store.is_fresh().map_err(|e| {
+        std::io::Error::other(format!(
+            "raft log store at {} is unreadable, refusing to treat it as fresh: {e}",
+            log_path.display()
+        ))
+    })?;
+    let snapshot_path = raft_dir.join("snapshot.redb");
+    let snapshot_db = Arc::new(redb::Database::create(&snapshot_path).map_err(|e| {
+        std::io::Error::other(format!(
+            "raft snapshot store open failed at {}: {e}",
+            snapshot_path.display()
+        ))
+    })?);
+    let state_machine = CouncilStateMachine::with_store(snapshot_db).map_err(|e| {
+        std::io::Error::other(format!(
+            "raft snapshot store load failed at {}: {e}",
+            snapshot_path.display()
+        ))
+    })?;
+    crate::council::validate_purge_boundary(&log_store, &state_machine)
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "raft storage validation failed at {}: {e}",
+                raft_dir.display()
+            ))
+        })?;
+    Ok((log_store, store_fresh, state_machine))
+}
+
 /// Start gossip + the Raft council and return a `ClusterHandle` plus a
 /// `ClusterRuntime` holding resources that must stay alive.
 pub async fn start(
@@ -150,21 +200,9 @@ pub async fn start(
     // Durable Raft storage: the log/vote (log.redb) and the state-machine
     // snapshot (snapshot.redb) live under {data_dir}/raft/ so the node
     // remembers its vote/log across restarts (Raft safety) instead of forming a
-    // fresh cluster.
+    // fresh cluster. `store_fresh` drives the bootstrap guard below.
     let raft_dir = params.data_dir.join("raft");
-    std::fs::create_dir_all(&raft_dir)?;
-    let log_store =
-        crate::council::durable_log::DurableLogStore::open(raft_dir.join("log.redb"))
-            .map_err(|e| std::io::Error::other(format!("raft log store open failed: {e}")))?;
-    // Whether this node has never persisted any Raft state — drives the
-    // bootstrap guard below.
-    let store_fresh = log_store.is_fresh().await;
-    let snapshot_db = Arc::new(
-        redb::Database::create(raft_dir.join("snapshot.redb"))
-            .map_err(|e| std::io::Error::other(format!("raft snapshot store open failed: {e}")))?,
-    );
-    let state_machine = CouncilStateMachine::with_store(snapshot_db)
-        .map_err(|e| std::io::Error::other(format!("raft snapshot store load failed: {e}")))?;
+    let (log_store, store_fresh, state_machine) = open_raft_storage(&raft_dir).await?;
 
     // Build the shared CRL handle (seeded from the bootstrap security state
     // if present) and, when this node has an identity, the mTLS acceptor and

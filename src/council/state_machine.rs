@@ -11,16 +11,67 @@ use openraft::{
     EntryPayload, LogId, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError,
     StoredMembership,
 };
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use super::types::{CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig};
 
 /// Persisted snapshot: `data` = JSON of `DesiredState` (which itself carries
-/// `last_applied_log` + `last_membership`), `index` = snapshot counter.
+/// `last_applied_log` + `last_membership`), `index` = snapshot counter,
+/// `version` = on-disk format version, `checksum` = SHA-256 of `data`.
+/// All four keys are written in one transaction, so they are always coherent.
 const SNAPSHOT: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_snapshot");
 const SNAP_DATA_KEY: &str = "data";
 const SNAP_INDEX_KEY: &str = "index";
+const SNAP_VERSION_KEY: &str = "version";
+const SNAP_CHECKSUM_KEY: &str = "checksum";
+
+/// Snapshot format version this binary writes. Bump it when the persisted
+/// layout changes incompatibly; loading rejects versions it doesn't know.
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Errors opening or validating the persisted snapshot store.
+///
+/// Every variant is startup-fatal: after log compaction the snapshot is the
+/// only copy of the covered log prefix, so a snapshot that cannot be trusted
+/// must refuse startup instead of booting an empty cluster state (CP3).
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotStoreError {
+    #[error(transparent)]
+    Transaction(#[from] redb::TransactionError),
+    #[error(transparent)]
+    Table(#[from] redb::TableError),
+    #[error(transparent)]
+    Storage(#[from] redb::StorageError),
+    #[error(transparent)]
+    Commit(#[from] redb::CommitError),
+    #[error("snapshot payload failed checksum verification: stored {stored}, computed {computed}")]
+    ChecksumMismatch { stored: String, computed: String },
+    #[error("snapshot records format version {version} but no checksum")]
+    MissingChecksum { version: u32 },
+    #[error(
+        "snapshot format version {found} is not supported (this binary supports up to {supported})"
+    )]
+    UnsupportedVersion { found: u32, supported: u32 },
+    #[error("snapshot version marker is malformed: expected 4 bytes, found {found}")]
+    MalformedVersion { found: usize },
+    #[error("snapshot present but failed to decode: {0}")]
+    Decode(#[from] serde_json::Error),
+    #[error(
+        "raft log purged up to index {purged_index} but no snapshot exists to cover it; compacted state cannot be reconstructed"
+    )]
+    PurgedWithoutSnapshot { purged_index: u64 },
+    #[error(
+        "raft log purged up to index {purged_index} but the snapshot only covers up to index {snapshot_index}; compacted state cannot be reconstructed"
+    )]
+    PurgedBeyondSnapshot {
+        purged_index: u64,
+        snapshot_index: u64,
+    },
+    #[error("raft log store read failed: {0}")]
+    LogRead(#[from] StorageError<u64>),
+}
 
 // ---------------------------------------------------------------------------
 // Inner state
@@ -48,17 +99,76 @@ impl std::fmt::Debug for StateMachineInner {
     }
 }
 
-/// Write the latest snapshot (data + index) to redb, fsyncing on commit.
+/// Write the latest snapshot (data + index + version + checksum) to redb,
+/// fsyncing on commit. A legacy (pre-envelope) store is upgraded in place:
+/// the version and checksum keys land in the same write transaction as the
+/// payload they describe.
 // `redb::Error` is large but dictated by the crate; boxing it here buys nothing.
 #[allow(clippy::result_large_err)]
 fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::Error> {
+    let checksum = snapshot_checksum(data);
     let wtx = db.begin_write()?;
     {
         let mut t = wtx.open_table(SNAPSHOT)?;
         t.insert(SNAP_DATA_KEY, data)?;
         t.insert(SNAP_INDEX_KEY, index.to_le_bytes().as_slice())?;
+        t.insert(
+            SNAP_VERSION_KEY,
+            SNAPSHOT_FORMAT_VERSION.to_le_bytes().as_slice(),
+        )?;
+        t.insert(SNAP_CHECKSUM_KEY, checksum.as_slice())?;
     }
     wtx.commit()?;
+    Ok(())
+}
+
+/// SHA-256 of the snapshot payload bytes.
+fn snapshot_checksum(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Read the stored format version, `None` for a legacy pre-envelope store.
+// `SnapshotStoreError` is large but dictated by the errors it wraps.
+#[allow(clippy::result_large_err)]
+fn read_snapshot_version(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<Option<u32>, SnapshotStoreError> {
+    match table.get(SNAP_VERSION_KEY)? {
+        Some(guard) => {
+            let bytes = guard.value().to_vec();
+            let bytes: [u8; 4] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| SnapshotStoreError::MalformedVersion { found: bytes.len() })?;
+            Ok(Some(u32::from_le_bytes(bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Verify the stored checksum matches the payload bytes.
+// `SnapshotStoreError` is large but dictated by the errors it wraps.
+#[allow(clippy::result_large_err)]
+fn verify_snapshot_checksum(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    payload: &[u8],
+) -> Result<(), SnapshotStoreError> {
+    let stored = table
+        .get(SNAP_CHECKSUM_KEY)?
+        .ok_or(SnapshotStoreError::MissingChecksum {
+            version: SNAPSHOT_FORMAT_VERSION,
+        })?
+        .value()
+        .to_vec();
+    let computed = snapshot_checksum(payload);
+    if stored != computed {
+        return Err(SnapshotStoreError::ChecksumMismatch {
+            stored: hex::encode(stored),
+            computed: hex::encode(computed),
+        });
+    }
     Ok(())
 }
 
@@ -278,8 +388,12 @@ impl CouncilStateMachine {
     ///
     /// On restart the loaded snapshot restores the applied state up to its
     /// boundary; openraft then replays the durable log's post-snapshot tail.
+    /// A snapshot that exists but fails its checksum, carries an unknown
+    /// format version, or won't decode is a hard error, never an empty state.
+    // `SnapshotStoreError` is large but dictated by the redb/openraft errors
+    // it wraps; boxing it here buys nothing.
     #[allow(clippy::result_large_err)]
-    pub fn with_store(db: Arc<Database>) -> Result<Self, redb::Error> {
+    pub fn with_store(db: Arc<Database>) -> Result<Self, SnapshotStoreError> {
         // Materialise the table so reads on a fresh store don't error.
         let wtx = db.begin_write()?;
         {
@@ -293,25 +407,35 @@ impl CouncilStateMachine {
             let t = rtx.open_table(SNAPSHOT)?;
             if let Some(data) = t.get(SNAP_DATA_KEY)? {
                 let bytes = data.value().to_vec();
+                match read_snapshot_version(&t)? {
+                    // Legacy pre-envelope snapshot: no version, no checksum.
+                    // Load it as before; the next persist rewrites it in the
+                    // enveloped format (version + checksum, one transaction).
+                    None => eprintln!(
+                        "council: snapshot has no version/checksum envelope (pre-12b format); \
+                         loading as legacy, it will be rewritten on the next snapshot"
+                    ),
+                    Some(SNAPSHOT_FORMAT_VERSION) => verify_snapshot_checksum(&t, &bytes)?,
+                    Some(found) => {
+                        return Err(SnapshotStoreError::UnsupportedVersion {
+                            found,
+                            supported: SNAPSHOT_FORMAT_VERSION,
+                        });
+                    }
+                }
                 // A snapshot blob that EXISTS but won't decode is corruption,
                 // not absence. Fail closed (CP3): after log compaction the
                 // entries this snapshot covers are gone, so silently booting an
                 // empty state here would destroy the cluster's desired and
                 // security state (app specs, CA material, tokens). Refuse to
                 // start so an operator can restore from backup instead.
-                let state = serde_json::from_slice::<DesiredState>(&bytes).map_err(|e| {
-                    redb::StorageError::Corrupted(format!(
-                        "council snapshot present but failed to decode: {e}"
-                    ))
-                })?;
-                inner.state = state;
+                inner.state = serde_json::from_slice::<DesiredState>(&bytes)?;
                 inner.snapshot_data = Some(bytes);
             }
-            if let Some(idx) = t.get(SNAP_INDEX_KEY)? {
-                let v = idx.value();
-                if v.len() == 8 {
-                    inner.snapshot_index = u64::from_le_bytes(v.try_into().unwrap());
-                }
+            if let Some(idx) = t.get(SNAP_INDEX_KEY)?
+                && let Ok(le) = <[u8; 8]>::try_from(idx.value())
+            {
+                inner.snapshot_index = u64::from_le_bytes(le);
             }
         }
         inner.db = Some(db);
@@ -323,6 +447,19 @@ impl CouncilStateMachine {
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
         self.inner.read().await.state.clone()
+    }
+
+    /// Log id the loaded snapshot covers up to, `None` when no snapshot is
+    /// loaded. Only meaningful straight after `with_store`, before Raft
+    /// applies new entries; `council::validate_purge_boundary` reads it at
+    /// startup to check the snapshot still covers the purged log prefix.
+    pub async fn snapshot_last_applied(&self) -> Option<LogId<u64>> {
+        let guard = self.inner.read().await;
+        if guard.snapshot_data.is_some() {
+            guard.state.last_applied_log
+        } else {
+            None
+        }
     }
 }
 
@@ -574,6 +711,189 @@ mod tests {
         let db = std::sync::Arc::new(Database::create(dir.path().join("fresh.redb")).unwrap());
         let sm = CouncilStateMachine::with_store(db).expect("fresh store opens");
         assert!(sm.desired_state().await.apps.is_empty());
+    }
+
+    /// Persist a small known state to `path` via the real snapshot path,
+    /// returning the app id it contains. Everything is dropped before
+    /// returning so the caller can reopen (or tamper with) the store.
+    async fn persist_known_snapshot(path: &std::path::Path) -> AppId {
+        let app_id = AppId::new("web", "prod");
+        let db = std::sync::Arc::new(Database::create(path).unwrap());
+        let mut sm = CouncilStateMachine::with_store(db).unwrap();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::AppSpec {
+                app_id: app_id.clone(),
+                spec: Box::new(default_spec()),
+            },
+        )])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+        app_id
+    }
+
+    /// Flip one byte in the middle of the stored value under `key`.
+    fn flip_stored_byte(path: &std::path::Path, key: &str) {
+        let db = Database::create(path).unwrap();
+        let wtx = db.begin_write().unwrap();
+        {
+            let mut t = wtx.open_table(SNAPSHOT).unwrap();
+            let mut bytes = {
+                let guard = t.get(key).unwrap().unwrap();
+                guard.value().to_vec()
+            };
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0x01;
+            t.insert(key, bytes.as_slice()).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_snapshot_carries_version_and_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("envelope.redb");
+        persist_known_snapshot(&path).await;
+
+        let db = Database::create(&path).unwrap();
+        let rtx = db.begin_read().unwrap();
+        let t = rtx.open_table(SNAPSHOT).unwrap();
+        let version = t.get(SNAP_VERSION_KEY).unwrap().unwrap().value().to_vec();
+        assert_eq!(
+            version,
+            SNAPSHOT_FORMAT_VERSION.to_le_bytes().to_vec(),
+            "the persisted snapshot records the format version"
+        );
+        assert!(
+            t.get(SNAP_CHECKSUM_KEY).unwrap().is_some(),
+            "the persisted snapshot records a payload checksum"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_store_fails_closed_on_a_flipped_payload_byte() {
+        // Bit-rot in the payload: whether or not the damaged bytes still
+        // parse as JSON, the checksum must catch it and refuse startup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bitrot.redb");
+        persist_known_snapshot(&path).await;
+        flip_stored_byte(&path, SNAP_DATA_KEY);
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let err = CouncilStateMachine::with_store(db).unwrap_err();
+        assert!(
+            matches!(err, SnapshotStoreError::ChecksumMismatch { .. }),
+            "expected a checksum mismatch, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_store_fails_closed_on_a_flipped_checksum_byte() {
+        // Same failure mode when the rot lands in the checksum itself.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sumrot.redb");
+        persist_known_snapshot(&path).await;
+        flip_stored_byte(&path, SNAP_CHECKSUM_KEY);
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let err = CouncilStateMachine::with_store(db).unwrap_err();
+        assert!(
+            matches!(err, SnapshotStoreError::ChecksumMismatch { .. }),
+            "expected a checksum mismatch, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_store_rejects_an_unknown_snapshot_version() {
+        // A snapshot written by a future binary must refuse to load rather
+        // than be misinterpreted by this one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.redb");
+        persist_known_snapshot(&path).await;
+        {
+            let db = Database::create(&path).unwrap();
+            let wtx = db.begin_write().unwrap();
+            {
+                let mut t = wtx.open_table(SNAPSHOT).unwrap();
+                t.insert(SNAP_VERSION_KEY, 99u32.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let err = CouncilStateMachine::with_store(db).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SnapshotStoreError::UnsupportedVersion {
+                    found: 99,
+                    supported: SNAPSHOT_FORMAT_VERSION
+                }
+            ),
+            "expected an unsupported-version error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_without_envelope_still_loads_and_is_rewritten() {
+        // Fixture: a snapshot exactly as a pre-envelope binary wrote it —
+        // raw `DesiredState` JSON under "data" plus the counter under
+        // "index", no version or checksum keys. Existing dev clusters and
+        // the Lima rigs carry this format; it must keep loading (with a
+        // warning), and the next persist must upgrade it in place.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.redb");
+        let app_id = AppId::new("web", "prod");
+        let mut legacy_state = DesiredState::default();
+        legacy_state.apps.insert(
+            app_id.clone(),
+            AppSpec {
+                image: Some("legacy:v1".to_string()),
+                ..default_spec()
+            },
+        );
+        legacy_state.last_applied_log = Some(log_id(1, 3));
+        let payload = serde_json::to_vec(&legacy_state).unwrap();
+        {
+            let db = Database::create(&path).unwrap();
+            let wtx = db.begin_write().unwrap();
+            {
+                let mut t = wtx.open_table(SNAPSHOT).unwrap();
+                t.insert(SNAP_DATA_KEY, payload.as_slice()).unwrap();
+                t.insert(SNAP_INDEX_KEY, 3u64.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let mut sm = CouncilStateMachine::with_store(db.clone()).expect("legacy snapshot loads");
+        let state = sm.desired_state().await;
+        assert_eq!(
+            state.apps.get(&app_id).unwrap().image,
+            Some("legacy:v1".to_string())
+        );
+        assert_eq!(sm.snapshot_last_applied().await, Some(log_id(1, 3)));
+
+        // The next snapshot persist rewrites the store in the new format.
+        let mut builder = sm.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+        let rtx = db.begin_read().unwrap();
+        let t = rtx.open_table(SNAPSHOT).unwrap();
+        assert!(t.get(SNAP_VERSION_KEY).unwrap().is_some());
+        assert!(t.get(SNAP_CHECKSUM_KEY).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_last_applied_is_none_without_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Database::create(dir.path().join("bare.redb")).unwrap());
+        let sm = CouncilStateMachine::with_store(db).unwrap();
+        assert_eq!(sm.snapshot_last_applied().await, None);
     }
 
     #[test]

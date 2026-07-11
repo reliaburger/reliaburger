@@ -422,13 +422,30 @@ whole theme lands.
     rolling redeploy and crash-restart through one shared `finish_instance_networking` helper,
     failing closed (deny-all) on any programming error, with stop/redeploy deleting the allow
     entries so a recycled cgroup id inherits nothing (NET6).
-- [ ] **Consensus persistence safety** — version and checksum snapshots, validate the
+- [x] **Consensus persistence safety** — version and checksum snapshots, validate the
   snapshot/log boundary, propagate vote/log/initialisation errors and refuse startup when
   compacted state cannot be reconstructed. Test compact → corrupt → restart returns an
   error instead of an empty cluster state (new CP3).
   - [x] A present-but-undecodable Raft snapshot is now a hard startup error instead of a silent
     empty-state boot after log compaction; a genuinely absent snapshot still loads an empty
     default (CP3).
+  - [x] Persisted snapshots carry a versioned envelope: format version + SHA-256 payload
+    checksum written in the same redb transaction as the payload. Load rejects a checksum
+    mismatch (naming both sums) and an unknown version (naming both versions); a pre-envelope
+    legacy snapshot still loads with a warning and is rewritten enveloped on the next persist,
+    pinned by a fixture test (CP3).
+  - [x] Snapshot/log purge-boundary validation at startup (`council::validate_purge_boundary`,
+    called from `cluster::runtime::open_raft_storage` before Raft starts): a log purged past
+    what the snapshot covers — or purged with no snapshot at all — refuses startup with the
+    exact purged/covered indices instead of booting with an unreconstructable gap (CP3).
+  - [x] `DurableLogStore::is_fresh` returns `Result<bool, _>` instead of mapping read errors
+    to "fresh": an unreadable store is fatal at startup, never a re-bootstrap (the C3
+    split-brain through the error path); `truncate`/`purge` propagate row read errors instead
+    of silently skipping keys (CP3).
+  - [x] Acceptance test through the real startup seam (`tests/council_persistence.rs`): a
+    single-node council on durable storage writes state, snapshots, purges the log, then a
+    flipped payload byte or a deleted snapshot makes restart return an error, while a clean
+    compact restores every entry (CP3).
 
 ### 12b.2 — Make the cluster converge
 

@@ -778,6 +778,63 @@ pub struct DesiredState {
 
 The `'de` lifetime on the deserialise function is serde's way of tracking the lifetime of the input data. If you're deserialising from a borrowed `&str`, the `K` and `V` types could borrow from that string (if they contain `&str` fields). The `'de` lifetime makes this safe. Our types all own their data (they use `String`, not `&str`), so the lifetime doesn't change runtime behaviour — but serde's trait bounds require it regardless.
 
+### When the snapshot becomes the only copy
+
+Failing closed on a snapshot that won't decode was half the fix. The Phase 12 review pointed out the other half: a snapshot that *does* decode can still be wrong. Flip one byte inside a stored string value and the blob is still perfectly valid JSON; it just describes a cluster that never existed. `serde_json` can't catch that, because there's nothing syntactically wrong to catch. And there's a second gap: if we ever change the snapshot layout, an old binary reading a new snapshot (or the reverse) has no way to notice. It would deserialise whatever fields happen to match and invent defaults for the rest.
+
+So the persisted snapshot now travels in an envelope. Alongside the payload and the snapshot counter, the same redb table stores two more keys: a format version and a SHA-256 checksum of the payload bytes.
+
+```rust
+fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::Error> {
+    let checksum = snapshot_checksum(data);          // SHA-256 of the payload
+    let wtx = db.begin_write()?;
+    {
+        let mut t = wtx.open_table(SNAPSHOT)?;
+        t.insert(SNAP_DATA_KEY, data)?;
+        t.insert(SNAP_INDEX_KEY, index.to_le_bytes().as_slice())?;
+        t.insert(SNAP_VERSION_KEY, SNAPSHOT_FORMAT_VERSION.to_le_bytes().as_slice())?;
+        t.insert(SNAP_CHECKSUM_KEY, checksum.as_slice())?;
+    }
+    wtx.commit()?;                                   // fsync: all four keys or none
+    Ok(())
+}
+```
+
+All four keys land in one write transaction, so they're always coherent: there is no window where the payload is new but the checksum is old. On load, the rules are strict. A checksum mismatch is a hard error naming both sums. A version we don't recognise is a hard error naming both versions. No cleverness, no "best effort". The operator gets told exactly what's wrong and the node refuses to start.
+
+One case gets gentler treatment. A snapshot written before the envelope existed has neither a version nor a checksum key. That's not corruption, it's history — every cluster that predates this change has one. So a missing envelope loads as legacy (with a warning in the logs), and the next snapshot rewrites the store in the enveloped format. A fixture test pins this: it plants a raw pre-envelope blob exactly as an old binary wrote it and asserts it still loads. Backwards compatibility isn't a nice-to-have here; without it, upgrading a node would look exactly like the corruption we're trying to detect.
+
+Why SHA-256 rather than a cheaper CRC? Because `sha2` was already in the dependency tree and snapshots are written rarely (every few thousand log entries). Spending a millisecond hashing at snapshot time to make on-disk corruption *provable* at startup is a good trade. We're not defending against an attacker here, just against disks and torn writes, so no key, no signature — that's Chapter 10's problem.
+
+There's a subtler invariant hiding behind all this. Once a snapshot is taken, openraft *purges* the log entries it covers — that's the whole point of compaction. The durable log remembers how far it purged (`last_purged`), and the snapshot remembers how far it applied (`last_applied`). Those two numbers must agree: everything purged must be covered. If the log says "I threw away entries up to index 500" and the snapshot only covers up to 300 (or is missing entirely), entries 301 to 500 exist nowhere. No amount of replication or retrying brings them back. Before the envelope work, a node in that state would boot happily with a silent 200-entry hole. Now startup cross-checks the boundary:
+
+```rust
+pub async fn validate_purge_boundary(
+    log_store: &DurableLogStore,
+    state_machine: &CouncilStateMachine,
+) -> Result<(), SnapshotStoreError> {
+    let Some(purged) = log_store.last_purged_log_id()? else {
+        return Ok(()); // nothing ever purged: the log alone is complete
+    };
+    match state_machine.snapshot_last_applied().await {
+        Some(applied) if applied.index >= purged.index => Ok(()),
+        Some(applied) => Err(SnapshotStoreError::PurgedBeyondSnapshot {
+            purged_index: purged.index,
+            snapshot_index: applied.index,
+        }),
+        None => Err(SnapshotStoreError::PurgedWithoutSnapshot {
+            purged_index: purged.index,
+        }),
+    }
+}
+```
+
+The `let Some(purged) = ... else { return Ok(()); }` line is a *let-else*, new syntax if you're coming from C or Go. It reads: bind `purged` if the value is `Some`, otherwise run the `else` block, which must exit (return, break, or panic). It's the tidy way to peel a value out of an `Option` and bail early without nesting the rest of the function inside an `if let`.
+
+The last piece is the bootstrap guard's freshness check. `is_fresh` used to return a plain `bool`, computed with `unwrap_or(None)`, meaning a redb read error quietly counted as "no vote, no log, must be a fresh node". Follow that thread: fresh node means bootstrap, bootstrap means initialise a brand-new single-node cluster, and now a node with a *damaged* store has elected itself a second leader next to the cluster it forgot it belonged to. That's the split-brain we fixed earlier in this chapter, reintroduced through the error path. The signature is now `Result<bool, StorageError>`, and startup treats an error as fatal. This is where Rust's `Result` earns its keep: once the return type says a read can fail, every caller is forced to write down what failure means — there's no Go-style `_` to silently drop it on the floor. "I can't read my store" and "my store is empty" are different answers, and only one of them should ever create a new cluster.
+
+The test that ties the theme together does the full loop through the real startup path: bootstrap a node on durable storage, write state, trigger a snapshot, let openraft purge the log, then flip one byte in the stored payload and restart. The restart must return an error — the checksum mismatch — and never a plausible-looking empty cluster. A sibling test deletes the snapshot outright and expects the purge-boundary error instead. Corruption you can detect at startup is an incident; corruption you detect three weeks later is an archaeology dig.
+
 ### The in-memory log store
 
 The log store is the simplest adapter. It stores entries in a `BTreeMap<u64, Entry>` keyed by log index:
