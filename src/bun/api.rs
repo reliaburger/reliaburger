@@ -79,8 +79,9 @@ pub struct ApiState {
     /// The cluster's internal service token, presented on cross-node fan-out
     /// calls so peers accept them as the system principal. `None` single-node.
     pub service_token: Option<String>,
-    /// HTTP client for cross-node fan-out queries.
-    pub http_client: reqwest::Client,
+    /// Scheme + client for cross-node agent-API calls (HTTPS + CA trust
+    /// under mTLS, plain HTTP otherwise).
+    pub cluster_http: crate::cluster::ClusterHttp,
     /// The API port this cluster runs on (uniform across nodes), used
     /// to derive peer API addresses from raft/gossip IPs.
     pub api_port: u16,
@@ -139,6 +140,7 @@ pub fn router(
         None,
         None,
         900,
+        crate::cluster::ClusterHttp::plaintext(),
     )
 }
 
@@ -164,6 +166,7 @@ pub fn router_with_upgrade(
     >,
     node_name: Option<String>,
     build_timeout_secs: u64,
+    cluster_http: crate::cluster::ClusterHttp,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -179,7 +182,7 @@ pub fn router_with_upgrade(
         membership,
         token_store: token_store.clone(),
         service_token: service_token.clone(),
-        http_client: reqwest::Client::new(),
+        cluster_http,
         api_port,
         upgrade,
         batch_tracker: Arc::new(tokio::sync::Mutex::new(
@@ -928,7 +931,8 @@ async fn cluster_apply(
                 .into_response();
         };
         let mut request = state
-            .http_client
+            .cluster_http
+            .client()
             .post(format!("{leader_url}/v1/apply"))
             .body(raw_body);
         if let Some(token) = &state.service_token {
@@ -1053,11 +1057,15 @@ pub(crate) async fn leader_api_url(
             .iter()
             .find(|m| m.node_id == crate::meat::NodeId::new(&leader_name))
         {
-            return Some(format!("http://{}", info.address));
+            return Some(state.cluster_http.url(&info.address.to_string(), ""));
         }
     }
 
-    Some(format!("http://{leader_ip}:{}", state.api_port))
+    Some(
+        state
+            .cluster_http
+            .url(&format!("{leader_ip}:{}", state.api_port), ""),
+    )
 }
 
 /// `GET /v1/placements/{node_id}` — the apps (and per-node replica
@@ -1376,7 +1384,7 @@ async fn logs_cross_node_handler(
 
         for node_id in &node_ids {
             if let Some(info) = members.iter().find(|m| m.node_id == *node_id) {
-                node_urls.push(format!("http://{}", info.address));
+                node_urls.push(state.cluster_http.url(&info.address.to_string(), ""));
             } else {
                 warnings.push(LogQueryWarning::NodeUnresponsive {
                     node_id: node_id.0.clone(),
@@ -1392,7 +1400,7 @@ async fn logs_cross_node_handler(
         match fan_out_query(
             &log_query,
             &node_urls,
-            &state.http_client,
+            state.cluster_http.client(),
             timeout,
             state.service_token.as_deref(),
         )

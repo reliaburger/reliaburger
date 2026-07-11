@@ -401,7 +401,7 @@ pub async fn batch_submit_handler(State(state): State<ApiState>, body: String) -
             callback_base_url: callback_base_url.clone(),
             jobs,
         };
-        let client = state.http_client.clone();
+        let client = state.cluster_http.client().clone();
         let token = state.service_token.clone();
         tokio::spawn(async move {
             let mut request = client.post(format!("{url}/v1/batch/run")).json(&run);
@@ -433,7 +433,7 @@ pub async fn batch_run_handler(
     let reporter = match run.callback_base_url {
         Some(base_url) => Reporter::Callback {
             base_url,
-            client: state.http_client.clone(),
+            client: state.cluster_http.client().clone(),
             service_token: state.service_token.clone(),
         },
         // No callback: the submitter is this process (or doesn't care).
@@ -506,7 +506,8 @@ async fn forward_to_leader(
             .into_response();
     };
     let mut request = state
-        .http_client
+        .cluster_http
+        .client()
         .post(format!("{leader_url}{path}"))
         .header("content-type", "application/json")
         .body(body);
@@ -528,7 +529,10 @@ async fn forward_get_to_leader(
         )
             .into_response();
     };
-    let mut request = state.http_client.get(format!("{leader_url}{path}"));
+    let mut request = state
+        .cluster_http
+        .client()
+        .get(format!("{leader_url}{path}"));
     if let Some(token) = &state.service_token {
         request = request.bearer_auth(token);
     }
@@ -558,7 +562,7 @@ async fn node_api_url(state: &ApiState, node_id: &NodeId) -> Option<String> {
     members
         .iter()
         .find(|m| &m.node_id == node_id)
-        .map(|m| format!("http://{}", m.address))
+        .map(|m| state.cluster_http.url(&m.address.to_string(), ""))
 }
 
 /// Our own reachable base URL, for completion callbacks. `None` when

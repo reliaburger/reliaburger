@@ -164,6 +164,7 @@ async fn start_node(
             None,
             cmd_tx.clone(),
             shutdown.clone(),
+            reliaburger::cluster::ClusterHttp::plaintext(),
         );
     }
 

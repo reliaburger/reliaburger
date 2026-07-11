@@ -118,6 +118,19 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
         self.inner.root_hint_subjects()
     }
 
+    // Delegate the auth-required policy to the inner verifier: the Raft/
+    // reporting configs require a client cert; the API config allows an
+    // unauthenticated client (relish/browsers use a bearer token or cookie).
+    // Without these the trait defaults to mandatory, ignoring the inner
+    // builder's `allow_unauthenticated`.
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -283,6 +296,63 @@ pub fn build_mtls_server_config(
     config.send_tls13_tickets = 0;
 
     Ok(Arc::new(config))
+}
+
+/// Build a rustls `ServerConfig` for the agent API listener: it presents the
+/// node certificate but treats client certs as **optional**.
+///
+/// The API is reached by the `relish` CLI and browsers, which have no node
+/// certificate — they authenticate with a bearer token or a session cookie
+/// over TLS. Node-to-node API calls that do present a node cert are verified
+/// (and CRL-checked) exactly as on the Raft transport; a client with no cert
+/// simply gets an unauthenticated TLS connection, which the bearer/cookie
+/// layer then handles.
+pub fn build_api_server_config(
+    identity: &NodeIdentity,
+    crl: CrlHandle,
+) -> Result<Arc<ServerConfig>, MtlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut root_store = RootCertStore::empty();
+    root_store
+        .add(CertificateDer::from(identity.node_ca_der.clone()))
+        .map_err(|e| MtlsError::InvalidCert(format!("node CA: {e}")))?;
+    let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| MtlsError::ConfigFailed(format!("client verifier: {e}")))?;
+    let client_verifier = Arc::new(RevocationCheckingClientVerifier { inner: webpki, crl });
+
+    let (chain, key) = identity_chain_and_key(identity)?;
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(chain, key)
+        .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
+    Ok(Arc::new(config))
+}
+
+/// Build a reqwest client that trusts the cluster root CA for verifying the
+/// server it connects to, using the same pinned verifier as the internal
+/// transports (no hostname check). Used for node-to-node API calls when the
+/// cluster runs mTLS. The client presents no certificate: node-to-node calls
+/// still authenticate with the service token, now inside TLS.
+pub fn build_cluster_http_client(identity: &NodeIdentity) -> Result<reqwest::Client, MtlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let verifier = Arc::new(PinnedChainServerVerifier::new(
+        identity.node_ca_der.clone(),
+        identity.root_ca_der.clone(),
+        // Peer API certs are node certs; revocation is enforced on the Raft
+        // and reporting transports. A fresh handle keeps this client simple.
+        CrlHandle::default(),
+    ));
+    let tls = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|e| MtlsError::ConfigFailed(format!("cluster http client: {e}")))
 }
 
 /// Build a rustls `ClientConfig` for connecting to cluster peers.

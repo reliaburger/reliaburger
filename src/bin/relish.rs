@@ -21,6 +21,11 @@ struct Cli {
     #[arg(long, global = true)]
     token: Option<String>,
 
+    /// Path to the cluster CA certificate (PEM). When set, the CLI reaches
+    /// the agent API over HTTPS. Overrides `RELIABURGER_CA_CERT`.
+    #[arg(long, global = true)]
+    ca_cert: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -665,8 +670,9 @@ enum FaultAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Record the --token override (if any) before any client is built.
+    // Record the --token and --ca-cert overrides before any client is built.
     reliaburger::relish::client::set_cli_token(cli.token.clone());
+    reliaburger::relish::client::set_cli_ca_cert(cli.ca_cert.clone());
 
     let result = match cli.command {
         Command::Apply { ref path, dry_run } => commands::apply(path, cli.output, dry_run).await,
