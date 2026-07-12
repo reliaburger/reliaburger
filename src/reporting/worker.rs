@@ -124,13 +124,20 @@ impl<T: ReportingTransport> ReportWorker<T> {
         // Skip the first tick (fires immediately)
         interval.tick().await;
 
+        // Set to false when the leader-target watch closes. Polling a closed
+        // watch resolves instantly with Err on every iteration — a hot spin
+        // (CP10) — so the guard drops that select arm instead of the worker:
+        // reporting must outlive the maintainer, degraded to the last known
+        // target, and only the shutdown token ends this task.
+        let mut watch_open = true;
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 _ = interval.tick() => {
                     self.send_report().await;
                 }
-                result = self.council_rx.changed() => {
+                result = self.council_rx.changed(), if watch_open => {
                     match result {
                         Ok(()) => {
                             // Re-point immediately on a leader change so a
@@ -141,16 +148,13 @@ impl<T: ReportingTransport> ReportWorker<T> {
                             }
                         }
                         Err(_) => {
-                            // The sender lives in the leader-target
-                            // maintainer and only drops at shutdown. Without
-                            // this break, a closed watch resolves instantly
-                            // on every loop iteration — a hot spin (CP10).
+                            watch_open = false;
                             if !self.shutdown.is_cancelled() {
                                 eprintln!(
-                                    "report worker: leader-target channel closed; stopping"
+                                    "report worker: leader-target channel closed; \
+                                     reporting to the last known target"
                                 );
                             }
-                            break;
                         }
                     }
                 }
@@ -487,12 +491,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_exits_cleanly_when_the_council_watch_closes() {
+    async fn worker_reports_to_last_known_target_after_the_watch_closes() {
         // CP10: a dropped leader-target sender used to make `changed()`
         // resolve instantly with Err on every iteration — a hot spin. The
-        // worker must exit instead.
+        // worker must keep reporting to the last known target without
+        // spinning; only the shutdown token ends it.
         let net = InMemoryReportingNetwork::new();
         let worker_transport = net.register(addr(1)).await;
+        let c1_transport = net.register(addr(2)).await;
         let shutdown = CancellationToken::new();
         let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
         spawn_fake_agent(snapshot_rx, shutdown.clone());
@@ -508,13 +514,22 @@ mod tests {
         );
         let handle = tokio::spawn(async move { worker.run().await });
 
+        // Close the watch before the first report interval elapses.
         drop(council_tx);
-        // Without the fix this times out (the task spins forever).
+
+        // The worker must still deliver a report to the last known target.
+        let result = tokio::time::timeout(Duration::from_secs(5), c1_transport.recv()).await;
+        assert!(
+            result.is_ok(),
+            "worker must keep reporting after the council watch closes"
+        );
+
+        // And it must still exit on shutdown (not spin, not hang).
+        shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
-            .expect("worker must exit when the council watch closes")
+            .expect("worker must exit on shutdown")
             .unwrap();
-        shutdown.cancel();
     }
 
     #[tokio::test]

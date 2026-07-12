@@ -68,24 +68,28 @@ impl<T: ReportingTransport> RollupWorker<T> {
         // Skip the first tick (fires immediately)
         interval.tick().await;
 
+        // A closed watch resolves instantly forever (CP10); the guard drops
+        // that select arm so the worker keeps pushing to the last known
+        // parent instead of hot-spinning or dying with the maintainer.
+        let mut watch_open = true;
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 _ = interval.tick() => {
                     self.push_rollup().await;
                 }
-                result = self.council_rx.changed() => {
+                result = self.council_rx.changed(), if watch_open => {
                     match result {
                         Ok(()) => self.update_parent(),
                         Err(_) => {
-                            // A closed watch resolves instantly forever —
-                            // exit instead of hot-spinning (CP10).
+                            watch_open = false;
                             if !self.shutdown.is_cancelled() {
                                 eprintln!(
-                                    "rollup worker: leader-target channel closed; stopping"
+                                    "rollup worker: leader-target channel closed; \
+                                     pushing to the last known parent"
                                 );
                             }
-                            break;
                         }
                     }
                 }
