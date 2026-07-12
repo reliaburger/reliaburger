@@ -13,6 +13,18 @@ use crate::mustard::membership::MembershipSnapshot;
 /// Derive a stable `u64` Raft id from a node name using djb2 (the same hash
 /// the networking layer uses for node indices). Deterministic across
 /// restarts. Never returns 0, which openraft treats specially in some paths.
+///
+/// Why djb2 stays (12b.2/CP10): the CP10 instability concern — a hash whose
+/// output the standard library may change between Rust versions — applies to
+/// `DefaultHasher` (fixed in `reporting::assignment`), not here: djb2 is
+/// pure pinned arithmetic, identical on every toolchain, and the test below
+/// pins its outputs. Its known weakness is poor avalanche on similar short
+/// names (a collision risk), but swapping the function was judged riskier
+/// than living with it: every node derives every PEER's id from its name, so
+/// old and new binaries in one cluster would disagree about identities
+/// mid-upgrade, and durable Raft logs/membership are keyed by the old ids.
+/// A migration would need a cluster-wide flag day plus durable-state
+/// rewriting; deferred until an id scheme change is worth that cost.
 pub fn raft_id_from_name(name: &str) -> u64 {
     let hash = name.bytes().fold(5381u64, |acc, b| {
         acc.wrapping_mul(33).wrapping_add(b as u64)
@@ -70,6 +82,17 @@ mod tests {
         assert_eq!(raft_id_from_name("node-1"), raft_id_from_name("node-1"));
         assert_ne!(raft_id_from_name("node-1"), raft_id_from_name("node-2"));
         assert_ne!(raft_id_from_name(""), 0);
+    }
+
+    /// Pin the exact id values (CP10). Durable Raft state and every peer's
+    /// view of this node are keyed by these numbers — a drift here corrupts
+    /// clusters on upgrade, so the mapping may never change.
+    #[test]
+    fn raft_id_values_are_pinned_across_versions() {
+        assert_eq!(raft_id_from_name("node-1"), 6_953_829_376_873);
+        assert_eq!(raft_id_from_name("node-2"), 6_953_829_376_874);
+        assert_eq!(raft_id_from_name("bun-a"), 210_708_095_992);
+        assert_eq!(raft_id_from_name("p1"), 5_863_654);
     }
 
     #[test]

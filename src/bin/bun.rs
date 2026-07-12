@@ -125,6 +125,9 @@ fn cluster_params_from_config(
         gossip_addr,
         raft_port: config.cluster.raft_port,
         reporting_port: config.cluster.reporting_port,
+        // The CLI can override the API listen port; main() re-sets this
+        // after parsing `--listen`, before the runtime starts.
+        api_port: 9117,
         reporting_config: config.reporting_tree.clone(),
         seeds,
         wrapping_ikm,
@@ -446,6 +449,9 @@ async fn main() -> anyhow::Result<()> {
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
+        // Advertised via the gossip directory (12b.2): peers reach this
+        // node's API at the port it actually listens on, not a derived one.
+        params.api_port = api_port;
 
         // Mode matrix: with require_mtls set, a node must have an identity on
         // disk before it can speak the internal transports. Refuse to start
@@ -486,6 +492,7 @@ async fn main() -> anyhow::Result<()> {
             handle.membership_rx.clone(),
             handle.raft_metrics_rx.clone(),
             cluster_runtime.aggregated_rx.clone(),
+            cluster_runtime.directory_rx.clone(),
         ));
         _cluster_runtime = Some(cluster_runtime);
         BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
@@ -506,7 +513,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Batch scheduling (F1) reads capacities from the same aggregated
     // view the deploy scheduler uses; None standalone.
-    let api_aggregated_rx = orchestration.as_ref().map(|(_, _, rx)| rx.clone());
+    let api_aggregated_rx = orchestration.as_ref().map(|(_, _, rx, _)| rx.clone());
 
     // Report real schedulable capacity to the cluster (L6: StateReports
     // used to carry zeroes).
@@ -580,7 +587,7 @@ async fn main() -> anyhow::Result<()> {
     // L1 orchestration: the leader schedules desired apps into
     // placements, every node keeps a fresh peer-API table, and every
     // node reconciles its instances against its assignments.
-    if let Some((membership_rx, metrics_rx, aggregated_rx)) = orchestration {
+    if let Some((membership_rx, metrics_rx, aggregated_rx, directory_rx)) = orchestration {
         if let Some(council) = &api_council {
             reliaburger::cluster::orchestrate::spawn_leader_scheduler(
                 Arc::clone(council),
@@ -640,6 +647,7 @@ async fn main() -> anyhow::Result<()> {
             reliaburger::cluster::orchestrate::spawn_placement_reconciler(
                 node_name.clone(),
                 metrics_rx,
+                directory_rx,
                 api_port as i32 - config.cluster.raft_port as i32,
                 service_token.clone(),
                 cmd_tx.clone(),

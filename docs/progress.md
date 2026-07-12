@@ -547,12 +547,42 @@ whole theme lands.
 
 ### 12b.2 — Make the cluster converge
 
-- [ ] **Control-plane directory and reporting robustness** — publish authenticated leader
+- [x] **Control-plane directory and reporting robustness** — publish authenticated leader
   API/reporting endpoints to every gossip member; make non-voters follow leader failover;
   replace weak/version-dependent node and parent hashes; evict departed/stale nodes; filter
   terminal workloads from running/capacity; stop closed-channel spins and supervise
   long-lived task failures. Acceptance: an 8+ node cluster reconciles and reports through
   leader failover (H1/D1, CP1/CP5/CP6/CP10).
+  - [x] Gossip directory extension: every datagram carries the sender's advertised
+    API/reporting endpoints plus the highest-term leader hint, HMAC-authenticated, appended
+    AFTER the bincode message body so old and new peers keep gossiping in both directions
+    (pinned by legacy-decoder tests; the 10k gossip test is untouched).
+  - [x] Non-voters follow leader failover (H1/D1/CP1): the leader-target maintainer and the
+    placement reconciler resolve the leader through Raft metrics OR the gossip directory
+    (`cluster::directory::resolve_leader`); a newer gossip hint outranks a deposed leader's
+    stale metrics; the derived `gossip-ip:9117` offset survives only as a propagation-lag
+    fallback; workers re-report immediately on re-point.
+  - [x] Epoch-scoped honest aggregation (CP5): report freshness judged on aggregator-side
+    monotonic receive time (never sender wall clock); entries tagged with the leadership
+    term and excluded once the epoch moves on; eviction of members gossip drops
+    (Dead/Left) and of entries older than three stale windows.
+  - [x] Terminal workloads out of running/capacity (CP6): `build_report` excludes
+    Stopped/Failed instances from `running_apps`, request sums and allocated ports;
+    Stopping still counts (draining holds resources).
+  - [x] Version-stable hashes (CP10): reporting parent assignment moved from
+    `DefaultHasher` to a local FNV-1a with the exact mapping pinned by test; Raft-id djb2
+    documented and value-pinned (kept: changing it would break durable state and
+    mixed-version clusters — see `cluster::identity`).
+  - [x] No silent task death, no hot spins (CP10): report/rollup workers stop polling a
+    closed leader-target watch (previously a 100%-CPU spin) but keep reporting to the
+    last known target — only the shutdown token ends them; cluster runtime tasks wrapped
+    in `spawn_supervised` (loud log on unexpected exit; respawn deliberately rejected —
+    documented in `runtime.rs`).
+  - [x] Acceptance (`tests/cluster_failover.rs`, gated `RELIABURGER_CLUSTER_TESTS=1`):
+    nine fully wired in-process nodes (7 voters + 2 workers), all nine report to the
+    leader, a daemonset converges onto the workers, the leader is killed, every survivor
+    re-points at the new leader, coverage recovers in the new epoch and new placements
+    still reconcile. Passes locally in ~18s.
 - [x] **Council membership self-healing** — add replacement as learner, wait for catch-up,
   promote, transfer/avoid leadership as needed and remove the dead or unsuitable voter via
   joint consensus. Prove quorum recovers with healthy spares and never removes the active

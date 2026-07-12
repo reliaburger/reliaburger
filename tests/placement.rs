@@ -59,6 +59,7 @@ async fn start_node(
             gossip_addr: local(gossip_port),
             raft_port,
             reporting_port,
+            api_port,
             reporting_config: ReportingTreeSection {
                 report_interval_secs: 1,
                 max_events_per_report: 100,
@@ -82,6 +83,7 @@ async fn start_node(
     let metrics_rx = handle.raft_metrics_rx.clone();
     let aggregated_rx = cluster_runtime.aggregated_rx.clone();
     let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
+    let directory_rx = cluster_runtime.directory_rx.clone();
 
     // Leak the runtime for the whole test (its tasks must outlive us).
     Box::leak(Box::new(cluster_runtime));
@@ -160,6 +162,7 @@ async fn start_node(
         spawn_placement_reconciler(
             name.to_string(),
             metrics_rx,
+            directory_rx,
             2, // api_port - raft_port
             None,
             cmd_tx.clone(),

@@ -1260,7 +1260,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 })
                 .collect(),
-            allocated_ports: instances.iter().filter_map(|i| i.host_port).collect(),
+            // Terminal instances no longer hold their ports (CP6) — the
+            // worker also filters them from running/capacity.
+            allocated_ports: instances
+                .iter()
+                .filter(|i| {
+                    !matches!(
+                        i.state,
+                        crate::grill::state::ContainerState::Stopped
+                            | crate::grill::state::ContainerState::Failed
+                    )
+                })
+                .filter_map(|i| i.host_port)
+                .collect(),
             capacity_cpu_millicores: self.capacity_cpu_millicores,
             capacity_memory_mb: self.capacity_memory_mb,
         };

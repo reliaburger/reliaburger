@@ -145,6 +145,7 @@ Some tests require specific runtimes or network access and are gated behind envi
 | `RELIABURGER_APPLE_CONTAINER_TESTS=1` | Apple Container tests (macOS only) |
 | `RELIABURGER_IMAGE_PULL_TESTS=1` | OCI image pull tests (requires network) |
 | `RELIABURGER_UPGRADE_TESTS=1` | real-binary self-upgrade tests (slow; also via `make test-upgrade`) |
+| `RELIABURGER_CLUSTER_TESTS=1` | 9-node in-process cluster failover acceptance (heavy; `cargo test --test cluster_failover`) |
 | `RELIABURGER_BTRFS_TESTS=1` | Btrfs quota + snapshot tests (Linux root; each test provisions its own loopback btrfs) |
 | `RELIABURGER_BUILDAH_TESTS=1` | real `buildah` image-build tests (Linux with buildah installed) |
 | `RELIABURGER_CLUSTER_TESTS=1` | in-process council self-healing acceptance tests (kill-a-voter, lagging learner, flap; a few seconds each) |

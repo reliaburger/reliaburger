@@ -88,6 +88,7 @@ async fn start_node_with_mayo(
             gossip_addr: local(gossip_port),
             raft_port: gossip_port + 1,
             reporting_port: gossip_port + 2,
+            api_port: gossip_port + 3,
             reporting_config: ReportingTreeSection {
                 report_interval_secs: 1,
                 max_events_per_report: 100,

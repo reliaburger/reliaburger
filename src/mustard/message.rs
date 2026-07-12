@@ -30,6 +30,15 @@ pub struct GossipMessage {
     pub hmac: [u8; 32],
     /// The message payload.
     pub payload: GossipPayload,
+    /// Node-directory extension (Phase 12b.2). `#[serde(skip)]` keeps it out
+    /// of the bincode message body — bincode is positional, so a new field
+    /// inside the message would break every older decoder. The UDP transport
+    /// instead appends the encoded extension AFTER the message bytes (see
+    /// [`encode_datagram`]/[`decode_datagram`]); older peers ignore the
+    /// trailing bytes and newer peers pick them up. In-memory transports
+    /// clone the whole struct, so the extension flows through untouched.
+    #[serde(skip)]
+    pub extension: Option<DirectoryExtension>,
 }
 
 impl GossipMessage {
@@ -45,6 +54,7 @@ impl GossipMessage {
             incarnation,
             hmac: [0u8; 32],
             payload,
+            extension: None,
         }
     }
 
@@ -134,6 +144,132 @@ pub struct MembershipUpdate {
     pub incarnation: u64,
     /// Lamport timestamp for ordering.
     pub lamport: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Directory extension (Phase 12b.2)
+// ---------------------------------------------------------------------------
+
+/// The sender's best knowledge of the current Raft leader, carried on every
+/// gossip datagram so nodes outside the voter set can route to the leader.
+///
+/// The leader originates its own hint (from its Raft metrics and its
+/// configured endpoints); every other node just relays the highest-term hint
+/// it has seen. Terms only grow in Raft, so `term` resolves conflicts: a
+/// deposed leader's stale hint always loses to the new leader's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderHint {
+    /// The leader's gossip node id.
+    pub node_id: NodeId,
+    /// The Raft term this hint was observed under.
+    pub term: u64,
+    /// The leader's advertised HTTP API endpoint.
+    pub api_address: SocketAddr,
+    /// The leader's advertised reporting-tree endpoint.
+    pub reporting_address: SocketAddr,
+}
+
+/// Per-datagram node-directory extension.
+///
+/// Carries the sending node's advertised control-plane endpoints and its
+/// best leader hint. Appended after the bincode-encoded [`GossipMessage`]
+/// rather than inside it, so older peers (which stop reading at the end of
+/// the message) still parse the datagram — see [`encode_datagram`].
+///
+/// `node_id` names the node the endpoints belong to. It is always the node
+/// that physically stamped the datagram — which is NOT always
+/// `GossipMessage::sender` (a relayed indirect-probe ACK is sent by the
+/// relay but carries the probed target as its sender).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryExtension {
+    /// The node these endpoints belong to (the stamping node).
+    pub node_id: NodeId,
+    /// This node's advertised HTTP API endpoint.
+    pub api_address: SocketAddr,
+    /// This node's advertised reporting-tree endpoint.
+    pub reporting_address: SocketAddr,
+    /// Best known leader, relayed epidemically; highest term wins.
+    pub leader: Option<LeaderHint>,
+    /// HMAC-SHA256 over the carrying message's canonical bytes plus this
+    /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
+    pub hmac: [u8; 32],
+}
+
+impl DirectoryExtension {
+    /// The canonical bytes the extension HMAC covers: the extension with
+    /// `hmac` zeroed. Combined with the carrying message's canonical bytes
+    /// so a valid extension can't be detached and replayed onto another
+    /// message.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        let mut canonical = self.clone();
+        canonical.hmac = [0u8; 32];
+        bincode::serialize(&canonical)
+    }
+
+    /// Return a copy with `hmac` set over `message_canonical` plus this
+    /// extension's canonical bytes, under `key`.
+    pub fn signed(
+        mut self,
+        key: &ring::hmac::Key,
+        message_canonical: &[u8],
+    ) -> Result<Self, bincode::Error> {
+        self.hmac = [0u8; 32];
+        let mut bytes = message_canonical.to_vec();
+        bytes.extend(self.canonical_bytes()?);
+        let tag = crate::sesame::mtls::gossip_hmac::sign(key, &bytes);
+        // HMAC-SHA256 is always 32 bytes.
+        self.hmac.copy_from_slice(&tag);
+        Ok(self)
+    }
+
+    /// Verify this extension's `hmac` against the carrying message's
+    /// canonical bytes under `key`. Returns `false` on any serialisation
+    /// error or tag mismatch.
+    pub fn verify_hmac(&self, key: &ring::hmac::Key, message_canonical: &[u8]) -> bool {
+        match self.canonical_bytes() {
+            Ok(ext_bytes) => {
+                let mut bytes = message_canonical.to_vec();
+                bytes.extend(ext_bytes);
+                crate::sesame::mtls::gossip_hmac::verify(key, &bytes, &self.hmac)
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Encode a gossip message (and its directory extension, if any) into a
+/// single datagram: `bincode(message) || bincode(extension)`.
+///
+/// The extension rides as trailing bytes because bincode is not
+/// self-describing: `#[serde(default)]` on a new struct field gives no
+/// tolerance at all (an old decoder misparses the extra bytes, a new decoder
+/// hits EOF on an old message). Trailing bytes give tolerance in BOTH
+/// directions — bincode's legacy `deserialize` ignores what it doesn't read,
+/// so an old peer parses a new datagram, and a new peer treats a datagram
+/// with no trailing bytes as extension-free.
+pub fn encode_datagram(message: &GossipMessage) -> Result<Vec<u8>, bincode::Error> {
+    // `extension` is #[serde(skip)], so this is exactly the old wire shape.
+    let mut bytes = bincode::serialize(message)?;
+    if let Some(extension) = &message.extension {
+        bytes.extend(bincode::serialize(extension)?);
+    }
+    Ok(bytes)
+}
+
+/// Decode a datagram produced by [`encode_datagram`] (or by an older peer,
+/// in which case the extension is `None`). A malformed extension is dropped
+/// silently rather than failing the whole message: the membership payload is
+/// still good, and gossip must keep flowing across versions.
+pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let mut message: GossipMessage = bincode::deserialize_from(&mut cursor)?;
+    let consumed = cursor.position() as usize;
+    if consumed < bytes.len()
+        && let Ok(extension) = bincode::deserialize::<DirectoryExtension>(&bytes[consumed..])
+    {
+        message.extension = Some(extension);
+    }
+    Ok(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +396,136 @@ mod tests {
         let json = serde_json::to_string(&update).unwrap();
         let decoded: MembershipUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(update, decoded);
+    }
+
+    // -- directory extension wire tolerance (12b.2) ---------------------------
+
+    fn an_extension() -> DirectoryExtension {
+        DirectoryExtension {
+            node_id: NodeId::new("sender"),
+            api_address: SocketAddr::from(([127, 0, 0, 1], 9117)),
+            reporting_address: SocketAddr::from(([127, 0, 0, 1], 9445)),
+            leader: Some(LeaderHint {
+                node_id: NodeId::new("leader"),
+                term: 7,
+                api_address: SocketAddr::from(([10, 0, 0, 1], 9117)),
+                reporting_address: SocketAddr::from(([10, 0, 0, 1], 9445)),
+            }),
+            hmac: [0u8; 32],
+        }
+    }
+
+    /// The exact wire shape a pre-12b.2 peer serialises and parses.
+    /// Field-for-field the old `GossipMessage` (no extension).
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LegacyGossipMessage {
+        version: u8,
+        sender: NodeId,
+        incarnation: u64,
+        hmac: [u8; 32],
+        payload: GossipPayload,
+    }
+
+    #[test]
+    fn old_peer_parses_a_datagram_carrying_an_extension() {
+        let mut msg = a_message();
+        msg.extension = Some(an_extension());
+        let datagram = encode_datagram(&msg).unwrap();
+
+        // An old peer deserialises the legacy shape from the full datagram;
+        // bincode's legacy `deserialize` must ignore the trailing extension.
+        let legacy: LegacyGossipMessage = bincode::deserialize(&datagram).unwrap();
+        assert_eq!(legacy.sender, NodeId::new("sender"));
+        assert_eq!(legacy.payload.updates().len(), 1);
+    }
+
+    #[test]
+    fn new_peer_parses_an_old_datagram_as_extension_free() {
+        // An old peer's datagram is just the bare message bytes.
+        let legacy = LegacyGossipMessage {
+            version: GossipMessage::VERSION,
+            sender: NodeId::new("old-node"),
+            incarnation: 3,
+            hmac: [0u8; 32],
+            payload: GossipPayload::Ping { updates: vec![] },
+        };
+        let datagram = bincode::serialize(&legacy).unwrap();
+
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded.sender, NodeId::new("old-node"));
+        assert!(decoded.extension.is_none());
+    }
+
+    #[test]
+    fn datagram_round_trip_preserves_the_extension() {
+        let mut msg = a_message();
+        msg.extension = Some(an_extension());
+        let datagram = encode_datagram(&msg).unwrap();
+
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded.extension, Some(an_extension()));
+        assert_eq!(decoded.sender, msg.sender);
+    }
+
+    #[test]
+    fn garbage_trailing_bytes_drop_the_extension_not_the_message() {
+        let msg = a_message();
+        let mut datagram = encode_datagram(&msg).unwrap();
+        datagram.extend_from_slice(&[0xFF, 0x01]);
+
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded.sender, msg.sender);
+        // Two junk bytes can't decode as an extension — dropped silently.
+        assert!(decoded.extension.is_none());
+    }
+
+    #[test]
+    fn extension_is_excluded_from_message_canonical_bytes() {
+        let mut with = a_message();
+        with.extension = Some(an_extension());
+        let without = a_message();
+        // The message HMAC must not change when an extension is attached,
+        // or old peers could no longer verify new datagrams.
+        assert_eq!(
+            with.canonical_bytes().unwrap(),
+            without.canonical_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn signed_extension_verifies_and_rejects_detach_and_tamper() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let msg = a_message().signed(&key).unwrap();
+        let canonical = msg.canonical_bytes().unwrap();
+        let ext = an_extension().signed(&key, &canonical).unwrap();
+        assert!(ext.verify_hmac(&key, &canonical));
+
+        // Tampered content fails.
+        let mut tampered = ext.clone();
+        tampered.api_address = SocketAddr::from(([9, 9, 9, 9], 1));
+        assert!(!tampered.verify_hmac(&key, &canonical));
+
+        // Detached onto a different message fails.
+        let other = GossipMessage::new(
+            NodeId::new("other"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        assert!(!ext.verify_hmac(&key, &other.canonical_bytes().unwrap()));
+    }
+
+    #[test]
+    fn extension_stays_within_the_udp_budget() {
+        let mut msg = a_message();
+        msg.extension = Some(an_extension());
+        let plain = bincode::serialize(&msg).unwrap();
+        let datagram = encode_datagram(&msg).unwrap();
+        // The extension costs well under 200 bytes of the 1400-byte budget.
+        assert!(
+            datagram.len() - plain.len() < 200,
+            "extension too large: {} bytes",
+            datagram.len() - plain.len()
+        );
     }
 
     #[test]
