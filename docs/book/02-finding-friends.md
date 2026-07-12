@@ -1905,6 +1905,156 @@ On top of that sits a proptest. It generates arbitrary voter sets, learner sets,
 
 The full loop runs in three gated acceptance tests (`RELIABURGER_CLUSTER_TESTS=1`): kill a voter and watch a spare walk in while a writer hammers the council and asserts every write lands; kill a learner mid-catch-up (faked by partitioning it at the Raft layer while gossip still likes it) and confirm the voter set refuses to move until a healthy learner catches up; and flap a voter inside the window and confirm nothing changes at all. They use real `CouncilNode`s over the in-memory router with gossip supplied through a watch channel, so the tests control exactly who looks alive and when — the same trick the SWIM tests used, one layer up.
 
+## When the whole council dies
+
+Self-healing has a floor. It keeps the council alive while a majority survives, because every membership change it proposes has to commit through Raft, and Raft needs a quorum to commit anything. Kill two of three voters and the planner does exactly nothing — there's no majority left to vote a replacement in. Kill all three and the cluster is, on paper, dead. Workers keep running whatever they were running, but nothing can elect a leader, schedule a new app, or answer a query about cluster state. There's no quorum to heal from.
+
+That's the scenario the whitepaper's promise of "reconstructable state" has to survive. And it's the one finding D21 flagged: we had self-healing, but no story at all for total council loss. Let's fix that.
+
+The shape of the fix is three pieces: back the state up somewhere the dying nodes don't control, let an operator restore it onto a survivor, and make sure the restored cluster can't be confused with the dead one.
+
+### Backing up: seal it, then ship it
+
+The council's whole job is to hold the desired state — app specs, scheduling decisions, CA material, tokens. That state already gets snapshotted to disk in a versioned, checksummed envelope (Chapter 5 covers the format). A backup is just that same envelope, encrypted and pushed off-box.
+
+Encrypted how? Every node already holds the cluster master key under `/etc/reliaburger`, and we already derive purpose-specific keys from it with HKDF. We derive one more:
+
+```rust
+const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v1";
+
+pub fn seal_snapshot(
+    master_key: &[u8; 32],
+    payload: &[u8],
+    _config: &BackupConfig,
+) -> Result<SealedBackup, BackupError> {
+    let salt = crypto::random_bytes::<32>()?;
+    let wrapping_key = crypto::hkdf_derive_key(master_key, &salt, BACKUP_SEAL_INFO)?;
+    let (ciphertext, nonce) = crypto::aes_256_gcm_encrypt(&wrapping_key, payload)?;
+    // ...pack salt, nonce, ciphertext into a self-describing envelope
+}
+```
+
+The `info` string is the important bit. HKDF binds the derived key to that exact string, so a key derived for backups can't decrypt anything else, and nothing else can decrypt a backup. The salt is random per backup and travels in the (public) envelope; the master key never does. Tamper with a single byte of the ciphertext and AES-GCM's authentication tag refuses to open it — that's not a nice-to-have, it's the difference between restoring your cluster and restoring an attacker's.
+
+Why derive from the master key rather than, say, generate a fresh backup key and store it somewhere? Because *any* surviving node must be able to restore, and every node already has the master key. There's no new secret to distribute, lose, or leak.
+
+Uploading rides `object_store`, the same crate the volume-snapshot worker uses, so `file://`, `s3://` and `gs://` all work with one code path and each backend's standard credentials. The loop runs only on the leader, only when you've set a destination, and prunes old backups past a retention count:
+
+```toml
+[cluster.backup]
+url = "s3://my-bucket/council"
+interval_secs = 300
+retain = 24
+```
+
+Off by default. If you don't set `url`, the loop never starts and you pay nothing.
+
+A word on `_config` — see the leading underscore? In Rust, an unused function parameter is a warning, and warnings are errors in our CI. The underscore tells the compiler "I know, I'm not using it yet." We keep the parameter because sealing may grow config-driven options later, and changing the signature then would ripple through every caller. It's a small hedge, marked honestly.
+
+### The honest cost
+
+Here's the thing nobody likes to say out loud: a backup is a point in time, and you lose everything after it. Set `interval_secs = 300` and a total loss can cost you up to five minutes of committed writes. That's not a bug to be fixed, it's physics. The alternative — synchronously replicating every write off-cluster before acknowledging it — would make every write as slow as your object store, which is a cure worse than the disease. So we make the freshness a knob, document the cost, and let you choose. Shorter interval, less data at risk, more uploads. Your call.
+
+### Restoring: re-bootstrap, don't resurrect
+
+Recovery is deliberately manual. You run `relish council recover` against a *stopped* survivor:
+
+```
+relish council recover --data-dir /var/lib/reliaburger/data \
+    --from s3://my-bucket/council
+```
+
+It refuses if a council voter still answers, unless you pass `--force` with a loud warning — recovering a cluster that still has a quorum would give you two clusters that both think they're in charge, which is the split-brain we spend the whole chapter avoiding. In a genuine total loss the check simply passes, because there's nothing left to answer.
+
+Then it restores the desired state and, crucially, *throws away the dead cluster's Raft log*:
+
+```rust
+pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), RecoveryError> {
+    let raft_dir = data_dir.join("raft");
+    // Wipe the dead cluster's log: its term line belongs to the council that died.
+    let log_path = raft_dir.join("log.redb");
+    if log_path.exists() {
+        std::fs::remove_file(&log_path)?;
+    }
+    // Write the restored state as the only snapshot the next start will load.
+    let db = redb::Database::create(raft_dir.join("snapshot.redb"))?;
+    CouncilStateMachine::persist_recovered_snapshot(&db, state)?;
+    Ok(())
+}
+```
+
+Why wipe the log? A Raft node's log carries its term and its idea of who the voters are. If we kept it, the restored node would try to resume the dead cluster's history — voting for peers that no longer exist, at a term line nobody else shares. Instead we clear it, so when the node starts it re-bootstraps a fresh single-voter council (quorum of one: itself), and the self-healing reconciler grows it back from the surviving workers exactly as if it were a brand-new cluster. The restored desired state comes along for the ride, so the apps are all still there.
+
+### The epoch marker
+
+One subtlety. After recovery, the cluster looks brand new to Raft, but the world outside it doesn't know that. A worker might still hold a token issued by the dead cluster; a stale report might be in flight. How do we tell "before the loss" from "after"?
+
+A monotonic counter, stamped into the restored state:
+
+```rust
+pub fn persist_recovered_snapshot(
+    snapshot_db: &Database,
+    mut state: DesiredState,
+) -> Result<(), redb::Error> {
+    state.recovery_epoch = state.recovery_epoch.saturating_add(1);
+    state.last_applied_log = None;
+    state.last_membership = StoredMembership::default();
+    // ...persist
+}
+```
+
+`saturating_add` is Rust's "add, but clamp at the maximum instead of overflowing." A plain `+` on an integer that's already at `u64::MAX` would panic in a debug build and wrap around in a release build — both wrong. Saturating arithmetic is the boring-correct choice for a counter that only ever goes up. Recover a cluster twice and the epoch reads 2; anything tagged with epoch 0 or 1 is demonstrably pre-recovery. It's cheap, it's monotonic, and it never lies.
+
+### Resigning under disk pressure
+
+There's a slower failure worth heading off before it becomes a total loss: a voter whose disk is filling up. Raft can't make progress if a voter can't persist its log, so a voter drowning in disk pressure is a liability sitting in the quorum. Better it resigns and lets a healthy spare take the seat.
+
+The decision is a tiny state machine with hysteresis, so a node oscillating around the threshold doesn't churn the council:
+
+```rust
+pub fn observe(&mut self, over_threshold: bool, now: Instant) -> ResignationVerdict {
+    if !over_threshold {
+        self.over_since = None;               // recovered — reset the clock
+        return ResignationVerdict::Hold;
+    }
+    let since = *self.over_since.get_or_insert(now);
+    if now.duration_since(since) >= self.hold_down {
+        ResignationVerdict::Resign            // sustained pressure — resign
+    } else {
+        ResignationVerdict::Hold
+    }
+}
+```
+
+`get_or_insert(now)` reads the stored "pressure started at" time, or sets it to `now` the first time pressure crosses the threshold, in one move. Drop back under the threshold and the clock resets, so the next spell waits out the full window again. Only sustained pressure resigns.
+
+A resigning *follower* is easy: it becomes a new input to the self-healing planner, which treats it like a soft-dead voter — bring a replacement in first, promote it, then evict the pressured seat, never dropping below quorum. The planner's existing invariants (never remove the leader, never break quorum, one action per tick) are untouched; disk pressure is just one more reason a seat might open. The property test that guards those invariants got a new generated input — a random set of pressured voters — and still holds.
+
+A resigning *leader* is the hard case, and it's where openraft 0.9 fought us.
+
+### The leadership-transfer trick
+
+openraft 0.9 has no graceful leadership transfer. You cannot say "hand off to node 2 and step down." The self-healing planner worked around this by making "never remove the leader" an absolute rule and leaving the transfer seam for later. Later is now.
+
+The trick is to abuse the one lever openraft *does* give us: `trigger().elect()`, which forces a node to start a fresh election at a higher term:
+
+```rust
+if disk_pressured.contains(&self_id) {
+    if let Some(target) = pick_deposition_target(&voters, &health, self_id) {
+        council.raft().trigger().elect().await?;   // a healthy voter campaigns
+    }
+    return;   // never plan our own removal
+}
+```
+
+A follower campaigning at a higher term deposes the current leader by the normal rules of Raft — the leader sees a higher term and steps down. So a pressured leader picks a healthy voter, tells it to campaign, and gets demoted to an ordinary follower. Once it's an ordinary follower, the *new* leader's planner sees it as a pressured voter and replaces it with the follower path above. No new consensus primitive, no fork of openraft, just Raft's own term rules pointed at a useful outcome.
+
+Before building anything on this, we verified it actually works against openraft 0.9 in a gated test: elect a leader, make a healthy follower campaign, and assert the term advances and leadership moves. It does. Had it not, the fallback was an openraft version bump — a wire-and-storage compatibility risk we'd have flagged before taking. It held, so we didn't have to.
+
+### Testing the whole thing
+
+The headline acceptance test (`RELIABURGER_CLUSTER_TESTS=1`) is the black box: stand up three voters and two workers, take a backup, kill all three voters, run recovery on a survivor, and assert the council re-forms with the pre-loss state intact and a bumped epoch. Alongside it, a deposition test flags the leader under disk pressure through the real reconciler and watches leadership move off it. The seal/restore round-trip, tamper rejection, retention pruning, threshold bounds and the resignation state machine are all fast unit tests that need no cluster at all — the same discipline as the planner: push the logic somewhere pure, and the pure part is trivial to test exhaustively.
+
 ## Breaking things on purpose
 
 You don't know if your cluster recovers from failure until you actually break something. Hoping it works is not a strategy. So we built chaos testing into Reliaburger as a first-class citizen.

@@ -290,6 +290,14 @@ pub struct DesiredState {
     /// Durable build tracker, same shape and rationale as `batch_state`.
     #[serde(default)]
     pub build_state: crate::bun::build_runner::BuildDurableState,
+    /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
+    /// that has never been recovered; the recovery path stamps a strictly
+    /// higher value into the restored state so anything issued before the
+    /// loss (stale reports, tokens tied to the old term line) is
+    /// distinguishable from post-recovery state. Defaults to zero so
+    /// pre-12b.2 snapshots load cleanly.
+    #[serde(default)]
+    pub recovery_epoch: u64,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

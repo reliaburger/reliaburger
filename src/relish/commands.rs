@@ -612,6 +612,79 @@ async fn council_with_client(output: OutputFormat, client: &BunClient) -> Result
     Ok(())
 }
 
+/// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
+///
+/// Offline by design: run it against a STOPPED node. It restores the desired
+/// state (from a sealed backup or the node's own durable snapshot), wipes the
+/// dead cluster's Raft log, and stamps a fresh recovery epoch. The next start
+/// re-bootstraps a single-voter council the reconciler regrows.
+pub async fn council_recover(
+    data_dir: &std::path::Path,
+    from: Option<&str>,
+    master_key_path: Option<&std::path::Path>,
+    force: bool,
+) -> Result<(), RelishError> {
+    use crate::council::recovery::{RecoverySource, load_recovery_state, recover_data_dir};
+
+    // Safety check: refuse if a live council still answers, unless forced. In a
+    // genuine full-council loss the local agent is down, so this check simply
+    // passes; it only bites when someone runs recovery against a healthy
+    // cluster by mistake.
+    if !force {
+        if let Ok(nodes) = BunClient::default_local().nodes().await {
+            let live_voter = nodes
+                .iter()
+                .find(|n| n.is_council && !matches!(n.state.as_str(), "dead" | "left"));
+            if let Some(voter) = live_voter {
+                return Err(RelishError::Recovery(format!(
+                    "a live council voter ({}) is still reachable; stop the cluster or pass --force",
+                    voter.node_id
+                )));
+            }
+        }
+    } else {
+        eprintln!(
+            "WARNING: --force skips the live-council check. Recovering a cluster that still has a \
+             quorum will split the brain. Continue only if every voter is truly gone."
+        );
+    }
+
+    // Load the master key when a sealed backup is the source.
+    let master_key = if from.is_some() {
+        let path = master_key_path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("/etc/reliaburger/master.key"));
+        Some(
+            crate::sesame::bootstrap::load_master_key(&path)
+                .map_err(|e| RelishError::Recovery(format!("load master key: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    let source = match from {
+        Some(url) => RecoverySource::BackupUrl(url.to_string()),
+        None => RecoverySource::NodeDataDir(data_dir.to_path_buf()),
+    };
+
+    let state = load_recovery_state(&source, master_key.as_ref())
+        .await
+        .map_err(|e| RelishError::Recovery(e.to_string()))?;
+    let app_count = state.apps.len();
+    let prior_epoch = state.recovery_epoch;
+
+    recover_data_dir(data_dir, state).map_err(|e| RelishError::Recovery(e.to_string()))?;
+
+    println!("Council recovery complete.");
+    println!("  Restored apps:   {app_count}");
+    println!("  Recovery epoch:  {} -> {}", prior_epoch, prior_epoch + 1);
+    println!("  Data directory:  {}", data_dir.display());
+    println!();
+    println!("Start this node to re-bootstrap a single-voter council; the reconciler");
+    println!("will regrow it from surviving members. Writes after the last backup are lost.");
+    Ok(())
+}
+
 fn print_council_human(council: &CouncilStatus) {
     let leader = council.leader.as_deref().unwrap_or("(none)");
     println!("Leader: {leader}");

@@ -3,9 +3,16 @@
 //! Monitors data directory sizes and triggers export-then-prune when
 //! usage exceeds a threshold. Ensures data is safely exported before
 //! being deleted locally.
+//!
+//! A second, cluster-level concern (12b.2 T3): a *council voter* whose disk
+//! fills up is a liability. Raft can't make progress if a voter can't persist
+//! its log, so a voter under sustained disk pressure should resign its seat
+//! and let the self-healing reconciler replace it. The pure state machine
+//! that decides "resign now?" with hysteresis lives here; the reconciler acts
+//! on its verdict.
 
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::ketchup::export::{ExportCheckpoint, export_logs};
 
@@ -131,6 +138,70 @@ pub fn check_and_relieve(
 }
 
 // ---------------------------------------------------------------------------
+// Council-voter disk-pressure resignation (12b.2 T3)
+// ---------------------------------------------------------------------------
+
+/// Whether a council voter should resign because its disk is under sustained
+/// pressure. The recommendation the reconciler acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResignationVerdict {
+    /// Disk is healthy (or pressure hasn't lasted long enough): keep the seat.
+    Hold,
+    /// Disk has been over the threshold for the whole hold-down window: resign.
+    Resign,
+}
+
+/// Tracks how long this node's disk has been over the pressure threshold and,
+/// once that exceeds a hold-down window, recommends resigning the council
+/// seat. The window is the hysteresis that stops a node oscillating around the
+/// threshold from churning the council.
+///
+/// Feed it one observation per tick via [`DiskPressureResignation::observe`].
+#[derive(Debug)]
+pub struct DiskPressureResignation {
+    /// How long pressure must persist before resignation is recommended.
+    hold_down: Duration,
+    /// When pressure first crossed the threshold in the current spell, or
+    /// `None` while the disk is below it.
+    over_since: Option<Instant>,
+}
+
+impl DiskPressureResignation {
+    /// A tracker with the given sustained-pressure hold-down window.
+    pub fn new(hold_down: Duration) -> Self {
+        Self {
+            hold_down,
+            over_since: None,
+        }
+    }
+
+    /// Fold one observation into the tracker and return the current verdict.
+    ///
+    /// `over_threshold` is whether the disk is currently over its pressure
+    /// limit; `now` is injected so tests control time. Dropping back under the
+    /// threshold resets the clock, so the next spell starts its window afresh.
+    pub fn observe(&mut self, over_threshold: bool, now: Instant) -> ResignationVerdict {
+        if !over_threshold {
+            self.over_since = None;
+            return ResignationVerdict::Hold;
+        }
+        let since = *self.over_since.get_or_insert(now);
+        if now.duration_since(since) >= self.hold_down {
+            ResignationVerdict::Resign
+        } else {
+            ResignationVerdict::Hold
+        }
+    }
+
+    /// Whether pressure is currently sustained past the window (the last
+    /// verdict was `Resign`), without folding a new observation.
+    pub fn is_resigning(&self, now: Instant) -> bool {
+        self.over_since
+            .is_some_and(|since| now.duration_since(since) >= self.hold_down)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -243,5 +314,57 @@ mod tests {
         );
 
         assert_eq!(result.files_pruned, 0);
+    }
+
+    // -- resignation state machine (12b.2 T3) ------------------------------
+
+    #[test]
+    fn resignation_holds_until_window_elapses() {
+        let t0 = Instant::now();
+        let mut tracker = DiskPressureResignation::new(Duration::from_secs(30));
+
+        // Over threshold, but only just: still inside the hold-down window.
+        assert_eq!(tracker.observe(true, t0), ResignationVerdict::Hold);
+        let t1 = t0 + Duration::from_secs(10);
+        assert_eq!(tracker.observe(true, t1), ResignationVerdict::Hold);
+    }
+
+    #[test]
+    fn resignation_fires_after_sustained_pressure() {
+        let t0 = Instant::now();
+        let mut tracker = DiskPressureResignation::new(Duration::from_secs(30));
+        tracker.observe(true, t0);
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(tracker.observe(true, t1), ResignationVerdict::Resign);
+        assert!(tracker.is_resigning(t1));
+    }
+
+    #[test]
+    fn dropping_under_threshold_resets_the_window() {
+        let t0 = Instant::now();
+        let mut tracker = DiskPressureResignation::new(Duration::from_secs(30));
+        tracker.observe(true, t0);
+
+        // Disk recovers before the window elapses: the clock resets.
+        let t1 = t0 + Duration::from_secs(20);
+        assert_eq!(tracker.observe(false, t1), ResignationVerdict::Hold);
+
+        // Pressure returns: it must wait out the full window again, so 20s
+        // after the return (40s after the very first spell) is still Hold.
+        let t2 = t1 + Duration::from_secs(1);
+        tracker.observe(true, t2);
+        let t3 = t2 + Duration::from_secs(20);
+        assert_eq!(tracker.observe(true, t3), ResignationVerdict::Hold);
+    }
+
+    #[test]
+    fn never_over_threshold_never_resigns() {
+        let t0 = Instant::now();
+        let mut tracker = DiskPressureResignation::new(Duration::from_secs(1));
+        for i in 0..100 {
+            let now = t0 + Duration::from_secs(i);
+            assert_eq!(tracker.observe(false, now), ResignationVerdict::Hold);
+        }
+        assert!(!tracker.is_resigning(t0 + Duration::from_secs(100)));
     }
 }

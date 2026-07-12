@@ -62,7 +62,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (2268 and counting)
+make test                    # run all tests (2368 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -111,7 +111,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**2,330 tests in the default suite** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). Phase 13 adds the interactive Relish terminal UI, backed by live event and log WebSockets. A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. The Phase 12b control-plane pass (12b.2) gave every node a gossip-published directory of leader endpoints, so clusters now reconcile and report past the seven-voter council and through leader failover (proven by a gated 9-node acceptance suite, `RELIABURGER_CLUSTER_TESTS=1`); the same pass carried node labels over authenticated gossip, gave the scheduler one reservation cache per planning pass (so co-scheduled apps can't double-book a node), converged daemon sets against eligible nodes, and fixed the autoscale lifecycle (validated bounds, commit-before-cooldown, stale-override clearing). See [progress.md](docs/progress.md) for the full checklist.
+**2,368 tests in the default suite** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM, and the gated cluster suites under `RELIABURGER_CLUSTER_TESTS=1`). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). Phase 13 adds the interactive Relish terminal UI, backed by live event and log WebSockets. A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. The Phase 12b control-plane pass (12b.2) gave every node a gossip-published directory of leader endpoints, so clusters now reconcile and report past the seven-voter council and through leader failover; the same pass carried node labels over authenticated gossip, gave the scheduler one reservation cache per planning pass (so co-scheduled apps can't double-book a node), converged daemon sets against eligible nodes, fixed the autoscale lifecycle (validated bounds, commit-before-cooldown, stale-override clearing), and added **council disaster recovery** — encrypted external state backups, an operator `relish council recover` path for full-council loss, and disk-pressure voter resignation (all proven by gated acceptance suites, `RELIABURGER_CLUSTER_TESTS=1`). See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -130,6 +130,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 | 14. Self-Upgrade | Done | 1,880 |
 | 12. Optimisations | Done | 1,981 |
 | 13. Relish TUI | Done | 2,268 |
+| 12b.2 Cluster convergence | Done | 2,368 |
 
 Phase 14 (rolling binary upgrades) landed ahead of 12 and 13: `relish
 upgrade start v0.2.0` rolls a live cluster onto a new dual-signed binary —

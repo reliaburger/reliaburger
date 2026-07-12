@@ -296,6 +296,14 @@ pub struct CouncilObservation<'a> {
     pub replication: &'a BTreeMap<u64, Option<u64>>,
     /// True while a joint-consensus membership change is still committing.
     pub change_in_flight: bool,
+    /// Voter ids that have reported sustained disk pressure and want to
+    /// resign (12b.2 T3). The planner treats a pressured *follower* voter as
+    /// replaceable-but-not-yet-evictable: it grows a healthy replacement in
+    /// first (add-before-remove) and only evicts the pressured seat once the
+    /// replacement is a voter and quorum can spare it. A pressured *leader*
+    /// deposes itself via `trigger().elect()` before it ever appears here as
+    /// an ordinary voter, so the planner never has to remove a leader.
+    pub disk_pressured: &'a BTreeSet<u64>,
 }
 
 /// Plan the single next membership action for the council.
@@ -360,6 +368,12 @@ pub fn plan_council_action(
         return CouncilAction::Nothing;
     }
 
+    // A non-leader voter under sustained disk pressure wants to resign. It
+    // still holds its seat and still votes, so it's treated as a soft-dead
+    // voter: replace it add-before-remove, evict it last, and never below
+    // quorum. An empty `disk_pressured` set leaves every rule below unchanged.
+    let pressured = |id: u64| id != leader_id && observation.disk_pressured.contains(&id);
+
     let dead_voters: Vec<u64> = voters
         .iter()
         .copied()
@@ -368,10 +382,18 @@ pub fn plan_council_action(
     // A voter that is merely flapping (dead inside the window) still holds
     // its seat: only confirmed-dead seats count as open.
     let seated = voters.len() - dead_voters.len();
+    // A pressured voter that is not already counted as dead also frees a seat
+    // for growth, so a healthy replacement is brought in before it resigns.
+    let pressured_alive_voters = voters
+        .iter()
+        .filter(|id| pressured(**id) && !dead_past_window(**id))
+        .count();
+    let effective_seated = seated.saturating_sub(pressured_alive_voters);
 
     // 1. Promote the best caught-up, stably-alive learner while a healthy
-    //    seat is free (growth below the cap, or a dead voter to replace).
-    if seated < config.max_council_size {
+    //    seat is free (growth below the cap, a dead voter, or a resigning
+    //    pressured voter to replace).
+    if effective_seated < config.max_council_size {
         for id in observation.candidates {
             if observation.learners.contains(id)
                 && stable_alive(*id)
@@ -392,12 +414,28 @@ pub fn plan_council_action(
         }
     }
 
+    // 2b. Evict a resigning pressured voter, but only once a healthy
+    //     replacement has landed so the council still has enough seats. It is
+    //     evicted last (after any dead voter above) and only while quorum and
+    //     the minimum size survive the shrink — hysteresis against churn is
+    //     the sustained-pressure window the caller applies before flagging it.
+    if let Some(id) = voters.iter().copied().find(|id| pressured(*id)) {
+        let shrunk = voters.len() - 1;
+        // "Healthy replacement present" == the surviving voters (minus the
+        // pressured one) are still at least the minimum council size, so the
+        // council doesn't shrink below its floor by letting it go.
+        if shrunk >= config.min_council_size && alive_voters.saturating_sub(1) >= majority(shrunk) {
+            return CouncilAction::RemoveVoter(id);
+        }
+    }
+
     // 3. Bring a replacement in as a learner (add-before-remove) when open
-    //    seats are not already covered by a live learner catching up.
+    //    seats are not already covered by a live learner catching up. A
+    //    resigning pressured voter's seat counts as open here too.
     let live_learners = observation.learners.iter().filter(|id| alive(**id)).count();
     let open_seats = config
         .max_council_size
-        .saturating_sub(seated + live_learners);
+        .saturating_sub(effective_seated + live_learners);
     if open_seats > 0 {
         for id in observation.candidates {
             if !observation.learners.contains(id) && !voters.contains(id) && stable_alive(*id) {
@@ -1012,6 +1050,7 @@ mod tests {
         leader_last_log_index: Option<u64>,
         replication: BTreeMap<u64, Option<u64>>,
         change_in_flight: bool,
+        disk_pressured: BTreeSet<u64>,
     }
 
     impl PlannerFixture {
@@ -1026,6 +1065,7 @@ mod tests {
                     leader_last_log_index: self.leader_last_log_index,
                     replication: &self.replication,
                     change_in_flight: self.change_in_flight,
+                    disk_pressured: &self.disk_pressured,
                 },
                 config,
                 now,
@@ -1049,6 +1089,7 @@ mod tests {
             leader_last_log_index: Some(100),
             replication: BTreeMap::from([(2, Some(100)), (3, Some(100))]),
             change_in_flight: false,
+            disk_pressured: BTreeSet::new(),
         }
     }
 
@@ -1248,11 +1289,72 @@ mod tests {
             leader_last_log_index: Some(10),
             replication: BTreeMap::new(),
             change_in_flight: false,
+            disk_pressured: BTreeSet::new(),
         };
         assert_eq!(
             fixture.plan(&heal_config(), now),
             CouncilAction::AddLearner(4)
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Disk-pressure resignation tests (12b.2 T3)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn planner_grows_replacement_for_a_disk_pressured_voter() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        // Voter 3 is a healthy follower under sustained disk pressure. It's
+        // still alive, so the planner brings in a replacement first rather
+        // than evicting it outright.
+        fixture.disk_pressured.insert(3);
+        assert_eq!(
+            fixture.plan(&heal_config(), now),
+            CouncilAction::AddLearner(4)
+        );
+    }
+
+    #[test]
+    fn planner_evicts_a_pressured_voter_once_replacement_seated() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        // A four-voter council with one pressured seat: the replacement (4) is
+        // already a voter, so the pressured voter (3) can resign without
+        // dropping below the minimum size.
+        fixture.voters.insert(4);
+        fixture.health.insert(4, alive_for(now, 600));
+        fixture.replication.insert(4, Some(100));
+        fixture.disk_pressured.insert(3);
+        fixture.candidates = vec![5];
+        assert_eq!(
+            fixture.plan(&heal_config(), now),
+            CouncilAction::RemoveVoter(3)
+        );
+    }
+
+    #[test]
+    fn planner_holds_pressured_eviction_below_min_size() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        // Three voters, one pressured, but no spare to grow into: evicting
+        // would shrink 3 -> 2, below the minimum. The planner must wait.
+        fixture.disk_pressured.insert(3);
+        fixture.candidates = Vec::new();
+        fixture.health.remove(&4);
+        fixture.health.remove(&5);
+        assert_eq!(fixture.plan(&heal_config(), now), CouncilAction::Nothing);
+    }
+
+    #[test]
+    fn planner_never_resigns_the_leader_for_disk_pressure() {
+        let now = Instant::now();
+        let mut fixture = healthy_three(now);
+        // Even if the leader itself is flagged (it shouldn't be — a pressured
+        // leader deposes itself first), the planner never removes it.
+        fixture.disk_pressured.insert(1);
+        let action = fixture.plan(&heal_config(), now);
+        assert_ne!(action, CouncilAction::RemoveVoter(1));
     }
 
     // -------------------------------------------------------------------
@@ -1386,6 +1488,7 @@ mod tests {
                 matched_seeds in proptest::collection::vec(proptest::option::of(0u64..1000), 16),
                 leader_last in proptest::option::of(0u64..1000),
                 change_in_flight in proptest::bool::ANY,
+                pressure_seeds in proptest::collection::vec(proptest::bool::ANY, 16),
             ) {
                 let now = Instant::now();
                 let config = heal_config();
@@ -1400,9 +1503,13 @@ mod tests {
 
                 let mut health = HashMap::new();
                 let mut replication = BTreeMap::new();
+                let mut disk_pressured = BTreeSet::new();
                 for (i, id) in voters.iter().chain(learners.iter()).chain(candidates.iter()).enumerate() {
                     health.insert(*id, health_from_seed(health_seeds[i % health_seeds.len()], now));
                     replication.insert(*id, matched_seeds[i % matched_seeds.len()]);
+                    if pressure_seeds[i % pressure_seeds.len()] {
+                        disk_pressured.insert(*id);
+                    }
                 }
 
                 let observation = CouncilObservation {
@@ -1414,6 +1521,7 @@ mod tests {
                     leader_last_log_index: leader_last,
                     replication: &replication,
                     change_in_flight,
+                    disk_pressured: &disk_pressured,
                 };
 
                 let action = plan_council_action(&observation, &config, now);
@@ -1451,11 +1559,27 @@ mod tests {
                     CouncilAction::RemoveVoter(id) => {
                         prop_assert_ne!(id, leader_id, "planner removed the leader");
                         prop_assert!(voters.contains(&id));
-                        prop_assert!(dead_past_window(id), "evicted a voter inside the window");
-                        // Quorum safety in both the old and new configs.
+                        // Minimum-size safety holds for every eviction.
                         prop_assert!(voters.len() > config.min_council_size);
                         prop_assert!(alive_voters >= majority(voters.len()));
-                        prop_assert!(alive_voters >= majority(voters.len() - 1));
+
+                        if dead_past_window(id) {
+                            // A dead voter is not counted in `alive_voters`, so
+                            // the survivors already form the shrunken majority.
+                            prop_assert!(alive_voters >= majority(voters.len() - 1));
+                        } else {
+                            // The only other reason to evict a live voter is a
+                            // disk-pressure resignation (12b.2 T3). It *is*
+                            // counted in `alive_voters`, so removing it drops
+                            // the count by one — quorum must survive that.
+                            prop_assert!(
+                                disk_pressured.contains(&id),
+                                "evicted a voter that was neither dead nor pressured"
+                            );
+                            prop_assert!(
+                                alive_voters.saturating_sub(1) >= majority(voters.len() - 1)
+                            );
+                        }
                     }
                     CouncilAction::RemoveLearner(id) => {
                         prop_assert_ne!(id, leader_id);

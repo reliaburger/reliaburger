@@ -614,10 +614,37 @@ whole theme lands.
     to three healthy voters with writes committing throughout and the leader never removed,
     a learner killed mid-catch-up (Raft-layer partition) blocks no healthy replacement, and
     a flapping node inside the window causes zero churn.
-- [ ] **Council disaster recovery** — implement full-council-loss recovery, encrypted
-  external backup/restore, explicit reconstruction thresholds and disk-pressure council
-  resignation. Exercise black-box loss/recovery rather than only candidate-selection helpers
-  (D21/CP12).
+- [x] **Council disaster recovery** — full-council-loss recovery, encrypted external
+  backup/restore, explicit reconstruction thresholds and disk-pressure council resignation.
+  Black-box loss/recovery exercised, not just candidate-selection helpers (D21/CP12).
+  - [x] Encrypted external backup: leader-only periodic export of the state-machine snapshot
+    (`src/council/backup.rs`), sealed with an HKDF-derived key
+    (`reliaburger-council-backup-seal-v1`) + AES-256-GCM over the #83 snapshot payload,
+    uploaded via `object_store` (`file://`/`s3://`/`gs://`) with retention pruning.
+    `[cluster.backup] { url, interval_secs, retain }`, off by default. Tests: seal→tamper
+    refuses, round-trip restores identical `DesiredState`, retention prunes oldest, disabled
+    by default, store upload/list/prune/latest.
+  - [x] Full-council-loss recovery (`src/council/recovery.rs`): `relish council recover
+    --data-dir --from <url> [--master-key] [--force]` restores from a sealed backup or the
+    node's own durable snapshot, refuses when a live voter answers (unless `--force`), wipes
+    the dead cluster's log, and stamps a **new recovery epoch** into `DesiredState`. Next
+    start re-bootstraps a single-voter Raft that the #88 reconciler regrows. Tests:
+    state-machine restore + re-bootstrap, live-council refusal guard, epoch bump across
+    repeated recoveries.
+  - [x] Explicit reconstruction thresholds: `[reconstruction]` gains bounds validation
+    (`0 < coverage ≤ 100`, positive timeouts), validated at bun startup; the recovery path
+    and the leadership edge share the same values. Tests: config parse + bounds.
+  - [x] Disk-pressure council resignation: a sustained-pressure state machine with hysteresis
+    (`src/bun/disk_pressure.rs`); a new `disk_pressured` planner input replaces a pressured
+    follower add-before-remove (never below quorum — the existing proptest holds with the new
+    input); a pressured leader deposes itself first via the verified `trigger().elect()`
+    mechanism. Tests: resignation windowing, planner pressure cases, gated leader-deposition.
+  - [x] Verified openraft 0.9 `trigger().elect()` deposes the current leader (gated step-0
+    test) — no version bump needed.
+  - [x] Gated black-box acceptance (`tests/council_disaster_recovery.rs`,
+    `RELIABURGER_CLUSTER_TESTS=1`): three voters + backup, kill all three, recover on a
+    survivor, council re-forms with restored state and a fresh epoch and regrows; plus a
+    reconciler-driven leader-deposition-under-pressure test.
 - [x] **Scheduler truth, labels, quotas and autoscaling** — advertise authenticated node
   labels/resources; use one mutable reservation cache per planning pass; revalidate
   generation, resources, labels, readiness and cordon; converge daemon workloads against

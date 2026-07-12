@@ -669,6 +669,57 @@ impl CouncilStateMachine {
         })
     }
 
+    /// Build an in-memory state machine seeded with a restored `DesiredState`
+    /// for disaster recovery (12b.2 D21/CP12).
+    ///
+    /// The restored state comes from an external backup (or a survivor's own
+    /// durable snapshot). Its `last_applied_log` and `last_membership` are
+    /// cleared so the fresh single-voter Raft that wraps this state machine
+    /// starts a clean log rather than inheriting the dead cluster's term line.
+    /// The recovery epoch is bumped so post-recovery state is distinguishable
+    /// from anything issued before the loss.
+    pub fn from_recovered_state(mut state: DesiredState) -> Self {
+        state.recovery_epoch = state.recovery_epoch.saturating_add(1);
+        // A recovered node re-bootstraps its own Raft: the old log id and
+        // membership belong to the cluster that died, so we drop them and let
+        // `initialize` establish a fresh term line and voter set.
+        state.last_applied_log = None;
+        state.last_membership = Default::default();
+
+        let inner = StateMachineInner {
+            state,
+            ..StateMachineInner::default()
+        };
+        Self {
+            inner: Arc::new(RwLock::new(inner)),
+        }
+    }
+
+    /// Offline disaster recovery (12b.2 D21/CP12): stamp a restored
+    /// `DesiredState` into the durable snapshot store at `snapshot_db`,
+    /// bumping the recovery epoch and clearing the dead cluster's log id and
+    /// membership. The next node start loads this snapshot via
+    /// [`CouncilStateMachine::with_store`] and re-bootstraps a fresh Raft.
+    ///
+    /// The write uses the same enveloped format (version + checksum) as a
+    /// normal snapshot, so nothing downstream can tell a recovered snapshot
+    /// from an ordinary one except by the bumped `recovery_epoch`.
+    // `redb::Error` is large but dictated by the crate; boxing it buys nothing.
+    #[allow(clippy::result_large_err)]
+    pub fn persist_recovered_snapshot(
+        snapshot_db: &Database,
+        mut state: DesiredState,
+    ) -> Result<(), redb::Error> {
+        state.recovery_epoch = state.recovery_epoch.saturating_add(1);
+        state.last_applied_log = None;
+        state.last_membership = StoredMembership::default();
+        // Serialisation of a plain struct with only owned data is infallible in
+        // practice; map any error into a redb error rather than panicking.
+        let data = serde_json::to_vec(&state)
+            .map_err(|e| redb::Error::Io(std::io::Error::other(e.to_string())))?;
+        persist_snapshot(snapshot_db, &data, 1)
+    }
+
     /// Read the current desired state.
     pub async fn desired_state(&self) -> DesiredState {
         self.inner.read().await.state.clone()

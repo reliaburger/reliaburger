@@ -103,6 +103,10 @@ pub struct ClusterParams {
     /// client certificates and peers are dialled over mTLS. `None` keeps the
     /// internal transports plaintext (the caller enforces `require_mtls`).
     pub identity: Option<Arc<crate::sesame::identity_store::NodeIdentity>>,
+    /// Encrypted external council backup (`[cluster.backup]`, 12b.2 D21/CP12).
+    /// The leader-only export loop runs when `url` is set and a master key is
+    /// available to seal with.
+    pub backup: crate::council::backup::BackupConfig,
     /// This node's placement labels (`[node] labels` in node.toml).
     /// Advertised (bounded) via the gossip directory so remote members can
     /// filter on them and zone-aware council selection has real input (CP7).
@@ -359,6 +363,26 @@ pub async fn start(
         self_info,
         shutdown.clone(),
     );
+
+    // Encrypted external council backup (12b.2 D21/CP12): a leader-only export
+    // loop, only when a destination is configured and a master key is present
+    // to seal with. Without the master key there is nothing to derive the seal
+    // key from, so we skip it loudly rather than shipping plaintext state.
+    if params.backup.enabled() {
+        match params.wrapping_ikm {
+            Some(master_key) => {
+                tokio::spawn(crate::council::backup::run_backup_loop(
+                    Arc::clone(&council),
+                    master_key,
+                    params.backup.clone(),
+                    shutdown.clone(),
+                ));
+            }
+            None => eprintln!(
+                "cluster: council backup configured but no master key available; backups disabled"
+            ),
+        }
+    }
 
     // --- Reporting tree (flat star: every node reports to the leader) ---
     let reporting_offset = params.reporting_port as i32 - params.raft_port as i32;
@@ -779,6 +803,38 @@ pub fn spawn_council_reconciler_with_config(
     config: CouncilReconcilerConfig,
     shutdown: CancellationToken,
 ) {
+    // No disk-pressure signal: the reconciler behaves exactly as before this
+    // theme. Dropping the sender is fine — `watch::Receiver::borrow` keeps
+    // returning the initial empty set after the sender is gone.
+    let (_pressure_tx, pressure_rx) = watch::channel(BTreeSet::new());
+    spawn_council_reconciler_with_pressure(
+        council,
+        membership_rx,
+        pressure_rx,
+        port_offset,
+        self_id,
+        self_info,
+        config,
+        shutdown,
+    );
+}
+
+/// As [`spawn_council_reconciler_with_config`], plus a `disk_pressured_rx`
+/// carrying the Raft ids of voters (including possibly this node) that have
+/// resigned under sustained disk pressure (12b.2 T3). The leader feeds this
+/// set to the planner so a pressured follower is replaced add-before-remove,
+/// and if this node is the pressured leader it deposes itself first.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_council_reconciler_with_pressure(
+    council: Arc<CouncilNode>,
+    membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    disk_pressured_rx: watch::Receiver<BTreeSet<u64>>,
+    port_offset: i32,
+    self_id: u64,
+    self_info: CouncilNodeInfo,
+    config: CouncilReconcilerConfig,
+    shutdown: CancellationToken,
+) {
     tokio::spawn(async move {
         let mut tracker = HealthTracker::default();
         let mut tick = tokio::time::interval(config.tick_interval);
@@ -786,6 +842,7 @@ pub fn spawn_council_reconciler_with_config(
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tick.tick() => {
+                    let disk_pressured = disk_pressured_rx.borrow().clone();
                     reconcile_council_once(
                         &council,
                         &membership_rx,
@@ -794,6 +851,7 @@ pub fn spawn_council_reconciler_with_config(
                         &self_info,
                         &config,
                         &mut tracker,
+                        &disk_pressured,
                     )
                     .await;
                 }
@@ -803,6 +861,7 @@ pub fn spawn_council_reconciler_with_config(
 }
 
 /// One reconciler tick: observe, plan, execute at most one action.
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_council_once(
     council: &CouncilNode,
     membership_rx: &watch::Receiver<Vec<MembershipSnapshot>>,
@@ -811,6 +870,7 @@ async fn reconcile_council_once(
     self_info: &CouncilNodeInfo,
     config: &CouncilReconcilerConfig,
     tracker: &mut HealthTracker,
+    disk_pressured: &BTreeSet<u64>,
 ) {
     let now = Instant::now();
     let snapshot = membership_rx.borrow().clone();
@@ -859,7 +919,42 @@ async fn reconcile_council_once(
         .collect();
     let health = tracker.observe(&present, &tracked, now);
 
+    // Leader disk-pressure resignation (12b.2 T3). openraft 0.9 has no
+    // graceful leadership transfer, and a node can only trigger an election on
+    // *itself*. So the pressured leader can't hand off directly; instead the
+    // chosen healthy follower campaigns. A follower's election at a higher term
+    // deposes the pressured leader by Raft's own rules, after which the ex-
+    // leader is an ordinary voter the new leader's planner replaces. Runs on
+    // followers (before the leader gate) so exactly the deposition target acts.
+    let current_leader = metrics.current_leader;
+    if let Some(leader) = current_leader
+        && leader != self_id
+        && disk_pressured.contains(&leader)
+        && pick_deposition_target(&voters, &health, leader) == Some(self_id)
+    {
+        match council.raft().trigger().elect().await {
+            Ok(()) => eprintln!(
+                "council reconciler: voter {self_id} campaigning to depose disk-pressured leader {leader}"
+            ),
+            Err(e) => eprintln!(
+                "council reconciler: voter {self_id} failed to trigger deposition election: {e}"
+            ),
+        }
+        return;
+    }
+
     if !council.is_leader().await {
+        return;
+    }
+
+    // A pressured leader never plans its own removal; it waits for a follower
+    // to depose it (above), then gets replaced as an ordinary voter.
+    if disk_pressured.contains(&self_id) {
+        if pick_deposition_target(&voters, &health, self_id).is_none() {
+            eprintln!(
+                "council reconciler: leader {self_id} under disk pressure but no healthy voter to hand off to; holding"
+            );
+        }
         return;
     }
 
@@ -882,9 +977,26 @@ async fn reconcile_council_once(
         leader_last_log_index: metrics.last_log_index,
         replication: &replication,
         change_in_flight,
+        disk_pressured,
     };
     let action = plan_council_action(&observation, &config.selection, now);
     execute_council_action(council, action, &voters, &directory, config.op_timeout).await;
+}
+
+/// Pick a healthy voter (not the leader itself) for the leader to hand off to
+/// when resigning under disk pressure. Prefers a stably-alive voter; returns
+/// `None` when the leader is the only viable voter, in which case resignation
+/// waits rather than risking an election no one can win.
+fn pick_deposition_target(
+    voters: &BTreeSet<u64>,
+    health: &HashMap<u64, crate::council::selection::MemberHealth>,
+    leader_id: u64,
+) -> Option<u64> {
+    use crate::council::selection::MemberHealth;
+    voters
+        .iter()
+        .copied()
+        .find(|id| *id != leader_id && matches!(health.get(id), Some(MemberHealth::Alive { .. })))
 }
 
 /// Execute a single planner action against the council, bounded by
@@ -1056,6 +1168,7 @@ mod tests {
         // tick performs at most one membership action.
         let config = fast_reconciler_config();
         let mut tracker = HealthTracker::default();
+        let no_pressure = BTreeSet::new();
         let expected: BTreeSet<u64> = names.iter().map(|n| raft_id_from_name(n)).collect();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1067,6 +1180,7 @@ mod tests {
                 &self_info,
                 &config,
                 &mut tracker,
+                &no_pressure,
             )
             .await;
 
@@ -1168,6 +1282,7 @@ mod tests {
         let mut tracker = HealthTracker::default();
         // A couple of ticks with an empty gossip view: the single-voter
         // council must stay exactly as it is.
+        let no_pressure = BTreeSet::new();
         for _ in 0..3 {
             reconcile_council_once(
                 &council,
@@ -1177,6 +1292,7 @@ mod tests {
                 &self_info,
                 &config,
                 &mut tracker,
+                &no_pressure,
             )
             .await;
         }
