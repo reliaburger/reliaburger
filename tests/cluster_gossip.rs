@@ -102,6 +102,7 @@ async fn start_node_with_mayo(
             // Fast rollups so tests observe delivery quickly.
             rollup_interval: Duration::from_millis(300),
             identity: None,
+            labels: std::collections::BTreeMap::new(),
         },
         shutdown.clone(),
     )

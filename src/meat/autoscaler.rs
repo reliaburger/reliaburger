@@ -31,28 +31,93 @@ pub struct AutoscaleConfig {
     pub scale_down_threshold: f64,
 }
 
+/// Why an `[autoscale]` block is invalid. Surfaced at config validation
+/// so a bad block fails the deploy loudly instead of silently clamping
+/// (DEP8: `min > max` used to be quietly clamped, hiding operator error).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum AutoscaleConfigError {
+    #[error("autoscale target {target:?} is not a valid percentage or fraction")]
+    InvalidTarget { target: String },
+    #[error("autoscale min ({min}) must not exceed max ({max})")]
+    MinExceedsMax { min: u32, max: u32 },
+    #[error("autoscale max must be at least 1")]
+    ZeroMax,
+    #[error("autoscale {field} {value:?} is not a valid duration")]
+    InvalidDuration { field: &'static str, value: String },
+    #[error("autoscale {field} must be positive")]
+    ZeroDuration { field: &'static str },
+    #[error("autoscale scale_down_threshold ({value}) must be between 0 and 1")]
+    InvalidThreshold { value: f64 },
+}
+
 impl AutoscaleConfig {
-    /// Parse from an `AutoscaleSpec`, applying defaults for optional fields.
-    pub fn from_spec(spec: &AutoscaleSpec) -> Option<Self> {
-        let target = parse_percentage(&spec.target)?;
-        Some(Self {
+    /// Parse and validate from an `AutoscaleSpec`, applying defaults for
+    /// optional fields. Rejects `min > max`, a zero max, unparseable or
+    /// zero windows/cooldowns, and an out-of-range hysteresis threshold —
+    /// an invalid block is an error, never a silent clamp (DEP8).
+    pub fn from_spec(spec: &AutoscaleSpec) -> Result<Self, AutoscaleConfigError> {
+        let target =
+            parse_percentage(&spec.target).ok_or_else(|| AutoscaleConfigError::InvalidTarget {
+                target: spec.target.clone(),
+            })?;
+        if spec.max == 0 {
+            return Err(AutoscaleConfigError::ZeroMax);
+        }
+        if spec.min > spec.max {
+            return Err(AutoscaleConfigError::MinExceedsMax {
+                min: spec.min,
+                max: spec.max,
+            });
+        }
+        // The evaluation window must be positive (a zero-length averaging
+        // window is meaningless). Cooldown MAY be zero — that legitimately
+        // means "no cooldown, scale as soon as the metric warrants".
+        let evaluation_window = parse_bounded_duration(
+            "evaluation_window",
+            spec.evaluation_window.as_deref(),
+            300,
+            false,
+        )?;
+        let cooldown = parse_bounded_duration("cooldown", spec.cooldown.as_deref(), 180, true)?;
+        let scale_down_threshold = spec.scale_down_threshold.unwrap_or(0.8);
+        if !(0.0..=1.0).contains(&scale_down_threshold) {
+            return Err(AutoscaleConfigError::InvalidThreshold {
+                value: scale_down_threshold,
+            });
+        }
+        Ok(Self {
             metric: spec.metric.clone(),
             target,
             min: spec.min,
             max: spec.max,
-            evaluation_window: spec
-                .evaluation_window
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(Duration::from_secs(300)),
-            cooldown: spec
-                .cooldown
-                .as_deref()
-                .and_then(parse_duration)
-                .unwrap_or(Duration::from_secs(180)),
-            scale_down_threshold: spec.scale_down_threshold.unwrap_or(0.8),
+            evaluation_window,
+            cooldown,
+            scale_down_threshold,
         })
     }
+}
+
+/// Parse an optional duration string, defaulting to `default_secs` when
+/// absent. An unparseable duration is always an error. A zero duration is
+/// an error unless `allow_zero` (cooldown may legitimately be zero — "scale
+/// with no wait" — but a zero averaging window is meaningless).
+fn parse_bounded_duration(
+    field: &'static str,
+    value: Option<&str>,
+    default_secs: u64,
+    allow_zero: bool,
+) -> Result<Duration, AutoscaleConfigError> {
+    let Some(raw) = value else {
+        return Ok(Duration::from_secs(default_secs));
+    };
+    let parsed = parse_duration(raw).ok_or_else(|| AutoscaleConfigError::InvalidDuration {
+        field,
+        value: raw.to_string(),
+    })?;
+    if parsed.is_zero() && !allow_zero {
+        return Err(AutoscaleConfigError::ZeroDuration { field });
+    }
+    Ok(parsed)
 }
 
 /// Per-app autoscale state tracked by the controller.
@@ -476,6 +541,94 @@ mod tests {
         assert_eq!(config.evaluation_window, Duration::from_secs(300));
         assert_eq!(config.cooldown, Duration::from_secs(180));
         assert_eq!(config.scale_down_threshold, 0.8);
+    }
+
+    #[test]
+    fn from_spec_rejects_min_greater_than_max() {
+        let spec = AutoscaleSpec {
+            metric: "cpu".to_string(),
+            target: "70%".to_string(),
+            min: 10,
+            max: 3,
+            evaluation_window: None,
+            cooldown: None,
+            scale_down_threshold: None,
+        };
+        assert_eq!(
+            AutoscaleConfig::from_spec(&spec).unwrap_err(),
+            AutoscaleConfigError::MinExceedsMax { min: 10, max: 3 },
+            "min>max must be a validation error, not a silent clamp"
+        );
+    }
+
+    #[test]
+    fn from_spec_rejects_zero_and_unparseable_windows() {
+        let base = AutoscaleSpec {
+            metric: "cpu".to_string(),
+            target: "70%".to_string(),
+            min: 1,
+            max: 5,
+            evaluation_window: None,
+            cooldown: None,
+            scale_down_threshold: None,
+        };
+        // A zero evaluation window is meaningless and rejected...
+        let zero_window = AutoscaleSpec {
+            evaluation_window: Some("0s".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            AutoscaleConfig::from_spec(&zero_window).unwrap_err(),
+            AutoscaleConfigError::ZeroDuration {
+                field: "evaluation_window"
+            }
+        );
+        // ...but a zero cooldown is legitimate ("scale with no wait").
+        let zero_cooldown = AutoscaleSpec {
+            cooldown: Some("0s".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            AutoscaleConfig::from_spec(&zero_cooldown).unwrap().cooldown,
+            Duration::ZERO
+        );
+        let garbage = AutoscaleSpec {
+            evaluation_window: Some("soon".to_string()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            AutoscaleConfig::from_spec(&garbage),
+            Err(AutoscaleConfigError::InvalidDuration {
+                field: "evaluation_window",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn from_spec_rejects_zero_max_and_bad_threshold() {
+        let base = AutoscaleSpec {
+            metric: "cpu".to_string(),
+            target: "70%".to_string(),
+            min: 0,
+            max: 0,
+            evaluation_window: None,
+            cooldown: None,
+            scale_down_threshold: None,
+        };
+        assert_eq!(
+            AutoscaleConfig::from_spec(&base).unwrap_err(),
+            AutoscaleConfigError::ZeroMax
+        );
+        let bad_threshold = AutoscaleSpec {
+            max: 5,
+            scale_down_threshold: Some(1.5),
+            ..base
+        };
+        assert!(matches!(
+            AutoscaleConfig::from_spec(&bad_threshold),
+            Err(AutoscaleConfigError::InvalidThreshold { .. })
+        ));
     }
 
     #[test]

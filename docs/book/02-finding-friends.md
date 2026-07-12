@@ -1991,6 +1991,16 @@ The durable Raft log and the council's TCP RPC both used bincode, a compact bina
 
 The bug had hidden for months because the only tests that wrote an `AppSpec` to Raft used a single-node, in-memory cluster — no serialization to disk, no replication over the wire. The moment a real three-node cluster tried to replicate an app-spec entry to a follower, the follower couldn't decode the RPC, never acked, and the write stalled. The snapshot code had actually hit this earlier and quietly switched to JSON; the log and RPC paths never got the memo. Now they have. The lesson the review keeps teaching: "library-only" doesn't just mean unused features — it means untriggered bugs, waiting for the first real caller.
 
+### A cache you rebuild per decision is a cache that lies between decisions
+
+The scheduler's cluster-state cache is the whole reason replicas of a single app spread out: place one, reserve its resources in the cache, and the next replica sees a node that's now fuller. That works beautifully *within* one app. But the leader schedules every app in the cluster on each tick, and the first wiring built a fresh cache for each app in the loop.
+
+Picture two apps deployed in the same tick, each wanting 600m of CPU, and a node with 1000m free. App A plans against a fresh cache, sees 1000m, lands on the node. App B plans against *another* fresh cache — also showing 1000m, because A's reservation lived and died inside A's cache — and lands on the same node. Now 1200m is booked onto 1000m of hardware. Neither app is wrong on its own; together they overcommit, and nobody noticed because each planned in isolation.
+
+The fix is one mutable reservation cache per planning *pass*, not per app. Build the cache once from gossip and reports, then plan every app against it in turn; each committed placement subtracts from the shared cache before the next app plans. App B now sees the 600m A already took and looks elsewhere — or, if there's nowhere else, is honestly refused rather than quietly stacked. The Rust wrinkle: the `Scheduler` *owns* its cache (no shared `&mut` aliasing allowed), so the pass hands the cache in with `std::mem::take` and takes it back out afterwards — a move in, a move out, no borrow that outlives the call.
+
+Two more validations ride the same pass. Nodes mid-binary-upgrade are *cordoned* — marked not-ready in the cache before filtering, so a node being replaced takes no new work (the upgrade helper from Chapter 14 finally has a caller). And because the Raft write that commits a placement is `async`, a node can die between planning and committing; before each commit the pass re-checks the *latest* membership and drops any placement whose target has left. Plan against a snapshot, commit against the present.
+
 ## What we built
 
 Take a step back and look at what happened in this chapter. We started with a single-node container agent and turned it into a distributed system.

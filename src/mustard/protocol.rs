@@ -67,6 +67,10 @@ pub struct MustardNode<T: MustardTransport> {
     /// stamped on every outgoing datagram. `None` until the runtime wires
     /// them in — then no extension is sent (pre-12b.2 behaviour).
     advertised: Option<(SocketAddr, SocketAddr)>,
+    /// This node's placement labels, advertised (bounded) on every
+    /// datagram alongside the endpoints so remote members learn them
+    /// (CP7). Empty until the runtime wires them in.
+    advertised_labels: BTreeMap<String, String>,
     /// The local leader hint: `Some` only while THIS node is the Raft
     /// leader (published by the cluster runtime). Everyone else relays the
     /// best hint they have heard instead.
@@ -100,6 +104,7 @@ impl<T: MustardTransport> MustardNode<T> {
             last_published_digest: Vec::new(),
             seeds: Vec::new(),
             advertised: None,
+            advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
@@ -107,13 +112,22 @@ impl<T: MustardTransport> MustardNode<T> {
     }
 
     /// Advertise this node's control-plane endpoints (API and reporting
-    /// ports on the gossip IP). From here on, every outgoing datagram
-    /// carries a directory extension, and the local directory can resolve
-    /// this node's own endpoints.
-    pub fn set_advertised_endpoints(&mut self, api_port: u16, reporting_port: u16) {
+    /// ports on the gossip IP) and placement labels. From here on, every
+    /// outgoing datagram carries a directory extension, and the local
+    /// directory and membership resolve this node's own endpoints and
+    /// labels. Labels are bounded on the wire (see
+    /// [`bounded_labels`](super::message::bounded_labels)); the local copy
+    /// keeps the full set.
+    pub fn set_advertised_endpoints(
+        &mut self,
+        api_port: u16,
+        reporting_port: u16,
+        labels: BTreeMap<String, String>,
+    ) {
         let api_address = SocketAddr::new(self.address.ip(), api_port);
         let reporting_address = SocketAddr::new(self.address.ip(), reporting_port);
         self.advertised = Some((api_address, reporting_address));
+        self.advertised_labels = labels.clone();
         self.directory.endpoints.insert(
             self.node_id.clone(),
             super::directory::NodeEndpoints {
@@ -121,6 +135,15 @@ impl<T: MustardTransport> MustardNode<T> {
                 reporting_address,
             },
         );
+        self.directory
+            .labels
+            .insert(self.node_id.clone(), labels.clone());
+        // Keep our own membership record's labels in sync so a snapshot of
+        // the local table already carries them (the scheduler reads labels
+        // from the membership snapshot).
+        if let Some(member) = self.membership.get_mut(&self.node_id) {
+            member.labels = labels;
+        }
         self.publish_directory();
     }
 
@@ -161,6 +184,7 @@ impl<T: MustardTransport> MustardNode<T> {
             api_address,
             reporting_address,
             leader,
+            labels: super::message::bounded_labels(&self.advertised_labels),
             hmac: [0u8; 32],
         })
     }
@@ -172,8 +196,17 @@ impl<T: MustardTransport> MustardNode<T> {
     }
 
     /// Fold a received extension into the directory and publish on change.
+    /// The extension's labels are also mirrored onto the stamping node's
+    /// membership record, so a membership snapshot carries them for the
+    /// scheduler (a `MembershipUpdate` never has).
     fn ingest_extension(&mut self, extension: &DirectoryExtension) {
-        if self.directory.observe(extension) {
+        let changed = self.directory.observe(extension);
+        if let Some(member) = self.membership.get_mut(&extension.node_id)
+            && member.labels != extension.labels
+        {
+            member.labels = extension.labels.clone();
+        }
+        if changed {
             self.publish_directory();
         }
     }
@@ -434,6 +467,17 @@ impl<T: MustardTransport> MustardNode<T> {
             BTreeMap::new(),
             now,
         );
+
+        // Mirror the freshly-registered sender's advertised labels onto its
+        // membership record. `ingest_extension` above ran before `add_node`,
+        // so a first-contact sender wouldn't yet have a record to label;
+        // do it here now the record exists.
+        if let Some(extension) = &message.extension
+            && let Some(member) = self.membership.get_mut(&extension.node_id)
+            && member.labels != extension.labels
+        {
+            member.labels = extension.labels.clone();
+        }
 
         // Disseminate newly discovered nodes so the whole cluster learns
         if is_new {
@@ -1304,7 +1348,7 @@ mod tests {
 
         let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
         let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
-        node2.set_advertised_endpoints(9117, 9445);
+        node2.set_advertised_endpoints(9117, 9445, BTreeMap::new());
         node1.add_seed(NodeId::new("n2"), addr(2));
 
         let shutdown = CancellationToken::new();
@@ -1342,9 +1386,9 @@ mod tests {
         let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
         let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
         let mut node3 = MustardNode::new(NodeId::new("n3"), addr(3), fast_config(), t3);
-        node1.set_advertised_endpoints(9117, 9445);
-        node2.set_advertised_endpoints(9127, 9455);
-        node3.set_advertised_endpoints(9137, 9465);
+        node1.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        node2.set_advertised_endpoints(9127, 9455, BTreeMap::new());
+        node3.set_advertised_endpoints(9137, 9465, BTreeMap::new());
 
         let hint = LeaderHint {
             node_id: NodeId::new("n1"),
@@ -1406,6 +1450,7 @@ mod tests {
             api_address: addr(1),
             reporting_address: addr(2),
             leader: Some(hint.clone()),
+            labels: BTreeMap::new(),
             hmac: [0u8; 32],
         };
 
@@ -1445,7 +1490,7 @@ mod tests {
         let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
         let (tx, rx) = watch::channel(NodeDirectory::default());
         node.set_directory_watch(tx);
-        node.set_advertised_endpoints(9117, 9445);
+        node.set_advertised_endpoints(9117, 9445, BTreeMap::new());
 
         // Own endpoints published immediately.
         assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n1")));
@@ -1460,10 +1505,61 @@ mod tests {
             api_address: addr(9127),
             reporting_address: addr(9455),
             leader: None,
+            labels: BTreeMap::new(),
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), msg).await;
         assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n2")));
+    }
+
+    #[tokio::test]
+    async fn advertised_labels_reach_a_remote_member_via_gossip() {
+        // n2 advertises a zone label; n1 probes it and must learn that
+        // label on n2's membership record — the wire path that makes
+        // label filtering and zone-aware council selection live (CP7).
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node2.set_advertised_endpoints(
+            9117,
+            9445,
+            BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
+        );
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        let shutdown = CancellationToken::new();
+        let shutdown2 = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            node2.run(shutdown2).await;
+            node2
+        });
+
+        node1.run_one_cycle().await;
+        shutdown.cancel();
+        let _ = handle.await;
+
+        let member = node1
+            .membership
+            .get(&NodeId::new("n2"))
+            .expect("n1 should know n2");
+        assert_eq!(
+            member.labels.get("zone").map(String::as_str),
+            Some("us-east"),
+            "n1 must learn n2's advertised zone label from gossip"
+        );
+        // The directory carries it too (what council selection reads).
+        assert_eq!(
+            node1
+                .directory()
+                .labels
+                .get(&NodeId::new("n2"))
+                .and_then(|l| l.get("zone"))
+                .map(String::as_str),
+            Some("us-east")
+        );
     }
 
     // -- graceful leave -------------------------------------------------------

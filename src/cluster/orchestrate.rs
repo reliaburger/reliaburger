@@ -23,7 +23,6 @@ use crate::config::{Config, Replicas};
 use crate::council::node::CouncilNode;
 use crate::council::types::{CouncilNodeInfo, RaftRequest};
 use crate::meat::cluster_state::{ClusterStateCache, SchedulerNodeState};
-use crate::meat::scheduler::Scheduler;
 use crate::meat::types::{NodeId, Resources};
 use crate::mustard::membership::MembershipSnapshot;
 use crate::mustard::state::NodeState;
@@ -130,55 +129,159 @@ pub fn spawn_leader_scheduler(
 
             let alive: HashSet<NodeId> = alive.into_iter().collect();
 
-            for (app_id, spec) in &desired.apps {
-                // Effective replicas = autoscale override (L3) if the
-                // autoscaler set one, else the spec/config baseline.
-                let override_replicas = desired
-                    .autoscale_overrides
-                    .iter()
-                    .find(|(k, _)| k == &app_id.to_string())
-                    .map(|(_, n)| *n);
-                let want = effective_replicas(spec, override_replicas, alive.len());
-                let placements_ok = desired
-                    .scheduling
-                    .get(app_id)
-                    .map(|placements| {
-                        placements.len() == want
-                            && placements.iter().all(|p| alive.contains(&p.node_id))
-                    })
-                    .unwrap_or(false);
-                if placements_ok {
-                    continue;
-                }
+            // Build the cache ONCE per tick, cordon mid-upgrade nodes, and
+            // plan every app against a single mutable reservation view so
+            // apps planned in the same pass reserve against each other. The
+            // old code rebuilt a fresh cache per app, so two apps that
+            // together exceeded one node's headroom both landed on it — a
+            // cache you rebuild per decision is a cache that lies between
+            // decisions (CP8).
+            let mut cache = build_cluster_cache(&members, &reports);
+            if cache.node_count() == 0 {
+                // No node has reported capacity yet; scheduling against
+                // unknown capacity would place blindly.
+                continue;
+            }
+            crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
 
-                let cache = build_cluster_cache(&members, &reports);
-                if cache.node_count() == 0 {
-                    // No node has reported capacity yet; scheduling
-                    // against unknown capacity would place blindly.
+            // Quotas are injected. Namespace resources are not desired state
+            // until T6, so the production table is empty today and every app
+            // is admitted; the enforcement seam is wired and tested here.
+            let mut quotas = crate::meat::quota::QuotaLedger::default();
+
+            let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+
+            for decision in decisions {
+                // Revalidate against the LATEST membership before the async
+                // Raft write: a node that died between planning and commit
+                // (or between two commits in this pass) must not receive the
+                // placement. `members`/`reports` were snapshotted at the top
+                // of the tick; membership can move under a slow write.
+                let live: HashSet<NodeId> = membership_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == NodeState::Alive)
+                    .map(|m| m.node_id.clone())
+                    .collect();
+                if !decision
+                    .placements
+                    .iter()
+                    .all(|p| live.contains(&p.node_id))
+                {
+                    eprintln!(
+                        "scheduler: dropping stale placement for {} (a target node left mid-pass)",
+                        decision.app_id
+                    );
                     continue;
                 }
-                // Feed the scheduler the effective replica count.
-                let mut effective_spec = spec.clone();
-                if let Some(n) = override_replicas {
-                    effective_spec.replicas = Replicas::Fixed(n);
-                }
-                let mut scheduler = Scheduler::new(cache);
-                match scheduler.schedule_app(app_id, &effective_spec) {
-                    Ok(decision) => {
-                        if let Err(e) = council
-                            .write(RaftRequest::SchedulingDecision(decision))
-                            .await
-                        {
-                            eprintln!("scheduler: failed to commit placement for {app_id}: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("scheduler: cannot place {app_id}: {e}");
-                    }
+                if let Err(e) = council
+                    .write(RaftRequest::SchedulingDecision(decision.clone()))
+                    .await
+                {
+                    eprintln!(
+                        "scheduler: failed to commit placement for {}: {e}",
+                        decision.app_id
+                    );
                 }
             }
         }
     });
+}
+
+/// Plan placements for one scheduling tick against a single mutable
+/// reservation cache.
+///
+/// For every desired app whose current placements are missing, wrongly
+/// sized, or on a now-ineligible node, this runs the scheduler and
+/// records the decision. Each committed decision reserves its resources
+/// in `cache` before the next app plans, so apps in the same pass reserve
+/// against each other (the CP8 double-booking fix). Daemon apps converge
+/// against the currently eligible nodes: they gain an instance as a node
+/// becomes eligible and lose one as a node leaves or is cordoned, because
+/// the scheduler re-plans a daemon set over the live filtered node list
+/// each tick.
+///
+/// `quotas` gates admission cumulatively per namespace (empty in
+/// production until T6 feeds it).
+fn plan_scheduling_pass(
+    cache: &mut ClusterStateCache,
+    desired: &crate::council::types::DesiredState,
+    alive: &HashSet<NodeId>,
+    quotas: &mut crate::meat::quota::QuotaLedger,
+) -> Vec<crate::meat::types::SchedulingDecision> {
+    use crate::meat::scheduler::Scheduler;
+
+    let mut decisions = Vec::new();
+    // A stable order so a pass is deterministic (HashMap iteration isn't).
+    let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
+    app_ids.sort_by_key(|a| a.to_string());
+
+    for app_id in &app_ids {
+        let Some(spec) = desired.apps.get(app_id) else {
+            continue;
+        };
+        let override_replicas = desired
+            .autoscale_overrides
+            .iter()
+            .find(|(k, _)| k == &app_id.to_string())
+            .map(|(_, n)| *n);
+        let want = effective_replicas(spec, override_replicas, alive.len());
+
+        // Already converged? A placement is only OK if it targets a node
+        // that is still alive (a departed/cordoned node's placement is
+        // stale and forces a re-plan — daemon convergence and node loss).
+        let placements_ok = desired
+            .scheduling
+            .get(app_id)
+            .map(|placements| {
+                placements.len() == want && placements.iter().all(|p| alive.contains(&p.node_id))
+            })
+            .unwrap_or(false);
+        if placements_ok {
+            continue;
+        }
+
+        // Quota admission (cumulative within the pass). A rejection is a
+        // deploy-time error surfaced through the log, not a silent skip
+        // that leaves the app forever pending without explanation.
+        let per_replica = scheduler_resources(spec);
+        let is_new_app = !desired.scheduling.contains_key(app_id);
+        if !quotas.is_empty()
+            && let Err(e) =
+                quotas.try_admit(&app_id.namespace, &per_replica, want as u32, is_new_app)
+        {
+            eprintln!("scheduler: quota rejects {app_id}: {e}");
+            continue;
+        }
+
+        // Feed the scheduler the effective replica count. The scheduler
+        // reserves into the SHARED cache, so the next app sees this app's
+        // footprint.
+        let mut effective_spec = spec.clone();
+        if let Some(n) = override_replicas {
+            effective_spec.replicas = Replicas::Fixed(n);
+        }
+        // The scheduler owns its cache, so hand it the shared one and take
+        // it back afterwards (Rust move semantics — no shared &mut alias).
+        let mut scheduler = Scheduler::new(std::mem::take(cache));
+        let result = scheduler.schedule_app(app_id, &effective_spec);
+        *cache = scheduler.cluster;
+        match result {
+            Ok(decision) => decisions.push(decision),
+            Err(e) => eprintln!("scheduler: cannot place {app_id}: {e}"),
+        }
+    }
+    decisions
+}
+
+/// The per-replica resources an app requests, for quota accounting. Mirrors
+/// the scheduler's `extract_resources` (request values, zero when unset).
+fn scheduler_resources(spec: &AppSpec) -> Resources {
+    Resources::new(
+        spec.cpu.as_ref().map(|r| r.request).unwrap_or(0),
+        spec.memory.as_ref().map(|r| r.request).unwrap_or(0),
+        spec.gpu.unwrap_or(0),
+    )
 }
 
 /// The replica count the scheduler should target for an app: the
@@ -230,8 +333,14 @@ pub fn spawn_autoscaler(
                 let Some(autoscale) = &spec.autoscale else {
                     continue;
                 };
-                let Some(config) = AutoscaleConfig::from_spec(autoscale) else {
-                    continue;
+                let config = match AutoscaleConfig::from_spec(autoscale) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        // Config validation catches this on apply, so a bad
+                        // block shouldn't reach here — log and skip if it does.
+                        eprintln!("autoscaler: invalid [autoscale] for {app_id}: {e}");
+                        continue;
+                    }
                 };
 
                 // Baseline the tracker at the current effective replica
@@ -246,9 +355,15 @@ pub fn spawn_autoscaler(
                         Replicas::DaemonSet => continue, // daemon sets don't autoscale
                     });
 
-                // Metric utilisation for this app over the last window.
-                let Some(metric) =
-                    app_metric_utilisation(&rollup_store, &config.metric, &app_id.name).await
+                // Metric utilisation for this app over the CONFIGURED window
+                // (was hardcoded to five minutes regardless of the spec).
+                let Some(metric) = app_metric_utilisation(
+                    &rollup_store,
+                    &config.metric,
+                    &app_id.name,
+                    config.evaluation_window,
+                )
+                .await
                 else {
                     continue; // no data yet
                 };
@@ -259,8 +374,12 @@ pub fn spawn_autoscaler(
                 // (another leader may have scaled while we were a follower).
                 state.current_replicas = baseline;
                 if let Some(decision) = evaluate(app_id, &config, state, metric, now) {
-                    tracker.apply_decision(&decision, now);
-                    if let Err(e) = council
+                    // Commit FIRST, start the cooldown only after the write
+                    // succeeds (DEP8). The old code applied the decision —
+                    // and thus started the cooldown — before the Raft write,
+                    // so a failed write would suppress the next real attempt
+                    // for a whole cooldown while nothing actually scaled.
+                    match council
                         .write(RaftRequest::AutoscaleOverride {
                             app_id: app_id.clone(),
                             replicas: decision.to,
@@ -268,7 +387,10 @@ pub fn spawn_autoscaler(
                         })
                         .await
                     {
-                        eprintln!("autoscaler: failed to commit override for {app_id}: {e}");
+                        Ok(_) => tracker.apply_decision(&decision, now),
+                        Err(e) => {
+                            eprintln!("autoscaler: failed to commit override for {app_id}: {e}")
+                        }
                     }
                 }
             }
@@ -276,8 +398,9 @@ pub fn spawn_autoscaler(
     });
 }
 
-/// Average utilisation of `metric` for `app` over the recent window,
-/// as a fraction, from the leader's rollup store.
+/// Average utilisation of `metric` for `app` over the given `window`,
+/// as a fraction, from the leader's rollup store. The window comes from
+/// the app's `[autoscale] evaluation_window`, not a hardcoded default.
 ///
 /// Returns `None` when there's no data. The value is interpreted as a
 /// utilisation fraction (0.0–1.0) to compare against the autoscale
@@ -286,12 +409,13 @@ async fn app_metric_utilisation(
     rollup_store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
     metric: &str,
     app: &str,
+    window: Duration,
 ) -> Option<f64> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    let window_start = now.saturating_sub(300); // last 5 minutes
+    let window_start = now.saturating_sub(window.as_secs());
 
     let store = rollup_store.read().await;
     let aggregates = store
@@ -617,7 +741,8 @@ mod tests {
             w.flush().await.unwrap();
         }
 
-        let value = app_metric_utilisation(&store, "cpu", "web").await;
+        let window = Duration::from_secs(300);
+        let value = app_metric_utilisation(&store, "cpu", "web", window).await;
         assert!(
             value.is_some_and(|v| (v - 0.8).abs() < 1e-9),
             "expected mean utilisation 0.8, got {value:?}"
@@ -625,9 +750,181 @@ mod tests {
 
         // Unknown app → no data.
         assert!(
-            app_metric_utilisation(&store, "cpu", "other")
+            app_metric_utilisation(&store, "cpu", "other", window)
                 .await
                 .is_none()
+        );
+    }
+
+    // -- plan_scheduling_pass (CP8 reservation cache, daemon, quotas) ---------
+
+    use crate::council::types::DesiredState;
+    use crate::meat::quota::{NamespaceQuota, QuotaLedger};
+    use crate::meat::types::AppId;
+
+    fn sched_node(name: &str, cpu: u64, labels: BTreeMap<String, String>) -> SchedulerNodeState {
+        SchedulerNodeState {
+            node_id: NodeId::new(name),
+            allocatable: Resources::new(cpu, 8 * 1024 * 1024 * 1024, 0),
+            allocated: Resources::default(),
+            labels,
+            ready: true,
+            running_apps: Default::default(),
+            uptime_secs: 86400,
+            cached_images: Default::default(),
+        }
+    }
+
+    fn app_spec(cpu_request: u64, replicas: u32) -> AppSpec {
+        let mut spec: AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+        spec.replicas = Replicas::Fixed(replicas);
+        spec.cpu = Some(crate::config::types::ResourceRange {
+            request: cpu_request,
+            limit: cpu_request,
+        });
+        spec
+    }
+
+    /// CP8: two apps that together exceed one node's headroom must NOT both
+    /// land on it. The single shared reservation cache makes the second app
+    /// see the first app's footprint.
+    #[test]
+    fn two_apps_do_not_double_book_one_node() {
+        // One node with room for exactly one 600m replica (1000m total).
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("solo", 1000, BTreeMap::new()));
+
+        let mut desired = DesiredState::default();
+        let a = AppId::new("a", "prod");
+        let b = AppId::new("b", "prod");
+        desired.apps.insert(a.clone(), app_spec(600, 1));
+        desired.apps.insert(b.clone(), app_spec(600, 1));
+
+        let alive = HashSet::from([NodeId::new("solo")]);
+        let mut quotas = QuotaLedger::default();
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+
+        // App "a" fits; app "b" cannot (600 + 600 > 1000) — exactly one app
+        // is placed, the other is refused rather than double-booked.
+        assert_eq!(
+            decisions.len(),
+            1,
+            "second app must not double-book: {decisions:?}"
+        );
+        assert_eq!(decisions[0].app_id, a);
+    }
+
+    /// A cordoned (upgrade) node receives nothing.
+    #[test]
+    fn cordoned_node_receives_no_placement() {
+        let mut cache = ClusterStateCache::new();
+        let mut cordoned = sched_node("up", 4000, BTreeMap::new());
+        cordoned.ready = false; // apply_upgrade_cordon would set this
+        cache.set_node(cordoned);
+
+        let mut desired = DesiredState::default();
+        let a = AppId::new("a", "prod");
+        desired.apps.insert(a.clone(), app_spec(100, 1));
+
+        let alive = HashSet::from([NodeId::new("up")]);
+        let mut quotas = QuotaLedger::default();
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        assert!(
+            decisions.is_empty(),
+            "a cordoned node must not receive placements: {decisions:?}"
+        );
+    }
+
+    /// Daemon convergence: a daemon app fans out to every eligible node, so
+    /// adding a node grows the placement on the next pass.
+    #[test]
+    fn daemon_app_gains_a_placement_when_a_node_joins() {
+        let mut desired = DesiredState::default();
+        let a = AppId::new("mon", "system");
+        let mut spec = app_spec(100, 1);
+        spec.replicas = Replicas::DaemonSet;
+        desired.apps.insert(a.clone(), spec);
+
+        // First pass: two nodes.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(decisions[0].placements.len(), 2);
+        // Record the placement as committed.
+        desired
+            .scheduling
+            .insert(a.clone(), decisions[0].placements.clone());
+
+        // A node joins: the daemon must gain a third instance.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(
+            decisions[0].placements.len(),
+            3,
+            "daemon should gain a placement on the new node"
+        );
+    }
+
+    /// A placement whose node has left is stale, so the app is re-planned.
+    #[test]
+    fn departed_node_placement_is_replanned() {
+        let mut desired = DesiredState::default();
+        let a = AppId::new("web", "prod");
+        desired.apps.insert(a.clone(), app_spec(100, 1));
+        // Committed placement points at a node that is no longer alive.
+        desired.scheduling.insert(
+            a.clone(),
+            vec![crate::meat::types::Placement {
+                node_id: NodeId::new("gone"),
+                resources: Resources::new(100, 0, 0),
+            }],
+        );
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("live", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("live")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(decisions.len(), 1, "departed placement must be re-planned");
+        assert_eq!(decisions[0].placements[0].node_id, NodeId::new("live"));
+    }
+
+    /// Quota rejection: a namespace over its CPU budget gets its app refused.
+    #[test]
+    fn quota_over_budget_app_is_rejected() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("big", 10000, BTreeMap::new()));
+
+        let mut desired = DesiredState::default();
+        let a = AppId::new("greedy", "prod");
+        desired.apps.insert(a.clone(), app_spec(800, 2)); // 1600m requested
+
+        let quota = NamespaceQuota {
+            namespace: "prod".to_string(),
+            max_cpu_millicores: Some(1000),
+            max_memory_bytes: None,
+            max_gpus: None,
+            max_apps: None,
+            max_replicas: None,
+        };
+        let mut quotas = QuotaLedger::new(std::collections::HashMap::from([(
+            "prod".to_string(),
+            quota,
+        )]));
+
+        let alive = HashSet::from([NodeId::new("big")]);
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        assert!(
+            decisions.is_empty(),
+            "an app over its namespace quota must be refused: {decisions:?}"
         );
     }
 }

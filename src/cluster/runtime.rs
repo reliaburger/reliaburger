@@ -103,6 +103,10 @@ pub struct ClusterParams {
     /// client certificates and peers are dialled over mTLS. `None` keeps the
     /// internal transports plaintext (the caller enforces `require_mtls`).
     pub identity: Option<Arc<crate::sesame::identity_store::NodeIdentity>>,
+    /// This node's placement labels (`[node] labels` in node.toml).
+    /// Advertised (bounded) via the gossip directory so remote members can
+    /// filter on them and zone-aware council selection has real input (CP7).
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Open and validate the durable Raft stores under `raft_dir`.
@@ -194,7 +198,11 @@ pub async fn start(
     // how nodes OUTSIDE the Raft voter set learn who leads and where — local
     // Raft metrics only carry that for voters. The hint channel is fed by
     // the publisher task below once the council exists.
-    node.set_advertised_endpoints(params.api_port, params.reporting_port);
+    node.set_advertised_endpoints(
+        params.api_port,
+        params.reporting_port,
+        params.labels.clone(),
+    );
     let (leader_hint_tx, leader_hint_rx) = watch::channel::<Option<LeaderHint>>(None);
     node.set_leader_hint_watch(leader_hint_rx);
     let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
