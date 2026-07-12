@@ -189,6 +189,7 @@ async fn start_node(
         Some(Arc::clone(&membership_table)),
         None,
         api_port,
+        None,
     );
     let sd = shutdown.clone();
     tokio::spawn(async move {

@@ -43,7 +43,7 @@ impl TestHarness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let app = api::router(
-            cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117,
+            cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
         );
         let server_shutdown = shutdown.clone();
 

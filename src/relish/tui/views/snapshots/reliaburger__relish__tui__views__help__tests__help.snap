@@ -1,0 +1,43 @@
+---
+source: src/relish/tui/views/help.rs
+expression: "render_to_string(&app, 120, 40)"
+---
+ RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
+                                                                                                                        
+┌help──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│KEY             CONTEXT       ACTION                                                                                  │
+│a               global        apps                                                                                    │
+│n               global        nodes                                                                                   │
+│j               global        jobs                                                                                    │
+│e               global        events                                                                                  │
+│l               global        logs                                                                                    │
+│r               global        routes / refresh on lists                                                               │
+│s               global        search                                                                                  │
+│?               global        help                                                                                    │
+│:               global        command palette                                                                         │
+│q               global        back / quit                                                                             │
+│Esc             global        back                                                                                    │
+│Enter           lists         open selection                                                                          │
+│↑/↓             lists         move selection                                                                          │
+│/               lists         filter                                                                                  │
+│Tab             app detail    next tab                                                                                │
+│Shift-Tab       app detail    previous tab                                                                            │
+│f               logs          toggle follow                                                                           │
+│PgUp/PgDn       streams       scroll                                                                                  │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit

@@ -27,6 +27,7 @@ pub mod k8s_export;
 pub mod k8s_import;
 pub mod output;
 pub mod plan;
+pub mod tui;
 pub mod upgrade;
 
 pub use output::OutputFormat;
@@ -56,6 +57,10 @@ pub enum RelishError {
     /// The Bun agent is not reachable.
     #[error("bun agent not reachable at localhost:9117 (is it running?)")]
     AgentUnreachable,
+
+    /// A WebSocket connection or frame failed.
+    #[error("websocket: {0}")]
+    WebSocket(String),
 
     /// A command-line flag value could not be parsed.
     #[error("invalid --{flag} value: {reason}")]

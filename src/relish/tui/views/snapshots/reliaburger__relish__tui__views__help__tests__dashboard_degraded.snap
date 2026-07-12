@@ -1,0 +1,43 @@
+---
+source: src/relish/tui/views/help.rs
+expression: "render_to_string(&app, 120, 40)"
+---
+ RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
+                                                                                                                        
+┌dashboard─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Apps                                                                                                                  │
+│NAME                 NS           READY  STATUS       RESTARTS  PORTS                                                 │
+│app-2                default       2/2   running             0  8002,8002                                             │
+│web                  default       1/2   unhealthy           4  8000,8000                                             │
+│worker               default       2/2   running             0  8001,8001                                             │
+│                                                                                                                      │
+│Nodes                                                                                                                 │
+│node-1             alive      COUNCIL ★ LEADER                                                                        │
+│node-2             alive      COUNCIL                                                                                 │
+│node-3             alive      COUNCIL                                                                                 │
+│                                                                                                                      │
+│Recent events                                                                                                         │
+│15:05:40  Health  fixture event 1                                                                                     │
+│15:05:50  Health  fixture event 2                                                                                     │
+│15:06:00  Health  fixture event 3                                                                                     │
+│15:06:10  Health  fixture event 4                                                                                     │
+│15:06:20  Health  fixture event 5                                                                                     │
+│15:06:30  Deploy  fixture event 6                                                                                     │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit

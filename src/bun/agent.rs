@@ -94,6 +94,10 @@ pub enum AgentCommand {
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
     },
+    /// Get status of run-to-completion workload instances.
+    JobStatus {
+        response: oneshot::Sender<Vec<JobStatus>>,
+    },
     /// Get the image references of all current instances (for GC
     /// protection: actively deployed images must not be collected).
     ActiveImages {
@@ -303,6 +307,18 @@ pub struct InstanceStatus {
     pub pid: Option<u32>,
 }
 
+/// Status of a run-to-completion job instance, as returned by `/v1/jobs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub name: String,
+    pub namespace: String,
+    pub instance_id: String,
+    pub image: String,
+    pub state: String,
+    pub restart_count: u32,
+    pub age_seconds: u64,
+}
+
 /// Status of a single cluster node, as returned by the nodes API.
 ///
 /// Flat, wire-friendly representation of `NodeMembership`. Uses strings
@@ -471,6 +487,8 @@ pub struct BunAgent<G: Grill> {
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
+    /// Bounded lifecycle event history shared with the API.
+    events: Option<Arc<tokio::sync::RwLock<crate::bun::events::EventStore>>>,
     /// Schedulable CPU capacity (system total minus `[resources]`
     /// reserved), reported to the cluster. Zero until the binary sets it.
     capacity_cpu_millicores: u32,
@@ -497,6 +515,25 @@ pub struct BunAgent<G: Grill> {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
+    async fn record_event(
+        &self,
+        kind: crate::bun::events::EventKind,
+        severity: crate::bun::events::EventSeverity,
+        app: Option<String>,
+        namespace: Option<String>,
+        message: String,
+    ) {
+        let Some(events) = &self.events else { return };
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        events
+            .write()
+            .await
+            .record(timestamp, kind, severity, app, namespace, None, message);
+    }
+
     /// Create a new agent in single-node mode (no cluster).
     pub fn new(
         grill: G,
@@ -545,6 +582,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             log_tx: None,
+            events: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
@@ -610,6 +648,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             log_tx: None,
+            events: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
@@ -634,6 +673,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `relish logs` (which asks the runtime directly).
     pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
         self.log_tx = Some(log_tx);
+    }
+
+    /// Attach the cluster event store used by the TUI and events API.
+    pub fn set_event_store(
+        &mut self,
+        events: Arc<tokio::sync::RwLock<crate::bun::events::EventStore>>,
+    ) {
+        self.events = Some(events);
     }
 
     /// Get a shared handle to the ingress routing table.
@@ -1391,6 +1438,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         match cmd {
             AgentCommand::Deploy { config, events } => {
                 if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.record_event(
+                        crate::bun::events::EventKind::Deploy,
+                        crate::bun::events::EventSeverity::Critical,
+                        None,
+                        None,
+                        "deploy refused while node is draining".to_string(),
+                    )
+                    .await;
                     let _ = events
                         .send(ApplyEvent::Error {
                             message: "node is draining for a binary upgrade; retry shortly"
@@ -1399,7 +1454,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .await;
                     return;
                 }
-                self.deploy(config, &events).await;
+                let (forward_tx, mut forward_rx) = mpsc::channel(64);
+                let event_store = self.events.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = forward_rx.recv().await {
+                        if let ApplyEvent::Error { message } = &event
+                            && let Some(store) = &event_store
+                        {
+                            let timestamp = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            store.write().await.record(
+                                timestamp,
+                                crate::bun::events::EventKind::Deploy,
+                                crate::bun::events::EventSeverity::Critical,
+                                None,
+                                None,
+                                None,
+                                message.clone(),
+                            );
+                        }
+                        if events.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                self.deploy(config, &forward_tx).await;
             }
             AgentCommand::Stop {
                 app_name,
@@ -1411,6 +1492,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             AgentCommand::Status { response } => {
                 let statuses = self.get_status().await;
+                let _ = response.send(statuses);
+            }
+            AgentCommand::JobStatus { response } => {
+                let statuses = self.get_job_status();
                 let _ = response.send(statuses);
             }
             AgentCommand::ActiveImages { response } => {
@@ -2331,6 +2416,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
         let now = Instant::now();
         let mut all_ids = Vec::new();
+        let deployed_apps: Vec<(String, String)> = config
+            .app
+            .iter()
+            .map(|(name, spec)| {
+                (
+                    name.clone(),
+                    spec.namespace
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                )
+            })
+            .collect();
 
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
@@ -2944,6 +3041,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instances: all_ids,
             })
             .await;
+        for (app, namespace) in deployed_apps {
+            let count = self
+                .supervisor
+                .list_instances()
+                .iter()
+                .filter(|instance| instance.app_name == app && instance.namespace == namespace)
+                .count();
+            self.record_event(
+                crate::bun::events::EventKind::Deploy,
+                crate::bun::events::EventSeverity::Info,
+                Some(app.clone()),
+                Some(namespace),
+                format!("deployed app {app} ({count} instances)"),
+            )
+            .await;
+        }
     }
 
     /// Drive a newly created instance through the startup state machine.
@@ -4113,9 +4226,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Ok(Some(ContainerState::Unhealthy)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
                             let app = inst.app_name.clone();
+                            let namespace = inst.namespace.clone();
                             let _ =
                                 self.service_map
                                     .set_backend_health(&app, &instance_id.0, false);
+                            self.record_event(
+                                crate::bun::events::EventKind::Health,
+                                crate::bun::events::EventSeverity::Warning,
+                                Some(app.clone()),
+                                Some(namespace),
+                                format!("instance {} became unhealthy", instance_id.0),
+                            )
+                            .await;
                             health_changed_app = Some(app);
                         }
                     }
@@ -4126,8 +4248,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
 
                 // Handle restart if unhealthy
-                if let Ok(Some(ContainerState::Unhealthy)) = transition {
-                    let _ = self.supervisor.maybe_restart(&instance_id, now).await;
+                if let Ok(Some(ContainerState::Unhealthy)) = transition
+                    && self
+                        .supervisor
+                        .maybe_restart(&instance_id, now)
+                        .await
+                        .unwrap_or(false)
+                    && let Some(instance) = self.supervisor.get_instance(&instance_id)
+                {
+                    self.record_event(
+                        crate::bun::events::EventKind::Restart,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(instance.app_name.clone()),
+                        Some(instance.namespace.clone()),
+                        format!(
+                            "instance {} restarted (attempt {})",
+                            instance_id.0, instance.restart_count
+                        ),
+                    )
+                    .await;
                 }
             }
 
@@ -4177,6 +4316,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 if exit_code == Some(0) {
                     // Job completed successfully — stays in Stopped
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::JobCompleted,
+                            crate::bun::events::EventSeverity::Info,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!("job {} completed", instance.app_name),
+                        )
+                        .await;
+                    }
                     continue;
                 }
 
@@ -4184,6 +4333,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 match self.supervisor.maybe_restart(&id, now).await {
                     Ok(true) => {
                         // Now in Pending — drive_pending_restarts will handle it
+                        if let Some(instance) = self.supervisor.get_instance(&id) {
+                            self.record_event(
+                                crate::bun::events::EventKind::Restart,
+                                crate::bun::events::EventSeverity::Warning,
+                                Some(instance.app_name.clone()),
+                                Some(instance.namespace.clone()),
+                                format!(
+                                    "instance {} restarted (attempt {})",
+                                    id.0, instance.restart_count
+                                ),
+                            )
+                            .await;
+                        }
                     }
                     Ok(false) => {
                         // Backoff not elapsed — will retry on next tick
@@ -4194,6 +4356,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                         {
                             instance.state = s;
+                        }
+                        if let Some(instance) = self.supervisor.get_instance(&id) {
+                            self.record_event(
+                                crate::bun::events::EventKind::JobFailed,
+                                crate::bun::events::EventSeverity::Warning,
+                                Some(instance.app_name.clone()),
+                                Some(instance.namespace.clone()),
+                                format!("job {} failed", instance.app_name),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -4213,6 +4385,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             match self.supervisor.maybe_restart(&id, now).await {
                 Ok(true) => {
                     // Now in Pending — drive_pending_restarts will handle it
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::Restart,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "instance {} restarted (attempt {})",
+                                id.0, instance.restart_count
+                            ),
+                        )
+                        .await;
+                    }
                 }
                 Ok(false) => {
                     // Still in backoff
@@ -4222,6 +4407,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                     {
                         instance.state = s;
+                    }
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::JobFailed,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!("job {} failed", instance.app_name),
+                        )
+                        .await;
                     }
                 }
             }
@@ -4476,6 +4671,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.sync_firewall_ebpf().await;
         self.ingress_configs.remove(app_name);
         self.rebuild_routing_table().await;
+
+        self.record_event(
+            crate::bun::events::EventKind::Stop,
+            crate::bun::events::EventSeverity::Info,
+            Some(app_name.to_string()),
+            Some(namespace.to_string()),
+            format!("stopped app {app_name}"),
+        )
+        .await;
 
         Ok(())
     }
@@ -4920,6 +5124,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         statuses
+    }
+
+    fn get_job_status(&self) -> Vec<JobStatus> {
+        self.supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| instance.is_job)
+            .map(|instance| JobStatus {
+                name: instance.app_name.clone(),
+                namespace: instance.namespace.clone(),
+                instance_id: instance.id.0.clone(),
+                image: instance.image.clone(),
+                state: instance.state.to_string(),
+                restart_count: instance.restart_count,
+                age_seconds: instance.created_at.elapsed().as_secs(),
+            })
+            .collect()
     }
 
     /// Get logs for all instances of an app in a namespace.

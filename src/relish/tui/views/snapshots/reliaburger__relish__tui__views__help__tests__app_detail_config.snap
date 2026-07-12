@@ -1,0 +1,43 @@
+---
+source: src/relish/tui/views/help.rs
+expression: "render_to_string(&app, 120, 40)"
+---
+ RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
+                                                                                                                        
+┌app detail────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│web · default                                                                                                         │
+│ Overview  │  Instances  │  Logs  │  Metrics  │  Deploys  │ [Config]                                                  │
+│                                                                                                                      │
+│full resolved config is not exposed by the API                                                                        │
+│instances      2                                                                                                      │
+│host ports     [8000, 8000]                                                                                           │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit

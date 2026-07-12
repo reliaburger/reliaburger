@@ -112,6 +112,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Workload lifecycle.
     route(Post, "/v1/apply", Deployer),
     route(Get, "/v1/status", AnyToken),
+    route(Get, "/v1/jobs", AnyToken),
+    route(Get, "/v1/events", AnyToken),
+    route(Get, "/v1/ws/events", AnyToken),
+    route(Get, "/v1/ws/logs/{app}/{namespace}", AnyToken),
     route(Get, "/v1/status/{app}/{namespace}", AnyToken),
     route(Post, "/v1/stop/{app}/{namespace}", Deployer),
     route(Get, "/v1/logs/{app}/{namespace}", AnyToken),

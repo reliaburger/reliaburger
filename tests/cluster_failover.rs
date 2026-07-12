@@ -189,6 +189,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         Some(Arc::new(RwLock::new(Vec::new()))),
         None,
         api_port,
+        None,
     );
     let api_shutdown = shutdown.clone();
     tokio::spawn(async move {

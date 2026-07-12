@@ -1,0 +1,20 @@
+---
+source: src/relish/tui/views/help.rs
+assertion_line: 26
+expression: "render_to_string(&app, 60, 15)"
+---
+┌relish────────────────────────────────────────────────────┐
+│       terminal too small — resize to at least 80x24      │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
