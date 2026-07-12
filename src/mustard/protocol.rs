@@ -75,6 +75,11 @@ pub struct MustardNode<T: MustardTransport> {
     /// leader (published by the cluster runtime). Everyone else relays the
     /// best hint they have heard instead.
     leader_hint_rx: Option<watch::Receiver<Option<LeaderHint>>>,
+    /// This node's own sustained-disk-pressure verdict, published by the
+    /// cluster runtime (12b.2 T3). `true` stamps `disk_pressured` on every
+    /// outgoing extension so the leader learns this voter should resign.
+    /// `None` until wired — then the bit is always `false`.
+    disk_pressured_rx: Option<watch::Receiver<bool>>,
     /// Directory accumulated from received extensions.
     directory: NodeDirectory,
     /// Optional watch channel publishing the directory on change.
@@ -106,6 +111,7 @@ impl<T: MustardTransport> MustardNode<T> {
             advertised: None,
             advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
+            disk_pressured_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
         }
@@ -153,6 +159,14 @@ impl<T: MustardTransport> MustardNode<T> {
         self.leader_hint_rx = Some(rx);
     }
 
+    /// Wire this node's own disk-pressure verdict: the cluster runtime
+    /// publishes `true` once the node's disk has been over its threshold for
+    /// the whole hold-down window, and every outgoing extension then advertises
+    /// `disk_pressured` so the leader's reconciler can replace this voter.
+    pub fn set_disk_pressured_watch(&mut self, rx: watch::Receiver<bool>) {
+        self.disk_pressured_rx = Some(rx);
+    }
+
     /// Set the directory watch channel, publishing endpoint and leader-hint
     /// changes learned from gossip.
     pub fn set_directory_watch(&mut self, tx: watch::Sender<NodeDirectory>) {
@@ -179,12 +193,18 @@ impl<T: MustardTransport> MustardNode<T> {
             (Some(a), Some(b)) => Some(if a.term >= b.term { a } else { b }),
             (a, b) => a.or(b),
         };
+        let disk_pressured = self
+            .disk_pressured_rx
+            .as_ref()
+            .map(|rx| *rx.borrow())
+            .unwrap_or(false);
         Some(DirectoryExtension {
             node_id: self.node_id.clone(),
             api_address,
             reporting_address,
             leader,
             labels: super::message::bounded_labels(&self.advertised_labels),
+            disk_pressured,
             hmac: [0u8; 32],
         })
     }
@@ -1451,6 +1471,7 @@ mod tests {
             reporting_address: addr(2),
             leader: Some(hint.clone()),
             labels: BTreeMap::new(),
+            disk_pressured: false,
             hmac: [0u8; 32],
         };
 
@@ -1506,10 +1527,48 @@ mod tests {
             reporting_address: addr(9455),
             leader: None,
             labels: BTreeMap::new(),
+            disk_pressured: false,
             hmac: [0u8; 32],
         });
         node.handle_message(addr(2), msg).await;
         assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n2")));
+    }
+
+    #[tokio::test]
+    async fn advertised_disk_pressure_reaches_a_remote_member_via_gossip() {
+        // n2 advertises disk pressure; n1 probes it and must record n2 in its
+        // directory's `disk_pressured` set — the wire path the leader's
+        // reconciler reads to replace a pressured voter (12b.2 T3).
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node2.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let (pressure_tx, pressure_rx) = watch::channel(true);
+        node2.set_disk_pressured_watch(pressure_rx);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        let shutdown = CancellationToken::new();
+        let shutdown2 = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            node2.run(shutdown2).await;
+            node2
+        });
+
+        node1.run_one_cycle().await;
+        shutdown.cancel();
+        let _ = handle.await;
+        drop(pressure_tx);
+
+        assert!(
+            node1
+                .directory()
+                .disk_pressured
+                .contains(&NodeId::new("n2")),
+            "n1 must learn n2's advertised disk pressure from gossip"
+        );
     }
 
     #[tokio::test]

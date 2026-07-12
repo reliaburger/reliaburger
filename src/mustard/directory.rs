@@ -8,7 +8,7 @@
 //! lets a cluster grow past the Raft council: Raft metrics only tell voters
 //! who leads; the gossip directory tells everyone.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
 use crate::meat::NodeId;
@@ -34,6 +34,12 @@ pub struct NodeDirectory {
     /// label filtering and zone-aware council selection live for remote
     /// members — a `MembershipUpdate` never carried them (CP7).
     pub labels: HashMap<NodeId, BTreeMap<String, String>>,
+    /// Nodes advertising sustained disk pressure (12b.2 T3). A voter only sees
+    /// its own disk locally, so it advertises this bit over gossip; the leader
+    /// reads the set here to learn which OTHER voters must resign and be
+    /// replaced. A node drops out of the set the moment it re-advertises a
+    /// healthy disk.
+    pub disk_pressured: HashSet<NodeId>,
     /// Best known leader; terms only grow, so highest term wins.
     pub leader: Option<LeaderHint>,
 }
@@ -64,6 +70,16 @@ impl NodeDirectory {
                 true
             }
         };
+        // Disk pressure is a live, per-tick bit: add on set, remove on clear,
+        // reporting a change only when the membership of the set flips.
+        let was_pressured = self.disk_pressured.contains(&extension.node_id);
+        if extension.disk_pressured && !was_pressured {
+            self.disk_pressured.insert(extension.node_id.clone());
+            changed = true;
+        } else if !extension.disk_pressured && was_pressured {
+            self.disk_pressured.remove(&extension.node_id);
+            changed = true;
+        }
         if let Some(hint) = &extension.leader {
             changed |= self.observe_hint(hint);
         }
@@ -94,6 +110,7 @@ impl NodeDirectory {
         for node_id in reaped {
             self.endpoints.remove(node_id);
             self.labels.remove(node_id);
+            self.disk_pressured.remove(node_id);
         }
         self.endpoints.len() != before
     }
@@ -118,6 +135,7 @@ mod tests {
             reporting_address: addr(api + 1),
             leader,
             labels: BTreeMap::new(),
+            disk_pressured: false,
             hmac: [0u8; 32],
         }
     }
@@ -132,6 +150,19 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            disk_pressured: false,
+            hmac: [0u8; 32],
+        }
+    }
+
+    fn extension_with_disk_pressure(node: &str, api: u16, pressured: bool) -> DirectoryExtension {
+        DirectoryExtension {
+            node_id: NodeId::new(node),
+            api_address: addr(api),
+            reporting_address: addr(api + 1),
+            leader: None,
+            labels: BTreeMap::new(),
+            disk_pressured: pressured,
             hmac: [0u8; 32],
         }
     }
@@ -221,5 +252,26 @@ mod tests {
         dir.observe(&extension_with_labels("n1", 9117, &[("zone", "us-east")]));
         dir.prune(&[NodeId::new("n1")]);
         assert!(!dir.labels.contains_key(&NodeId::new("n1")));
+    }
+
+    #[test]
+    fn observe_tracks_disk_pressure_set_and_clear() {
+        let mut dir = NodeDirectory::default();
+        // Advertising pressure adds the node and reports a change.
+        assert!(dir.observe(&extension_with_disk_pressure("n1", 9117, true)));
+        assert!(dir.disk_pressured.contains(&NodeId::new("n1")));
+        // Same pressured state again: no change.
+        assert!(!dir.observe(&extension_with_disk_pressure("n1", 9117, true)));
+        // Recovering clears it and reports a change.
+        assert!(dir.observe(&extension_with_disk_pressure("n1", 9117, false)));
+        assert!(!dir.disk_pressured.contains(&NodeId::new("n1")));
+    }
+
+    #[test]
+    fn prune_drops_reaped_disk_pressure() {
+        let mut dir = NodeDirectory::default();
+        dir.observe(&extension_with_disk_pressure("n1", 9117, true));
+        dir.prune(&[NodeId::new("n1")]);
+        assert!(!dir.disk_pressured.contains(&NodeId::new("n1")));
     }
 }

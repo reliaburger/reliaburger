@@ -221,6 +221,17 @@ pub struct DirectoryExtension {
     /// always emit the field, so a mixed cluster converges on labels as
     /// the old nodes roll.
     pub labels: BTreeMap<String, String>,
+    /// Whether the stamping node's disk has been under sustained pressure long
+    /// enough that it should resign its council seat (12b.2 T3). A voter only
+    /// knows its OWN disk locally; advertising this bit is how the leader (who
+    /// runs the reconciler) learns which OTHER voters are pressured and must be
+    /// replaced. It rides the same trailing, position-versioned extension as
+    /// `labels`: a pre-field peer sends a shorter extension a newer decoder
+    /// drops, and new peers always emit the field, so a mixed cluster converges
+    /// as the old nodes roll. It sits before `hmac` for the same reason `labels`
+    /// does — the extension HMAC covers everything up to (and excluding) the
+    /// zeroed `hmac`, so a flipped `disk_pressured` bit fails verification.
+    pub disk_pressured: bool,
     /// HMAC-SHA256 over the carrying message's canonical bytes plus this
     /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
     pub hmac: [u8; 32],
@@ -467,6 +478,7 @@ mod tests {
                 reporting_address: SocketAddr::from(([10, 0, 0, 1], 9445)),
             }),
             labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
+            disk_pressured: false,
             hmac: [0u8; 32],
         }
     }
@@ -628,6 +640,90 @@ mod tests {
         // The shorter legacy extension hits EOF partway through the labels
         // map; the modern decoder rejects it rather than mis-reading.
         assert!(decoded.extension.is_none());
+    }
+
+    /// The exact wire shape a pre-`disk_pressured` (but post-labels) peer
+    /// serialises for the extension: labels, but no `disk_pressured` field.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LegacyLabelledDirectoryExtension {
+        node_id: NodeId,
+        api_address: SocketAddr,
+        reporting_address: SocketAddr,
+        leader: Option<LeaderHint>,
+        labels: BTreeMap<String, String>,
+        hmac: [u8; 32],
+    }
+
+    #[test]
+    fn extension_carries_disk_pressured_round_trip() {
+        let mut ext = an_extension();
+        ext.disk_pressured = true;
+        let mut msg = a_message();
+        msg.extension = Some(ext);
+        let datagram = encode_datagram(&msg).unwrap();
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert!(decoded.extension.unwrap().disk_pressured);
+    }
+
+    #[test]
+    fn new_peer_drops_a_pre_disk_pressured_extension_but_keeps_the_message() {
+        // A pre-`disk_pressured` peer's extension is one bool shorter. bincode
+        // is positional, so the modern decoder hits EOF where it expects the
+        // bool and drops the extension; the message body still parses. This is
+        // the same both-direction tolerance labels already relied on.
+        let msg = a_message();
+        let legacy_ext = LegacyLabelledDirectoryExtension {
+            node_id: NodeId::new("old"),
+            api_address: SocketAddr::from(([127, 0, 0, 1], 9117)),
+            reporting_address: SocketAddr::from(([127, 0, 0, 1], 9445)),
+            leader: None,
+            labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
+            hmac: [0u8; 32],
+        };
+        let mut datagram = bincode::serialize(&msg).unwrap();
+        datagram.extend(bincode::serialize(&legacy_ext).unwrap());
+
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded.sender, msg.sender);
+        assert!(decoded.extension.is_none());
+    }
+
+    #[test]
+    fn old_labelled_peer_parses_a_datagram_carrying_disk_pressured() {
+        // The reverse direction: a new peer's datagram (with `disk_pressured`)
+        // must still parse as the shorter pre-`disk_pressured` extension shape,
+        // ignoring the trailing bool. bincode's legacy `deserialize` ignores
+        // what it doesn't read, so labels come through and the extra byte is
+        // dropped.
+        let mut ext = an_extension();
+        ext.disk_pressured = true;
+        let mut msg = a_message();
+        msg.extension = Some(ext);
+        let datagram = encode_datagram(&msg).unwrap();
+
+        let body = bincode::serialize(&msg).unwrap();
+        let legacy: LegacyLabelledDirectoryExtension =
+            bincode::deserialize(&datagram[body.len()..]).unwrap();
+        assert_eq!(
+            legacy.labels.get("zone").map(String::as_str),
+            Some("us-east")
+        );
+    }
+
+    #[test]
+    fn signed_extension_rejects_a_flipped_disk_pressured_bit() {
+        let key = crate::sesame::mtls::gossip_hmac::derive_gossip_key(&[3u8; 32]);
+        let msg = a_message().signed(&key).unwrap();
+        let canonical = msg.canonical_bytes().unwrap();
+        let mut ext = an_extension();
+        ext.disk_pressured = false;
+        let signed = ext.signed(&key, &canonical).unwrap();
+        assert!(signed.verify_hmac(&key, &canonical));
+
+        // Flip only the disk-pressure bit: the HMAC must reject it.
+        let mut tampered = signed.clone();
+        tampered.disk_pressured = true;
+        assert!(!tampered.verify_hmac(&key, &canonical));
     }
 
     #[test]

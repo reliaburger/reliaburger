@@ -104,6 +104,7 @@ async fn start_node_with_mayo(
             identity: None,
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
+            self_disk_pressured_rx: None,
         },
         shutdown.clone(),
     )

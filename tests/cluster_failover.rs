@@ -116,6 +116,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
             identity: None,
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
+            self_disk_pressured_rx: None,
         },
         shutdown.clone(),
     )

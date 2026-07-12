@@ -140,6 +140,8 @@ fn cluster_params_from_config(
         identity,
         backup: config.cluster.backup.clone(),
         labels: config.node.labels.clone(),
+        // Wired in by the caller (run) once the disk-pressure channel exists.
+        self_disk_pressured_rx: None,
     })
 }
 
@@ -441,6 +443,13 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(9117);
 
+    // Disk-pressure resignation signal (12b.2 T3): the disk-pressure loop below
+    // publishes this node's own sustained-pressure verdict here; in cluster mode
+    // the runtime advertises it over gossip so the leader resigns and replaces a
+    // pressured voter. Created before the cluster block so the receiver can ride
+    // into ClusterParams.
+    let (disk_pressured_tx, disk_pressured_rx) = tokio::sync::watch::channel(false);
+
     let _cluster_runtime;
     // Cloned out of the ClusterHandle before it's moved into the agent, so the
     // API router can expose council-backed endpoints (JWKS, tokens, secrets).
@@ -465,6 +474,7 @@ async fn main() -> anyhow::Result<()> {
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
+        params.self_disk_pressured_rx = Some(disk_pressured_rx.clone());
         // Advertised via the gossip directory (12b.2): peers reach this
         // node's API at the port it actually listens on, not a derived one.
         params.api_port = api_port;
@@ -946,10 +956,18 @@ async fn main() -> anyhow::Result<()> {
             .name
             .clone()
             .unwrap_or_else(|| "local".to_string());
+        let dp_pressured_tx = disk_pressured_tx.clone();
         tokio::spawn(async move {
-            use reliaburger::bun::disk_pressure::check_and_relieve;
+            use reliaburger::bun::disk_pressure::{
+                DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
+            };
             use reliaburger::ketchup::export::ExportCheckpoint;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            let tick_period = std::time::Duration::from_secs(300);
+            let mut tick = tokio::time::interval(tick_period);
+            // Council resignation waits for two sustained ticks (~10 min) over
+            // the threshold before advertising, so a transient spike between
+            // export and prune doesn't churn the council (12b.2 T3).
+            let mut resignation = DiskPressureResignation::new(tick_period * 2);
             tick.tick().await; // skip first immediate tick
 
             let log_store_guard = dp_log_store.read().await;
@@ -1000,6 +1018,26 @@ async fn main() -> anyhow::Result<()> {
                                 metrics_result.files_pruned, metrics_result.bytes_reclaimed
                             );
                             mayo_checkpoint.save(&mayo_checkpoint_path).ok();
+                        }
+
+                        // Council resignation (12b.2 T3): if either store stays
+                        // over its threshold AFTER export-and-prune, the disk is
+                        // genuinely full, not just holding stale data. Sustained
+                        // long enough, advertise resignation so the leader
+                        // replaces this voter.
+                        let over_threshold = (log_max_bytes > 0
+                            && dir_parquet_size(&log_data_dir) > log_max_bytes)
+                            || (metrics_max_bytes > 0
+                                && dir_parquet_size(&mayo_data_dir) > metrics_max_bytes);
+                        let verdict = resignation.observe(over_threshold, std::time::Instant::now());
+                        let should_resign = verdict == ResignationVerdict::Resign;
+                        if *dp_pressured_tx.borrow() != should_resign {
+                            if should_resign {
+                                println!(
+                                    "bun: sustained disk pressure — advertising council resignation"
+                                );
+                            }
+                            let _ = dp_pressured_tx.send(should_resign);
                         }
                     }
                 }

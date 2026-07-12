@@ -479,6 +479,7 @@ mod tests {
             reporting_address: addr(9445),
             leader: None,
             labels: std::collections::BTreeMap::new(),
+            disk_pressured: false,
             hmac: [0u8; 32],
         }
     }

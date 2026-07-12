@@ -111,6 +111,12 @@ pub struct ClusterParams {
     /// Advertised (bounded) via the gossip directory so remote members can
     /// filter on them and zone-aware council selection has real input (CP7).
     pub labels: std::collections::BTreeMap<String, String>,
+    /// This node's own sustained-disk-pressure verdict (12b.2 T3). The bun
+    /// disk-pressure loop publishes `true` once the node's disk has been over
+    /// its threshold for the hold-down window; the runtime advertises the bit
+    /// over gossip so the leader's reconciler resigns and replaces this voter.
+    /// `None` (single-node / no disk-pressure loop) advertises "healthy".
+    pub self_disk_pressured_rx: Option<watch::Receiver<bool>>,
 }
 
 /// Open and validate the durable Raft stores under `raft_dir`.
@@ -209,6 +215,13 @@ pub async fn start(
     );
     let (leader_hint_tx, leader_hint_rx) = watch::channel::<Option<LeaderHint>>(None);
     node.set_leader_hint_watch(leader_hint_rx);
+    // Disk-pressure resignation signal (12b.2 T3): the bun disk-pressure loop
+    // publishes this node's own verdict, and gossip advertises it so the leader
+    // learns which OTHER voters are pressured. Without a producer we advertise a
+    // constant "healthy", the pre-theme behaviour.
+    if let Some(rx) = params.self_disk_pressured_rx.clone() {
+        node.set_disk_pressured_watch(rx);
+    }
     let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
     node.set_directory_watch(directory_tx);
     // The gossip node is spawned *after* the council is built, so a restarted
@@ -355,12 +368,28 @@ pub async fn start(
 
     let raft_metrics_rx = council.metrics();
 
-    spawn_council_reconciler(
+    // Disk-pressure resignation (12b.2 T3): a consumer task folds the gossip
+    // directory's advertised `disk_pressured` set (which peers OTHER than this
+    // one populate — a voter only sees its own disk locally) and the current
+    // voter set into the Raft-id set the reconciler acts on. Feeding gossip
+    // through this channel is what makes resignation engage in production; the
+    // reconciler used to receive a permanently empty set here.
+    let (disk_pressured_tx, disk_pressured_rx) = watch::channel(BTreeSet::new());
+    spawn_disk_pressure_consumer(
+        Arc::clone(&council),
+        directory_rx.clone(),
+        disk_pressured_tx,
+        shutdown.clone(),
+    );
+
+    spawn_council_reconciler_with_pressure(
         Arc::clone(&council),
         membership_rx.clone(),
+        disk_pressured_rx,
         port_offset,
         raft_id,
         self_info,
+        CouncilReconcilerConfig::default(),
         shutdown.clone(),
     );
 
@@ -860,6 +889,67 @@ pub fn spawn_council_reconciler_with_pressure(
     });
 }
 
+/// The Raft ids of current voters that gossip reports under sustained disk
+/// pressure (12b.2 T3).
+///
+/// A voter only ever knows its OWN disk locally, so it advertises the bit over
+/// gossip; here on the reconciler node we translate every pressured gossip name
+/// to its Raft id (the one mapping the rest of the runtime uses,
+/// [`identity::raft_id_from_name`]) and keep only those that are current
+/// voters. Non-voters under pressure aren't the council's problem, and a stale
+/// directory entry for a departed voter is filtered out by the voter check.
+pub fn pressured_voter_ids(directory: &NodeDirectory, voters: &BTreeSet<u64>) -> BTreeSet<u64> {
+    directory
+        .disk_pressured
+        .iter()
+        .map(|node_id| identity::raft_id_from_name(&node_id.0))
+        .filter(|rid| voters.contains(rid))
+        .collect()
+}
+
+/// Spawn the consumer that turns the gossip directory's advertised disk
+/// pressure into the Raft-id set the reconciler acts on (12b.2 T3).
+///
+/// It re-derives the set whenever the directory changes and republishes only on
+/// a genuine change, so the reconciler's `watch` doesn't churn. Runs on every
+/// node; the set only matters where the reconciler is the leader, but computing
+/// it everywhere keeps a freshly elected leader from starting blind.
+pub fn spawn_disk_pressure_consumer(
+    council: Arc<CouncilNode>,
+    mut directory_rx: watch::Receiver<NodeDirectory>,
+    disk_pressured_tx: watch::Sender<BTreeSet<u64>>,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        // A periodic re-derive catches voter-set changes (which arrive on the
+        // Raft metrics watch, not the directory) even when the directory itself
+        // is momentarily quiet.
+        let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+        loop {
+            let voters: BTreeSet<u64> = council
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .collect();
+            let pressured = pressured_voter_ids(&directory_rx.borrow(), &voters);
+            if *disk_pressured_tx.borrow() != pressured {
+                let _ = disk_pressured_tx.send(pressured);
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tick.tick() => {}
+                changed = directory_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// One reconciler tick: observe, plan, execute at most one action.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_council_once(
@@ -1081,6 +1171,46 @@ mod tests {
             addr: format!("127.0.0.1:{port}").parse().unwrap(),
             name: name.to_string(),
         }
+    }
+
+    fn directory_advertising_pressure(pressured: &[&str]) -> NodeDirectory {
+        let mut dir = NodeDirectory::default();
+        for name in pressured {
+            dir.disk_pressured.insert(NodeId::new(*name));
+        }
+        dir
+    }
+
+    #[test]
+    fn pressured_voter_ids_keeps_only_pressured_current_voters() {
+        let voters: BTreeSet<u64> = ["v1", "v2", "v3"]
+            .iter()
+            .map(|n| raft_id_from_name(n))
+            .collect();
+        // v2 is pressured (a voter) and "spare" is pressured but NOT a voter.
+        let directory = directory_advertising_pressure(&["v2", "spare"]);
+
+        let pressured = pressured_voter_ids(&directory, &voters);
+        assert_eq!(pressured, BTreeSet::from([raft_id_from_name("v2")]));
+    }
+
+    #[test]
+    fn pressured_voter_ids_is_empty_when_no_voter_is_pressured() {
+        let voters: BTreeSet<u64> = ["v1", "v2"].iter().map(|n| raft_id_from_name(n)).collect();
+        // Only a non-voter advertises pressure.
+        let directory = directory_advertising_pressure(&["spare"]);
+        assert!(pressured_voter_ids(&directory, &voters).is_empty());
+    }
+
+    #[test]
+    fn pressured_voter_ids_collects_multiple_pressured_voters() {
+        let voters: BTreeSet<u64> = ["v1", "v2", "v3"]
+            .iter()
+            .map(|n| raft_id_from_name(n))
+            .collect();
+        let directory = directory_advertising_pressure(&["v1", "v3"]);
+        let expected: BTreeSet<u64> = ["v1", "v3"].iter().map(|n| raft_id_from_name(n)).collect();
+        assert_eq!(pressured_voter_ids(&directory, &voters), expected);
     }
 
     #[test]

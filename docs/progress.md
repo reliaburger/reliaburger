@@ -639,6 +639,16 @@ whole theme lands.
     follower add-before-remove (never below quorum — the existing proptest holds with the new
     input); a pressured leader deposes itself first via the verified `trigger().elect()`
     mechanism. Tests: resignation windowing, planner pressure cases, gated leader-deposition.
+  - [x] Disk-pressure signal path wired end-to-end (12b.2 T3 follow-up): the resignation
+    mechanism above shipped complete, but production `start()` fed the reconciler a permanently
+    empty pressured set — a voter only knows its own disk locally, and nothing carried that to
+    the leader. Now the node advertises a `disk_pressured: bool` on the authenticated gossip
+    directory extension (same trailing, position-versioned, HMAC-covered wire model as
+    `labels`); the bun disk-pressure loop drives it off the hysteresis state machine; and a
+    consumer task on the reconciler node folds the directory's pressured set with the live voter
+    set into the Raft-id set the planner acts on. Tests: gossip wire round-trip + both-direction
+    legacy tolerance + flipped-bit HMAC rejection, directory fold/prune, `pressured_voter_ids`
+    filtering, and a gated end-to-end test driving pressure through real gossip into the set.
   - [x] Verified openraft 0.9 `trigger().elect()` deposes the current leader (gated step-0
     test) — no version bump needed.
   - [x] Gated black-box acceptance (`tests/council_disaster_recovery.rs`,
