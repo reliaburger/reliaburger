@@ -370,13 +370,15 @@ fn build_cluster_cache(
 /// local instances: deploys apps whose assignment appeared or changed,
 /// stops apps whose assignment disappeared. Skips no-op cycles by
 /// remembering the last applied assignment per app.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_placement_reconciler(
     node_name: String,
     metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
-    // API port relative to the raft port (ports are uniform ACROSS
-    // nodes only as offsets — single-host clusters, like the tests,
-    // give every node its own port block). Same derivation idiom as
-    // the runtime's raft/reporting offsets.
+    directory_rx: watch::Receiver<crate::mustard::directory::NodeDirectory>,
+    // Fallback: API port relative to the raft port (ports are uniform
+    // ACROSS nodes only as offsets — single-host clusters, like the
+    // tests, give every node its own port block). Used only while the
+    // gossip directory has no advertised endpoint for the leader.
     raft_to_api_offset: i32,
     service_token: Option<String>,
     cmd_tx: mpsc::Sender<AgentCommand>,
@@ -395,22 +397,22 @@ pub fn spawn_placement_reconciler(
                 _ = tick.tick() => {}
             }
 
-            // Leader's API address, derived from its raft address by
-            // the fixed offset. Nodes outside the council don't learn
-            // a leader from Raft metrics and skip — same standing
-            // limitation as the reporting tree (flat-star,
-            // ≤ council-size clusters fully covered).
+            // Leader's advertised API address, resolved from Raft metrics
+            // (voters) or the gossip directory (everyone — this is what
+            // lets a node OUTSIDE the council keep converging, H1/CP1).
+            // The reporting offset is passed as 0 because only the API
+            // address matters here.
             let leader_url = {
-                let m = metrics_rx.borrow();
-                m.current_leader.and_then(|leader_id| {
-                    m.membership_config
-                        .membership()
-                        .get_node(&leader_id)
-                        .map(|info| {
-                            let api_port = (info.addr.port() as i32 + raft_to_api_offset) as u16;
-                            cluster_http.url(&format!("{}:{api_port}", info.addr.ip()), "")
-                        })
-                })
+                let metrics = metrics_rx.borrow();
+                let directory = directory_rx.borrow();
+                crate::cluster::directory::resolve_leader(
+                    &metrics,
+                    &directory,
+                    raft_to_api_offset,
+                    0,
+                )
+                .and_then(|view| view.api_address)
+                .map(|address| cluster_http.url(&address.to_string(), ""))
             };
             let Some(leader_url) = leader_url else {
                 continue;

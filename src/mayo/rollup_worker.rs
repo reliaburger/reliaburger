@@ -75,8 +75,18 @@ impl<T: ReportingTransport> RollupWorker<T> {
                     self.push_rollup().await;
                 }
                 result = self.council_rx.changed() => {
-                    if result.is_ok() {
-                        self.update_parent();
+                    match result {
+                        Ok(()) => self.update_parent(),
+                        Err(_) => {
+                            // A closed watch resolves instantly forever —
+                            // exit instead of hot-spinning (CP10).
+                            if !self.shutdown.is_cancelled() {
+                                eprintln!(
+                                    "rollup worker: leader-target channel closed; stopping"
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
             }

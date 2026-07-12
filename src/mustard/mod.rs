@@ -8,6 +8,7 @@
 /// - Step 2: state machine, membership table, messages, dissemination
 /// - Step 3: transport trait, SWIM probe cycle protocol
 pub mod config;
+pub mod directory;
 pub mod dissemination;
 pub mod membership;
 pub mod message;
@@ -16,9 +17,13 @@ pub mod state;
 pub mod transport;
 
 pub use config::GossipConfig;
+pub use directory::{NodeDirectory, NodeEndpoints};
 pub use dissemination::DisseminationQueue;
 pub use membership::{MembershipSnapshot, MembershipTable, NodeMembership, ResourceSummary};
-pub use message::{GossipMessage, GossipPayload, MAX_PIGGYBACK_UPDATES, MembershipUpdate};
+pub use message::{
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
+    MembershipUpdate,
+};
 pub use protocol::MustardNode;
 pub use state::NodeState;
 pub use transport::{InMemoryNetwork, InMemoryTransport, MustardTransport, UdpMustardTransport};

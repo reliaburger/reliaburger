@@ -5,19 +5,36 @@
 /// worker ID and council member list, every node in the cluster computes
 /// the same parent. This avoids coordination — workers and council
 /// members independently agree on the mapping.
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use crate::meat::NodeId;
+
+/// FNV-1a offset basis (64-bit).
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a prime (64-bit).
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// 64-bit FNV-1a over a byte string.
+///
+/// The parent assignment used to hash with
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm the
+/// standard library explicitly does NOT guarantee across Rust versions —
+/// two nodes built with different toolchains could disagree about the
+/// reporting tree (CP10). FNV-1a is a fixed, published algorithm: the
+/// mapping is pinned by tests and can never drift with a compiler
+/// upgrade. (The 32-bit variant already lives in `smoker::bpf_types` for
+/// eBPF map keys; reporting needs 64 bits, kept local to avoid a
+/// cross-subsystem dependency.)
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
 
 /// Assign a worker to its parent council member.
 ///
 /// Returns `None` if the council is empty. The council list is sorted
-/// internally so the result is independent of input order.
-///
-/// Uses `DefaultHasher` (SipHash) which is deterministic within the
-/// same binary. Since all nodes run the same Reliaburger binary, this
-/// is safe for cross-node agreement.
+/// internally so the result is independent of input order, and the hash
+/// is version-stable (FNV-1a), so every node — whatever toolchain built
+/// its binary — computes the same parent.
 pub fn assign_parent(worker_id: &NodeId, council_members: &[NodeId]) -> Option<NodeId> {
     if council_members.is_empty() {
         return None;
@@ -26,10 +43,8 @@ pub fn assign_parent(worker_id: &NodeId, council_members: &[NodeId]) -> Option<N
     let mut sorted: Vec<&NodeId> = council_members.iter().collect();
     sorted.sort();
 
-    let mut hasher = DefaultHasher::new();
-    worker_id.hash(&mut hasher);
-    let hash = hasher.finish();
-    let index = (hash as usize) % sorted.len();
+    let hash = fnv1a_64(worker_id.0.as_bytes());
+    let index = (hash % sorted.len() as u64) as usize;
 
     Some(sorted[index].clone())
 }
@@ -102,6 +117,50 @@ mod tests {
             );
         }
         assert_eq!(counts.len(), 5, "all 5 council members should appear");
+    }
+
+    /// Snapshot-style pin: these exact assignments must NEVER change.
+    ///
+    /// Every node computes the tree independently; if a toolchain or
+    /// refactor altered the hash, workers and aggregators would silently
+    /// disagree about who reports where. Expected values were computed
+    /// from the published FNV-1a algorithm (offset basis
+    /// 0xcbf29ce484222325, prime 0x100000001b3).
+    #[test]
+    fn assignment_is_pinned_across_versions() {
+        let council: Vec<NodeId> = (1..=5).map(|i| node(&format!("c{i}"))).collect();
+        let expected = [
+            ("worker-0", "c5"),
+            ("worker-1", "c1"),
+            ("worker-2", "c3"),
+            ("worker-42", "c2"),
+            ("node-a", "c2"),
+            ("node-b", "c3"),
+            ("a-very-long-node-name-0123456789", "c1"),
+        ];
+        for (worker, parent) in expected {
+            assert_eq!(
+                assign_parent(&node(worker), &council).unwrap(),
+                node(parent),
+                "pinned parent for {worker} drifted"
+            );
+        }
+
+        let small_council = vec![node("c1"), node("c2"), node("c3")];
+        for (worker, parent) in [("worker-0", "c3"), ("worker-42", "c3"), ("node-b", "c2")] {
+            assert_eq!(
+                assign_parent(&node(worker), &small_council).unwrap(),
+                node(parent),
+                "pinned parent for {worker} (3-member council) drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn fnv1a_matches_published_test_vectors() {
+        // From the FNV reference implementation.
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]

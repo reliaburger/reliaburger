@@ -74,8 +74,14 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
     let agg_transport = TcpReportingTransport::bind(agg_addr, shutdown.clone())
         .await
         .unwrap();
-    let (mut aggregator, watch_rx) =
-        ReportAggregator::new(agg_transport, fast_config(), shutdown.clone(), None);
+    let (mut aggregator, watch_rx) = ReportAggregator::new(
+        agg_transport,
+        fast_config(),
+        shutdown.clone(),
+        None,
+        None,
+        None,
+    );
     tokio::spawn(async move { aggregator.run().await });
 
     // Council list both workers see: the single aggregator.
@@ -184,8 +190,14 @@ async fn report_arrives(
             .await
             .unwrap();
     let agg_addr = agg_transport.local_addr();
-    let (mut aggregator, watch_rx) =
-        ReportAggregator::new(agg_transport, fast_config(), shutdown.clone(), None);
+    let (mut aggregator, watch_rx) = ReportAggregator::new(
+        agg_transport,
+        fast_config(),
+        shutdown.clone(),
+        None,
+        None,
+        None,
+    );
     tokio::spawn(async move { aggregator.run().await });
 
     let (w_acc, w_con) = match worker_tls {

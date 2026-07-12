@@ -219,17 +219,30 @@ impl MustardTransport for UdpMustardTransport {
         }
 
         // Sign the datagram if a key is configured. Signing zeroes then fills
-        // the `hmac` field, so it doesn't change the on-wire size.
+        // the `hmac` field, so it doesn't change the on-wire size. The
+        // directory extension gets its own tag (over the message's canonical
+        // bytes plus the extension), because the message HMAC deliberately
+        // excludes the extension — old peers must still verify new datagrams.
         let bytes = match &self.hmac_key {
             Some(key) => {
-                let signed = message
+                let mut signed = message
                     .clone()
                     .signed(key)
                     .map_err(|e| MustardError::Serialisation(e.to_string()))?;
-                bincode::serialize(&signed)
+                if let Some(extension) = signed.extension.take() {
+                    let canonical = signed
+                        .canonical_bytes()
+                        .map_err(|e| MustardError::Serialisation(e.to_string()))?;
+                    signed.extension = Some(
+                        extension
+                            .signed(key, &canonical)
+                            .map_err(|e| MustardError::Serialisation(e.to_string()))?,
+                    );
+                }
+                super::message::encode_datagram(&signed)
                     .map_err(|e| MustardError::Serialisation(e.to_string()))?
             }
-            None => bincode::serialize(message)
+            None => super::message::encode_datagram(message)
                 .map_err(|e| MustardError::Serialisation(e.to_string()))?,
         };
 
@@ -258,14 +271,24 @@ impl MustardTransport for UdpMustardTransport {
                     if self.blocklist.read().await.contains(&from) {
                         continue; // silently drop
                     }
-                    match bincode::deserialize::<GossipMessage>(&buf[..len]) {
-                        Ok(msg) => {
-                            // Drop datagrams that don't carry a valid HMAC when a
-                            // key is configured — the integrity gate.
-                            if let Some(key) = &self.hmac_key
-                                && !msg.verify_hmac(key)
-                            {
-                                continue;
+                    match super::message::decode_datagram(&buf[..len]) {
+                        Ok(mut msg) => {
+                            if let Some(key) = &self.hmac_key {
+                                // Drop datagrams that don't carry a valid HMAC
+                                // when a key is configured — the integrity gate.
+                                if !msg.verify_hmac(key) {
+                                    continue;
+                                }
+                                // The extension authenticates separately; a bad
+                                // tag drops the extension, not the message.
+                                let extension_ok = msg.extension.as_ref().is_some_and(|e| {
+                                    msg.canonical_bytes()
+                                        .map(|c| e.verify_hmac(key, &c))
+                                        .unwrap_or(false)
+                                });
+                                if !extension_ok {
+                                    msg.extension = None;
+                                }
                             }
                             return Some((from, msg));
                         }
@@ -447,6 +470,91 @@ mod tests {
         t1.send(dst, &ping_msg("node-1")).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), t2.recv()).await;
         assert!(result.is_err(), "a wrong-key datagram must be dropped");
+    }
+
+    fn an_extension() -> crate::mustard::message::DirectoryExtension {
+        crate::mustard::message::DirectoryExtension {
+            node_id: NodeId::new("node-1"),
+            api_address: addr(9117),
+            reporting_address: addr(9445),
+            leader: None,
+            hmac: [0u8; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_transport_delivers_a_signed_extension() {
+        let t1 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(gossip_key(1)));
+        let t2 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(gossip_key(1)));
+        let dst = t2.local_addr();
+
+        let mut msg = ping_msg("node-1");
+        msg.extension = Some(an_extension());
+        t1.send(dst, &msg).await.unwrap();
+
+        let (_, received) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let extension = received.extension.expect("extension should survive UDP");
+        assert_eq!(extension.node_id, NodeId::new("node-1"));
+        assert_eq!(extension.api_address, addr(9117));
+    }
+
+    #[tokio::test]
+    async fn udp_transport_without_keys_delivers_the_extension_unsigned() {
+        let t1 = UdpMustardTransport::bind(addr(0)).await.unwrap();
+        let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
+        let dst = t2.local_addr();
+
+        let mut msg = ping_msg("node-1");
+        msg.extension = Some(an_extension());
+        t1.send(dst, &msg).await.unwrap();
+
+        let (_, received) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received.extension.is_some());
+    }
+
+    #[tokio::test]
+    async fn keyed_receiver_drops_an_unsigned_extension_but_keeps_the_message() {
+        // A keyed cluster must not trust unauthenticated directory data:
+        // hand-craft a datagram whose message is properly signed but whose
+        // extension tag is zeroed.
+        let key = gossip_key(1);
+        let t2 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_key(Some(key));
+        let dst = t2.local_addr();
+
+        let mut msg = ping_msg("node-1")
+            .signed(&crate::sesame::mtls::gossip_hmac::derive_gossip_key(
+                &[1u8; 32],
+            ))
+            .unwrap();
+        msg.extension = Some(an_extension()); // hmac stays zeroed
+        let datagram = crate::mustard::message::encode_datagram(&msg).unwrap();
+        let raw = tokio::net::UdpSocket::bind(addr(0)).await.unwrap();
+        raw.send_to(&datagram, dst).await.unwrap();
+
+        let (_, received) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.sender, NodeId::new("node-1"));
+        assert!(
+            received.extension.is_none(),
+            "an unsigned extension must be dropped under a keyed transport"
+        );
     }
 
     #[tokio::test]

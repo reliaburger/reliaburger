@@ -30,7 +30,9 @@ use crate::council::state_machine::CouncilStateMachine;
 use crate::council::types::{CouncilConfig, CouncilNodeInfo};
 use crate::meat::types::NodeId;
 use crate::mustard::config::GossipConfig;
+use crate::mustard::directory::NodeDirectory;
 use crate::mustard::membership::MembershipSnapshot;
+use crate::mustard::message::LeaderHint;
 use crate::mustard::protocol::MustardNode;
 use crate::mustard::state::NodeState;
 use crate::mustard::transport::UdpMustardTransport;
@@ -62,6 +64,10 @@ pub struct ClusterRuntime {
     /// messages. Only populated on the leader (same flat-star rule);
     /// the API serves `/v1/metrics/cluster` from it.
     pub rollup_store: Arc<tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>>,
+    /// The gossip-learned control-plane directory: per-node advertised
+    /// endpoints and the best leader hint. This is what lets non-voters
+    /// find the leader (Phase 12b.2, H1).
+    pub directory_rx: watch::Receiver<NodeDirectory>,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -74,6 +80,9 @@ pub struct ClusterParams {
     pub raft_port: u16,
     /// Port for the reporting-tree transport (same IP as gossip).
     pub reporting_port: u16,
+    /// Port the HTTP API listens on (same IP as gossip). Advertised via the
+    /// gossip directory so peers stop deriving it by offset arithmetic.
+    pub api_port: u16,
     /// Reporting-tree timing config.
     pub reporting_config: ReportingTreeSection,
     /// Seed addresses to join (other nodes' gossip endpoints). Empty for the
@@ -179,6 +188,18 @@ pub async fn start(
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
     node.set_membership_watch(membership_tx);
+
+    // Control-plane directory (12b.2): every datagram this node sends
+    // advertises its API and reporting endpoints, plus the best leader hint
+    // it knows. Received extensions accumulate into `directory_rx`, which is
+    // how nodes OUTSIDE the Raft voter set learn who leads and where — local
+    // Raft metrics only carry that for voters. The hint channel is fed by
+    // the publisher task below once the council exists.
+    node.set_advertised_endpoints(params.api_port, params.reporting_port);
+    let (leader_hint_tx, leader_hint_rx) = watch::channel::<Option<LeaderHint>>(None);
+    node.set_leader_hint_watch(leader_hint_rx);
+    let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
+    node.set_directory_watch(directory_tx);
     // The gossip node is spawned *after* the council is built, so a restarted
     // node can seed gossip from its restored Raft membership (see below).
 
@@ -286,7 +307,7 @@ pub async fn start(
 
     // Now start gossip.
     let gossip_shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    spawn_supervised("gossip", shutdown.clone(), async move {
         node.run(gossip_shutdown).await;
     });
 
@@ -334,7 +355,38 @@ pub async fn start(
 
     // --- Reporting tree (flat star: every node reports to the leader) ---
     let reporting_offset = params.reporting_port as i32 - params.raft_port as i32;
+    let api_offset = params.api_port as i32 - params.raft_port as i32;
     let reporting_addr = SocketAddr::new(params.gossip_addr.ip(), params.reporting_port);
+    let api_addr = SocketAddr::new(params.gossip_addr.ip(), params.api_port);
+
+    // Leader hint publisher: while THIS node is the Raft leader, gossip
+    // carries a hint naming it (with its advertised endpoints and term).
+    // Every other node relays the highest-term hint, so workers outside the
+    // council learn the leader without Raft metrics.
+    spawn_leader_hint_publisher(
+        raft_metrics_rx.clone(),
+        leader_hint_tx,
+        raft_id,
+        NodeId::new(&params.node_name),
+        api_addr,
+        reporting_addr,
+        shutdown.clone(),
+    );
+
+    // A maintainer keeps `council_rx` pointing at the current leader's
+    // reporting address (the worker reports there) and `epoch_rx` at the
+    // current leadership term (the aggregator scopes reports to it).
+    let (council_tx, council_rx) = watch::channel::<Vec<(NodeId, SocketAddr)>>(Vec::new());
+    let (epoch_tx, epoch_rx) = watch::channel(0u64);
+    spawn_leader_target_maintainer(
+        raft_metrics_rx.clone(),
+        directory_rx.clone(),
+        council_tx,
+        epoch_tx,
+        api_offset,
+        reporting_offset,
+        shutdown.clone(),
+    );
 
     // Aggregator: every node listens, but only the leader actually receives
     // reports (workers target the leader), so a leadership change needs no
@@ -358,18 +410,12 @@ pub async fn start(
         params.reporting_config.clone(),
         shutdown.clone(),
         Some(Arc::clone(&rollup_store)),
+        Some(epoch_rx),
+        Some(membership_rx.clone()),
     );
-    tokio::spawn(async move { aggregator.run().await });
-
-    // A maintainer keeps `council_rx` pointing at the current leader's
-    // reporting address; the worker reports there.
-    let (council_tx, council_rx) = watch::channel::<Vec<(NodeId, SocketAddr)>>(Vec::new());
-    spawn_leader_target_maintainer(
-        raft_metrics_rx.clone(),
-        council_tx,
-        reporting_offset,
-        shutdown.clone(),
-    );
+    spawn_supervised("report aggregator", shutdown.clone(), async move {
+        aggregator.run().await
+    });
 
     // Worker: snapshots this node's state (via the agent) and sends it to the
     // leader. Binds an ephemeral port — it only sends; replies are ignored.
@@ -391,7 +437,9 @@ pub async fn start(
         council_rx,
         shutdown.clone(),
     );
-    tokio::spawn(async move { worker.run().await });
+    spawn_supervised("report worker", shutdown.clone(), async move {
+        worker.run().await
+    });
 
     // Rollup worker: pushes this node's metric rollups to the leader,
     // where the aggregator ingests them into the rollup store.
@@ -412,7 +460,9 @@ pub async fn start(
             params.rollup_interval,
             shutdown.clone(),
         );
-        tokio::spawn(async move { rollup_worker.run().await });
+        spawn_supervised("rollup worker", shutdown.clone(), async move {
+            rollup_worker.run().await
+        });
     }
 
     let handle = ClusterHandle {
@@ -434,43 +484,140 @@ pub async fn start(
         ClusterRuntime {
             aggregated_rx,
             rollup_store,
+            directory_rx,
         },
     ))
 }
 
+/// Spawn a long-lived subsystem task and log loudly if it exits while the
+/// node is still running.
+///
+/// Every task passed here is wired to stop only at shutdown; an earlier
+/// exit means a closed channel or a dead transport — a bug we want visible
+/// in the logs, not a silently missing subsystem (CP10). We deliberately
+/// don't respawn: each of these tasks owns sockets and channel endpoints
+/// that can't be rebuilt from inside a generic wrapper, and a
+/// degraded-but-alive node still serves traffic, so the honest move is to
+/// surface the failure and keep the rest of the node up.
+fn spawn_supervised(
+    name: &'static str,
+    shutdown: CancellationToken,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        task.await;
+        if !shutdown.is_cancelled() {
+            eprintln!("cluster: {name} task exited unexpectedly (before shutdown)");
+        }
+    });
+}
+
+/// Publish a [`LeaderHint`] naming THIS node while it is the Raft leader,
+/// and `None` otherwise. The gossip node stamps the hint (or the best
+/// relayed one) onto every outgoing datagram; term ordering lets the whole
+/// cluster converge on the newest leader.
+fn spawn_leader_hint_publisher(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    hint_tx: watch::Sender<Option<LeaderHint>>,
+    self_id: u64,
+    node_id: NodeId,
+    api_address: SocketAddr,
+    reporting_address: SocketAddr,
+    shutdown: CancellationToken,
+) {
+    spawn_supervised("leader hint publisher", shutdown.clone(), async move {
+        loop {
+            let hint = {
+                let m = metrics_rx.borrow();
+                (m.current_leader == Some(self_id)).then(|| LeaderHint {
+                    node_id: node_id.clone(),
+                    term: m.current_term,
+                    api_address,
+                    reporting_address,
+                })
+            };
+            hint_tx.send_if_modified(|current| {
+                if *current != hint {
+                    *current = hint;
+                    true
+                } else {
+                    false
+                }
+            });
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = metrics_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Keep `council_tx` pointing at the current Raft leader's reporting address
-/// (a single-element council list), so the flat-star worker always reports to
-/// the leader. Recomputes on every metrics change.
+/// (a single-element council list), so the flat-star worker always reports
+/// to the leader, and `epoch_tx` at the leadership term the aggregator
+/// scopes reports to.
+///
+/// Resolution combines local Raft metrics (authoritative on voters) with
+/// the gossip directory (the only source on workers outside the council),
+/// via [`crate::cluster::directory::resolve_leader`]. This is the H1 fix:
+/// the old version read metrics alone, so an eighth node in a seven-voter
+/// council never found anywhere to report.
 fn spawn_leader_target_maintainer(
     mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    mut directory_rx: watch::Receiver<NodeDirectory>,
     council_tx: watch::Sender<Vec<(NodeId, SocketAddr)>>,
+    epoch_tx: watch::Sender<u64>,
+    api_offset: i32,
     reporting_offset: i32,
     shutdown: CancellationToken,
 ) {
-    tokio::spawn(async move {
+    spawn_supervised("leader target maintainer", shutdown.clone(), async move {
         loop {
-            let target = {
-                let m = metrics_rx.borrow();
-                m.current_leader.and_then(|leader_id| {
-                    m.membership_config
-                        .membership()
-                        .get_node(&leader_id)
-                        .map(|info| {
-                            let raft = info.addr;
-                            let reporting = SocketAddr::new(
-                                raft.ip(),
-                                (raft.port() as i32 + reporting_offset) as u16,
-                            );
-                            vec![(NodeId::new(&info.name), reporting)]
-                        })
-                })
+            let view = {
+                let metrics = metrics_rx.borrow();
+                let directory = directory_rx.borrow();
+                crate::cluster::directory::resolve_leader(
+                    &metrics,
+                    &directory,
+                    api_offset,
+                    reporting_offset,
+                )
             };
-            if let Some(target) = target {
-                let _ = council_tx.send(target);
+            if let Some(view) = view {
+                if let Some(reporting) = view.reporting_address {
+                    let target = vec![(view.node_id.clone(), reporting)];
+                    council_tx.send_if_modified(|current| {
+                        if *current != target {
+                            *current = target;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                // Terms only grow; ignoring lower values keeps a lagging
+                // gossip hint from briefly rolling the epoch back.
+                epoch_tx.send_if_modified(|epoch| {
+                    if view.term > *epoch {
+                        *epoch = view.term;
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 changed = metrics_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                changed = directory_rx.changed() => {
                     if changed.is_err() {
                         break;
                     }

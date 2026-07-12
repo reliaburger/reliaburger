@@ -131,8 +131,27 @@ impl<T: ReportingTransport> ReportWorker<T> {
                     self.send_report().await;
                 }
                 result = self.council_rx.changed() => {
-                    if result.is_ok() {
-                        self.update_parent();
+                    match result {
+                        Ok(()) => {
+                            // Re-point immediately on a leader change so a
+                            // fresh leader's aggregator fills without waiting
+                            // out the report interval.
+                            if self.update_parent() {
+                                self.send_report().await;
+                            }
+                        }
+                        Err(_) => {
+                            // The sender lives in the leader-target
+                            // maintainer and only drops at shutdown. Without
+                            // this break, a closed watch resolves instantly
+                            // on every loop iteration — a hot spin (CP10).
+                            if !self.shutdown.is_cancelled() {
+                                eprintln!(
+                                    "report worker: leader-target channel closed; stopping"
+                                );
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -140,9 +159,13 @@ impl<T: ReportingTransport> ReportWorker<T> {
     }
 
     /// Recompute the parent assignment from the current council membership.
-    fn update_parent(&mut self) {
+    /// Returns `true` if the parent actually changed.
+    fn update_parent(&mut self) -> bool {
         let council = self.council_rx.borrow().clone();
-        self.parent_address = Self::compute_parent(&self.node_id, &council);
+        let new_parent = Self::compute_parent(&self.node_id, &council);
+        let changed = new_parent != self.parent_address;
+        self.parent_address = new_parent;
+        changed
     }
 
     /// Determine the parent address from a council membership list.
@@ -190,9 +213,19 @@ impl<T: ReportingTransport> ReportWorker<T> {
     }
 
     /// Build a StateReport from an agent snapshot.
+    ///
+    /// Terminal instances (stopped, failed, completed jobs) are excluded
+    /// from `running_apps` and from the resource-usage sums: they hold no
+    /// resources any more, and counting them made the leader see phantom
+    /// capacity commitments (CP6).
     fn build_report(&self, snapshot: AgentSnapshot) -> StateReport {
-        let running_apps = snapshot
+        let active: Vec<&InstanceSnapshot> = snapshot
             .instances
+            .iter()
+            .filter(|inst| !is_terminal_state(inst.container_state))
+            .collect();
+
+        let running_apps = active
             .iter()
             .map(|inst| {
                 let health_status = match inst.container_state {
@@ -222,14 +255,10 @@ impl<T: ReportingTransport> ReportWorker<T> {
             })
             .collect();
 
-        // "Used" is the sum of requests over running instances — the
+        // "Used" is the sum of requests over ACTIVE instances — the
         // commitments the scheduler must respect, not measured load.
-        let cpu_used: u32 = snapshot
-            .instances
-            .iter()
-            .map(|i| i.cpu_request_millicores)
-            .sum();
-        let memory_used: u32 = snapshot.instances.iter().map(|i| i.memory_request_mb).sum();
+        let cpu_used: u32 = active.iter().map(|i| i.cpu_request_millicores).sum();
+        let memory_used: u32 = active.iter().map(|i| i.memory_request_mb).sum();
 
         StateReport {
             node_id: self.node_id.clone(),
@@ -249,6 +278,14 @@ impl<T: ReportingTransport> ReportWorker<T> {
             has_buildah: self.has_buildah,
         }
     }
+}
+
+/// Whether an instance state is terminal — no process, no held resources.
+///
+/// `Stopping` is deliberately NOT terminal: a draining instance still
+/// occupies its port and memory until it finishes.
+fn is_terminal_state(state: ContainerState) -> bool {
+    matches!(state, ContainerState::Stopped | ContainerState::Failed)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +396,125 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    fn instance(name: &str, state: ContainerState, cpu: u32, memory: u32) -> InstanceSnapshot {
+        InstanceSnapshot {
+            app_name: name.to_string(),
+            namespace: "default".to_string(),
+            instance_id: 0,
+            image: "proc-grill:image-ignored".to_string(),
+            port: None,
+            container_state: state,
+            consecutive_unhealthy: 0,
+            uptime: Duration::from_secs(10),
+            cpu_request_millicores: cpu,
+            memory_request_mb: memory,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_instances_are_excluded_from_running_and_capacity() {
+        // CP6: 2 running + 3 terminal (stopped/failed/completed job) must
+        // report 2 running apps and only THEIR resource commitments.
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let shutdown = CancellationToken::new();
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+
+        let worker = ReportWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            shutdown,
+        );
+
+        let snapshot = AgentSnapshot {
+            instances: vec![
+                instance("web", ContainerState::Running, 250, 128),
+                instance("api", ContainerState::Running, 300, 256),
+                instance("done-job-1", ContainerState::Stopped, 500, 512),
+                instance("done-job-2", ContainerState::Stopped, 500, 512),
+                instance("crashed", ContainerState::Failed, 500, 512),
+            ],
+            allocated_ports: vec![],
+            capacity_cpu_millicores: 8000,
+            capacity_memory_mb: 16384,
+        };
+        let report = worker.build_report(snapshot);
+
+        assert_eq!(report.running_apps.len(), 2);
+        let names: Vec<&str> = report
+            .running_apps
+            .iter()
+            .map(|a| a.app_name.as_str())
+            .collect();
+        assert!(names.contains(&"web") && names.contains(&"api"));
+        assert_eq!(report.resource_usage.cpu_used_millicores, 550);
+        assert_eq!(report.resource_usage.memory_used_mb, 384);
+    }
+
+    #[tokio::test]
+    async fn draining_instances_still_count_as_running() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let shutdown = CancellationToken::new();
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(16);
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+
+        let worker = ReportWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            shutdown,
+        );
+
+        let snapshot = AgentSnapshot {
+            instances: vec![instance("web", ContainerState::Stopping, 250, 128)],
+            allocated_ports: vec![],
+            capacity_cpu_millicores: 8000,
+            capacity_memory_mb: 16384,
+        };
+        let report = worker.build_report(snapshot);
+        // A draining instance still holds its resources.
+        assert_eq!(report.running_apps.len(), 1);
+        assert_eq!(report.resource_usage.cpu_used_millicores, 250);
+    }
+
+    #[tokio::test]
+    async fn worker_exits_cleanly_when_the_council_watch_closes() {
+        // CP10: a dropped leader-target sender used to make `changed()`
+        // resolve instantly with Err on every iteration — a hot spin. The
+        // worker must exit instead.
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let shutdown = CancellationToken::new();
+        let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
+        spawn_fake_agent(snapshot_rx, shutdown.clone());
+        let (council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            shutdown.clone(),
+        );
+        let handle = tokio::spawn(async move { worker.run().await });
+
+        drop(council_tx);
+        // Without the fix this times out (the task spins forever).
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("worker must exit when the council watch closes")
+            .unwrap();
+        shutdown.cancel();
     }
 
     #[tokio::test]
