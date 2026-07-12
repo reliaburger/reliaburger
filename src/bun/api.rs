@@ -1304,6 +1304,14 @@ async fn status_app_handler(
 }
 
 /// Stop an app.
+///
+/// In cluster mode, stopping an app is a desired-state change: the app is
+/// deleted from Raft (`AppDelete`) so the scheduler stops placing it and no
+/// reconciler resurrects it on the next tick (DEP2). The local supervisor
+/// stop is then best-effort. Because the delete goes through the council,
+/// a leader that holds no local replica still clears cluster state instead
+/// of returning a spurious 404. In standalone mode there is no desired
+/// state, so we just stop the local instances as before.
 async fn stop_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -1314,6 +1322,89 @@ async fn stop_handler(
     {
         return resp;
     }
+
+    if let Some(council) = state.council.clone() {
+        return cluster_stop(state, council, app, namespace).await;
+    }
+
+    stop_local(&state, app, namespace).await
+}
+
+/// Stop an app in cluster mode: clear its desired state through Raft, then
+/// best-effort stop the local instances.
+async fn cluster_stop(
+    state: ApiState,
+    council: Arc<crate::council::CouncilNode>,
+    app: String,
+    namespace: String,
+) -> Response {
+    // Followers can't write to Raft (openraft does not forward client
+    // writes), so forward the whole stop to the leader's API.
+    if !council.is_leader().await {
+        let Some(leader_url) = leader_api_url(&state, &council).await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "no cluster leader known yet; retry shortly"
+                })),
+            )
+                .into_response();
+        };
+        let url = format!("{leader_url}/v1/stop/{app}/{namespace}");
+        let mut request = state.cluster_http.client().post(url);
+        if let Some(token) = &state.service_token {
+            request = request.bearer_auth(token);
+        }
+        return match request.send().await {
+            Ok(response) => {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let body = response.bytes().await.unwrap_or_default();
+                (status, body).into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("failed to forward stop to the leader: {e}")
+                })),
+            )
+                .into_response(),
+        };
+    }
+
+    let app_id = crate::meat::AppId::new(&app, &namespace);
+    if let Err(e) = council
+        .write(crate::council::types::RaftRequest::AppDelete { app_id })
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("failed to clear desired state: {e}")
+            })),
+        )
+            .into_response();
+    }
+
+    // The desired state is gone; stop the local replica if we have one.
+    // A missing local instance is expected on a leader that holds no
+    // replica, so it is not an error here.
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let _ = state
+        .cmd_tx
+        .send(AgentCommand::Stop {
+            app_name: app,
+            namespace,
+            response: resp_tx,
+        })
+        .await;
+    let _ = resp_rx.await;
+
+    Json(serde_json::json!({ "status": "stopped" })).into_response()
+}
+
+/// Stop an app on this node only (standalone mode).
+async fn stop_local(state: &ApiState, app: String, namespace: String) -> Response {
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx

@@ -48,6 +48,7 @@ async fn start_node(
 
     let data_dir = std::env::temp_dir().join(format!("rb-placement-{name}-{gossip_port}"));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let reconciler_state_dir = data_dir.clone();
 
     let mayo = Arc::new(RwLock::new(reliaburger::mayo::store::MayoStore::new(
         data_dir.join("metrics"),
@@ -170,6 +171,7 @@ async fn start_node(
             cmd_tx.clone(),
             shutdown.clone(),
             reliaburger::cluster::ClusterHttp::plaintext(),
+            Some(reconciler_state_dir),
         );
     }
 
@@ -368,6 +370,132 @@ async fn apply_on_any_node_places_across_the_cluster() {
         total_instances(&nodes).await,
         3,
         "reconcilers must not create extra instances once converged"
+    );
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
+        let _ = &n.name;
+    }
+}
+
+/// How many "web" instances are in a *live* state (not stopped/failed)
+/// across all nodes. A cluster stop leaves the stopped instance in the
+/// status list (terminal states are only filtered from reporting, CP6), so
+/// "torn down" means no live replica, not an empty list.
+async fn live_web_instances(nodes: &[&Node]) -> usize {
+    let mut count = 0;
+    for node in nodes {
+        if let Ok(statuses) = node.client.status().await {
+            count += statuses
+                .iter()
+                .filter(|s| {
+                    s.app_name == "web"
+                        && !matches!(s.state.as_str(), "stopped" | "stopping" | "failed")
+                })
+                .count();
+        }
+    }
+    count
+}
+
+/// DEP2: a cluster stop clears desired state through Raft, so the app is
+/// gone from every council's `desired_state()` and no reconciler resurrects
+/// it on the next tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn cluster_stop_clears_desired_state_and_does_not_resurrect() {
+    let shutdown = CancellationToken::new();
+
+    let n1 = start_node("s1", 18461, vec![], &shutdown).await;
+    let n2 = start_node("s2", 18465, vec![local(18461)], &shutdown).await;
+    let n3 = start_node("s3", 18469, vec![local(18461)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        replicas = 1
+        cpu = "200m-400m"
+    "#,
+    )
+    .unwrap();
+
+    // Get the app running somewhere, re-applying idempotently under load.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut placed = false;
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    while tokio::time::Instant::now() < deadline {
+        if total_instances(&nodes).await >= 1 && nodes_running_web(&nodes).await >= 1 {
+            placed = true;
+            break;
+        }
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let applier = nodes.first().expect("a node");
+            let _ =
+                tokio::time::timeout(Duration::from_secs(15), applier.client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(placed, "app never came up to stop");
+
+    // Stop it through any node (exercises leader-forwarding of the delete).
+    let stopper = nodes.first().expect("a node");
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stopper.client.stop("web", "default"),
+    )
+    .await
+    .expect("stop did not hang")
+    .expect("stop succeeded");
+
+    // Desired state clears on the leader, and it stays clear: give the
+    // reconcilers several ticks to (not) resurrect the app. "Torn down"
+    // means no *live* replica remains anywhere.
+    let torn_down_by = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut cleared = false;
+    while tokio::time::Instant::now() < torn_down_by {
+        if live_web_instances(&nodes).await == 0 {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(cleared, "the stopped app was not torn down");
+
+    // The desired-state map must not contain the app on any council.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    for n in &nodes {
+        if let Some(council) = &n.handle.council {
+            let ds = council.desired_state().await;
+            let app = reliaburger::meat::AppId::new("web", "default");
+            assert!(
+                !ds.apps.contains_key(&app),
+                "node {}: desired state still holds the stopped app",
+                n.name
+            );
+            assert!(
+                !ds.scheduling.contains_key(&app),
+                "node {}: scheduling still holds the stopped app",
+                n.name
+            );
+        }
+    }
+    assert_eq!(
+        live_web_instances(&nodes).await,
+        0,
+        "a reconciler resurrected the stopped app"
     );
 
     shutdown.cancel();

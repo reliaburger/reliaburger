@@ -152,7 +152,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
         let mut instance_ids = Vec::with_capacity(replica_count as usize);
 
         for i in 0..replica_count {
-            let instance_id = InstanceId(format!("{app_name}-{i}"));
+            let instance_id =
+                crate::grill::InstanceIdentity::new(namespace, app_name, i).instance_id();
 
             // Allocate a host port if the app declares one
             let host_port = if spec.port.is_some() {
@@ -228,7 +229,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 })?;
         }
 
-        let instance_id = InstanceId(format!("{job_name}-0"));
+        let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
 
         let instance = WorkloadInstance {
             id: instance_id.clone(),
@@ -536,6 +537,36 @@ mod tests {
     // -- deploy_app -----------------------------------------------------------
 
     #[tokio::test]
+    async fn same_app_name_in_two_namespaces_coexists() {
+        // DEP1 regression: `default/api` and `payments/api` used to key the
+        // same `api-0`, so deploying the second clobbered the first. With
+        // namespace-qualified identities they must coexist independently.
+        let mut sup = test_supervisor();
+        let now = Instant::now();
+        let spec = basic_app_spec(None);
+
+        let default_ids = sup.deploy_app("api", "default", &spec, now).await.unwrap();
+        let payments_ids = sup.deploy_app("api", "payments", &spec, now).await.unwrap();
+
+        assert_eq!(default_ids.len(), 1);
+        assert_eq!(payments_ids.len(), 1);
+        assert_ne!(
+            default_ids[0], payments_ids[0],
+            "the two namespaces must produce distinct instance ids"
+        );
+        assert_eq!(sup.list_instances().len(), 2, "both instances must survive");
+
+        let a = sup
+            .get_instance(&default_ids[0])
+            .expect("default api alive");
+        assert_eq!(a.namespace, "default");
+        let b = sup
+            .get_instance(&payments_ids[0])
+            .expect("payments api alive");
+        assert_eq!(b.namespace, "payments");
+    }
+
+    #[tokio::test]
     async fn deploy_creates_pending_instances() {
         let mut sup = test_supervisor();
         let now = Instant::now();
@@ -558,9 +589,9 @@ mod tests {
 
         let ids = sup.deploy_app("api", "prod", &spec, now).await.unwrap();
         assert_eq!(ids.len(), 3);
-        assert_eq!(ids[0], InstanceId("api-0".to_string()));
-        assert_eq!(ids[1], InstanceId("api-1".to_string()));
-        assert_eq!(ids[2], InstanceId("api-2".to_string()));
+        assert_eq!(ids[0], InstanceId("prod__api-0".to_string()));
+        assert_eq!(ids[1], InstanceId("prod__api-1".to_string()));
+        assert_eq!(ids[2], InstanceId("prod__api-2".to_string()));
     }
 
     #[tokio::test]
@@ -876,7 +907,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], InstanceId("migrate-0".to_string()));
+        assert_eq!(ids[0], InstanceId("default__migrate-0".to_string()));
 
         let instance = sup.get_instance(&ids[0]).unwrap();
         assert_eq!(instance.state, ContainerState::Pending);

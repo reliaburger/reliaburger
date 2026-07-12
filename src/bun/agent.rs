@@ -968,18 +968,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let Some(pid) = self.supervisor.grill().pid(&instance.id).await else {
                 continue;
             };
-            let replica_index: u32 = instance
-                .id
-                .0
-                .rsplit('-')
-                .next()
-                .and_then(|s| s.parse().ok())
+            let replica_index = crate::grill::InstanceIdentity::parse(&instance.id.0)
+                .map(|ident| ident.ordinal)
                 .unwrap_or(0);
             inventory.push(crate::upgrade::marker::InstanceInventory {
                 namespace: instance.namespace.clone(),
                 app_name: instance.app_name.clone(),
                 instance_id: replica_index,
                 pid,
+                full_id: instance.id.0.clone(),
             });
         }
         inventory
@@ -991,7 +988,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         marker: &crate::upgrade::marker::UpgradeMarker,
     ) -> Result<(), String> {
         for item in &marker.pre_upgrade_instances {
-            let id = InstanceId(format!("{}-{}", item.app_name, item.instance_id));
+            // Prefer the exact canonical id; fall back to the legacy
+            // `{app}-{ordinal}` form for a marker written before this theme.
+            let id = if item.full_id.is_empty() {
+                InstanceId(format!("{}-{}", item.app_name, item.instance_id))
+            } else {
+                InstanceId(item.full_id.clone())
+            };
             match self.supervisor.get_instance(&id) {
                 Some(instance) if instance.state == ContainerState::Running => {}
                 Some(instance) => {
@@ -1026,11 +1029,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
-        let replica_index: u32 = instance_id
-            .0
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse().ok())
+        let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
+            .map(|ident| ident.ordinal)
             .unwrap_or(0);
         let runtime = self.supervisor.grill().runtime_kind();
         let record = crate::grill::records::InstanceRecord {
@@ -1087,23 +1087,51 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut adopted_count = 0;
 
         for record in crate::grill::records::load_records(&dir) {
-            let instance_id = InstanceId(record.instance_id.clone());
+            // The runtime knows the still-running container by the id it was
+            // started under, which is what the record stores. The supervisor
+            // and everything downstream key on the canonical id: for a fresh
+            // record they're the same; for a legacy record (this node
+            // upgraded across the identity change with workloads running) the
+            // canonical id is rebuilt from the record's structured fields so
+            // the adopted instance lands under a namespace-safe key.
+            let runtime_id = InstanceId(record.instance_id.clone());
+            let instance_id =
+                if crate::grill::InstanceIdentity::parse(&record.instance_id).is_some() {
+                    runtime_id.clone()
+                } else {
+                    let mut ident = crate::grill::InstanceIdentity::new(
+                        &record.namespace,
+                        &record.app_name,
+                        record.replica_index,
+                    );
+                    // Preserve a legacy canary generation if the id carried one.
+                    if let Some(legacy) = crate::grill::InstanceIdentity::parse_legacy(
+                        &record.instance_id,
+                        &record.namespace,
+                    ) && legacy.app == record.app_name
+                    {
+                        ident.generation = legacy.generation;
+                    }
+                    ident.instance_id()
+                };
             // Never clobber an instance the current process already tracks.
             if self.supervisor.get_instance(&instance_id).is_some() {
                 continue;
             }
 
             let adopted = matches!(
-                self.supervisor.grill().adopt(&instance_id, &record).await,
+                self.supervisor.grill().adopt(&runtime_id, &record).await,
                 Ok(true)
             );
             if !adopted {
                 let _ = crate::grill::records::remove_record(&dir, &record.instance_id);
                 // The instance is gone for good — its key material goes
-                // with it (PKI7).
-                let identity_dir = self.instance_identity_dir(&instance_id);
+                // with it (PKI7). The identity dir was created under the id
+                // the container ran as (the runtime id), which for a legacy
+                // record differs from the canonical supervisor key.
+                let identity_dir = self.instance_identity_dir(&runtime_id);
                 if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&identity_dir) {
-                    eprintln!("bun: warning: failed to remove identity dir for {instance_id}: {e}");
+                    eprintln!("bun: warning: failed to remove identity dir for {runtime_id}: {e}");
                 }
                 continue;
             }
@@ -1127,13 +1155,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // Rebuild the workload's identity and rotation schedule from
             // its per-instance directory, so an adopted instance keeps
             // rotating on time instead of coming back with
-            // `identity: None` (D9). A legacy or unprovisioned directory
-            // loads as `None` and the rotation loop provisions afresh.
-            let identity_dir = self.instance_identity_dir(&instance_id);
+            // `identity: None` (D9). The directory was created under the
+            // runtime id, so a legacy record still finds its keys. An
+            // unprovisioned directory loads as `None` and the rotation loop
+            // provisions afresh.
+            let identity_dir = self.instance_identity_dir(&runtime_id);
             let identity = match crate::sesame::identity::load_identity(&identity_dir) {
                 Ok(identity) => identity,
                 Err(e) => {
-                    eprintln!("bun: warning: could not restore identity for {instance_id}: {e}");
+                    eprintln!("bun: warning: could not restore identity for {runtime_id}: {e}");
                     None
                 }
             };
@@ -1171,7 +1201,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.deployed_specs.insert(key, spec);
             }
             // Keep the adopted instance's output flowing into the log store.
-            self.spawn_log_forwarder(&instance_id, &record.app_name, &record.namespace);
+            // Logs are captured under the runtime id (the container's name).
+            self.spawn_log_forwarder(&runtime_id, &record.app_name, &record.namespace);
             adopted_count += 1;
         }
 
@@ -1271,12 +1302,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instances: instances
                 .iter()
                 .map(|inst| {
-                    // Parse instance index from ID (e.g. "web-0" → 0)
-                    let instance_id = inst
-                        .id
-                        .0
-                        .rsplit_once('-')
-                        .and_then(|(_, n)| n.parse::<u32>().ok())
+                    // The report carries the replica ordinal, recovered from
+                    // the canonical id (e.g. "default__web-0" → 0).
+                    let instance_id = crate::grill::InstanceIdentity::parse(&inst.id.0)
+                        .map(|ident| ident.ordinal)
                         .unwrap_or(0);
 
                     // Requested resources from the deployed spec: these
@@ -2528,7 +2557,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let mut new_prepared: Vec<InstanceId> = Vec::new();
                 let mut new_failed = false;
                 for i in 0..replica_count {
-                    let new_id = crate::grill::InstanceId(format!("{app_name}-g{deploy_gen}-{i}"));
+                    let new_id =
+                        crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
+                            .instance_id();
                     let _ = events
                         .send(ApplyEvent::Progress {
                             message: format!("starting new instance {}", new_id.0),
@@ -5591,18 +5622,22 @@ mod tests {
 
         // Pin the instance to Running so stop() is effectively ignored (the
         // process refuses SIGTERM). shutdown_all must escalate to SIGKILL.
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         grill_handle.set_state(&id, ContainerState::Running);
 
         agent.shutdown_all().await;
 
         let calls = grill_handle.calls();
         assert!(
-            calls.iter().any(|(op, i)| op == "stop" && i.0 == "web-0"),
+            calls
+                .iter()
+                .any(|(op, i)| op == "stop" && i.0 == "default__web-0"),
             "shutdown should SIGTERM first"
         );
         assert!(
-            calls.iter().any(|(op, i)| op == "kill" && i.0 == "web-0"),
+            calls
+                .iter()
+                .any(|(op, i)| op == "kill" && i.0 == "default__web-0"),
             "shutdown should escalate to SIGKILL when the process ignores stop"
         );
     }
@@ -5618,7 +5653,7 @@ mod tests {
         let events = send_deploy(&tx, basic_config()).await;
         let (created, instances) = expect_complete(&events);
         assert_eq!(created, 1);
-        assert_eq!(instances, &["web-0"]);
+        assert_eq!(instances, &["default__web-0"]);
 
         shutdown.cancel();
         agent_handle.await.unwrap();
@@ -5930,7 +5965,7 @@ mod tests {
 
         let instance_created = events
             .iter()
-            .any(|e| matches!(e, ApplyEvent::InstanceCreated { id, .. } if id == "web-0"));
+            .any(|e| matches!(e, ApplyEvent::InstanceCreated { id, .. } if id == "default__web-0"));
         assert!(instance_created, "expected InstanceCreated for web-0");
 
         expect_complete(&events);
@@ -6165,14 +6200,14 @@ mod tests {
 
         assert_eq!(
             identity_dir_names(volumes.path()),
-            vec!["web-0".to_string(), "web-1".to_string()],
+            vec!["default__web-0".to_string(), "default__web-1".to_string()],
             "one identity dir per instance"
         );
 
         // Simulate provisioned key material so the stop has something to
         // scrub (single-node mode never reaches the council).
         std::fs::write(
-            volumes.path().join(".identity/web-0/key.pem"),
+            volumes.path().join(".identity/default__web-0/key.pem"),
             b"PRIVATE KEY",
         )
         .unwrap();
@@ -6212,7 +6247,7 @@ mod tests {
         expect_complete(&events);
         assert_eq!(
             identity_dir_names(volumes.path()),
-            vec!["web-0".to_string()]
+            vec!["default__web-0".to_string()]
         );
 
         // Redeploy: the rolling path replaces web-0 with web-g1-0.
@@ -6264,7 +6299,7 @@ mod tests {
         let events = send_deploy(&tx, job_config()).await;
         let (created, instances) = expect_complete(&events);
         assert_eq!(created, 1);
-        assert_eq!(instances, &["migrate-0"]);
+        assert_eq!(instances, &["default__migrate-0"]);
 
         shutdown.cancel();
         agent_handle.await.unwrap();
@@ -6336,7 +6371,7 @@ mod tests {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
 
         // Pre-configure: init container exits successfully
-        let init_id = InstanceId("web-0-init-0".to_string());
+        let init_id = InstanceId("default__web-0-init-0".to_string());
         grill.set_state(&init_id, ContainerState::Stopped);
         grill.set_exit_code(&init_id, Some(0));
 
@@ -6365,7 +6400,7 @@ mod tests {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
 
         // Pre-configure: init container exits with failure
-        let init_id = InstanceId("web-0-init-0".to_string());
+        let init_id = InstanceId("default__web-0-init-0".to_string());
         grill.set_state(&init_id, ContainerState::Stopped);
         grill.set_exit_code(&init_id, Some(1));
 
@@ -6536,11 +6571,11 @@ mod tests {
     async fn startup_adopts_recorded_instances_instead_of_restarting() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let dir = tempfile::tempdir().unwrap();
-        let record = adoption_record("web-0", "web", false);
+        let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
 
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
         assert_eq!(agent.adopt_recorded_instances().await, 1);
@@ -6556,11 +6591,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_record_adopts_under_a_canonical_key() {
+        // In-place upgrade across the identity change: an old bun left a
+        // record whose instance_id has no namespace prefix (`web-0`). The
+        // runtime still knows the container by that legacy id, but the
+        // supervisor must key the adopted instance canonically so it can't
+        // collide with a same-name app in another namespace (DEP1).
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let dir = tempfile::tempdir().unwrap();
+        let record = adoption_record("web-0", "web", false); // legacy, bare id
+        crate::grill::records::write_record(dir.path(), &record).unwrap();
+        agent.set_records_dir(dir.path().to_path_buf());
+
+        // The runtime adopts by the id it ran under: the legacy one.
+        let runtime_id = InstanceId("web-0".to_string());
+        grill.set_adopt_result(&runtime_id, true);
+
+        assert_eq!(agent.adopt_recorded_instances().await, 1);
+
+        // But the supervisor keys it canonically.
+        let canonical = InstanceId("default__web-0".to_string());
+        let instance = agent
+            .supervisor
+            .get_instance(&canonical)
+            .expect("adopted under the canonical key");
+        assert_eq!(instance.namespace, "default");
+        assert_eq!(instance.app_name, "web");
+        // The legacy key resolves to nothing.
+        assert!(agent.supervisor.get_instance(&runtime_id).is_none());
+        // The runtime was asked to adopt the legacy container id, not to
+        // create or start a fresh one.
+        let calls = grill.calls();
+        assert!(calls.contains(&("adopt".to_string(), runtime_id.clone())));
+        assert!(!calls.contains(&("create".to_string(), runtime_id.clone())));
+        assert!(!calls.contains(&("start".to_string(), runtime_id)));
+    }
+
+    #[tokio::test]
     async fn startup_deletes_stale_records_and_reschedules() {
         let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
         let dir = tempfile::tempdir().unwrap();
         // MockGrill declines adoption by default (dead process).
-        let record = adoption_record("web-0", "web", false);
+        let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
 
@@ -6572,7 +6644,7 @@ mod tests {
         assert!(
             agent
                 .supervisor
-                .get_instance(&InstanceId("web-0".to_string()))
+                .get_instance(&InstanceId("default__web-0".to_string()))
                 .is_none()
         );
     }
@@ -6627,10 +6699,10 @@ mod tests {
         agent.set_volumes_dir(volumes.path().to_path_buf());
         agent.set_records_dir(records.path().to_path_buf());
 
-        let written = write_test_identity(volumes.path(), "web-0");
-        let record = adoption_record("web-0", "web", false);
+        let written = write_test_identity(volumes.path(), "default__web-0");
+        let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(records.path(), &record).unwrap();
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
         assert_eq!(agent.adopt_recorded_instances().await, 1);
@@ -6648,7 +6720,10 @@ mod tests {
         );
         assert_eq!(
             instance.identity_mount.as_deref(),
-            Some(crate::sesame::identity::instance_identity_dir(volumes.path(), "web-0").as_path())
+            Some(
+                crate::sesame::identity::instance_identity_dir(volumes.path(), "default__web-0")
+                    .as_path()
+            )
         );
 
         // The rotation loop fires on the restored schedule: fresh now,
@@ -6679,7 +6754,7 @@ mod tests {
 
         // A live instance's dir, a legacy app-scoped dir, and a dead
         // instance's leftovers.
-        write_test_identity(volumes.path(), "web-0");
+        write_test_identity(volumes.path(), "default__web-0");
         let legacy = volumes.path().join(".identity/default");
         std::fs::create_dir_all(legacy.join("web")).unwrap();
         std::fs::write(legacy.join("web/key.pem"), b"legacy key").unwrap();
@@ -6687,16 +6762,16 @@ mod tests {
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::write(dead.join("key.pem"), b"dead key").unwrap();
 
-        let record = adoption_record("web-0", "web", false);
+        let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(records.path(), &record).unwrap();
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
         assert_eq!(agent.adopt_recorded_instances().await, 1);
 
         assert_eq!(
             identity_dir_names(volumes.path()),
-            vec!["web-0".to_string()],
+            vec!["default__web-0".to_string()],
             "only the adopted instance's identity dir survives"
         );
     }
@@ -6705,11 +6780,11 @@ mod tests {
     async fn adopted_instances_resume_health_checks() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let dir = tempfile::tempdir().unwrap();
-        let record = adoption_record("web-0", "web", true);
+        let record = adoption_record("default__web-0", "web", true);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
 
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
         assert_eq!(agent.adopt_recorded_instances().await, 1);
 
@@ -6721,11 +6796,11 @@ mod tests {
     async fn adopted_instance_port_is_reserved() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let dir = tempfile::tempdir().unwrap();
-        let record = adoption_record("web-0", "web", false);
+        let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
 
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
         assert_eq!(agent.adopt_recorded_instances().await, 1);
 
@@ -6746,9 +6821,9 @@ mod tests {
         drop(ev_tx);
         while ev_rx.recv().await.is_some() {}
 
-        let id = InstanceId("web-0".to_string());
+        let id = InstanceId("default__web-0".to_string());
         assert!(agent.supervisor.get_instance(&id).is_some());
-        let record = adoption_record("web-0", "web", false);
+        let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         grill.set_adopt_result(&id, true);
 

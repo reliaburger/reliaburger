@@ -29,6 +29,12 @@ pub struct InstanceInventory {
     pub app_name: String,
     pub instance_id: u32,
     pub pid: u32,
+    /// The instance's full canonical id string. Defaults to empty when a
+    /// marker written by a pre-theme binary is loaded across an upgrade;
+    /// the reconstruction path falls back to the legacy `{app}-{ordinal}`
+    /// form in that case.
+    #[serde(default)]
+    pub full_id: String,
 }
 
 /// Node-local upgrade state, persisted across exec and crashes.
@@ -266,11 +272,38 @@ mod tests {
                 app_name: "web".to_string(),
                 instance_id: 0,
                 pid: 4242,
+                full_id: "default__web-0".to_string(),
             }],
         }
     }
 
     const MAX: u32 = 2;
+
+    #[test]
+    fn pre_theme_marker_without_full_id_still_loads() {
+        // A marker written by a pre-identity-theme binary has no `full_id`
+        // on its instance inventory. It must deserialise cleanly (serde
+        // default), so an in-flight upgrade across the change is not
+        // orphaned.
+        let json = r#"{
+            "schema": 1,
+            "upgrade_id": "up-1",
+            "previous_version": "0.1.0",
+            "previous_binary": "bun-v0.1.0",
+            "target_version": "0.2.0",
+            "target_binary": "bun-v0.2.0",
+            "phase": "Executed",
+            "boot_attempts": 0,
+            "pre_upgrade_instances": [
+                {"namespace":"default","app_name":"web","instance_id":0,"pid":4242}
+            ]
+        }"#;
+        let marker: UpgradeMarker = serde_json::from_str(json).expect("legacy marker loads");
+        let inst = &marker.pre_upgrade_instances[0];
+        assert_eq!(inst.full_id, "", "missing full_id defaults to empty");
+        assert_eq!(inst.app_name, "web");
+        assert_eq!(inst.instance_id, 0);
+    }
 
     #[test]
     fn no_marker_boots_normally() {

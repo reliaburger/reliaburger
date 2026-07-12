@@ -508,12 +508,24 @@ pub fn spawn_placement_reconciler(
     cmd_tx: mpsc::Sender<AgentCommand>,
     shutdown: CancellationToken,
     cluster_http: crate::cluster::ClusterHttp,
+    // Where to persist the durable applied-state checkpoint (DEP3). `None`
+    // disables persistence (the reconciler is still correct, it just
+    // re-derives applied-state from scratch on every restart).
+    state_dir: Option<std::path::PathBuf>,
 ) {
     tokio::spawn(async move {
         let client = cluster_http.client().clone();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
-        // (name, namespace) → serialized assignment we last applied.
-        let mut applied: BTreeMap<(String, String), String> = BTreeMap::new();
+        let checkpoint_path = state_dir
+            .as_deref()
+            .map(crate::cluster::applied::checkpoint_path);
+        // (name, namespace) → serialized assignment we last SUCCESSFULLY
+        // applied. Seeded from the durable checkpoint so a restart doesn't
+        // redeploy work that already converged (DEP3).
+        let mut applied: BTreeMap<(String, String), String> = checkpoint_path
+            .as_deref()
+            .map(crate::cluster::applied::load)
+            .unwrap_or_default();
 
         loop {
             tokio::select! {
@@ -556,6 +568,7 @@ pub fn spawn_placement_reconciler(
             };
 
             let mut seen: HashSet<(String, String)> = HashSet::new();
+            let mut changed = false;
             for assignment in &assignments.apps {
                 let key = (assignment.name.clone(), assignment.namespace.clone());
                 seen.insert(key.clone());
@@ -571,19 +584,25 @@ pub fn spawn_placement_reconciler(
                 let mut config = Config::default();
                 config.app.insert(assignment.name.clone(), spec);
 
-                // Drain the deploy events; the reconciler's outcome is
-                // visible through /v1/status, not a console.
-                let (event_tx, mut event_rx) = mpsc::channel::<ApplyEvent>(32);
-                tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+                // Drive the deploy and wait for its TERMINAL outcome
+                // (DEP3): the placement is applied only when the deploy
+                // reports `Complete`, not when the command is queued. A
+                // failed deploy leaves `applied` untouched, so the next
+                // tick retries it.
+                let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
                 if cmd_tx
                     .send(AgentCommand::Deploy {
                         config,
                         events: event_tx,
                     })
                     .await
-                    .is_ok()
+                    .is_err()
                 {
+                    continue; // agent gone; retry next tick
+                }
+                if deploy_succeeded(event_rx).await {
                     applied.insert(key, fingerprint);
+                    changed = true;
                 }
             }
 
@@ -604,9 +623,31 @@ pub fn spawn_placement_reconciler(
                     })
                     .await;
                 applied.remove(&(name, namespace));
+                changed = true;
+            }
+
+            // Persist the durable checkpoint whenever the applied set moved,
+            // so a restart resumes from the converged state (DEP3).
+            if changed && let Some(path) = &checkpoint_path {
+                crate::cluster::applied::save(path, &applied);
             }
         }
     });
+}
+
+/// Drain a deploy's event stream and report whether it reached `Complete`.
+///
+/// Returns `false` if the deploy emitted `Error` or the channel closed
+/// without a terminal event (the agent dropped it), so the caller retries.
+async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>) -> bool {
+    while let Some(event) = events.recv().await {
+        match event {
+            ApplyEvent::Complete { .. } => return true,
+            ApplyEvent::Error { .. } => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 #[cfg(test)]

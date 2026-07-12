@@ -184,7 +184,7 @@ async fn deploy_app_with_port_has_backend() {
     let info = harness.client.resolve("redis").await.unwrap();
     // ProcessGrill apps get a backend after reaching Running
     assert_eq!(info.total_backends, 1);
-    assert_eq!(info.backends[0].instance_id, "redis-0");
+    assert_eq!(info.backends[0].instance_id, "default__redis-0");
 }
 
 #[tokio::test]
