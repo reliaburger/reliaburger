@@ -174,6 +174,33 @@ impl CouncilNode {
         Ok(())
     }
 
+    /// Change the voter set, dropping demoted voters from the membership
+    /// entirely rather than retaining them as learners.
+    ///
+    /// The self-healing reconciler uses this to evict dead voters: the
+    /// joint-consensus change commits with a majority of both the old and
+    /// new configurations, so it never waits on the evicted node's vote.
+    pub async fn change_membership_evicting(
+        &self,
+        members: BTreeSet<u64>,
+    ) -> Result<(), CouncilError> {
+        self.raft
+            .change_membership(ChangeMembers::ReplaceAllVoters(members), false)
+            .await
+            .map_err(|e| CouncilError::WriteFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Remove a learner from the membership entirely. The node must not be
+    /// a voter; demote it first via `change_membership`.
+    pub async fn remove_learner(&self, id: u64) -> Result<(), CouncilError> {
+        self.raft
+            .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([id])), false)
+            .await
+            .map_err(|e| CouncilError::WriteFailed(e.to_string()))?;
+        Ok(())
+    }
+
     /// Shut down this Raft node.
     pub async fn shutdown(&self) -> Result<(), CouncilError> {
         self.raft
@@ -756,6 +783,98 @@ mod tests {
             state.config.get("env").map(String::as_str),
             Some("production")
         );
+    }
+
+    #[tokio::test]
+    async fn membership_changes_compose_add_then_evict() {
+        // The self-healing reconciler's sequence: add a learner, promote it
+        // via joint consensus, then evict a voter without leaving it behind
+        // as a learner. Each step must compose with the previous one.
+        let (mut nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        // Bring up node 4 and walk it in: learner first, then voter.
+        let network = InMemoryRaftNetworkFactory::new(4, router.clone());
+        let node4 = CouncilNode::new(
+            4,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(4, node4.raft().clone()).await;
+        nodes.push(node4);
+
+        let leader = &nodes[(leader_id - 1) as usize];
+        leader.add_learner(4, node_info(4)).await.unwrap();
+        leader
+            .change_membership(BTreeSet::from([1, 2, 3, 4]))
+            .await
+            .unwrap();
+
+        // Evict a non-leader voter entirely.
+        let victim = if leader_id == 3 { 2 } else { 3 };
+        let mut remaining = BTreeSet::from([1, 2, 3, 4]);
+        remaining.remove(&victim);
+        leader
+            .change_membership_evicting(remaining.clone())
+            .await
+            .unwrap();
+
+        let metrics = leader.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership().clone();
+        let voters: BTreeSet<u64> = membership.voter_ids().collect();
+        let all: BTreeSet<u64> = membership.nodes().map(|(id, _)| *id).collect();
+        assert_eq!(voters, remaining);
+        assert!(
+            !all.contains(&victim),
+            "evicted voter must not linger as a learner: {all:?}"
+        );
+
+        // The council still commits after the whole dance.
+        let resp = leader.write(RaftRequest::Noop).await.unwrap();
+        assert!(matches!(resp, CouncilResponse::Applied { .. }));
+    }
+
+    #[tokio::test]
+    async fn remove_learner_drops_it_from_membership() {
+        let (mut nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let network = InMemoryRaftNetworkFactory::new(4, router.clone());
+        let node4 = CouncilNode::new(
+            4,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(4, node4.raft().clone()).await;
+        nodes.push(node4);
+
+        let leader = &nodes[(leader_id - 1) as usize];
+        leader.add_learner(4, node_info(4)).await.unwrap();
+        leader.remove_learner(4).await.unwrap();
+
+        let metrics = leader.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership().clone();
+        let all: BTreeSet<u64> = membership.nodes().map(|(id, _)| *id).collect();
+        assert!(!all.contains(&4), "removed learner still present: {all:?}");
+        // Voters are untouched.
+        let voters: BTreeSet<u64> = membership.voter_ids().collect();
+        assert_eq!(voters, BTreeSet::from([1, 2, 3]));
     }
 
     #[tokio::test]
