@@ -214,8 +214,12 @@ Stop with `Ctrl-C` — the agent shuts down gracefully.
 ### CLI (relish)
 
 Relish is the command-line interface for interacting with a running bun agent.
+Run it without a subcommand, or use `relish tui`, to open the interactive
+terminal dashboard. The TUI needs a terminal of at least 80×24 cells.
 
 ```sh
+cargo run --bin relish              # interactive TUI
+cargo run --bin relish -- tui       # the same, explicitly
 cargo run --bin relish -- <command>
 ```
 
@@ -223,6 +227,7 @@ Commands:
 
 | Command | Description |
 |---------|-------------|
+| `tui` (or no command) | Interactive dashboard for apps, nodes, jobs, events, logs, metrics and routes |
 | `apply <path>` | Deploy workloads from a TOML config file |
 | `status` | List all running workloads |
 | `logs <name>` | Show captured stdout/stderr for an app |
@@ -280,6 +285,18 @@ Commands:
 | `upgrade status` | Show upgrade progress (cluster or node) |
 | `upgrade rollback [version]` | Roll back to a previous binary version |
 | `upgrade resume` | Resume a paused upgrade under a fresh attempt id |
+
+TUI keys:
+
+| Key | Action |
+|-----|--------|
+| `a`, `n`, `j`, `e`, `l`, `r` | Open apps, nodes, jobs, events, logs or routes |
+| `s`, `?`, `:` | Search, help or command palette |
+| Arrow keys, Enter | Select and open a row |
+| Tab, Shift-Tab | Cycle app-detail tabs |
+| `/` | Filter the current list |
+| `f` | Toggle log following |
+| Escape, `q` | Go back; quit from the dashboard |
 
 ### Self-upgrade (Phase 14)
 

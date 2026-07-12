@@ -1,0 +1,43 @@
+---
+source: src/relish/tui/views/help.rs
+expression: "render_to_string(&app, 120, 40)"
+---
+ RELISH  3 nodes · 30 apps · leader node-1 · CONNECTED                                                                  
+                                                                                                                        
+┌apps──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│NAME                 NS           READY  STATUS       RESTARTS  PORTS                                                 │
+│app-10               default       2/2   running             0  8010,8010                                             │
+│app-11               default       2/2   running             0  8011,8011                                             │
+│app-12               default       2/2   running             0  8012,8012                                             │
+│app-13               default       2/2   running             0  8013,8013                                             │
+│app-14               default       2/2   running             0  8014,8014                                             │
+│app-15               default       2/2   running             0  8015,8015                                             │
+│app-16               default       2/2   running             0  8016,8016                                             │
+│app-17               default       2/2   running             0  8017,8017                                             │
+│app-18               default       2/2   running             0  8018,8018                                             │
+│app-19               default       2/2   running             0  8019,8019                                             │
+│app-2                default       2/2   running             0  8002,8002                                             │
+│app-20               default       2/2   running             0  8020,8020                                             │
+│app-21               default       2/2   running             0  8021,8021                                             │
+│app-22               default       2/2   running             0  8022,8022                                             │
+│app-23               default       2/2   running             0  8023,8023                                             │
+│app-24               default       2/2   running             0  8024,8024                                             │
+│app-25               default       2/2   running             0  8025,8025                                             │
+│app-26               default       2/2   running             0  8026,8026                                             │
+│app-27               default       2/2   running             0  8027,8027                                             │
+│app-28               default       2/2   running             0  8028,8028                                             │
+│app-29               default       2/2   running             0  8029,8029                                             │
+│app-3                default       2/2   running             0  8003,8003                                             │
+│app-4                default       2/2   running             0  8004,8004                                             │
+│app-5                default       2/2   running             0  8005,8005                                             │
+│app-6                default       2/2   running             0  8006,8006                                             │
+│app-7                default       2/2   running             0  8007,8007                                             │
+│app-8                default       2/2   running             0  8008,8008                                             │
+│app-9                default       2/2   running             0  8009,8009                                             │
+│web                  default       2/2   running             0  8000,8000                                             │
+│worker               default       2/2   running             0  8001,8001                                             │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit

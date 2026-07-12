@@ -27,11 +27,13 @@ struct Cli {
     ca_cert: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Launch the interactive terminal UI.
+    Tui,
     /// Apply configuration from a file or directory.
     Apply {
         /// Path to a TOML config file or directory.
@@ -674,7 +676,13 @@ async fn main() -> ExitCode {
     reliaburger::relish::client::set_cli_token(cli.token.clone());
     reliaburger::relish::client::set_cli_ca_cert(cli.ca_cert.clone());
 
-    let result = match cli.command {
+    let command = match cli.command {
+        Some(command) => command,
+        None => return finish(reliaburger::relish::tui::run().await),
+    };
+
+    let result = match command {
+        Command::Tui => reliaburger::relish::tui::run().await,
         Command::Apply { ref path, dry_run } => commands::apply(path, cli.output, dry_run).await,
         Command::Status => commands::status().await,
         Command::Logs {
@@ -974,6 +982,10 @@ async fn main() -> ExitCode {
         }
     };
 
+    finish(result)
+}
+
+fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -988,8 +1000,26 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(args)
+    struct ParsedCli {
+        command: Command,
+        output: OutputFormat,
+        token: Option<String>,
+    }
+
+    fn parse(args: &[&str]) -> Result<ParsedCli, clap::Error> {
+        Cli::try_parse_from(args).map(|cli| ParsedCli {
+            command: cli.command.expect("test supplies a subcommand"),
+            output: cli.output,
+            token: cli.token,
+        })
+    }
+
+    #[test]
+    fn bare_relish_and_tui_are_valid_entry_points() {
+        let bare = Cli::try_parse_from(["relish"]).unwrap();
+        assert!(bare.command.is_none());
+        let tui = Cli::try_parse_from(["relish", "tui"]).unwrap();
+        assert!(matches!(tui.command, Some(Command::Tui)));
     }
 
     #[test]

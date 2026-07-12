@@ -23,7 +23,7 @@ path = "src/bin/testapp.rs"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.29", features = ["signal", "process", "user", "sched", "net", "fs"] }
 rand = "0.8"
@@ -45,6 +45,9 @@ hex = "0.4"
 dirs = "6"
 tokio-stream = "0.1"
 futures-util = "0.3"
+crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.29"
+tokio-tungstenite = "0.28"
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
 redb = "2"

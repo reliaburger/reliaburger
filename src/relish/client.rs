@@ -7,6 +7,7 @@
 /// reads incrementally — printing progress to stderr and collecting
 /// the final result.
 use futures_util::StreamExt;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::bun::agent::{
     ApplyEvent, ApplyResult, ChaosState, CouncilStatus, InstanceStatus, NodeStatus,
@@ -16,9 +17,11 @@ use crate::config::Config;
 use super::RelishError;
 
 /// Client for the Bun agent HTTP API.
+#[derive(Clone)]
 pub struct BunClient {
     base_url: String,
     client: reqwest::Client,
+    token: Option<String>,
 }
 
 /// Options for fetching or streaming logs.
@@ -176,6 +179,7 @@ impl BunClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: builder.build().expect("failed to create HTTP client"),
+            token: token.map(str::to_string),
         }
     }
 
@@ -368,6 +372,137 @@ impl BunClient {
             })?;
 
         Ok(statuses)
+    }
+
+    /// List alert statuses as their wire JSON representation.
+    pub async fn alerts(&self) -> Result<Vec<serde_json::Value>, RelishError> {
+        let value: serde_json::Value = self.get_typed_json("/v1/alerts").await?;
+        Ok(value["alerts"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// List run-to-completion workload instances.
+    pub async fn jobs(&self) -> Result<Vec<crate::bun::agent::JobStatus>, RelishError> {
+        self.get_typed_json("/v1/jobs").await
+    }
+
+    /// Fetch recent cluster events.
+    pub async fn events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::bun::events::ClusterEvent>, RelishError> {
+        let value: serde_json::Value = self
+            .get_typed_json(&format!("/v1/events?limit={limit}"))
+            .await?;
+        serde_json::from_value(value["events"].clone()).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse events response: {error}"),
+        })
+    }
+
+    /// Fetch deploy history for an app.
+    pub async fn deploy_history(&self, app: &str) -> Result<Vec<serde_json::Value>, RelishError> {
+        let value: serde_json::Value = self
+            .get_typed_json(&format!("/v1/deploys/history/{app}"))
+            .await?;
+        Ok(value["history"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Fetch metrics recorded for one app.
+    pub async fn app_metrics(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<crate::mayo::rollup::MetricsQueryResult, RelishError> {
+        self.get_typed_json(&format!("/v1/metrics/app/{app}/{namespace}"))
+            .await
+    }
+
+    async fn get_typed_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, RelishError> {
+        let response = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: format!("failed to parse response: {error}"),
+            })
+    }
+
+    /// Open an authenticated WebSocket to an agent path.
+    pub async fn ws_connect(
+        &self,
+        path_and_query: &str,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        RelishError,
+    > {
+        let scheme = if self.base_url.starts_with("https://") {
+            "wss://"
+        } else {
+            "ws://"
+        };
+        let authority = self
+            .base_url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&self.base_url);
+        let url = format!("{scheme}{authority}{path_and_query}");
+        let mut request = url
+            .into_client_request()
+            .map_err(|error| RelishError::WebSocket(error.to_string()))?;
+        if let Some(token) = &self.token {
+            let value = format!("Bearer {token}")
+                .parse()
+                .map_err(|_| RelishError::WebSocket("bad token".to_string()))?;
+            request.headers_mut().insert("Authorization", value);
+        }
+        let (stream, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|error| RelishError::WebSocket(error.to_string()))?;
+        Ok(stream)
+    }
+
+    /// Follow app logs over WebSocket.
+    pub async fn ws_logs(
+        &self,
+        app: &str,
+        namespace: &str,
+        tail: usize,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        RelishError,
+    > {
+        self.ws_connect(&format!("/v1/ws/logs/{app}/{namespace}?tail={tail}"))
+            .await
+    }
+
+    /// Follow cluster events over WebSocket.
+    pub async fn ws_events(
+        &self,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        RelishError,
+    > {
+        self.ws_connect("/v1/ws/events").await
     }
 
     /// Stop an app.

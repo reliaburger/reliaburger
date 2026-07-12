@@ -6,6 +6,7 @@
 /// `oneshot` response. The `apply` endpoint streams progress events
 /// via Server-Sent Events (SSE).
 use axum::Router;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -63,6 +64,8 @@ pub struct ApiState {
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     /// Deploy history (shared with agent).
     pub deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    /// Bounded cluster event history and live feed.
+    pub events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     /// Pickle image catalog (shared with registry).
     pub pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     /// GitOps webhook signal channel (signals the Lettuce sync loop).
@@ -128,6 +131,7 @@ pub fn router(
     membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
     gitops_webhook_tx: Option<mpsc::Sender<()>>,
     api_port: u16,
+    events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
 ) -> Router {
     router_with_upgrade(
         cmd_tx,
@@ -143,6 +147,7 @@ pub fn router(
         membership,
         gitops_webhook_tx,
         api_port,
+        events,
         None,
         None,
         None,
@@ -169,6 +174,7 @@ pub fn router_with_upgrade(
     membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
     gitops_webhook_tx: Option<mpsc::Sender<()>>,
     api_port: u16,
+    events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
     aggregated_rx: Option<
         tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>,
@@ -186,6 +192,7 @@ pub fn router_with_upgrade(
         log_store,
         alerts,
         deploy_history,
+        events,
         pickle_catalog,
         gitops_webhook_tx,
         council,
@@ -253,6 +260,10 @@ pub fn router_with_upgrade(
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/jobs", get(jobs_handler))
+        .route("/v1/events", get(events_handler))
+        .route("/v1/ws/events", get(ws_events_handler))
+        .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
@@ -1145,6 +1156,89 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+/// List all run-to-completion workload instances.
+async fn jobs_handler(State(state): State<ApiState>) -> Response {
+    let (response_tx, response_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::JobStatus {
+            response: response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return agent_unavailable();
+    }
+    match response_rx.await {
+        Ok(statuses) => Json(statuses).into_response(),
+        Err(_) => agent_unavailable(),
+    }
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    limit: Option<usize>,
+    app: Option<String>,
+    severity: Option<crate::bun::events::EventSeverity>,
+}
+
+/// Return recent events from the bounded in-memory store.
+async fn events_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<EventsQuery>,
+) -> impl IntoResponse {
+    let Some(events) = &state.events else {
+        return Json(serde_json::json!({"events": []}));
+    };
+    let store = events.read().await;
+    Json(serde_json::json!({
+        "events": store.recent(
+            query.limit.unwrap_or(100),
+            query.app.as_deref(),
+            query.severity,
+        )
+    }))
+}
+
+/// Upgrade an authenticated request to the live event stream.
+async fn ws_events_handler(State(state): State<ApiState>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .on_upgrade(move |socket| ws_events_session(socket, state.events))
+        .into_response()
+}
+
+async fn ws_events_session(
+    mut socket: WebSocket,
+    events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
+) {
+    let Some(events) = events else { return };
+    let (recent, mut receiver) = {
+        let store = events.read().await;
+        (store.recent(50, None, None), store.subscribe())
+    };
+    for event in recent {
+        let Ok(json) = serde_json::to_string(&event) else {
+            continue;
+        };
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            event = receiver.recv() => match event {
+                Ok(event) => {
+                    let Ok(json) = serde_json::to_string(&event) else { continue };
+                    if socket.send(Message::Text(json.into())).await.is_err() { return; }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            message = socket.recv() => if message.is_none() { return; },
+        }
+    }
+}
+
 /// Status for a specific app.
 async fn status_app_handler(
     State(state): State<ApiState>,
@@ -1309,6 +1403,49 @@ async fn logs_handler(
             Json(serde_json::json!({ "error": "agent dropped response" })),
         )
             .into_response(),
+    }
+}
+
+/// Upgrade an authenticated request to a live log stream.
+async fn ws_logs_handler(
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<LogsQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    upgrade
+        .on_upgrade(move |socket| ws_logs_session(socket, state.cmd_tx, app, namespace, query.tail))
+        .into_response()
+}
+
+async fn ws_logs_session(
+    mut socket: WebSocket,
+    command_tx: mpsc::Sender<AgentCommand>,
+    app: String,
+    namespace: String,
+    tail: Option<usize>,
+) {
+    let (lines_tx, mut lines_rx) = mpsc::channel(64);
+    if command_tx
+        .send(AgentCommand::FollowLogs {
+            app_name: app,
+            namespace,
+            tail,
+            lines: lines_tx,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            line = lines_rx.recv() => match line {
+                Some(line) => if socket.send(Message::Text(line.into())).await.is_err() { return; },
+                None => return,
+            },
+            message = socket.recv() => if message.is_none() { return; },
+        }
     }
 }
 
@@ -3410,7 +3547,7 @@ mod tests {
         });
 
         let app = router(
-            cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117,
+            cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
         );
         (app, shutdown)
     }
@@ -3527,6 +3664,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
         (app, shutdown)
     }
@@ -3557,6 +3695,17 @@ mod tests {
         let (app, shutdown) = setup_with_auth(vec![token], None).await;
         assert_eq!(
             get_status(app, "/v1/status", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_requires_a_token() {
+        let (token, _plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        assert_eq!(
+            get_status(app, "/v1/ws/events", None).await,
             StatusCode::UNAUTHORIZED
         );
         shutdown.cancel();
@@ -3641,6 +3790,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
         (app, shutdown, plaintext)
     }
@@ -3765,6 +3915,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
         (app, shutdown, plaintext)
     }
@@ -3898,6 +4049,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
         let status = post_status(
             app,
@@ -3927,6 +4079,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
 
         let (status, body) = get(app, "/v1/identity/jwks").await;
@@ -3966,6 +4119,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
 
         let response = app
@@ -4023,6 +4177,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
         let (status, body) = get(app, "/v1/token/list").await;
         assert_eq!(status, StatusCode::OK);
@@ -4145,6 +4300,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
 
         // Deploy first via channel
@@ -4370,6 +4526,7 @@ mod tests {
             None,
             None,
             9117,
+            None,
         );
         (app, shutdown, plaintext)
     }

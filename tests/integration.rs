@@ -4,8 +4,11 @@
 //! restart logic, and CLI output. Each test spins up a real Bun agent
 //! with a ProcessGrill backend and interacts with it via the HTTP API.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use futures_util::StreamExt;
 use reliaburger::bun::agent::{AgentCommand, BunAgent};
 use reliaburger::bun::api;
 use reliaburger::bun::testapp::{TestApp, TestAppMode};
@@ -13,7 +16,11 @@ use reliaburger::config::Config;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
 use reliaburger::relish::client::{BunClient, LogOptions};
-use tokio::sync::mpsc;
+use reliaburger::relish::tui::app::{DetailTab, TuiApp, View};
+use reliaburger::relish::tui::data::{DataProvider, HttpDataProvider};
+use reliaburger::relish::tui::fixtures::render_to_string;
+use reliaburger::relish::tui::msg::{DataUpdate, Msg};
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Test harness: starts a real agent with ProcessGrill on an ephemeral port.
@@ -33,6 +40,8 @@ impl TestHarness {
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
         let deploy_history = agent.deploy_history_handle();
+        let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
+        agent.set_event_store(Arc::clone(&event_store));
 
         tokio::spawn(async move {
             agent.run().await;
@@ -55,6 +64,7 @@ impl TestHarness {
             None,
             None,
             9117,
+            Some(event_store),
         );
         let server_shutdown = shutdown.clone();
 
@@ -310,6 +320,145 @@ async fn job_runs_to_completion() {
         "expected stopped after successful job, got {}",
         statuses[0].state
     );
+}
+
+#[tokio::test]
+async fn tui_events_endpoint_records_successful_deploy() {
+    let harness = TestHarness::start().await;
+    harness
+        .client
+        .apply(&TestHarness::config_no_health())
+        .await
+        .unwrap();
+
+    let events = harness.client.events(20).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == reliaburger::bun::events::EventKind::Deploy
+            && event.app.as_deref() == Some("worker")
+    }));
+}
+
+#[tokio::test]
+async fn tui_jobs_endpoint_lists_supervisor_job_state() {
+    let harness = TestHarness::start().await;
+    let config = Config::parse(
+        r#"
+        [job.listed]
+        image = "test:v1"
+        command = ["echo", "done"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+
+    let jobs = harness.client.jobs().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].name, "listed");
+    assert_eq!(jobs[0].namespace, "default");
+}
+
+#[tokio::test]
+async fn tui_fetches_renders_and_navigates_real_api_data() {
+    let harness = TestHarness::start().await;
+    harness
+        .client
+        .apply(&TestHarness::config_no_health())
+        .await
+        .unwrap();
+    let provider = HttpDataProvider {
+        client: harness.client.clone(),
+    };
+    let mut app = TuiApp::new();
+    app.update(Msg::Data(DataUpdate::Status(provider.status().await)));
+    app.update(Msg::Data(DataUpdate::Nodes(provider.nodes().await)));
+    app.update(Msg::Data(DataUpdate::Council(provider.council().await)));
+    app.update(Msg::Data(DataUpdate::EventsSeed(
+        provider.recent_events(100).await,
+    )));
+
+    let dashboard = render_to_string(&app, 120, 40);
+    assert!(dashboard.contains("worker"));
+    assert!(dashboard.contains("nodes"));
+
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+    )));
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(matches!(app.view(), View::AppDetail { app, .. } if app == "worker"));
+    app.view_stack.pop();
+    app.view_stack.push(View::AppDetail {
+        app: "worker".into(),
+        namespace: "default".into(),
+        tab: DetailTab::Instances,
+    });
+    assert!(render_to_string(&app, 120, 40).contains("running"));
+}
+
+#[tokio::test]
+async fn tui_search_filters_and_jumps_to_app() {
+    let mut app =
+        TuiApp::with_test_data(reliaburger::relish::tui::fixtures::TestScenario::HealthyCluster);
+    app.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::NONE,
+    )));
+    for character in "web".chars() {
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        )));
+    }
+    assert!(app.search.results.iter().any(|hit| hit.name == "web"));
+    assert!(app.search.results.iter().all(|hit| hit.name != "worker"));
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert!(matches!(app.view(), View::AppDetail { app, .. } if app == "web"));
+}
+
+#[tokio::test]
+async fn tui_websocket_events_replay_deploy_event() {
+    let harness = TestHarness::start().await;
+    harness
+        .client
+        .apply(&TestHarness::config_no_health())
+        .await
+        .unwrap();
+    let mut socket = harness.client.ws_events().await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let event: reliaburger::bun::events::ClusterEvent =
+        serde_json::from_str(frame.to_text().unwrap()).unwrap();
+    assert_eq!(event.kind, reliaburger::bun::events::EventKind::Deploy);
+}
+
+#[tokio::test]
+async fn tui_websocket_logs_replay_known_line() {
+    let harness = TestHarness::start().await;
+    let config = Config::parse(
+        r#"
+        [app.streamer]
+        image = "test:v1"
+        command = ["sh", "-c", "echo phase-thirteen-line; sleep 2"]
+    "#,
+    )
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut socket = harness
+        .client
+        .ws_logs("streamer", "default", 100)
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(frame.to_text().unwrap().contains("phase-thirteen-line"));
 }
 
 #[tokio::test]
