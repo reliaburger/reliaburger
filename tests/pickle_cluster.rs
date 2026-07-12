@@ -641,7 +641,7 @@ async fn p2p_pull_retries_alternate_holder() {
     let (_, catalog) = manifest_with_holders(
         "flaky",
         &config_digest,
-        &[layer_digest.clone()],
+        std::slice::from_ref(&layer_digest),
         &[4096],
         &[1, 2],
     );
@@ -824,7 +824,7 @@ async fn pull_through_serves_stale_when_upstream_down() {
     let (_, catalog) = manifest_with_holders(
         &cached_repo,
         &config_digest,
-        &[layer_digest.clone()],
+        std::slice::from_ref(&layer_digest),
         &[2048],
         &[1],
     );

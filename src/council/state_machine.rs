@@ -279,7 +279,17 @@ impl StateMachineInner {
                 self.state.gitops_sync_state = Some(*sync_state.clone());
             }
             RaftRequest::AttachSignature(attach) => {
-                self.state.manifest_catalog.apply_attach_signature(attach);
+                // An unknown digest is refused, not silently dropped
+                // (JOB7): the old no-op let a build report success while
+                // its "signature" attached to nothing.
+                if !self.state.manifest_catalog.apply_attach_signature(attach) {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "no manifest with digest {} in the catalogue",
+                            attach.manifest_digest.as_str()
+                        ),
+                    });
+                }
             }
             RaftRequest::SecurityStateInit(ss) => {
                 self.state.security_state = *ss.clone();
@@ -427,6 +437,41 @@ impl StateMachineInner {
                         // Clear for a different id: put it back untouched.
                         self.state.active_upgrade = Some(active);
                     }
+                }
+            }
+            RaftRequest::BatchRegister { batch } => {
+                // The durable counter is the id authority (JOB4): a
+                // restarted leader continues from the replicated value
+                // instead of reusing ids from 1. Registration also prunes
+                // stale terminal batches, keyed on the *request's* clock
+                // so every replica prunes identically.
+                let batch_id = self.state.batch_state.register(batch.clone());
+                return Some(CouncilResponse::BatchRegistered { batch_id });
+            }
+            RaftRequest::BatchJobUpdate {
+                batch_id,
+                job_name,
+                status,
+            } => {
+                // Transition validation lives here, at the single point
+                // every replica passes through: forged states, unknown
+                // jobs and conflicting terminal reports are refused;
+                // duplicate terminal reports apply as no-ops (JOB3).
+                if let Err(e) = self.state.batch_state.report(*batch_id, job_name, *status) {
+                    return Some(CouncilResponse::Refused {
+                        reason: e.to_string(),
+                    });
+                }
+            }
+            RaftRequest::BuildRegister { build } => {
+                let build_id = self.state.build_state.register(build.clone());
+                return Some(CouncilResponse::BuildRegistered { build_id });
+            }
+            RaftRequest::BuildUpdate { build_id, state } => {
+                if let Err(e) = self.state.build_state.update(*build_id, state.clone()) {
+                    return Some(CouncilResponse::Refused {
+                        reason: e.to_string(),
+                    });
                 }
             }
         }
@@ -2120,5 +2165,332 @@ mod tests {
         let json = serde_json::to_string(&inner.state).unwrap();
         let reloaded: DesiredState = serde_json::from_str(&json).unwrap();
         assert_eq!(reloaded.active_upgrade, inner.state.active_upgrade);
+    }
+
+    // -- Batch/build durable tracking (12b.2) ---------------------------------
+
+    fn batch_record(job: &str, node: &str) -> crate::meat::batch_tracker::BatchRecord {
+        crate::meat::batch_tracker::BatchRecord {
+            jobs: vec![crate::meat::batch_tracker::BatchJobRecord {
+                name: job.to_string(),
+                namespace: "default".to_string(),
+                node: Some(crate::meat::types::NodeId::new(node)),
+                status: crate::meat::batch_tracker::JobStatus::Pending,
+            }],
+            submitted_at_epoch_secs: 1_000_000,
+        }
+    }
+
+    fn build_record(name: &str) -> crate::bun::build_runner::BuildRecord {
+        crate::bun::build_runner::BuildRecord {
+            name: name.to_string(),
+            runner_node: Some("n1".to_string()),
+            state: crate::bun::build_runner::BuildState::Running,
+            created_at_epoch_secs: 1_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_register_returns_the_allocated_id() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply(vec![
+                normal_entry(
+                    1,
+                    1,
+                    RaftRequest::BatchRegister {
+                        batch: batch_record("j1", "n1"),
+                    },
+                ),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::BatchRegister {
+                        batch: batch_record("j2", "n1"),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            CouncilResponse::BatchRegistered { batch_id: 1 }
+        );
+        assert_eq!(
+            responses[1],
+            CouncilResponse::BatchRegistered { batch_id: 2 }
+        );
+    }
+
+    /// JOB4: the id counters ride the persisted snapshot, so a
+    /// restarted leader continues the sequence instead of reusing ids.
+    #[tokio::test]
+    async fn batch_and_build_ids_survive_a_snapshot_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ids.redb");
+        {
+            let db = std::sync::Arc::new(Database::create(&path).unwrap());
+            let mut sm = CouncilStateMachine::with_store(db).unwrap();
+            sm.apply(vec![
+                normal_entry(
+                    1,
+                    1,
+                    RaftRequest::BatchRegister {
+                        batch: batch_record("j1", "n1"),
+                    },
+                ),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::BuildRegister {
+                        build: build_record("b1"),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+            let mut builder = sm.get_snapshot_builder().await;
+            builder.build_snapshot().await.unwrap();
+        }
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let mut sm = CouncilStateMachine::with_store(db).unwrap();
+        let responses = sm
+            .apply(vec![
+                normal_entry(
+                    2,
+                    3,
+                    RaftRequest::BatchRegister {
+                        batch: batch_record("j2", "n1"),
+                    },
+                ),
+                normal_entry(
+                    2,
+                    4,
+                    RaftRequest::BuildRegister {
+                        build: build_record("b2"),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[0],
+            CouncilResponse::BatchRegistered { batch_id: 2 }
+        );
+        assert_eq!(
+            responses[1],
+            CouncilResponse::BuildRegistered { build_id: 2 }
+        );
+
+        // The pre-restart records reloaded too.
+        let state = sm.desired_state().await;
+        assert!(state.batch_state.get(1).is_some());
+        assert!(state.build_state.get(1).is_some());
+    }
+
+    #[tokio::test]
+    async fn batch_job_update_validates_transitions() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::BatchRegister {
+                batch: batch_record("j1", "n1"),
+            },
+        )])
+        .await
+        .unwrap();
+
+        // A legal completion applies…
+        let ok = sm
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::BatchJobUpdate {
+                    batch_id: 1,
+                    job_name: "j1".to_string(),
+                    status: crate::meat::batch_tracker::JobStatus::Completed,
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(ok[0], CouncilResponse::Applied { log_index: 2 });
+
+        // …a conflicting terminal report is refused…
+        let refused = sm
+            .apply(vec![normal_entry(
+                1,
+                3,
+                RaftRequest::BatchJobUpdate {
+                    batch_id: 1,
+                    job_name: "j1".to_string(),
+                    status: crate::meat::batch_tracker::JobStatus::Failed,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+
+        // …and so is a report for an unknown batch.
+        let unknown = sm
+            .apply(vec![normal_entry(
+                1,
+                4,
+                RaftRequest::BatchJobUpdate {
+                    batch_id: 99,
+                    job_name: "j1".to_string(),
+                    status: crate::meat::batch_tracker::JobStatus::Completed,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(unknown[0], CouncilResponse::Refused { .. }));
+    }
+
+    #[tokio::test]
+    async fn build_update_refuses_unknown_ids_and_bad_transitions() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::BuildRegister {
+                build: build_record("b1"),
+            },
+        )])
+        .await
+        .unwrap();
+
+        let ok = sm
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::BuildUpdate {
+                    build_id: 1,
+                    state: crate::bun::build_runner::BuildState::Failed {
+                        reason: "boom".to_string(),
+                    },
+                },
+            )])
+            .await
+            .unwrap();
+        assert_eq!(ok[0], CouncilResponse::Applied { log_index: 2 });
+
+        let refused = sm
+            .apply(vec![
+                normal_entry(
+                    1,
+                    3,
+                    RaftRequest::BuildUpdate {
+                        build_id: 1,
+                        state: crate::bun::build_runner::BuildState::Completed {
+                            image: "b1:v1".to_string(),
+                        },
+                    },
+                ),
+                normal_entry(
+                    1,
+                    4,
+                    RaftRequest::BuildUpdate {
+                        build_id: 42,
+                        state: crate::bun::build_runner::BuildState::Running,
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+        assert!(matches!(refused[1], CouncilResponse::Refused { .. }));
+    }
+
+    /// JOB7: attaching a signature to a digest the catalogue doesn't
+    /// know is refused, not silently dropped — the old no-op let a
+    /// build report success with a signature attached to nothing.
+    #[tokio::test]
+    async fn attach_signature_for_an_unknown_digest_is_refused() {
+        let mut sm = CouncilStateMachine::new();
+        let attach = crate::pickle::types::AttachSignature {
+            manifest_digest: test_digest("unknown"),
+            signature: crate::pickle::types::ImageSignature {
+                method: crate::pickle::types::SigningMethod::ExternalKey {
+                    key_id: "k".to_string(),
+                },
+                signature: "sig".to_string(),
+                verification_material: crate::pickle::types::VerificationMaterial::PublicKey(vec![
+                    1, 2, 3,
+                ]),
+                signed_at: std::time::SystemTime::UNIX_EPOCH,
+            },
+        };
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::AttachSignature(attach),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(responses[0], CouncilResponse::Refused { .. }),
+            "got: {:?}",
+            responses[0]
+        );
+    }
+
+    /// The 12b.2 compatibility rule made executable: a snapshot written
+    /// before the batch/build tracker fields existed must load cleanly,
+    /// with both trackers defaulting to empty and counters at 1.
+    #[test]
+    fn pre_12b2_snapshot_without_tracker_fields_still_loads() {
+        let state = DesiredState::default();
+        let mut value = serde_json::to_value(&state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(object.remove("batch_state").is_some());
+        assert!(object.remove("build_state").is_some());
+
+        let reloaded: DesiredState = serde_json::from_value(value).unwrap();
+        assert_eq!(reloaded.batch_state.next_batch_id, 1);
+        assert!(reloaded.batch_state.batches.is_empty());
+        assert_eq!(reloaded.build_state.next_build_id, 1);
+        assert!(reloaded.build_state.builds.is_empty());
+    }
+
+    /// The same rule end to end through the persisted store: a legacy
+    /// pre-envelope snapshot without the tracker fields loads through
+    /// `with_store` (the #83 envelope loader), and the trackers start
+    /// from their defaults.
+    #[tokio::test]
+    async fn pre_12b2_persisted_snapshot_loads_through_the_envelope_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre12b2.redb");
+        let app_id = AppId::new("web", "prod");
+
+        // Fake the exact bytes an older binary persisted: current state
+        // serialised, tracker fields stripped, stored without envelope.
+        let mut legacy_state = DesiredState::default();
+        legacy_state.apps.insert(app_id.clone(), default_spec());
+        let mut value = serde_json::to_value(&legacy_state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("batch_state");
+        object.remove("build_state");
+        let payload = serde_json::to_vec(&value).unwrap();
+        {
+            let db = Database::create(&path).unwrap();
+            let wtx = db.begin_write().unwrap();
+            {
+                let mut t = wtx.open_table(SNAPSHOT).unwrap();
+                t.insert(SNAP_DATA_KEY, payload.as_slice()).unwrap();
+                t.insert(SNAP_INDEX_KEY, 1u64.to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+
+        let db = std::sync::Arc::new(Database::create(&path).unwrap());
+        let sm = CouncilStateMachine::with_store(db).expect("pre-12b.2 snapshot loads");
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&app_id));
+        assert_eq!(state.batch_state.next_batch_id, 1);
+        assert_eq!(state.build_state.next_build_id, 1);
     }
 }

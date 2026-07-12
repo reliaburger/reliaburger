@@ -388,9 +388,7 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
 
     // Raw client handshake through the proxy.
     let mut client = TcpStream::connect(harness.http_addr).await.unwrap();
-    let req = format!(
-        "GET /socket HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
+    let req = "GET /socket HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string();
     client.write_all(req.as_bytes()).await.unwrap();
 
     let (head, _) = read_head(&mut client).await;

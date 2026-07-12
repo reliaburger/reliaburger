@@ -1075,6 +1075,9 @@ async fn main() -> anyhow::Result<()> {
         cluster_http.clone(),
         config.images.registry_port,
         config.images.max_context_bytes,
+        // Signing becomes part of a build's terminal state under a
+        // signature-requiring trust policy (12b.2 JOB7).
+        config.images.trust_policy.require_signatures,
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener
