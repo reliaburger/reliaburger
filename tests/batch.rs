@@ -119,6 +119,7 @@ impl Harness {
             None,
             9117,
             None,
+            None,
             aggregated_rx,
             options.node_name,
             900,

@@ -101,6 +101,7 @@ impl Harness {
             None,
             9117,
             None,
+            None,
             Some(aggregated_rx),
             options.node_name,
             600,
