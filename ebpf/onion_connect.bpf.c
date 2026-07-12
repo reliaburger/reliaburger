@@ -50,6 +50,34 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } egress_map SEC(".maps");
 
+/* Exact IPv6 destinations. Same semantics as egress_map. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct egress6_key);
+    __type(value, struct egress_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress6_map SEC(".maps");
+
+/* CIDR allowlists per family. LPM tries: a lookup returns the entry with
+ * the longest matching prefix, so userspace folds the ports of enclosing
+ * prefixes into every more-specific entry (see merge_cidr_ports). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __type(key, struct egress_cidr4_key);
+    __type(value, struct egress_cidr_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_cidr4_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __type(key, struct egress_cidr6_key);
+    __type(value, struct egress_cidr_value);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} egress_cidr6_map SEC(".maps");
+
 /* Per-cgroup flag: 1 = egress enforcement active for this cgroup.
  * If a cgroup is not in this map, all egress is allowed (no config). */
 struct {
@@ -59,6 +87,65 @@ struct {
     __type(value, __u32);       /* 1 = enforce egress */
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } egress_enabled_map SEC(".maps");
+
+/* ---------- Egress policy helpers ---------------------------------------- */
+
+/* Write the cgroup id into the first 8 bytes of an LPM key in big-endian
+ * order, so both userspace and the kernel produce identical bytes. */
+static __always_inline void fill_cgroup_be(__u8 *data, __u64 cg)
+{
+    data[0] = cg >> 56;
+    data[1] = cg >> 48;
+    data[2] = cg >> 40;
+    data[3] = cg >> 32;
+    data[4] = cg >> 24;
+    data[5] = cg >> 16;
+    data[6] = cg >> 8;
+    data[7] = cg;
+}
+
+/* Does a CIDR value allow this (network byte order) port? */
+static __always_inline int cidr_port_allowed(struct egress_cidr_value *cv,
+                                             __u16 port_be)
+{
+    __u16 n = cv->count;
+    if (n > MAX_CIDR_PORTS)
+        n = MAX_CIDR_PORTS;
+
+    #pragma unroll
+    for (int i = 0; i < MAX_CIDR_PORTS; i++) {
+        if (i >= n)
+            break;
+        if (cv->ports[i] == port_be)
+            return 1;
+    }
+    return 0;
+}
+
+/* Is this IPv4 destination allowed for the cgroup? Exact match first,
+ * then the CIDR trie. ip_be and port_be are in network byte order. */
+static __always_inline int egress4_allowed(__u64 cg, __u32 ip_be, __u16 port_be)
+{
+    struct egress_key ek = {
+        .src_cgroup_id = cg,
+        .dst_ip        = ip_be,
+        .dst_port      = port_be,
+        ._pad          = 0,
+    };
+    struct egress_value *ev = bpf_map_lookup_elem(&egress_map, &ek);
+    if (ev && ev->action == 1)
+        return 1;
+
+    struct egress_cidr4_key ck = {};
+    ck.prefixlen = CIDR_CGROUP_PREFIX_BITS + 32;
+    fill_cgroup_be(ck.data, cg);
+    __builtin_memcpy(&ck.data[8], &ip_be, 4);
+    struct egress_cidr_value *cv = bpf_map_lookup_elem(&egress_cidr4_map, &ck);
+    if (cv && cidr_port_allowed(cv, port_be))
+        return 1;
+
+    return 0;
+}
 
 /* ---------- Smoker fault maps ------------------------------------------- */
 
@@ -85,20 +172,13 @@ int onion_connect(struct bpf_sock_addr *ctx)
     if ((dst_ip & VIP_MASK) != VIP_PREFIX) {
         /* Not a VIP — check egress allowlist.
          * If the calling cgroup has egress enforcement enabled and
-         * the destination is not in the egress_map, deny the connection. */
+         * the destination is neither an exact allow entry nor inside
+         * an allowed CIDR, deny the connection. */
         __u64 eg_cgroup = bpf_get_current_cgroup_id();
         __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &eg_cgroup);
-        if (enforced && *enforced == 1) {
-            struct egress_key ek = {
-                .src_cgroup_id = eg_cgroup,
-                .dst_ip        = ctx->user_ip4,
-                .dst_port      = ctx->user_port,
-                ._pad          = 0,
-            };
-            struct egress_value *ev = bpf_map_lookup_elem(&egress_map, &ek);
-            if (!ev || ev->action != 1)
-                return 0;  /* -ECONNREFUSED: egress not allowed */
-        }
+        if (enforced && *enforced == 1 &&
+            !egress4_allowed(eg_cgroup, ctx->user_ip4, ctx->user_port))
+            return 0;  /* EPERM: egress not allowed */
         return 1;  /* pass through (no enforcement or allowed) */
     }
 
@@ -216,6 +296,64 @@ no_fault:
     ctx->user_port = be->host_port;
 
     return 1;  /* proceed with connect() to the rewritten address */
+}
+
+/* ---------- Connect6 hook ------------------------------------------------ */
+
+/* IPv6 egress policy. Without this hook a dual-stack workload bypasses the
+ * whole allowlist by connecting over IPv6 (NET7). VIP rewrite stays
+ * v4-only: VIPs live in 127.128.0.0/16 and the service map never hands out
+ * IPv6 backends, so this program is pure policy — no rewriting.
+ */
+SEC("cgroup/connect6")
+int onion_connect6(struct bpf_sock_addr *ctx)
+{
+    __u64 cg = bpf_get_current_cgroup_id();
+    __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &cg);
+    if (!enforced || *enforced != 1)
+        return 1;  /* no enforcement for this cgroup */
+
+    /* v4-mapped destination (::ffff:a.b.c.d): a dual-stack socket reaching
+     * an IPv4 server goes through connect6, so it must be judged against
+     * the *IPv4* policy or the v4 allowlist is trivially bypassable. */
+    if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
+        ctx->user_ip6[2] == bpf_htonl(0x0000FFFF)) {
+        __u32 v4 = ctx->user_ip6[3];
+        /* Mapped VIPs mirror connect4: the egress check does not police
+         * the VIP range (no rewrite happens here, so the connect fails
+         * against the unroutable VIP by itself). */
+        if ((bpf_ntohl(v4) & VIP_MASK) == VIP_PREFIX)
+            return 1;
+        if (egress4_allowed(cg, v4, ctx->user_port))
+            return 1;
+        return 0;  /* EPERM: egress not allowed */
+    }
+
+    /* Exact IPv6 match. ctx->user_ip6 must be read in 32-bit chunks. */
+    struct egress6_key ek = {};
+    ek.src_cgroup_id = cg;
+    ek.dst_ip[0]     = ctx->user_ip6[0];
+    ek.dst_ip[1]     = ctx->user_ip6[1];
+    ek.dst_ip[2]     = ctx->user_ip6[2];
+    ek.dst_ip[3]     = ctx->user_ip6[3];
+    ek.dst_port      = ctx->user_port;
+    struct egress_value *ev = bpf_map_lookup_elem(&egress6_map, &ek);
+    if (ev && ev->action == 1)
+        return 1;
+
+    /* CIDR match via the IPv6 LPM trie. */
+    struct egress_cidr6_key ck = {};
+    ck.prefixlen = CIDR_CGROUP_PREFIX_BITS + 128;
+    fill_cgroup_be(ck.data, cg);
+    __builtin_memcpy(&ck.data[8],  &ek.dst_ip[0], 4);
+    __builtin_memcpy(&ck.data[12], &ek.dst_ip[1], 4);
+    __builtin_memcpy(&ck.data[16], &ek.dst_ip[2], 4);
+    __builtin_memcpy(&ck.data[20], &ek.dst_ip[3], 4);
+    struct egress_cidr_value *cv = bpf_map_lookup_elem(&egress_cidr6_map, &ck);
+    if (cv && cidr_port_allowed(cv, ctx->user_port))
+        return 1;
+
+    return 0;  /* EPERM: egress not allowed */
 }
 
 char _license[] SEC("license") = "GPL";

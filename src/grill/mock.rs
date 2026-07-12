@@ -19,6 +19,7 @@ pub struct MockGrill {
     exit_codes: Arc<Mutex<HashMap<InstanceId, Option<i32>>>>,
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
+    honours_cgroup_path: Arc<Mutex<bool>>,
 }
 
 impl MockGrill {
@@ -66,6 +67,14 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_container_ip(&self, ip: std::net::Ipv4Addr) {
         *self.container_ip.lock().unwrap() = Some(ip);
+    }
+
+    /// Make `honours_cgroup_path()` report `value`, simulating a runtime
+    /// (root-mode runc) that places workloads into the OCI `cgroupsPath`
+    /// — which enables the agent's pre-start egress programming path.
+    #[allow(dead_code)]
+    pub fn set_honours_cgroup_path(&self, value: bool) {
+        *self.honours_cgroup_path.lock().unwrap() = value;
     }
 }
 
@@ -132,6 +141,10 @@ impl super::Grill for MockGrill {
 
     async fn container_ip(&self, _instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
         *self.container_ip.lock().unwrap()
+    }
+
+    fn honours_cgroup_path(&self) -> bool {
+        *self.honours_cgroup_path.lock().unwrap()
     }
 
     async fn adopt(

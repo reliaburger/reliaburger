@@ -541,6 +541,14 @@ We also test the failure cases: connecting to a VIP with no backends returns `EP
 
 One surprise: returning 0 from a `cgroup/connect4` hook gives `EPERM`, not `ECONNREFUSED`. The kernel interprets "BPF program returned 0" as "permission denied", not "connection refused". It's a subtle distinction that only matters if your application distinguishes between the two error codes. Most don't.
 
+### connect4 has a sibling
+
+The name `cgroup/connect4` gives it away: this hook only sees IPv4 `connect()` calls. IPv6 connects go through a separate hook, `cgroup/connect6`, and for a long time we simply didn't attach one. For the VIP rewrite that's fine — VIPs live in `127.128.0.0/16` and are v4 by construction. For the egress policy that later grew inside this same program (Chapter 10), it was a hole you could drive a truck through: any dual-stack workload could bypass its entire allowlist by connecting over IPv6. Phase 12b added `onion_connect6` to the same object file and attaches it right next to connect4. It does no rewriting (there are no v6 VIPs to rewrite), it's pure policy.
+
+One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
+
+While we were in there, we fixed how a defective object file fails. The map handles used to be fetched lazily, deep inside the agent, with `.unwrap()` — a `.bpf.o` missing a map would panic Bun at the first write, minutes or hours after startup. Now the loader validates every required map and program against a single list the moment the object loads, and refuses with the full roster of what's missing. One clear error at load time beats nine scattered panics at use time.
+
 ### Running Linux tests from a MacBook
 
 Here's a problem we hit early: most of the interesting tests need Linux. Network namespaces, veth pairs, runc containers, eBPF programs — none of these exist on macOS. You could push to CI and wait, but that's a slow feedback loop when you're debugging a failing test.
@@ -694,6 +702,14 @@ The nftables input chain in the `reliaburger` table has `policy accept` (everyth
 Cluster nodes get a blanket `accept` rule that comes *before* all the `drop` rules. So inter-node traffic is never blocked — gossip, scheduling, state replication all work normally. Admin CIDRs get access to the management port specifically.
 
 The order matters in nftables: first match wins. Cluster node accept → admin CIDR accept → drop rules → everything else passes.
+
+### Two address families, two tables
+
+An early version of this ruleset lived in a single `table ip reliaburger_fw`. Spot the problem? In nftables, the `ip` family only matches IPv4 packets. Every one of those carefully ordered drop rules was void for IPv6 traffic — a client connecting to `[::1]` equivalent addresses or the node's global v6 address sailed past the "blocked" management port. A firewall that only guards one address family isn't half a firewall; it's a decoy.
+
+The generator now renders the same policy twice: once for `table ip reliaburger_fw` and once for `table ip6 reliaburger_fw` (same name, different family — nftables treats them as distinct tables). Port drops appear in both. Source-address rules go where they belong: v4 cluster nodes and admin CIDRs into the `ip` table, v6 ones into `ip6`. A test pins that a v6 admin CIDR never leaks into the v4 half and vice versa.
+
+Two more hardening notes from the same pass. First, admin CIDRs come from `node.toml`, and the old code interpolated them into the `nft -f` script as raw strings — a config value of `10.0.0.0/8; drop` would have become part of the ruleset. Now every CIDR is parsed into a real address and prefix length, validated (`10.1.2.3/8` with host bits set is an error, not a guess), and only the re-serialised form is ever rendered. Config is input; input gets validated. Second, the `nft` invocation itself now runs under a ten-second `tokio::time::timeout` — a wedged nft process used to be able to hang the agent's event loop indefinitely.
 
 ### Testable without root
 

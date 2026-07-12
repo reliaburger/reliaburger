@@ -120,12 +120,15 @@ async fn ebpf_backend_map_write_and_read() {
         .unwrap();
 
     // Sync to BPF maps
-    bpf_map.sync_from_service_map(&svc_map, &mut ebpf);
+    bpf_map
+        .sync_from_service_map(&svc_map, &mut ebpf)
+        .expect("sync to backend_map");
 
     // Read back
     let vip = VirtualIP::from_app_name("redis");
     let value = bpf_map
         .read_backends(&mut ebpf, vip, 6379)
+        .expect("backend_map read failed")
         .expect("entry not found in backend_map");
 
     assert_eq!(value.count, 1);
@@ -157,14 +160,28 @@ async fn ebpf_backend_map_remove() {
         .register_app("redis", "default", 6379, None)
         .unwrap();
 
-    bpf_map.sync_from_service_map(&svc_map, &mut ebpf);
+    bpf_map
+        .sync_from_service_map(&svc_map, &mut ebpf)
+        .expect("sync to backend_map");
 
     let vip = VirtualIP::from_app_name("redis");
-    assert!(bpf_map.read_backends(&mut ebpf, vip, 6379).is_some());
+    assert!(
+        bpf_map
+            .read_backends(&mut ebpf, vip, 6379)
+            .unwrap()
+            .is_some()
+    );
 
     // Remove
-    bpf_map.remove_backends_bpf(&mut ebpf, vip, 6379);
-    assert!(bpf_map.read_backends(&mut ebpf, vip, 6379).is_none());
+    bpf_map
+        .remove_backends_bpf(&mut ebpf, vip, 6379)
+        .expect("remove backend entry");
+    assert!(
+        bpf_map
+            .read_backends(&mut ebpf, vip, 6379)
+            .unwrap()
+            .is_none()
+    );
 
     ebpf.detach();
 }
@@ -189,22 +206,27 @@ async fn ebpf_service_map_sync_multiple() {
     svc_map.register_app("web", "default", 8080, None).unwrap();
     svc_map.register_app("api", "prod", 3000, None).unwrap();
 
-    bpf_map.sync_from_service_map(&svc_map, &mut ebpf);
+    bpf_map
+        .sync_from_service_map(&svc_map, &mut ebpf)
+        .expect("sync to backend_map");
 
     // All three should be in the map
     assert!(
         bpf_map
             .read_backends(&mut ebpf, VirtualIP::from_app_name("redis"), 6379)
+            .unwrap()
             .is_some()
     );
     assert!(
         bpf_map
             .read_backends(&mut ebpf, VirtualIP::from_app_name("web"), 8080)
+            .unwrap()
             .is_some()
     );
     assert!(
         bpf_map
             .read_backends(&mut ebpf, VirtualIP::from_app_name("api"), 3000)
+            .unwrap()
             .is_some()
     );
 
@@ -252,7 +274,9 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
         .unwrap();
 
     let mut bpf_map = BpfServiceMap::new();
-    bpf_map.sync_from_service_map(&svc_map, &mut ebpf);
+    bpf_map
+        .sync_from_service_map(&svc_map, &mut ebpf)
+        .expect("sync to backend_map");
 
     // Connect to the VIP — the eBPF program should rewrite to our listener
     let vip_addr = SocketAddr::new(vip.0.into(), service_port);
@@ -294,7 +318,9 @@ async fn ebpf_connect_to_vip_no_backends_refused() {
         .unwrap();
 
     let mut bpf_map = BpfServiceMap::new();
-    bpf_map.sync_from_service_map(&svc_map, &mut ebpf);
+    bpf_map
+        .sync_from_service_map(&svc_map, &mut ebpf)
+        .expect("sync to backend_map");
 
     // Connect to the VIP — should get ECONNREFUSED
     let vip_addr = SocketAddr::new(vip.0.into(), 7777);
@@ -412,6 +438,7 @@ async fn agent_deploy_populates_backend_map() {
             let has_backend = {
                 let mut e = ebpf.lock().await;
                 bpf.read_backends(&mut e, vip, 8080)
+                    .unwrap()
                     .is_some_and(|v| v.count >= 1)
             };
             if has_backend {
@@ -496,6 +523,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
         let has = {
             let mut e = ebpf.lock().await;
             bpf.read_backends(&mut e, vip, service_port)
+                .unwrap()
                 .is_some_and(|v| v.count >= 1)
         };
         if has {
@@ -759,7 +787,9 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     )
     .unwrap();
     let entry = map.resolve("dest").unwrap().clone();
-    BpfServiceMap::new().update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry);
+    BpfServiceMap::new()
+        .update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
+        .expect("write backend entry");
 
     // Put the test process's cgroup in a *different* namespace than the
     // destination service. Any id that differs from the service's forces the
@@ -897,6 +927,475 @@ async fn dns_responder_non_internal_times_out() {
     // (RCODE 2) instead of leaving the client to time out.
     assert_eq!(buf[3] & 0x0F, 2, "expected SERVFAIL for dead upstream");
     assert!(len >= 12);
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2d: IPv6 + CIDR egress (NET7) and kernel-truth sweep (NET8)
+// ---------------------------------------------------------------------------
+
+/// NET7: with egress enforcement on, a listed IPv6 destination connects
+/// and an unlisted one is denied with EPERM — the connect6 hook, driven
+/// against the test's own cgroup.
+#[tokio::test]
+async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v6_key};
+    use std::net::Ipv6Addr;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    assert!(
+        ebpf.connect6_attached(),
+        "connect6 must attach on the test kernel"
+    );
+
+    let allowed = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let allowed_port = allowed.local_addr().unwrap().port();
+    let denied = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let denied_port = denied.local_addr().unwrap().port();
+
+    let cgroup_id =
+        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+
+    egress::write_egress6_entry(
+        &mut ebpf.bpf,
+        exact_v6_key(cgroup_id, Ipv6Addr::LOCALHOST, allowed_port),
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .expect("write egress6 entry");
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+
+    let ok = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), allowed_port),
+        Duration::from_secs(2),
+    );
+    let blocked = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port),
+        Duration::from_secs(2),
+    );
+
+    // Lift enforcement before asserting, so a failure never leaves the
+    // harness cgroup restricted.
+    egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
+    ebpf.detach();
+
+    assert!(ok.is_ok(), "listed IPv6 destination should connect: {ok:?}");
+    assert!(
+        matches!(
+            blocked.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "unlisted IPv6 destination should be denied with EPERM, got {blocked:?}"
+    );
+}
+
+/// NET7 regression: a v4-only allowlist used to be a suggestion — any
+/// dual-stack workload could bypass it entirely over IPv6. The old
+/// behaviour (v6 connect succeeds) must now deny, while the same v4
+/// destination stays reachable both natively and as a v4-mapped
+/// (::ffff:a.b.c.d) connect through the connect6 hook.
+#[tokio::test]
+async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v4_key};
+    use std::net::{Ipv6Addr, SocketAddrV6};
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // A v4 listener we allow, and a v6 listener we do not.
+    let v4_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let v4_port = v4_listener.local_addr().unwrap().port();
+    let v6_listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let v6_port = v6_listener.local_addr().unwrap().port();
+
+    let cgroup_id =
+        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+
+    egress::write_egress_entry(
+        &mut ebpf.bpf,
+        exact_v4_key(cgroup_id, Ipv4Addr::LOCALHOST, v4_port),
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .expect("write egress entry");
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+
+    // Native v4: allowed.
+    let v4_ok = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::LOCALHOST.into(), v4_port),
+        Duration::from_secs(2),
+    );
+    // v4-mapped through connect6: same policy, still allowed.
+    let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001);
+    let mapped_ok = TcpStream::connect_timeout(
+        &SocketAddr::V6(SocketAddrV6::new(mapped, v4_port, 0, 0)),
+        Duration::from_secs(2),
+    );
+    // Plain IPv6 to an unlisted destination: the old bypass, now denied.
+    let v6_blocked = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), v6_port),
+        Duration::from_secs(2),
+    );
+    // v4-mapped to an unlisted v4 port: denied through connect6 too.
+    let mapped_blocked = TcpStream::connect_timeout(
+        &SocketAddr::V6(SocketAddrV6::new(mapped, v6_port, 0, 0)),
+        Duration::from_secs(2),
+    );
+
+    egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
+    ebpf.detach();
+
+    assert!(
+        v4_ok.is_ok(),
+        "listed v4 destination should connect: {v4_ok:?}"
+    );
+    assert!(
+        mapped_ok.is_ok(),
+        "listed v4 destination should connect as v4-mapped IPv6: {mapped_ok:?}"
+    );
+    assert!(
+        matches!(
+            v6_blocked.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "IPv6 must no longer bypass a v4 allowlist, got {v6_blocked:?}"
+    );
+    assert!(
+        matches!(
+            mapped_blocked.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "unlisted v4-mapped destination should be denied, got {mapped_blocked:?}"
+    );
+}
+
+/// NET7: CIDR entries are enforced via the LPM trie — an address inside
+/// an allowed prefix connects on the listed port and is denied on any
+/// other port.
+#[tokio::test]
+async fn cidr_egress_allowed_via_lpm_trie() {
+    use reliaburger::sesame::egress::{self, EgressDestination, merge_cidr_ports};
+    use std::net::IpAddr;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // Two loopback listeners; 127.0.0.0/8 covers both addresses, but only
+    // one port is allowed.
+    let allowed = std::net::TcpListener::bind("127.0.0.5:0").unwrap();
+    let allowed_port = allowed.local_addr().unwrap().port();
+    let denied = std::net::TcpListener::bind("127.0.0.6:0").unwrap();
+    let denied_port = denied.local_addr().unwrap().port();
+
+    let cgroup_id =
+        egress::cgroup_id_of_pid(std::process::id()).expect("failed to resolve own cgroup id");
+
+    let dests = vec![EgressDestination::Cidr {
+        network: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
+        prefix_len: 8,
+        port: allowed_port,
+    }];
+    let merged = merge_cidr_ports(&dests).expect("merge");
+    egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &dests, &merged)
+        .expect("program CIDR destinations");
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("enable enforcement");
+
+    let inside_cidr = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 5).into(), allowed_port),
+        Duration::from_secs(2),
+    );
+    let wrong_port = TcpStream::connect_timeout(
+        &SocketAddr::new(Ipv4Addr::new(127, 0, 0, 6).into(), denied_port),
+        Duration::from_secs(2),
+    );
+
+    egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
+    ebpf.detach();
+
+    assert!(
+        inside_cidr.is_ok(),
+        "address inside the allowed CIDR should connect on the listed port: {inside_cidr:?}"
+    );
+    assert!(
+        matches!(
+            wrong_port.as_ref().map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "same CIDR on an unlisted port should be denied, got {wrong_port:?}"
+    );
+}
+
+/// NET8 sweep: kernel egress state for a cgroup with no live instance is
+/// planned stale and scrubbed across all four allow maps plus the flag.
+#[tokio::test]
+async fn sweep_scrubs_orphaned_cgroup_state() {
+    use reliaburger::sesame::egress::{
+        self, EgressDestination, merge_cidr_ports, plan_egress_sweep,
+    };
+    use std::collections::HashSet;
+    use std::net::IpAddr;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+
+    // A synthetic cgroup id (well outside the real range) with exact v4,
+    // exact v6 and CIDR entries, plus the enforcement flag.
+    let orphan: u64 = 0xDEAD_BEEF_5EEE_0001;
+    let dests = vec![
+        EgressDestination::Ip {
+            ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            port: 443,
+        },
+        EgressDestination::Ip {
+            ip: "2001:db8::7".parse().unwrap(),
+            port: 443,
+        },
+        EgressDestination::Cidr {
+            network: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+            prefix_len: 8,
+            port: 80,
+        },
+    ];
+    let merged = merge_cidr_ports(&dests).unwrap();
+    egress::write_egress_destinations(&mut ebpf.bpf, orphan, &dests, &merged)
+        .expect("program orphan destinations");
+    egress::set_egress_enforced(&mut ebpf.bpf, orphan).expect("enable enforcement");
+
+    let enforced = egress::list_enforced_cgroups(&mut ebpf.bpf).unwrap();
+    let entries = egress::list_egress_entry_cgroups(&mut ebpf.bpf).unwrap();
+    assert!(enforced.contains(&orphan));
+    assert!(entries.contains(&orphan));
+
+    // No live instance expects this cgroup: the plan marks it stale.
+    let expected: HashSet<u64> = HashSet::new();
+    let plan = plan_egress_sweep(&expected, &enforced, &entries);
+    assert!(plan.stale.contains(&orphan), "orphan not planned stale");
+
+    // Scrub, then nothing lingers for a recycled cgroup id.
+    egress::delete_cgroup_egress_state(&mut ebpf.bpf, orphan).expect("scrub");
+    assert!(
+        !egress::list_enforced_cgroups(&mut ebpf.bpf)
+            .unwrap()
+            .contains(&orphan)
+    );
+    assert!(
+        !egress::list_egress_entry_cgroups(&mut ebpf.bpf)
+            .unwrap()
+            .contains(&orphan)
+    );
+
+    ebpf.detach();
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2e: pre-start programming (create → program → start)
+// ---------------------------------------------------------------------------
+
+/// The agent programs egress against the cgroup directory's inode
+/// *before* `start`. The mock grill never runs a process (`pid()` is
+/// `None`), so the post-start pid path cannot have programmed anything:
+/// enforcement being active for the cgroup path proves the pre-start
+/// ordering — there is no window in which the workload runs unpoliced.
+#[tokio::test]
+async fn egress_programmed_before_start_via_cgroup_path() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::sesame::egress::{self, exact_v4_key};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
+    ));
+
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(42100, 42400),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.prestart]
+        image = "mock:image"
+        command = ["sleep", "600"]
+
+        [app.prestart.egress]
+        allow = ["203.0.113.9:443"]
+    "#,
+    )
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while ev_rx.recv().await.is_some() {}
+
+    // The agent created the cgroup directory and programmed enforcement
+    // against its inode before ever calling start.
+    let cgroup_dir = std::path::Path::new("/sys/fs/cgroup/reliaburger/default/prestart/0");
+    let cgroup_id =
+        egress::cgroup_id_of_path(cgroup_dir).expect("agent should have created the cgroup dir");
+    {
+        let mut e = ebpf.lock().await;
+        assert!(
+            egress::egress_enforced(&mut e.bpf, cgroup_id).unwrap(),
+            "enforcement flag missing: egress was not programmed pre-start"
+        );
+        assert!(
+            egress::egress_allowed(
+                &mut e.bpf,
+                exact_v4_key(cgroup_id, Ipv4Addr::new(203, 0, 113, 9), 443)
+            )
+            .unwrap(),
+            "allow entry missing: egress was not programmed pre-start"
+        );
+    }
+
+    // create must precede start, and both must have happened.
+    let calls = grill.calls();
+    let create_pos = calls.iter().position(|(op, _)| op == "create");
+    let start_pos = calls.iter().position(|(op, _)| op == "start");
+    assert!(create_pos.is_some() && start_pos.is_some());
+    assert!(create_pos < start_pos);
+
+    // Clean up the kernel state for the synthetic cgroup.
+    {
+        let mut e = ebpf.lock().await;
+        let _ = egress::delete_cgroup_egress_state(&mut e.bpf, cgroup_id);
+    }
+    shutdown.cancel();
+}
+
+/// Fail closed: a pre-start programming error (here: an allowlist that
+/// cannot be represented in the kernel CIDR value) fails the deploy and
+/// leaves no running process — the mock grill records a create and a
+/// stop, but never a start.
+#[tokio::test]
+async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    if !ebpf_tests_enabled() {
+        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
+        return;
+    }
+
+    let obj_dir = find_bpf_obj_dir();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program"),
+    ));
+
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(42500, 42800),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    tokio::spawn(async move { agent.run().await });
+
+    // Nine ports on one CIDR overflows the kernel value (MAX_CIDR_PORTS
+    // is 8): a permanent representation error, so the deploy must fail.
+    let allow: Vec<String> = (1..=9).map(|p| format!("\"10.0.0.0/8:{p}\"")).collect();
+    let config = Config::parse(&format!(
+        r#"
+        [app.badcidr]
+        image = "mock:image"
+        command = ["sleep", "600"]
+
+        [app.badcidr.egress]
+        allow = [{}]
+    "#,
+        allow.join(", ")
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    let mut saw_error = false;
+    while let Some(event) = ev_rx.recv().await {
+        if matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }) {
+            saw_error = true;
+        }
+    }
+    assert!(saw_error, "deploy should report the pre-start failure");
+
+    let calls = grill.calls();
+    assert!(
+        calls.iter().any(|(op, _)| op == "create"),
+        "container should have been created"
+    );
+    assert!(
+        !calls.iter().any(|(op, _)| op == "start"),
+        "fail-closed: the workload must never start, got {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|(op, _)| op == "stop"),
+        "the created container should be removed, got {calls:?}"
+    );
 
     shutdown.cancel();
 }

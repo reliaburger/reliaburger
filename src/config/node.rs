@@ -122,6 +122,11 @@ pub struct EbpfSection {
     pub program_dir: Option<PathBuf>,
     /// Root cgroup v2 path to attach the connect hook to.
     pub cgroup_path: PathBuf,
+    /// How often (seconds) to reconcile the kernel egress/firewall maps
+    /// against live instances — deleting entries whose cgroup no longer
+    /// maps to a running workload and reinstalling entries a live
+    /// instance lost (e.g. across a Bun restart). `0` disables the sweep.
+    pub sweep_interval_secs: u64,
 }
 
 impl Default for EbpfSection {
@@ -130,6 +135,7 @@ impl Default for EbpfSection {
             enabled: false,
             program_dir: None,
             cgroup_path: PathBuf::from("/sys/fs/cgroup"),
+            sweep_interval_secs: 60,
         }
     }
 }
@@ -720,6 +726,20 @@ mod tests {
         assert!(!nc.ebpf.enabled);
         assert_eq!(nc.ebpf.cgroup_path, PathBuf::from("/sys/fs/cgroup"));
         assert!(nc.ebpf.program_dir.is_none());
+        // The kernel-truth sweep defaults on with a sane interval.
+        assert_eq!(nc.ebpf.sweep_interval_secs, 60);
+    }
+
+    #[test]
+    fn ebpf_sweep_interval_parses_and_zero_disables() {
+        let nc = NodeConfig::parse(
+            r#"
+            [ebpf]
+            sweep_interval_secs = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(nc.ebpf.sweep_interval_secs, 0);
     }
 
     #[test]

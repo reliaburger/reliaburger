@@ -453,7 +453,7 @@ whole theme lands.
     which parses through `ImageReference`/`ClusterSource` content-addressed — a tag moved
     between verify and pull cannot swap the image (IMG1). Acceptance test drives push →
     GC past grace → manifest GET 200 → peer pull in `tests/pickle_integrity.rs`.
-- [ ] **Network policy enforcement** — write namespace/cgroup firewall maps for every
+- [x] **Network policy enforcement** — write namespace/cgroup firewall maps for every
   instance; program egress before process start and on rolling deploy; fail deployment
   closed when required policy cannot be installed; reconcile kernel truth and delete every
   per-cgroup entry. Add IPv6/connect6 and CIDR enforcement, safe nftables input, required-map
@@ -464,6 +464,35 @@ whole theme lands.
     rolling redeploy and crash-restart through one shared `finish_instance_networking` helper,
     failing closed (deny-all) on any programming error, with stop/redeploy deleting the allow
     entries so a recycled cgroup id inherits nothing (NET6).
+  - [x] IPv6 egress enforcement: a `cgroup/connect6` program mirrors the policy against an
+    `egress6_map` (v4-mapped `::ffff:a.b.c.d` destinations judged against the IPv4 policy),
+    the parser keeps AAAA records and accepts bracketed v6 entries, and a deploy with an
+    allowlist is refused when connect6 cannot attach — a v4-only allowlist is bypassable
+    over IPv6, so it is not enforced (NET7). Lima test pins the old bypass now denying.
+  - [x] CIDR enforcement via per-family `BPF_MAP_TYPE_LPM_TRIE` maps keyed by big-endian
+    cgroup id + network address; `merge_cidr_ports` folds enclosing prefixes' ports into
+    more specific entries (longest-prefix match would otherwise shadow them) with a tested
+    8-port cap; the parser validates prefix lengths per family and rejects host bits with
+    the normalised form in the error (NET7).
+  - [x] No BPF map panics or discarded errors: every `map_mut(...).unwrap()` replaced with a
+    typed `BpfMapError`, update/remove results propagated to logging callers, and the loader
+    validates all required maps and programs against one list at load time, failing with the
+    full roster of what is missing (NET8).
+  - [x] nftables hardening: admin CIDRs parsed and re-serialised before rendering (a value
+    like `10.0.0.0/8; drop` is a parse error, never an injected rule), the perimeter renders
+    both `ip` and `ip6` `reliaburger_fw` tables with family-appropriate sources, and every
+    `nft` invocation is bounded by a 10s timeout (NET8, old nftables Lows).
+  - [x] Start-window closed on root-mode runc: the agent creates the instance's cgroup
+    directory itself, programs egress against its inode, then starts (create → program →
+    start) in fresh deploy, rolling redeploy and crash-restart; programming errors delete
+    the created container and fail the deploy closed. Gated by `Grill::honours_cgroup_path`;
+    ProcessGrill/Apple keep the documented post-start path. Lima test proves pre-start
+    programming via a pid-less mock grill.
+  - [x] Kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60, 0 disables): enumerates
+    enforcement flags and allow entries in the kernel, scrubs state whose cgroup no longer
+    maps to a live instance, rebuilds bindings adopted instances lost across a Bun restart,
+    rewrites live bindings (healing lost entries) and prunes stale `cgroup_namespace_map`
+    keys; a no-op sweep is silent. Pure `plan_egress_sweep` tested in the default suite.
 - [x] **Consensus persistence safety** — version and checksum snapshots, validate the
   snapshot/log boundary, propagate vote/log/initialisation errors and refuse startup when
   compacted state cannot be reconstructed. Test compact → corrupt → restart returns an

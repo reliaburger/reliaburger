@@ -529,6 +529,7 @@ async fn main() -> anyhow::Result<()> {
     // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.
     // A load failure is logged and the node continues without kernel
     // enforcement rather than refusing to start.
+    agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
     if config.ebpf.enabled {
         match config.ebpf.resolve_program_dir() {
             Some(program_dir) => {
