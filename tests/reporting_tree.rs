@@ -90,12 +90,30 @@ async fn reporting_tree_failover() {
     ];
 
     // Set up aggregators for each council member
-    let (mut agg1, mut watch_rx1) =
-        ReportAggregator::new(c1_transport, fast_config(), shutdown.clone(), None);
-    let (mut agg2, mut watch_rx2) =
-        ReportAggregator::new(c2_transport, fast_config(), shutdown.clone(), None);
-    let (mut agg3, mut watch_rx3) =
-        ReportAggregator::new(c3_transport, fast_config(), shutdown.clone(), None);
+    let (mut agg1, mut watch_rx1) = ReportAggregator::new(
+        c1_transport,
+        fast_config(),
+        shutdown.clone(),
+        None,
+        None,
+        None,
+    );
+    let (mut agg2, mut watch_rx2) = ReportAggregator::new(
+        c2_transport,
+        fast_config(),
+        shutdown.clone(),
+        None,
+        None,
+        None,
+    );
+    let (mut agg3, mut watch_rx3) = ReportAggregator::new(
+        c3_transport,
+        fast_config(),
+        shutdown.clone(),
+        None,
+        None,
+        None,
+    );
 
     tokio::spawn(async move { agg1.run().await });
     tokio::spawn(async move { agg2.run().await });

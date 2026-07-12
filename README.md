@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (2204 and counting)
+make test                    # run all tests (2242 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -108,7 +108,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**2,204 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. See [progress.md](docs/progress.md) for the full checklist.
+**2,242 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. The Phase 12b control-plane pass (12b.2) gave every node a gossip-published directory of leader endpoints, so clusters now reconcile and report past the seven-voter council and through leader failover (proven by a gated 9-node acceptance suite, `RELIABURGER_CLUSTER_TESTS=1`). See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|

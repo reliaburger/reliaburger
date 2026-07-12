@@ -1278,10 +1278,8 @@ pub fn assign_parent(worker_id: &NodeId, council_members: &[NodeId]) -> Option<N
     let mut sorted: Vec<&NodeId> = council_members.iter().collect();
     sorted.sort();
 
-    let mut hasher = DefaultHasher::new();
-    worker_id.hash(&mut hasher);
-    let hash = hasher.finish();
-    let index = (hash as usize) % sorted.len();
+    let hash = fnv1a_64(worker_id.0.as_bytes());
+    let index = (hash % sorted.len() as u64) as usize;
 
     Some(sorted[index].clone())
 }
@@ -1289,7 +1287,7 @@ pub fn assign_parent(worker_id: &NodeId, council_members: &[NodeId]) -> Option<N
 
 Why sort? Because different nodes might learn about council members in different orders through gossip. If node A sees `[c3, c1, c2]` and node B sees `[c1, c2, c3]`, they'd compute different parents for the same worker. Sorting eliminates that problem.
 
-Why `DefaultHasher`? It uses SipHash, which is deterministic within the same binary. Since all nodes run the same Reliaburger binary, cross-node agreement is guaranteed. If we ever need to handle mixed binary versions during rolling upgrades, we can switch to a fixed hasher, but that's a problem for another day.
+The hash deserves a confession. The first version used `std::collections::hash_map::DefaultHasher`, with a comment arguing that SipHash is deterministic within the same binary, all nodes run the same binary, so cross-node agreement is guaranteed — and if we ever needed mixed binary versions, that was "a problem for another day". That day arrived with Phase 14's self-upgrade, where old and new binaries coexist in one cluster by design, and the standard library explicitly reserves the right to change `DefaultHasher`'s algorithm between Rust releases. Two toolchains, two trees, and workers quietly reporting to a member that isn't expecting them. The Phase 12b review flagged it (finding CP10), and the fix is `fnv1a_64`: FNV-1a is a published, fixed algorithm, about four lines of fold-and-multiply, and a test now pins the exact worker-to-parent mapping so it can never drift again. The lesson generalises: anything two independently built binaries must agree on needs an algorithm you control, not one the standard library merely lends you.
 
 ### The StateReport
 
@@ -1381,15 +1379,21 @@ let (watch_tx, watch_rx) = watch::channel(AggregatedState::default());
 
 Why `watch`? Because the consumer (the leader, the scheduler, the API) always wants the latest state, not a queue of historical states. If the aggregator receives three reports in quick succession, the consumer only sees the final result. This is exactly what `watch` is designed for: single-producer, multiple-consumer, latest-value-only semantics.
 
-The aggregator also tracks stale reports. If a worker's last report is older than `stale_report_timeout` (default 30 seconds), it shows up in `AggregatedState.stale_nodes`. This is useful for the leader during scheduling: don't send work to a node that hasn't checked in.
+The aggregator also tracks stale reports. If a worker hasn't been heard from for longer than `stale_report_timeout` (default 30 seconds), it shows up in `AggregatedState.stale_nodes`. This is useful for the leader during scheduling: don't send work to a node that hasn't checked in.
+
+One word in that sentence carries a lot of weight: *heard*. The first implementation judged staleness by the `timestamp` field inside the report — the sender's wall clock. Think about what that means. A node with its clock an hour behind reports diligently every second and gets branded stale anyway. Worse, a node with its clock a year ahead sends one report and stays "fresh" forever, feeding the scheduler a snapshot of the distant past (finding CP5). Distributed systems rule number one: never trust another machine's clock for anything you could measure locally. The aggregator now records its own monotonic receive time (`tokio::time::Instant::now()`) for every report, and both staleness and eviction run off that. The sender's timestamp is still in the report — it's honest observability data — but it decides nothing.
+
+Two more honesty rules landed in the same pass. Entries now get evicted, not just flagged: a report older than three stale windows is dropped, and when gossip declares a node Dead or Left, its report goes immediately (the aggregator subscribes to the same membership watch as everyone else). Before that, nothing evicted at all — a departed node's last report sat in the map until process exit, satisfying coverage checks for a machine that no longer existed. And every entry is tagged with the leadership *epoch* it arrived under (the Raft term, which you'll meet properly in the failover section below): after a leader change, the new leader's aggregator only counts reports received under its own term. Whatever it happened to hold from an earlier life can't masquerade as current cluster truth.
 
 ### Failover
 
-When a council member departs, workers need to re-hash and connect to a surviving member. The `ReportWorker` watches the council membership via a `watch::Receiver<Vec<(NodeId, SocketAddr)>>`. When the membership changes, the worker calls `assign_parent()` again and updates its `parent_address`.
+When a council member departs, workers need to re-hash and connect to a surviving member. The `ReportWorker` watches the council membership via a `watch::Receiver<Vec<(NodeId, SocketAddr)>>`. When the membership changes, the worker calls `assign_parent()` again and updates its `parent_address` — and sends a report immediately rather than waiting out the interval, so a fresh leader's view fills fast.
 
 The new parent receives a full `StateReport` from each reassigned worker on the next reporting cycle. No explicit "handoff" protocol is needed. The new parent simply starts accumulating reports.
 
-We test this end-to-end in the integration test: set up 3 council members and 2 workers, let reports flow, remove a council member, and verify that both workers re-hash to surviving members and reports arrive correctly.
+One more detail in that event loop, easy to miss and expensive to get wrong. `watch::Receiver::changed()` returns `Err` once the sender is dropped — and then keeps returning `Err` immediately, forever. The first version of the loop did `if result.is_ok() { update_parent(); }`, which reads as "ignore errors" and actually means "spin at 100% CPU once the channel closes": the `select!` arm completes instantly on every iteration with nothing to wait for. The rule we adopted (CP10): every long-lived loop treats a closed channel as a reason to exit, logs if that happens outside shutdown, and the cluster runtime wraps each of these tasks in a small supervisor that shouts into the log if a task dies while the node is still running. We chose loud logging over automatic respawn deliberately — these tasks own sockets and channel endpoints a generic wrapper can't rebuild, and a node that silently lost its reporting worker is worse than one that tells you.
+
+We test the re-hash end-to-end in the integration test: set up 3 council members and 2 workers, let reports flow, remove a council member, and verify that both workers re-hash to surviving members and reports arrive correctly.
 
 ### Configuration
 
@@ -1403,6 +1407,63 @@ stale_report_timeout_secs = 30
 ```
 
 The defaults are sensible for most clusters. Smaller clusters might lower the interval; very large clusters might raise it to reduce load on council members.
+
+## The node directory: growing past the council
+
+Here's an embarrassing question the Phase 12b review asked: what happens to the *eighth* node in a cluster whose council caps at seven?
+
+The whitepaper promises two layers — a small Raft council and thousands of gossip-only workers. The reporting worker and the placement reconciler both need one piece of information to do their jobs: where is the leader? And for a long time they answered it the same way — by reading the node's own Raft metrics (`openraft` publishes them on a `watch` channel, including `current_leader`). Which works beautifully, on voters. A worker that was never admitted to the council has a Raft instance that has never heard from anyone. Its metrics say there is no leader. So it never reports, never polls for placements, and never converges. The two-layer design was, in practice, capped at seven nodes (findings H1 and CP1). The seven in-process nodes our tests used never noticed.
+
+The fix follows a principle we already trust: gossip is the layer that reaches *everyone*. If the membership table can reach 10,000 nodes, it can carry three more facts per node: where my API listens, where my reporting port listens, and who I believe the leader is.
+
+### The directory extension
+
+Each node now stamps a small `DirectoryExtension` onto every gossip datagram it sends:
+
+```rust
+pub struct DirectoryExtension {
+    pub node_id: NodeId,
+    pub api_address: SocketAddr,
+    pub reporting_address: SocketAddr,
+    pub leader: Option<LeaderHint>,
+    pub hmac: [u8; 32],
+}
+
+pub struct LeaderHint {
+    pub node_id: NodeId,
+    pub term: u64,
+    pub api_address: SocketAddr,
+    pub reporting_address: SocketAddr,
+}
+```
+
+The endpoints are the sender's own, straight from its config. No more "the API is probably at the gossip IP on port 9117" arithmetic — that guess held only while every node used identical port layouts, and it quietly broke the moment one didn't. If you're wondering why the extension carries `node_id` when the message already names its sender: an indirect-probe ACK is relayed — node C sends it, but the message's `sender` field says B (the probed target). The extension always describes the node that physically stamped the datagram, so it names itself.
+
+The leader hint is the interesting part. Only the actual leader *originates* a hint: the cluster runtime watches the local Raft metrics and, while this node leads, publishes `Some(LeaderHint { me, my term, my endpoints })` into the gossip node. Everyone else just relays the highest-term hint they've seen. Raft terms only ever grow, so failover resolves itself: the new leader's hint carries a higher term and displaces the old one everywhere within a few gossip rounds, and a deposed leader's stale hint (or a replayed datagram) always loses the comparison. There's no retraction protocol, no invalidation message. Just max-by-term, the same trick incarnation numbers pull in SWIM.
+
+On the receiving side, every node folds extensions into a `NodeDirectory` — a map of node to endpoints plus the best hint — and publishes it on a `watch` channel. The reporting worker's leader-target maintainer and the placement reconciler now resolve the leader through one shared function: Raft metrics stay authoritative when they know a leader (voters, same term or newer), and the gossip directory answers for everyone else. A worker outside the council learns the leader from its very first gossip exchange with anyone who knows.
+
+### Old peers must keep gossiping
+
+Now, the wire problem. Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Add a field to `GossipMessage` and an old binary misparses every datagram a new binary sends. `#[serde(default)]`, the usual "tolerate missing fields" tool, is useless here: it only helps formats that know which fields are present. During a rolling upgrade (Phase 14 makes this routine), old and new binaries *will* share a cluster, and the membership protocol is the one thing that must not fracture.
+
+The trick is to not put the extension in the message at all:
+
+```rust
+pub struct GossipMessage {
+    // ... the five original fields, untouched ...
+    #[serde(skip)]
+    pub extension: Option<DirectoryExtension>,
+}
+```
+
+`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). So the message body's bytes are *identical* to the old wire format. The UDP transport then appends the encoded extension after the message bytes in the same datagram. Old peers deserialise the message and never look at the trailing bytes (bincode's legacy `deserialize` ignores them — a behaviour we pin with a test that decodes a new datagram using a copy of the old struct). New peers read the message, notice the cursor hasn't consumed the whole datagram, and decode the extension from the remainder. Tolerant in both directions, and the 10,000-node gossip test doesn't change by a byte.
+
+Authentication needed one extra step. The message HMAC (Phase 4) deliberately still covers only the message — otherwise old peers couldn't verify new datagrams. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
+
+### Proving it: eight-plus nodes through failover
+
+The acceptance test for all of this (`tests/cluster_failover.rs`, gated behind `RELIABURGER_CLUSTER_TESTS=1` because nine Raft nodes deserve more than a 2-core CI runner) starts nine fully wired in-process nodes — the exact `bun --cluster` wiring, real UDP gossip, real TCP Raft. The council reconciler admits seven voters; two nodes stay genuine workers. The test then checks the three things this section promised: all nine nodes appear in the leader's aggregated reports (the workers found it through the directory — they have no other way), a daemonset app converges onto the workers, and after the leader is killed, every survivor re-points at the new leader without a restart, coverage recovers under the new epoch, and a fresh app still lands everywhere.
 
 ## State reconstruction
 

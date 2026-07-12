@@ -22,9 +22,12 @@ use tokio::sync::watch;
 use crate::meat::NodeId;
 
 use super::config::GossipConfig;
+use super::directory::NodeDirectory;
 use super::dissemination::DisseminationQueue;
 use super::membership::{MembershipSnapshot, MembershipTable};
-use super::message::{GossipMessage, GossipPayload, MembershipUpdate};
+use super::message::{
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate,
+};
 use super::state::NodeState;
 use super::transport::MustardTransport;
 
@@ -60,6 +63,18 @@ pub struct MustardNode<T: MustardTransport> {
     /// Used to bootstrap a join by address without inserting a placeholder
     /// member: we ping the seed, and learn its real identity from the reply.
     seeds: Vec<SocketAddr>,
+    /// This node's advertised control-plane endpoints (API, reporting),
+    /// stamped on every outgoing datagram. `None` until the runtime wires
+    /// them in — then no extension is sent (pre-12b.2 behaviour).
+    advertised: Option<(SocketAddr, SocketAddr)>,
+    /// The local leader hint: `Some` only while THIS node is the Raft
+    /// leader (published by the cluster runtime). Everyone else relays the
+    /// best hint they have heard instead.
+    leader_hint_rx: Option<watch::Receiver<Option<LeaderHint>>>,
+    /// Directory accumulated from received extensions.
+    directory: NodeDirectory,
+    /// Optional watch channel publishing the directory on change.
+    directory_watch: Option<watch::Sender<NodeDirectory>>,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -84,6 +99,88 @@ impl<T: MustardTransport> MustardNode<T> {
             membership_watch: None,
             last_published_digest: Vec::new(),
             seeds: Vec::new(),
+            advertised: None,
+            leader_hint_rx: None,
+            directory: NodeDirectory::default(),
+            directory_watch: None,
+        }
+    }
+
+    /// Advertise this node's control-plane endpoints (API and reporting
+    /// ports on the gossip IP). From here on, every outgoing datagram
+    /// carries a directory extension, and the local directory can resolve
+    /// this node's own endpoints.
+    pub fn set_advertised_endpoints(&mut self, api_port: u16, reporting_port: u16) {
+        let api_address = SocketAddr::new(self.address.ip(), api_port);
+        let reporting_address = SocketAddr::new(self.address.ip(), reporting_port);
+        self.advertised = Some((api_address, reporting_address));
+        self.directory.endpoints.insert(
+            self.node_id.clone(),
+            super::directory::NodeEndpoints {
+                api_address,
+                reporting_address,
+            },
+        );
+        self.publish_directory();
+    }
+
+    /// Wire the local leader hint: the cluster runtime publishes
+    /// `Some(hint)` while this node is the Raft leader, `None` otherwise.
+    pub fn set_leader_hint_watch(&mut self, rx: watch::Receiver<Option<LeaderHint>>) {
+        self.leader_hint_rx = Some(rx);
+    }
+
+    /// Set the directory watch channel, publishing endpoint and leader-hint
+    /// changes learned from gossip.
+    pub fn set_directory_watch(&mut self, tx: watch::Sender<NodeDirectory>) {
+        let _ = tx.send(self.directory.clone());
+        self.directory_watch = Some(tx);
+    }
+
+    /// Read access to the accumulated directory (mainly for tests).
+    pub fn directory(&self) -> &NodeDirectory {
+        &self.directory
+    }
+
+    /// Build the extension for an outgoing datagram: our advertised
+    /// endpoints plus the best leader hint we can offer — our own if we
+    /// lead (it carries the freshest term), otherwise the best relayed one.
+    fn local_extension(&self) -> Option<DirectoryExtension> {
+        let (api_address, reporting_address) = self.advertised?;
+        let own = self
+            .leader_hint_rx
+            .as_ref()
+            .and_then(|rx| rx.borrow().clone());
+        let relayed = self.directory.leader.clone();
+        let leader = match (own, relayed) {
+            (Some(a), Some(b)) => Some(if a.term >= b.term { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        Some(DirectoryExtension {
+            node_id: self.node_id.clone(),
+            api_address,
+            reporting_address,
+            leader,
+            hmac: [0u8; 32],
+        })
+    }
+
+    /// Stamp an outgoing message with this node's directory extension.
+    fn stamp(&self, mut message: GossipMessage) -> GossipMessage {
+        message.extension = self.local_extension();
+        message
+    }
+
+    /// Fold a received extension into the directory and publish on change.
+    fn ingest_extension(&mut self, extension: &DirectoryExtension) {
+        if self.directory.observe(extension) {
+            self.publish_directory();
+        }
+    }
+
+    fn publish_directory(&self) {
+        if let Some(tx) = &self.directory_watch {
+            let _ = tx.send(self.directory.clone());
         }
     }
 
@@ -110,7 +207,7 @@ impl<T: MustardTransport> MustardNode<T> {
                     updates: Vec::new(),
                 },
             );
-            let _ = self.transport.send(addr, &ping).await;
+            let _ = self.transport.send(addr, &self.stamp(ping)).await;
         }
     }
 
@@ -195,7 +292,7 @@ impl<T: MustardTransport> MustardNode<T> {
                 self.incarnation,
                 GossipPayload::Ping { updates },
             );
-            let _ = self.transport.send(peer_addr, &ping).await;
+            let _ = self.transport.send(peer_addr, &self.stamp(ping)).await;
         }
     }
 
@@ -235,8 +332,12 @@ impl<T: MustardTransport> MustardNode<T> {
     pub async fn run_one_cycle(&mut self) {
         self.promote_expired_suspects();
         let now = Instant::now();
-        self.membership
+        let reaped = self
+            .membership
             .reap_expired_dead(self.config.cleanup_timeout, now);
+        if !reaped.is_empty() && self.directory.prune(&reaped) {
+            self.publish_directory();
+        }
 
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
@@ -255,7 +356,7 @@ impl<T: MustardTransport> MustardNode<T> {
             self.incarnation,
             GossipPayload::Ping { updates },
         );
-        let _ = self.transport.send(target_addr, &ping).await;
+        let _ = self.transport.send(target_addr, &self.stamp(ping)).await;
 
         // Wait for ACK
         let got_ack = self
@@ -278,7 +379,10 @@ impl<T: MustardTransport> MustardNode<T> {
                     updates,
                 },
             );
-            let _ = self.transport.send(*relay_addr, &ping_req).await;
+            let _ = self
+                .transport
+                .send(*relay_addr, &self.stamp(ping_req))
+                .await;
         }
 
         // Wait for indirect ACK
@@ -315,6 +419,12 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Handle an incoming gossip message.
     pub async fn handle_message(&mut self, from: SocketAddr, message: GossipMessage) {
         let now = Instant::now();
+
+        // Fold the directory extension in first — endpoint knowledge and the
+        // leader hint are useful even if the membership payload is stale.
+        if let Some(extension) = &message.extension {
+            self.ingest_extension(extension);
+        }
 
         // Register the sender if we haven't seen them
         let is_new = self.membership.add_node(
@@ -371,7 +481,7 @@ impl<T: MustardTransport> MustardNode<T> {
                     self.incarnation,
                     GossipPayload::Ack { updates },
                 );
-                let _ = self.transport.send(from, &ack).await;
+                let _ = self.transport.send(from, &self.stamp(ack)).await;
             }
             GossipPayload::PingReq {
                 target, requester, ..
@@ -390,7 +500,7 @@ impl<T: MustardTransport> MustardNode<T> {
                         self.incarnation,
                         GossipPayload::Ping { updates },
                     );
-                    let _ = self.transport.send(target_addr, &ping).await;
+                    let _ = self.transport.send(target_addr, &self.stamp(ping)).await;
 
                     // Wait for target's ACK (simple inline wait to avoid
                     // async recursion through handle_message → wait_for_ack)
@@ -411,7 +521,7 @@ impl<T: MustardTransport> MustardNode<T> {
                                     updates: fwd_updates,
                                 },
                             );
-                            let _ = self.transport.send(req_addr, &fwd_ack).await;
+                            let _ = self.transport.send(req_addr, &self.stamp(fwd_ack)).await;
                         }
                     }
                 }
@@ -572,6 +682,9 @@ impl<T: MustardTransport> MustardNode<T> {
 
                     // Apply piggybacked updates without full handle_message
                     let now = Instant::now();
+                    if let Some(extension) = &message.extension {
+                        self.ingest_extension(extension);
+                    }
                     for update in message.payload.updates() {
                         self.membership.apply_update(update, now);
                     }
@@ -1179,6 +1292,178 @@ mod tests {
                 node.node_id, alive_count
             );
         }
+    }
+
+    // -- directory extension propagation (12b.2) ------------------------------
+
+    #[tokio::test]
+    async fn ack_carries_advertised_endpoints_to_the_prober() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        node2.set_advertised_endpoints(9117, 9445);
+        node1.add_seed(NodeId::new("n2"), addr(2));
+
+        let shutdown = CancellationToken::new();
+        let shutdown2 = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            node2.run(shutdown2).await;
+            node2
+        });
+
+        // n1 probes n2; n2's ACK carries its directory extension.
+        node1.run_one_cycle().await;
+        shutdown.cancel();
+        let _ = handle.await;
+
+        let endpoints = node1
+            .directory()
+            .endpoints
+            .get(&NodeId::new("n2"))
+            .expect("n1 should learn n2's endpoints from the ACK");
+        assert_eq!(endpoints.api_address, addr(9117));
+        assert_eq!(endpoints.reporting_address, addr(9445));
+    }
+
+    #[tokio::test]
+    async fn leader_hint_relays_through_a_non_leader() {
+        // n1 is the leader (local hint set); n2 learns the hint from n1's
+        // PING and relays it to n3 — a node that never talks to the leader
+        // directly still learns where it is. This is the H1 propagation
+        // path for workers outside the council.
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let t3 = net.register(addr(3)).await;
+
+        let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        let mut node3 = MustardNode::new(NodeId::new("n3"), addr(3), fast_config(), t3);
+        node1.set_advertised_endpoints(9117, 9445);
+        node2.set_advertised_endpoints(9127, 9455);
+        node3.set_advertised_endpoints(9137, 9465);
+
+        let hint = LeaderHint {
+            node_id: NodeId::new("n1"),
+            term: 4,
+            api_address: addr(9117),
+            reporting_address: addr(9445),
+        };
+        let (hint_tx, hint_rx) = watch::channel(Some(hint.clone()));
+        node1.set_leader_hint_watch(hint_rx);
+
+        // n1 pings n2 directly.
+        let ping = node1.stamp(GossipMessage::new(
+            node1.node_id.clone(),
+            node1.incarnation,
+            GossipPayload::Ping { updates: vec![] },
+        ));
+        node1.transport.send(addr(2), &ping).await.unwrap();
+        let (from, msg) = node2.transport.try_recv().unwrap();
+        node2.handle_message(from, msg).await;
+        assert_eq!(node2.directory().leader, Some(hint.clone()));
+
+        // n2 (not a leader — no local hint) relays it to n3.
+        let ping = node2.stamp(GossipMessage::new(
+            node2.node_id.clone(),
+            node2.incarnation,
+            GossipPayload::Ping { updates: vec![] },
+        ));
+        node2.transport.send(addr(3), &ping).await.unwrap();
+        let (from, msg) = node3.transport.try_recv().unwrap();
+        node3.handle_message(from, msg).await;
+        assert_eq!(node3.directory().leader, Some(hint));
+        // n3 also learned n2's endpoints from the same datagram.
+        assert!(node3.directory().endpoints.contains_key(&NodeId::new("n2")));
+
+        drop(hint_tx);
+    }
+
+    #[tokio::test]
+    async fn newer_leader_hint_overrides_the_old_one_after_failover() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("w"), addr(1), fast_config(), t1);
+
+        let old = LeaderHint {
+            node_id: NodeId::new("old-leader"),
+            term: 3,
+            api_address: addr(9117),
+            reporting_address: addr(9445),
+        };
+        let new = LeaderHint {
+            node_id: NodeId::new("new-leader"),
+            term: 4,
+            api_address: addr(9217),
+            reporting_address: addr(9545),
+        };
+
+        let ext = |node_name: &str, hint: &LeaderHint| DirectoryExtension {
+            node_id: NodeId::new(node_name),
+            api_address: addr(1),
+            reporting_address: addr(2),
+            leader: Some(hint.clone()),
+            hmac: [0u8; 32],
+        };
+
+        let mut msg = GossipMessage::new(
+            NodeId::new("peer-a"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        msg.extension = Some(ext("peer-a", &old));
+        node.handle_message(addr(2), msg).await;
+        assert_eq!(node.directory().leader, Some(old.clone()));
+
+        // The new leader's hint (higher term) wins; a stale replay loses.
+        let mut msg = GossipMessage::new(
+            NodeId::new("peer-b"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        msg.extension = Some(ext("peer-b", &new));
+        node.handle_message(addr(3), msg).await;
+        assert_eq!(node.directory().leader, Some(new.clone()));
+
+        let mut msg = GossipMessage::new(
+            NodeId::new("peer-c"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        msg.extension = Some(ext("peer-c", &old));
+        node.handle_message(addr(4), msg).await;
+        assert_eq!(node.directory().leader, Some(new));
+    }
+
+    #[tokio::test]
+    async fn directory_watch_publishes_on_change() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let (tx, rx) = watch::channel(NodeDirectory::default());
+        node.set_directory_watch(tx);
+        node.set_advertised_endpoints(9117, 9445);
+
+        // Own endpoints published immediately.
+        assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n1")));
+
+        let mut msg = GossipMessage::new(
+            NodeId::new("n2"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        msg.extension = Some(DirectoryExtension {
+            node_id: NodeId::new("n2"),
+            api_address: addr(9127),
+            reporting_address: addr(9455),
+            leader: None,
+            hmac: [0u8; 32],
+        });
+        node.handle_message(addr(2), msg).await;
+        assert!(rx.borrow().endpoints.contains_key(&NodeId::new("n2")));
     }
 
     // -- graceful leave -------------------------------------------------------

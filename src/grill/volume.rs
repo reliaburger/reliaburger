@@ -374,7 +374,7 @@ mod tests {
         );
         // The sidecar lives NEXT TO the volume, not inside it — it must
         // not appear as a file in the container's mount.
-        assert!(path.join("data.volume.json").exists() == false);
+        assert!(!path.join("data.volume.json").exists());
         assert!(path.with_file_name("data.volume.json").exists());
     }
 

@@ -12,6 +12,7 @@
 //! and the agent sees the cluster via `membership_rx`. Raft council and the
 //! reporting tree are layered on in follow-up changes.
 
+pub mod directory;
 pub mod http;
 pub mod identity;
 pub mod orchestrate;
