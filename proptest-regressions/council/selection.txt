@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ed7c33d653bebd4fb31b2da67856087ffbd3da77815a0251488e5bdbec36acc4 # shrinks to voter_count = 1, learner_count = 0, extra_count = 0, health_seeds = [(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)], matched_seeds = [None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None], leader_last = None, change_in_flight = false

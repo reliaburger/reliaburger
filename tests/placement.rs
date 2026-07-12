@@ -529,7 +529,24 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     })
     .await;
     assert!(ready, "no leader elected");
-    tokio::time::sleep(Duration::from_secs(3)).await; // let the council grow to 3
+    // Wait for the council to actually grow to 3 voters. The self-healing
+    // reconciler admits members one action per tick with a stability
+    // window, so growth takes several ticks rather than one.
+    let grown = wait_until(Duration::from_secs(60), || {
+        nodes.iter().any(|n| {
+            n.handle.council.as_ref().is_some_and(|c| {
+                c.metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .count()
+                    >= 3
+            })
+        })
+    })
+    .await;
+    assert!(grown, "council did not grow to 3 voters");
 
     let leader = nodes
         .iter()

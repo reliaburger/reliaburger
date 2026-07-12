@@ -1734,7 +1734,7 @@ reliaburger-2  192.168.104.3:9443    alive   yes      -
 reliaburger-3  192.168.104.4:9443    alive   yes      -
 ```
 
-One thing you'll notice: the council forms in seconds, not the ten minutes the eligibility walk-through above would suggest. That ten-minute `min_node_age` gate belongs to the Meat scheduler's `select_council_candidates()` — the careful, age-and-zone-aware selection meant for a production cluster that's already humming. The cluster *runtime* that `bun --cluster` actually runs uses a simpler reconciler: the leader admits every alive gossiped node, up to the council size cap, on a two-second loop. For a dev cluster you want to see form now, that's the right trade-off. Swapping in the age-gated selection is a drop-in change to the same reconcile step.
+One thing you'll notice: the council forms in seconds, not the ten minutes the eligibility walk-through above would suggest. That ten-minute `min_node_age` gate belongs to `select_council_candidates()` — the careful, age-and-zone-aware selection meant for a production cluster that's already humming. The cluster *runtime* that `bun --cluster` actually runs sets `min_node_age` to zero, so a fresh node is eligible right away; age still orders candidates, it just doesn't block them. The reconciler then walks members in, one membership action per two-second tick, up to the council size cap. For a dev cluster you want to see form now, that's the right trade-off, and it's the same reconcile loop a production cluster runs.
 
 When you're done, `relish dev destroy mycluster` deletes the VMs.
 
@@ -1775,6 +1775,74 @@ The leader calls this function periodically (every gossip cycle, since it's chea
 ### What happens to running apps during a council change?
 
 Nothing. Council changes affect the control plane only. Running workloads are managed by the Bun agent on each node, which doesn't care about Raft membership. Apps keep serving traffic. Health checks keep running. The gossip protocol keeps probing. The only visible effect is that the reporting tree rebalances: workers re-hash their parent assignments when the council membership changes, and the new parent starts receiving reports on the next cycle.
+
+## Healing the council
+
+Time for a confession. For quite a while, the four-step sequence above was better than the code that shipped. The reconciler could *add* members, and it carefully never demoted the leader — a fix for an earlier bug where the leader could vote itself off the island. But somewhere along the way, "never remove the leader" had quietly become "never remove anyone". The voter set was a one-way ratchet.
+
+Why is that so bad? Count the votes. A five-voter council needs three votes to commit anything. Now two voters die and stay dead. Quorum is still three of five, and exactly three nodes are alive: every single write needs every single survivor. One more failure — one reboot, one network blip past the timeout — and the cluster goes read-only. Forever. It doesn't matter that ten healthy spares are gossiping away in the membership table, because nothing ever frees the dead seats. The post-Phase-12 review flagged this as a High finding, and this section is the fix.
+
+### A planner that returns one action
+
+The heart of the fix is a pure function, `plan_council_action()`, that looks at what the reconciler observed this tick and returns *at most one* thing to do:
+
+```rust
+pub enum CouncilAction {
+    AddLearner(u64),
+    Promote(u64),
+    RemoveVoter(u64),
+    RemoveLearner(u64),
+    Nothing,
+}
+```
+
+One action per tick is a deliberate straitjacket. Membership changes are the most dangerous writes a Raft cluster performs, and the failure modes multiply when several are in flight. So the planner refuses to pipeline: if a joint-consensus change is still committing, it returns `Nothing`; otherwise it proposes the single next step. If that step fails or times out, nothing is remembered — the next tick observes the actual state and re-plans from scratch. Idempotent planning means retrying is free, which is what keeps the reconciler non-wedging: every operation is bounded by a timeout, every error is logged and abandoned, and the loop never blocks on a peer that won't answer.
+
+The planner's input is worth a look, because it introduces a bit of Rust we haven't written ourselves yet:
+
+```rust
+pub struct CouncilObservation<'a> {
+    pub voters: &'a BTreeSet<u64>,
+    pub learners: &'a BTreeSet<u64>,
+    pub leader_id: u64,
+    pub health: &'a HashMap<u64, MemberHealth>,
+    pub candidates: &'a [u64],
+    pub leader_last_log_index: Option<u64>,
+    pub replication: &'a BTreeMap<u64, Option<u64>>,
+    pub change_in_flight: bool,
+}
+```
+
+That `<'a>` is a *lifetime parameter* on a struct. You met lifetimes briefly with serde's `'de` in chapter 1; this is the first struct we've defined that borrows its fields. The annotation tells the compiler: every reference inside a `CouncilObservation` is valid for at least the region `'a`, so the struct itself must not outlive the collections it points at. In C you'd hold these pointers and hope; in Go the garbage collector would keep the maps alive for you. Rust makes the dependency explicit and checks it at compile time. The pay-off is that building an observation allocates nothing — the reconciler owns the collections, the planner just looks at them.
+
+### Add before remove
+
+When a voter is confirmed dead and a spare exists, the planner walks a fixed sequence, one tick at a time:
+
+1. **`AddLearner(spare)`** — the spare starts receiving log replication but has no vote. Quorum arithmetic is untouched.
+2. **Wait for catch-up.** Promotion is gated on the learner's replicated log index being within `max_promotion_lag` entries (64 by default) of the leader's last index, read from openraft's replication metrics. A learner that can't catch up simply never gets a vote.
+3. **`Promote(spare)`** — a joint-consensus `change_membership`. Take the three-voter case with one seat dead: the new config has four voters, three of them alive. The change must commit in *both* configs — majority of the old three (two votes: fine) and of the new four (three votes: also fine). At no point does anything wait on the dead node.
+4. **`RemoveVoter(dead)`** — another joint-consensus change, shrinking back to three healthy voters. This one uses openraft's non-retaining mode, so the evicted node is dropped from the membership entirely rather than lingering as a learner the leader keeps trying to replicate to.
+
+Could we remove first and add later? Sometimes, and the planner will evict a dead seat early when the council is large enough to spare it. But removal is refused whenever it would shrink the voter set below `min_council_size`, so in the common three-voter case the replacement *must* land first. Add-before-remove is the order that never gambles on the dead node's vote coming back.
+
+Two guards apply to every plan. Live voters must form a majority of both the current and the proposed config, otherwise the change couldn't commit and proposing it would just wedge a timeout loop (if quorum is already lost, membership surgery can't fix it — that's disaster recovery's job, a later theme). And the planner never, under any input, proposes removing the leader. Gossip claiming the leader is dead gets ignored: the planner runs *on* the leader, and a node that's executing code is not dead, whatever the rumour mill says. When the leader itself must one day step aside (disk pressure, planned drain), that path needs a leadership transfer first — and openraft 0.9 has no graceful transfer, as we discovered the hard way in the self-upgrade work of chapter 14. The seam is documented and deliberately left empty rather than stubbed with something that can't work.
+
+### Hysteresis, or why flapping must not churn
+
+SWIM tells us a node's state; it doesn't tell us whether to trust it yet. A node that dies for four seconds and comes back — a GC pause, a switch reconvergence, an overloaded probe — must not trigger membership surgery. So both directions carry a waiting period: a voter must be continuously dead (or missing from gossip) for `dead_window` (30 seconds) before it's evictable, and a candidate must be continuously alive for `candidate_alive_window` (5 seconds) before it can be added or promoted.
+
+The word *continuously* is doing the work, and gossip snapshots can't provide it — they only say what a node's state is now. A small `HealthTracker` folds one snapshot per tick and remembers when each node entered its current state. Any observed transition resets the clock, so a flapper keeps restarting its own countdown and never accumulates enough continuous death to be evicted, or enough continuous life to be trusted. There's one wrinkle: a member that was already alive before the tracker started (say, the reconciler just failed over to a new leader) seeds its alive-clock from gossip's `first_seen` instead of from zero, so a warm, stable cluster doesn't sit through the window again after every election.
+
+While a voter is inside the dead window, its seat still counts as occupied. That detail matters: it means a brief flap doesn't even trigger the *add* half of a replacement, so the membership genuinely doesn't move at all.
+
+### Testing it
+
+The planner being pure pays for itself here. Seventeen unit tests feed it hand-built observations — dead voter with a spare, learner sixty entries behind, quorum already lost, leader reported dead by gossip — and assert the exact action. No cluster, no sleeps, no flakes.
+
+On top of that sits a proptest. It generates arbitrary voter sets, learner sets, health maps and replication states, and asserts the invariants hold for all of them: the leader is never removed, evictions only target nodes dead past the window, no plan drops live voters below a committable majority or the set below its minimum size, and the planner is deterministic. Writing the properties down turned out to be the best design review the planner got — two of the guards above exist because early property runs found inputs that violated them.
+
+The full loop runs in three gated acceptance tests (`RELIABURGER_CLUSTER_TESTS=1`): kill a voter and watch a spare walk in while a writer hammers the council and asserts every write lands; kill a learner mid-catch-up (faked by partitioning it at the Raft layer while gossip still likes it) and confirm the voter set refuses to move until a healthy learner catches up; and flap a voter inside the window and confirm nothing changes at all. They use real `CouncilNode`s over the in-memory router with gossip supplied through a watch channel, so the tests control exactly who looks alive and when — the same trick the SWIM tests used, one layer up.
 
 ## Breaking things on purpose
 

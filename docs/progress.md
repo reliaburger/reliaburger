@@ -553,10 +553,37 @@ whole theme lands.
   terminal workloads from running/capacity; stop closed-channel spins and supervise
   long-lived task failures. Acceptance: an 8+ node cluster reconciles and reports through
   leader failover (H1/D1, CP1/CP5/CP6/CP10).
-- [ ] **Council membership self-healing** — add replacement as learner, wait for catch-up,
+- [x] **Council membership self-healing** — add replacement as learner, wait for catch-up,
   promote, transfer/avoid leadership as needed and remove the dead or unsuitable voter via
   joint consensus. Prove quorum recovers with healthy spares and never removes the active
   leader mid-change (H2/D2).
+  - [x] Pure replacement planner (`council::selection::plan_council_action`): observes
+    voters/learners, gossip health, ranked spares and replication progress; returns at most
+    one action per tick (`AddLearner`/`Promote`/`RemoveVoter`/`RemoveLearner`/`Nothing`).
+    Never proposes removing the leader, never plans a change live voters can't commit or
+    that drops below `min_council_size`, holds entirely when quorum is already lost (the T3
+    disaster-recovery seam), and prefers add-before-remove so quorum never depends on the
+    dead node's vote. Proptest pins the invariants for arbitrary observations (H2).
+  - [x] Hysteresis via `council::selection::HealthTracker`: eviction requires `dead_window`
+    (30s) of continuous death/absence, candidacy requires `candidate_alive_window` (5s) of
+    continuous life; observed transitions reset the clocks (flap-proof) and pre-tracker
+    members seed from gossip `first_seen` so warm clusters don't re-wait after failover.
+    A voter inside the dead window still holds its seat, so a flap adds no learner either.
+  - [x] Catch-up gating: promotion compares the learner's replicated log index (openraft
+    replication metrics) against the leader's last index within `max_promotion_lag` (64);
+    missing metrics count as behind unless the log is empty (D2).
+  - [x] Reconciler rework (`cluster::runtime::spawn_council_reconciler[_with_config]`):
+    re-plans each tick from observed state (idempotent, timeout-bounded, errors logged —
+    the M15 non-wedging property), executes exactly one action, feeds the health tracker
+    on followers too so a new leader starts warm. Voter eviction uses non-retaining
+    `change_membership` (`CouncilNode::change_membership_evicting`) so dead nodes leave the
+    membership entirely; dead learners are dropped via `CouncilNode::remove_learner`.
+  - [x] Tests: 17 planner + 5 tracker unit tests and the planner proptest; add-then-evict
+    joint-consensus composition against the in-memory Raft harness; gated acceptance suite
+    (`tests/council_self_healing.rs`, `RELIABURGER_CLUSTER_TESTS=1`) — kill-a-voter heals
+    to three healthy voters with writes committing throughout and the leader never removed,
+    a learner killed mid-catch-up (Raft-layer partition) blocks no healthy replacement, and
+    a flapping node inside the window causes zero churn.
 - [ ] **Council disaster recovery** — implement full-council-loss recovery, encrypted
   external backup/restore, explicit reconstruction thresholds and disk-pressure council
   resignation. Exercise black-box loss/recovery rather than only candidate-selection helpers
