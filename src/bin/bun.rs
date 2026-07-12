@@ -138,6 +138,7 @@ fn cluster_params_from_config(
         mayo: None,
         rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
         identity,
+        backup: config.cluster.backup.clone(),
     })
 }
 
@@ -276,6 +277,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         NodeConfig::default()
     };
+
+    // Validate the reconstruction thresholds and backup settings before we
+    // build anything on top of them (12b.2 D21/CP12): a nonsensical coverage
+    // or a zero backup interval must fail loudly at startup, not silently
+    // misbehave later.
+    config
+        .reconstruction
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    config
+        .cluster
+        .backup
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
     let port_allocator = PortAllocator::new(

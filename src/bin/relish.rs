@@ -116,8 +116,11 @@ enum Command {
     },
     /// List cluster nodes and their gossip state.
     Nodes,
-    /// Show council (Raft) composition and status.
-    Council,
+    /// Show council (Raft) composition and status, or recover from full loss.
+    Council {
+        #[command(subcommand)]
+        action: Option<CouncilCommand>,
+    },
     /// Join an existing cluster.
     Join {
         /// Join token issued by `relish init` or `relish token create`.
@@ -280,6 +283,37 @@ enum Command {
     Upgrade {
         #[command(subcommand)]
         action: UpgradeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CouncilCommand {
+    /// Recover a cluster whose entire council was lost (12b.2 D21/CP12).
+    ///
+    /// Run this against a STOPPED surviving node. It restores the desired
+    /// state from a sealed backup (or this node's own durable snapshot),
+    /// wipes the dead cluster's Raft log, and stamps a fresh recovery epoch.
+    /// Starting the node afterwards re-bootstraps a single-voter council that
+    /// the reconciler regrows. Writes made after the last backup are lost.
+    Recover {
+        /// The node's data directory (`[storage] data`), whose `raft/`
+        /// subdirectory is recovered in place.
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+        /// Restore from a sealed backup at this object-store URL
+        /// (`file://`, `s3://`, `gs://`). Omit to restore from the node's own
+        /// durable snapshot under `data_dir`.
+        #[arg(long)]
+        from: Option<String>,
+        /// Path to the cluster master key file (32-byte hex), needed to
+        /// unseal a backup. Defaults to `/etc/reliaburger/master.key`.
+        #[arg(long)]
+        master_key: Option<std::path::PathBuf>,
+        /// Skip the "is a council still alive?" safety check. Only pass this
+        /// when you are certain every voter is gone; recovering a live cluster
+        /// splits the brain.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -735,7 +769,18 @@ async fn main() -> ExitCode {
             ref node_id,
         } => commands::init(dir, cluster_name, node_id),
         Command::Nodes => commands::nodes(cli.output).await,
-        Command::Council => commands::council(cli.output).await,
+        Command::Council { ref action } => match action {
+            None => commands::council(cli.output).await,
+            Some(CouncilCommand::Recover {
+                data_dir,
+                from,
+                master_key,
+                force,
+            }) => {
+                commands::council_recover(data_dir, from.as_deref(), master_key.as_deref(), *force)
+                    .await
+            }
+        },
         Command::Join {
             ref token,
             ref addr,
@@ -1158,7 +1203,28 @@ mod tests {
     #[test]
     fn parse_council_command() {
         let cli = parse(&["relish", "council"]).unwrap();
-        assert!(matches!(cli.command, Command::Council));
+        assert!(matches!(cli.command, Command::Council { action: None }));
+    }
+
+    #[test]
+    fn parse_council_recover_command() {
+        let cli = parse(&[
+            "relish",
+            "council",
+            "recover",
+            "--data-dir",
+            "/var/lib/reliaburger/data",
+            "--from",
+            "file:///var/backups/council",
+            "--force",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Council {
+                action: Some(CouncilCommand::Recover { force: true, .. })
+            }
+        ));
     }
 
     #[test]

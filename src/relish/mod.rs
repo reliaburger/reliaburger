@@ -116,4 +116,8 @@ pub enum RelishError {
     /// fingerprint mismatch, or the identity could not be persisted).
     #[error("join failed: {0}")]
     JoinFailed(String),
+
+    /// Council disaster recovery failed (12b.2 D21/CP12).
+    #[error("council recover failed: {0}")]
+    Recovery(String),
 }

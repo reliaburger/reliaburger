@@ -291,6 +291,9 @@ pub struct ClusterSection {
     pub raft_port: u16,
     /// Port for reporting tree state reports.
     pub reporting_port: u16,
+    /// Encrypted external council backup (`[cluster.backup]`, 12b.2
+    /// D21/CP12). Off by default; set `url` to enable.
+    pub backup: crate::council::backup::BackupConfig,
 }
 
 impl Default for ClusterSection {
@@ -300,6 +303,7 @@ impl Default for ClusterSection {
             gossip_port: 9443,
             raft_port: 9444,
             reporting_port: 9445,
+            backup: crate::council::backup::BackupConfig::default(),
         }
     }
 }
@@ -456,6 +460,39 @@ impl Default for ReconstructionSection {
             large_cluster_timeout_secs: 30,
             large_cluster_node_count: 5000,
         }
+    }
+}
+
+impl ReconstructionSection {
+    /// Validate the reconstruction thresholds.
+    ///
+    /// The recovery path (12b.2 D21/CP12) and the ordinary leadership edge
+    /// both gate on these, so a nonsensical value would silently break the
+    /// learning period. Coverage must sit in `1..=100` (0% would end the
+    /// period before any report, 100% needs everyone) and every timeout must
+    /// be positive (a zero timeout would fire the moment learning starts).
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        let bad = |field: &str, reason: &str| super::error::ConfigError::Validation {
+            field: field.to_string(),
+            context: "reconstruction".to_string(),
+            reason: reason.to_string(),
+        };
+        if self.report_threshold_percent == 0 || self.report_threshold_percent > 100 {
+            return Err(bad(
+                "coverage_percent",
+                "must be between 1 and 100 inclusive",
+            ));
+        }
+        if self.learning_period_timeout_secs == 0 {
+            return Err(bad("timeout_secs", "must be greater than zero"));
+        }
+        if self.large_cluster_timeout_secs == 0 {
+            return Err(bad(
+                "large_cluster_timeout_secs",
+                "must be greater than zero",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1026,5 +1063,103 @@ mod tests {
             nc.alerts.destinations[0].secret.as_deref(),
             Some("my-shared-secret")
         );
+    }
+
+    // -- reconstruction thresholds (12b.2 D21/CP12) -----------------------
+
+    #[test]
+    fn reconstruction_defaults_validate() {
+        assert!(ReconstructionSection::default().validate().is_ok());
+    }
+
+    #[test]
+    fn reconstruction_rejects_zero_coverage() {
+        let section = ReconstructionSection {
+            report_threshold_percent: 0,
+            ..ReconstructionSection::default()
+        };
+        assert!(section.validate().is_err());
+    }
+
+    #[test]
+    fn reconstruction_rejects_coverage_above_100() {
+        let section = ReconstructionSection {
+            report_threshold_percent: 101,
+            ..ReconstructionSection::default()
+        };
+        assert!(section.validate().is_err());
+    }
+
+    #[test]
+    fn reconstruction_accepts_full_coverage() {
+        let section = ReconstructionSection {
+            report_threshold_percent: 100,
+            ..ReconstructionSection::default()
+        };
+        assert!(section.validate().is_ok());
+    }
+
+    #[test]
+    fn reconstruction_rejects_zero_timeout() {
+        let section = ReconstructionSection {
+            learning_period_timeout_secs: 0,
+            ..ReconstructionSection::default()
+        };
+        assert!(section.validate().is_err());
+    }
+
+    #[test]
+    fn reconstruction_section_parses_overrides() {
+        let nc = NodeConfig::parse(
+            r#"
+            [reconstruction]
+            report_threshold_percent = 80
+            learning_period_timeout_secs = 20
+        "#,
+        )
+        .unwrap();
+        assert_eq!(nc.reconstruction.report_threshold_percent, 80);
+        assert_eq!(nc.reconstruction.learning_period_timeout_secs, 20);
+        assert!(nc.reconstruction.validate().is_ok());
+    }
+
+    // -- cluster backup (12b.2 D21/CP12) ----------------------------------
+
+    #[test]
+    fn cluster_backup_disabled_by_default() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(nc.cluster.backup.url.is_none());
+        assert!(!nc.cluster.backup.enabled());
+        assert!(nc.cluster.backup.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_backup_section_parses() {
+        let nc = NodeConfig::parse(
+            r#"
+            [cluster.backup]
+            url = "file:///var/backups/council"
+            interval_secs = 60
+            retain = 10
+        "#,
+        )
+        .unwrap();
+        assert!(nc.cluster.backup.enabled());
+        assert_eq!(nc.cluster.backup.interval_secs, 60);
+        assert_eq!(nc.cluster.backup.retain, 10);
+        assert!(nc.cluster.backup.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_backup_rejects_zero_retain_when_enabled() {
+        let nc = NodeConfig::parse(
+            r#"
+            [cluster.backup]
+            url = "file:///var/backups/council"
+            retain = 0
+        "#,
+        )
+        .unwrap();
+        assert!(nc.cluster.backup.validate().is_err());
     }
 }
