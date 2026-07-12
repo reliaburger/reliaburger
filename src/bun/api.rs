@@ -113,6 +113,18 @@ pub struct ApiState {
     /// `[images] max_context_bytes` — hard cap on an extracted build
     /// context (JOB6).
     pub max_context_bytes: u64,
+    /// `[images.trust_policy] require_signatures` — when set, a build
+    /// is only `Completed` once its pushed digest carries a signature
+    /// the cluster trusts (JOB7).
+    pub require_signatures: bool,
+    /// Batch ids with a live leader-side completion watcher in this
+    /// process. Lets a restarted leader spot durable batches nobody is
+    /// watching and resume them (JOB4).
+    pub batch_watchers: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
+    /// Build ids with a live runner task in this process. A durable
+    /// `Running` record without one means the node restarted mid-build
+    /// and the record is terminated honestly (JOB4).
+    pub active_builds: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
 }
 
 /// Build the API router.
@@ -155,6 +167,7 @@ pub fn router(
         crate::cluster::ClusterHttp::plaintext(),
         5050,
         256 * 1024 * 1024,
+        false,
     )
 }
 
@@ -184,6 +197,7 @@ pub fn router_with_upgrade(
     cluster_http: crate::cluster::ClusterHttp,
     registry_port: u16,
     max_context_bytes: u64,
+    require_signatures: bool,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -214,6 +228,9 @@ pub fn router_with_upgrade(
         build_timeout_secs,
         registry_port,
         max_context_bytes,
+        require_signatures,
+        batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(
@@ -338,6 +355,10 @@ pub fn router_with_upgrade(
         .route(
             "/v1/build/run",
             post(super::build_runner::build_run_handler),
+        )
+        .route(
+            "/v1/build/track",
+            post(super::build_runner::build_track_handler),
         )
         .route(
             "/v1/build/{id}",

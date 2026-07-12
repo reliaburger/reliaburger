@@ -233,6 +233,10 @@ enum Command {
         /// Pickle registry port for context upload and image push.
         #[arg(long, default_value_t = 5050)]
         registry_port: u16,
+        /// Give up waiting after this many seconds (the server-side
+        /// build timeout is 900s; the margin covers queueing).
+        #[arg(long, default_value_t = 960)]
+        timeout: u64,
     },
     /// Submit a batch of jobs for high-throughput scheduling.
     Batch {
@@ -244,6 +248,13 @@ enum Command {
     BatchStatus {
         /// Batch id from `relish batch`.
         id: u64,
+        /// Poll until the batch reaches a terminal state.
+        #[arg(long)]
+        wait: bool,
+        /// Give up waiting after this many seconds (jobs time out
+        /// server-side after 3600s; the margin covers reporting).
+        #[arg(long, default_value_t = 3660)]
+        timeout: u64,
     },
     /// Manage secrets (encrypt values for use in app configs).
     Secret {
@@ -864,9 +875,12 @@ async fn main() -> ExitCode {
         Command::Build {
             ref path,
             registry_port,
-        } => commands::build(path, registry_port).await,
+            timeout,
+        } => commands::build(path, registry_port, timeout).await,
         Command::Batch { ref path } => commands::batch(path).await,
-        Command::BatchStatus { id } => commands::batch_status(id).await,
+        Command::BatchStatus { id, wait, timeout } => {
+            commands::batch_status(id, wait, timeout).await
+        }
         Command::Secret { action } => match &action {
             SecretAction::Pubkey { dir } => commands::secret_pubkey(dir),
             SecretAction::Encrypt { pubkey, value } => commands::secret_encrypt(pubkey, value),
@@ -1625,7 +1639,23 @@ mod tests {
     #[test]
     fn parse_build_command() {
         let cli = parse(&["relish", "build", "build.toml"]).unwrap();
-        assert!(matches!(cli.command, Command::Build { .. }));
+        match cli.command {
+            Command::Build { timeout, .. } => assert_eq!(timeout, 960),
+            _ => panic!("expected Build"),
+        }
+    }
+
+    #[test]
+    fn parse_batch_status_wait_flags() {
+        let cli = parse(&["relish", "batch-status", "7", "--wait", "--timeout", "30"]).unwrap();
+        match cli.command {
+            Command::BatchStatus { id, wait, timeout } => {
+                assert_eq!(id, 7);
+                assert!(wait);
+                assert_eq!(timeout, 30);
+            }
+            _ => panic!("expected BatchStatus"),
+        }
     }
 
     #[test]

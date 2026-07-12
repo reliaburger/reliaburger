@@ -165,13 +165,14 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/rollback/{app}/{namespace}", AnyToken),
     route(Get, "/v1/placements/{node_id}", AnyToken),
     route(Get, "/v1/images", AnyToken),
-    // Batch + build. `run`/`report` are node-to-node (System).
+    // Batch + build. `run`/`report`/`track` are node-to-node (System).
     route(Post, "/v1/batch", Deployer),
     route(Post, "/v1/batch/run", System),
     route(Post, "/v1/batch/{id}/report", System),
     route(Get, "/v1/batch/{id}", AnyToken),
     route(Post, "/v1/build", Deployer),
     route(Post, "/v1/build/run", System),
+    route(Post, "/v1/build/track", System),
     route(Get, "/v1/build/{id}", AnyToken),
     // GitOps + identity + tokens + secrets.
     route(Post, "/v1/gitops/webhook", AnyToken),
@@ -229,7 +230,12 @@ mod tests {
 
     #[test]
     fn node_to_node_routes_require_the_system_principal() {
-        for path in ["/v1/batch/run", "/v1/batch/{id}/report", "/v1/build/run"] {
+        for path in [
+            "/v1/batch/run",
+            "/v1/batch/{id}/report",
+            "/v1/build/run",
+            "/v1/build/track",
+        ] {
             assert_eq!(
                 required_principal(Method::Post, path),
                 Some(RoutePrincipal::System),

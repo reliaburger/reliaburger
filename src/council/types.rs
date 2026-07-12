@@ -169,6 +169,29 @@ pub enum RaftRequest {
     /// Finish a cluster upgrade: archive it to history and clear the
     /// active slot.
     UpgradeClear { upgrade_id: String },
+    /// Register a batch, allocating its id from the durable counter
+    /// (12b.2 JOB4). The response carries the assigned id.
+    BatchRegister {
+        batch: crate::meat::batch_tracker::BatchRecord,
+    },
+    /// Record a job's state transition within a tracked batch. An
+    /// unknown batch/job or an illegal transition is `Refused`.
+    BatchJobUpdate {
+        batch_id: u64,
+        job_name: String,
+        status: crate::meat::batch_tracker::JobStatus,
+    },
+    /// Register a build, allocating its id from the durable counter
+    /// (12b.2 JOB4). The response carries the assigned id.
+    BuildRegister {
+        build: crate::bun::build_runner::BuildRecord,
+    },
+    /// Record a build's state transition. An unknown build or an
+    /// illegal transition is `Refused`.
+    BuildUpdate {
+        build_id: u64,
+        state: crate::bun::build_runner::BuildState,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +223,11 @@ pub enum CouncilResponse {
     /// sealed under an old generation (PKI8). The state is unchanged;
     /// `reason` tells the proposer why.
     Refused { reason: String },
+    /// A `BatchRegister` entry was applied; carries the batch id the
+    /// durable counter assigned to *this* entry (12b.2 JOB4).
+    BatchRegistered { batch_id: u64 },
+    /// A `BuildRegister` entry was applied; carries the assigned build id.
+    BuildRegistered { build_id: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +282,14 @@ pub struct DesiredState {
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
     #[serde(default)]
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
+    /// Durable batch tracker: monotonic id counter plus in-flight and
+    /// recently terminal batches (12b.2 JOB4). Defaults empty so
+    /// pre-12b.2 snapshots load cleanly.
+    #[serde(default)]
+    pub batch_state: crate::meat::batch_tracker::BatchDurableState,
+    /// Durable build tracker, same shape and rationale as `batch_state`.
+    #[serde(default)]
+    pub build_state: crate::bun::build_runner::BuildDurableState,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

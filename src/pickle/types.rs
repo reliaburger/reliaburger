@@ -370,14 +370,20 @@ impl ManifestCatalog {
         }
     }
 
-    /// Apply an AttachSignature (set the signature on an existing manifest).
-    pub fn apply_attach_signature(&mut self, attach: &AttachSignature) {
-        if let Some((_, manifest)) = self
+    /// Apply an AttachSignature (set the signature on an existing
+    /// manifest). Returns `false` when the digest is unknown, so the
+    /// state machine can refuse instead of no-opping (JOB7).
+    pub fn apply_attach_signature(&mut self, attach: &AttachSignature) -> bool {
+        match self
             .manifests
             .iter_mut()
             .find(|(d, _)| d == &attach.manifest_digest.0)
         {
-            manifest.signature = Some(attach.signature.clone());
+            Some((_, manifest)) => {
+                manifest.signature = Some(attach.signature.clone());
+                true
+            }
+            None => false,
         }
     }
 
@@ -975,23 +981,25 @@ mod tests {
                 .is_none()
         );
 
-        catalog.apply_attach_signature(&AttachSignature {
+        assert!(catalog.apply_attach_signature(&AttachSignature {
             manifest_digest: m.digest.clone(),
             signature: test_signature(),
-        });
+        }));
 
         let updated = catalog.get_manifest(m.digest.as_str()).unwrap();
         assert!(updated.signature.is_some());
     }
 
     #[test]
-    fn manifest_catalog_attach_signature_missing_manifest_is_noop() {
+    fn manifest_catalog_attach_signature_missing_manifest_reports_failure() {
         let mut catalog = ManifestCatalog::default();
-        // No manifest committed — attach should be a no-op
-        catalog.apply_attach_signature(&AttachSignature {
+        // No manifest committed — attach reports the unknown digest so
+        // the state machine can refuse it (JOB7).
+        let attached = catalog.apply_attach_signature(&AttachSignature {
             manifest_digest: test_digest("nonexistent"),
             signature: test_signature(),
         });
+        assert!(!attached);
         assert!(catalog.manifests.is_empty());
     }
 

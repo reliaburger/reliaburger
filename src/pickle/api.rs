@@ -250,12 +250,23 @@ async fn blob_upload_initiate(
 /// `PATCH /v2/{name}/blobs/uploads/{upload_id}` — upload a chunk.
 async fn blob_upload_patch(
     State(state): State<PickleState>,
-    Path((_name, upload_id)): Path<(String, String)>,
+    Path((name, upload_id)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> Response {
     match state.store.write_upload_chunk(&upload_id, &body).await {
         Ok(total) => {
             let mut headers = HeaderMap::new();
+            // The OCI distribution spec requires a Location on every
+            // chunk response — the URL for the next chunk or final PUT.
+            // containers/image 5.29+ (buildah 1.33) reads it strictly:
+            // without it, `buildah push` dies with "determining upload
+            // URL: http: no Location header in response" (12b.2).
+            headers.insert(
+                "location",
+                format!("/v2/{name}/blobs/uploads/{upload_id}")
+                    .parse()
+                    .expect("ASCII header value"),
+            );
             headers.insert(
                 "docker-upload-uuid",
                 upload_id.parse().expect("ASCII header value"),
@@ -309,6 +320,13 @@ async fn blob_upload_complete(
     match state.store.complete_upload(&upload_id, &digest).await {
         Ok(()) => {
             let mut headers = HeaderMap::new();
+            // Location of the created blob (OCI distribution spec).
+            headers.insert(
+                "location",
+                format!("/v2/{_name}/blobs/{}", digest.as_str())
+                    .parse()
+                    .expect("ASCII header value"),
+            );
             headers.insert(
                 "docker-content-digest",
                 digest.as_str().parse().expect("ASCII header value"),
@@ -771,7 +789,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let location = resp.headers()["location"].to_str().unwrap().to_string();
 
-        // Upload data via PATCH
+        // Upload data via PATCH. The 202 must carry a Location for the
+        // next request — containers/image (buildah 1.33+) reads it
+        // strictly, and its absence broke real `buildah push` (12b.2).
         let resp = app
             .clone()
             .oneshot(
@@ -784,8 +804,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
 
-        // Complete upload
+        // Complete upload; the 201 names the created blob's location.
         let resp = app
             .clone()
             .oneshot(
@@ -798,6 +819,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(resp.headers().contains_key("location"));
 
         digest
     }
