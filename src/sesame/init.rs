@@ -136,6 +136,7 @@ pub fn initialize_cluster(
         next_serial: 6, // Next available serial after root(1), node(2), workload(3), ingress(4), first-node(5)
         oidc_signing_config: Some(oidc_config),
         crl: super::types::Crl::default(),
+        secret_seals: std::collections::BTreeMap::new(),
     };
 
     Ok(InitResult {

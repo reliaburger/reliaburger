@@ -329,6 +329,23 @@ pub struct AgeKeypair {
     pub read_only: bool,
 }
 
+/// Which age key generation sealed one stored secret (PKI8).
+///
+/// Age ciphertext doesn't disclose its recipient, so the only reliable
+/// moment to note which generation sealed a stored `ENC[AGE:...]` value
+/// is when the value is written: new config values are encrypted against
+/// the scope's *active* public key, so applying an app spec records the
+/// active generation for each of its encrypted values. Finalising a
+/// rotation checks these records — a secret still sealed under an older
+/// generation blocks retirement of the key that can decrypt it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecretSeal {
+    /// The scope whose key sealed the value.
+    pub scope: AgeKeyScope,
+    /// The generation of that scope's key at write time.
+    pub generation: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Join token
 // ---------------------------------------------------------------------------
@@ -418,6 +435,12 @@ pub struct SecurityState {
     /// Certificate revocation list.
     #[serde(default)]
     pub crl: Crl,
+    /// Sealing generation per stored encrypted secret, keyed by
+    /// `namespace/app/ENV_KEY` (PKI8). Legacy state persisted before
+    /// this field existed loads with it empty — those secrets count as
+    /// "unknown generation" and block finalise until re-encrypted.
+    #[serde(default)]
+    pub secret_seals: std::collections::BTreeMap<String, SecretSeal>,
 }
 
 impl SecurityState {

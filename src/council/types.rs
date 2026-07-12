@@ -193,6 +193,13 @@ pub enum CouncilResponse {
     GcApproved {
         approved: Vec<crate::pickle::types::Digest>,
     },
+    // NOTE: like `RaftRequest`, responses ride the bincode-encoded wire,
+    // so new variants are appended, never inserted or reordered.
+    /// The entry was applied but the state machine refused to act on it —
+    /// e.g. finalising a secret rotation while stored secrets are still
+    /// sealed under an old generation (PKI8). The state is unchanged;
+    /// `reason` tells the proposer why.
+    Refused { reason: String },
 }
 
 // ---------------------------------------------------------------------------

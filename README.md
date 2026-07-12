@@ -59,7 +59,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 ## Try it
 
 ```sh
-make test                    # run all tests (2130 and counting)
+make test                    # run all tests (2175 and counting)
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
@@ -108,7 +108,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 
 ## Current status
 
-**2,130 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. See [progress.md](docs/progress.md) for the full checklist.
+**2,175 tests across 13 completed phases** (plus the Lima-gated eBPF/netns/btrfs/buildah integration suites run in the dev VM). Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. See [progress.md](docs/progress.md) for the full checklist.
 
 | Phase | Status | Tests |
 |-------|--------|-------|
@@ -156,6 +156,13 @@ process starts on root-mode runc (create → program → start, failing the
 deploy closed if policy can't be installed), a periodic sweep reconciles
 the kernel maps against live instances, and the nftables perimeter is
 dual-stack with parsed-and-validated admin CIDRs and bounded `nft` calls.
+Secret and workload-identity safety rounds out the 12b.1 "stop the
+bleeding" themes: workload certificates get exact one-hour validity
+windows and server-rebuilt SANs (a CSR can't smuggle extra names), each
+instance's identity lives in its own tmpfs-backed directory that follows
+the instance from creation to stop and survives agent restarts with its
+rotation schedule intact, and secret-key rotation refuses to retire an
+old key while any stored secret is still sealed under it.
 Still open in this stage: the Pickle registry's own auth/TLS, and the
 broader correctness/observability items tracked in
 [progress.md](docs/progress.md).

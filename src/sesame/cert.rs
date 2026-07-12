@@ -96,10 +96,16 @@ pub fn verify_signature(child_der: &[u8], parent_der: &[u8]) -> Result<(), CertE
 
 /// Check that a certificate is currently valid (not expired, not before start).
 pub fn check_validity(der: &[u8]) -> Result<(), CertError> {
+    check_validity_at(der, SystemTime::now())
+}
+
+/// Check that a certificate is valid at the given instant. The injected
+/// clock exists so tests can assert exact validity windows (PKI6).
+pub fn check_validity_at(der: &[u8], at: SystemTime) -> Result<(), CertError> {
     let (_, cert) =
         X509Certificate::from_der(der).map_err(|e| CertError::ParseFailed(format!("{e}")))?;
 
-    let now = SystemTime::now()
+    let now = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let now_secs = now.as_secs() as i64;

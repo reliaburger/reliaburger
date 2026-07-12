@@ -776,6 +776,12 @@ Bun on each worker node maintains a rotation schedule for every running workload
 6. **Pre-fetch.** At the 30-minute mark, Bun generates a new keypair, sends a new CSR, receives the new certificate, and atomically writes the new files to the tmpfs mount.
 7. **Grace period.** If the CSR fails because the council is unreachable, Bun keeps the current certificate and extends its local validity window by up to 4 additional hours (configurable). The extension is logged as a security event, `relish wtf` warns about it, and an alert fires.
 
+**Host-side layout.** The mount source is a per-*instance* directory, `{volumes}/.identity/{instance_id}` — never shared between replicas of the same app, so no replica can overwrite another's private key. Bun prepares the directory before the container is created (it is the bind-mount source); on Linux, running as root, it is backed by a dedicated size-bounded tmpfs (`mode=0700`) so key material never touches persistent storage, and the key/token files are chowned to the container's runtime UID. On other platforms it is a plain `0700` directory (documented gap). The directory is removed — and the tmpfs unmounted — when the instance stops, is replaced by a rolling deploy, or is rolled back.
+
+**Restart safety.** Alongside the PEM files, Bun writes a `meta.json` sidecar (SPIFFE URI, issuance/expiry/rotation timestamps — no secrets). After a Bun restart or self-upgrade, workload adoption rebuilds each instance's `WorkloadIdentity` and its rotation schedule from this directory, so rotation continues on the original timetable instead of restarting from `identity: None`. Identity directories with no live owner are swept at adoption.
+
+**Certificate contents.** The council rebuilds every certificate field server-side from the expected identity; the only input taken from the CSR is the public key. Extra SANs in a hostile CSR are never signed. Validity is an exact timestamped window (`now − 5 min` skew backdate to `now + 1 h`), not calendar dates.
+
 **OIDC JWT minting** happens at the same time as certificate issuance. The council member constructs the JWT with the workload's SPIFFE URI as the `sub` claim, the cluster's OIDC issuer as `iss`, default audience `spiffe://CLUSTER`, plus any per-app audiences from the `[app.NAME.identity]` config. The JWT is signed with the Ed25519 OIDC signing key and returned alongside the signed X.509 certificate.
 
 ### 5.4 API Token Lifecycle
@@ -834,10 +840,10 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 **Key rotation (`relish secret rotate`):**
 
 1. Generate a new age keypair.
-2. Store the new keypair in Raft, marking the old keypair as `read_only = true`.
-3. The cluster now accepts ciphertexts encrypted with either key.
-4. The operator (or CI) re-encrypts all secrets with the new public key and commits to git.
-5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair.
+2. Store the new keypair in Raft, marking the old keypair as `read_only = true`. Starting a second rotation while one is un-finalised is refused (idempotent retries of the same rotation, deduped on the generation number, are accepted).
+3. The cluster now accepts ciphertexts encrypted with either key; new encryption always uses the newest non-read-only generation.
+4. The operator (or CI) re-encrypts all secrets with the new public key and commits to git. Each applied `AppSpec` records which generation seals its encrypted values (`SecurityState.secret_seals`, keyed `namespace/app/ENV_KEY`) — age ciphertext does not disclose its recipient, so write time is the only moment this is knowable.
+5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all (legacy state) — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
 
 ### 5.6 Raft Log Encryption
 

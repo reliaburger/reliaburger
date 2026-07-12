@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use super::types::{CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig};
+use crate::sesame::types::AgeKeyScope;
 
 /// Persisted snapshot: `data` = JSON of `DesiredState` (which itself carries
 /// `last_applied_log` + `last_membership`), `index` = snapshot counter,
@@ -181,10 +182,20 @@ impl StateMachineInner {
         match request {
             RaftRequest::AppSpec { app_id, spec } => {
                 self.state.apps.insert(app_id.clone(), *spec.clone());
+                // Applying a spec is the moment its `ENC[AGE:...]` values
+                // were (re-)encrypted against the active key: record which
+                // generation seals each of them (PKI8). This is also how
+                // the operator's re-encrypt step unblocks finalise.
+                self.record_secret_seals(app_id, spec);
             }
             RaftRequest::AppDelete { app_id } => {
                 self.state.apps.remove(app_id);
                 self.state.scheduling.remove(app_id);
+                let prefix = format!("{app_id}/");
+                self.state
+                    .security_state
+                    .secret_seals
+                    .retain(|key, _| !key.starts_with(&prefix));
             }
             RaftRequest::SchedulingDecision(decision) => {
                 self.state
@@ -303,6 +314,35 @@ impl StateMachineInner {
                 return Some(CouncilResponse::SerialAllocated { serial });
             }
             RaftRequest::RotateSecretKey { scope, new_keypair } => {
+                // Idempotent retry of the *same* rotation (deduped on the
+                // new generation number): keep the first-applied keypair,
+                // change nothing.
+                let generation_exists = self
+                    .state
+                    .security_state
+                    .age_keypairs
+                    .iter()
+                    .any(|kp| kp.scope == *scope && kp.generation == new_keypair.generation);
+                if generation_exists {
+                    return None;
+                }
+                // One rotation at a time (PKI8): a read-only key means an
+                // earlier rotation hasn't been finalised. Stacking a third
+                // generation on top multiplies the re-encrypt bookkeeping
+                // and the ways to brick a secret — refuse instead.
+                let rotation_in_flight = self
+                    .state
+                    .security_state
+                    .age_keypairs
+                    .iter()
+                    .any(|kp| kp.scope == *scope && kp.read_only);
+                if rotation_in_flight {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a secret rotation for this scope is already in progress: \
+                                 re-encrypt stored secrets and finalise it before starting another"
+                            .to_string(),
+                    });
+                }
                 // Mark existing keypairs with the same scope as read-only
                 for kp in &mut self.state.security_state.age_keypairs {
                     if kp.scope == *scope {
@@ -329,12 +369,41 @@ impl StateMachineInner {
                     .age_keypairs
                     .iter()
                     .any(|kp| kp.scope == *scope && !kp.read_only);
-                if has_active {
-                    self.state
-                        .security_state
-                        .age_keypairs
-                        .retain(|kp| kp.scope != *scope || !kp.read_only);
+                if !has_active {
+                    return Some(CouncilResponse::Refused {
+                        reason: "no active replacement key exists for this scope: \
+                                 start a rotation before finalising one"
+                            .to_string(),
+                    });
                 }
+                // Verify before retiring (PKI8): every stored secret in the
+                // scope must be sealed under the newest generation, or the
+                // retirement would brick it. Secrets without a recorded
+                // seal (legacy state) count as "unknown generation" and
+                // block finalise until re-encrypted.
+                let newest = self
+                    .state
+                    .security_state
+                    .age_keypairs
+                    .iter()
+                    .filter(|kp| kp.scope == *scope)
+                    .map(|kp| kp.generation)
+                    .max()
+                    .unwrap_or(0);
+                let stale = self.stale_sealed_secrets(scope, newest);
+                if !stale.is_empty() {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "cannot finalise secret rotation: secrets still sealed under \
+                             an old generation (re-encrypt and re-apply them first): {}",
+                            stale.join(", ")
+                        ),
+                    });
+                }
+                self.state
+                    .security_state
+                    .age_keypairs
+                    .retain(|kp| kp.scope != *scope || !kp.read_only);
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -362,6 +431,99 @@ impl StateMachineInner {
             }
         }
         None
+    }
+
+    /// The scope whose key seals `app_id`'s secrets: its namespace's key
+    /// when one exists, the cluster-wide key otherwise — mirroring the
+    /// agent's decrypt order (namespace first, then cluster-wide).
+    fn effective_secret_scope(&self, app_id: &crate::meat::types::AppId) -> AgeKeyScope {
+        let ns_scope = AgeKeyScope::Namespace(app_id.namespace.clone());
+        let has_ns_key = self
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .any(|kp| kp.scope == ns_scope);
+        if has_ns_key {
+            ns_scope
+        } else {
+            AgeKeyScope::ClusterWide
+        }
+    }
+
+    /// Record the sealing generation for each of `spec`'s encrypted env
+    /// values, replacing any previous records for the app (PKI8).
+    fn record_secret_seals(
+        &mut self,
+        app_id: &crate::meat::types::AppId,
+        spec: &crate::config::app::AppSpec,
+    ) {
+        let prefix = format!("{app_id}/");
+        self.state
+            .security_state
+            .secret_seals
+            .retain(|key, _| !key.starts_with(&prefix));
+
+        let scope = self.effective_secret_scope(app_id);
+        // No key material for the scope means nothing could have sealed
+        // the values; record nothing (they'll block finalise as unknown).
+        let Some(generation) = self
+            .state
+            .security_state
+            .active_age_keypair(&scope)
+            .map(|kp| kp.generation)
+        else {
+            return;
+        };
+
+        let encrypted_keys: Vec<String> = spec
+            .env
+            .iter()
+            .filter(|(_, value)| value.is_encrypted())
+            .map(|(key, _)| format!("{app_id}/{key}"))
+            .collect();
+        for key in encrypted_keys {
+            self.state.security_state.secret_seals.insert(
+                key,
+                crate::sesame::types::SecretSeal {
+                    scope: scope.clone(),
+                    generation,
+                },
+            );
+        }
+    }
+
+    /// Every stored secret in `scope` still sealed under a generation
+    /// older than `newest` — including secrets with no recorded seal
+    /// (legacy state written before seals existed). Sorted, as
+    /// `namespace/app/ENV_KEY` names, for deterministic error messages.
+    fn stale_sealed_secrets(&self, scope: &AgeKeyScope, newest: u64) -> Vec<String> {
+        let mut stale = Vec::new();
+        for (app_id, spec) in &self.state.apps {
+            for (env_key, value) in &spec.env {
+                if !value.is_encrypted() {
+                    continue;
+                }
+                let seal_key = format!("{app_id}/{env_key}");
+                match self.state.security_state.secret_seals.get(&seal_key) {
+                    Some(seal) => {
+                        if &seal.scope == scope && seal.generation < newest {
+                            stale.push(seal_key);
+                        }
+                    }
+                    None => {
+                        // Unknown generation: attribute it to the app's
+                        // effective scope and treat it as needing
+                        // re-encryption.
+                        if &self.effective_secret_scope(app_id) == scope {
+                            stale.push(seal_key);
+                        }
+                    }
+                }
+            }
+        }
+        stale.sort();
+        stale
     }
 }
 
@@ -1522,7 +1684,7 @@ mod tests {
             .age_keypairs
             .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, true));
 
-        inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
             scope: AgeKeyScope::ClusterWide,
         });
 
@@ -1531,6 +1693,248 @@ mod tests {
             1,
             "no active key means nothing is retired"
         );
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "the stray finalize is refused, not silently ignored"
+        );
+    }
+
+    /// App spec with one encrypted and one plain env value.
+    fn spec_with_encrypted_env() -> crate::config::app::AppSpec {
+        toml::from_str(
+            r#"
+            image = "t:v1"
+            [env]
+            DB_PASSWORD = "ENC[AGE:c2VhbGVk]"
+            LOG_LEVEL = "info"
+            "#,
+        )
+        .unwrap()
+    }
+
+    fn apply_app(inner: &mut StateMachineInner, name: &str, namespace: &str) {
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: crate::meat::types::AppId::new(name, namespace),
+            spec: Box::new(spec_with_encrypted_env()),
+        });
+    }
+
+    /// PKI8: finalising while a stored secret is still sealed under the
+    /// old generation is refused, and the refusal names the secret.
+    #[test]
+    fn finalize_refused_while_a_secret_is_sealed_under_an_old_generation() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        // The app (and its seal record at generation 0) lands first…
+        apply_app(&mut inner, "web", "default");
+        // …then a rotation adds generation 1 and retires generation 0.
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+        });
+
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert!(
+            reason.contains("default/web/DB_PASSWORD"),
+            "the refusal names the stale secret: {reason}"
+        );
+        assert!(
+            !reason.contains("LOG_LEVEL"),
+            "plain values are not implicated: {reason}"
+        );
+        assert_eq!(
+            inner.state.security_state.age_keypairs.len(),
+            2,
+            "the old key survives — the secret is still decryptable"
+        );
+    }
+
+    /// PKI8: after the operator re-encrypts (re-applies the spec under the
+    /// new generation), finalize retires the old key as before.
+    #[test]
+    fn finalize_succeeds_after_secrets_re_encrypted_under_the_new_generation() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        apply_app(&mut inner, "web", "default");
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+        });
+
+        // The re-encrypt step: the spec is re-applied, which re-records
+        // its seals against the now-active generation 1.
+        apply_app(&mut inner, "web", "default");
+
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "finalize proceeds once everything is re-sealed: {response:?}"
+        );
+        let remaining = &inner.state.security_state.age_keypairs;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].generation, 1);
+    }
+
+    /// PKI8: a second rotation while one is un-finalised is refused; the
+    /// key set is unchanged.
+    #[test]
+    fn concurrent_second_rotation_refused_until_finalised() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+        });
+
+        let response = inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 2, false),
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert!(reason.contains("finalise"), "tells the operator what to do");
+        let generations: Vec<u64> = inner
+            .state
+            .security_state
+            .age_keypairs
+            .iter()
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(generations, vec![0, 1], "generation 2 was not added");
+    }
+
+    /// PKI8: a duplicate delivery of the *same* rotation (same new
+    /// generation) is accepted idempotently — no refusal, no second key.
+    #[test]
+    fn same_generation_rotation_retry_is_idempotent() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+        });
+
+        let response = inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+        });
+
+        assert!(
+            !matches!(response, Some(CouncilResponse::Refused { .. })),
+            "a retry of the same rotation must not be refused"
+        );
+        assert_eq!(
+            inner.state.security_state.age_keypairs.len(),
+            2,
+            "no duplicate keypair for generation 1"
+        );
+    }
+
+    /// PKI8 fixture: security state persisted before `secret_seals`
+    /// existed loads fine (self-describing JSON, `#[serde(default)]`),
+    /// and its secrets — with no recorded generation — block finalize
+    /// until re-encrypted.
+    #[test]
+    fn legacy_secret_without_generation_metadata_blocks_finalize() {
+        use crate::sesame::types::AgeKeyScope;
+
+        // A legacy SecurityState JSON with no `secret_seals` field.
+        let legacy_json = r#"{
+            "certificate_authorities": [],
+            "age_keypairs": [],
+            "api_tokens": [],
+            "join_tokens": [],
+            "next_serial": 6
+        }"#;
+        let legacy: crate::sesame::types::SecurityState =
+            serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.secret_seals.is_empty(), "missing field defaults");
+
+        let mut inner = StateMachineInner::default();
+        inner.state.security_state = legacy;
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        // The app predates seal recording: insert it directly, the way a
+        // pre-upgrade snapshot would restore it — no seal entry.
+        inner.state.apps.insert(
+            crate::meat::types::AppId::new("web", "default"),
+            spec_with_encrypted_env(),
+        );
+
+        inner.apply_request(&RaftRequest::RotateSecretKey {
+            scope: AgeKeyScope::ClusterWide,
+            new_keypair: test_age_keypair(AgeKeyScope::ClusterWide, 1, false),
+        });
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = response else {
+            panic!("expected a refusal, got {response:?}");
+        };
+        assert!(reason.contains("default/web/DB_PASSWORD"), "{reason}");
+
+        // Re-encrypting (re-applying the spec) records the seal and
+        // unblocks the finalize.
+        apply_app(&mut inner, "web", "default");
+        let response = inner.apply_request(&RaftRequest::FinalizeSecretRotation {
+            scope: AgeKeyScope::ClusterWide,
+        });
+        assert!(!matches!(response, Some(CouncilResponse::Refused { .. })));
+    }
+
+    /// Seals follow the app: deleting it clears them, so a deleted app
+    /// can never block a rotation from finalising.
+    #[test]
+    fn app_delete_clears_its_secret_seals() {
+        use crate::sesame::types::AgeKeyScope;
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .security_state
+            .age_keypairs
+            .push(test_age_keypair(AgeKeyScope::ClusterWide, 0, false));
+        apply_app(&mut inner, "web", "default");
+        assert_eq!(inner.state.security_state.secret_seals.len(), 1);
+
+        inner.apply_request(&RaftRequest::AppDelete {
+            app_id: crate::meat::types::AppId::new("web", "default"),
+        });
+        assert!(inner.state.security_state.secret_seals.is_empty());
     }
 
     #[test]

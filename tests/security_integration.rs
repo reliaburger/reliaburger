@@ -42,6 +42,7 @@ fn bootstrap_security_state() -> (SecurityState, String, [u8; 32]) {
         next_serial: 6,
         oidc_signing_config: None,
         crl: Crl::default(),
+        secret_seals: std::collections::BTreeMap::new(),
     };
 
     (state, token_plaintext, wrapping_ikm)
@@ -99,6 +100,7 @@ fn join_token_expiry_enforced() {
         next_serial: 6,
         oidc_signing_config: None,
         crl: Crl::default(),
+        secret_seals: std::collections::BTreeMap::new(),
     };
 
     let result = join::validate_and_issue(&token_plaintext, "node-02", &mut state, &wrapping_ikm);
