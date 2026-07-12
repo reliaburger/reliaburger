@@ -163,6 +163,18 @@ That last word is the whole trick. The autoscaler doesn't deploy anything or tal
 
 One honesty note on the metric. The autoscaler compares the rollup value against the target as a *utilisation fraction* (0.95 vs 0.70). What Mayo actually records for an app therefore has to be scaled that way; a metric reported in raw millicores would need a target expressed to match. The code documents this at the query seam rather than silently assuming.
 
+### Getting the lifecycle right
+
+The first wired autoscaler had four subtle bugs the review caught, and each one is a small lesson in ordering.
+
+**Start the cooldown after the write, not before.** The loop used to record the scale event — which starts the cooldown clock — and *then* write to Raft. If that write failed, the app never actually scaled, but the cooldown had already started, so the autoscaler sat on its hands for three minutes while nothing had happened. The fix is a one-line reorder: commit first, and only mark the cooldown on a successful write. A failed write now retries on the very next tick, because as far as the tracker is concerned, nothing has changed. Order your side effects so a failure leaves no false memory behind.
+
+**Clear an override the moment its baseline moves.** An override is a runtime adjustment *relative to a baseline*. Redeploy the app with a different replica count, or delete it entirely, and the old override is meaningless — worse than meaningless, because a stale "scale to 7" left sitting in Raft would quietly resize a freshly redeployed app. So the state machine clears the override in the same apply that changes the baseline: on `AppDelete`, and on an `AppSpec` whose replica count differs from the stored one. An image-only redeploy (same replica baseline) leaves the override alone — you don't want a routine version bump throwing away a legitimate scale-up.
+
+**`min > max` is an error, not a clamp.** The old code fed `min` and `max` straight into `.clamp()`, which silently swaps them if they're out of order — so `min = 10, max = 3` quietly became "always 3", hiding an obvious operator typo. Now the `[autoscale]` block is validated at config time: `min > max`, a zero `max`, an unparseable or zero window, an out-of-range threshold — every one fails the deploy loudly with a message naming the field. A validation error the operator reads beats a clamp the operator never sees.
+
+**Use the window the operator configured.** The rollup query was hardcoded to average the last five minutes regardless of what `evaluation_window` said. Now the configured window drives the query, as it always should have. And while we were in the numeric code, we made the resource parsers use checked arithmetic: a memory string like `99999999999999999999Gi` now returns a validation error instead of silently overflowing 64 bits into some small wrong number (a whole class of bug the review labelled DEP9).
+
 ## Config tooling
 
 Before GitOps, before Kubernetes migration, before any of the fancy stuff, you need basic config manipulation tools. Three commands, all local (no cluster contact needed).

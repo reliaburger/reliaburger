@@ -2,6 +2,8 @@
 ///
 /// Enforced at scheduling time. Each namespace can have limits on
 /// CPU, memory, GPUs, app count, and total replica count.
+use std::collections::HashMap;
+
 use super::types::Resources;
 
 /// Resource quota for a namespace.
@@ -82,37 +84,48 @@ pub fn check_quota(
     new_replicas: u32,
     is_new_app: bool,
 ) -> Result<(), QuotaError> {
+    // Saturating arithmetic throughout: a spec asking for an absurd
+    // per-replica resource times a large replica count must reject
+    // cleanly, never wrap (DEP9). A saturated total still exceeds any
+    // real limit, so the check stays correct.
     if let Some(limit) = quota.max_cpu_millicores {
-        let total = usage.cpu_millicores + requested.cpu_millicores * new_replicas as u64;
+        let requested_total = requested
+            .cpu_millicores
+            .saturating_mul(u64::from(new_replicas));
+        let total = usage.cpu_millicores.saturating_add(requested_total);
         if total > limit {
             return Err(QuotaError::CpuExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.cpu_millicores,
-                requested: requested.cpu_millicores * new_replicas as u64,
+                requested: requested_total,
                 limit,
             });
         }
     }
 
     if let Some(limit) = quota.max_memory_bytes {
-        let total = usage.memory_bytes + requested.memory_bytes * new_replicas as u64;
+        let requested_total = requested
+            .memory_bytes
+            .saturating_mul(u64::from(new_replicas));
+        let total = usage.memory_bytes.saturating_add(requested_total);
         if total > limit {
             return Err(QuotaError::MemoryExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.memory_bytes,
-                requested: requested.memory_bytes * new_replicas as u64,
+                requested: requested_total,
                 limit,
             });
         }
     }
 
     if let Some(limit) = quota.max_gpus {
-        let total = usage.gpus + requested.gpus * new_replicas;
+        let requested_total = requested.gpus.saturating_mul(new_replicas);
+        let total = usage.gpus.saturating_add(requested_total);
         if total > limit {
             return Err(QuotaError::GpuExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.gpus,
-                requested: requested.gpus * new_replicas,
+                requested: requested_total,
                 limit,
             });
         }
@@ -130,7 +143,7 @@ pub fn check_quota(
     }
 
     if let Some(limit) = quota.max_replicas {
-        let total = usage.replica_count + new_replicas;
+        let total = usage.replica_count.saturating_add(new_replicas);
         if total > limit {
             return Err(QuotaError::MaxReplicasExceeded {
                 namespace: quota.namespace.clone(),
@@ -142,6 +155,75 @@ pub fn check_quota(
     }
 
     Ok(())
+}
+
+/// Per-namespace usage ledger for one scheduling pass.
+///
+/// The leader plans every app in a single pass. Quotas are *cumulative*
+/// within a namespace, so a ledger accumulates usage as each app is
+/// admitted: the second app in `prod` is checked against the first's
+/// footprint, not a clean slate. Without this a namespace could hold two
+/// apps that each fit alone but together bust the budget.
+///
+/// The quota table is *injected*. Namespace resources are not yet
+/// desired state (that lands with T6 declarative resources), so in
+/// production the table is empty today and every app is admitted — the
+/// enforcement seam is wired and tested here, ready for T6 to feed it.
+#[derive(Debug, Default)]
+pub struct QuotaLedger {
+    quotas: HashMap<String, NamespaceQuota>,
+    usage: HashMap<String, NamespaceUsage>,
+}
+
+impl QuotaLedger {
+    /// Build a ledger from a namespace → quota table.
+    pub fn new(quotas: HashMap<String, NamespaceQuota>) -> Self {
+        Self {
+            quotas,
+            usage: HashMap::new(),
+        }
+    }
+
+    /// Whether any quota is configured. An empty ledger admits everything
+    /// without allocating usage maps.
+    pub fn is_empty(&self) -> bool {
+        self.quotas.is_empty()
+    }
+
+    /// Check whether admitting `replicas` of an app requesting `per_replica`
+    /// resources in `namespace` fits its quota; if so, record the usage.
+    ///
+    /// Returns `Ok(())` and mutates the ledger on admission, or the quota
+    /// error without mutating on rejection. A namespace with no configured
+    /// quota is always admitted (its usage is still tracked, harmlessly).
+    pub fn try_admit(
+        &mut self,
+        namespace: &str,
+        per_replica: &Resources,
+        replicas: u32,
+        is_new_app: bool,
+    ) -> Result<(), QuotaError> {
+        let entry = self.usage.entry(namespace.to_string()).or_default();
+        if let Some(quota) = self.quotas.get(namespace) {
+            check_quota(quota, entry, per_replica, replicas, is_new_app)?;
+        }
+        entry.cpu_millicores = entry.cpu_millicores.saturating_add(
+            per_replica
+                .cpu_millicores
+                .saturating_mul(u64::from(replicas)),
+        );
+        entry.memory_bytes = entry
+            .memory_bytes
+            .saturating_add(per_replica.memory_bytes.saturating_mul(u64::from(replicas)));
+        entry.gpus = entry
+            .gpus
+            .saturating_add(per_replica.gpus.saturating_mul(replicas));
+        entry.replica_count = entry.replica_count.saturating_add(replicas);
+        if is_new_app {
+            entry.app_count = entry.app_count.saturating_add(1);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +289,61 @@ mod tests {
         let res = Resources::new(100, 1024, 0);
         let err = check_quota(&quota("prod"), &usage, &res, 2, false);
         assert!(matches!(err, Err(QuotaError::MaxReplicasExceeded { .. })));
+    }
+
+    #[test]
+    fn quota_does_not_overflow_on_absurd_replica_product() {
+        // A spec asking for a huge per-replica memory times a large replica
+        // count must reject cleanly (saturate), not wrap around to a small
+        // total that spuriously passes (DEP9).
+        let q = NamespaceQuota {
+            namespace: "prod".to_string(),
+            max_cpu_millicores: None,
+            max_memory_bytes: Some(1024),
+            max_gpus: None,
+            max_apps: None,
+            max_replicas: None,
+        };
+        let res = Resources::new(0, u64::MAX, 0);
+        let err = check_quota(&q, &empty_usage(), &res, 1_000_000, false);
+        assert!(matches!(err, Err(QuotaError::MemoryExceeded { .. })));
+    }
+
+    #[test]
+    fn ledger_accumulates_across_apps_in_a_namespace() {
+        let q = NamespaceQuota {
+            namespace: "prod".to_string(),
+            max_cpu_millicores: Some(1000),
+            max_memory_bytes: None,
+            max_gpus: None,
+            max_apps: None,
+            max_replicas: None,
+        };
+        let mut ledger = QuotaLedger::new(HashMap::from([("prod".to_string(), q)]));
+        // First app: 2 × 300m = 600m — fits under 1000m.
+        assert!(
+            ledger
+                .try_admit("prod", &Resources::new(300, 0, 0), 2, true)
+                .is_ok()
+        );
+        // Second app: 2 × 300m = 600m more → 1200m total > 1000m — rejected
+        // because the first app already consumed the namespace budget.
+        let err = ledger.try_admit("prod", &Resources::new(300, 0, 0), 2, true);
+        assert!(
+            matches!(err, Err(QuotaError::CpuExceeded { .. })),
+            "cumulative usage should bust the quota: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ledger_without_quota_admits_everything() {
+        let mut ledger = QuotaLedger::default();
+        assert!(ledger.is_empty());
+        assert!(
+            ledger
+                .try_admit("anything", &Resources::new(9_999_999, 0, 0), 100, true)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -139,6 +139,7 @@ fn cluster_params_from_config(
         rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
         identity,
         backup: config.cluster.backup.clone(),
+        labels: config.node.labels.clone(),
     })
 }
 

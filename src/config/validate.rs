@@ -98,6 +98,19 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         }
     }
 
+    // Autoscale block: bounds, windows and threshold are validated up front
+    // so a bad `[autoscale]` fails the deploy instead of silently clamping
+    // at runtime (DEP8).
+    if let Some(autoscale) = &app.autoscale
+        && let Err(e) = crate::meat::autoscaler::AutoscaleConfig::from_spec(autoscale)
+    {
+        return Err(ConfigError::Validation {
+            field: "autoscale".to_string(),
+            context: format!("app {name:?}"),
+            reason: e.to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -295,6 +308,27 @@ mod tests {
     fn validate_valid_app_passes() {
         let config = config_with_app("test", minimal_app());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_autoscale_min_greater_than_max_rejected() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "web:v1"
+            [autoscale]
+            metric = "cpu"
+            target = "70%"
+            min = 10
+            max = 3
+        "#,
+        )
+        .unwrap();
+        let config = config_with_app("web", app);
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "autoscale"),
+            "min>max autoscale must be rejected at validation: {err:?}"
+        );
     }
 
     #[test]

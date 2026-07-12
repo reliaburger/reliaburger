@@ -73,6 +73,7 @@ async fn start_node(
             rollup_interval: Duration::from_millis(500),
             identity: None,
             backup: Default::default(),
+            labels: std::collections::BTreeMap::new(),
         },
         shutdown.clone(),
     )

@@ -103,6 +103,7 @@ async fn start_node_with_mayo(
             rollup_interval: Duration::from_millis(300),
             identity: None,
             backup: Default::default(),
+            labels: std::collections::BTreeMap::new(),
         },
         shutdown.clone(),
     )

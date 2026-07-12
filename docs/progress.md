@@ -645,12 +645,48 @@ whole theme lands.
     `RELIABURGER_CLUSTER_TESTS=1`): three voters + backup, kill all three, recover on a
     survivor, council re-forms with restored state and a fresh epoch and regrows; plus a
     reconciler-driven leader-deposition-under-pressure test.
-- [ ] **Scheduler truth, labels, quotas and autoscaling** — advertise authenticated node
+- [x] **Scheduler truth, labels, quotas and autoscaling** — advertise authenticated node
   labels/resources; use one mutable reservation cache per planning pass; revalidate
   generation, resources, labels, readiness and cordon; converge daemon workloads against
   eligible nodes; wire namespace quotas. Validate autoscale bounds/durations, use structured
   namespace/app metrics and configured windows, commit before cooldown and clear stale
   overrides. Reject numeric overflow (CP7-CP8, DEP8-DEP9, D13).
+  - [x] Labels travel (CP7): the gossip `DirectoryExtension` now carries the sending node's
+    placement labels (`BTreeMap`, bounded to 16 keys / 64-byte fields / 512 total bytes so
+    datagrams stay well under the MTU), HMAC-authenticated like #89's endpoints and appended
+    as trailing bytes so old and pre-labels peers keep gossiping in both directions (pinned by
+    a legacy-extension decoder test). Received labels land on the stamping node's membership
+    record and the `NodeDirectory`, so `filter_nodes`' label filtering and zone-aware council
+    selection have live input instead of the empty map Mustard used to insert. `[node] labels`
+    flows from node.toml → `ClusterParams` → `set_advertised_endpoints`.
+  - [x] One reservation cache per planning pass (CP8): the leader builds the cluster cache
+    ONCE per tick and plans every app against a single mutable reservation view — each
+    committed placement subtracts before the next app plans, so two apps that together exceed
+    one node's headroom no longer both land on it (regression test: exactly one is placed, the
+    other refused). `apply_upgrade_cordon` is wired into the pass (Phase 14's helper finally
+    has a caller); a cordoned node receives nothing. Each decision is revalidated against the
+    LATEST membership immediately before the async Raft write, so a node that dies mid-pass is
+    dropped rather than assigned. Pure `plan_scheduling_pass` is unit-tested for all four cases.
+  - [x] Daemon convergence: a daemon app re-plans over the currently eligible nodes each tick
+    (a placement targeting a departed/cordoned node counts as stale), so it gains an instance
+    when a node joins/becomes eligible and loses one when a node leaves. Tests cover node-join
+    growth and departed-node re-plan.
+  - [x] Namespace quotas wired (enforcement seam): `QuotaLedger` accumulates per-namespace
+    usage cumulatively across the pass and refuses an app that would bust its quota, with a
+    clear deploy-time error. **Handoff:** namespace resources are not desired state until T6
+    (Complete declarative resources), so the production quota table is empty today and every
+    app is admitted — the seam and its tests (injected table, cumulative rejection, overflow)
+    are in place, ready for T6 to feed `NamespaceSpec` quotas in.
+  - [x] Autoscale lifecycle (DEP8): `AutoscaleConfig::from_spec` returns a validated `Result`
+    (rejects `min > max`, zero max, zero/unparseable evaluation window — cooldown may be zero,
+    out-of-range threshold) and config validation surfaces it on `relish apply`; the cooldown
+    starts only *after* a successful Raft write (a failed write no longer suppresses the next
+    attempt); stale overrides are cleared in the state machine when an app's replica baseline
+    changes or the app is deleted (an image-only redeploy keeps the override); the rollup query
+    uses the configured `evaluation_window` instead of a hardcoded five minutes.
+  - [x] Numeric overflow rejected (DEP9): `parse_num` uses checked multiplication (a huge
+    memory string is a validation error, not a wrapped small value) and the quota arithmetic
+    saturates throughout.
 - [ ] **Transactional desired state and deployment** — make instance identity include
   namespace/generation/ordinal; apply AppDelete through Raft on cluster stop; consume
   count/generation-aware reconstruction corrections; wait for terminal deploy/stop outcome,
