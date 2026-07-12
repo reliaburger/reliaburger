@@ -4,6 +4,7 @@
 /// (max 1400 bytes). Membership updates are piggybacked on every
 /// PING/ACK exchange, achieving O(log N) convergence without
 /// dedicated broadcast messages.
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,22 @@ use super::state::NodeState;
 /// Maximum number of piggybacked membership updates per gossip message.
 /// Bounded to keep message size constant (~512 bytes total).
 pub const MAX_PIGGYBACK_UPDATES: usize = 8;
+
+/// Most label keys a directory extension will carry. Labels ride every
+/// gossip datagram, so an unbounded set would blow past the UDP budget;
+/// past this many keys we drop the rest (deterministically — `BTreeMap`
+/// iterates in key order, so every node truncates the same way).
+pub const MAX_DIRECTORY_LABELS: usize = 16;
+
+/// Longest label key or value we advertise. A key or value longer than
+/// this is skipped rather than truncated mid-string (a truncated value
+/// would silently mismatch a placement constraint).
+pub const MAX_DIRECTORY_LABEL_LEN: usize = 64;
+
+/// Total bytes of label key+value data we advertise. This is the real
+/// guard: even 16 keys of 64 bytes each would overflow the MTU alongside
+/// the message body, so we stop accumulating once this budget is hit.
+const MAX_DIRECTORY_LABEL_BYTES: usize = 512;
 
 /// Top-level gossip message sent as a single UDP datagram.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,9 +207,47 @@ pub struct DirectoryExtension {
     pub reporting_address: SocketAddr,
     /// Best known leader, relayed epidemically; highest term wins.
     pub leader: Option<LeaderHint>,
+    /// The stamping node's placement labels (zone, rack, gpu_model, …).
+    /// Bounded on the way out by [`bounded_labels`] so gossip datagrams
+    /// stay under the UDP budget. `BTreeMap` for a deterministic wire
+    /// order (a `HashMap` would break the HMAC across nodes).
+    ///
+    /// `#[serde(default)]` is deliberately NOT used here: the extension
+    /// rides as trailing bytes (see [`encode_datagram`]), so the whole
+    /// struct is versioned by its trailing position, not per-field. A
+    /// pre-labels peer sends an extension one field shorter, which a
+    /// newer decoder rejects and drops (the endpoints/leader hint still
+    /// come through the message body's own relayed copies). New peers
+    /// always emit the field, so a mixed cluster converges on labels as
+    /// the old nodes roll.
+    pub labels: BTreeMap<String, String>,
     /// HMAC-SHA256 over the carrying message's canonical bytes plus this
     /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
     pub hmac: [u8; 32],
+}
+
+/// Trim a label set to what a gossip datagram can safely carry: at most
+/// [`MAX_DIRECTORY_LABELS`] keys, each key and value at most
+/// [`MAX_DIRECTORY_LABEL_LEN`] bytes. Over-long entries are skipped, not
+/// truncated (a half a value would mis-match a placement constraint).
+pub fn bounded_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut bytes = 0usize;
+    for (k, v) in labels {
+        if out.len() >= MAX_DIRECTORY_LABELS {
+            break;
+        }
+        if k.len() > MAX_DIRECTORY_LABEL_LEN || v.len() > MAX_DIRECTORY_LABEL_LEN {
+            continue;
+        }
+        let cost = k.len() + v.len();
+        if bytes + cost > MAX_DIRECTORY_LABEL_BYTES {
+            break;
+        }
+        bytes += cost;
+        out.insert(k.clone(), v.clone());
+    }
+    out
 }
 
 impl DirectoryExtension {
@@ -411,6 +466,7 @@ mod tests {
                 api_address: SocketAddr::from(([10, 0, 0, 1], 9117)),
                 reporting_address: SocketAddr::from(([10, 0, 0, 1], 9445)),
             }),
+            labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
             hmac: [0u8; 32],
         }
     }
@@ -526,6 +582,88 @@ mod tests {
             "extension too large: {} bytes",
             datagram.len() - plain.len()
         );
+    }
+
+    /// The exact wire shape a pre-labels (post-12b.2-directory) peer
+    /// serialises for the extension: no `labels` field.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct LegacyDirectoryExtension {
+        node_id: NodeId,
+        api_address: SocketAddr,
+        reporting_address: SocketAddr,
+        leader: Option<LeaderHint>,
+        hmac: [u8; 32],
+    }
+
+    #[test]
+    fn extension_carries_labels_round_trip() {
+        let mut msg = a_message();
+        msg.extension = Some(an_extension());
+        let datagram = encode_datagram(&msg).unwrap();
+        let decoded = decode_datagram(&datagram).unwrap();
+        let labels = &decoded.extension.unwrap().labels;
+        assert_eq!(labels.get("zone").map(String::as_str), Some("us-east"));
+    }
+
+    #[test]
+    fn new_peer_drops_a_pre_labels_extension_but_keeps_the_message() {
+        // A pre-labels peer's datagram is the message body followed by the
+        // shorter extension. bincode is positional, so the trailing bytes
+        // don't decode as the current `DirectoryExtension` — the extension
+        // is dropped, the message body still parses (both-direction
+        // tolerance, exactly as for a pre-directory peer).
+        let msg = a_message();
+        let legacy_ext = LegacyDirectoryExtension {
+            node_id: NodeId::new("old"),
+            api_address: SocketAddr::from(([127, 0, 0, 1], 9117)),
+            reporting_address: SocketAddr::from(([127, 0, 0, 1], 9445)),
+            leader: None,
+            hmac: [0u8; 32],
+        };
+        let mut datagram = bincode::serialize(&msg).unwrap();
+        datagram.extend(bincode::serialize(&legacy_ext).unwrap());
+
+        let decoded = decode_datagram(&datagram).unwrap();
+        assert_eq!(decoded.sender, msg.sender);
+        // The shorter legacy extension hits EOF partway through the labels
+        // map; the modern decoder rejects it rather than mis-reading.
+        assert!(decoded.extension.is_none());
+    }
+
+    #[test]
+    fn bounded_labels_caps_key_count_and_length() {
+        let mut labels = BTreeMap::new();
+        for i in 0..100 {
+            labels.insert(format!("k{i:03}"), "v".to_string());
+        }
+        labels.insert("toolong".to_string(), "x".repeat(200));
+        let bounded = bounded_labels(&labels);
+        assert_eq!(bounded.len(), MAX_DIRECTORY_LABELS);
+        // The over-long value was skipped entirely.
+        assert!(!bounded.contains_key("toolong"));
+        // Truncation is deterministic (lowest keys survive).
+        assert!(bounded.contains_key("k000"));
+    }
+
+    #[test]
+    fn labelled_extension_stays_within_the_udp_budget() {
+        let mut labels = BTreeMap::new();
+        for i in 0..MAX_DIRECTORY_LABELS {
+            labels.insert(format!("key{i:02}"), "value".repeat(4));
+        }
+        let mut ext = an_extension();
+        ext.labels = bounded_labels(&labels);
+        let mut msg = a_message();
+        msg.extension = Some(ext);
+        let plain = bincode::serialize(&msg).unwrap();
+        let datagram = encode_datagram(&msg).unwrap();
+        // A full label set plus endpoints stays well under the 1400-byte MTU.
+        assert!(
+            datagram.len() < 1400,
+            "labelled datagram too large: {} bytes",
+            datagram.len()
+        );
+        assert!(datagram.len() > plain.len());
     }
 
     #[test]

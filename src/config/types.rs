@@ -64,7 +64,14 @@ fn parse_num(num_str: &str, multiplier: u64, original: &str) -> Result<u64, Conf
             value: original.to_string(),
             reason: format!("{num_str:?} is not a valid number"),
         })?;
-    Ok(n * multiplier)
+    // A huge memory string like "99999999999999999999Gi" must be rejected
+    // as invalid, not silently wrapped by an overflowing `n * multiplier`
+    // into some small nonsense value (DEP9).
+    n.checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::InvalidResourceValue {
+            value: original.to_string(),
+            reason: "value overflows 64-bit byte count".to_string(),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +356,16 @@ mod tests {
     #[test]
     fn parse_resource_value_invalid_suffix_rejected() {
         assert!(parse_resource_value("100X").is_err());
+    }
+
+    #[test]
+    fn parse_resource_value_overflow_rejected() {
+        // A number that overflows u64 once multiplied by the suffix must be
+        // a validation error, not a wrapped small value (DEP9).
+        let err = parse_resource_value("99999999999999999999Gi");
+        assert!(matches!(err, Err(ConfigError::InvalidResourceValue { .. })));
+        // Also the bare-parse overflow (number itself too large for u64).
+        assert!(parse_resource_value("99999999999999999999999").is_err());
     }
 
     // -- ResourceRange --------------------------------------------------------

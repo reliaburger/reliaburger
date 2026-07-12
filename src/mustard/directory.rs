@@ -8,7 +8,7 @@
 //! lets a cluster grow past the Raft council: Raft metrics only tell voters
 //! who leads; the gossip directory tells everyone.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 
 use crate::meat::NodeId;
@@ -30,6 +30,10 @@ pub struct NodeEndpoints {
 pub struct NodeDirectory {
     /// Advertised endpoints per node.
     pub endpoints: HashMap<NodeId, NodeEndpoints>,
+    /// Placement labels per node, learned from gossip. This is what makes
+    /// label filtering and zone-aware council selection live for remote
+    /// members — a `MembershipUpdate` never carried them (CP7).
+    pub labels: HashMap<NodeId, BTreeMap<String, String>>,
     /// Best known leader; terms only grow, so highest term wins.
     pub leader: Option<LeaderHint>,
 }
@@ -46,6 +50,17 @@ impl NodeDirectory {
             Some(existing) if *existing == endpoints => false,
             _ => {
                 self.endpoints.insert(extension.node_id.clone(), endpoints);
+                true
+            }
+        };
+        // Labels change rarely, but a re-labelled node must propagate. We
+        // compare against the stored set so identical extensions don't
+        // churn the watch.
+        changed |= match self.labels.get(&extension.node_id) {
+            Some(existing) if *existing == extension.labels => false,
+            _ => {
+                self.labels
+                    .insert(extension.node_id.clone(), extension.labels.clone());
                 true
             }
         };
@@ -78,6 +93,7 @@ impl NodeDirectory {
         let before = self.endpoints.len();
         for node_id in reaped {
             self.endpoints.remove(node_id);
+            self.labels.remove(node_id);
         }
         self.endpoints.len() != before
     }
@@ -101,6 +117,21 @@ mod tests {
             api_address: addr(api),
             reporting_address: addr(api + 1),
             leader,
+            labels: BTreeMap::new(),
+            hmac: [0u8; 32],
+        }
+    }
+
+    fn extension_with_labels(node: &str, api: u16, labels: &[(&str, &str)]) -> DirectoryExtension {
+        DirectoryExtension {
+            node_id: NodeId::new(node),
+            api_address: addr(api),
+            reporting_address: addr(api + 1),
+            leader: None,
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             hmac: [0u8; 32],
         }
     }
@@ -168,5 +199,27 @@ mod tests {
         // The hint survives until a higher-term one arrives.
         assert!(dir.leader.is_some());
         assert!(!dir.prune(&[NodeId::new("gone")]));
+    }
+
+    #[test]
+    fn observe_records_labels_and_reports_change() {
+        let mut dir = NodeDirectory::default();
+        assert!(dir.observe(&extension_with_labels("n1", 9117, &[("zone", "us-east")])));
+        assert_eq!(
+            dir.labels.get(&NodeId::new("n1")).unwrap().get("zone"),
+            Some(&"us-east".to_string())
+        );
+        // Same labels again: no change.
+        assert!(!dir.observe(&extension_with_labels("n1", 9117, &[("zone", "us-east")])));
+        // Re-labelled node: change.
+        assert!(dir.observe(&extension_with_labels("n1", 9117, &[("zone", "us-west")])));
+    }
+
+    #[test]
+    fn prune_drops_reaped_node_labels() {
+        let mut dir = NodeDirectory::default();
+        dir.observe(&extension_with_labels("n1", 9117, &[("zone", "us-east")]));
+        dir.prune(&[NodeId::new("n1")]);
+        assert!(!dir.labels.contains_key(&NodeId::new("n1")));
     }
 }

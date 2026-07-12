@@ -478,6 +478,7 @@ mod tests {
             api_address: addr(9117),
             reporting_address: addr(9445),
             leader: None,
+            labels: std::collections::BTreeMap::new(),
             hmac: [0u8; 32],
         }
     }

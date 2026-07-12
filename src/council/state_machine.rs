@@ -181,6 +181,19 @@ impl StateMachineInner {
     fn apply_request(&mut self, request: &RaftRequest) -> Option<CouncilResponse> {
         match request {
             RaftRequest::AppSpec { app_id, spec } => {
+                // A redeploy that changes the replica baseline invalidates any
+                // autoscale override: the operator has re-declared the desired
+                // count, so a stale override from a previous baseline must not
+                // survive and quietly resize the app (DEP8).
+                let baseline_changed = self
+                    .state
+                    .apps
+                    .get(app_id)
+                    .is_some_and(|old| old.replicas != spec.replicas);
+                if baseline_changed {
+                    let key = app_id.to_string();
+                    self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+                }
                 self.state.apps.insert(app_id.clone(), *spec.clone());
                 // Applying a spec is the moment its `ENC[AGE:...]` values
                 // were (re-)encrypted against the active key: record which
@@ -191,6 +204,11 @@ impl StateMachineInner {
             RaftRequest::AppDelete { app_id } => {
                 self.state.apps.remove(app_id);
                 self.state.scheduling.remove(app_id);
+                // A deleted app leaves no baseline for an override to sit
+                // above; drop it so a re-created app of the same name starts
+                // from its own spec, not a ghost override (DEP8).
+                let key = app_id.to_string();
+                self.state.autoscale_overrides.retain(|(k, _)| k != &key);
                 let prefix = format!("{app_id}/");
                 self.state
                     .security_state
@@ -1158,6 +1176,155 @@ mod tests {
 
         let state = sm.desired_state().await;
         assert!(state.apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn app_delete_clears_a_stale_autoscale_override() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let spec = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(2),
+            ..default_spec()
+        };
+        sm.apply(vec![
+            normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec),
+                },
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AutoscaleOverride {
+                    app_id: app_id.clone(),
+                    replicas: 5,
+                    reason: "load".to_string(),
+                },
+            ),
+            normal_entry(
+                1,
+                3,
+                RaftRequest::AppDelete {
+                    app_id: app_id.clone(),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let state = sm.desired_state().await;
+        assert!(
+            state.autoscale_overrides.is_empty(),
+            "deleting an app must clear its override"
+        );
+    }
+
+    #[tokio::test]
+    async fn baseline_change_clears_a_stale_autoscale_override() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let spec2 = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(2),
+            ..default_spec()
+        };
+        let spec4 = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(4),
+            ..default_spec()
+        };
+        sm.apply(vec![
+            normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec2),
+                },
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AutoscaleOverride {
+                    app_id: app_id.clone(),
+                    replicas: 5,
+                    reason: "load".to_string(),
+                },
+            ),
+            // Operator redeploys with a new baseline (2 → 4): the old
+            // override must not survive to resize the app.
+            normal_entry(
+                1,
+                3,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec4),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let state = sm.desired_state().await;
+        assert!(
+            state.autoscale_overrides.is_empty(),
+            "a changed replica baseline must clear the stale override"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_baseline_redeploy_keeps_the_override() {
+        // Redeploying with the SAME replica baseline (e.g. an image bump)
+        // must not disturb a live autoscale override.
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "prod");
+        let spec = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(2),
+            image: Some("web:v1".to_string()),
+            ..default_spec()
+        };
+        let spec_new_image = AppSpec {
+            replicas: crate::config::types::Replicas::Fixed(2),
+            image: Some("web:v2".to_string()),
+            ..default_spec()
+        };
+        sm.apply(vec![
+            normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec),
+                },
+            ),
+            normal_entry(
+                1,
+                2,
+                RaftRequest::AutoscaleOverride {
+                    app_id: app_id.clone(),
+                    replicas: 5,
+                    reason: "load".to_string(),
+                },
+            ),
+            normal_entry(
+                1,
+                3,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(spec_new_image),
+                },
+            ),
+        ])
+        .await
+        .unwrap();
+
+        let state = sm.desired_state().await;
+        assert_eq!(
+            state.autoscale_overrides,
+            vec![("prod/web".to_string(), 5)],
+            "an image-only redeploy must keep the override"
+        );
     }
 
     #[tokio::test]

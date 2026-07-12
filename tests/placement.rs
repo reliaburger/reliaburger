@@ -72,6 +72,7 @@ async fn start_node(
             mayo: Some(mayo),
             rollup_interval: Duration::from_millis(500),
             identity: None,
+            labels: std::collections::BTreeMap::new(),
         },
         shutdown.clone(),
     )
