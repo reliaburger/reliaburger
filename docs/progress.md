@@ -635,13 +635,48 @@ whole theme lands.
   resources plus build scope; reject or remove every parsed field that cannot affect the
   binary. Acceptance: one configuration containing every resource kind converges identically
   through manual apply and GitOps (DEP7/D12).
-- [ ] **Durable batch and build execution** — use one authoritative namespace; persist
+- [x] **Durable batch and build execution** — use one authoritative namespace; persist
   monotonic IDs, trackers and terminal state; include unschedulable jobs; bound and retry
   dispatch/callbacks; make duplicate reports idempotent and run GC. Transfer build context
   to the chosen builder, derive registry endpoints from node config, isolate/clean tempdirs,
   bound CLI polling, retry another builder and make required signing part of terminal
   success. Test leader restart, lost callback and delegation from a non-builder entry node
   (D18, JOB3-JOB7, old batch-order Low).
+  - [x] One authoritative job namespace (JOB3): resolved once at submit (conflicting
+    submission/spec values are a 400), written into both the record and the spec so
+    dispatch, deploy and the watcher agree; non-default-namespace batch completes e2e.
+  - [x] Raft-durable trackers and IDs (JOB4): `batch_state`/`build_state` in `DesiredState`
+    (serde defaults; pre-theme snapshot fixture-tested through the envelope loader),
+    append-only `BatchRegister`/`BatchJobUpdate`/`BuildRegister`/`BuildUpdate` variants,
+    monotonic Raft-allocated ids that survive restart, deterministic register-time GC
+    (retention window + cap-at-50, keyed on the request's clock), `/v1/build/track`
+    leader-forwarding for follower builders.
+  - [x] Bounded, retried dispatch and callbacks; validated idempotent reports (JOB3):
+    dispatch retries then fails jobs honestly, callbacks retry with backoff, reports are
+    transition-validated (forged status 400, unknown batch/job 404, conflicting terminal
+    409, duplicate 200 no-double-count), unschedulable jobs are first-class terminal
+    records in the batch summary.
+  - [x] Pull backstop + restart resumption (JOB3/JOB4): leader-side per-batch watcher polls
+    assigned nodes; lost-callback batch still terminates; a restarted leader respawns the
+    watcher from the durable record on status reads; a Running build with no live runner is
+    rewritten to an honest durable failure.
+  - [x] Build context transfer + builder retry (D18/JOB5): confirmed the residual (bare
+    `_buildcontext` blobs are uncatalogued and never replicate), closed it by copying the
+    blob to the chosen builder's registry before dispatch (addresses from membership +
+    config only); delegation walks all capable peers before an honest 502.
+  - [x] Signing as part of terminal success (JOB7): builds sign keylessly with a
+    Workload-CA-issued certificate (verified against the root CA before attaching);
+    `AttachSignature` for an unknown digest is Refused, not a no-op; under
+    `require_signatures` a signing failure fails the build with the reason.
+  - [x] Deterministic allocation (old Low): `BTreeMap` profile groups + name-sorted input,
+    pinned by a same-input-same-plan test.
+  - [x] Bounded CLI polling (JOB6 residue): `relish build --timeout` and
+    `relish batch-status --wait --timeout` with Ctrl-C handling; timeout exits non-zero
+    with the last known state.
+  - [x] Registry chunked-upload PATCH/PUT responses now carry the spec-required
+    `Location` header — found by the Lima buildah gate: containers/image 5.29
+    (buildah 1.33) reads it strictly, so every real `buildah push` against Pickle
+    failed (pre-existing on main; the gated e2e build now passes in the VM).
 
 ### 12b.3 — Secure every boundary
 

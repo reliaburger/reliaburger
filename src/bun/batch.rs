@@ -3,53 +3,82 @@
 //! The flow: `POST /v1/batch` (leader-forwarded) carries full job
 //! specs; the leader maps the reporting pipeline's `AggregatedState`
 //! into scheduler capacities, runs the library `schedule_batch`
-//! bin-packer, registers the batch in a leader-side `BatchTracker`,
-//! and dispatches per-node job groups — locally for itself, via
-//! `POST /v1/batch/run` for peers. Running nodes watch their jobs to a
-//! terminal state and report through `POST /v1/batch/{id}/report`;
-//! `GET /v1/batch/{id}` serves the tracker's summary.
+//! bin-packer, registers the batch durably (Raft when a council
+//! exists, the in-memory tracker standalone), and dispatches per-node
+//! job groups — locally for itself, via `POST /v1/batch/run` for
+//! peers. Running nodes watch their jobs to a terminal state and
+//! report through `POST /v1/batch/{id}/report`; `GET /v1/batch/{id}`
+//! serves the summary.
+//!
+//! Since 12b.2 (JOB3/JOB4) the push reports have a pull backstop: the
+//! leader runs a per-batch watcher that polls the assigned nodes, so a
+//! lost callback (or a leader restart — the watcher respawns from the
+//! durable record) can no longer strand a batch. Dispatch and
+//! callbacks retry with bounded backoff, reports are transition-
+//! validated and idempotent, unschedulable jobs appear in the batch
+//! as `Unschedulable` instead of vanishing, and the job namespace is
+//! resolved once at submit and used everywhere.
 //!
 //! Batch deliberately does NOT ride the deploy placements reconciler:
 //! that machinery *converges desired state* — a completed job looks
 //! like drift to it, and moving an assignment would kill a running
 //! job. Run-to-completion work wants dispatch + completion callbacks.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
 use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::config::job::JobSpec;
 use crate::meat::batch::{BatchJob, schedule_batch};
-use crate::meat::batch_tracker::BatchTracker;
+use crate::meat::batch_tracker::{
+    BatchJobRecord, BatchRecord, JobStatus, ReportError, ReportOutcome, epoch_now_secs,
+};
 use crate::meat::types::{NodeCapacity, NodeId, Resources};
 use crate::reporting::aggregator::AggregatedState;
 
-use super::agent::AgentCommand;
+use super::agent::{AgentCommand, InstanceStatus};
 use super::api::{ApiState, NodeMembershipInfo};
 
 /// How long a dispatched job may run before the watcher gives up and
 /// reports it failed.
 const JOB_WATCH_TIMEOUT_SECS: u64 = 3600;
 
+/// Extra slack the leader-side pull watcher grants past the job
+/// timeout before it fails whatever is still pending.
+const WATCH_GRACE_SECS: u64 = 60;
+
+/// How often the leader-side pull watcher polls assigned nodes.
+const PULL_INTERVAL_MS: u64 = 1000;
+
+/// Attempts for dispatching a job group to its node.
+const DISPATCH_ATTEMPTS: u32 = 3;
+
+/// Attempts for delivering a completion callback.
+const CALLBACK_ATTEMPTS: u32 = 4;
+
 /// One job in a batch submission: the full spec travels with the
 /// request, so target nodes need no prior deploy.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchJobSubmission {
     pub name: String,
-    /// Namespace the job deploys into. Plain `[job.*]` configs land in
-    /// `default`; the watcher matches instances on (name, namespace).
-    #[serde(default = "default_namespace")]
-    pub namespace: String,
+    /// Namespace the job deploys into. Optional on the wire; the submit
+    /// handler resolves one authoritative value per job (JOB3) — this
+    /// field must agree with `spec.namespace` when both are set.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub spec: JobSpec,
 }
 
-fn default_namespace() -> String {
-    "default".to_string()
+impl BatchJobSubmission {
+    /// The resolved namespace (always set after submit-side resolution).
+    pub fn namespace(&self) -> &str {
+        self.namespace.as_deref().unwrap_or("default")
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -77,8 +106,39 @@ pub struct BatchRunRequest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BatchReportRequest {
     pub job_name: String,
-    /// `"completed"` or `"failed"`.
+    /// `"completed"`, `"failed"` or `"running"`.
     pub status: String,
+}
+
+// ---------------------------------------------------------------------------
+// Namespace resolution (JOB3)
+// ---------------------------------------------------------------------------
+
+/// Resolve one authoritative namespace per job. The submission field
+/// and `spec.namespace` used to be two independent sources: the agent
+/// deployed into the spec's namespace while the watcher matched the
+/// submission's, so a disagreement left the batch pending for an hour.
+/// Now a conflict is rejected at submit, and the resolved value is
+/// written into *both* places so dispatch, deploy and watching agree.
+pub fn resolve_job_namespaces(
+    mut jobs: Vec<BatchJobSubmission>,
+) -> Result<Vec<BatchJobSubmission>, String> {
+    for job in &mut jobs {
+        let effective = match (&job.namespace, &job.spec.namespace) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!(
+                    "job {:?} names two namespaces: {a:?} in the submission, {b:?} in the spec",
+                    job.name
+                ));
+            }
+            (Some(a), _) => a.clone(),
+            (None, Some(b)) => b.clone(),
+            (None, None) => "default".to_string(),
+        };
+        job.namespace = Some(effective.clone());
+        job.spec.namespace = Some(effective);
+    }
+    Ok(jobs)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,14 +196,197 @@ pub fn local_only_capacity(node_name: &str) -> Vec<NodeCapacity> {
 }
 
 // ---------------------------------------------------------------------------
+// Durable batch state access
+// ---------------------------------------------------------------------------
+
+/// Why a batch report could not be applied, mapped to an HTTP status
+/// by the report handler.
+#[derive(Debug, Clone)]
+pub enum BatchRejection {
+    /// Unknown batch or job → 404.
+    NotFound(String),
+    /// Forged state, illegal or conflicting transition → 409.
+    Conflict(String),
+    /// The durable tracker could not be reached → 503.
+    Unavailable(String),
+}
+
+fn map_report_error(error: ReportError) -> BatchRejection {
+    match error {
+        ReportError::UnknownBatch { .. } | ReportError::UnknownJob { .. } => {
+            BatchRejection::NotFound(error.to_string())
+        }
+        ReportError::IllegalTransition { .. } | ReportError::NotReportable { .. } => {
+            BatchRejection::Conflict(error.to_string())
+        }
+    }
+}
+
+/// Register a batch record durably: through Raft when a council
+/// exists (the id comes from the replicated counter, JOB4), through
+/// the in-memory tracker standalone.
+pub(crate) async fn register_batch(state: &ApiState, record: BatchRecord) -> Result<u64, String> {
+    match &state.council {
+        Some(council) => match council
+            .write(crate::council::types::RaftRequest::BatchRegister { batch: record })
+            .await
+        {
+            Ok(crate::council::types::CouncilResponse::BatchRegistered { batch_id }) => {
+                Ok(batch_id)
+            }
+            Ok(other) => Err(format!("unexpected raft response: {other:?}")),
+            Err(e) => Err(format!("raft register failed: {e}")),
+        },
+        None => Ok(state.batch_tracker.lock().await.register(record).0),
+    }
+}
+
+/// Read a batch record from the durable tracker.
+pub(crate) async fn get_batch(state: &ApiState, batch_id: u64) -> Option<BatchRecord> {
+    match &state.council {
+        Some(council) => council
+            .desired_state()
+            .await
+            .batch_state
+            .get(batch_id)
+            .cloned(),
+        None => state.batch_tracker.lock().await.get(batch_id),
+    }
+}
+
+/// Apply a job report to the durable tracker, validating the
+/// transition. On a node whose council handle is a follower the report
+/// is forwarded to the leader's report endpoint over HTTP.
+pub(crate) async fn report_batch_job(
+    state: &ApiState,
+    batch_id: u64,
+    job_name: &str,
+    status: JobStatus,
+) -> Result<ReportOutcome, BatchRejection> {
+    let Some(council) = &state.council else {
+        return state
+            .batch_tracker
+            .lock()
+            .await
+            .report(batch_id, job_name, status)
+            .map_err(map_report_error);
+    };
+
+    if !council.is_leader().await {
+        return forward_report_to_leader(state, council, batch_id, job_name, status).await;
+    }
+
+    // Pre-validate against the leader's (authoritative) replica so the
+    // caller gets a precise verdict; duplicates never hit the log.
+    let Some(record) = council
+        .desired_state()
+        .await
+        .batch_state
+        .get(batch_id)
+        .cloned()
+    else {
+        return Err(BatchRejection::NotFound(
+            ReportError::UnknownBatch { batch_id }.to_string(),
+        ));
+    };
+    let mut probe = record;
+    match probe.report(job_name, status) {
+        Err(e) => return Err(map_report_error(e)),
+        Ok(ReportOutcome::Duplicate) => return Ok(ReportOutcome::Duplicate),
+        Ok(ReportOutcome::Applied) => {}
+    }
+    match council
+        .write(crate::council::types::RaftRequest::BatchJobUpdate {
+            batch_id,
+            job_name: job_name.to_string(),
+            status,
+        })
+        .await
+    {
+        // A refusal here means we lost a race with another report; the
+        // apply-side validation is the authority.
+        Ok(crate::council::types::CouncilResponse::Refused { reason }) => {
+            Err(BatchRejection::Conflict(reason))
+        }
+        Ok(_) => Ok(ReportOutcome::Applied),
+        Err(e) => Err(BatchRejection::Unavailable(format!(
+            "raft report failed: {e}"
+        ))),
+    }
+}
+
+/// POST the report to the leader's `/v1/batch/{id}/report`.
+async fn forward_report_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    batch_id: u64,
+    job_name: &str,
+    status: JobStatus,
+) -> Result<ReportOutcome, BatchRejection> {
+    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
+        return Err(BatchRejection::Unavailable(
+            "no cluster leader known yet".to_string(),
+        ));
+    };
+    let body = BatchReportRequest {
+        job_name: job_name.to_string(),
+        status: status_to_wire(status).to_string(),
+    };
+    let mut request = state
+        .cluster_http
+        .client()
+        .post(format!("{leader_url}/v1/batch/{batch_id}/report"))
+        .json(&body);
+    if let Some(token) = &state.service_token {
+        request = request.bearer_auth(token);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => Ok(ReportOutcome::Applied),
+        Ok(response) => {
+            let code = response.status();
+            let text = response.text().await.unwrap_or_default();
+            match code.as_u16() {
+                404 => Err(BatchRejection::NotFound(text)),
+                409 => Err(BatchRejection::Conflict(text)),
+                _ => Err(BatchRejection::Unavailable(text)),
+            }
+        }
+        Err(e) => Err(BatchRejection::Unavailable(format!(
+            "leader forward failed: {e}"
+        ))),
+    }
+}
+
+fn status_to_wire(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Running => "running",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
+        JobStatus::Pending => "pending",
+        JobStatus::Unschedulable => "unschedulable",
+    }
+}
+
+fn status_from_wire(status: &str) -> Option<JobStatus> {
+    match status {
+        "running" => Some(JobStatus::Running),
+        "completed" => Some(JobStatus::Completed),
+        "failed" => Some(JobStatus::Failed),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Running and watching
 // ---------------------------------------------------------------------------
 
 /// Where completion reports go.
 pub enum Reporter {
-    /// The submitting node itself — mark the tracker directly.
-    Local(Arc<Mutex<BatchTracker>>),
-    /// A remote submitter — POST to its report endpoint.
+    /// The submitting node itself — apply through the durable tracker.
+    Leader(Box<ApiState>),
+    /// A remote submitter — POST to its report endpoint, with bounded
+    /// retries (JOB3). The leader-side pull watcher is the backstop if
+    /// every attempt is lost.
     Callback {
         base_url: String,
         client: reqwest::Client,
@@ -153,13 +396,15 @@ pub enum Reporter {
 
 impl Reporter {
     async fn report(&self, batch_id: u64, job_name: &str, completed: bool) {
+        let status = if completed {
+            JobStatus::Completed
+        } else {
+            JobStatus::Failed
+        };
         match self {
-            Reporter::Local(tracker) => {
-                let mut tracker = tracker.lock().await;
-                if completed {
-                    tracker.mark_completed(batch_id, job_name);
-                } else {
-                    tracker.mark_failed(batch_id, job_name);
+            Reporter::Leader(state) => {
+                if let Err(e) = report_batch_job(state, batch_id, job_name, status).await {
+                    eprintln!("bun: batch {batch_id}: local report for {job_name} rejected: {e:?}");
                 }
             }
             Reporter::Callback {
@@ -170,18 +415,64 @@ impl Reporter {
                 let url = format!("{base_url}/v1/batch/{batch_id}/report");
                 let body = BatchReportRequest {
                     job_name: job_name.to_string(),
-                    status: if completed { "completed" } else { "failed" }.to_string(),
+                    status: status_to_wire(status).to_string(),
                 };
-                let mut request = client.post(&url).json(&body);
-                if let Some(token) = service_token {
-                    request = request.bearer_auth(token);
+                for attempt in 0..CALLBACK_ATTEMPTS {
+                    let mut request = client.post(&url).json(&body);
+                    if let Some(token) = service_token {
+                        request = request.bearer_auth(token);
+                    }
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => return,
+                        // 4xx verdicts are final (duplicate/conflict);
+                        // retrying cannot change them.
+                        Ok(response) if response.status().is_client_error() => {
+                            eprintln!("bun: batch report to {url} rejected: {}", response.status());
+                            return;
+                        }
+                        Ok(response) => {
+                            eprintln!("bun: batch report to {url}: {}", response.status());
+                        }
+                        Err(e) => eprintln!("bun: batch report to {url} failed: {e}"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        500 * u64::from(attempt + 1),
+                    ))
+                    .await;
                 }
-                if let Err(e) = request.send().await {
-                    eprintln!("bun: batch report to {url} failed: {e}");
-                }
+                eprintln!(
+                    "bun: batch {batch_id}: callback for {job_name} gave up after \
+                     {CALLBACK_ATTEMPTS} attempts; the leader's pull watcher will catch it"
+                );
             }
         }
     }
+}
+
+/// Map instance statuses to a job outcome: `Some(true)` completed,
+/// `Some(false)` failed, `None` still running/unknown.
+///
+/// `stopped` alone is ambiguous: a failing job passes through it
+/// between retries (any exit maps to Stopped; the code is tracked
+/// separately). Success is stopped with exit 0; a non-zero stop is
+/// backoff, not terminal — the agent marks the instance `failed` once
+/// retries exhaust. Runtimes without exit codes (runc, review H13)
+/// report `None`: treat their stops as success rather than hanging.
+fn job_outcome(statuses: &[InstanceStatus], name: &str, namespace: &str) -> Option<bool> {
+    for status in statuses
+        .iter()
+        .filter(|s| s.app_name == name && s.namespace == namespace)
+    {
+        let outcome = match (status.state.as_str(), status.exit_code) {
+            ("failed", _) => Some(false),
+            ("stopped", Some(0) | None) => Some(true),
+            _ => None,
+        };
+        if outcome.is_some() {
+            return outcome;
+        }
+    }
+    None
 }
 
 /// Deploy this node's share of a batch and watch each job to a
@@ -259,28 +550,7 @@ pub async fn run_jobs_and_watch(
 
         let mut still_pending = Vec::new();
         for job in pending {
-            // `stopped` alone is ambiguous: a failing job passes
-            // through it between retries (any exit maps to Stopped;
-            // the code is tracked separately). Success is stopped with
-            // exit 0; a non-zero stop is backoff, not terminal — the
-            // agent marks the instance `failed` once retries exhaust.
-            // Runtimes without exit codes (runc, review H13) report
-            // None: treat their stops as success rather than hanging.
-            let mut outcome = None;
-            for status in statuses
-                .iter()
-                .filter(|s| s.app_name == job.name && s.namespace == job.namespace)
-            {
-                outcome = match (status.state.as_str(), status.exit_code) {
-                    ("failed", _) => Some(false),
-                    ("stopped", Some(0) | None) => Some(true),
-                    _ => None,
-                };
-                if outcome.is_some() {
-                    break;
-                }
-            }
-            match outcome {
+            match job_outcome(&statuses, &job.name, job.namespace()) {
                 Some(completed) => reporter.report(batch_id, &job.name, completed).await,
                 None => still_pending.push(job),
             }
@@ -292,6 +562,126 @@ pub async fn run_jobs_and_watch(
     for job in pending {
         reporter.report(batch_id, &job.name, false).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The leader-side pull watcher (JOB3/JOB4)
+// ---------------------------------------------------------------------------
+
+/// Spawn a completion watcher for a batch, unless one is already live
+/// in this process. Submit spawns one; a status read on a batch with
+/// no watcher (a restarted leader) spawns one too — that is how a new
+/// leader resumes in-flight batches from the durable record.
+pub(crate) fn spawn_batch_watcher(state: &ApiState, batch_id: u64) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        {
+            let mut watchers = state.batch_watchers.lock().await;
+            if !watchers.insert(batch_id) {
+                return; // someone is already watching
+            }
+        }
+        watch_batch(&state, batch_id).await;
+        state.batch_watchers.lock().await.remove(&batch_id);
+    });
+}
+
+/// Poll the durable record and the assigned nodes until the batch is
+/// terminal. Completion callbacks are the fast path; this pull loop is
+/// the liveness backstop — a lost callback, a dead runner or a leader
+/// restart all still converge to a terminal batch, bounded by the job
+/// timeout plus grace.
+async fn watch_batch(state: &ApiState, batch_id: u64) {
+    loop {
+        let Some(record) = get_batch(state, batch_id).await else {
+            return; // pruned or never registered here
+        };
+        if record.is_terminal() {
+            return;
+        }
+
+        let now = epoch_now_secs();
+        let deadline = record.submitted_at_epoch_secs + JOB_WATCH_TIMEOUT_SECS + WATCH_GRACE_SECS;
+        if now > deadline {
+            for job in record.jobs.iter().filter(|j| !j.status.is_terminal()) {
+                let _ = report_batch_job(state, batch_id, &job.name, JobStatus::Failed).await;
+            }
+            return;
+        }
+
+        // Fetch this node's statuses once per tick if any job is local.
+        let self_name = state
+            .node_name
+            .clone()
+            .unwrap_or_else(|| "local".to_string());
+        let needs_local = record
+            .jobs
+            .iter()
+            .any(|j| !j.status.is_terminal() && j.node.as_ref().is_some_and(|n| n.0 == self_name));
+        let local_statuses = if needs_local {
+            fetch_local_statuses(state).await
+        } else {
+            None
+        };
+
+        for job in record.jobs.iter().filter(|j| !j.status.is_terminal()) {
+            let Some(node) = &job.node else { continue };
+            let outcome = if node.0 == self_name {
+                local_statuses
+                    .as_deref()
+                    .and_then(|statuses| job_outcome(statuses, &job.name, &job.namespace))
+            } else {
+                fetch_remote_outcome(state, node, &job.name, &job.namespace).await
+            };
+            if let Some(completed) = outcome {
+                let status = if completed {
+                    JobStatus::Completed
+                } else {
+                    JobStatus::Failed
+                };
+                let _ = report_batch_job(state, batch_id, &job.name, status).await;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(PULL_INTERVAL_MS)).await;
+    }
+}
+
+async fn fetch_local_statuses(state: &ApiState) -> Option<Vec<InstanceStatus>> {
+    let (status_tx, status_rx) = oneshot::channel();
+    state
+        .cmd_tx
+        .send(AgentCommand::Status {
+            response: status_tx,
+        })
+        .await
+        .ok()?;
+    status_rx.await.ok()
+}
+
+/// Poll a remote node's `/v1/status/{app}/{namespace}` for a job's
+/// outcome. Unreachable nodes and missing instances read as "not yet"
+/// — the watch deadline bounds how long that can last.
+async fn fetch_remote_outcome(
+    state: &ApiState,
+    node: &NodeId,
+    job_name: &str,
+    namespace: &str,
+) -> Option<bool> {
+    let url = node_api_url(state, node).await?;
+    let mut request = state
+        .cluster_http
+        .client()
+        .get(format!("{url}/v1/status/{job_name}/{namespace}"));
+    if let Some(token) = &state.service_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let statuses: Vec<InstanceStatus> = response.json().await.ok()?;
+    job_outcome(&statuses, job_name, namespace)
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +725,21 @@ pub async fn batch_submit_handler(
         )
             .into_response();
     }
+    // One namespace per job, resolved here and used everywhere (JOB3).
+    let mut jobs = match resolve_job_namespaces(request.jobs) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    // Stable input order: together with the scheduler's ordered
+    // profile groups this pins the assignment plan (the old
+    // allocation-order finding).
+    jobs.sort_by(|a, b| a.name.cmp(&b.name));
 
     let self_name = state
         .node_name
@@ -355,8 +760,7 @@ pub async fn batch_submit_handler(
         _ => local_only_capacity(&self_name),
     };
 
-    let batch_jobs: Vec<BatchJob> = request
-        .jobs
+    let batch_jobs: Vec<BatchJob> = jobs
         .iter()
         .map(|job| BatchJob {
             name: job.name.clone(),
@@ -369,18 +773,49 @@ pub async fn batch_submit_handler(
         .collect();
 
     let allocation = schedule_batch(&batch_jobs, &mut capacities);
-    let batch_id = state
-        .batch_tracker
-        .lock()
-        .await
-        .register(&allocation.assignments)
-        .0;
 
-    // Group assignments by node and dispatch.
-    let mut by_node: std::collections::HashMap<NodeId, Vec<BatchJobSubmission>> =
-        std::collections::HashMap::new();
+    // The durable record includes unschedulable jobs (JOB3): they are
+    // part of the batch's story, not an omission.
+    let mut job_records = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        let node = allocation
+            .assignments
+            .iter()
+            .find(|(name, _)| name == &job.name)
+            .map(|(_, node)| node.clone());
+        job_records.push(BatchJobRecord {
+            name: job.name.clone(),
+            namespace: job.namespace().to_string(),
+            status: if node.is_some() {
+                JobStatus::Pending
+            } else {
+                JobStatus::Unschedulable
+            },
+            node,
+        });
+    }
+    let record = BatchRecord {
+        jobs: job_records,
+        submitted_at_epoch_secs: epoch_now_secs(),
+    };
+    let batch_id = match register_batch(&state, record).await {
+        Ok(batch_id) => batch_id,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("cluster batch tracker unavailable: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Group assignments by node and dispatch. A BTreeMap so dispatch
+    // order is deterministic too.
+    let mut by_node: BTreeMap<NodeId, Vec<BatchJobSubmission>> = BTreeMap::new();
     for (job_name, node_id) in &allocation.assignments {
-        if let Some(submission) = request.jobs.iter().find(|j| &j.name == job_name) {
+        if let Some(submission) = jobs.iter().find(|j| &j.name == job_name) {
             by_node
                 .entry(node_id.clone())
                 .or_default()
@@ -389,40 +824,75 @@ pub async fn batch_submit_handler(
     }
 
     let callback_base_url = self_callback_url(&state, &self_name).await;
-    for (node_id, jobs) in by_node {
+    for (node_id, node_jobs) in by_node {
         if node_id.0 == self_name {
             // Our own share: no HTTP, report straight into the tracker.
             tokio::spawn(run_jobs_and_watch(
                 state.cmd_tx.clone(),
                 batch_id,
-                jobs,
-                Reporter::Local(Arc::clone(&state.batch_tracker)),
+                node_jobs,
+                Reporter::Leader(Box::new(state.clone())),
             ));
             continue;
         }
 
-        // Remote share: POST the group to the target node.
+        // Remote share: POST the group to the target node, with
+        // bounded retries; exhausted retries fail the jobs honestly
+        // instead of leaving them pending forever (JOB3).
         let Some(url) = node_api_url(&state, &node_id).await else {
-            eprintln!("bun: batch {batch_id}: no address for {node_id:?}; jobs will time out");
+            eprintln!("bun: batch {batch_id}: no address for {node_id:?}; failing its jobs");
+            for job in &node_jobs {
+                let _ = report_batch_job(&state, batch_id, &job.name, JobStatus::Failed).await;
+            }
             continue;
         };
         let run = BatchRunRequest {
             batch_id,
             callback_base_url: callback_base_url.clone(),
-            jobs,
+            jobs: node_jobs,
         };
-        let client = state.cluster_http.client().clone();
-        let token = state.service_token.clone();
+        let dispatch_state = state.clone();
         tokio::spawn(async move {
-            let mut request = client.post(format!("{url}/v1/batch/run")).json(&run);
-            if let Some(token) = &token {
-                request = request.bearer_auth(token);
+            let client = dispatch_state.cluster_http.client().clone();
+            let token = dispatch_state.service_token.clone();
+            for attempt in 0..DISPATCH_ATTEMPTS {
+                let mut request = client.post(format!("{url}/v1/batch/run")).json(&run);
+                if let Some(token) = &token {
+                    request = request.bearer_auth(token);
+                }
+                match request.send().await {
+                    Ok(response) if response.status().is_success() => return,
+                    Ok(response) => eprintln!(
+                        "bun: batch dispatch to {url}: {} (attempt {})",
+                        response.status(),
+                        attempt + 1
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "bun: batch dispatch to {url} failed (attempt {}): {e}",
+                            attempt + 1
+                        )
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    500 * u64::from(attempt + 1),
+                ))
+                .await;
             }
-            if let Err(e) = request.send().await {
-                eprintln!("bun: batch dispatch to {url} failed: {e}");
+            eprintln!(
+                "bun: batch {batch_id}: dispatch to {url} exhausted \
+                 {DISPATCH_ATTEMPTS} attempts; failing its jobs"
+            );
+            for job in &run.jobs {
+                let _ =
+                    report_batch_job(&dispatch_state, batch_id, &job.name, JobStatus::Failed).await;
             }
         });
     }
+
+    // The pull backstop: polls assigned nodes so a lost callback can
+    // never strand the batch.
+    spawn_batch_watcher(&state, batch_id);
 
     (
         StatusCode::ACCEPTED,
@@ -468,12 +938,24 @@ pub async fn batch_run_handler(
             }
         }
         // No callback: the submitter is this process (or doesn't care).
-        None => Reporter::Local(Arc::clone(&state.batch_tracker)),
+        None => Reporter::Leader(Box::new(state.clone())),
+    };
+    // Dispatched job specs resolve their namespaces the same way the
+    // submit path does, so the deploy and the watch agree (JOB3).
+    let jobs = match resolve_job_namespaces(run.jobs) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
     };
     tokio::spawn(run_jobs_and_watch(
         state.cmd_tx.clone(),
         run.batch_id,
-        run.jobs,
+        jobs,
         reporter,
     ));
     (
@@ -483,7 +965,11 @@ pub async fn batch_run_handler(
         .into_response()
 }
 
-/// `POST /v1/batch/{id}/report` — a completion callback.
+/// `POST /v1/batch/{id}/report` — a completion callback. Validated
+/// (JOB3): unknown batches/jobs are 404, forged states and illegal
+/// transitions are 409, duplicate terminal reports are an idempotent
+/// 200. Forwarded to the leader when this node is a follower, so
+/// reports survive a leadership change mid-batch.
 pub async fn batch_report_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -495,16 +981,42 @@ pub async fn batch_report_handler(
     if let Err(resp) = crate::sesame::auth::require_system(auth.as_deref()) {
         return resp;
     }
-    let mut tracker = state.batch_tracker.lock().await;
-    if report.status == "completed" {
-        tracker.mark_completed(batch_id, &report.job_name);
-    } else {
-        tracker.mark_failed(batch_id, &report.job_name);
+    let Some(status) = status_from_wire(&report.status) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown report status {:?}", report.status)
+            })),
+        )
+            .into_response();
+    };
+    match report_batch_job(&state, batch_id, &report.job_name, status).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "recorded": true,
+            "duplicate": outcome == ReportOutcome::Duplicate,
+        }))
+        .into_response(),
+        Err(BatchRejection::NotFound(reason)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        Err(BatchRejection::Conflict(reason)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        Err(BatchRejection::Unavailable(reason)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
     }
-    Json(serde_json::json!({ "recorded": true })).into_response()
 }
 
 /// `GET /v1/batch/{id}` — the tracker's summary (leader-forwarded).
+/// Reading a non-terminal batch with no live watcher spawns one: this
+/// is how a restarted leader resumes watching in-flight batches (JOB4).
 pub async fn batch_status_handler(
     State(state): State<ApiState>,
     AxumPath(batch_id): AxumPath<u64>,
@@ -515,8 +1027,16 @@ pub async fn batch_status_handler(
         return forward_get_to_leader(&state, council, &format!("/v1/batch/{batch_id}")).await;
     }
 
-    match state.batch_tracker.lock().await.summary(batch_id) {
-        Some(summary) => Json(serde_json::json!(summary)).into_response(),
+    match get_batch(&state, batch_id).await {
+        Some(record) => {
+            if !record.is_terminal() {
+                spawn_batch_watcher(&state, batch_id);
+            }
+            Json(serde_json::json!(
+                record.summary(batch_id, epoch_now_secs())
+            ))
+            .into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("batch {batch_id} not found") })),
@@ -640,7 +1160,7 @@ mod tests {
         let request = BatchSubmitRequest {
             jobs: vec![BatchJobSubmission {
                 name: "render".to_string(),
-                namespace: "default".to_string(),
+                namespace: Some("default".to_string()),
                 spec: toml::from_str(r#"command = ["true"]"#).unwrap(),
             }],
         };
@@ -654,7 +1174,69 @@ mod tests {
     fn submission_namespace_defaults() {
         let json = r#"{ "name": "j", "spec": { "command": ["true"] } }"#;
         let submission: BatchJobSubmission = serde_json::from_str(json).unwrap();
-        assert_eq!(submission.namespace, "default");
+        assert_eq!(submission.namespace(), "default");
+    }
+
+    fn submission(name: &str, namespace: Option<&str>, spec_toml: &str) -> BatchJobSubmission {
+        BatchJobSubmission {
+            name: name.to_string(),
+            namespace: namespace.map(str::to_string),
+            spec: toml::from_str(spec_toml).unwrap(),
+        }
+    }
+
+    #[test]
+    fn namespace_resolution_prefers_the_single_source() {
+        // Only the spec names one → it wins everywhere.
+        let jobs = resolve_job_namespaces(vec![submission(
+            "a",
+            None,
+            r#"command = ["true"]
+               namespace = "prod""#,
+        )])
+        .unwrap();
+        assert_eq!(jobs[0].namespace(), "prod");
+        assert_eq!(jobs[0].spec.namespace.as_deref(), Some("prod"));
+
+        // Only the submission names one → written into the spec too,
+        // so the deploy and the watcher agree (JOB3).
+        let jobs = resolve_job_namespaces(vec![submission(
+            "a",
+            Some("batchns"),
+            r#"command = ["true"]"#,
+        )])
+        .unwrap();
+        assert_eq!(jobs[0].namespace(), "batchns");
+        assert_eq!(jobs[0].spec.namespace.as_deref(), Some("batchns"));
+
+        // Neither → default.
+        let jobs =
+            resolve_job_namespaces(vec![submission("a", None, r#"command = ["true"]"#)]).unwrap();
+        assert_eq!(jobs[0].namespace(), "default");
+    }
+
+    #[test]
+    fn conflicting_namespaces_are_rejected() {
+        let err = resolve_job_namespaces(vec![submission(
+            "a",
+            Some("one"),
+            r#"command = ["true"]
+               namespace = "two""#,
+        )])
+        .unwrap_err();
+        assert!(err.contains("two namespaces"), "{err}");
+    }
+
+    #[test]
+    fn agreeing_namespaces_are_accepted() {
+        let jobs = resolve_job_namespaces(vec![submission(
+            "a",
+            Some("prod"),
+            r#"command = ["true"]
+               namespace = "prod""#,
+        )])
+        .unwrap();
+        assert_eq!(jobs[0].namespace(), "prod");
     }
 
     fn report_with_usage(
@@ -726,5 +1308,42 @@ mod tests {
         let allocation = schedule_batch(&jobs, &mut capacities);
         assert_eq!(allocation.assignments.len(), 100);
         assert!(allocation.unschedulable.is_empty());
+    }
+
+    #[test]
+    fn job_outcome_maps_terminal_states() {
+        let status = |state: &str, exit: Option<i32>| InstanceStatus {
+            id: "i1".to_string(),
+            app_name: "j".to_string(),
+            namespace: "default".to_string(),
+            state: state.to_string(),
+            restart_count: 0,
+            host_port: None,
+            exit_code: exit,
+            pid: None,
+        };
+        assert_eq!(
+            job_outcome(&[status("stopped", Some(0))], "j", "default"),
+            Some(true)
+        );
+        assert_eq!(
+            job_outcome(&[status("stopped", None)], "j", "default"),
+            Some(true)
+        );
+        assert_eq!(
+            job_outcome(&[status("failed", Some(1))], "j", "default"),
+            Some(false)
+        );
+        // Non-zero stop is retry backoff, not terminal.
+        assert_eq!(
+            job_outcome(&[status("stopped", Some(1))], "j", "default"),
+            None
+        );
+        // Wrong namespace never matches (JOB3).
+        assert_eq!(
+            job_outcome(&[status("stopped", Some(0))], "j", "prod"),
+            None
+        );
+        assert_eq!(job_outcome(&[], "j", "default"), None);
     }
 }

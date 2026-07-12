@@ -8,7 +8,7 @@
 //! available capacity, and greedily bin-packs in O(nodes × profiles).
 //! This achieves the 100M jobs/day target (~1,157/s sustained).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::types::{NodeCapacity, NodeId, Resources};
 
@@ -56,8 +56,12 @@ pub fn schedule_batch(jobs: &[BatchJob], nodes: &mut [NodeCapacity]) -> BatchAll
         };
     }
 
-    // Group jobs by resource profile
-    let mut profile_groups: HashMap<ResourceProfile, Vec<&BatchJob>> = HashMap::new();
+    // Group jobs by resource profile. A BTreeMap, not a HashMap: the
+    // groups are processed in order, and HashMap iteration order is
+    // random per process, which made the same submission produce a
+    // different assignment plan on every run (the old allocation-order
+    // finding). Ordered keys pin the plan.
+    let mut profile_groups: BTreeMap<ResourceProfile, Vec<&BatchJob>> = BTreeMap::new();
     for job in jobs {
         let profile = ResourceProfile::from(&job.resources);
         profile_groups.entry(profile).or_default().push(job);
@@ -145,7 +149,7 @@ fn jobs_that_fit(available: &Resources, required: &Resources) -> usize {
 ///
 /// Jobs with the same CPU, memory, and GPU requirements are grouped
 /// together so we can bin-pack them in bulk.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct ResourceProfile {
     cpu_millicores: u64,
     memory_bytes: u64,
@@ -315,5 +319,38 @@ mod tests {
         let required = Resources::new(100, 500_000_000, 0);
         // CPU: 10000/100 = 100, Mem: 1000000000/500000000 = 2 → limited by memory
         assert_eq!(jobs_that_fit(&available, &required), 2);
+    }
+
+    /// The old allocation-order finding: with several resource
+    /// profiles, HashMap group iteration made the plan differ between
+    /// runs. Same input must now always produce the same plan.
+    #[test]
+    fn same_input_batch_produces_the_same_assignment_plan() {
+        let jobs: Vec<BatchJob> = (0..30)
+            .map(|i| BatchJob {
+                name: format!("job-{i}"),
+                // Ten distinct resource profiles across the jobs.
+                resources: Resources::new(100 + (i % 10) * 50, 64 * 1024 * 1024, 0),
+            })
+            .collect();
+        let make_nodes = || {
+            vec![
+                make_node("n1", 2000, 4_000_000_000),
+                make_node("n2", 3000, 4_000_000_000),
+                make_node("n3", 1000, 4_000_000_000),
+            ]
+        };
+
+        let mut reference_nodes = make_nodes();
+        let reference = schedule_batch(&jobs, &mut reference_nodes);
+        for _ in 0..20 {
+            let mut nodes = make_nodes();
+            let plan = schedule_batch(&jobs, &mut nodes);
+            assert_eq!(
+                plan.assignments, reference.assignments,
+                "assignment plan must be deterministic"
+            );
+            assert_eq!(plan.unschedulable, reference.unschedulable);
+        }
     }
 }

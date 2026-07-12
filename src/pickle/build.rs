@@ -257,6 +257,16 @@ pub fn context_upload_url(pickle_port: u16, digest: &str) -> String {
     format!("http://localhost:{pickle_port}/v2/_buildcontext/blobs/uploads/?digest={digest}")
 }
 
+/// Build the URL to upload a context blob to a specific node's Pickle
+/// registry (`address` is `host:port`). Used by a delegating node to
+/// transfer the context to the chosen builder (12b.2, JOB5): bare
+/// `_buildcontext` blobs have no manifest, so nothing replicates them
+/// — the delegator copies the blob across before the run request. The
+/// address derives from cluster membership, never from request data.
+pub fn context_upload_url_at(address: &str, digest: &str) -> String {
+    format!("http://{address}/v2/_buildcontext/blobs/uploads/?digest={digest}")
+}
+
 /// Check that a build's namespace is allowed to push to the destination.
 pub fn check_namespace_scope(
     spec: &BuildSpec,

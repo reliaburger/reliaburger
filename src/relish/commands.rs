@@ -1005,11 +1005,112 @@ pub async fn images() -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Poll a build to a terminal state, bounded by `timeout` and Ctrl-C
+/// (12b.2, the JOB6 residue: the old loop polled forever). Returns the
+/// built image reference; a timeout or interrupt is an error carrying
+/// the last known state, so the caller exits non-zero with something
+/// useful to print.
+pub async fn wait_for_build(
+    client: &BunClient,
+    build_id: u64,
+    timeout: std::time::Duration,
+) -> Result<String, RelishError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_state = "unknown".to_string();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: format!(
+                    "timed out after {}s waiting for build {build_id}; \
+                     last known state: {last_state}",
+                    timeout.as_secs()
+                ),
+            });
+        }
+        let pause = std::cmp::min(std::time::Duration::from_secs(2), deadline - now);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                return Err(RelishError::ApiError {
+                    status: 0,
+                    body: format!(
+                        "interrupted while waiting for build {build_id}; \
+                         last known state: {last_state}"
+                    ),
+                });
+            }
+            _ = tokio::time::sleep(pause) => {}
+        }
+        let status = client.build_status(build_id).await?;
+        match status["status"].as_str() {
+            Some("completed") => {
+                return Ok(status["image"].as_str().unwrap_or("?").to_string());
+            }
+            Some("failed") => {
+                return Err(RelishError::ApiError {
+                    status: 0,
+                    body: format!(
+                        "build failed: {}",
+                        status["reason"].as_str().unwrap_or("unknown")
+                    ),
+                });
+            }
+            other => last_state = other.unwrap_or("unknown").to_string(),
+        }
+    }
+}
+
+/// Poll a batch to a terminal state, bounded by `timeout` and Ctrl-C
+/// (12b.2, JOB6 residue). Returns the final summary JSON.
+pub async fn wait_for_batch(
+    client: &BunClient,
+    batch_id: u64,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, RelishError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let summary = client.batch_status(batch_id).await?;
+        if summary["done"].as_bool().unwrap_or(false) {
+            return Ok(summary);
+        }
+        let last_summary = summary;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: format!(
+                    "timed out after {}s waiting for batch {batch_id}; \
+                     last known state: {last_summary}",
+                    timeout.as_secs()
+                ),
+            });
+        }
+        let pause = std::cmp::min(std::time::Duration::from_secs(1), deadline - now);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                return Err(RelishError::ApiError {
+                    status: 0,
+                    body: format!(
+                        "interrupted while waiting for batch {batch_id}; \
+                         last known state: {last_summary}"
+                    ),
+                });
+            }
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
 /// Build OCI images and push to Pickle.
 ///
 /// Reads `[build.*]` sections from the config, tars each context,
 /// uploads it to Pickle, and submits a build job.
-pub async fn build(path: &std::path::Path, registry_port: u16) -> Result<(), RelishError> {
+pub async fn build(
+    path: &std::path::Path,
+    registry_port: u16,
+    timeout_secs: u64,
+) -> Result<(), RelishError> {
     use crate::config::Config;
     use crate::pickle::build::{digest_of, execute_build, tar_context};
 
@@ -1082,31 +1183,17 @@ pub async fn build(path: &std::path::Path, registry_port: u16) -> Result<(), Rel
 
         // Submit and poll: builds run async on the builder node —
         // minutes-long buildah runs must not hold an HTTP request open.
+        // The wait is bounded (JOB6): a stuck build ends with a
+        // non-zero exit and the last known state, not an infinite loop.
         let build_id = client.submit_build(name, &digest, spec).await?;
-        println!("  build {build_id} accepted; waiting...");
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let status = client.build_status(build_id).await?;
-            match status["status"].as_str() {
-                Some("completed") => {
-                    println!(
-                        "  built and pushed {}",
-                        status["image"].as_str().unwrap_or("?")
-                    );
-                    break;
-                }
-                Some("failed") => {
-                    return Err(RelishError::ApiError {
-                        status: 0,
-                        body: format!(
-                            "build failed: {}",
-                            status["reason"].as_str().unwrap_or("unknown")
-                        ),
-                    });
-                }
-                _ => {} // running / delegated — keep polling
-            }
-        }
+        println!("  build {build_id} accepted; waiting (up to {timeout_secs}s)...");
+        let image = wait_for_build(
+            &client,
+            build_id,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await?;
+        println!("  built and pushed {image}");
     }
 
     Ok(())
@@ -1148,24 +1235,44 @@ pub async fn batch(path: &std::path::Path) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Show a batch's progress.
-pub async fn batch_status(batch_id: u64) -> Result<(), RelishError> {
+/// Show a batch's progress; with `wait`, poll (bounded by `timeout`)
+/// until the batch reaches a terminal state.
+pub async fn batch_status(batch_id: u64, wait: bool, timeout_secs: u64) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let summary = client.batch_status(batch_id).await?;
+    let summary = if wait {
+        wait_for_batch(
+            &client,
+            batch_id,
+            std::time::Duration::from_secs(timeout_secs),
+        )
+        .await?
+    } else {
+        client.batch_status(batch_id).await?
+    };
+    print_batch_summary(batch_id, &summary);
+    Ok(())
+}
+
+fn print_batch_summary(batch_id: u64, summary: &serde_json::Value) {
+    let unschedulable = summary["unschedulable"].as_u64().unwrap_or(0);
     println!(
-        "batch {}: {} total, {} pending, {} completed, {} failed{}",
+        "batch {}: {} total, {} pending, {} completed, {} failed{}{}",
         batch_id,
         summary["total"].as_u64().unwrap_or(0),
         summary["pending"].as_u64().unwrap_or(0),
         summary["completed"].as_u64().unwrap_or(0),
         summary["failed"].as_u64().unwrap_or(0),
+        if unschedulable > 0 {
+            format!(", {unschedulable} unschedulable")
+        } else {
+            String::new()
+        },
         if summary["done"].as_bool().unwrap_or(false) {
             " — done"
         } else {
             ""
         },
     );
-    Ok(())
 }
 
 /// Create a new API token (local operation — no agent needed).

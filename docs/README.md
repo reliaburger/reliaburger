@@ -244,9 +244,9 @@ Commands:
 | `rollback <app>` | Rollback an app to the previous version |
 | `lint <path>` | Validate a config file without deploying |
 | `images` | List images in the local Pickle registry |
-| `build <path>` | Build OCI images from `[build.*]` sections and push to Pickle (async: submits, then polls) |
+| `build <path>` | Build OCI images from `[build.*]` sections and push to Pickle (async: submits, then polls; `--timeout` bounds the wait) |
 | `batch <path>` | Submit `[job.*]` sections as a high-throughput batch across the cluster |
-| `batch-status <id>` | Show a submitted batch's progress (total/pending/completed/failed) |
+| `batch-status <id>` | Show a submitted batch's progress (`--wait --timeout` polls to a terminal state) |
 | `sign <image>` | Sign an image in the Pickle registry and attach the signature |
 | `snapshot create <app>` | Snapshot an app's managed volumes (Btrfs-backed; `--volume` for one, `--name` to label) |
 | `snapshot list <app>` | List an app's snapshots, newest first |

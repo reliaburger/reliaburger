@@ -351,7 +351,7 @@ pub fn schedule_batch(
     nodes: &mut [NodeCapacity],
 ) -> BatchAllocation {
     // Group jobs by resource profile
-    let mut profile_groups: HashMap<ResourceProfile, Vec<&BatchJob>> = HashMap::new();
+    let mut profile_groups: BTreeMap<ResourceProfile, Vec<&BatchJob>> = BTreeMap::new();
     for job in jobs {
         let profile = ResourceProfile::from(&job.resources);
         profile_groups.entry(profile).or_default().push(job);
@@ -360,7 +360,7 @@ pub fn schedule_batch(
 }
 ```
 
-For each profile group, the scheduler sorts nodes by available capacity (most room first), then greedily assigns as many jobs as will fit on each node before moving to the next. The `jobs_that_fit` function divides available resources by the job's requirements — pure integer arithmetic, no I/O.
+For each profile group, the scheduler sorts nodes by available capacity (most room first), then greedily assigns as many jobs as will fit on each node before moving to the next. The `jobs_that_fit` function divides available resources by the job's requirements — pure integer arithmetic, no I/O. The groups live in a `BTreeMap` rather than a `HashMap` for one reason: `HashMap` iteration order is random per process, and the groups are processed in order, so the same submission would produce a different assignment plan on every run. Ordered keys make the plan reproducible (a test in Chapter 12 pins it).
 
 The complexity is O(nodes × profiles + total_jobs). If you have 100 nodes and all jobs are identical (1 profile), it's O(100 + 100,000) — essentially linear in the number of jobs. Even with 100 different profiles, it's O(10,000 + 100,000). The per-job pipeline would be O(100 × 100,000) — ten million evaluations.
 
@@ -373,10 +373,13 @@ pub struct BatchSummary {
     pub pending: usize,
     pub completed: usize,
     pub failed: usize,
+    pub unschedulable: usize,
     pub done: bool,
     pub elapsed_secs: u64,
 }
 ```
+
+(The `unschedulable` count arrived later, in Chapter 12's durability work — jobs the scheduler couldn't place used to be silently omitted from the batch; now they're part of its story.)
 
 The 100K-in-<1s benchmark runs as a unit test on every build. If someone introduces a regression that makes scheduling slower, the test fails immediately.
 

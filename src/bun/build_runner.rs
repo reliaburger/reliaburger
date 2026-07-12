@@ -8,18 +8,34 @@
 //! a build id immediately, `GET /v1/build/{id}` reports progress, and
 //! nodes without `buildah` delegate to a peer that reported the
 //! capability in its state reports.
+//!
+//! Since 12b.2 (JOB4/JOB7/D18) the tracker is Raft-durable when a
+//! council exists: ids come from a replicated counter (never reused
+//! across restarts), state transitions are Raft entries, delegation
+//! transfers the context blob to the builder and retries across
+//! capable peers, and — when the trust policy requires signatures — a
+//! build only counts as `Completed` once the pushed digest carries a
+//! signature that chains to the cluster CA.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use tokio::sync::{Mutex, oneshot};
+use serde::{Deserialize, Serialize};
 
-use super::agent::AgentCommand;
+use crate::meat::batch_tracker::epoch_now_secs;
+
 use super::api::ApiState;
+
+/// How long a terminal build record is kept before registration-time
+/// pruning removes it.
+pub const TERMINAL_BUILD_RETENTION_SECS: u64 = 3600;
+
+/// Ceiling on retained terminal build records (the deploy-history
+/// cap-at-50 precedent).
+pub const MAX_TERMINAL_BUILDS: usize = 50;
 
 /// Request body for `/v1/build` and `/v1/build/run`.
 ///
@@ -36,12 +52,12 @@ pub struct BuildSubmitRequest {
 }
 
 /// Lifecycle of one tracked build.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum BuildState {
     /// The runner is fetching context / building / pushing.
     Running,
-    /// Built, pushed, and (cluster mode) signed.
+    /// Built, pushed, and (when the policy requires it) signed.
     Completed { image: String },
     /// Any stage failed; the reason is the last useful stderr.
     Failed { reason: String },
@@ -49,30 +65,330 @@ pub enum BuildState {
     Delegated { url: String, remote_id: u64 },
 }
 
-/// Leader-less, node-local build registry. Unlike batches there is no
-/// cross-node summary to keep — each build lives where it was
-/// submitted, and delegated builds proxy their status reads.
+impl BuildState {
+    /// Short name of the state, for transition error messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BuildState::Running => "running",
+            BuildState::Completed { .. } => "completed",
+            BuildState::Failed { .. } => "failed",
+            BuildState::Delegated { .. } => "delegated",
+        }
+    }
+
+    /// Whether the state can never change again on this node.
+    /// `Delegated` counts: the entry node's record is a pointer, and
+    /// the real lifecycle lives on the builder.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, BuildState::Running)
+    }
+}
+
+/// One tracked build: what it builds, where it runs, and its state.
+/// Serialised into the Raft state machine, so every field is data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildRecord {
+    /// The `[build.*]` section name.
+    pub name: String,
+    /// Gossip name of the node running the build; `None` for records
+    /// created before the runner was known (delegated pointers).
+    pub runner_node: Option<String>,
+    /// Current lifecycle state.
+    pub state: BuildState,
+    /// Registration time as seconds since the Unix epoch.
+    pub created_at_epoch_secs: u64,
+}
+
+/// Why a build state update was rejected.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum BuildUpdateError {
+    #[error("build {build_id} is not tracked")]
+    UnknownBuild { build_id: u64 },
+    #[error("illegal build transition from {from} to {to}")]
+    IllegalTransition {
+        from: &'static str,
+        to: &'static str,
+    },
+}
+
+/// The durable half of build tracking, mirrored into the Raft
+/// `DesiredState` when a council exists (`#[serde(default)]` there, so
+/// pre-12b.2 snapshots load cleanly).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildDurableState {
+    /// Next build id to allocate. Monotonic; never reset or reused.
+    pub next_build_id: u64,
+    /// Tracked builds as `(id, record)` pairs, oldest first.
+    pub builds: Vec<(u64, BuildRecord)>,
+}
+
+impl Default for BuildDurableState {
+    fn default() -> Self {
+        Self {
+            next_build_id: 1,
+            builds: Vec::new(),
+        }
+    }
+}
+
+impl BuildDurableState {
+    /// Register a build: allocate the next id, prune stale terminal
+    /// records (using the new record's clock — deterministic across
+    /// Raft replicas), and store the record.
+    pub fn register(&mut self, record: BuildRecord) -> u64 {
+        let id = self.next_build_id.max(1);
+        self.next_build_id = id + 1;
+        self.prune_terminal(record.created_at_epoch_secs);
+        self.builds.push((id, record));
+        id
+    }
+
+    fn prune_terminal(&mut self, now_epoch_secs: u64) {
+        self.builds.retain(|(_, record)| {
+            !(record.state.is_terminal()
+                && now_epoch_secs.saturating_sub(record.created_at_epoch_secs)
+                    > TERMINAL_BUILD_RETENTION_SECS)
+        });
+        let terminal = self
+            .builds
+            .iter()
+            .filter(|(_, r)| r.state.is_terminal())
+            .count();
+        if terminal > MAX_TERMINAL_BUILDS {
+            let mut to_drop = terminal - MAX_TERMINAL_BUILDS;
+            self.builds.retain(|(_, record)| {
+                if to_drop > 0 && record.state.is_terminal() {
+                    to_drop -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    /// Look up a build by id.
+    pub fn get(&self, build_id: u64) -> Option<&BuildRecord> {
+        self.builds
+            .iter()
+            .find(|(id, _)| *id == build_id)
+            .map(|(_, record)| record)
+    }
+
+    /// Apply a state transition, validating it. A repeat of the current
+    /// state kind is idempotent; anything else from a terminal state is
+    /// rejected, as is any transition of a `Delegated` pointer.
+    pub fn update(&mut self, build_id: u64, state: BuildState) -> Result<(), BuildUpdateError> {
+        let record = self
+            .builds
+            .iter_mut()
+            .find(|(id, _)| *id == build_id)
+            .map(|(_, record)| record)
+            .ok_or(BuildUpdateError::UnknownBuild { build_id })?;
+        if record.state.kind() == state.kind() {
+            return Ok(()); // idempotent duplicate
+        }
+        if record.state.is_terminal() {
+            return Err(BuildUpdateError::IllegalTransition {
+                from: record.state.kind(),
+                to: state.kind(),
+            });
+        }
+        record.state = state;
+        Ok(())
+    }
+}
+
+/// Node-local build registry. Standalone it is the only tracker; in a
+/// cluster it mirrors the Raft records this node cares about, so
+/// status reads don't wait on replication.
 #[derive(Debug, Default)]
 pub struct BuildRegistry {
     next_id: u64,
-    builds: HashMap<u64, BuildState>,
+    builds: HashMap<u64, BuildRecord>,
 }
 
 impl BuildRegistry {
-    pub fn register(&mut self, state: BuildState) -> u64 {
+    /// Standalone registration with a process-local id.
+    pub fn register(&mut self, record: BuildRecord) -> u64 {
         self.next_id += 1;
-        self.builds.insert(self.next_id, state);
+        self.builds.insert(self.next_id, record);
         self.next_id
     }
 
-    pub fn set(&mut self, id: u64, state: BuildState) {
-        self.builds.insert(id, state);
+    /// Insert or overwrite a record under a known (Raft-allocated) id.
+    pub fn set(&mut self, id: u64, record: BuildRecord) {
+        self.builds.insert(id, record);
     }
 
-    pub fn get(&self, id: u64) -> Option<BuildState> {
+    /// Update the state of a tracked record; a no-op for unknown ids.
+    pub fn set_state(&mut self, id: u64, state: BuildState) {
+        if let Some(record) = self.builds.get_mut(&id) {
+            record.state = state;
+        }
+    }
+
+    pub fn get(&self, id: u64) -> Option<BuildRecord> {
         self.builds.get(&id).cloned()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Durable tracking plumbing
+// ---------------------------------------------------------------------------
+
+/// Cross-node build tracking request, POSTed to the leader's
+/// `/v1/build/track` by nodes whose council handle is a follower.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum BuildTrackRequest {
+    /// Allocate an id and store the record; the reply carries `build_id`.
+    Register { record: BuildRecord },
+    /// Apply a state transition to a tracked build.
+    Update { build_id: u64, state: BuildState },
+}
+
+/// Propose a tracking operation to Raft from this node, forwarding to
+/// the leader over HTTP when this node's council handle is a follower.
+/// Returns the allocated id for `Register`, `None` for `Update`.
+async fn propose_track(
+    state: &ApiState,
+    request: &BuildTrackRequest,
+) -> Result<Option<u64>, String> {
+    let Some(council) = &state.council else {
+        return Err("no council available".to_string());
+    };
+    let raft_request = match request {
+        BuildTrackRequest::Register { record } => {
+            crate::council::types::RaftRequest::BuildRegister {
+                build: record.clone(),
+            }
+        }
+        BuildTrackRequest::Update { build_id, state } => {
+            crate::council::types::RaftRequest::BuildUpdate {
+                build_id: *build_id,
+                state: state.clone(),
+            }
+        }
+    };
+    match council.write(raft_request).await {
+        Ok(crate::council::types::CouncilResponse::BuildRegistered { build_id }) => {
+            Ok(Some(build_id))
+        }
+        Ok(crate::council::types::CouncilResponse::Refused { reason }) => Err(reason),
+        Ok(_) => Ok(None),
+        Err(crate::council::CouncilError::ForwardToLeader { .. }) => {
+            forward_track_to_leader(state, council, request).await
+        }
+        Err(e) => Err(format!("raft write failed: {e}")),
+    }
+}
+
+/// POST the tracking operation to the leader's `/v1/build/track`.
+async fn forward_track_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    request: &BuildTrackRequest,
+) -> Result<Option<u64>, String> {
+    let Some(leader_url) = super::api::leader_api_url(state, council).await else {
+        return Err("no cluster leader known yet".to_string());
+    };
+    let mut proxied = state
+        .cluster_http
+        .client()
+        .post(format!("{leader_url}/v1/build/track"))
+        .json(request);
+    if let Some(token) = &state.service_token {
+        proxied = proxied.bearer_auth(token);
+    }
+    let response = proxied
+        .send()
+        .await
+        .map_err(|e| format!("leader forward failed: {e}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("leader refused the tracking op ({status}): {body}"));
+    }
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("leader track response unreadable: {e}"))?;
+    Ok(value["build_id"].as_u64())
+}
+
+/// Register a build record durably (Raft when a council exists, the
+/// local registry standalone), mirroring it locally either way.
+pub(crate) async fn register_build_record(
+    state: &ApiState,
+    record: BuildRecord,
+) -> Result<u64, String> {
+    let build_id = match &state.council {
+        Some(_) => propose_track(
+            state,
+            &BuildTrackRequest::Register {
+                record: record.clone(),
+            },
+        )
+        .await?
+        .ok_or_else(|| "raft register returned no build id".to_string())?,
+        None => state.build_registry.lock().await.register(record.clone()),
+    };
+    if state.council.is_some() {
+        state.build_registry.lock().await.set(build_id, record);
+    }
+    Ok(build_id)
+}
+
+/// Record a build state transition durably, mirroring it locally.
+/// Never fails the caller: the mirror always updates, and a Raft write
+/// failure is logged (the honest-failure path on status reads catches
+/// records that stayed `Running`).
+pub(crate) async fn update_build_state(state: &ApiState, build_id: u64, new_state: BuildState) {
+    state
+        .build_registry
+        .lock()
+        .await
+        .set_state(build_id, new_state.clone());
+    if state.council.is_none() {
+        return;
+    }
+    let request = BuildTrackRequest::Update {
+        build_id,
+        state: new_state,
+    };
+    for attempt in 0..3u32 {
+        match propose_track(state, &request).await {
+            Ok(_) => return,
+            Err(e) if attempt == 2 => {
+                eprintln!("bun: build {build_id}: state update not written to raft: {e}");
+            }
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt as u64 + 1)))
+                    .await;
+            }
+        }
+    }
+}
+
+/// Look up a build record: the local mirror first, then the replicated
+/// Raft state (which also serves reads for builds registered elsewhere).
+async fn lookup_build(state: &ApiState, build_id: u64) -> Option<BuildRecord> {
+    if let Some(record) = state.build_registry.lock().await.get(build_id) {
+        return Some(record);
+    }
+    let council = state.council.as_ref()?;
+    council
+        .desired_state()
+        .await
+        .build_state
+        .get(build_id)
+        .cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem and subprocess plumbing
+// ---------------------------------------------------------------------------
 
 /// An owned build directory that deletes itself on drop (JOB6).
 ///
@@ -150,6 +466,21 @@ async fn download_to_file_capped(
     Ok(())
 }
 
+/// Read a response body into memory, aborting past `max_bytes`.
+async fn read_body_capped(response: reqwest::Response, max_bytes: u64) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt as _;
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if body.len() as u64 + chunk.len() as u64 > max_bytes {
+            return Err(format!("body exceeds the {max_bytes} byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Why a bounded subprocess run failed to produce output.
 enum BoundedError {
     /// The process outlived its timeout and was killed.
@@ -220,69 +551,242 @@ pub async fn local_buildah_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Pick a peer builder: any member whose latest state report says it
-/// has buildah. Returns its API base URL.
-pub fn find_peer_builder(
+// ---------------------------------------------------------------------------
+// Peer builder selection and context transfer
+// ---------------------------------------------------------------------------
+
+/// A peer that can run a build: where its API lives and where its
+/// registry listens. Both derive from the membership table and this
+/// node's own config — never from request data (JOB2/D18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerBuilder {
+    /// The peer's Bun API base URL.
+    pub api_url: String,
+    /// The peer's Pickle registry as `host:port` (cluster registry
+    /// ports are uniform, like API ports).
+    pub registry_address: String,
+}
+
+/// All capable peer builders, in membership order: any member whose
+/// latest state report says it has buildah, excluding this node.
+/// Multiple candidates make builder failure retryable (D18).
+pub fn find_peer_builders(
     members: &[super::api::NodeMembershipInfo],
     aggregated: &crate::reporting::aggregator::AggregatedState,
     self_name: Option<&str>,
     cluster_http: &crate::cluster::ClusterHttp,
-) -> Option<String> {
+    registry_port: u16,
+) -> Vec<PeerBuilder> {
     members
         .iter()
         .filter(|m| Some(m.node_id.0.as_str()) != self_name)
-        .find(|m| {
+        .filter(|m| {
             aggregated
                 .reports
                 .get(&m.node_id)
                 .is_some_and(|report| report.has_buildah)
         })
-        .map(|m| cluster_http.url(&m.address.to_string(), ""))
+        .map(|m| PeerBuilder {
+            api_url: cluster_http.url(&m.address.to_string(), ""),
+            registry_address: format!("{}:{registry_port}", m.address.ip()),
+        })
+        .collect()
+}
+
+/// Copy the build-context blob from this node's registry to a peer
+/// builder's registry (12b.2, the JOB5 residual). Locally-uploaded
+/// `_buildcontext` blobs are bare blobs — no manifest, so no holder
+/// record, no replication — which means a delegated builder's own
+/// registry has never heard of them. Transferring the blob at
+/// delegation time closes that gap without inventing request-supplied
+/// registry endpoints: both addresses derive from config + membership.
+pub async fn transfer_context_to_builder(
+    client: &reqwest::Client,
+    local_registry_port: u16,
+    builder_registry_address: &str,
+    digest: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    // Skip the copy if the builder already holds the blob.
+    let peer_blob_url =
+        crate::pickle::build::context_download_url_at(builder_registry_address, digest);
+    if let Ok(response) = client.head(&peer_blob_url).send().await
+        && response.status().is_success()
+    {
+        return Ok(());
+    }
+
+    let local_url = crate::pickle::build::context_download_url(local_registry_port, digest);
+    let response = client
+        .get(&local_url)
+        .send()
+        .await
+        .map_err(|e| format!("local registry unreachable: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "context blob {digest} not found in the local registry"
+        ));
+    }
+    let body = read_body_capped(response, max_bytes)
+        .await
+        .map_err(|e| format!("context read failed: {e}"))?;
+
+    let upload_url = crate::pickle::build::context_upload_url_at(builder_registry_address, digest);
+    let response = client
+        .post(&upload_url)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("builder registry unreachable: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "builder registry refused the context blob: {}",
+            response.status()
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Signing
+// ---------------------------------------------------------------------------
+
+/// Sign a pushed manifest digest with a certificate issued by the
+/// cluster's Workload CA and attach the signature via Raft (JOB7).
+///
+/// The old path generated an ephemeral external key that no trust
+/// policy could ever list, so the signature was decorative. A keyless
+/// signature over a CA-issued certificate verifies against the
+/// cluster's root CA — the same check `require_signatures` deploys
+/// run. The signature is verified locally before it is attached, and
+/// an `AttachSignature` for a digest the catalogue doesn't know is
+/// refused by the state machine, not silently dropped.
+pub async fn sign_pushed_image(
+    council: &crate::council::CouncilNode,
+    digest: &crate::pickle::types::Digest,
+    namespace: &str,
+    build_name: &str,
+    node_name: &str,
+) -> Result<(), String> {
+    let uri = crate::sesame::types::SpiffeUri {
+        trust_domain: "default".to_string(),
+        namespace: namespace.to_string(),
+        workload_type: crate::sesame::types::WorkloadType::Job,
+        name: build_name.to_string(),
+    };
+    let (csr_der, key_der) = crate::sesame::identity::create_workload_csr(&uri)
+        .map_err(|e| format!("csr generation failed: {e}"))?;
+    let signed = council
+        .sign_workload_csr(
+            &csr_der,
+            &uri,
+            "default",
+            node_name,
+            &format!("build-{build_name}"),
+        )
+        .await
+        .map_err(|e| format!("csr signing failed: {e}"))?;
+    let signature = crate::pickle::signing::create_keyless_signature(
+        digest,
+        &signed.cert_der,
+        &key_der,
+        std::slice::from_ref(&signed.workload_ca_cert_der),
+        "reliaburger-council",
+        &uri.to_uri(),
+    )
+    .map_err(|e| format!("signature creation failed: {e}"))?;
+
+    // Self-check before attaching: the signature must verify against
+    // the cluster root CA — the exact check enforcement runs.
+    crate::pickle::signing::verify_signature(
+        &signature,
+        digest,
+        &crate::config::node::TrustPolicySection::default(),
+        Some(&signed.root_ca_cert_der),
+        None,
+    )
+    .map_err(|e| format!("signature failed verification against the cluster ca: {e}"))?;
+
+    let attach = crate::pickle::types::AttachSignature {
+        manifest_digest: digest.clone(),
+        signature,
+    };
+    match council
+        .write(crate::council::types::RaftRequest::AttachSignature(attach))
+        .await
+    {
+        Ok(crate::council::types::CouncilResponse::Refused { reason }) => {
+            Err(format!("signature attach refused: {reason}"))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("signature attach failed: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The build runner
+// ---------------------------------------------------------------------------
+
+/// Everything `run_build` needs, bundled so the spawned task owns its
+/// dependencies. Built from `ApiState` on the handler path; tests can
+/// construct it directly.
+#[derive(Clone)]
+pub struct BuildRunnerContext {
+    /// The handler state (durable tracking, council, catalog, config).
+    pub api: ApiState,
+}
+
+impl BuildRunnerContext {
+    async fn set_state(&self, build_id: u64, state: BuildState) {
+        update_build_state(&self.api, build_id, state).await;
+    }
 }
 
 /// The lifted build body: fetch the context blob from the local
 /// registry, extract, run `buildah bud` + `buildah push` (bounded by
-/// `[images] build_timeout_secs`), then sign the pushed manifest when
-/// a cluster is available. Every failure lands in the registry with a
+/// `[images] build_timeout_secs`), then sign the pushed manifest.
+/// When `[images.trust_policy] require_signatures` is set, signing is
+/// part of the terminal-state definition: no trusted signature, no
+/// `Completed` (JOB7). Every failure lands in the tracker with a
 /// reason; nothing is reported over HTTP from here.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_build(
-    request: BuildSubmitRequest,
+pub async fn run_build(request: BuildSubmitRequest, build_id: u64, ctx: BuildRunnerContext) {
+    let outcome = run_build_inner(&request, build_id, &ctx).await;
+    match outcome {
+        Ok(image) => {
+            ctx.set_state(build_id, BuildState::Completed { image })
+                .await;
+        }
+        Err(reason) => {
+            eprintln!("bun: build {build_id} ({}) failed: {reason}", request.name);
+            ctx.set_state(build_id, BuildState::Failed { reason }).await;
+        }
+    }
+    ctx.api.active_builds.lock().await.remove(&build_id);
+}
+
+async fn run_build_inner(
+    request: &BuildSubmitRequest,
     build_id: u64,
-    registry: Arc<Mutex<BuildRegistry>>,
-    cmd_tx: tokio::sync::mpsc::Sender<AgentCommand>,
-    pickle_catalog: Option<Arc<tokio::sync::RwLock<crate::pickle::types::ManifestCatalog>>>,
-    timeout: std::time::Duration,
-    registry_port: u16,
-    max_context_bytes: u64,
-) {
-    let fail = |reason: String| async {
-        eprintln!("bun: build {build_id} ({}) failed: {reason}", request.name);
-        registry
-            .lock()
-            .await
-            .set(build_id, BuildState::Failed { reason });
-    };
+    ctx: &BuildRunnerContext,
+) -> Result<String, String> {
+    let state = &ctx.api;
+    let timeout = std::time::Duration::from_secs(state.build_timeout_secs);
 
     // The registry destination is the node's own config, never the
     // request (JOB2): a caller cannot point this privileged process at
     // an arbitrary localhost service.
-    let job = match crate::pickle::build::execute_build(
+    let job = crate::pickle::build::execute_build(
         &request.spec,
         &request.context_digest,
-        Some(registry_port),
-    ) {
-        Ok(job) => job,
-        Err(e) => return fail(format!("invalid build spec: {e}")).await,
-    };
+        Some(state.registry_port),
+    )
+    .map_err(|e| format!("invalid build spec: {e}"))?;
 
     // A unique, self-cleaning build directory. `ScopedDir::drop` removes
     // it on every exit path below, so no failure leaves a stray context.
     let base = std::env::temp_dir().join("reliaburger-build");
-    let build_dir = match ScopedDir::new(&base, build_id) {
-        Ok(dir) => dir,
-        Err(e) => return fail(format!("failed to create build directory: {e}")).await,
-    };
+    let build_dir = ScopedDir::new(&base, build_id)
+        .map_err(|e| format!("failed to create build directory: {e}"))?;
     // The tar lands beside the context, not inside it, so `context.tar`
     // never becomes part of the build.
     let tar_path = build_dir.path().join("context.tar");
@@ -293,30 +797,30 @@ pub async fn run_build(
     // size/entries, rejects traversal/symlinks, strips setuid) off the
     // async runtime.
     let context_url =
-        crate::pickle::build::context_download_url(registry_port, &request.context_digest);
+        crate::pickle::build::context_download_url(state.registry_port, &request.context_digest);
     let response = match reqwest::get(&context_url).await {
         Ok(response) if response.status().is_success() => response,
         _ => {
-            return fail(format!(
+            return Err(format!(
                 "context blob {} not found in the registry",
                 request.context_digest
-            ))
-            .await;
+            ));
         }
     };
-    match download_to_file_capped(response, &tar_path, max_context_bytes).await {
+    match download_to_file_capped(response, &tar_path, state.max_context_bytes).await {
         Ok(()) => {}
         Err(DownloadError::TooLarge) => {
-            return fail(format!(
-                "build context exceeds the {max_context_bytes} byte limit"
-            ))
-            .await;
+            return Err(format!(
+                "build context exceeds the {} byte limit",
+                state.max_context_bytes
+            ));
         }
-        Err(DownloadError::Io(e)) => return fail(format!("context read failed: {e}")).await,
+        Err(DownloadError::Io(e)) => return Err(format!("context read failed: {e}")),
     }
 
     let extract_path = ctx_dir.clone();
     let dockerfile = request.spec.dockerfile.clone();
+    let max_context_bytes = state.max_context_bytes;
     let extracted = tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&tar_path)?;
         crate::pickle::build::unpack_context(
@@ -332,8 +836,8 @@ pub async fn run_build(
     .await;
     match extracted {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return fail(format!("failed to prepare build context: {e}")).await,
-        Err(e) => return fail(format!("context extraction task failed: {e}")).await,
+        Ok(Err(e)) => return Err(format!("failed to prepare build context: {e}")),
+        Err(e) => return Err(format!("context extraction task failed: {e}")),
     }
 
     // Build, then push. The push targets the local registry, so the
@@ -349,55 +853,74 @@ pub async fn run_build(
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let tail: String = stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n");
-                return fail(format!("buildah {label} failed: {tail}")).await;
+                return Err(format!("buildah {label} failed: {tail}"));
             }
             Err(BoundedError::Timeout) => {
-                return fail(format!(
+                return Err(format!(
                     "buildah {label} exceeded build_timeout_secs ({}s)",
                     timeout.as_secs()
-                ))
-                .await;
+                ));
             }
             Err(BoundedError::Spawn(e)) => {
-                return fail(format!("failed to run buildah {label}: {e}")).await;
+                return Err(format!("failed to run buildah {label}: {e}"));
             }
         }
     }
 
     // Sign the pushed manifest so it deploys under require_signatures.
-    // Best-effort: standalone nodes have no council to sign with, and
-    // an unsigned build on a trust-free cluster is still useful.
-    if let Some(catalog) = &pickle_catalog {
-        let digest = catalog
-            .read()
-            .await
-            .get_manifest_by_tag(&job.destination.name, &job.destination.tag)
-            .map(|manifest| manifest.digest.as_str().to_string());
-        if let Some(digest) = digest {
-            let (sign_tx, sign_rx) = oneshot::channel();
-            let _ = cmd_tx
-                .send(AgentCommand::SignImage {
-                    manifest_digest: digest,
-                    response: sign_tx,
-                })
-                .await;
-            match sign_rx.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!(
-                    "bun: build {build_id}: image pushed but signing failed \
-                     (deploys need require_signatures = false): {e}"
-                ),
-                Err(_) => {}
-            }
+    // With the policy set, signing is part of success (JOB7); without
+    // it, a failure is a warning and the unsigned image stays useful.
+    let digest = pushed_manifest_digest(state, &job.destination.name, &job.destination.tag).await;
+    let sign_outcome: Result<(), String> = match (&state.council, digest) {
+        (Some(council), Some(digest)) => {
+            let namespace = request.spec.namespace.as_deref().unwrap_or("default");
+            let node_name = state.node_name.as_deref().unwrap_or("local");
+            sign_pushed_image(council, &digest, namespace, &request.name, node_name).await
+        }
+        (Some(_), None) => Err("pushed image not found in the catalogue".to_string()),
+        (None, _) => Err("no council available for signing".to_string()),
+    };
+    match sign_outcome {
+        Ok(()) => {}
+        Err(reason) if state.require_signatures => {
+            return Err(format!(
+                "image pushed but the trust policy requires signatures and signing failed: {reason}"
+            ));
+        }
+        Err(reason) => {
+            eprintln!(
+                "bun: build {build_id}: image pushed but unsigned ({reason}); \
+                 deploys need require_signatures = false"
+            );
         }
     }
 
-    registry.lock().await.set(
-        build_id,
-        BuildState::Completed {
-            image: format!("{}:{}", job.destination.name, job.destination.tag),
-        },
-    );
+    Ok(format!("{}:{}", job.destination.name, job.destination.tag))
+}
+
+/// The manifest digest the push landed under, from the local catalog
+/// (shared with the registry) or the replicated council catalog.
+async fn pushed_manifest_digest(
+    state: &ApiState,
+    name: &str,
+    tag: &str,
+) -> Option<crate::pickle::types::Digest> {
+    if let Some(catalog) = &state.pickle_catalog {
+        let found = catalog
+            .read()
+            .await
+            .get_manifest_by_tag(name, tag)
+            .map(|manifest| manifest.digest.clone());
+        if found.is_some() {
+            return found;
+        }
+    }
+    let council = state.council.as_ref()?;
+    council
+        .manifest_catalog()
+        .await
+        .get_manifest_by_tag(name, tag)
+        .map(|manifest| manifest.digest.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +943,8 @@ fn parse_build_request(body: &str) -> Result<BuildSubmitRequest, Response> {
 }
 
 /// `POST /v1/build`: run locally when buildah is present, else
-/// delegate to a peer that reported the capability, else 503.
+/// delegate to a peer that reported the capability (transferring the
+/// context blob and retrying across candidates, D18/JOB5), else 503.
 pub async fn build_submit_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -440,20 +964,21 @@ pub async fn build_submit_handler(
         return accept_build(&state, request).await;
     }
 
-    // Delegate to a capable peer.
-    let peer = match (&state.membership, &state.aggregated_rx) {
+    // Delegate to a capable peer, trying each candidate in turn (D18).
+    let candidates = match (&state.membership, &state.aggregated_rx) {
         (Some(membership), Some(aggregated_rx)) => {
             let members = membership.read().await.clone();
-            find_peer_builder(
+            find_peer_builders(
                 &members,
                 &aggregated_rx.borrow(),
                 state.node_name.as_deref(),
                 &state.cluster_http,
+                state.registry_port,
             )
         }
-        _ => None,
+        _ => Vec::new(),
     };
-    let Some(peer_url) = peer else {
+    if candidates.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -462,56 +987,95 @@ pub async fn build_submit_handler(
             })),
         )
             .into_response();
-    };
-
-    let mut proxied = state
-        .cluster_http
-        .client()
-        .post(format!("{peer_url}/v1/build/run"))
-        .json(&request);
-    if let Some(token) = &state.service_token {
-        proxied = proxied.bearer_auth(token);
     }
-    let response = match proxied.send().await {
-        Ok(response) => response,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("builder dispatch failed: {e}") })),
-            )
-                .into_response();
-        }
-    };
-    let remote: serde_json::Value = match response.json().await {
-        Ok(value) => value,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("builder response: {e}") })),
-            )
-                .into_response();
-        }
-    };
-    let Some(remote_id) = remote["build_id"].as_u64() else {
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": format!("builder rejected the build: {remote}") })),
-        )
-            .into_response();
-    };
 
-    // Track locally as delegated, so the client polls one node.
-    let build_id = state
-        .build_registry
-        .lock()
+    let mut last_error = String::new();
+    for candidate in candidates {
+        // The builder fetches the context from its *own* registry, so
+        // the blob must be there before the run request lands (JOB5).
+        if let Err(e) = transfer_context_to_builder(
+            state.cluster_http.client(),
+            state.registry_port,
+            &candidate.registry_address,
+            &request.context_digest,
+            state.max_context_bytes,
+        )
         .await
-        .register(BuildState::Delegated {
-            url: peer_url,
-            remote_id,
-        });
+        {
+            last_error = format!("context transfer to {} failed: {e}", candidate.api_url);
+            eprintln!("bun: build delegation: {last_error}");
+            continue;
+        }
+
+        let mut proxied = state
+            .cluster_http
+            .client()
+            .post(format!("{}/v1/build/run", candidate.api_url))
+            .json(&request);
+        if let Some(token) = &state.service_token {
+            proxied = proxied.bearer_auth(token);
+        }
+        let response = match proxied.send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                last_error = format!(
+                    "builder {} refused the build: {}",
+                    candidate.api_url,
+                    response.status()
+                );
+                eprintln!("bun: build delegation: {last_error}");
+                continue;
+            }
+            Err(e) => {
+                last_error = format!("builder {} unreachable: {e}", candidate.api_url);
+                eprintln!("bun: build delegation: {last_error}");
+                continue;
+            }
+        };
+        let remote: serde_json::Value = match response.json().await {
+            Ok(value) => value,
+            Err(e) => {
+                last_error = format!("builder {} response unreadable: {e}", candidate.api_url);
+                continue;
+            }
+        };
+        let Some(remote_id) = remote["build_id"].as_u64() else {
+            last_error = format!("builder {} rejected the build: {remote}", candidate.api_url);
+            continue;
+        };
+
+        // Track locally as delegated, so the client polls one node.
+        let record = BuildRecord {
+            name: request.name.clone(),
+            runner_node: None,
+            state: BuildState::Delegated {
+                url: candidate.api_url.clone(),
+                remote_id,
+            },
+            created_at_epoch_secs: epoch_now_secs(),
+        };
+        return match register_build_record(&state, record).await {
+            Ok(build_id) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "build_id": build_id })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("build accepted by {} (remote id {remote_id}) but \
+                                      tracking it failed: {e}", candidate.api_url)
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "build_id": build_id })),
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": format!("all capable builders failed; last error: {last_error}")
+        })),
     )
         .into_response()
 }
@@ -555,6 +1119,55 @@ pub async fn build_run_handler(
     accept_build(&state, request).await
 }
 
+/// `POST /v1/build/track`: leader-side durable tracking for builds
+/// running on nodes whose council handle is a follower (node-to-node
+/// only). Proposes the operation to Raft and answers with the outcome.
+pub async fn build_track_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    Json(request): Json<BuildTrackRequest>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return resp;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council on this node" })),
+        )
+            .into_response();
+    };
+    let raft_request = match &request {
+        BuildTrackRequest::Register { record } => {
+            crate::council::types::RaftRequest::BuildRegister {
+                build: record.clone(),
+            }
+        }
+        BuildTrackRequest::Update { build_id, state } => {
+            crate::council::types::RaftRequest::BuildUpdate {
+                build_id: *build_id,
+                state: state.clone(),
+            }
+        }
+    };
+    match council.write(raft_request).await {
+        Ok(crate::council::types::CouncilResponse::BuildRegistered { build_id }) => {
+            Json(serde_json::json!({ "build_id": build_id })).into_response()
+        }
+        Ok(crate::council::types::CouncilResponse::Refused { reason }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
+        Ok(_) => Json(serde_json::json!({ "recorded": true })).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": format!("raft write failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 /// Register + spawn a local build; answer 202 with the id.
 async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response {
     // Validate the context digest before it is ever used to build a path
@@ -582,20 +1195,31 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
             .into_response();
     }
 
-    let build_id = state
-        .build_registry
-        .lock()
-        .await
-        .register(BuildState::Running);
+    let record = BuildRecord {
+        name: request.name.clone(),
+        runner_node: state.node_name.clone(),
+        state: BuildState::Running,
+        created_at_epoch_secs: epoch_now_secs(),
+    };
+    let build_id = match register_build_record(state, record).await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("cluster build tracker unavailable: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    // Mark the runner live before answering, so a status read can never
+    // see a Running record with no live runner on this node.
+    state.active_builds.lock().await.insert(build_id);
     tokio::spawn(run_build(
         request,
         build_id,
-        Arc::clone(&state.build_registry),
-        state.cmd_tx.clone(),
-        state.pickle_catalog.clone(),
-        std::time::Duration::from_secs(state.build_timeout_secs),
-        state.registry_port,
-        state.max_context_bytes,
+        BuildRunnerContext { api: state.clone() },
     ));
     (
         StatusCode::ACCEPTED,
@@ -605,14 +1229,23 @@ async fn accept_build(state: &ApiState, request: BuildSubmitRequest) -> Response
 }
 
 /// `GET /v1/build/{id}`: local state, or a proxy read for delegated
-/// builds.
+/// builds. A `Running` record whose runner is this node but has no
+/// live runner task means the node restarted mid-build: the record is
+/// terminated honestly rather than reading `Running` forever (JOB4).
 pub async fn build_status_handler(
     State(state): State<ApiState>,
     AxumPath(build_id): AxumPath<u64>,
 ) -> Response {
-    let entry = state.build_registry.lock().await.get(build_id);
-    match entry {
-        Some(BuildState::Delegated { url, remote_id }) => {
+    let Some(record) = lookup_build(&state, build_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("build {build_id} not found") })),
+        )
+            .into_response();
+    };
+
+    match record.state {
+        BuildState::Delegated { url, remote_id } => {
             let mut request = state
                 .cluster_http
                 .client()
@@ -634,12 +1267,18 @@ pub async fn build_status_handler(
                     .into_response(),
             }
         }
-        Some(build_state) => Json(serde_json::json!(build_state)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("build {build_id} not found") })),
-        )
-            .into_response(),
+        BuildState::Running
+            if record.runner_node.is_some()
+                && record.runner_node == state.node_name
+                && !state.active_builds.lock().await.contains(&build_id) =>
+        {
+            let failed = BuildState::Failed {
+                reason: "builder restarted mid-build".to_string(),
+            };
+            update_build_state(&state, build_id, failed.clone()).await;
+            Json(serde_json::json!(failed)).into_response()
+        }
+        build_state => Json(serde_json::json!(build_state)).into_response(),
     }
 }
 
@@ -652,6 +1291,15 @@ mod tests {
     use super::*;
     use crate::reporting::aggregator::AggregatedState;
     use crate::reporting::types::{ResourceUsage, StateReport};
+
+    fn running_record(name: &str) -> BuildRecord {
+        BuildRecord {
+            name: name.to_string(),
+            runner_node: Some("n1".to_string()),
+            state: BuildState::Running,
+            created_at_epoch_secs: 1_000_000,
+        }
+    }
 
     #[test]
     fn build_request_rejects_unknown_fields() {
@@ -737,17 +1385,20 @@ mod tests {
     #[test]
     fn registry_tracks_lifecycle() {
         let mut registry = BuildRegistry::default();
-        let id = registry.register(BuildState::Running);
-        assert!(matches!(registry.get(id), Some(BuildState::Running)));
+        let id = registry.register(running_record("myapp"));
+        assert!(matches!(
+            registry.get(id).map(|r| r.state),
+            Some(BuildState::Running)
+        ));
 
-        registry.set(
+        registry.set_state(
             id,
             BuildState::Completed {
                 image: "myapp:v1".to_string(),
             },
         );
         assert!(matches!(
-            registry.get(id),
+            registry.get(id).map(|r| r.state),
             Some(BuildState::Completed { .. })
         ));
         assert!(registry.get(id + 1).is_none());
@@ -761,6 +1412,101 @@ mod tests {
         .unwrap();
         assert_eq!(json["status"], "completed");
         assert_eq!(json["image"], "myapp:v1");
+    }
+
+    #[test]
+    fn durable_state_allocates_monotonic_ids() {
+        let mut state = BuildDurableState::default();
+        let a = state.register(running_record("a"));
+        let b = state.register(running_record("b"));
+        assert_eq!(a, 1);
+        assert_eq!(b, 2);
+        assert_eq!(state.next_build_id, 3);
+    }
+
+    #[test]
+    fn durable_state_validates_transitions() {
+        let mut state = BuildDurableState::default();
+        let id = state.register(running_record("a"));
+
+        // Running → Completed is fine.
+        state
+            .update(
+                id,
+                BuildState::Completed {
+                    image: "a:v1".to_string(),
+                },
+            )
+            .unwrap();
+        // A duplicate terminal report of the same kind is idempotent.
+        state
+            .update(
+                id,
+                BuildState::Completed {
+                    image: "a:v1".to_string(),
+                },
+            )
+            .unwrap();
+        // Completed → Failed is a forged/conflicting transition.
+        let err = state
+            .update(
+                id,
+                BuildState::Failed {
+                    reason: "nope".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BuildUpdateError::IllegalTransition { .. }));
+        // Unknown ids are an error, never a silent no-op.
+        let err = state.update(999, BuildState::Running).unwrap_err();
+        assert_eq!(err, BuildUpdateError::UnknownBuild { build_id: 999 });
+    }
+
+    #[test]
+    fn delegated_records_reject_updates() {
+        let mut state = BuildDurableState::default();
+        let id = state.register(BuildRecord {
+            name: "a".to_string(),
+            runner_node: None,
+            state: BuildState::Delegated {
+                url: "http://10.0.0.2:9117".to_string(),
+                remote_id: 4,
+            },
+            created_at_epoch_secs: 1_000_000,
+        });
+        let err = state
+            .update(
+                id,
+                BuildState::Completed {
+                    image: "a:v1".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BuildUpdateError::IllegalTransition { .. }));
+    }
+
+    #[test]
+    fn registration_prunes_old_terminal_builds() {
+        let mut state = BuildDurableState::default();
+        let mut done = running_record("old");
+        done.state = BuildState::Failed {
+            reason: "old".to_string(),
+        };
+        done.created_at_epoch_secs = 1_000;
+        let old_id = state.register(done);
+
+        let mut in_flight = running_record("running");
+        in_flight.created_at_epoch_secs = 1_000;
+        let running_id = state.register(in_flight);
+
+        let mut fresh = running_record("fresh");
+        fresh.created_at_epoch_secs = 1_000 + TERMINAL_BUILD_RETENTION_SECS + 1;
+        let fresh_id = state.register(fresh);
+
+        assert!(state.get(old_id).is_none(), "terminal build pruned");
+        assert!(state.get(running_id).is_some(), "in-flight build kept");
+        assert!(state.get(fresh_id).is_some());
+        assert_eq!(state.next_build_id, fresh_id + 1);
     }
 
     fn report(node: &crate::meat::NodeId, has_buildah: bool) -> StateReport {
@@ -799,11 +1545,19 @@ mod tests {
         ];
 
         let http = crate::cluster::ClusterHttp::plaintext();
-        let url = find_peer_builder(&members, &aggregated, Some("plain"), &http);
-        assert_eq!(url.as_deref(), Some("http://10.0.0.2:9117"));
+        let builders = find_peer_builders(&members, &aggregated, Some("plain"), &http, 5050);
+        assert_eq!(
+            builders,
+            vec![PeerBuilder {
+                api_url: "http://10.0.0.2:9117".to_string(),
+                // The registry address is membership host + this node's
+                // configured registry port — never request data (D18).
+                registry_address: "10.0.0.2:5050".to_string(),
+            }]
+        );
 
         // The capable node itself is excluded — "peer" means peer.
-        let url = find_peer_builder(&members, &aggregated, Some("builder"), &http);
-        assert!(url.is_none());
+        let builders = find_peer_builders(&members, &aggregated, Some("builder"), &http, 5050);
+        assert!(builders.is_empty());
     }
 }
