@@ -34,6 +34,11 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// How many event-loop ticks (~1s each) between attempts to provision an
+/// identity for a running instance that has none — frequent enough to heal
+/// promptly, infrequent enough not to hammer an unreachable council.
+const IDENTITY_RETRY_TICKS: u32 = 30;
+
 /// Grace period between SIGTERM and SIGKILL during shutdown.
 const SHUTDOWN_GRACE_SECS: u64 = 5;
 
@@ -486,6 +491,9 @@ pub struct BunAgent<G: Grill> {
     /// Set while an upgrade is staged/executing: new deploys are refused,
     /// running workloads are untouched.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Ticks since the last attempt to provision identities for running
+    /// instances that have none (see `IDENTITY_RETRY_TICKS`).
+    identity_retry_ticks: u32,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -543,6 +551,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             records_dir: None,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            identity_retry_ticks: 0,
         }
     }
 
@@ -607,6 +616,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             records_dir: None,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            identity_retry_ticks: 0,
         }
     }
 
@@ -1042,6 +1052,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             );
             if !adopted {
                 let _ = crate::grill::records::remove_record(&dir, &record.instance_id);
+                // The instance is gone for good — its key material goes
+                // with it (PKI7).
+                let identity_dir = self.instance_identity_dir(&instance_id);
+                if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&identity_dir) {
+                    eprintln!("bun: warning: failed to remove identity dir for {instance_id}: {e}");
+                }
                 continue;
             }
 
@@ -1061,6 +1077,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .register_health(instance_id.clone(), config.clone(), now);
             }
 
+            // Rebuild the workload's identity and rotation schedule from
+            // its per-instance directory, so an adopted instance keeps
+            // rotating on time instead of coming back with
+            // `identity: None` (D9). A legacy or unprovisioned directory
+            // loads as `None` and the rotation loop provisions afresh.
+            let identity_dir = self.instance_identity_dir(&instance_id);
+            let identity = match crate::sesame::identity::load_identity(&identity_dir) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    eprintln!("bun: warning: could not restore identity for {instance_id}: {e}");
+                    None
+                }
+            };
+            let identity_mount = identity.is_some().then(|| identity_dir.clone());
+
             let key = (record.app_name.clone(), record.namespace.clone());
             let instance = WorkloadInstance {
                 id: instance_id.clone(),
@@ -1078,8 +1109,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 is_job: record.is_job,
                 image: record.image.clone(),
                 oci_spec: Some(record.oci_spec.clone()),
-                identity: None,
-                identity_mount: None,
+                identity,
+                identity_mount,
             };
             self.supervisor
                 .instances
@@ -1100,6 +1131,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if adopted_count > 0 {
             println!("bun: adopted {adopted_count} running instance(s) from a previous process");
         }
+
+        // Identity dirs with no live owner — legacy app-scoped layouts and
+        // instances that died while bun was down — are stale key material.
+        self.sweep_orphaned_identity_dirs();
+
         adopted_count
     }
 
@@ -2377,6 +2413,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // instead of falling back to loopback.
                 let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
                     std::collections::HashMap::new();
+                // Every instance whose identity dir was prepared, so a
+                // rollback can remove the dirs (including the failed
+                // instance's — it never reaches `new_ids`).
+                let mut new_prepared: Vec<InstanceId> = Vec::new();
                 let mut new_failed = false;
                 for i in 0..replica_count {
                     let new_id = crate::grill::InstanceId(format!("{app_name}-g{deploy_gen}-{i}"));
@@ -2419,14 +2459,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         new_failed = true;
                         break;
                     }
+                    // Same pre-create seam as the fresh path: the new
+                    // instance's identity dir (its bind-mount source, and
+                    // tmpfs on Linux root) exists before create (PKI7).
+                    new_prepared.push(new_id.clone());
+                    if let Err(e) = self.prepare_instance_identity(&new_id) {
+                        eprintln!("bun: warning: {e}");
+                    }
                     let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
                     let oci_spec = Self::oci_spec_with_secrets(
                         app_name,
                         namespace,
                         spec,
+                        &new_id.0,
                         host_port,
                         &cgroup_path.to_string_lossy(),
-                        None,
+                        Some(&self.volumes_dir),
                         None,
                         identities,
                     );
@@ -2549,6 +2597,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             let _ = self.supervisor.port_allocator.release(port).await;
                         }
                     }
+                    // Their identity dirs (and the failed instance's) go
+                    // too — rolled-back key material must not linger (PKI7).
+                    for new_id in &new_prepared {
+                        self.cleanup_instance_identity(new_id);
+                    }
                     // Record failed deploy in history
                     let entry = crate::meat::deploy_types::DeployHistoryEntry {
                         id: crate::meat::deploy_types::DeployId(
@@ -2587,6 +2640,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // cgroup id. Old and new instances have distinct cgroups, so
                     // this never touches the just-programmed new instance.
                     self.clear_egress(old_id).await;
+                    // The retiring instance's identity (key material and
+                    // rotation entry) goes with it (PKI7) — the new
+                    // instance provisioned its own above.
+                    self.cleanup_instance_identity(old_id);
                 }
                 self.supervisor.remove_app(app_name, namespace).await;
                 self.remove_backend_ebpf(app_name).await;
@@ -2775,6 +2832,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 }
 
+                // Provision workload identity (SPIFFE cert + OIDC JWT).
+                // Previously only the rolling path did this, so freshly
+                // deployed workloads never received an identity (PKI7).
+                // No-op in standalone mode; a failure here is retried by
+                // the rotation loop rather than failing the deploy.
+                self.provision_identity(app_name, namespace, id, false, events)
+                    .await;
+
                 let _ = events
                     .send(ApplyEvent::InstanceCreated {
                         id: id.0.clone(),
@@ -2955,6 +3020,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
+        instance_id: &str,
         host_port: Option<u16>,
         cgroup_str: &str,
         volumes_dir: Option<&std::path::Path>,
@@ -2982,6 +3048,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             app_name,
             namespace,
             spec,
+            instance_id,
             host_port,
             cgroup_str,
             volumes_dir,
@@ -3083,10 +3150,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })?;
         }
 
+        // The per-instance identity directory must exist before create —
+        // it's the bind-mount source, and on Linux root mode the backing
+        // tmpfs is mounted here, before anything runs (PKI7). Best-effort:
+        // runtimes that bind-mount it (runc) fail create on a missing
+        // source anyway; runtimes that ignore mounts keep working.
+        if let Err(e) = self.prepare_instance_identity(instance_id) {
+            eprintln!("bun: warning: {e}");
+        }
+
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
             spec,
+            &instance_id.0,
             host_port,
             &cgroup_str,
             Some(&self.volumes_dir),
@@ -4376,6 +4453,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in &instances {
             let _ = self.service_map.remove_backend(app_name, &id.0);
             self.clear_egress(id).await;
+            // Key material must not outlive the instance (PKI7): remove
+            // the identity dir and unmount its tmpfs backing.
+            self.cleanup_instance_identity(id);
         }
         self.remove_backend_ebpf(app_name).await;
         let _ = self.service_map.unregister_app(app_name);
@@ -4432,6 +4512,75 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             eprintln!("warning: firewall reconciliation failed: {e}");
         } else {
             self.last_firewall_nodes = Some(cluster_nodes);
+        }
+    }
+
+    /// The per-instance identity directory (PKI7): keyed by instance id so
+    /// replicas never share (or clobber) key material.
+    fn instance_identity_dir(&self, instance_id: &InstanceId) -> std::path::PathBuf {
+        crate::sesame::identity::instance_identity_dir(&self.volumes_dir, &instance_id.0)
+    }
+
+    /// The uid/gid identity files should be owned by, so the container
+    /// process can read its owner-only key: the OCI runtime user (65534),
+    /// but only when we're root and can actually chown. In rootless mode
+    /// the files stay owned by the bun user — the same user namespace the
+    /// workload runs in.
+    fn workload_identity_owner() -> Option<(u32, u32)> {
+        #[cfg(unix)]
+        {
+            nix::unistd::geteuid().is_root().then_some((65534, 65534))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// Prepare an instance's identity directory before its container is
+    /// created — the bind-mount source must exist, and on Linux root mode
+    /// this is where the backing tmpfs gets mounted (PKI7).
+    fn prepare_instance_identity(&self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let dir = self.instance_identity_dir(instance_id);
+        crate::sesame::identity::prepare_identity_dir(&dir).map_err(|e| BunError::SecurityError {
+            reason: format!("failed to prepare identity dir for {instance_id}: {e}"),
+        })
+    }
+
+    /// Remove an instance's identity directory (and drop the in-memory
+    /// identity), so key material never outlives the instance (PKI7).
+    fn cleanup_instance_identity(&mut self, instance_id: &InstanceId) {
+        let dir = self.instance_identity_dir(instance_id);
+        if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&dir) {
+            eprintln!("bun: warning: failed to remove identity dir for {instance_id}: {e}");
+        }
+        if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
+            inst.identity = None;
+            inst.identity_mount = None;
+        }
+    }
+
+    /// Remove identity directories that don't belong to any tracked
+    /// instance. Runs once after adoption: legacy app-scoped directories
+    /// and instances that died while bun was down both get swept, so
+    /// stale key material never lingers (PKI7).
+    fn sweep_orphaned_identity_dirs(&self) {
+        let root = self.volumes_dir.join(".identity");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let tracked = self
+                .supervisor
+                .get_instance(&InstanceId(name.clone()))
+                .is_some();
+            if tracked {
+                continue;
+            }
+            if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&entry.path()) {
+                eprintln!("bun: warning: failed to sweep stale identity dir {name}: {e}");
+            }
         }
     }
 
@@ -4501,15 +4650,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     jwt,
                 );
 
-                // Write to the identity mount
-                let identity_dir = self
-                    .volumes_dir
-                    .join(".identity")
-                    .join(namespace)
-                    .join(app_name);
-                if let Err(e) =
-                    crate::sesame::identity::write_identity_to_tmpfs(&identity, &identity_dir)
-                {
+                // Write to the instance's own identity mount (PKI7). The
+                // dir was prepared before the container was created; a
+                // rotation for an adopted instance may find it missing, so
+                // prepare (idempotently) here too.
+                let identity_dir = self.instance_identity_dir(instance_id);
+                if let Err(e) = crate::sesame::identity::prepare_identity_dir(&identity_dir) {
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("identity: failed to prepare directory: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+                if let Err(e) = crate::sesame::identity::write_identity_files(
+                    &identity,
+                    &identity_dir,
+                    Self::workload_identity_owner(),
+                ) {
                     let _ = events
                         .send(ApplyEvent::Progress {
                             message: format!("identity: failed to write files: {e}"),
@@ -4654,37 +4812,59 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(format!("signature attached to {manifest_digest}"))
     }
 
-    /// Check identity rotation for all instances.
+    /// Check identity rotation for all instances, and (rate-limited)
+    /// provision identities for running instances that don't have one —
+    /// a failed CSR at deploy time, or an adopted instance whose
+    /// directory predates the per-instance layout, heals here (D9).
     async fn check_identity_rotation(&mut self) {
         let now = std::time::SystemTime::now();
         let mut needs_rotation = Vec::new();
 
+        self.identity_retry_ticks += 1;
+        let retry_missing = self.identity_retry_ticks >= IDENTITY_RETRY_TICKS;
+        if retry_missing {
+            self.identity_retry_ticks = 0;
+        }
+
         for inst in self.supervisor.list_instances() {
-            if let Some(ref identity) = inst.identity {
-                let state = crate::sesame::identity::rotation_state(identity, now);
-                match state {
-                    crate::sesame::identity::RotationState::NeedsRotation => {
-                        needs_rotation.push((
-                            inst.id.clone(),
-                            inst.app_name.clone(),
-                            inst.namespace.clone(),
-                            inst.is_job,
-                        ));
-                    }
-                    crate::sesame::identity::RotationState::Expired => {
-                        eprintln!(
-                            "warning: identity expired for {} ({})",
-                            inst.id.0, inst.app_name
-                        );
-                    }
-                    crate::sesame::identity::RotationState::GracePeriod => {
-                        eprintln!(
-                            "warning: identity in grace period for {} ({})",
-                            inst.id.0, inst.app_name
-                        );
-                    }
-                    crate::sesame::identity::RotationState::Valid => {}
+            let Some(ref identity) = inst.identity else {
+                // Apps only: job containers don't mount an identity dir.
+                if retry_missing
+                    && !inst.is_job
+                    && inst.state == crate::grill::state::ContainerState::Running
+                {
+                    needs_rotation.push((
+                        inst.id.clone(),
+                        inst.app_name.clone(),
+                        inst.namespace.clone(),
+                        inst.is_job,
+                    ));
                 }
+                continue;
+            };
+            let state = crate::sesame::identity::rotation_state(identity, now);
+            match state {
+                crate::sesame::identity::RotationState::NeedsRotation => {
+                    needs_rotation.push((
+                        inst.id.clone(),
+                        inst.app_name.clone(),
+                        inst.namespace.clone(),
+                        inst.is_job,
+                    ));
+                }
+                crate::sesame::identity::RotationState::Expired => {
+                    eprintln!(
+                        "warning: identity expired for {} ({})",
+                        inst.id.0, inst.app_name
+                    );
+                }
+                crate::sesame::identity::RotationState::GracePeriod => {
+                    eprintln!(
+                        "warning: identity in grace period for {} ({})",
+                        inst.id.0, inst.app_name
+                    );
+                }
+                crate::sesame::identity::RotationState::Valid => {}
             }
         }
 
@@ -5710,6 +5890,114 @@ mod tests {
         agent_handle.await.unwrap();
     }
 
+    // ---- per-instance workload identity lifecycle (PKI7/D9) ----
+
+    /// Names of the entries under `{volumes}/.identity`, sorted.
+    fn identity_dir_names(volumes: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(volumes.join(".identity"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// PKI7: deploying two replicas prepares one identity directory per
+    /// instance, and stopping the app removes them (key material never
+    /// outlives the instance).
+    #[tokio::test]
+    async fn deploy_prepares_and_stop_removes_per_instance_identity_dirs() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let config = Config::parse(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            replicas = 2
+        "#,
+        )
+        .unwrap();
+        let events = send_deploy(&tx, config).await;
+        expect_complete(&events);
+
+        assert_eq!(
+            identity_dir_names(volumes.path()),
+            vec!["web-0".to_string(), "web-1".to_string()],
+            "one identity dir per instance"
+        );
+
+        // Simulate provisioned key material so the stop has something to
+        // scrub (single-node mode never reaches the council).
+        std::fs::write(
+            volumes.path().join(".identity/web-0/key.pem"),
+            b"PRIVATE KEY",
+        )
+        .unwrap();
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "web".to_string(),
+            namespace: "default".to_string(),
+            response: resp_tx,
+        })
+        .await
+        .unwrap();
+        resp_rx.await.unwrap().unwrap();
+
+        assert!(
+            identity_dir_names(volumes.path()).is_empty(),
+            "stop removes every instance identity dir"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    /// PKI7: a rolling redeploy leaves exactly the live (new) instances'
+    /// identity dirs — the retired generation's key material is gone.
+    #[tokio::test]
+    async fn rolling_redeploy_leaves_only_live_instances_identity_dirs() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let events = send_deploy(&tx, basic_config()).await;
+        expect_complete(&events);
+        assert_eq!(
+            identity_dir_names(volumes.path()),
+            vec!["web-0".to_string()]
+        );
+
+        // Redeploy: the rolling path replaces web-0 with web-g1-0.
+        let events = send_deploy(&tx, basic_config()).await;
+        let (_, instances) = expect_complete(&events);
+        let mut expected: Vec<String> = instances.to_vec();
+        expected.sort();
+
+        assert_eq!(
+            identity_dir_names(volumes.path()),
+            expected,
+            "exactly the live instances' dirs survive the redeploy"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
     fn job_config() -> Config {
         let toml_str = r#"
             [job.migrate]
@@ -6053,6 +6341,130 @@ mod tests {
                 .supervisor
                 .get_instance(&InstanceId("web-0".to_string()))
                 .is_none()
+        );
+    }
+
+    /// Write a real identity bundle into `volumes/.identity/{instance}`
+    /// and return it, so adoption tests have on-disk state to restore.
+    fn write_test_identity(
+        volumes: &std::path::Path,
+        instance: &str,
+    ) -> crate::sesame::types::WorkloadIdentity {
+        let uri = crate::sesame::types::SpiffeUri {
+            trust_domain: "default".to_string(),
+            namespace: "default".to_string(),
+            workload_type: crate::sesame::types::WorkloadType::App,
+            name: "web".to_string(),
+        };
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("default", b"test-ikm-32-bytes!").unwrap();
+        let (csr_der, private_key_der) =
+            crate::sesame::identity::create_workload_csr(&uri).unwrap();
+        let cert_der = crate::sesame::identity::validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            crate::sesame::types::SerialNumber(42),
+            &hierarchy.workload.signing_keypair,
+            &hierarchy.workload.certificate_params,
+            SystemTime::now(),
+        )
+        .unwrap();
+        let identity = crate::sesame::identity::build_identity_bundle(
+            uri,
+            cert_der,
+            private_key_der,
+            &hierarchy.workload.ca.certificate_der,
+            &hierarchy.root.ca.certificate_der,
+            "adopted-jwt".to_string(),
+        );
+        let dir = crate::sesame::identity::instance_identity_dir(volumes, instance);
+        crate::sesame::identity::write_identity_files(&identity, &dir, None).unwrap();
+        identity
+    }
+
+    /// D9: adoption rebuilds the identity and its rotation schedule from
+    /// the per-instance directory — no `identity: None`, no fresh CSR.
+    /// The restored schedule means the next rotation fires exactly when
+    /// the pre-restart one would have.
+    #[tokio::test]
+    async fn adoption_restores_identity_and_rotation_schedule_from_disk() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        agent.set_records_dir(records.path().to_path_buf());
+
+        let written = write_test_identity(volumes.path(), "web-0");
+        let record = adoption_record("web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        let id = InstanceId("web-0".to_string());
+        grill.set_adopt_result(&id, true);
+
+        assert_eq!(agent.adopt_recorded_instances().await, 1);
+
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        let restored = instance
+            .identity
+            .as_ref()
+            .expect("adopted instance keeps its identity");
+        assert_eq!(restored.spiffe_uri, written.spiffe_uri);
+        assert_eq!(restored.private_key_der, written.private_key_der);
+        assert_eq!(
+            restored.next_rotation, written.next_rotation,
+            "the rotation schedule is the disk one, not a fresh clock"
+        );
+        assert_eq!(
+            instance.identity_mount.as_deref(),
+            Some(crate::sesame::identity::instance_identity_dir(volumes.path(), "web-0").as_path())
+        );
+
+        // The rotation loop fires on the restored schedule: fresh now,
+        // then due once the recorded next_rotation passes.
+        assert_eq!(
+            crate::sesame::identity::rotation_state(restored, written.issued_at),
+            crate::sesame::identity::RotationState::Valid
+        );
+        assert_eq!(
+            crate::sesame::identity::rotation_state(
+                restored,
+                written.next_rotation + std::time::Duration::from_secs(1)
+            ),
+            crate::sesame::identity::RotationState::NeedsRotation
+        );
+    }
+
+    /// PKI7: identity directories with no live owner — a legacy
+    /// app-scoped layout, or an instance that died while bun was down —
+    /// are swept at adoption, so stale key material never lingers.
+    #[tokio::test]
+    async fn adoption_sweeps_orphaned_identity_dirs() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        agent.set_records_dir(records.path().to_path_buf());
+
+        // A live instance's dir, a legacy app-scoped dir, and a dead
+        // instance's leftovers.
+        write_test_identity(volumes.path(), "web-0");
+        let legacy = volumes.path().join(".identity/default");
+        std::fs::create_dir_all(legacy.join("web")).unwrap();
+        std::fs::write(legacy.join("web/key.pem"), b"legacy key").unwrap();
+        let dead = volumes.path().join(".identity/old-app-0");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("key.pem"), b"dead key").unwrap();
+
+        let record = adoption_record("web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        let id = InstanceId("web-0".to_string());
+        grill.set_adopt_result(&id, true);
+
+        assert_eq!(agent.adopt_recorded_instances().await, 1);
+
+        assert_eq!(
+            identity_dir_names(volumes.path()),
+            vec!["web-0".to_string()],
+            "only the adopted instance's identity dir survives"
         );
     }
 

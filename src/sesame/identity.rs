@@ -4,13 +4,14 @@
 //! workers generate keypairs and CSRs, council nodes validate and sign them,
 //! and identity bundles are delivered to workloads via tmpfs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber as RcgenSerial,
 };
+use serde::{Deserialize, Serialize};
 
 use super::cert;
 use super::types::{SerialNumber, SpiffeUri, WorkloadIdentity};
@@ -24,6 +25,11 @@ pub const ROTATION_INTERVAL: Duration = Duration::from_secs(1800);
 /// Maximum grace period extension when council is unreachable: 4 hours.
 pub const GRACE_PERIOD_EXTENSION: Duration = Duration::from_secs(4 * 3600);
 
+/// How far a workload certificate's `not_before` is backdated, so a signer
+/// and verifier whose clocks disagree by a few minutes still accept a
+/// freshly issued certificate.
+pub const CLOCK_SKEW_BACKDATE: Duration = Duration::from_secs(300);
+
 /// Errors from workload identity operations.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -35,8 +41,10 @@ pub enum IdentityError {
     CsrValidationFailed(String),
     #[error("failed to sign workload certificate: {0}")]
     SignFailed(String),
-    #[error("failed to write identity to tmpfs: {0}")]
+    #[error("failed to write identity files: {0}")]
     WriteFailed(#[from] std::io::Error),
+    #[error("invalid identity file {file}: {reason}")]
+    InvalidFile { file: String, reason: String },
     #[error("OIDC error: {0}")]
     Oidc(#[from] super::oidc::OidcError),
     #[error("CA error: {0}")]
@@ -96,19 +104,28 @@ pub fn create_workload_csr(spiffe_uri: &SpiffeUri) -> Result<(Vec<u8>, Vec<u8>),
 /// The council calls this after verifying that the requesting node is
 /// actually scheduled to run the workload. Returns the signed
 /// certificate DER.
+///
+/// The only thing taken from the CSR is its public key. Every other
+/// certificate field — the SAN list in particular — is rebuilt
+/// server-side from what the council *expects*, so a CSR smuggling
+/// extra SANs (another workload's SPIFFE URI, a DNS name) never gets
+/// them signed (PKI6). Validity is an exact timestamped window around
+/// `now` (injected for testability), not calendar dates.
 pub fn validate_and_sign_csr(
     csr_der: &[u8],
     expected_spiffe_uri: &SpiffeUri,
     serial: SerialNumber,
     workload_ca_keypair: &KeyPair,
     workload_ca_params: &CertificateParams,
+    now: SystemTime,
 ) -> Result<Vec<u8>, IdentityError> {
     let csr_der_owned: Vec<u8> = csr_der.to_vec();
     let csr_der_ref = rustls::pki_types::CertificateSigningRequestDer::from(csr_der_owned);
-    let mut csr_params = CertificateSigningRequestParams::from_der(&csr_der_ref)
+    let csr_params = CertificateSigningRequestParams::from_der(&csr_der_ref)
         .map_err(|e| IdentityError::CsrValidationFailed(format!("failed to parse CSR: {e}")))?;
 
-    // Validate the SPIFFE URI SAN
+    // The CSR must claim the identity the council expects. This is a
+    // request check only — the claimed SAN list is never signed as-is.
     let expected_uri = expected_spiffe_uri.to_uri();
     let has_matching_uri = csr_params
         .params
@@ -121,17 +138,30 @@ pub fn validate_and_sign_csr(
         )));
     }
 
-    // Override lifetime and serial for the signed certificate
-    let now = SystemTime::now();
-    let not_after_time = now + WORKLOAD_CERT_LIFETIME;
-    csr_params.params.not_before =
-        rcgen::date_time_ymd(time_to_year(now), time_to_month(now), time_to_day(now));
-    csr_params.params.not_after = rcgen::date_time_ymd(
-        time_to_year(not_after_time),
-        time_to_month(not_after_time),
-        time_to_day(not_after_time),
-    );
-    csr_params.params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
+    // Rebuild the certificate contents server-side.
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, &expected_uri);
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.subject_alt_names =
+        vec![SanType::URI(expected_uri.try_into().map_err(
+            |e: rcgen::Error| IdentityError::SignFailed(e.to_string()),
+        )?)];
+    params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
+
+    // Exact validity window: a one-hour certificate is valid for one hour
+    // (plus the skew backdate), not until midnight.
+    params.not_before = time::OffsetDateTime::from(now - CLOCK_SKEW_BACKDATE);
+    params.not_after = time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME);
 
     // Reconstruct the CA certificate object for signing
     let ca_cert = workload_ca_params
@@ -139,8 +169,8 @@ pub fn validate_and_sign_csr(
         .self_signed(workload_ca_keypair)
         .map_err(|e| IdentityError::SignFailed(format!("failed to reconstruct CA cert: {e}")))?;
 
-    let signed = csr_params
-        .signed_by(&ca_cert, workload_ca_keypair)
+    let signed = params
+        .signed_by(&csr_params.public_key, &ca_cert, workload_ca_keypair)
         .map_err(|e| IdentityError::SignFailed(e.to_string()))?;
 
     Ok(signed.der().to_vec())
@@ -178,29 +208,163 @@ pub fn build_identity_bundle(
 }
 
 // ---------------------------------------------------------------------------
-// Tmpfs delivery
+// Per-instance identity directories
 // ---------------------------------------------------------------------------
 
-/// Write identity files to a workload's tmpfs mount point.
+/// Metadata sidecar file name inside an instance identity directory.
+const IDENTITY_META_FILE: &str = "meta.json";
+
+/// Size cap for the tmpfs backing an instance identity directory. The
+/// bundle is a few kilobytes; 1 MiB leaves generous headroom.
+#[cfg(target_os = "linux")]
+const IDENTITY_TMPFS_SIZE: &str = "1m";
+
+/// Rotation metadata persisted next to the identity files, so a restarted
+/// Bun can rebuild the rotation schedule from disk instead of re-CSRing
+/// from scratch (D9). Contains no secrets.
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkloadIdentityMeta {
+    schema: u32,
+    spiffe_uri: SpiffeUri,
+    issued_at: SystemTime,
+    expires_at: SystemTime,
+    next_rotation: SystemTime,
+    grace_extended: bool,
+}
+
+/// The identity directory for one workload instance:
+/// `{volumes_dir}/.identity/{instance_id}` (PKI7). Keying by instance —
+/// not by app — is what stops replicas of the same app overwriting one
+/// another's private key.
+pub fn instance_identity_dir(volumes_dir: &Path, instance_id: &str) -> PathBuf {
+    volumes_dir.join(".identity").join(instance_id)
+}
+
+/// Prepare an instance's identity directory before its container is
+/// created (the bind-mount source must exist).
 ///
-/// Creates the directory and writes five files atomically (write to
-/// `.tmp` then rename):
+/// On Linux, running as root, the directory is backed by a small
+/// dedicated tmpfs so private keys never touch persistent storage.
+/// Everywhere else (macOS, rootless) it is a plain `0700` directory —
+/// a documented gap, not silent parity. Idempotent: re-driving a
+/// restart never stacks mounts.
+pub fn prepare_identity_dir(dir: &Path) -> Result<(), IdentityError> {
+    std::fs::create_dir_all(dir)?;
+    restrict_dir_permissions(dir)?;
+
+    #[cfg(target_os = "linux")]
+    if nix::unistd::geteuid().is_root() && !is_mount_point(dir) {
+        let status = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o"])
+            .arg(format!("size={IDENTITY_TMPFS_SIZE},mode=0700"))
+            .arg("reliaburger-identity")
+            .arg(dir)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            other => {
+                // Fall back to the plain directory rather than failing the
+                // deploy: the key material is still 0700, just disk-backed.
+                eprintln!(
+                    "sesame: warning: tmpfs mount for {} failed ({other:?}); \
+                     identity files will be disk-backed",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove an instance's identity directory, unmounting its tmpfs backing
+/// first when present. Key material must not outlive the instance (PKI7).
+pub fn cleanup_identity_dir(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    if is_mount_point(dir) {
+        let status = std::process::Command::new("umount").arg(dir).status()?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
+                "umount {} failed",
+                dir.display()
+            )));
+        }
+    }
+
+    std::fs::remove_dir_all(dir)
+}
+
+/// Owner-only directory permissions (no-op off Unix).
+fn restrict_dir_permissions(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Whether `dir` is currently a mount point (Linux: scan
+/// `/proc/self/mounts` for its canonical path).
+#[cfg(target_os = "linux")]
+fn is_mount_point(dir: &Path) -> bool {
+    let Ok(canonical) = dir.canonicalize() else {
+        return false;
+    };
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    let needle = canonical.to_string_lossy();
+    mounts
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|mount_point| mount_point == needle)
+}
+
+/// Write a workload identity's files into its per-instance directory.
+///
+/// Writes six files atomically (write to `.tmp` then rename):
 /// - `cert.pem` — the workload certificate
-/// - `key.pem` — the private key
+/// - `key.pem` — the private key (owner-only)
 /// - `ca.pem` — the CA trust chain
 /// - `bundle.pem` — cert + CA chain concatenated
-/// - `token` — the OIDC JWT string
-pub fn write_identity_to_tmpfs(
+/// - `token` — the OIDC JWT string (owner-only)
+/// - `meta.json` — rotation metadata for adoption after a Bun restart
+///
+/// When `owner` is set (Linux root mode), every file and the directory
+/// itself are chowned to the workload's runtime UID/GID so the container
+/// process — not just root — can read its own owner-only key.
+pub fn write_identity_files(
     identity: &WorkloadIdentity,
-    base_path: &Path,
+    dir: &Path,
+    owner: Option<(u32, u32)>,
 ) -> Result<(), IdentityError> {
-    let dir = base_path.join("identity");
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir)?;
 
     let cert_pem = cert::der_to_pem(&identity.certificate_der, "CERTIFICATE");
     let key_pem = cert::der_to_pem(&identity.private_key_der, "PRIVATE KEY");
 
     let bundle_pem = format!("{}{}", cert_pem, identity.ca_chain_pem);
+
+    let meta = WorkloadIdentityMeta {
+        schema: 1,
+        spiffe_uri: identity.spiffe_uri.clone(),
+        issued_at: identity.issued_at,
+        expires_at: identity.expires_at,
+        next_rotation: identity.next_rotation,
+        grace_extended: identity.grace_extended,
+    };
+    let meta_json =
+        serde_json::to_string_pretty(&meta).map_err(|e| IdentityError::InvalidFile {
+            file: IDENTITY_META_FILE.to_string(),
+            reason: e.to_string(),
+        })?;
 
     atomic_write(&dir.join("cert.pem"), cert_pem.as_bytes())?;
     // The private key and the JWT are secrets — owner-only (M25). The certs
@@ -213,7 +377,80 @@ pub fn write_identity_to_tmpfs(
         identity.jwt_token.as_bytes(),
         Some(0o600),
     )?;
+    atomic_write(&dir.join(IDENTITY_META_FILE), meta_json.as_bytes())?;
 
+    if let Some((uid, gid)) = owner {
+        chown_identity_dir(dir, uid, gid)?;
+    }
+
+    Ok(())
+}
+
+/// Load a workload identity back from its per-instance directory.
+///
+/// Returns `Ok(None)` when no identity has been written there (no
+/// `meta.json`) — a legacy app-scoped directory or a not-yet-provisioned
+/// instance. Used at adoption so a restarted Bun keeps each workload's
+/// identity and rotation schedule instead of `identity: None` (D9).
+pub fn load_identity(dir: &Path) -> Result<Option<WorkloadIdentity>, IdentityError> {
+    let meta_path = dir.join(IDENTITY_META_FILE);
+    if !meta_path.exists() {
+        return Ok(None);
+    }
+
+    let meta_json = std::fs::read_to_string(&meta_path)?;
+    let meta: WorkloadIdentityMeta =
+        serde_json::from_str(&meta_json).map_err(|e| IdentityError::InvalidFile {
+            file: IDENTITY_META_FILE.to_string(),
+            reason: e.to_string(),
+        })?;
+
+    let certificate_der = read_pem_der(dir, "cert.pem")?;
+    let private_key_der = read_pem_der(dir, "key.pem")?;
+    let ca_chain_pem = std::fs::read_to_string(dir.join("ca.pem"))?;
+    let jwt_token = std::fs::read_to_string(dir.join("token"))?;
+
+    Ok(Some(WorkloadIdentity {
+        spiffe_uri: meta.spiffe_uri,
+        certificate_der,
+        private_key_der,
+        ca_chain_pem,
+        jwt_token,
+        issued_at: meta.issued_at,
+        expires_at: meta.expires_at,
+        next_rotation: meta.next_rotation,
+        grace_extended: meta.grace_extended,
+    }))
+}
+
+/// Parse a PEM file back to its DER contents.
+fn read_pem_der(dir: &Path, file: &str) -> Result<Vec<u8>, IdentityError> {
+    let content = std::fs::read_to_string(dir.join(file))?;
+    let parsed = ::pem::parse(&content).map_err(|e| IdentityError::InvalidFile {
+        file: file.to_string(),
+        reason: e.to_string(),
+    })?;
+    Ok(parsed.contents().to_vec())
+}
+
+/// Chown the identity directory and every file in it (Unix only).
+#[cfg(unix)]
+fn chown_identity_dir(dir: &Path, uid: u32, gid: u32) -> Result<(), IdentityError> {
+    let uid = nix::unistd::Uid::from_raw(uid);
+    let gid = nix::unistd::Gid::from_raw(gid);
+    let chown = |path: &Path| -> std::io::Result<()> {
+        nix::unistd::chown(path, Some(uid), Some(gid))
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+    };
+    chown(dir)?;
+    for entry in std::fs::read_dir(dir)? {
+        chown(&entry?.path())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_identity_dir(_dir: &Path, _uid: u32, _gid: u32) -> Result<(), IdentityError> {
     Ok(())
 }
 
@@ -286,59 +523,6 @@ pub fn extend_grace_period(identity: &mut WorkloadIdentity) -> bool {
     identity.expires_at = max_expiry;
     identity.grace_extended = true;
     true
-}
-
-// ---------------------------------------------------------------------------
-// Time helpers (same approach as ca.rs)
-// ---------------------------------------------------------------------------
-
-fn system_time_to_date_components(t: SystemTime) -> (i32, u8, u8) {
-    let duration = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let secs = duration.as_secs() as i64;
-    let days = secs / 86400;
-    let mut year = 1970 + (days / 365) as i32;
-    let mut day_of_year = days - ((year - 1970) as i64 * 365 + ((year - 1969) / 4) as i64);
-
-    while day_of_year < 0 {
-        year -= 1;
-        day_of_year = days - ((year - 1970) as i64 * 365 + ((year - 1969) / 4) as i64);
-    }
-
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let month_days: [i64; 12] = if is_leap {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 0u8;
-    let mut remaining = day_of_year;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining < md {
-            month = (i + 1) as u8;
-            break;
-        }
-        remaining -= md;
-    }
-    if month == 0 {
-        month = 12;
-    }
-    let day = (remaining + 1).max(1) as u8;
-    (year, month, day)
-}
-
-fn time_to_year(t: SystemTime) -> i32 {
-    system_time_to_date_components(t).0
-}
-
-fn time_to_month(t: SystemTime) -> u8 {
-    system_time_to_date_components(t).1
-}
-
-fn time_to_day(t: SystemTime) -> u8 {
-    system_time_to_date_components(t).2
 }
 
 #[cfg(test)]
@@ -440,8 +624,15 @@ mod tests {
         let (csr_der, _private_key_der) = create_workload_csr(&uri).unwrap();
         let (ca_kp, ca_params, _, _) = test_workload_ca();
 
-        let cert_der =
-            validate_and_sign_csr(&csr_der, &uri, SerialNumber(100), &ca_kp, &ca_params).unwrap();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(100),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         assert!(!cert_der.is_empty());
 
@@ -462,8 +653,14 @@ mod tests {
         let (csr_der, _) = create_workload_csr(&uri).unwrap();
         let (ca_kp, ca_params, _, _) = test_workload_ca();
 
-        let result =
-            validate_and_sign_csr(&csr_der, &wrong_uri, SerialNumber(100), &ca_kp, &ca_params);
+        let result = validate_and_sign_csr(
+            &csr_der,
+            &wrong_uri,
+            SerialNumber(100),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -478,17 +675,145 @@ mod tests {
         let (csr_der, _) = create_workload_csr(&uri).unwrap();
         let (ca_kp, ca_params, _, _) = test_workload_ca();
 
-        let cert_der =
-            validate_and_sign_csr(&csr_der, &uri, SerialNumber(100), &ca_kp, &ca_params).unwrap();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(100),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
         // End-entity cert, not a CA
         assert!(!cert.is_ca());
-        // Validity period exists (rcgen uses day granularity, so
-        // not_after >= not_before is the best we can check)
-        assert!(cert.validity().not_after >= cert.validity().not_before);
+        // A real validity window: strictly increasing, exact-second precision
+        assert!(cert.validity().not_after > cert.validity().not_before);
         // Subject contains the SPIFFE URI
         assert!(cert.subject().to_string().contains("test-cluster"));
+    }
+
+    /// PKI6: a one-hour certificate's validity window is one hour (plus the
+    /// clock-skew backdate), not equal midnight calendar dates.
+    #[test]
+    fn one_hour_certificate_window_is_exact_not_calendar_dates() {
+        let uri = test_spiffe_uri();
+        let (csr_der, _) = create_workload_csr(&uri).unwrap();
+        let (ca_kp, ca_params, _, _) = test_workload_ca();
+
+        // Injected clock: a fixed instant with no sub-second noise.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_752_000_000);
+        let cert_der =
+            validate_and_sign_csr(&csr_der, &uri, SerialNumber(9), &ca_kp, &ca_params, now)
+                .unwrap();
+
+        let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+        let not_before = cert.validity().not_before.timestamp();
+        let not_after = cert.validity().not_after.timestamp();
+
+        let now_secs = 1_752_000_000i64;
+        assert_eq!(
+            not_before,
+            now_secs - CLOCK_SKEW_BACKDATE.as_secs() as i64,
+            "not_before is now minus the skew backdate"
+        );
+        assert_eq!(
+            not_after,
+            now_secs + WORKLOAD_CERT_LIFETIME.as_secs() as i64,
+            "not_after is now plus the configured lifetime"
+        );
+    }
+
+    /// PKI6: `check_validity` accepts a fresh certificate and rejects the
+    /// same certificate once its exact window has passed (injected clock).
+    #[test]
+    fn check_validity_accepts_fresh_and_rejects_expired_workload_cert() {
+        let uri = test_spiffe_uri();
+        let (csr_der, _) = create_workload_csr(&uri).unwrap();
+        let (ca_kp, ca_params, _, _) = test_workload_ca();
+
+        let issued_at = SystemTime::now();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(9),
+            &ca_kp,
+            &ca_params,
+            issued_at,
+        )
+        .unwrap();
+
+        // Valid right now.
+        cert::check_validity_at(&cert_der, issued_at).unwrap();
+        // Expired one second past the window.
+        let past_expiry = issued_at + WORKLOAD_CERT_LIFETIME + Duration::from_secs(1);
+        assert!(matches!(
+            cert::check_validity_at(&cert_der, past_expiry),
+            Err(cert::CertError::Expired)
+        ));
+        // Not yet valid before the backdated start.
+        let before_start = issued_at - CLOCK_SKEW_BACKDATE - Duration::from_secs(1);
+        assert!(matches!(
+            cert::check_validity_at(&cert_der, before_start),
+            Err(cert::CertError::NotYetValid)
+        ));
+    }
+
+    /// PKI6: the signer rebuilds the SAN list server-side. A CSR smuggling
+    /// another workload's SPIFFE URI and a DNS name still yields a
+    /// certificate containing exactly the expected URI SAN.
+    #[test]
+    fn smuggled_csr_sans_are_not_signed() {
+        let uri = test_spiffe_uri();
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+
+        // A hand-built CSR: the legitimate SAN plus two smuggled ones.
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![
+            SanType::URI(uri.to_uri().try_into().unwrap()),
+            SanType::URI(
+                "spiffe://test-cluster/ns/default/app/victim"
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+            ),
+            SanType::DnsName(
+                "payments.internal.example.com"
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+            ),
+        ];
+        let csr = params.serialize_request(&key_pair).unwrap();
+
+        let (ca_kp, ca_params, _, _) = test_workload_ca();
+        let cert_der = validate_and_sign_csr(
+            csr.der(),
+            &uri,
+            SerialNumber(7),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        )
+        .unwrap();
+
+        let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+        let san = cert
+            .subject_alternative_name()
+            .unwrap()
+            .expect("issued certificate carries a SAN extension");
+
+        let mut uris = Vec::new();
+        let mut other_names = 0usize;
+        for name in &san.value.general_names {
+            match name {
+                x509_parser::extensions::GeneralName::URI(u) => uris.push(u.to_string()),
+                _ => other_names += 1,
+            }
+        }
+        assert_eq!(uris, vec![uri.to_uri()], "exactly the expected URI SAN");
+        assert_eq!(other_names, 0, "no DNS or other smuggled SANs are signed");
     }
 
     #[test]
@@ -497,8 +822,15 @@ mod tests {
         let (csr_der, _) = create_workload_csr(&uri).unwrap();
         let (ca_kp, ca_params, workload_ca_cert_der, _) = test_workload_ca();
 
-        let cert_der =
-            validate_and_sign_csr(&csr_der, &uri, SerialNumber(100), &ca_kp, &ca_params).unwrap();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(100),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         // Verify the workload cert is signed by the Workload CA
         cert::verify_signature(&cert_der, &workload_ca_cert_der).unwrap();
@@ -510,8 +842,15 @@ mod tests {
         let (csr_der, private_key_der) = create_workload_csr(&uri).unwrap();
         let (ca_kp, ca_params, workload_ca_cert_der, root_ca_cert_der) = test_workload_ca();
 
-        let cert_der =
-            validate_and_sign_csr(&csr_der, &uri, SerialNumber(100), &ca_kp, &ca_params).unwrap();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(100),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         let identity = build_identity_bundle(
             uri.clone(),
@@ -533,48 +872,179 @@ mod tests {
         assert!(identity.next_rotation < identity.expires_at);
     }
 
-    #[test]
-    fn write_identity_to_tmpfs_creates_all_files() {
+    /// Build a full identity bundle for tests (fresh keypair each call).
+    fn test_identity_bundle(jwt: &str) -> WorkloadIdentity {
         let uri = test_spiffe_uri();
         let (csr_der, private_key_der) = create_workload_csr(&uri).unwrap();
         let (ca_kp, ca_params, workload_ca_cert_der, root_ca_cert_der) = test_workload_ca();
-
-        let cert_der =
-            validate_and_sign_csr(&csr_der, &uri, SerialNumber(100), &ca_kp, &ca_params).unwrap();
-
-        let identity = build_identity_bundle(
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(100),
+            &ca_kp,
+            &ca_params,
+            SystemTime::now(),
+        )
+        .unwrap();
+        build_identity_bundle(
             uri,
             cert_der,
             private_key_der,
             &workload_ca_cert_der,
             &root_ca_cert_der,
-            "my-jwt-token".to_string(),
-        );
+            jwt.to_string(),
+        )
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        write_identity_to_tmpfs(&identity, dir.path()).unwrap();
+    #[test]
+    fn write_identity_files_creates_all_files_in_the_instance_dir() {
+        let identity = test_identity_bundle("my-jwt-token");
 
-        let id_dir = dir.path().join("identity");
-        assert!(id_dir.join("cert.pem").exists());
-        assert!(id_dir.join("key.pem").exists());
-        assert!(id_dir.join("ca.pem").exists());
-        assert!(id_dir.join("bundle.pem").exists());
-        assert!(id_dir.join("token").exists());
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+        prepare_identity_dir(&dir).unwrap();
+        write_identity_files(&identity, &dir, None).unwrap();
+
+        assert!(dir.join("cert.pem").exists());
+        assert!(dir.join("key.pem").exists());
+        assert!(dir.join("ca.pem").exists());
+        assert!(dir.join("bundle.pem").exists());
+        assert!(dir.join("token").exists());
+        assert!(dir.join("meta.json").exists());
 
         // Verify content
-        let cert_pem = std::fs::read_to_string(id_dir.join("cert.pem")).unwrap();
+        let cert_pem = std::fs::read_to_string(dir.join("cert.pem")).unwrap();
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
 
-        let key_pem = std::fs::read_to_string(id_dir.join("key.pem")).unwrap();
+        let key_pem = std::fs::read_to_string(dir.join("key.pem")).unwrap();
         assert!(key_pem.contains("BEGIN PRIVATE KEY"));
 
-        let token = std::fs::read_to_string(id_dir.join("token")).unwrap();
+        let token = std::fs::read_to_string(dir.join("token")).unwrap();
         assert_eq!(token, "my-jwt-token");
 
-        let bundle = std::fs::read_to_string(id_dir.join("bundle.pem")).unwrap();
+        let bundle = std::fs::read_to_string(dir.join("bundle.pem")).unwrap();
         // Bundle should contain the cert + CA chain (at least 3 PEM blocks)
         let cert_count = bundle.matches("BEGIN CERTIFICATE").count();
         assert!(cert_count >= 2, "bundle should contain cert + CA chain");
+    }
+
+    /// PKI7: two replicas of the same app land in distinct per-instance
+    /// directories with distinct private keys — the overwrite regression.
+    #[test]
+    fn two_replicas_of_one_app_get_distinct_identity_dirs_and_keys() {
+        let volumes = tempfile::tempdir().unwrap();
+        let dir_0 = instance_identity_dir(volumes.path(), "web-0");
+        let dir_1 = instance_identity_dir(volumes.path(), "web-1");
+        assert_ne!(dir_0, dir_1, "instance dirs must not collide by app");
+
+        let identity_0 = test_identity_bundle("jwt-0");
+        let identity_1 = test_identity_bundle("jwt-1");
+        write_identity_files(&identity_0, &dir_0, None).unwrap();
+        write_identity_files(&identity_1, &dir_1, None).unwrap();
+
+        let key_0 = std::fs::read(dir_0.join("key.pem")).unwrap();
+        let key_1 = std::fs::read(dir_1.join("key.pem")).unwrap();
+        assert_ne!(key_0, key_1, "replicas must not share a private key");
+        // Both survive: neither replica clobbered the other.
+        assert!(dir_0.join("cert.pem").exists());
+        assert!(dir_1.join("cert.pem").exists());
+    }
+
+    /// D9: an identity written to disk loads back byte-for-byte, including
+    /// the rotation schedule — what adoption relies on after a Bun restart.
+    #[test]
+    fn identity_round_trips_through_the_instance_dir() {
+        let identity = test_identity_bundle("adopt-me");
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+        write_identity_files(&identity, &dir, None).unwrap();
+
+        let loaded = load_identity(&dir).unwrap().expect("identity loads back");
+        assert_eq!(loaded.spiffe_uri, identity.spiffe_uri);
+        assert_eq!(loaded.certificate_der, identity.certificate_der);
+        assert_eq!(loaded.private_key_der, identity.private_key_der);
+        assert_eq!(loaded.ca_chain_pem, identity.ca_chain_pem);
+        assert_eq!(loaded.jwt_token, identity.jwt_token);
+        assert_eq!(loaded.next_rotation, identity.next_rotation);
+        assert_eq!(loaded.expires_at, identity.expires_at);
+        assert!(!loaded.grace_extended);
+    }
+
+    /// A directory without `meta.json` (legacy app-scoped layout, or a
+    /// not-yet-provisioned instance) loads as `None`, never an error.
+    #[test]
+    fn load_identity_returns_none_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_identity(dir.path()).unwrap().is_none());
+        // A legacy-style dir with stray files but no sidecar: still None.
+        std::fs::write(dir.path().join("cert.pem"), b"stale").unwrap();
+        assert!(load_identity(dir.path()).unwrap().is_none());
+    }
+
+    /// PKI7: cleanup removes the key material with the instance.
+    #[test]
+    fn cleanup_identity_dir_removes_key_material() {
+        let identity = test_identity_bundle("bye");
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+        prepare_identity_dir(&dir).unwrap();
+        write_identity_files(&identity, &dir, None).unwrap();
+        assert!(dir.join("key.pem").exists());
+
+        cleanup_identity_dir(&dir).unwrap();
+        assert!(!dir.exists(), "the whole instance dir is gone");
+        // Idempotent: a second cleanup is a no-op.
+        cleanup_identity_dir(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_identity_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+        prepare_identity_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "identity dir must be owner-only");
+        // Idempotent: preparing again never fails or stacks mounts.
+        prepare_identity_dir(&dir).unwrap();
+    }
+
+    /// Linux + root only (run in the Lima rig): the identity directory is
+    /// backed by a real size-bounded tmpfs, and cleanup unmounts it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_dir_is_tmpfs_backed_under_root() {
+        if !nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: requires root (run in the Lima VM)");
+            return;
+        }
+
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+        prepare_identity_dir(&dir).unwrap();
+        assert!(is_mount_point(&dir), "identity dir should be a tmpfs mount");
+
+        // Preparing again must not stack a second mount.
+        prepare_identity_dir(&dir).unwrap();
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+        let canonical = dir.canonicalize().unwrap();
+        let count = mounts
+            .lines()
+            .filter(|l| l.split_whitespace().nth(1) == Some(&canonical.to_string_lossy()))
+            .count();
+        assert_eq!(count, 1, "prepare is idempotent, no stacked mounts");
+
+        let identity = test_identity_bundle("tmpfs");
+        write_identity_files(&identity, &dir, Some((65534, 65534))).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(dir.join("key.pem")).unwrap();
+        assert_eq!(meta.uid(), 65534, "key owned by the workload uid");
+
+        cleanup_identity_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        assert!(!is_mount_point(&dir));
     }
 
     #[test]

@@ -142,6 +142,7 @@ pub fn generate_oci_spec(
     app_name: &str,
     namespace: &str,
     spec: &AppSpec,
+    instance_id: &str,
     host_port: Option<u16>,
     cgroup_path: &str,
     volumes_dir: Option<&Path>,
@@ -151,6 +152,7 @@ pub fn generate_oci_spec(
         app_name,
         namespace,
         spec,
+        instance_id,
         host_port,
         cgroup_path,
         volumes_dir,
@@ -171,6 +173,7 @@ pub fn generate_oci_spec_with_decryptor(
     app_name: &str,
     namespace: &str,
     spec: &AppSpec,
+    instance_id: &str,
     host_port: Option<u16>,
     cgroup_path: &str,
     volumes_dir: Option<&Path>,
@@ -179,7 +182,14 @@ pub fn generate_oci_spec_with_decryptor(
 ) -> OciSpec {
     let env = build_env_with_decryptor(spec, decryptor);
     let args = build_args(app_name, spec);
-    let mounts = build_mounts(spec, host_port, app_name, namespace, volumes_dir);
+    let mounts = build_mounts(
+        spec,
+        host_port,
+        app_name,
+        namespace,
+        instance_id,
+        volumes_dir,
+    );
 
     let namespaces = standard_namespaces(netns_path);
 
@@ -289,6 +299,7 @@ fn build_mounts(
     _host_port: Option<u16>,
     app_name: &str,
     namespace: &str,
+    instance_id: &str,
     volumes_dir: Option<&Path>,
 ) -> Vec<OciMount> {
     let mut mounts = standard_mounts();
@@ -352,14 +363,18 @@ fn build_mounts(
     }
 
     // Workload identity mount — populated by Bun after CSR signing.
-    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, and token
-    // appear once the council signs the workload's CSR.
-    let identity_host_dir = volumes_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"))
-        .join(".identity")
-        .join(namespace)
-        .join(app_name);
+    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token, and
+    // meta.json appear once the council signs the workload's CSR. The
+    // source is per-INSTANCE (PKI7): replicas of the same app must not
+    // share (or overwrite) each other's private key. Bun prepares the
+    // directory (tmpfs-backed on Linux root) before create; the
+    // create_dir_all here is a fallback for direct grill users.
+    let identity_host_dir = crate::sesame::identity::instance_identity_dir(
+        &volumes_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes")),
+        instance_id,
+    );
     let _ = std::fs::create_dir_all(&identity_host_dir);
     mounts.push(OciMount {
         destination: PathBuf::from("/run/reliaburger/identity"),
@@ -587,7 +602,16 @@ mod tests {
     #[test]
     fn generate_minimal_app() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         assert_eq!(oci.root.path, "test:v1");
         assert_eq!(oci.process.cwd, "/");
@@ -604,7 +628,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, Some(30017), "/cg", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            Some(30017),
+            "/cg",
+            None,
+            None,
+        );
 
         assert_eq!(
             oci.port_mapping,
@@ -624,7 +657,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cg", None, None);
+        let oci = generate_oci_spec("web", "default", &spec, "web-0", None, "/cg", None, None);
 
         assert_eq!(oci.port_mapping, None);
     }
@@ -632,7 +665,16 @@ mod tests {
     #[test]
     fn port_mapping_absent_when_app_has_no_port() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, Some(30017), "/cg", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            Some(30017),
+            "/cg",
+            None,
+            None,
+        );
 
         assert_eq!(oci.port_mapping, None);
     }
@@ -641,7 +683,7 @@ mod tests {
     fn port_mapping_survives_record_round_trip_and_old_records_default() {
         // New records carry the mapping through serde…
         let spec: AppSpec = toml::from_str(r#"image = "t:v1""#).unwrap();
-        let mut oci = generate_oci_spec("web", "default", &spec, None, "/cg", None, None);
+        let mut oci = generate_oci_spec("web", "default", &spec, "web-0", None, "/cg", None, None);
         oci.port_mapping = Some(PortMapping {
             host_port: 30017,
             container_port: 8080,
@@ -660,7 +702,16 @@ mod tests {
     #[test]
     fn generate_without_image_uses_filesystem_path() {
         let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         assert_eq!(
             oci.root.path,
@@ -679,7 +730,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         assert!(oci.process.env.contains(&"FOO=bar".to_string()));
         assert!(oci.process.env.contains(&"BAZ=qux".to_string()));
@@ -695,7 +755,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         assert!(
             oci.process
@@ -720,6 +789,7 @@ mod tests {
             "web",
             "default",
             &spec,
+            "web-0",
             None,
             "/cgroup/path",
             None,
@@ -744,7 +814,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let resources = oci.linux.resources.unwrap();
         let cpu = resources.cpu.unwrap();
@@ -761,7 +840,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let resources = oci.linux.resources.unwrap();
         let memory = resources.memory.unwrap();
@@ -771,14 +859,32 @@ mod tests {
     #[test]
     fn generate_without_resources_has_no_resources_block() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
         assert!(oci.linux.resources.is_none());
     }
 
     #[test]
     fn generate_has_all_namespaces() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let ns_types: Vec<&str> = oci
             .linux
@@ -800,6 +906,7 @@ mod tests {
             "web",
             "default",
             &spec,
+            "web-0",
             None,
             "/sys/fs/cgroup/reliaburger/default/web/0",
             None,
@@ -815,7 +922,16 @@ mod tests {
     #[test]
     fn generate_has_standard_mounts() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let mount_paths: Vec<&str> = oci
             .mounts
@@ -827,6 +943,40 @@ mod tests {
         assert!(mount_paths.contains(&"/sys"));
     }
 
+    /// PKI7: the identity mount source is keyed by instance, so two
+    /// replicas of the same app never share (or overwrite) key material.
+    #[test]
+    fn identity_mount_source_is_per_instance_not_per_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = minimal_app();
+
+        let identity_source = |instance_id: &str| {
+            let oci = generate_oci_spec(
+                "web",
+                "default",
+                &spec,
+                instance_id,
+                None,
+                "/cg",
+                Some(tmp.path()),
+                None,
+            );
+            oci.mounts
+                .iter()
+                .find(|m| m.destination == std::path::Path::new("/run/reliaburger/identity"))
+                .expect("identity mount present")
+                .source
+                .clone()
+                .expect("identity mount has a source")
+        };
+
+        let source_0 = identity_source("web-0");
+        let source_1 = identity_source("web-1");
+        assert_ne!(source_0, source_1, "replicas must not share a source");
+        assert!(source_0.ends_with(".identity/web-0"));
+        assert!(source_1.ends_with(".identity/web-1"));
+    }
+
     #[test]
     fn generate_with_config_file_source() {
         let mut spec = minimal_app();
@@ -835,7 +985,16 @@ mod tests {
             content: None,
             source: Some("/host/configs/app.conf".to_string()),
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let cf_mount = oci
             .mounts
@@ -862,6 +1021,7 @@ mod tests {
             "web",
             "default",
             &spec,
+            "web-0",
             None,
             "/cgroup/path",
             Some(tmp.path()),
@@ -893,7 +1053,16 @@ mod tests {
             source: Some(PathBuf::from("/host/data")),
             size: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let vol_mount = oci
             .mounts
@@ -917,6 +1086,7 @@ mod tests {
             "redis",
             "prod",
             &spec,
+            "redis-0",
             None,
             "/cgroup/path",
             Some(&volumes_dir),
@@ -950,7 +1120,16 @@ mod tests {
             source: None,
             size: None,
         });
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let data_mount = oci
             .mounts
@@ -967,7 +1146,16 @@ mod tests {
     #[test]
     fn generate_serialises_to_json() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let json = serde_json::to_string_pretty(&oci).unwrap();
         assert!(json.contains("\"root\""));
@@ -1043,7 +1231,16 @@ mod tests {
     #[test]
     fn uid_gid_mappings_omitted_when_none() {
         let spec = minimal_app();
-        let oci = generate_oci_spec("web", "default", &spec, None, "/cgroup/path", None, None);
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
 
         let json = serde_json::to_string(&oci).unwrap();
         assert!(!json.contains("uidMappings"));
@@ -1073,6 +1270,7 @@ mod tests {
             "web",
             "default",
             &spec,
+            "web-0",
             None,
             "/cgroup/path",
             None,

@@ -51,6 +51,9 @@ redb = "2"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
+# rcgen's validity fields are `time::OffsetDateTime`; the direct dependency
+# lets us set exact timestamped windows instead of calendar dates (PKI6).
+time = "0.3"
 ring = "0.17"
 rustls-pemfile = "2"
 x509-parser = { version = "0.16", features = ["verify"] }

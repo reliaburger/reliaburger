@@ -347,6 +347,7 @@ mod tests {
             next_serial: 6,
             oidc_signing_config: None,
             crl: super::super::types::Crl::default(),
+            secret_seals: std::collections::BTreeMap::new(),
         };
 
         (state, token_plaintext, master_secret)

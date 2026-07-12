@@ -3305,6 +3305,14 @@ async fn secret_rotate_handler(
             .write(crate::council::RaftRequest::FinalizeSecretRotation { scope })
             .await
         {
+            // Verify-before-retire (PKI8): the state machine refuses to
+            // drop the old key while any stored secret is still sealed
+            // under it, and names the offenders.
+            Ok(crate::council::types::CouncilResponse::Refused { reason }) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response(),
             Ok(_) => Json(
                 serde_json::json!({ "message": "secret rotation finalised, old keys removed" }),
             )
@@ -3356,6 +3364,13 @@ async fn secret_rotate_handler(
             .write(crate::council::RaftRequest::RotateSecretKey { scope, new_keypair })
             .await
         {
+            // One rotation at a time (PKI8): an un-finalised rotation
+            // must be finalised (or re-encrypted then finalised) first.
+            Ok(crate::council::types::CouncilResponse::Refused { reason }) => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response(),
             Ok(_) => Json(serde_json::json!({
                 "message": format!("secret key rotated to generation {new_gen}"),
                 "new_public_key": new_pubkey,
@@ -3665,6 +3680,164 @@ mod tests {
             setup_with_role("rotate-empty", crate::sesame::types::ApiRole::Admin).await;
         let status = post_status(app, "/v1/secret/rotate", &tok, "").await;
         assert_ne!(status, StatusCode::BAD_REQUEST);
+        shutdown.cancel();
+    }
+
+    /// Like `seeded_council`, but the node holds the cluster's wrapping IKM
+    /// so the rotate endpoint can mint real keypairs.
+    async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> {
+        use std::collections::BTreeMap;
+
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
+
+        let dir = std::env::temp_dir().join(format!("rb-api-seeded-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("apitest", "node-1", &dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let raft_router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
+        let node = crate::council::CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            Some(init.master_secret),
+        )
+        .await
+        .unwrap();
+        raft_router.register(1, node.raft().clone()).await;
+        let mut members = BTreeMap::new();
+        members.insert(
+            1,
+            CouncilNodeInfo {
+                addr: "127.0.0.1:9444".parse().unwrap(),
+                name: "node-1".into(),
+            },
+        );
+        node.initialize(members).await.unwrap();
+
+        // Retry while leadership settles after initialize.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let req = RaftRequest::SecurityStateInit(Box::new(init.security_state.clone()));
+            if node.write(req).await.is_ok() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("seeding SecurityState timed out");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Arc::new(node)
+    }
+
+    /// Build an admin-authorised router around an existing council.
+    async fn router_for_council(
+        council: Arc<crate::council::CouncilNode>,
+    ) -> (Router, CancellationToken, String) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+        );
+        (app, shutdown, plaintext)
+    }
+
+    /// PKI8 end-to-end: finalising while a stored secret is still sealed
+    /// under the retiring generation comes back as a 409 naming the secret.
+    #[tokio::test]
+    async fn secret_rotate_finalize_refusal_surfaces_as_conflict() {
+        let council = seeded_council_with_ikm("rotate-verify").await;
+
+        // A deployed app with an encrypted secret, sealed under gen 0…
+        let spec: crate::config::app::AppSpec = toml::from_str(
+            r#"
+            image = "t:v1"
+            [env]
+            DB_PASSWORD = "ENC[AGE:c2VhbGVk]"
+            "#,
+        )
+        .unwrap();
+        council
+            .write(crate::council::RaftRequest::AppSpec {
+                app_id: crate::meat::types::AppId::new("web", "default"),
+                spec: Box::new(spec),
+            })
+            .await
+            .unwrap();
+
+        let (app, shutdown, tok) = router_for_council(council).await;
+
+        // …a rotation starts (gen 1)…
+        let status = post_status(app.clone(), "/v1/secret/rotate", &tok, "{}").await;
+        assert_eq!(status, StatusCode::OK, "starting the rotation succeeds");
+
+        // …and an early finalize is refused with the offender named.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/secret/rotate")
+                    .header("authorization", format!("Bearer {tok}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"finalize": true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("default/web/DB_PASSWORD"),
+            "the refusal names the stale secret: {json}"
+        );
+        shutdown.cancel();
+    }
+
+    /// PKI8 end-to-end: a second rotation while one is un-finalised is a 409.
+    #[tokio::test]
+    async fn secret_rotate_second_rotation_surfaces_as_conflict() {
+        let council = seeded_council_with_ikm("rotate-concurrent").await;
+        let (app, shutdown, tok) = router_for_council(council).await;
+
+        let status = post_status(app.clone(), "/v1/secret/rotate", &tok, "{}").await;
+        assert_eq!(status, StatusCode::OK);
+        let status = post_status(app, "/v1/secret/rotate", &tok, "{}").await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a rotation is already in flight"
+        );
         shutdown.cancel();
     }
 

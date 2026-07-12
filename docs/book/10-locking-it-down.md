@@ -89,6 +89,10 @@ When the council receives a CSR, it doesn't just blindly sign it. It validates:
 1. The CSR's URI SAN matches the workload the council expects (based on the scheduler's placement decisions)
 2. The requesting node is actually supposed to be running this workload
 
+Our first version of the signer got this subtly, dangerously wrong. It checked that the expected URI SAN was *present* in the CSR, then handed the whole CSR to `signed_by()` — which signs the SAN list exactly as the requester submitted it. Spot the problem? A compromised node could send a CSR containing the expected URI *plus* another workload's SPIFFE URI, or a DNS name like `payments.internal`, and the council would cheerfully sign all of them. The presence check passes; the smuggled names ride along.
+
+The fix is a rule worth framing: **never sign what the requester asked for — sign what the server decided.** The only thing the signer takes from the CSR is its public key. Everything else, the SAN list above all, gets rebuilt server-side from the identity the council expects:
+
 ```rust
 pub fn validate_and_sign_csr(
     csr_der: &[u8],
@@ -96,11 +100,12 @@ pub fn validate_and_sign_csr(
     serial: SerialNumber,
     workload_ca_keypair: &KeyPair,
     workload_ca_params: &CertificateParams,
+    now: SystemTime,
 ) -> Result<Vec<u8>, IdentityError> {
     let csr_params = CertificateSigningRequestParams::from_der(&csr_der_ref)?;
 
-    // Validate the SPIFFE URI SAN
-    let expected_uri = expected_spiffe_uri.to_uri();
+    // The CSR must claim the identity the council expects. This is a
+    // request check only — the claimed SAN list is never signed as-is.
     let has_matching_uri = csr_params.params.subject_alt_names.iter().any(|san| {
         matches!(san, SanType::URI(uri) if uri.as_str() == expected_uri)
     });
@@ -108,19 +113,29 @@ pub fn validate_and_sign_csr(
         return Err(IdentityError::CsrValidationFailed(...));
     }
 
-    // Sign with Workload CA, 1-hour lifetime
-    let signed = csr_params.signed_by(&ca_cert, workload_ca_keypair)?;
+    // Rebuild the certificate contents server-side.
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = vec![SanType::URI(expected_uri.try_into()?)];
+    // ... DN, key usages, serial ...
+    params.not_before = time::OffsetDateTime::from(now - CLOCK_SKEW_BACKDATE);
+    params.not_after = time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME);
+
+    let signed = params.signed_by(&csr_params.public_key, &ca_cert, workload_ca_keypair)?;
     Ok(signed.der().to_vec())
 }
 ```
 
-The `rcgen` crate gives us the CSR round-trip. We enabled the `x509-parser` feature on rcgen to get `CertificateSigningRequestParams::from_der()`, which parses the incoming CSR and extracts the public key and SANs. Then `signed_by()` creates a new certificate using the CSR's public key (not a new keypair), signed by the Workload CA.
+The `rcgen` crate gives us the CSR round-trip. We enabled the `x509-parser` feature on rcgen to get `CertificateSigningRequestParams::from_der()`, which parses the incoming CSR and extracts the public key and SANs. The three-argument `signed_by(public_key, issuer, issuer_key)` on `CertificateParams` is the key move: it builds a certificate from *our* parameters around *their* public key. The worker still has the only copy of the private key, the council has the CA key, and neither side ever sees the other's.
 
-This pattern matters: the worker has the private key, the council has the CA key, and neither side ever sees the other's key.
+The regression test (`smuggled_csr_sans_are_not_signed`) hand-builds a hostile CSR with two extra SANs, signs it, parses the issued DER, and asserts the SAN set contains exactly one URI — the expected one.
 
-### Certificates expire fast
+### Certificates expire fast (and exactly)
 
 Workload certificates live for 1 hour. That's deliberate. Short-lived certificates mean that if a credential is stolen, the window for misuse is tiny. Compare this with Kubernetes ServiceAccount tokens, which historically had no expiry at all.
+
+There was a second bug hiding in that sentence, though. The original signer converted `now` and `now + 1 hour` to *calendar dates* with a hand-rolled days-since-epoch helper, because that's the shape `rcgen::date_time_ymd()` wants. A certificate issued at 14:00 got `not_before` and `not_after` both equal to that day's midnight — a "one-hour" certificate that was either valid for the rest of the day or already expired, depending on which side of midnight the maths fell. The fix was to stop converting at all: rcgen's validity fields are `time::OffsetDateTime` values, and the `time` crate implements `From<SystemTime>`, so `time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME)` gives second-precision timestamps directly. The hand-rolled date helpers went in the bin, which is the best kind of fix.
+
+Two details worth copying. The signer takes `now` as a parameter instead of calling `SystemTime::now()` inside — an injected clock, so the test can pin a fixed instant and assert the exact window (`one_hour_certificate_window_is_exact_not_calendar_dates`). And `not_before` is backdated by five minutes (`CLOCK_SKEW_BACKDATE`), because the verifying node's clock rarely agrees with the signer's to the second, and a freshly issued certificate that's "not yet valid" is a miserable bug to chase.
 
 Rotation happens at the 30-minute mark (half the lifetime). The worker generates a fresh keypair, sends a new CSR, gets a new certificate. The old one is replaced atomically on the tmpfs mount. The workload doesn't need to do anything.
 
@@ -173,15 +188,19 @@ The workload sees its identity at `/run/reliaburger/identity/`:
 ```
 /run/reliaburger/identity/
     cert.pem      — the workload's X.509 certificate
-    key.pem       — the private key (never left this node)
+    key.pem       — the private key (never left this node, owner-only)
     ca.pem        — Workload CA + Root CA chain
     bundle.pem    — cert + CA chain concatenated
-    token         — OIDC JWT
+    token         — OIDC JWT (owner-only)
+    meta.json     — rotation metadata (no secrets)
 ```
 
 This is a bind mount from the host into the container. The OCI spec adds it automatically:
 
 ```rust
+let identity_host_dir = crate::sesame::identity::instance_identity_dir(
+    &volumes_dir, instance_id,
+);
 mounts.push(OciMount {
     destination: PathBuf::from("/run/reliaburger/identity"),
     source: Some(identity_host_dir),
@@ -194,10 +213,23 @@ The directory starts empty. Files appear after the CSR round-trip completes. On 
 
 For process workloads (ProcessGrill), there's no container to mount into. Instead, the `RELIABURGER_IDENTITY_DIR` environment variable points to the host path.
 
+### One directory per instance, cradle to grave
+
+The host side of that mount deserves its own story, because the first version got the granularity wrong. Identity files landed in `{volumes}/.identity/{namespace}/{app}` — one directory per *app*. Run two replicas of `web` and they share the directory; each CSR round-trip overwrites the other replica's private key and JWT. A rolling redeploy dropped the in-memory rotation entry with the old instance, and an adopted workload came back with `identity: None`, so its certificate silently ran out. Key material also survived `relish stop`, sitting on disk with nothing attached to it.
+
+The fix is one idea applied at every point in the lifecycle: **the identity directory belongs to the instance, not the app.** `{volumes}/.identity/{instance_id}`, created before the container, destroyed with it.
+
+- **Before create.** The agent prepares the directory at the same pre-start seam where it programs egress: the bind-mount source must exist before `runc create`, and this is where the backing mount goes. On Linux, running as root, the directory is a dedicated size-bounded tmpfs (`mode=0700`), so private keys never touch persistent storage. On macOS or rootless it's a plain `0700` directory — a documented gap, same honesty rule as the network chapter's non-runc runtimes.
+- **After start.** The CSR round-trip writes the files. The key and token are `0600`, and under root they're chowned to the container's runtime UID (65534) so the workload — not just root — can read its own owner-only key. A `meta.json` sidecar records the SPIFFE URI and the rotation schedule; it holds no secrets.
+- **On stop, redeploy, rollback.** The directory (and its tmpfs) goes with the instance. A rolling redeploy provisions the new instance's identity, then removes the retired instance's directory; a failed redeploy removes the half-born instance's directory during rollback.
+- **On adoption.** When a new `bun` process adopts workloads from a previous one (a crash restart, a self-upgrade), it rebuilds each `WorkloadIdentity` from the per-instance directory — the PEM files plus `meta.json`. The adopted workload keeps its certificate *and its rotation schedule*: the next rotation fires when the pre-restart one would have, not thirty minutes after whenever the process happened to restart. Rotation state lives on disk, not in process memory. Directories with no live owner (including old app-scoped layouts) get swept at the same moment.
+
+That last point is the general lesson. Any timer you keep only in memory is a timer that resets on restart, and for credentials "resets" means "quietly never fires" (identity was `None`; nothing rotates `None`). If a schedule matters across restarts, it has to be derivable from disk.
+
 ### What we built
 
 The crypto library layer is complete and tested:
-- `src/sesame/identity.rs` — CSR creation (worker), validation + signing (council), identity bundles, tmpfs delivery, rotation state machine
+- `src/sesame/identity.rs` — CSR creation (worker), validation + signing (council), identity bundles, per-instance delivery (tmpfs-backed on Linux root), rotation state machine
 - `src/sesame/oidc.rs` — Ed25519 keypair generation, JWT minting and verification, JWKS endpoint response
 - `src/sesame/types.rs` — `WorkloadIdentity`, `OidcSigningConfig`, `WorkloadJwtClaims`
 - `src/sesame/init.rs` — OIDC keypair generation during cluster bootstrap
@@ -456,9 +488,37 @@ if has_active {
 }
 ```
 
-Without the guard, a stray finalise on a scope that only holds read-only keys would `retain` nothing and leave the scope with no usable key, making every secret sealed under it permanently undecryptable. The guard makes finalise a no-op in that case rather than a shredder.
+Without the guard, a stray finalise on a scope that only holds read-only keys would `retain` nothing and leave the scope with no usable key, making every secret sealed under it permanently undecryptable. The guard now answers with a `Refused` response rather than a silent no-op, so the operator learns *why* nothing happened.
 
 The API mirrors the same fail-safe instinct: a malformed body to `/v1/secret/rotate` returns `400`, never a silent default rotation. Mutating cluster key state should take a deliberate request, not a typo.
+
+### Verify before you retire
+
+The three invariants keep the *window* safe. But the window still ended on trust: finalise deleted the old key as soon as an active replacement existed, taking the operator's word that every stored secret had been re-encrypted. Finalise early — before re-applying an app whose config still carries generation-N ciphertext — and that secret is bricked the moment the key is gone. A guard that trusts the operator isn't a guard.
+
+The awkward bit: you can't look at an `ENC[AGE:...]` value and tell which key sealed it. Age ciphertext deliberately doesn't disclose its recipient. So the state machine records it as metadata at the only moment it's knowable — write time. Applying an app spec encrypts new values against the scope's *active* key, so the `AppSpec` entry records the active generation for each encrypted env value:
+
+```rust
+pub struct SecretSeal {
+    pub scope: AgeKeyScope,
+    pub generation: u64,
+}
+// SecurityState:
+pub secret_seals: BTreeMap<String, SecretSeal>,  // "namespace/app/ENV_KEY"
+```
+
+A `BTreeMap` rather than a `HashMap`, because it serialises in key order — snapshots stay byte-deterministic across nodes. Finalise now walks every stored app, and any encrypted value whose recorded generation is older than the newest — or that has no record at all, which is what state persisted before this field existed looks like — blocks the retirement and gets named in the error:
+
+```
+409 cannot finalise secret rotation: secrets still sealed under an old
+generation (re-encrypt and re-apply them first): default/web/DB_PASSWORD
+```
+
+The operator's re-encrypt step (encrypt against the new public key, `relish apply`) re-records the seal at the new generation, and the finalise goes through. The `#[serde(default)]` on the field is doing quiet compatibility work here: old snapshots load with an empty map, their secrets count as "unknown generation", and the system fails towards *keeping* the key — the recoverable direction.
+
+Is the record proof? No — it's the write-time assumption made explicit. Re-apply an unchanged config and the seal updates without any real re-encryption. What it catches is the case that actually eats data: finalising while a secret demonstrably hasn't been touched since the old generation.
+
+One more rule rounds it off: **one rotation at a time.** A second `RotateSecretKey` while a read-only key still exists for the scope is refused (finalise or re-encrypt first); a duplicate delivery of the *same* rotation is recognised by its generation number and accepted idempotently. Both refusals travel as a new `CouncilResponse::Refused { reason }` variant — appended to the enum, never inserted, because responses cross the bincode-encoded wire where variants are identified by index.
 
 ## Certificate revocation
 
@@ -582,13 +642,19 @@ So the agent now treats the kernel as something to *reconcile against*, not just
 
 **The registry accepts everything; the scheduler enforces trust.** Putting signature enforcement at *schedule* time rather than *push* time means a missing signature never breaks your CI pipeline. Unsigned images land in Pickle and simply sit there, visible but unschedulable. Pushing the policy check to the latest possible moment kept two concerns from tangling.
 
+**Sign what the server decided, not what the requester asked for.** Our CSR signer checked that the expected SAN was present, then signed the requester's SAN list wholesale — smuggled names included. Any signing service faces this shape of bug: validation that inspects the request and then signs the request anyway. The safe pattern takes only the public key from the request and rebuilds everything else from server-side expectations.
+
+**Credential lifecycles must be derivable from disk.** Rotation schedules that lived only in agent memory reset (or vanished) on every restart; identity directories keyed by app instead of instance meant replicas overwrote each other's keys. Both fixes are the same idea — the instance is the unit of identity, and its on-disk directory is the source of truth for what it holds and when it rotates.
+
 ## Tests
 
 Like Chapter 4, this is crypto, so it's almost all pure functions and almost all unit tests — nothing here needs root, a network, or a second node. But Phase 10 is also where the *lifecycle* tests live, the ones that drive a feature end to end through the `sesame` library.
 
 ### Unit tests
 
-Image signing (`src/pickle/signing.rs`) is the clearest example of testing a security property through its negatives. Alongside `sign_and_verify_round_trip`, the suite asserts the *failures*: `verify_keyless_wrong_digest_fails`, `verify_keyless_wrong_ca_fails`, `verify_external_key_untrusted_fails`, `verify_external_key_wrong_digest_fails`. A signature scheme that only proves "a valid signature verifies" proves nothing; the value is in "a tampered digest, a foreign CA, or an untrusted key all fail". There's also `sign_with_workload_identity_keypair`, the test that nails down the PKCS#8 coincidence above. The identity and OIDC modules (`sesame/identity.rs`, `sesame/oidc.rs`) carry their own unit tests for CSR creation, SAN validation, JWT minting and verification, and the rotation state machine.
+Image signing (`src/pickle/signing.rs`) is the clearest example of testing a security property through its negatives. Alongside `sign_and_verify_round_trip`, the suite asserts the *failures*: `verify_keyless_wrong_digest_fails`, `verify_keyless_wrong_ca_fails`, `verify_external_key_untrusted_fails`, `verify_external_key_wrong_digest_fails`. A signature scheme that only proves "a valid signature verifies" proves nothing; the value is in "a tampered digest, a foreign CA, or an untrusted key all fail". There's also `sign_with_workload_identity_keypair`, the test that nails down the PKCS#8 coincidence above. The identity and OIDC modules (`sesame/identity.rs`, `sesame/oidc.rs`) carry their own unit tests for CSR creation, SAN validation, JWT minting and verification, and the rotation state machine — including the hostile ones: `smuggled_csr_sans_are_not_signed` and `one_hour_certificate_window_is_exact_not_calendar_dates` (with `check_validity_accepts_fresh_and_rejects_expired_workload_cert` pinning the window through an injected clock).
+
+The per-instance lifecycle has its own regression suite spread across the layers it touches: `identity_mount_source_is_per_instance_not_per_app` (OCI spec), `two_replicas_of_one_app_get_distinct_identity_dirs_and_keys` (the overwrite bug), `deploy_prepares_and_stop_removes_per_instance_identity_dirs` and `rolling_redeploy_leaves_only_live_instances_identity_dirs` (agent lifecycle), and `adoption_restores_identity_and_rotation_schedule_from_disk` plus `adoption_sweeps_orphaned_identity_dirs` (restart safety). The tmpfs backing itself only shows up under Linux as root, so `identity_dir_is_tmpfs_backed_under_root` self-skips elsewhere and runs in the Lima rig. On the rotation side, the state machine's verify-before-retire behaviour is pinned by `finalize_refused_while_a_secret_is_sealed_under_an_old_generation`, `finalize_succeeds_after_secrets_re_encrypted_under_the_new_generation`, `concurrent_second_rotation_refused_until_finalised`, `same_generation_rotation_retry_is_idempotent`, and the compatibility fixture `legacy_secret_without_generation_metadata_blocks_finalize`; the API tests assert the refusals surface as `409`s.
 
 ### Integration tests — the lifecycles
 
@@ -617,12 +683,13 @@ The `--nocapture` on the last one is the point: it turns the test into a guided 
 
 Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 
-- Every workload gets a SPIFFE X.509 certificate and OIDC JWT automatically
+- Every workload instance gets a SPIFFE X.509 certificate and OIDC JWT automatically, with exact validity windows and server-rebuilt SANs
+- Identity lives in a per-instance directory (tmpfs-backed on Linux root), created before start, removed with the instance, and restored — schedule and all — across agent restarts
 - Images are signed (keyless or cosign-compatible) and verified by the scheduler
-- SecurityState (CAs, tokens, keypairs, CRL) is replicated through Raft
+- SecurityState (CAs, tokens, keypairs, CRL, secret seals) is replicated through Raft
 - The agent provisions identity during deploy and rotates certificates every 30 minutes
 - API tokens are managed via `relish token list/revoke`
-- Secret keys rotate with a dual-key transition window
+- Secret keys rotate with a dual-key transition window, one rotation at a time, and finalise verifies every stored secret is re-sealed before the old key is retired
 - The CRL tracks revoked certificates
 - Egress DNS re-resolves asynchronously
 

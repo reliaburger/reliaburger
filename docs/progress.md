@@ -415,7 +415,7 @@ whole theme lands.
     mounted route to `Public | AnyToken | Deployer | Admin | System`; a source-scan test asserts
     every `.route(…)` the router mounts has a matrix entry, so the auditable role list can't drift
     from the code. (Scope enforcement stays in 12b.3.)
-- [ ] **Secret and workload-identity safety** — make rotation generation-aware:
+- [x] **Secret and workload-identity safety** — make rotation generation-aware:
   encrypt with the newest key, decrypt with active generations, re-encrypt and acknowledge
   every stored secret before retiring the old key, and reject malformed/concurrent
   rotations. Issue exact validity windows, rebuild SANs server-side, store identity in
@@ -425,6 +425,33 @@ whole theme lands.
     decryption tries every live generation, finalize refuses to empty a scope, and a malformed
     rotate body is rejected — so a secret sealed under generation N survives the rotation window
     (PKI8).
+  - [x] Exact workload-certificate validity (PKI6): `validate_and_sign_csr` takes an injected
+    clock and issues `now − 5 min` (skew backdate) to `now + 1 h` as timestamps via
+    `time::OffsetDateTime`; the calendar-date helpers that gave a one-hour cert equal midnight
+    bounds are deleted, and `cert::check_validity_at` pins the window in tests.
+  - [x] Server-side SAN rebuild (PKI6): the signer takes only the public key from the CSR and
+    rebuilds DN/usages/serial/SANs from the expected identity, so a CSR smuggling another
+    workload's SPIFFE URI or a DNS SAN yields a certificate with exactly the expected URI
+    (`smuggled_csr_sans_are_not_signed` parses the issued DER).
+  - [x] Per-instance identity directories (PKI7): `{volumes}/.identity/{instance_id}` replaces
+    the app-scoped dir (replicas no longer overwrite each other's keys — OCI mount source is
+    per instance); prepared at the same pre-create seam as egress programming, tmpfs-backed
+    (`mode=0700`, size-bounded) on Linux root with key/token chowned to the workload UID,
+    plain `0700` dir elsewhere (documented gap); removed (and unmounted) on stop, rolling
+    replacement and rollback; fresh deploys now provision identity at all (previously only
+    the rolling path did).
+  - [x] Restart-safe rotation (D9): a `meta.json` sidecar (SPIFFE URI + schedule, no secrets)
+    lets adoption rebuild each instance's identity and rotation timetable from disk instead of
+    `identity: None`; orphaned/legacy identity dirs are swept at adoption; a rate-limited
+    retry provisions running instances that still lack an identity.
+  - [x] Verify-before-retire (PKI8): applying an `AppSpec` records the sealing generation per
+    encrypted env value (`SecurityState.secret_seals`, self-describing JSON with
+    `#[serde(default)]`); finalize refuses (new `CouncilResponse::Refused`, surfaced as HTTP
+    409) while any secret in scope is sealed under an older — or unknown/legacy — generation,
+    naming the offenders; re-applying the re-encrypted spec unblocks it (legacy fixture test).
+  - [x] One rotation at a time (PKI8): a second `RotateSecretKey` for a scope with an
+    un-finalised rotation is refused with instructions; idempotent retries of the same
+    rotation are deduped on the generation number.
 - [x] **Pickle reference integrity** — include raw manifest/index blobs in holder,
   replication and GC reachability; validate JSON, media types, descriptor digest/size and
   referenced blob existence before returning Created; use canonical repository identity

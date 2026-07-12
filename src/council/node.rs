@@ -280,6 +280,7 @@ impl CouncilNode {
             serial,
             &ca_keypair,
             &ca_params,
+            std::time::SystemTime::now(),
         )
         .map_err(|e| CouncilError::SecurityError(format!("CSR signing failed: {e}")))?;
 
@@ -922,6 +923,7 @@ mod tests {
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
             crl: crate::sesame::types::Crl::default(),
+            secret_seals: std::collections::BTreeMap::new(),
         };
         node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
             .await

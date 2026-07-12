@@ -72,6 +72,7 @@ fn demo_csr_generation_and_signing() {
         reliaburger::sesame::types::SerialNumber(serial),
         &hierarchy.workload.signing_keypair,
         &hierarchy.workload.certificate_params,
+        SystemTime::now(),
     )
     .unwrap();
 
@@ -156,6 +157,7 @@ fn demo_identity_bundle_and_tmpfs() {
         reliaburger::sesame::types::SerialNumber(10),
         &hierarchy.workload.signing_keypair,
         &hierarchy.workload.certificate_params,
+        SystemTime::now(),
     )
     .unwrap();
 
@@ -191,12 +193,20 @@ fn demo_identity_bundle_and_tmpfs() {
     println!("  CA chain:    {} bytes", bundle.ca_chain_pem.len());
     println!("  JWT length:  {} chars", bundle.jwt_token.len());
 
-    step("writing to tmpfs");
-    let dir = tempfile::tempdir().unwrap();
-    identity::write_identity_to_tmpfs(&bundle, dir.path()).unwrap();
+    step("writing to the per-instance identity dir");
+    let volumes = tempfile::tempdir().unwrap();
+    let id_dir = identity::instance_identity_dir(volumes.path(), "api-g1234-0");
+    identity::prepare_identity_dir(&id_dir).unwrap();
+    identity::write_identity_files(&bundle, &id_dir, None).unwrap();
 
-    let id_dir = dir.path().join("identity");
-    for name in &["cert.pem", "key.pem", "ca.pem", "bundle.pem", "token"] {
+    for name in &[
+        "cert.pem",
+        "key.pem",
+        "ca.pem",
+        "bundle.pem",
+        "token",
+        "meta.json",
+    ] {
         let path = id_dir.join(name);
         let size = std::fs::metadata(&path).unwrap().len();
         println!("  {:<12} {} bytes", name, size);
