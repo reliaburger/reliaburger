@@ -144,12 +144,19 @@ pub fn status_dot(state: &str) -> &'static str {
     }
 }
 
-/// Escape HTML special characters.
+/// Escape HTML special characters, including both quote styles.
+///
+/// We escape `'` as well as `"` (AUTH8) because chart config JSON is embedded
+/// in a single-quoted attribute (`data-chart-config='...'`). Without escaping
+/// the apostrophe, an app or label value containing `'` closes the attribute
+/// early and can inject markup. Escaping both quote characters makes the
+/// output safe in either attribute context.
 pub fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -280,6 +287,26 @@ mod tests {
     fn escape_html_works() {
         assert_eq!(escape_html("<script>"), "&lt;script&gt;");
         assert_eq!(escape_html("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn escape_html_escapes_the_apostrophe_for_single_quoted_attributes() {
+        // AUTH8: a value carrying `'` must not break out of a single-quoted
+        // attribute like `data-chart-config='...'`.
+        let hostile = "x' onload='alert(1)";
+        let escaped = escape_html(hostile);
+        assert!(
+            !escaped.contains('\''),
+            "raw apostrophe survived: {escaped}"
+        );
+        assert!(escaped.contains("&#39;"));
+    }
+
+    #[test]
+    fn escape_html_leaves_ordinary_values_readable() {
+        // A normal value round-trips unchanged (no over-escaping).
+        assert_eq!(escape_html("web-frontend"), "web-frontend");
+        assert_eq!(escape_html("prod_namespace"), "prod_namespace");
     }
 
     #[test]

@@ -212,6 +212,21 @@ mod tests {
     }
 
     #[test]
+    fn hostile_chart_title_cannot_break_out_of_the_single_quoted_attribute() {
+        // AUTH8: a chart title carrying an apostrophe lands in a single-quoted
+        // `data-chart-config='...'` attribute. It must be escaped so it can't
+        // close the attribute and inject an event handler.
+        let mut data = sample_data();
+        data.charts[0].title = "x' onload='alert(1)".to_string();
+        let html = render_app_detail(&data);
+        assert!(
+            !html.contains("onload='alert"),
+            "attribute break-out survived: {html}"
+        );
+        assert!(html.contains("&#39;"));
+    }
+
+    #[test]
     fn render_app_detail_with_instances() {
         let data = sample_data();
         let html = render_app_detail(&data);

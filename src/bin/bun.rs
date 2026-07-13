@@ -262,6 +262,30 @@ async fn refresh_token_store(
     *store.write().await = tokens;
 }
 
+/// Refuse to bind a token-less (wide-open) API to a routable address (AUTH3).
+///
+/// Returns an error when `listen` resolves to a non-loopback IP, so the caller
+/// aborts startup. A loopback address, an unparseable one (a hostname we leave
+/// to the resolver), or a `0.0.0.0`/`::`-free routable IP all take the safe
+/// path: only a clearly non-loopback bind is refused. The message names the
+/// two recovery routes so the operator isn't left guessing.
+fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
+    let Ok(address) = listen.parse::<std::net::SocketAddr>() else {
+        // A hostname, not a literal address: we can't tell if it's loopback
+        // here, so don't block. The operator opted into a name deliberately.
+        return Ok(());
+    };
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to bind the API to non-loopback address {address} while no user tokens exist: \
+         the API would be open to anyone who can reach it. bind a loopback address \
+         (e.g. 127.0.0.1:9117) and run `relish token create` to mint the first admin token, \
+         then restart with your intended --listen address"
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1049,7 +1073,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Start the API server
+    // Start the API server.
+    //
+    // AUTH3 fail-closed: a fresh cluster with no user tokens leaves the API
+    // wide open (the middleware's bootstrap window). That's fine on loopback
+    // — the operator creates the first token locally — but binding a wide-open
+    // API to a routable address exposes the whole cluster to anyone who can
+    // reach it. Refuse that combination and tell the operator how to recover.
+    if let Some(store) = &api_token_store {
+        let no_tokens = store.read().await.is_empty();
+        if no_tokens {
+            refuse_open_non_loopback_bind(&cli.listen)?;
+        }
+    }
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
 
@@ -1620,6 +1656,30 @@ mod tests {
     use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
     use reliaburger::sesame::token::create_token;
     use reliaburger::sesame::types::{ApiRole, TokenScope};
+
+    #[test]
+    fn bind_check_refuses_open_non_loopback() {
+        // A wide-open API on a routable address must be refused (AUTH3).
+        let err = refuse_open_non_loopback_bind("10.0.0.5:9117").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("non-loopback"), "message was: {msg}");
+        assert!(msg.contains("relish token create"), "message was: {msg}");
+    }
+
+    #[test]
+    fn bind_check_allows_loopback() {
+        // Loopback is the bootstrap path: the operator mints the first token
+        // locally, so a token-less loopback bind is fine.
+        refuse_open_non_loopback_bind("127.0.0.1:9117").unwrap();
+        refuse_open_non_loopback_bind("[::1]:9117").unwrap();
+    }
+
+    #[test]
+    fn bind_check_allows_hostnames() {
+        // A hostname isn't a literal address; we can't classify it here, so
+        // we don't block — the resolver decides.
+        refuse_open_non_loopback_bind("localhost:9117").unwrap();
+    }
 
     #[tokio::test]
     async fn refresh_token_store_overwrites_with_current_raft_tokens() {
