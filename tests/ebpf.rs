@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use reliaburger::onion::ebpf::loader::OnionEbpf;
 use reliaburger::onion::ebpf::maps::BpfServiceMap;
+use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::service_map::ServiceMap;
 use reliaburger::onion::types::BackendInstance;
 use reliaburger::onion::vip::VirtualIP;
@@ -109,7 +110,7 @@ async fn ebpf_backend_map_write_and_read() {
         .unwrap();
     svc_map
         .add_backend(
-            "redis",
+            &ServiceId::new("default", "redis"),
             BackendInstance {
                 instance_id: "redis-0".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
@@ -125,7 +126,7 @@ async fn ebpf_backend_map_write_and_read() {
         .expect("sync to backend_map");
 
     // Read back
-    let vip = VirtualIP::from_app_name("redis");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
     let value = bpf_map
         .read_backends(&mut ebpf, vip, 6379)
         .expect("backend_map read failed")
@@ -164,7 +165,7 @@ async fn ebpf_backend_map_remove() {
         .sync_from_service_map(&svc_map, &mut ebpf)
         .expect("sync to backend_map");
 
-    let vip = VirtualIP::from_app_name("redis");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
     assert!(
         bpf_map
             .read_backends(&mut ebpf, vip, 6379)
@@ -213,19 +214,31 @@ async fn ebpf_service_map_sync_multiple() {
     // All three should be in the map
     assert!(
         bpf_map
-            .read_backends(&mut ebpf, VirtualIP::from_app_name("redis"), 6379)
+            .read_backends(
+                &mut ebpf,
+                VirtualIP::from_service_id(&ServiceId::new("default", "redis")),
+                6379
+            )
             .unwrap()
             .is_some()
     );
     assert!(
         bpf_map
-            .read_backends(&mut ebpf, VirtualIP::from_app_name("web"), 8080)
+            .read_backends(
+                &mut ebpf,
+                VirtualIP::from_service_id(&ServiceId::new("default", "web")),
+                8080
+            )
             .unwrap()
             .is_some()
     );
     assert!(
         bpf_map
-            .read_backends(&mut ebpf, VirtualIP::from_app_name("api"), 3000)
+            .read_backends(
+                &mut ebpf,
+                VirtualIP::from_service_id(&ServiceId::new("prod", "api")),
+                3000
+            )
             .unwrap()
             .is_some()
     );
@@ -254,7 +267,7 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
     listener.set_nonblocking(false).unwrap();
 
     // Populate backend_map: VIP → our listener
-    let vip = VirtualIP::from_app_name("test-service");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "test-service"));
     let service_port: u16 = 9999;
 
     let mut svc_map = ServiceMap::new();
@@ -263,7 +276,7 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
         .unwrap();
     svc_map
         .add_backend(
-            "test-service",
+            &ServiceId::new("default", "test-service"),
             BackendInstance {
                 instance_id: "test-0".to_string(),
                 node_ip: Ipv4Addr::LOCALHOST,
@@ -311,7 +324,7 @@ async fn ebpf_connect_to_vip_no_backends_refused() {
         OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
 
     // Register a service with no backends
-    let vip = VirtualIP::from_app_name("empty-service");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "empty-service"));
     let mut svc_map = ServiceMap::new();
     svc_map
         .register_app("empty-service", "default", 7777, None)
@@ -429,7 +442,7 @@ async fn agent_deploy_populates_backend_map() {
     while ev_rx.recv().await.is_some() {}
 
     // Let the instance reach Running and register its backend.
-    let vip = VirtualIP::from_app_name("web");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "web"));
     let bpf = BpfServiceMap::new();
     let populated = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -516,7 +529,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
         .unwrap();
     while ev_rx.recv().await.is_some() {}
 
-    let vip = VirtualIP::from_app_name("faulty");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "faulty"));
     let bpf = BpfServiceMap::new();
     // Wait for the backend to register so the VIP resolves to a real entry.
     for _ in 0..25 {
@@ -777,7 +790,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     map.register_app("dest", "backend-ns", backend_port, None)
         .unwrap();
     map.add_backend(
-        "dest",
+        &ServiceId::new("backend-ns", "dest"),
         BackendInstance {
             instance_id: "dest-0".to_string(),
             node_ip: Ipv4Addr::LOCALHOST,
@@ -786,7 +799,10 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
         },
     )
     .unwrap();
-    let entry = map.resolve("dest").unwrap().clone();
+    let entry = map
+        .resolve(&ServiceId::new("backend-ns", "dest"))
+        .unwrap()
+        .clone();
     BpfServiceMap::new()
         .update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
         .expect("write backend entry");
@@ -855,6 +871,7 @@ async fn dns_responder_resolves_internal_name() {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
         upstream: "8.8.8.8:53".parse().unwrap(),
         upstream_timeout: Duration::from_secs(2),
+        ..reliaburger::onion::dns::DnsConfig::default()
     };
 
     let shutdown_clone = shutdown.clone();
@@ -883,7 +900,7 @@ async fn dns_responder_resolves_internal_name() {
     assert_eq!(response[7], 0x01);
 
     // Last 4 bytes should be the VIP
-    let vip = VirtualIP::from_app_name("redis");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
     assert_eq!(&response[len - 4..], &vip.0.octets());
 
     shutdown.cancel();
@@ -904,6 +921,7 @@ async fn dns_responder_non_internal_times_out() {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
         upstream: "192.0.2.1:53".parse().unwrap(), // TEST-NET, unreachable
         upstream_timeout: Duration::from_millis(500),
+        ..reliaburger::onion::dns::DnsConfig::default()
     };
 
     let shutdown_clone = shutdown.clone();

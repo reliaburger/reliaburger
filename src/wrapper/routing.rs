@@ -2,11 +2,18 @@
 ///
 /// Maps `(host, path)` pairs to backend pools. Rebuilt from the
 /// `ServiceMap` whenever apps with ingress configuration change.
+///
+/// Ingress configs key on `(namespace, app_name)`, not the bare app
+/// name: two apps of the same name in different namespaces must route
+/// independently (D3/codex-M1). Their VIPs and service-map entries are
+/// already namespace-distinct, so the routing table only needs the
+/// namespaced key to look each one up.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::app::IngressSpec;
+use crate::onion::service_id::ServiceId;
 use crate::onion::service_map::ServiceMap;
 use crate::onion::types::ServiceEntry;
 
@@ -27,6 +34,8 @@ pub struct Backend {
 pub struct PathRoute {
     /// Path prefix (e.g. "/api"). Empty string means "/".
     pub path_prefix: String,
+    /// Namespace that owns this route.
+    pub namespace: String,
     /// App that owns this route.
     pub app_name: String,
     /// Active backends (new requests go here).
@@ -80,22 +89,24 @@ impl RoutingTable {
 
     /// Rebuild the routing table from the ServiceMap and app ingress configs.
     ///
-    /// `ingress_configs` maps app names to their `IngressSpec`. Only
-    /// apps with both a ServiceMap entry and an ingress config get routes.
+    /// `ingress_configs` maps `(namespace, app_name)` to their
+    /// `IngressSpec`. Only apps with both a ServiceMap entry and an
+    /// ingress config get routes.
     pub fn rebuild(
         &mut self,
         service_map: &ServiceMap,
-        ingress_configs: &HashMap<String, IngressSpec>,
+        ingress_configs: &HashMap<(String, String), IngressSpec>,
     ) {
         self.routes.clear();
 
-        for (app_name, ingress) in ingress_configs {
-            let entry = match service_map.resolve(app_name) {
+        for ((namespace, app_name), ingress) in ingress_configs {
+            let service_id = ServiceId::new(namespace, app_name);
+            let entry = match service_map.resolve(&service_id) {
                 Some(e) => e,
                 None => continue,
             };
 
-            let route = build_path_route(app_name, ingress, entry);
+            let route = build_path_route(namespace, app_name, ingress, entry);
             let host = ingress.host.to_lowercase();
 
             self.routes.entry(host).or_default().push(route);
@@ -156,7 +167,12 @@ impl Default for RoutingTable {
 }
 
 /// Build a PathRoute from an ingress config and service entry.
-fn build_path_route(app_name: &str, ingress: &IngressSpec, entry: &ServiceEntry) -> PathRoute {
+fn build_path_route(
+    namespace: &str,
+    app_name: &str,
+    ingress: &IngressSpec,
+    entry: &ServiceEntry,
+) -> PathRoute {
     let path_prefix = ingress.path.as_deref().unwrap_or("/").to_string();
 
     let backends: Vec<Backend> = entry
@@ -179,6 +195,7 @@ fn build_path_route(app_name: &str, ingress: &IngressSpec, entry: &ServiceEntry)
 
     PathRoute {
         path_prefix,
+        namespace: namespace.to_string(),
         app_name: app_name.to_string(),
         backends,
         lb_strategy: LoadBalanceStrategy::default(),
@@ -195,11 +212,15 @@ mod tests {
 
     use crate::onion::types::BackendInstance;
 
-    fn setup_map_and_configs() -> (ServiceMap, HashMap<String, IngressSpec>) {
+    fn ns_key(namespace: &str, app: &str) -> (String, String) {
+        (namespace.to_string(), app.to_string())
+    }
+
+    fn setup_map_and_configs() -> (ServiceMap, HashMap<(String, String), IngressSpec>) {
         let mut map = ServiceMap::new();
         map.register_app("web", "default", 8080, None).unwrap();
         map.add_backend(
-            "web",
+            &ServiceId::new("default", "web"),
             BackendInstance {
                 instance_id: "web-0".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
@@ -209,7 +230,7 @@ mod tests {
         )
         .unwrap();
         map.add_backend(
-            "web",
+            &ServiceId::new("default", "web"),
             BackendInstance {
                 instance_id: "web-1".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 4, 2),
@@ -221,7 +242,7 @@ mod tests {
 
         let mut configs = HashMap::new();
         configs.insert(
-            "web".to_string(),
+            ns_key("default", "web"),
             IngressSpec {
                 host: "myapp.com".to_string(),
                 path: None,
@@ -292,7 +313,7 @@ mod tests {
 
         let mut configs = HashMap::new();
         configs.insert(
-            "api".to_string(),
+            ns_key("default", "api"),
             IngressSpec {
                 host: "myapp.com".to_string(),
                 path: Some("/api".to_string()),
@@ -303,7 +324,7 @@ mod tests {
             },
         );
         configs.insert(
-            "web".to_string(),
+            ns_key("default", "web"),
             IngressSpec {
                 host: "myapp.com".to_string(),
                 path: Some("/".to_string()),
@@ -350,7 +371,7 @@ mod tests {
         let mut map = ServiceMap::new();
         map.register_app("web", "default", 8080, None).unwrap();
         map.add_backend(
-            "web",
+            &ServiceId::new("default", "web"),
             BackendInstance {
                 instance_id: "web-0".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
@@ -360,7 +381,7 @@ mod tests {
         )
         .unwrap();
         map.add_backend(
-            "web",
+            &ServiceId::new("default", "web"),
             BackendInstance {
                 instance_id: "web-1".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 4, 2),
@@ -372,7 +393,7 @@ mod tests {
 
         let mut configs = HashMap::new();
         configs.insert(
-            "web".to_string(),
+            ns_key("default", "web"),
             IngressSpec {
                 host: "myapp.com".to_string(),
                 path: None,
@@ -400,7 +421,7 @@ mod tests {
         let mut map = ServiceMap::new();
         map.register_app("web", "default", 8080, None).unwrap();
         map.add_backend(
-            "web",
+            &ServiceId::new("default", "web"),
             BackendInstance {
                 instance_id: "web-0".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 2, 2),
@@ -412,7 +433,7 @@ mod tests {
 
         let mut configs = HashMap::new();
         configs.insert(
-            "web".to_string(),
+            ns_key("default", "web"),
             IngressSpec {
                 host: "myapp.com".to_string(),
                 path: None,
@@ -445,11 +466,77 @@ mod tests {
     }
 
     #[test]
+    fn same_name_apps_in_two_namespaces_route_independently() {
+        // The D3/codex-M1 regression at the ingress layer: `api` in
+        // `default` and `api` in `payments` both expose an ingress route,
+        // on different hosts, and each must resolve to its own backends.
+        let mut map = ServiceMap::new();
+        map.register_app("api", "default", 3000, None).unwrap();
+        map.register_app("api", "payments", 3000, None).unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "api"),
+            BackendInstance {
+                instance_id: "api-0".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 2, 2),
+                host_port: 30001,
+                healthy: true,
+            },
+        )
+        .unwrap();
+        map.add_backend(
+            &ServiceId::new("payments", "api"),
+            BackendInstance {
+                instance_id: "api-0".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 9, 9),
+                host_port: 40001,
+                healthy: true,
+            },
+        )
+        .unwrap();
+
+        let mut configs = HashMap::new();
+        configs.insert(
+            ns_key("default", "api"),
+            IngressSpec {
+                host: "default.example.com".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+        configs.insert(
+            ns_key("payments", "api"),
+            IngressSpec {
+                host: "payments.example.com".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs);
+
+        // Both routes exist and point at their own namespace's backend.
+        let d = table.lookup("default.example.com", "/").unwrap();
+        assert_eq!(d.namespace, "default");
+        assert_eq!(d.backends[0].addr.port(), 30001);
+
+        let p = table.lookup("payments.example.com", "/").unwrap();
+        assert_eq!(p.namespace, "payments");
+        assert_eq!(p.backends[0].addr.port(), 40001);
+    }
+
+    #[test]
     fn app_without_service_entry_skipped() {
         let map = ServiceMap::new(); // empty
         let mut configs = HashMap::new();
         configs.insert(
-            "web".to_string(),
+            ns_key("default", "web"),
             IngressSpec {
                 host: "myapp.com".to_string(),
                 path: None,
@@ -473,7 +560,7 @@ mod tests {
 
         let mut configs = HashMap::new();
         configs.insert(
-            "ws".to_string(),
+            ns_key("default", "ws"),
             IngressSpec {
                 host: "ws.example.com".to_string(),
                 path: None,
@@ -498,7 +585,7 @@ mod tests {
 
         let mut configs = HashMap::new();
         configs.insert(
-            "api".to_string(),
+            ns_key("default", "api"),
             IngressSpec {
                 host: "api.example.com".to_string(),
                 path: None,
