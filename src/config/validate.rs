@@ -19,8 +19,148 @@ impl Config {
         for (name, job) in &self.job {
             validate_job(name, job)?;
         }
+        for (name, ns) in &self.namespace {
+            validate_namespace(name, ns)?;
+        }
+        // Permissions and builds may reference namespaces declared in the
+        // same file. Apply passes the already-committed desired-state
+        // namespaces through `validate_against`; a bare `validate` only
+        // knows about namespaces in this config.
+        let declared: Vec<String> = self.namespace.keys().cloned().collect();
+        for (name, perm) in &self.permission {
+            validate_permission(name, perm, &declared)?;
+        }
+        for (name, build) in &self.build {
+            validate_build(name, build, &declared)?;
+        }
         Ok(())
     }
+
+    /// Validate this config, treating `known_namespaces` (from committed
+    /// desired state) as also declared. Permissions and builds may target
+    /// a namespace created by an earlier apply, not just one in this file.
+    pub fn validate_against(&self, known_namespaces: &[String]) -> Result<(), ConfigError> {
+        for (name, app) in &self.app {
+            validate_app(name, app)?;
+        }
+        for (name, job) in &self.job {
+            validate_job(name, job)?;
+        }
+        for (name, ns) in &self.namespace {
+            validate_namespace(name, ns)?;
+        }
+        let mut declared: Vec<String> = self.namespace.keys().cloned().collect();
+        declared.extend(known_namespaces.iter().cloned());
+        for (name, perm) in &self.permission {
+            validate_permission(name, perm, &declared)?;
+        }
+        for (name, build) in &self.build {
+            validate_build(name, build, &declared)?;
+        }
+        Ok(())
+    }
+}
+
+/// Actions a `[[permission]]` may grant. Mirrors `permission.rs`'s doc.
+const KNOWN_PERMISSION_ACTIONS: &[&str] = &[
+    "deploy",
+    "scale",
+    "logs",
+    "metrics",
+    "exec",
+    "host-exec",
+    "admin",
+    "secret-read",
+    "secret-write",
+];
+
+fn validate_namespace(name: &str, ns: &super::namespace::NamespaceSpec) -> Result<(), ConfigError> {
+    // Resource budgets must parse as non-negative resource values. A
+    // negative or overflowing CPU/memory budget is a typo, not a quota.
+    if let Some(cpu) = &ns.cpu {
+        parse_resource_value(cpu).map_err(|_| ConfigError::Validation {
+            field: "cpu".to_string(),
+            context: format!("namespace {name:?}"),
+            reason: format!("invalid resource value {cpu:?}"),
+        })?;
+    }
+    if let Some(memory) = &ns.memory {
+        parse_resource_value(memory).map_err(|_| ConfigError::Validation {
+            field: "memory".to_string(),
+            context: format!("namespace {name:?}"),
+            reason: format!("invalid resource value {memory:?}"),
+        })?;
+    }
+    // A zero cap means "admit nothing", which is never what an operator
+    // wants and almost always a mistake. Omit the field for "no limit".
+    for (field, value) in [
+        ("max_apps", ns.max_apps),
+        ("max_replicas", ns.max_replicas),
+        ("gpu", ns.gpu),
+    ] {
+        if value == Some(0) {
+            return Err(ConfigError::Validation {
+                field: field.to_string(),
+                context: format!("namespace {name:?}"),
+                reason: format!("{field} must be positive; omit it for no limit"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_permission(
+    name: &str,
+    perm: &super::permission::PermissionSpec,
+    known_namespaces: &[String],
+) -> Result<(), ConfigError> {
+    for action in &perm.actions {
+        if !KNOWN_PERMISSION_ACTIONS.contains(&action.as_str()) {
+            return Err(ConfigError::Validation {
+                field: "actions".to_string(),
+                context: format!("permission {name:?}"),
+                reason: format!(
+                    "unknown action {action:?}; valid actions are {}",
+                    KNOWN_PERMISSION_ACTIONS.join(", ")
+                ),
+            });
+        }
+    }
+    // A permission scoped to a namespace that doesn't exist grants nothing
+    // and hides a typo. `default` always exists implicitly.
+    if let Some(namespaces) = &perm.namespaces {
+        for ns in namespaces {
+            if ns != "default" && !known_namespaces.iter().any(|n| n == ns) {
+                return Err(ConfigError::Validation {
+                    field: "namespaces".to_string(),
+                    context: format!("permission {name:?}"),
+                    reason: format!("references unknown namespace {ns:?}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_build(
+    name: &str,
+    build: &super::build::BuildSpec,
+    known_namespaces: &[String],
+) -> Result<(), ConfigError> {
+    // Destination syntax and context existence.
+    super::build::validate_build_namespace(name, build)?;
+    // A build's namespace must exist. `default` is implicit.
+    if let Some(ns) = &build.namespace
+        && ns != "default"
+        && !known_namespaces.iter().any(|n| n == ns)
+    {
+        return Err(ConfigError::Validation {
+            field: "namespace".to_string(),
+            context: format!("build {name:?}"),
+            reason: format!("references unknown namespace {ns:?}"),
+        });
+    }
+    Ok(())
 }
 
 fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
@@ -534,6 +674,156 @@ mod tests {
             toml::from_str(r#"exec = "/usr/bin/python3""#).unwrap();
         let mut config = Config::default();
         config.job.insert("test-job".to_string(), job);
+        config.validate().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Namespace / permission / build validation (12b.2 T6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_namespace_negative_quota_rejected() {
+        let config = Config::parse(
+            r#"
+            [namespace.team]
+            cpu = "-5"
+        "#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "cpu"),
+            "negative cpu budget must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_namespace_zero_max_apps_rejected() {
+        let config = Config::parse(
+            r#"
+            [namespace.team]
+            max_apps = 0
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_namespace_valid_quota_passes() {
+        let config = Config::parse(
+            r#"
+            [namespace.team]
+            cpu = "8000m"
+            memory = "16Gi"
+            gpu = 2
+            max_apps = 50
+            max_replicas = 200
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_permission_unknown_action_rejected() {
+        let config = Config::parse(
+            r#"
+            [permission.p]
+            actions = ["deploy", "teleport"]
+        "#,
+        )
+        .unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "actions"),
+            "unknown permission action must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_permission_unknown_namespace_rejected() {
+        let config = Config::parse(
+            r#"
+            [permission.p]
+            actions = ["deploy"]
+            namespaces = ["ghost"]
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_permission_namespace_in_same_config_passes() {
+        let config = Config::parse(
+            r#"
+            [namespace.prod]
+            cpu = "8000m"
+
+            [permission.p]
+            actions = ["deploy", "scale"]
+            namespaces = ["prod"]
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_permission_namespace_from_desired_state_passes() {
+        // `prod` isn't in this file but was created by an earlier apply.
+        let config = Config::parse(
+            r#"
+            [permission.p]
+            actions = ["deploy"]
+            namespaces = ["prod"]
+        "#,
+        )
+        .unwrap();
+        assert!(config.validate().is_err(), "bare validate can't see prod");
+        config
+            .validate_against(&["prod".to_string()])
+            .expect("validate_against sees the committed namespace");
+    }
+
+    #[test]
+    fn validate_build_unknown_namespace_rejected() {
+        let config = Config::parse(
+            r#"
+            [build.img]
+            context = "."
+            destination = "pickle://img:v1"
+            namespace = "ghost"
+        "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_build_existing_namespace_passes() {
+        let config = Config::parse(
+            r#"
+            [namespace.prod]
+            cpu = "8000m"
+
+            [build.img]
+            context = "."
+            destination = "pickle://img:v1"
+            namespace = "prod"
+        "#,
+        )
+        .unwrap();
         config.validate().unwrap();
     }
 }

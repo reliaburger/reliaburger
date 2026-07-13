@@ -683,10 +683,10 @@ whole theme lands.
     growth and departed-node re-plan.
   - [x] Namespace quotas wired (enforcement seam): `QuotaLedger` accumulates per-namespace
     usage cumulatively across the pass and refuses an app that would bust its quota, with a
-    clear deploy-time error. **Handoff:** namespace resources are not desired state until T6
-    (Complete declarative resources), so the production quota table is empty today and every
-    app is admitted — the seam and its tests (injected table, cumulative rejection, overflow)
-    are in place, ready for T6 to feed `NamespaceSpec` quotas in.
+    clear deploy-time error. **Handoff closed in T6:** namespace resources are now desired
+    state, and the scheduling pass builds its ledger from `desired.namespaces` via
+    `ledger_from_namespaces` (`orchestrate.rs:150`), so a declared quota actually rejects an
+    over-budget app on the apply path.
   - [x] Autoscale lifecycle (DEP8): `AutoscaleConfig::from_spec` returns a validated `Result`
     (rejects `min > max`, zero max, zero/unparseable evaluation window — cooldown may be zero,
     out-of-range threshold) and config validation surfaces it on `relish apply`; the cooldown
@@ -791,11 +791,51 @@ whole theme lands.
       `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 7
       (wiring drain/surge/rollback into the live path, why stop must wait for exit). Theme
       complete.
-- [ ] **Complete declarative resources** — validate and apply apps, jobs, builds, namespaces
+- [x] **Complete declarative resources** — validate and apply apps, jobs, builds, namespaces
   and permissions through the same local/Raft/GitOps path; enforce namespace and permission
   resources plus build scope; reject or remove every parsed field that cannot affect the
   binary. Acceptance: one configuration containing every resource kind converges identically
-  through manual apply and GitOps (DEP7/D12).
+  through manual apply and GitOps (DEP7/D12). **This theme closes the 12b.2 "Make the cluster
+  converge" tier.**
+  - [x] Namespaces and permissions as desired state (DEP7): append-only serde-default
+    `NamespaceSpec`/`NamespaceDelete`/`PermissionSpec`/`PermissionDelete` Raft variants and
+    `namespaces`/`permissions` `BTreeMap`s in `DesiredState`; a pre-theme snapshot without
+    those keys loads cleanly (fixture test through the strict loader). `Config::validate`
+    rejects negative/overflowing namespace budgets, zero caps, unknown permission actions,
+    and permissions/builds referencing a namespace that exists in neither the config nor
+    committed desired state (`validate_against`).
+  - [x] Shared apply path (the linchpin): one `council::config_to_desired_writes` turns a
+    parsed `Config` into the ordered write set (namespaces, then permissions, then apps).
+    BOTH manual `cluster_apply` (`bun/api.rs`) and Lettuce call it, so the two paths cannot
+    diverge by construction. Deletion semantics: manual `relish apply` is additive (writes
+    what's in the file, prunes nothing — matching how app apply already behaved); GitOps
+    reconciles the whole repo and prunes namespaces/permissions consistently with apps.
+  - [x] Namespace quota handoff closed (T4 seam): the scheduling pass builds its
+    `QuotaLedger` from `desired.namespaces` via `ledger_from_namespaces`
+    (`orchestrate.rs:150`), so an app exceeding its namespace CPU/replica budget is refused
+    at deploy time with a logged reason; a namespace with headroom admits it. `quota_from_spec`
+    parses the config's `"8000m"`/`"16Gi"` strings into the scheduler's integer quota.
+  - [x] Build scope wired (DEP7): `Config::validate` runs `validate_build_namespace`, and
+    `/v1/build` submission runs `check_namespace_scope` against desired-state namespaces so a
+    build pushing to a `pickle://ns/name` destination must target an existing namespace.
+  - [x] Lettuce through the unified path, atomically (D12): `resource_change_to_request` was
+    replaced by `change_to_request`/`payload_to_request`/`remove_to_request` handling apps,
+    namespaces and permissions (no more silent `None` skip); the app write now keys on the
+    spec's own namespace, not a hardcoded `default` (the divergence the acceptance test
+    caught). `last_applied_commit` advances ONLY when every write in the sync succeeds
+    (`apply_changes` returns `Err(id)` and stops on first failure); a partial/failed sync
+    leaves the commit unadvanced and re-applies (idempotently) next tick.
+  - [x] Parsed-but-dead audit: `NamespaceSpec` (all five fields feed the quota),
+    `PermissionSpec` (actions/namespaces validated, stored as desired state; principal→
+    permission *binding* is AUTH1/12b.3, noted in the book), `BuildSpec`
+    (destination/namespace/context validated). Nothing removed — every field now affects the
+    binary.
+  - [x] Acceptance: `manual_apply_and_gitops_converge_identically` asserts one every-kind
+    config produces byte-identical declarative `DesiredState` via manual apply and GitOps.
+    `make ci` green (fmt, clippy `-D warnings`, 2431-test default suite); gated
+    `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 7
+    (why apply and GitOps must share one path; why `last_applied` advancing on partial failure
+    silently drops resources). Theme complete; 12b.2 tier complete.
 - [x] **Durable batch and build execution** — use one authoritative namespace; persist
   monotonic IDs, trackers and terminal state; include unschedulable jobs; bound and retry
   dispatch/callbacks; make duplicate reports idempotent and run GC. Transfer build context

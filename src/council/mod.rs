@@ -10,6 +10,7 @@
 /// - `MemLogStore` — in-memory Raft log storage
 /// - `CouncilStateMachine` — applies entries to desired cluster state
 /// - `InMemoryRaftRouter` — in-memory network for testing
+pub mod apply;
 pub mod backup;
 pub mod durable_log;
 pub mod log_store;
@@ -20,6 +21,7 @@ pub mod selection;
 pub mod state_machine;
 pub mod types;
 
+pub use apply::config_to_desired_writes;
 pub use node::CouncilNode;
 pub use selection::{CouncilSelectionConfig, select_council_candidates};
 pub use state_machine::SnapshotStoreError;

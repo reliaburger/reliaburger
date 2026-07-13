@@ -960,6 +960,29 @@ pub async fn build_submit_handler(
         Ok(request) => request,
         Err(resp) => return resp,
     };
+
+    // A build's `pickle://ns/name` destination must target an existing
+    // namespace (12b.2 T6). Desired-state namespaces are the source of
+    // truth; `default` is always available. Without a council this node
+    // is single-node, so only the destination syntax is enforced.
+    if let Some(council) = &state.council {
+        let mut existing: Vec<String> = council
+            .desired_state()
+            .await
+            .namespaces
+            .keys()
+            .cloned()
+            .collect();
+        existing.push("default".to_string());
+        if let Err(e) = crate::pickle::build::check_namespace_scope(&request.spec, &existing) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
     if local_buildah_available().await {
         return accept_build(&state, request).await;
     }

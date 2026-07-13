@@ -590,6 +590,104 @@ The worker sequences the deploy; the loop applies each authoritative step and st
 
 Two tests pin the behaviour down. The first deploys an app whose `create` sleeps for three seconds, then fires a `Status` command and asserts it's answered in well under that — proof the loop kept moving. The second starts two deploys whose creates both sleep, and checks that *both* creates are in flight before either finishes; serially, the second couldn't start until the first returned. Both tests fail against the old inline deploy and pass against the task-per-deploy one, which is exactly what you want a regression test to do.
 
+## One config, two front doors, one path
+
+A Reliaburger config file describes more than apps. It can declare namespaces (with resource budgets), permissions (who can do what), jobs, and image builds — all in the same TOML. And there are two ways to get that file into the cluster. You can run `relish apply` by hand, or you can commit it to a git repo and let the Lettuce GitOps engine sync it. Same file, two front doors.
+
+Here's the question that keeps you up at night: do those two doors lead to the same room? If `relish apply` writes an app but silently drops the namespace, while GitOps writes the namespace but mangles the app's identity, then "declarative" is a lie. The cluster's state depends on *how* you applied the config, not *what's in it*. That's the worst kind of bug, because it only shows up when someone switches from one door to the other and wonders why their quota vanished.
+
+For a long time, that was exactly the situation. Manual apply proposed an `AppSpec` for each app and dropped everything else on the floor. GitOps had its own translation step, `resource_change_to_request`, which returned `None` for anything that wasn't an app — jobs, namespaces, permissions, all silently skipped. Two code paths, two sets of blind spots, and no reason to think they'd ever agree.
+
+The fix is structural, not a patch. We wrote one function, `config_to_desired_writes`, that turns a parsed `Config` into the ordered list of Raft writes it implies:
+
+```rust
+pub fn config_to_desired_writes(config: &Config) -> Vec<RaftRequest> {
+    let mut writes = Vec::new();
+    for (name, spec) in &config.namespace {
+        writes.push(RaftRequest::NamespaceSpec { name: name.clone(), spec: Box::new(spec.clone()) });
+    }
+    for (name, spec) in &config.permission {
+        writes.push(RaftRequest::PermissionSpec { name: name.clone(), spec: Box::new(spec.clone()) });
+    }
+    for (name, spec) in &config.app {
+        let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+        writes.push(RaftRequest::AppSpec { app_id: AppId::new(name, &namespace), spec: Box::new(spec.clone()) });
+    }
+    writes
+}
+```
+
+`Box<T>` here is Rust's heap pointer — the same idea as a C `malloc`'d struct behind a pointer, but the compiler frees it for you when the `Box` goes out of scope. We box the specs because `RaftRequest` is an enum, and an enum is as big as its largest variant; boxing the big payloads keeps the whole enum small to move around. `Vec<T>` is a growable array, like Go's slice or C++'s `std::vector`.
+
+Now both front doors call this one function. Manual apply loops over its output and writes each request. GitOps, after diffing the repo against the current state, maps each change through the *same* request shapes. There's no second translation that could drift, because there's no second translation. Notice the ordering, too: namespaces first, then permissions, then apps. A namespace's quota has to be committed before an app schedules against it, or the app's first placement races the budget that's meant to constrain it.
+
+How do you *prove* the two doors agree? You write the test that would have caught the old divergence:
+
+```rust
+#[tokio::test]
+async fn manual_apply_and_gitops_converge_identically() {
+    // Apply the every-kind config by hand to one council…
+    for request in config_to_desired_writes(&config) {
+        manual.write(request).await.unwrap();
+    }
+    let manual_state = declarative_json(&manual.desired_state().await);
+    // …and sync the identical file through GitOps to another.
+    // Then assert the declarative desired state is byte-identical.
+}
+```
+
+The first time we ran it, it failed — and it failed for a *real* reason. Manual apply keyed an app on its declared namespace (`prod/web`), but the GitOps path hardcoded `default` when it built the app's identity. Same config, two different `AppId`s, two different rooms. The shared write function fixed the manual side; the GitOps translation had to learn to read the app's own namespace instead of assuming `default`. That's the whole point of an acceptance test written against the property you care about: it doesn't care *how* the paths differ, only *that* they agree, so it catches drift you didn't think to look for.
+
+## Why "applied" must mean "all of it applied"
+
+GitOps has a second failure mode that's subtler and nastier. A sync isn't one write; it's a batch. A single commit might add a namespace, update a permission, and create three apps. What happens if the second write fails?
+
+The old runner applied each change in a loop, logged failures, and then — regardless of what failed — recorded the commit as applied:
+
+```rust
+// old: apply each change, then unconditionally advance the commit
+for change in &outcome.changes {
+    if let Err(e) = council.write(request).await { eprintln!("failed: {e}"); }
+}
+sync_state.last_applied_commit = Some(commit);   // ← runs even after a failure
+```
+
+Read that again, because it's the bug. `last_applied_commit` is how GitOps knows what it's already done. On the next tick, it fetches the repo, sees the commit hasn't changed, and skips — "already applied, nothing to do." So if a write failed but the commit advanced anyway, that failed resource is now *permanently* missing. It won't retry, because as far as the runner knows, it's done. The namespace you committed just quietly doesn't exist, and nothing ever tries again until some *unrelated* future commit happens to touch the repo.
+
+The fix is a rule you can state in one sentence: the commit advances only if every write in the sync succeeds.
+
+```rust
+async fn apply_changes(council: &CouncilNode, changes: &[ResourceChange]) -> Result<usize, String> {
+    let mut applied = 0;
+    for change in changes {
+        let Some(request) = change_to_request(change) else { continue };
+        if let Err(e) = council.write(request).await {
+            return Err(change_id(change).to_string());   // stop; don't advance
+        }
+        applied += 1;
+    }
+    Ok(applied)
+}
+```
+
+`Result<usize, String>` is Rust's answer to error handling — a value that's *either* an `Ok` carrying the count, *or* an `Err` carrying the id of the change that failed. There's no exception to forget to catch and no error code to ignore; the caller can't get at the count without acknowledging the failure case. The `let Some(x) = … else { continue }` is a *let-else*: bind `x` if the pattern matches, otherwise run the `else` (which must diverge — here, `continue` to the next change). It's the clean way to say "skip the ones that don't map to a write" without nesting.
+
+The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the commit untouched and moves on; the next tick sees an unapplied commit and re-runs the whole set. That only works because the writes are idempotent — applying a `NamespaceSpec` that's already there is an upsert, a harmless no-op — so re-running a partially-applied sync converges instead of double-counting. Idempotence is what buys you "just retry the whole thing," which is the simplest correct recovery there is.
+
+The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
+
+## Namespaces that actually say no
+
+There's a nice pay-off from making namespaces real desired state. Back when we built the scheduler, it already had a quota ledger — a per-namespace accountant that checks whether admitting an app would bust its CPU, memory, GPU, or replica budget. It was wired, tested, and completely inert, because it was fed an empty table: namespaces weren't desired state yet, so there were no budgets to enforce.
+
+Now they are. The scheduling pass builds its ledger straight from the desired-state namespaces:
+
+```rust
+let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+```
+
+Declare a namespace with `cpu = "2000m"`, apply an app that wants three replicas at 800 millicores each, and the scheduler does the arithmetic — 2,400 > 2,000 — and refuses the placement with a clear reason in the log, instead of over-committing the budget you set. A namespace with headroom admits the same app without complaint. The enforcement was built and proven long ago; all this theme did was hand it the numbers.
+
 ## What we deferred
 
 Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.

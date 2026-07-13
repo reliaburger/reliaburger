@@ -59,6 +59,8 @@ pub fn spawn_gitops_sync(
 
             let desired = council.desired_state().await;
             let current_apps = desired.apps.clone();
+            let current_namespaces = desired.namespaces.clone();
+            let current_permissions = desired.permissions.clone();
             let overrides = desired.autoscale_overrides.clone();
             let last_sha = desired
                 .gitops_sync_state
@@ -79,6 +81,8 @@ pub fn spawn_gitops_sync(
                     &repo,
                     &config_clone,
                     &current_apps,
+                    &current_namespaces,
+                    &current_permissions,
                     &overrides,
                     last_sha.as_deref(),
                 ))
@@ -107,32 +111,39 @@ pub fn spawn_gitops_sync(
                 SyncResult::Success | SyncResult::PartialSuccess { .. } => {}
             }
 
-            // Apply each change through the standard desired-state path.
-            let mut applied = 0usize;
-            for change in &outcome.changes {
-                let request = match change {
-                    ResourceChange::Add { resource_id, spec }
-                    | ResourceChange::Update {
-                        resource_id, spec, ..
-                    } => match resource_change_to_request(resource_id, spec) {
-                        Some(req) => req,
-                        None => continue,
-                    },
-                    ResourceChange::Remove { resource_id } => {
-                        let Some(app_id) = app_id_from_resource(resource_id) else {
-                            continue;
-                        };
-                        RaftRequest::AppDelete { app_id }
-                    }
-                };
-                if let Err(e) = council.write(request).await {
-                    eprintln!("gitops: failed to apply {}: {e}", change_id(change));
-                } else {
-                    applied += 1;
+            // Apply each change through the SAME desired-state writes a
+            // manual `relish apply` makes (12b.2 T6). Every kind now maps
+            // to a request — apps, namespaces, permissions — so nothing is
+            // silently skipped the way a `None` used to drop jobs and
+            // namespaces on the floor.
+            //
+            // Atomicity (D12): `last_applied_commit` advances only if
+            // EVERY write in the sync succeeds. The old code advanced the
+            // commit regardless of per-change failures, so a failed write
+            // was marked "applied" and never retried — the resource just
+            // vanished until the next unrelated commit. Now a failure
+            // leaves the commit unadvanced, and the next tick re-applies
+            // the whole set. Writes are idempotent (spec upsert / delete),
+            // so re-applying an already-committed change is a harmless
+            // no-op.
+            let applied = match apply_changes(&council, &outcome.changes).await {
+                Ok(applied) => applied,
+                Err(unapplied) => {
+                    eprintln!(
+                        "gitops: sync of {} failed at {unapplied}; commit not advanced, \
+                         will retry next tick",
+                        outcome
+                            .commit
+                            .as_ref()
+                            .map(|c| c.sha.as_str())
+                            .unwrap_or("?")
+                    );
+                    continue;
                 }
-            }
+            };
 
-            // Record the sync state (last applied commit → last_sha).
+            // Record the sync state (last applied commit → last_sha) only
+            // after every change committed cleanly.
             if let Some(commit) = &outcome.commit {
                 let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
                 sync_state.last_applied_commit = Some(commit.clone());
@@ -159,20 +170,93 @@ pub fn spawn_gitops_sync(
     });
 }
 
-/// `"app.web"` → the `AppSpec` write, if the payload is an app.
-fn resource_change_to_request(resource_id: &str, payload: &ChangePayload) -> Option<RaftRequest> {
+/// Apply a sync's changes to Raft, stopping at the first failure.
+///
+/// Returns `Ok(count)` with the number of writes committed when every
+/// change applied, or `Err(resource_id)` naming the change that failed.
+/// The caller must advance `last_applied_commit` only on `Ok` — that's
+/// the D12 atomicity guarantee: a half-applied sync leaves the commit
+/// unadvanced so the next tick re-applies the whole (idempotent) set.
+pub async fn apply_changes(
+    council: &CouncilNode,
+    changes: &[ResourceChange],
+) -> Result<usize, String> {
+    let mut applied = 0usize;
+    for change in changes {
+        let Some(request) = change_to_request(change) else {
+            continue; // jobs/builds: not reconciled desired state
+        };
+        if let Err(e) = council.write(request).await {
+            eprintln!("gitops: failed to apply {}: {e}", change_id(change));
+            return Err(change_id(change).to_string());
+        }
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Map a diff `ResourceChange` to the Raft write that realises it.
+///
+/// Returns `None` for kinds that aren't reconciled desired state (jobs,
+/// builds) — those carry a `Generic` payload, so their add/update yields
+/// nothing to write. Every declarative kind (app, namespace, permission)
+/// maps to a real write for both add/update and remove.
+fn change_to_request(change: &ResourceChange) -> Option<RaftRequest> {
+    match change {
+        ResourceChange::Add { resource_id, spec }
+        | ResourceChange::Update {
+            resource_id, spec, ..
+        } => payload_to_request(resource_id, spec),
+        ResourceChange::Remove { resource_id } => remove_to_request(resource_id),
+    }
+}
+
+/// An add/update payload → its `Spec` write.
+fn payload_to_request(resource_id: &str, payload: &ChangePayload) -> Option<RaftRequest> {
     match payload {
         ChangePayload::App(spec) => {
-            let app_id = app_id_from_resource(resource_id)?;
+            // Key on the spec's own namespace, exactly as
+            // `config_to_desired_writes` does — not a hardcoded `default`.
+            // Otherwise a `namespace = "prod"` app lands under `default`
+            // via GitOps but `prod` via manual apply: the two paths would
+            // diverge (caught by the T6 acceptance test).
+            let name = resource_id.strip_prefix("app.")?;
+            let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
             Some(RaftRequest::AppSpec {
-                app_id,
+                app_id: AppId::new(name, &namespace),
                 spec: spec.clone(),
             })
         }
-        // Jobs/namespaces/permissions aren't cluster-scheduled desired
-        // state yet; skip rather than mis-apply.
+        ChangePayload::Namespace(spec) => Some(RaftRequest::NamespaceSpec {
+            name: resource_id.strip_prefix("namespace.")?.to_string(),
+            spec: spec.clone(),
+        }),
+        ChangePayload::Permission(spec) => Some(RaftRequest::PermissionSpec {
+            name: resource_id.strip_prefix("permission.")?.to_string(),
+            spec: spec.clone(),
+        }),
+        // Jobs (run to completion) and builds (imperative) aren't
+        // reconciled desired state; nothing to write.
         ChangePayload::Generic => None,
     }
+}
+
+/// A removal `resource_id` → its `Delete` write.
+fn remove_to_request(resource_id: &str) -> Option<RaftRequest> {
+    if let Some(app_id) = app_id_from_resource(resource_id) {
+        return Some(RaftRequest::AppDelete { app_id });
+    }
+    if let Some(name) = resource_id.strip_prefix("namespace.") {
+        return Some(RaftRequest::NamespaceDelete {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = resource_id.strip_prefix("permission.") {
+        return Some(RaftRequest::PermissionDelete {
+            name: name.to_string(),
+        });
+    }
+    None
 }
 
 /// Parse `"app.<name>"` into an `AppId` in the default namespace.
@@ -209,10 +293,63 @@ mod tests {
             .app
             .remove("web")
             .unwrap();
-        let req = resource_change_to_request("app.web", &ChangePayload::App(Box::new(spec)));
+        let req = payload_to_request("app.web", &ChangePayload::App(Box::new(spec)));
         assert!(matches!(req, Some(RaftRequest::AppSpec { .. })));
 
         // Generic payloads (jobs etc.) are skipped, not mis-applied.
-        assert!(resource_change_to_request("job.x", &ChangePayload::Generic).is_none());
+        assert!(payload_to_request("job.x", &ChangePayload::Generic).is_none());
+    }
+
+    #[test]
+    fn namespace_and_permission_payloads_become_writes() {
+        let ns = crate::config::NamespaceSpec {
+            cpu: Some("8000m".to_string()),
+            memory: None,
+            gpu: None,
+            max_apps: None,
+            max_replicas: None,
+        };
+        assert!(matches!(
+            payload_to_request("namespace.prod", &ChangePayload::Namespace(Box::new(ns))),
+            Some(RaftRequest::NamespaceSpec { .. })
+        ));
+        let perm = crate::config::PermissionSpec {
+            actions: vec!["deploy".to_string()],
+            apps: vec![],
+            namespaces: None,
+        };
+        assert!(matches!(
+            payload_to_request("permission.dep", &ChangePayload::Permission(Box::new(perm))),
+            Some(RaftRequest::PermissionSpec { .. })
+        ));
+    }
+
+    #[test]
+    fn removals_map_to_delete_writes_for_every_kind() {
+        assert!(matches!(
+            change_to_request(&ResourceChange::Remove {
+                resource_id: "app.web".to_string()
+            }),
+            Some(RaftRequest::AppDelete { .. })
+        ));
+        assert!(matches!(
+            change_to_request(&ResourceChange::Remove {
+                resource_id: "namespace.prod".to_string()
+            }),
+            Some(RaftRequest::NamespaceDelete { .. })
+        ));
+        assert!(matches!(
+            change_to_request(&ResourceChange::Remove {
+                resource_id: "permission.dep".to_string()
+            }),
+            Some(RaftRequest::PermissionDelete { .. })
+        ));
+        // An unknown kind maps to nothing rather than a bogus write.
+        assert!(
+            change_to_request(&ResourceChange::Remove {
+                resource_id: "job.x".to_string()
+            })
+            .is_none()
+        );
     }
 }
