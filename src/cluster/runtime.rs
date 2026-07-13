@@ -260,7 +260,10 @@ pub async fn start(
             .map(|s| s.crl.clone())
             .unwrap_or_default(),
     );
-    let (raft_acceptor, raft_connector) = match &params.identity {
+    // The Raft acceptor (server side) and a node-id-bound dial material for
+    // the factory (PKI3). Reporting still dials by address, so it keeps the
+    // unbound connector below.
+    let (raft_acceptor, raft_connector, raft_tls_material) = match &params.identity {
         Some(identity) => {
             let server =
                 crate::sesame::mtls::build_mtls_server_config(identity, crl_handle.clone())
@@ -268,16 +271,21 @@ pub async fn start(
             let client =
                 crate::sesame::mtls::build_mtls_client_config(identity, crl_handle.clone())
                     .map_err(|e| std::io::Error::other(format!("mTLS client config: {e}")))?;
+            let material = crate::council::network::RaftTlsMaterial::new(
+                (**identity).clone(),
+                crl_handle.clone(),
+            );
             (
                 Some(tokio_rustls::TlsAcceptor::from(server)),
                 Some(tokio_rustls::TlsConnector::from(client)),
+                Some(material),
             )
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
-    let factory = match raft_connector.clone() {
-        Some(connector) => TcpRaftNetworkFactory::new_tls(raft_id, connector),
+    let factory = match raft_tls_material {
+        Some(material) => TcpRaftNetworkFactory::new_tls_bound(raft_id, material),
         None => TcpRaftNetworkFactory::new(raft_id),
     };
     // Same for the Raft RPC blocklist — a partition must cut both the

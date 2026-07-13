@@ -117,7 +117,11 @@ $ relish join --token rbrg_join_1_a7f3b9c2... 10.0.1.5:9443
 
 The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, and hasn't been consumed, the council marks it as consumed and issues a node certificate.
 
-There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs the token and the node's chosen id to that member's `/v1/cluster/join` endpoint, which validates the token, issues the certificate, and returns a bundle: the new cert, its private key, and the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
+There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs to that member's `/v1/cluster/join` endpoint, which validates the token and signs the joiner a certificate, returning a bundle with the new cert plus the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
+
+Read that again, though, and one word should worry you: *returns*. An earlier version of this flow had the issuer generate the joiner's keypair and post the private key back in the bundle. That's a private key travelling over the wire and sitting in the issuer's memory — a key that's supposed to be the one thing only the joiner ever holds. So we changed it. The joiner now generates its own keypair locally and sends only a **CSR** (a certificate signing request: a public key plus the identity it's asking to be certified for, signed by the matching private key to prove possession). The issuer signs the CSR and returns just the leaf certificate. The private key never leaves the joining node. This is the same shape as the workload-identity flow from Chapter 10, and for the same reason: a key you never transmit is a key you can't leak in transit.
+
+The issuer takes exactly one thing from the CSR — its public key. Every other field of the certificate, the node-id SAN in particular, it rebuilds from the id *it* validated. So a joiner that stuffs a rival node's id into its CSR gets a certificate for its own id anyway; the request is a request, not an instruction.
 
 That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
 
@@ -153,6 +157,83 @@ The fix is `sesame::identity_store`, a small module that owns one directory:
 `relish init` now writes this for the bootstrap node, and fills the `[security]` section of the generated `reliaburger.toml` so `bun` knows where to look. Two details are worth stealing for your own projects. First, the private key is written with `atomic_write_mode(path, data, Some(0o600))` — the permission is set on the temp file *before* the rename, so there is never a moment when the key sits at its final path world-readable. Second, `load()` returns `Result<Option<NodeIdentity>, _>`, not a bare `Result`. A missing identity isn't an error; it's a state ("this node hasn't enrolled yet") that the caller matches on explicitly. Rust makes the three outcomes — loaded, absent, corrupt — impossible to conflate, which is exactly what you want for a file that decides whether your listeners speak TLS.
 
 `init` also prints the root CA fingerprint (`sha256:...`). Keep it. When a joiner enrols later, `relish join` prints the fingerprint of the root CA it received, and those two strings matching is your defence against handing a node's trust to the wrong cluster.
+
+### One token, one certificate
+
+Look back at how the issuer handled a token: check it's unused, mark it consumed, then allocate a serial and sign. Three steps. On a single-threaded toy that's fine. In a real cluster it's a race waiting to happen. Two nodes fire the *same* leaked token at two different members at the same instant. Both members read the replicated state, both see the token as unused, both sail past the check, and now one token has minted two certificates with two serials. Not catastrophic on its own, but it's a duplicate-issuance bug in the part of the system whose entire job is to say "no" precisely.
+
+The fix is to make "check unused, mark consumed, allocate serial" a single indivisible operation. We already have a machine that does exactly one thing at a time in a total order across the whole cluster: the Raft log. So we added one log entry, `ConsumeJoinTokenForIssue`, that does all three inside the state machine:
+
+```rust
+RaftRequest::ConsumeJoinTokenForIssue { token_hash } => {
+    let Some(token) = /* find by hash */ else {
+        return Some(CouncilResponse::Refused { reason: "join token not found".into() });
+    };
+    if token.consumed {
+        return Some(CouncilResponse::Refused { reason: "join token already consumed".into() });
+    }
+    token.consumed = true;
+    let serial = self.state.security_state.next_serial;
+    self.state.security_state.next_serial += 1;
+    return Some(CouncilResponse::JoinTokenConsumed { serial });
+}
+```
+
+Because every node applies the log serially, exactly one entry for a given token finds it unconsumed. That entry gets a `JoinTokenConsumed { serial }`; the racer's entry, and every retry, gets `Refused`. The issuer only signs *after* this returns a serial, so a token that lost the race never produces a certificate. One token, one cert — enforced by consensus, not by hope.
+
+The `Option<CouncilResponse>` return is Rust's way of saying "this entry might carry a verdict back to whoever proposed it". Most log entries return `None` (applied, nothing to report). This one returns `Some(...)` so the proposer learns which serial it won, or why it was turned away, without racing to read shared state back — the same pattern the plain serial allocator already used.
+
+One more thing changed while we were in here. The old code hard-coded the issuer's distinguished name as a string literal when it rebuilt the CA for signing. If that string ever drifted from the actual Node CA's subject, the issued leaf wouldn't chain. We now derive it straight from the stored CA certificate with rcgen's `CertificateParams::from_ca_cert_der`, so the issuer field always matches the CA that's really in the trust store.
+
+### Binding a connection to a node
+
+Chapter 10 pins the client verifier to the Node CA: a peer must present a valid, unrevoked certificate that the Node CA issued. That stops outsiders cold. It does *not* stop one cluster node from impersonating another. Node B holds a perfectly valid Node-CA certificate. If B connects to A pretending to be C, the CA-pin check is happy — B's cert is genuine. We just never asked "genuine as *whom*?"
+
+To ask that, the verifier needs two things: a name to expect, and a name inside the certificate to check against. The name inside the certificate is the node-id URI SAN we started issuing, `spiffe://reliaburger/node/<id>`. The name to expect is whichever node we meant to dial. On the Raft transport that's easy — openraft hands the connection factory the target's `CouncilNodeInfo`, which carries the peer's node id — so we build a per-target verifier bound to that id:
+
+```rust
+if let Some(expected) = &self.expected_node_id {
+    let presented = node_id_from_leaf(end_entity).ok_or(/* no SAN → reject */)?;
+    if &presented != expected {
+        return Err(/* wrong node → reject */);
+    }
+}
+```
+
+Now a valid certificate for node C, presented when we dialled node A, is rejected: the SAN says C, we expected A. A certificate with no node-id SAN at all is rejected too — under binding, absence is mismatch. The property jumps from "some valid node" to "the specific node I meant to reach". (The reporting transport dials by address without a target id to hand the verifier, so it keeps the CA-pin-plus-CRL guarantee; binding lives where the id is known.)
+
+### Installing the bundle without half-doing it
+
+Each identity file is already written atomically — temp file, then rename — so no single file is ever truncated. But a node's identity is *five* files, and a crash between the second and third rename leaves a directory that looks populated and is quietly broken: a certificate from the new enrolment, say, beside a CA from the old one. Load that and your listeners come up with an identity that doesn't chain.
+
+The cheap, robust fix is a commit marker. `save` clears the marker first, writes all five files, and writes the marker *last*. `load` refuses any directory that has identity files but no marker — that's a crash caught mid-install — and, for good measure, re-checks that the leaf actually chains to the CA chain before handing the identity back:
+
+```rust
+if !marker_path.exists() {
+    return Err(IdentityStoreError::PartialBundle);
+}
+// ... read the five files ...
+cert::validate_chain(&certificate_der, &node_ca_der, &root_ca_der)
+    .map_err(|e| IdentityStoreError::InconsistentBundle { reason: e.to_string() })?;
+```
+
+A half-installed bundle now fails loudly at load instead of silently running degraded. It's the filesystem equivalent of the Raft trick above: make the "it's ready" signal a single thing that lands last, so partial states are detectable.
+
+### A connection that never finishes
+
+The accept side of a network listener has a quiet failure mode: a peer connects, sends two of the four length-prefix bytes, and then just... stops. It never sends more, never closes. The `read_exact` for the rest of the frame blocks forever, and the task handling that connection is pinned for the life of the process. Do it a few thousand times and you've exhausted the node without sending a single valid byte.
+
+The frame-size cap doesn't help here — the attacker never claims a large frame, they just never finish a small one. What's missing is a clock. So every accept-side connection on the Raft and reporting listeners now runs its handshake and framed read under a `tokio::time::timeout`:
+
+```rust
+let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
+    if let Ok(tls_stream) = acceptor.accept(stream).await {
+        handle_raft_rpc(tls_stream, raft).await;
+    }
+}).await;
+```
+
+A peer that stalls is dropped when the deadline fires, and the task is freed. `tokio::time::timeout` wraps any future and races it against a timer, returning `Err` if the timer wins — a much better tool than trusting TCP's own timeouts, which are measured in minutes and aren't really yours to set. The outbound side already had a connect timeout; this closes the same gap on the way in.
 
 ## Gossip HMAC
 

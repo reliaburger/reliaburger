@@ -31,6 +31,10 @@ pub enum IdentityStoreError {
     Io(#[from] std::io::Error),
     #[error("failed to parse {file}: {reason}")]
     ParseFailed { file: String, reason: String },
+    #[error("identity bundle is incomplete: no commit marker (interrupted install)")]
+    PartialBundle,
+    #[error("identity bundle is inconsistent: {reason}")]
+    InconsistentBundle { reason: String },
 }
 
 /// A node's cluster identity: its certificate and private key, plus the CA
@@ -72,6 +76,11 @@ const NODE_KEY_FILE: &str = "node.key";
 const NODE_CA_FILE: &str = "node-ca.crt";
 const ROOT_CA_FILE: &str = "root-ca.crt";
 const META_FILE: &str = "meta.json";
+/// Written last, after every other file lands (PKI9). Its presence marks the
+/// bundle as complete; `load` refuses a directory without it, so a crash
+/// mid-install (some files written, marker not) is detected rather than a
+/// half-installed identity being used.
+const COMMIT_MARKER_FILE: &str = "bundle.committed";
 
 /// The identity directory under a node's data directory.
 pub fn identity_dir(data_dir: &Path) -> PathBuf {
@@ -81,10 +90,26 @@ pub fn identity_dir(data_dir: &Path) -> PathBuf {
 /// Persist a node identity to `dir`, creating the directory if needed.
 ///
 /// The private key is written owner-only (0600); certificates are public
-/// material and stay world-readable. All writes are atomic (temp + rename)
-/// so a crash never leaves a truncated key or certificate at the final path.
+/// material and stay world-readable. Each write is atomic (temp + rename) so
+/// no individual file is ever truncated.
+///
+/// The whole bundle is also transactional (PKI9): the commit marker
+/// (`bundle.committed`) is removed first, every file is written, and the
+/// marker is written last. If the process crashes mid-write the marker is
+/// absent, so [`load`] refuses the directory instead of using a half-installed
+/// identity. `load` additionally re-validates that the leaf chains to the CA
+/// chain before returning.
 pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreError> {
     std::fs::create_dir_all(dir)?;
+
+    // Clear any prior commit marker first: from here until the marker is
+    // rewritten the bundle is "in flight" and a reader must not trust it.
+    let marker_path = dir.join(COMMIT_MARKER_FILE);
+    match std::fs::remove_file(&marker_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
 
     let cert_pem = cert::der_to_pem(&identity.certificate_der, "CERTIFICATE");
     let key_pem = cert::der_to_pem(&identity.private_key_der, "PRIVATE KEY");
@@ -110,18 +135,35 @@ pub fn save(dir: &Path, identity: &NodeIdentity) -> Result<(), IdentityStoreErro
     atomic_write(&dir.join(ROOT_CA_FILE), root_ca_pem.as_bytes())?;
     atomic_write(&dir.join(META_FILE), meta_json.as_bytes())?;
 
+    // Marker last: its presence is the "all files landed" commit point.
+    atomic_write(&marker_path, b"1\n")?;
+
     Ok(())
 }
 
 /// Load a node identity from `dir`.
 ///
-/// Returns `Ok(None)` when no identity has been installed (the directory or
-/// its metadata file is absent) — callers treat that as "plaintext mode" or
+/// Returns `Ok(None)` when no identity has been installed (the directory is
+/// empty or was never committed) — callers treat that as "plaintext mode" or
 /// "enrollment pending", not an error.
+///
+/// A partially installed bundle is refused, not silently used (PKI9). An
+/// identity dir with a metadata file but no commit marker means a crash landed
+/// between the first write and the marker, so `load` returns an error. A
+/// committed bundle whose leaf does not chain to its CA chain is also refused.
 pub fn load(dir: &Path) -> Result<Option<NodeIdentity>, IdentityStoreError> {
     let meta_path = dir.join(META_FILE);
-    if !meta_path.exists() {
+    let marker_path = dir.join(COMMIT_MARKER_FILE);
+
+    // No metadata and no marker: nothing was ever installed here.
+    if !meta_path.exists() && !marker_path.exists() {
         return Ok(None);
+    }
+
+    // Metadata (or some other file) present but no commit marker: a crash
+    // interrupted an install. Refuse rather than run on a half-written bundle.
+    if !marker_path.exists() {
+        return Err(IdentityStoreError::PartialBundle);
     }
 
     let meta_json = std::fs::read_to_string(&meta_path)?;
@@ -135,6 +177,13 @@ pub fn load(dir: &Path) -> Result<Option<NodeIdentity>, IdentityStoreError> {
     let private_key_der = read_pem(dir, NODE_KEY_FILE)?;
     let node_ca_der = read_pem(dir, NODE_CA_FILE)?;
     let root_ca_der = read_pem(dir, ROOT_CA_FILE)?;
+
+    // Self-consistency: the committed leaf must chain to the committed CAs.
+    cert::validate_chain(&certificate_der, &node_ca_der, &root_ca_der).map_err(|e| {
+        IdentityStoreError::InconsistentBundle {
+            reason: e.to_string(),
+        }
+    })?;
 
     Ok(Some(NodeIdentity {
         node_id: meta.node_id,
@@ -232,6 +281,51 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn load_refuses_a_bundle_missing_the_commit_marker() {
+        // PKI9: simulate a crash after the metadata landed but before the
+        // marker. load must refuse, not run on a half-installed identity.
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &test_identity()).unwrap();
+        std::fs::remove_file(dir.path().join(COMMIT_MARKER_FILE)).unwrap();
+
+        let err = load(dir.path()).unwrap_err();
+        assert!(matches!(err, IdentityStoreError::PartialBundle));
+    }
+
+    #[test]
+    fn load_refuses_a_bundle_missing_a_file_even_with_a_marker() {
+        // A marker present but a file gone is still a broken bundle; the
+        // missing PEM read errors out rather than yielding a partial identity.
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &test_identity()).unwrap();
+        std::fs::remove_file(dir.path().join(NODE_CERT_FILE)).unwrap();
+
+        assert!(load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_refuses_a_bundle_whose_leaf_does_not_chain() {
+        // PKI9 self-consistency: a committed bundle whose CA chain was swapped
+        // for a foreign one (leaf no longer chains) is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let mut identity = test_identity();
+        let foreign = ca::generate_ca_hierarchy("intruder", b"other").unwrap();
+        identity.node_ca_der = foreign.node.ca.certificate_der.clone();
+        identity.root_ca_der = foreign.root.ca.certificate_der.clone();
+        save(dir.path(), &identity).unwrap();
+
+        let err = load(dir.path()).unwrap_err();
+        assert!(matches!(err, IdentityStoreError::InconsistentBundle { .. }));
+    }
+
+    #[test]
+    fn a_committed_bundle_loads_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), &test_identity()).unwrap();
+        assert!(load(dir.path()).unwrap().is_some());
     }
 
     #[test]

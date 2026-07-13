@@ -895,17 +895,29 @@ whole theme lands.
     off-lock bounded Argon2 with a format short-circuit + `spawn_blocking` semaphore (AUTH5);
     dashboard/node fragments read the live gossip membership (AUTH7); `escape_html` now escapes
     `'` for single-quoted chart attributes (AUTH8).
-- [ ] **Node PKI, join and mTLS** — the listener/identity half landed with Stage 5; what
-  remains is the join hardening, peer binding and registry security below.
+- [x] **Node PKI, join and mTLS** — the listener/identity half landed with Stage 5; the join
+  hardening and peer binding below landed with 12b.3 (registry auth/TLS moves to the Pickle
+  storage theme).
   - [x] Persist the bootstrap node leaf/key/Node CA/root CA + config paths; deliver a bundle
     to joiners with TOFU fingerprint (Stage 5 — PKI1).
   - [x] Handshake-true, CRL-aware mTLS builders with live-update tests, Node-CA-pinned client
     verifier, and **mTLS wired onto the Raft, reporting and agent-API listeners** behind the
     `require_mtls` mode matrix (Stage 5 — PKI1/PKI2, C5(b) listeners, L17 peer-CRL refresh).
-  - [ ] CSR-based, atomic compare-consume-and-serial join keeping the key on the joiner
-    (PKI4/PKI5); expected-peer node-id binding (PKI3); secure temp-file modes + transactional
-    bundle install/validation (PKI9); per-connection handshake/read deadlines + frame bounds
-    (CP11); registry auth/TLS + connection semaphores (moves to "Pickle storage" theme).
+  - [x] CSR-based join keeping the key on the joiner: the joiner generates its keypair + CSR,
+    the issuer signs it and returns a key-free bundle, the joiner assembles its identity from
+    its own key (12b.3 — PKI4).
+  - [x] Atomic consume-and-serial join: one Raft `ConsumeJoinTokenForIssue` entry marks the
+    token consumed and allocates the serial together, so racing joiners with one token issue
+    exactly one cert; the issuer DN is derived from the stored Node CA (12b.3 — PKI5).
+  - [x] Expected-peer node-id binding: node certs carry a `spiffe://reliaburger/node/<id>` URI
+    SAN, and the Raft connector builds a per-target verifier that asserts the peer leaf's
+    node-id SAN matches the node it is dialling (12b.3 — PKI3).
+  - [x] Transactional bundle install/validation: the identity bundle writes a commit marker
+    last and `load` refuses a marker-less (partial) or non-chaining bundle (12b.3 — PKI9).
+  - [x] Per-connection handshake/read deadlines on the Raft and reporting accept paths, on top
+    of the existing frame bounds, so a stalled peer is dropped (12b.3 — CP11).
+  - [x] Constant-time join-token comparison (12b.3 — PKI10 slice; IMG1-IMG3 remain in the
+    image-trust theme).
 - [ ] **Image trust policy** — distribute authoritative trust state to workers and
   standalone mode and fail closed; validate every intermediate, time, revocation, EKU,
   issuer and SPIFFE/OIDC identity; enforce issuer/audience/algorithm/kid; use a persistent

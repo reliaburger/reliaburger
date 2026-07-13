@@ -205,6 +205,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Maximum Raft RPC payload size (64 MiB — snapshots can be large).
 const MAX_RAFT_RPC_SIZE: usize = 64 * 1024 * 1024;
 
+/// How long the accept side waits for a peer to finish its mTLS handshake and
+/// deliver a complete frame before dropping the connection (CP11). A peer that
+/// connects and stalls (half-open handshake, partial length prefix) must not
+/// pin the task forever.
+const RAFT_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Raft RPC request envelope, serialised over TCP.
 #[derive(Serialize, Deserialize)]
 pub enum RaftRpc {
@@ -273,14 +279,26 @@ pub async fn serve_raft_rpc(
                                 tokio::spawn(async move {
                                     // A failed handshake (no/invalid/revoked
                                     // client cert) is dropped silently — a
-                                    // rejected peer must not learn why.
-                                    if let Ok(tls_stream) = acceptor.accept(stream).await {
-                                        handle_raft_rpc(tls_stream, raft).await;
-                                    }
+                                    // rejected peer must not learn why. The
+                                    // whole handshake + frame exchange is under
+                                    // one deadline so a stalled peer can't pin
+                                    // the task (CP11).
+                                    let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
+                                        if let Ok(tls_stream) = acceptor.accept(stream).await {
+                                            handle_raft_rpc(tls_stream, raft).await;
+                                        }
+                                    })
+                                    .await;
                                 });
                             }
                             None => {
-                                tokio::spawn(handle_raft_rpc(stream, raft));
+                                tokio::spawn(async move {
+                                    let _ = tokio::time::timeout(
+                                        RAFT_ACCEPT_DEADLINE,
+                                        handle_raft_rpc(stream, raft),
+                                    )
+                                    .await;
+                                });
                             }
                         }
                     }
@@ -325,6 +343,40 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, raft:
     }
 }
 
+/// The material needed to build a per-target, node-id-bound mTLS connector
+/// (PKI3): this node's identity (CA pins + client cert/key) and the shared,
+/// live CRL handle. Held by the factory so `new_client` can bind each peer
+/// connection to the specific node id it is dialling.
+#[derive(Clone)]
+pub struct RaftTlsMaterial {
+    identity: std::sync::Arc<crate::sesame::identity_store::NodeIdentity>,
+    crl: crate::sesame::mtls::CrlHandle,
+}
+
+impl RaftTlsMaterial {
+    /// Bundle a node identity and CRL handle for node-id-bound dialling.
+    pub fn new(
+        identity: crate::sesame::identity_store::NodeIdentity,
+        crl: crate::sesame::mtls::CrlHandle,
+    ) -> Self {
+        Self {
+            identity: std::sync::Arc::new(identity),
+            crl,
+        }
+    }
+
+    /// Build a connector that binds the handshake to `expected_node_id`.
+    fn connector_for(&self, expected_node_id: &str) -> Option<tokio_rustls::TlsConnector> {
+        let config = crate::sesame::mtls::build_mtls_client_config_bound(
+            &self.identity,
+            self.crl.clone(),
+            expected_node_id,
+        )
+        .ok()?;
+        Some(tokio_rustls::TlsConnector::from(config))
+    }
+}
+
 /// Creates TCP-based Raft network connections.
 ///
 /// Supports a runtime blocklist for chaos testing.
@@ -333,15 +385,19 @@ pub struct TcpRaftNetworkFactory {
     #[allow(dead_code)]
     source_id: u64,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
-    /// When set, peers are dialled over mTLS. `None` keeps plaintext TCP.
+    /// When set, peers are dialled over mTLS with an unbound connector (CA-pin
+    /// + CRL only). Kept for callers that don't thread an identity through.
     tls: Option<tokio_rustls::TlsConnector>,
+    /// When set, each peer connection is dialled over a node-id-bound
+    /// connector built from this material (PKI3). Takes precedence over `tls`.
+    tls_material: Option<RaftTlsMaterial>,
 }
 
 impl fmt::Debug for TcpRaftNetworkFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TcpRaftNetworkFactory")
             .field("source_id", &self.source_id)
-            .field("tls", &self.tls.is_some())
+            .field("tls", &(self.tls.is_some() || self.tls_material.is_some()))
             .finish()
     }
 }
@@ -355,10 +411,12 @@ impl TcpRaftNetworkFactory {
                 std::collections::HashSet::new(),
             )),
             tls: None,
+            tls_material: None,
         }
     }
 
-    /// Create a factory that dials peers over mTLS.
+    /// Create a factory that dials peers over mTLS with a single shared
+    /// (unbound) connector.
     pub fn new_tls(source_id: u64, connector: tokio_rustls::TlsConnector) -> Self {
         Self {
             source_id,
@@ -366,6 +424,20 @@ impl TcpRaftNetworkFactory {
                 std::collections::HashSet::new(),
             )),
             tls: Some(connector),
+            tls_material: None,
+        }
+    }
+
+    /// Create a factory that dials each peer over a node-id-bound mTLS
+    /// connector (PKI3), built from this node's identity + the live CRL.
+    pub fn new_tls_bound(source_id: u64, material: RaftTlsMaterial) -> Self {
+        Self {
+            source_id,
+            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            tls: None,
+            tls_material: Some(material),
         }
     }
 
@@ -381,10 +453,16 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
     type Network = TcpRaftNetwork;
 
     async fn new_client(&mut self, _target: u64, node: &CouncilNodeInfo) -> Self::Network {
+        // Prefer a node-id-bound connector built for this exact peer (PKI3);
+        // fall back to the shared unbound connector, then plaintext.
+        let tls = match &self.tls_material {
+            Some(material) => material.connector_for(&node.name),
+            None => self.tls.clone(),
+        };
         TcpRaftNetwork {
             target_addr: node.addr,
             blocklist: std::sync::Arc::clone(&self.blocklist),
-            tls: self.tls.clone(),
+            tls,
         }
     }
 }
@@ -560,5 +638,28 @@ mod tests {
         let router = InMemoryRaftRouter::new();
         let result = router.lookup(1, 42).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_frame_never_completes_on_a_stalled_half_frame() {
+        // CP11: a peer that sends 2 of the 4 length bytes then stalls would
+        // hang read_frame forever without a deadline. Under a short timeout
+        // (standing in for RAFT_ACCEPT_DEADLINE) the read is abandoned.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        // Write half a length prefix, then hold the connection open by never
+        // dropping `client` and never writing more.
+        client.write_all(&[0u8, 0u8]).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            read_frame(&mut server),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a stalled half-frame read must be cut off by the deadline, not return"
+        );
     }
 }

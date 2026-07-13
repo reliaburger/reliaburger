@@ -14,13 +14,15 @@
 //!   connection without rebuilding any config.
 //!
 //! The client side uses [`PinnedChainServerVerifier`], which checks the chain
-//! against the pinned cluster CAs and skips hostname verification. Node certs
-//! do carry the node id as a CN SAN (for DNS-valid ids), but peers are dialled
-//! by gossip IP, so binding the connection to an expected node id is a
-//! separate hardening step (it needs per-target names threaded through the
-//! connector; tracked as PKI3). Today the guarantee is "a valid, unrevoked
-//! Node-CA certificate", which stops outsiders but not one compromised node
-//! impersonating another.
+//! against the pinned cluster CAs and skips hostname verification (peers are
+//! dialled by gossip IP, not by DNS name). When the caller knows which node it
+//! is dialling — the Raft transport does — it builds the verifier in *bound*
+//! mode, which also asserts the peer leaf carries the matching node-id URI SAN
+//! (`spiffe://reliaburger/node/<id>`, PKI3). That lifts the guarantee from "a
+//! valid, unrevoked Node-CA certificate" to "the specific node I meant to
+//! reach", so one compromised node can't impersonate another. Callers that
+//! dial by address only (reporting, node-to-node API) stay on the CA-pin +
+//! CRL guarantee.
 
 use std::sync::{Arc, RwLock};
 
@@ -42,6 +44,16 @@ pub enum MtlsError {
     InvalidCert(String),
     #[error("invalid private key: {0}")]
     InvalidKey(String),
+}
+
+/// The peer's leaf certificate did not carry the node-id URI SAN we required
+/// (PKI3). Carried inside a rustls `CertificateError::Other` so the handshake
+/// fails with a diagnosable reason.
+#[derive(Debug, thiserror::Error)]
+#[error("peer node-id mismatch: expected {expected}, presented {presented:?}")]
+struct NodeIdMismatch {
+    expected: String,
+    presented: Option<String>,
 }
 
 /// A shared, updatable view of the cluster CRL.
@@ -172,29 +184,69 @@ impl ClientCertVerifier for RevocationCheckingClientVerifier {
 /// A server-certificate verifier for cluster peers.
 ///
 /// Validates the presented certificate against the **pinned** Node CA and
-/// Root CA from this node's identity, checks the CRL, and deliberately
-/// skips hostname verification (peers are dialled by gossip IP, not by the
-/// node id in the cert). The property this verifier establishes is "the peer
-/// holds a valid, unrevoked certificate from our Node CA" — not "the peer is
-/// the specific node I meant to reach" (see PKI3).
+/// Root CA from this node's identity, checks the CRL, and skips hostname
+/// verification (peers are dialled by gossip IP, not by a DNS name).
+///
+/// When `expected_node_id` is set (PKI3), the verifier additionally asserts
+/// that the peer leaf carries the matching node-id URI SAN
+/// (`spiffe://reliaburger/node/<id>`). That turns the guarantee from "some
+/// valid, unrevoked Node-CA certificate" into "the specific node I meant to
+/// reach", so one compromised node cannot present its own valid cert to
+/// impersonate another. When it is `None` the check is CA-pin + CRL only,
+/// which is what the join-time bootstrap and node-to-node API calls use.
 #[derive(Debug)]
 pub struct PinnedChainServerVerifier {
     node_ca_der: Vec<u8>,
     root_ca_der: Vec<u8>,
     crl: CrlHandle,
+    expected_node_id: Option<String>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl PinnedChainServerVerifier {
-    /// Build a verifier pinned to the given CA certificates.
+    /// Build a verifier pinned to the given CA certificates, without node-id
+    /// binding (CA-pin + CRL only).
     pub fn new(node_ca_der: Vec<u8>, root_ca_der: Vec<u8>, crl: CrlHandle) -> Self {
         Self {
             node_ca_der,
             root_ca_der,
             crl,
+            expected_node_id: None,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
         }
     }
+
+    /// Build a verifier that also binds the connection to `expected_node_id`
+    /// (PKI3): the peer leaf must carry the matching node-id URI SAN.
+    pub fn new_bound(
+        node_ca_der: Vec<u8>,
+        root_ca_der: Vec<u8>,
+        crl: CrlHandle,
+        expected_node_id: String,
+    ) -> Self {
+        Self {
+            node_ca_der,
+            root_ca_der,
+            crl,
+            expected_node_id: Some(expected_node_id),
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
+
+/// Extract the node id from a leaf certificate's node-id URI SAN, if present.
+fn node_id_from_leaf(der: &CertificateDer<'_>) -> Option<String> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let san = cert.subject_alternative_name().ok().flatten()?;
+    for name in &san.value.general_names {
+        if let x509_parser::extensions::GeneralName::URI(uri) = name
+            && let Some(id) = super::ca::node_id_from_spiffe_uri(uri)
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 impl ServerCertVerifier for PinnedChainServerVerifier {
@@ -216,6 +268,27 @@ impl ServerCertVerifier for PinnedChainServerVerifier {
         self.crl
             .check(node_ca_serial)
             .map_err(cert_error_to_rustls)?;
+
+        // PKI3: bind to the expected node id when one was threaded through.
+        if let Some(expected) = &self.expected_node_id {
+            let presented = node_id_from_leaf(end_entity).ok_or_else(|| {
+                rustls::Error::InvalidCertificate(rustls::CertificateError::Other(
+                    rustls::OtherError(Arc::new(NodeIdMismatch {
+                        expected: expected.clone(),
+                        presented: None,
+                    })),
+                ))
+            })?;
+            if &presented != expected {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Other(rustls::OtherError(Arc::new(NodeIdMismatch {
+                        expected: expected.clone(),
+                        presented: Some(presented),
+                    }))),
+                ));
+            }
+        }
+
         Ok(ServerCertVerified::assertion())
     }
 
@@ -371,6 +444,34 @@ pub fn build_mtls_client_config(
         identity.node_ca_der.clone(),
         identity.root_ca_der.clone(),
         crl,
+    ));
+
+    let (chain, key) = identity_chain_and_key(identity)?;
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(chain, key)
+        .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
+
+    Ok(Arc::new(config))
+}
+
+/// Build a `ClientConfig` that binds the connection to `expected_node_id`
+/// (PKI3): in addition to the CA-pin and CRL checks, the peer's leaf must
+/// carry the matching node-id URI SAN. Used by the Raft transport, which
+/// knows which node it is dialling.
+pub fn build_mtls_client_config_bound(
+    identity: &NodeIdentity,
+    crl: CrlHandle,
+    expected_node_id: &str,
+) -> Result<Arc<ClientConfig>, MtlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let verifier = Arc::new(PinnedChainServerVerifier::new_bound(
+        identity.node_ca_der.clone(),
+        identity.root_ca_der.clone(),
+        crl,
+        expected_node_id.to_string(),
     ));
 
     let (chain, key) = identity_chain_and_key(identity)?;
@@ -701,6 +802,77 @@ mod tests {
         // ServerConfig must now refuse the same client.
         server_crl.update(crl_with(11));
         try_handshake(server, client).await.unwrap_err();
+    }
+
+    /// Handshake helper that binds the client to an expected node id (PKI3).
+    async fn try_handshake_bound(
+        server_id: &NodeIdentity,
+        client_id: &NodeIdentity,
+        expected_node_id: &str,
+    ) -> Result<(), String> {
+        let server = build_mtls_server_config(server_id, CrlHandle::default()).unwrap();
+        let client =
+            build_mtls_client_config_bound(client_id, CrlHandle::default(), expected_node_id)
+                .unwrap();
+        try_handshake(server, client).await
+    }
+
+    #[tokio::test]
+    async fn bound_verifier_accepts_the_expected_node_id() {
+        // PKI3: the server is node-01; the client dials expecting node-01.
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+        try_handshake_bound(&server_id, &client_id, "node-01")
+            .await
+            .expect("matching node id should pass");
+    }
+
+    #[tokio::test]
+    async fn bound_verifier_rejects_a_valid_cert_for_the_wrong_node() {
+        // PKI3: node-99 holds a perfectly valid Node-CA cert, but a client that
+        // meant to reach node-01 must refuse it — one compromised node cannot
+        // impersonate another just by presenting its own valid cert.
+        let hierarchy = test_hierarchy("test");
+        let wrong_server = identity_from(&hierarchy, "node-99", 12);
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+        let err = try_handshake_bound(&wrong_server, &client_id, "node-01")
+            .await
+            .expect_err("a valid cert for the wrong node must be rejected");
+        assert!(
+            err.to_lowercase().contains("certificate") || err.to_lowercase().contains("node-id"),
+            "expected a node-id binding failure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_verifier_rejects_a_leaf_without_a_node_id_san() {
+        // A node cert issued the legacy way (no node-id URI SAN) fails the
+        // binding check: absence is treated as mismatch under the bound mode.
+        let hierarchy = test_hierarchy("test");
+        let mut server_id = identity_from(&hierarchy, "node-01", 10);
+        // Re-issue the server leaf without the node-id URI SAN.
+        let (cert_der, key_der, serial) = ca::issue_end_entity_cert(
+            "node-01",
+            SerialNumber(20),
+            std::time::Duration::from_secs(3600),
+            &[],
+            &[
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            ],
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        server_id.certificate_der = cert_der;
+        server_id.private_key_der = key_der;
+        server_id.serial = serial;
+        let client_id = identity_from(&hierarchy, "node-02", 11);
+
+        try_handshake_bound(&server_id, &client_id, "node-01")
+            .await
+            .expect_err("a leaf without a node-id SAN must be rejected under binding");
     }
 
     #[test]

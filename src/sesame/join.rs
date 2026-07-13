@@ -1,8 +1,9 @@
 //! Join token validation and node certificate issuance.
 //!
-//! When a new node joins the cluster, it presents a join token.
-//! The council validates the token and issues a node certificate
-//! signed by the Node CA.
+//! When a new node joins the cluster it generates its own keypair and CSR and
+//! presents a join token. The council validates the token, atomically consumes
+//! it and allocates a serial through Raft (PKI5), then signs the joiner's CSR
+//! (PKI4) with the Node CA. The private key never leaves the joining node.
 
 use std::time::{Duration, SystemTime};
 
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::ca;
 use super::crypto;
 use super::identity_store::NodeIdentity;
-use super::types::{CaRole, NodeCertificate, SecurityState, SerialNumber};
+use super::types::{CaRole, SecurityState, SerialNumber};
 
 /// Errors from join operations.
 #[derive(Debug, thiserror::Error)]
@@ -36,24 +37,48 @@ pub enum JoinError {
     CaFailed(#[from] ca::CaError),
 }
 
-/// The result of a successful join: the new node's certificate
+/// The result of a successful join: the new node's signed certificate
 /// plus the CA chain it needs for mTLS verification.
+///
+/// There is deliberately no private key here (PKI4). The joiner generated its
+/// own keypair and CSR; the issuer only ever sees, signs, and returns the
+/// certificate.
 #[derive(Debug)]
 pub struct JoinResult {
-    /// The newly issued node certificate.
-    pub node_certificate: NodeCertificate,
+    /// The node id the certificate was issued for.
+    pub node_id: String,
+    /// DER-encoded signed node certificate.
+    pub certificate_der: Vec<u8>,
+    /// The serial the Node CA assigned.
+    pub serial: SerialNumber,
+    /// The Node CA generation that signed the certificate.
+    pub ca_generation: u64,
     /// DER-encoded Root CA certificate (trust anchor).
     pub root_ca_der: Vec<u8>,
     /// DER-encoded Node CA certificate (for verifying peer nodes).
     pub node_ca_der: Vec<u8>,
 }
 
+/// The certificate signing request a joiner sends to a cluster member.
+///
+/// The joiner keeps its private key; only the CSR crosses the wire, so a
+/// compromised or eavesdropped join can never yield the joiner's key (PKI4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinRequest {
+    /// The one-time join token, plaintext.
+    pub token: String,
+    /// The node id the joiner wants a certificate for.
+    pub node_id: String,
+    /// Base64 DER PKCS#10 certificate signing request.
+    pub csr_b64: String,
+}
+
 /// The join response sent over the wire to a joining node.
 ///
-/// DER material is base64-encoded so the bundle is plain JSON. The private
-/// key is included because the issuer generates the keypair (a CSR-based
-/// flow that keeps the key on the joiner is a future refinement); the whole
-/// exchange is protected by the one-time join token and TLS.
+/// DER material is base64-encoded so the bundle is plain JSON. There is **no
+/// private key** in the bundle (PKI4): the issuer signs the joiner's CSR and
+/// returns only the leaf certificate plus the CA chain. The joiner assembles
+/// its identity from this bundle and the private key it kept locally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinBundle {
     /// The node id the certificate was issued for.
@@ -64,8 +89,6 @@ pub struct JoinBundle {
     pub ca_generation: u64,
     /// Base64 DER node certificate.
     pub certificate_b64: String,
-    /// Base64 DER private key.
-    pub private_key_b64: String,
     /// Base64 DER Node CA certificate.
     pub node_ca_b64: String,
     /// Base64 DER root CA certificate.
@@ -90,29 +113,35 @@ pub enum JoinClientError {
 impl JoinBundle {
     /// Build a wire bundle from an issuer-side [`JoinResult`].
     pub fn from_result(result: &JoinResult) -> Self {
-        let cert = &result.node_certificate;
         Self {
-            node_id: cert.node_id.clone(),
-            serial: cert.serial.0,
-            ca_generation: cert.ca_generation,
-            certificate_b64: BASE64.encode(&cert.certificate_der),
-            private_key_b64: BASE64.encode(&cert.private_key_der),
+            node_id: result.node_id.clone(),
+            serial: result.serial.0,
+            ca_generation: result.ca_generation,
+            certificate_b64: BASE64.encode(&result.certificate_der),
             node_ca_b64: BASE64.encode(&result.node_ca_der),
             root_ca_b64: BASE64.encode(&result.root_ca_der),
         }
     }
 
-    /// Decode the bundle into an on-disk [`NodeIdentity`].
-    pub fn into_identity(self) -> Result<NodeIdentity, JoinClientError> {
+    /// Decode the bundle into an on-disk [`NodeIdentity`], supplying the
+    /// private key the joiner kept locally.
+    ///
+    /// The bundle carries no key (PKI4), so the joiner pairs the signed leaf
+    /// with the key from its own CSR. A `validate_chain` guard rejects a
+    /// bundle whose leaf does not chain to the returned CA chain.
+    pub fn into_identity(self, private_key_der: Vec<u8>) -> Result<NodeIdentity, JoinClientError> {
         let decode = |field: &str, s: &str| {
             BASE64
                 .decode(s)
                 .map_err(|e| JoinClientError::Malformed(format!("{field}: {e}")))
         };
         let certificate_der = decode("certificate", &self.certificate_b64)?;
-        let private_key_der = decode("private_key", &self.private_key_b64)?;
         let node_ca_der = decode("node_ca", &self.node_ca_b64)?;
         let root_ca_der = decode("root_ca", &self.root_ca_b64)?;
+
+        super::cert::validate_chain(&certificate_der, &node_ca_der, &root_ca_der)
+            .map_err(|e| JoinClientError::Malformed(format!("issued leaf does not chain: {e}")))?;
+
         let now = SystemTime::now();
         Ok(NodeIdentity {
             node_id: self.node_id,
@@ -151,9 +180,19 @@ pub async fn request_join(
     node_id: &str,
     expected_fingerprint: Option<&str>,
 ) -> Result<NodeIdentity, JoinClientError> {
+    // Generate our own keypair and CSR. The private key stays here (PKI4).
+    let (csr_der, private_key_der) = ca::create_node_csr(node_id)
+        .map_err(|e| JoinClientError::Malformed(format!("failed to build CSR: {e}")))?;
+
+    let request = JoinRequest {
+        token: token.to_string(),
+        node_id: node_id.to_string(),
+        csr_b64: BASE64.encode(&csr_der),
+    };
+
     let response = client
         .post(member_url)
-        .json(&serde_json::json!({ "token": token, "node_id": node_id }))
+        .json(&request)
         .send()
         .await
         .map_err(|e| JoinClientError::Transport(e.to_string()))?;
@@ -179,33 +218,25 @@ pub async fn request_join(
         }
     }
 
-    bundle.into_identity()
+    bundle.into_identity(private_key_der)
 }
 
-/// Validate a join token and issue a node certificate.
+/// Pre-validate a join token against the replicated security state.
 ///
-/// This is called on the council leader when a new node presents
-/// a join token. The function:
-/// 1. Verifies the token is valid, not expired, and not consumed
-/// 2. Marks the token as consumed (caller must persist this via Raft)
-/// 3. Issues a node certificate signed by the Node CA
-///
-/// The `wrapping_ikm` is needed to unwrap the Node CA private key
-/// from Raft storage.
-pub fn validate_and_issue(
+/// Confirms the token exists, hasn't expired, and hasn't already been
+/// consumed. Returns the token's hash so the caller can consume it atomically
+/// through Raft. This is only a fast-fail check: the authoritative
+/// consume-and-allocate happens in the state machine (PKI5), so a token that
+/// passes here can still lose the race and be refused at commit time.
+pub fn check_join_token(
     token_plaintext: &str,
-    node_id: &str,
-    state: &mut SecurityState,
-    wrapping_ikm: &[u8],
-) -> Result<JoinResult, JoinError> {
-    // Step 1: Find and validate the join token
-    let token_idx = state
+    state: &SecurityState,
+) -> Result<[u8; 32], JoinError> {
+    let join_token = state
         .join_tokens
         .iter()
-        .position(|jt| ca::verify_join_token(token_plaintext, &jt.token_hash))
+        .find(|jt| ca::verify_join_token(token_plaintext, &jt.token_hash))
         .ok_or(JoinError::InvalidToken)?;
-
-    let join_token = &state.join_tokens[token_idx];
 
     if join_token.consumed {
         return Err(JoinError::TokenConsumed);
@@ -213,11 +244,29 @@ pub fn validate_and_issue(
     if SystemTime::now() > join_token.expires_at {
         return Err(JoinError::TokenExpired);
     }
+    Ok(join_token.token_hash)
+}
 
-    // Step 2: Mark as consumed
-    state.join_tokens[token_idx].consumed = true;
-
-    // Step 3: Extract Node CA data (clone to release immutable borrow)
+/// Sign a joiner's CSR into a node certificate (PKI4/PKI5).
+///
+/// The caller has already consumed the join token and allocated `serial` in
+/// one atomic Raft commit, so this function does no token bookkeeping. It
+/// takes only the joiner's public key (from the CSR), rebuilds the certificate
+/// server-side with the node-id URI SAN, and signs it with the Node CA.
+///
+/// The issuer DN is derived from the stored Node CA certificate itself, not a
+/// hard-coded string, so the issued leaf always chains to the CA that is
+/// actually in the trust store.
+///
+/// The `wrapping_ikm` is needed to unwrap the Node CA private key from Raft
+/// storage.
+pub fn sign_join_csr(
+    csr_der: &[u8],
+    node_id: &str,
+    serial: SerialNumber,
+    state: &SecurityState,
+    wrapping_ikm: &[u8],
+) -> Result<JoinResult, JoinError> {
     let node_ca = state.get_ca(CaRole::Node).ok_or(JoinError::NoNodeCa)?;
     let wrapped_key = node_ca
         .private_key_wrapped
@@ -230,42 +279,27 @@ pub fn validate_and_issue(
         .map(|ca| ca.certificate_der.clone())
         .unwrap_or_default();
 
-    // Unwrap the Node CA private key
+    // Unwrap the Node CA private key.
     let ca_private_key_der = crypto::unwrap_key(wrapping_ikm, &wrapped_key)?;
-
-    // Reconstruct the CA keypair for signing
     let ca_key_der = rustls::pki_types::PrivateKeyDer::try_from(ca_private_key_der)
         .map_err(|e| JoinError::CertIssueFailed(format!("invalid CA key DER: {e}")))?;
     let ca_keypair =
         rcgen::KeyPair::from_der_and_sign_algo(&ca_key_der, &rcgen::PKCS_ECDSA_P256_SHA256)
             .map_err(|e| JoinError::CertIssueFailed(format!("invalid CA key: {e}")))?;
 
-    // Build minimal CA params for signing (only DN matters for issuer field)
-    let mut ca_params = rcgen::CertificateParams::default();
-    let mut dn = rcgen::DistinguishedName::new();
-    dn.push(rcgen::DnType::CommonName, "Reliaburger Node CA".to_string());
-    dn.push(rcgen::DnType::OrganizationName, "Reliaburger");
-    ca_params.distinguished_name = dn;
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    // Derive the issuer params (DN, constraints) from the stored Node CA cert
+    // so the issued leaf's issuer field matches the CA in the trust store.
+    let ca_cert_der = rustls::pki_types::CertificateDer::from(node_ca_der.clone());
+    let ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der)
+        .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA cert: {e}")))?;
 
-    // Step 4: Issue the node certificate (mutable borrow for serial allocation)
-    let serial = state.next_serial();
-    let (cert_der, key_der, serial) =
-        ca::issue_node_cert(node_id, serial, &ca_keypair, &ca_params)?;
-
-    let now = SystemTime::now();
-    let node_certificate = NodeCertificate {
-        node_id: node_id.to_string(),
-        certificate_der: cert_der,
-        private_key_der: key_der,
-        serial,
-        not_before: now,
-        not_after: now + Duration::from_secs(365 * 24 * 3600),
-        ca_generation: node_ca_generation,
-    };
+    let (cert_der, serial) = ca::sign_node_csr(csr_der, node_id, serial, &ca_keypair, &ca_params)?;
 
     Ok(JoinResult {
-        node_certificate,
+        node_id: node_id.to_string(),
+        certificate_der: cert_der,
+        serial,
+        ca_generation: node_ca_generation,
         root_ca_der,
         node_ca_der,
     })
@@ -353,39 +387,67 @@ mod tests {
         (state, token_plaintext, master_secret)
     }
 
+    /// Drive a join the way the agent handler does: pre-check the token, sign
+    /// the joiner's CSR with the allocated serial. Returns the CSR private key
+    /// (kept by the joiner) alongside the issuer result.
+    fn issue(
+        state: &SecurityState,
+        token: &str,
+        node_id: &str,
+        serial: SerialNumber,
+        master_secret: &[u8],
+    ) -> Result<(JoinResult, Vec<u8>), JoinError> {
+        check_join_token(token, state)?;
+        let (csr_der, key_der) = ca::create_node_csr(node_id).unwrap();
+        let result = sign_join_csr(&csr_der, node_id, serial, state, master_secret)?;
+        Ok((result, key_der))
+    }
+
     #[test]
     fn join_with_valid_token_succeeds() {
-        let (mut state, token, master_secret) = setup_with_known_key();
+        let (state, token, master_secret) = setup_with_known_key();
 
-        let result = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
+        let (result, _key) = issue(&state, &token, "node-02", SerialNumber(6), &master_secret)
+            .expect("valid token issues a cert");
 
-        assert_eq!(result.node_certificate.node_id, "node-02");
-        assert!(!result.node_certificate.certificate_der.is_empty());
-        assert!(!result.node_certificate.private_key_der.is_empty());
+        assert_eq!(result.node_id, "node-02");
+        assert!(!result.certificate_der.is_empty());
         assert!(!result.root_ca_der.is_empty());
         assert!(!result.node_ca_der.is_empty());
     }
 
     #[test]
-    fn join_bundle_round_trips_a_result_into_an_identity() {
-        let (mut state, token, master_secret) = setup_with_known_key();
-        let result = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
+    fn join_bundle_carries_no_private_key() {
+        // PKI4: the bundle must never contain a private key. The joiner keeps
+        // its key locally; only the CSR and the signed leaf cross the wire.
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) = issue(&state, &token, "node-02", SerialNumber(6), &master_secret)
+            .expect("valid token issues a cert");
 
         let bundle = JoinBundle::from_result(&result);
-        // Survives a JSON hop.
+        let json = serde_json::to_string(&bundle).unwrap();
+        assert!(
+            !json.contains("private_key"),
+            "join bundle must not carry a private key, got: {json}"
+        );
+    }
+
+    #[test]
+    fn joiner_assembles_a_working_identity_from_its_own_key() {
+        // PKI4: the joiner pairs the returned leaf with the key it kept and
+        // gets a self-consistent identity that chains to the CA.
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, private_key_der) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
+
+        let bundle = JoinBundle::from_result(&result);
         let json = serde_json::to_string(&bundle).unwrap();
         let decoded: JoinBundle = serde_json::from_str(&json).unwrap();
 
-        let identity = decoded.into_identity().unwrap();
+        let identity = decoded.into_identity(private_key_der.clone()).unwrap();
         assert_eq!(identity.node_id, "node-02");
-        assert_eq!(
-            identity.certificate_der,
-            result.node_certificate.certificate_der
-        );
-        assert_eq!(
-            identity.private_key_der,
-            result.node_certificate.private_key_der
-        );
+        assert_eq!(identity.certificate_der, result.certificate_der);
+        assert_eq!(identity.private_key_der, private_key_der);
         crate::sesame::cert::validate_chain(
             &identity.certificate_der,
             &identity.node_ca_der,
@@ -395,9 +457,26 @@ mod tests {
     }
 
     #[test]
+    fn into_identity_rejects_a_leaf_that_does_not_chain() {
+        // A bundle whose leaf was signed by a foreign CA must be refused even
+        // if the client kept a matching key.
+        let (state, token, master_secret) = setup_with_known_key();
+        let (mut result, key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
+        // Swap in a Node CA from a different cluster: the leaf no longer chains.
+        let foreign = ca::generate_ca_hierarchy("intruder", b"other").unwrap();
+        result.node_ca_der = foreign.node.ca.certificate_der.clone();
+
+        let bundle = JoinBundle::from_result(&result);
+        let err = bundle.into_identity(key).unwrap_err();
+        assert!(matches!(err, JoinClientError::Malformed(_)));
+    }
+
+    #[test]
     fn join_bundle_fingerprint_matches_the_root_ca() {
-        let (mut state, token, master_secret) = setup_with_known_key();
-        let result = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
 
         let bundle = JoinBundle::from_result(&result);
         let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
@@ -405,76 +484,49 @@ mod tests {
     }
 
     #[test]
-    fn join_with_valid_token_marks_consumed() {
-        let (mut state, token, master_secret) = setup_with_known_key();
-
-        validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
-
-        assert!(state.join_tokens[0].consumed);
-    }
-
-    #[test]
-    fn join_with_consumed_token_fails() {
-        let (mut state, token, master_secret) = setup_with_known_key();
-
-        // First join succeeds
-        validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
-
-        // Second join with same token fails
-        let err = validate_and_issue(&token, "node-03", &mut state, &master_secret).unwrap_err();
+    fn check_join_token_rejects_a_consumed_token() {
+        let (mut state, token, _master_secret) = setup_with_known_key();
+        state.join_tokens[0].consumed = true;
+        let err = check_join_token(&token, &state).unwrap_err();
         assert!(matches!(err, JoinError::TokenConsumed));
     }
 
     #[test]
-    fn join_with_expired_token_fails() {
-        let (mut state, token, master_secret) = setup_with_known_key();
-
-        // Force the token to be expired
+    fn check_join_token_rejects_an_expired_token() {
+        let (mut state, token, _master_secret) = setup_with_known_key();
         state.join_tokens[0].expires_at = SystemTime::now() - Duration::from_secs(60);
-
-        let err = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap_err();
+        let err = check_join_token(&token, &state).unwrap_err();
         assert!(matches!(err, JoinError::TokenExpired));
     }
 
     #[test]
-    fn join_with_invalid_token_fails() {
-        let (mut state, _token, master_secret) = setup_with_known_key();
-
-        let err = validate_and_issue(
-            "rbrg_join_1_deadbeef",
-            "node-02",
-            &mut state,
-            &master_secret,
-        )
-        .unwrap_err();
+    fn check_join_token_rejects_an_unknown_token() {
+        let (state, _token, _master_secret) = setup_with_known_key();
+        let err = check_join_token("rbrg_join_1_deadbeef", &state).unwrap_err();
         assert!(matches!(err, JoinError::InvalidToken));
     }
 
     #[test]
-    fn join_token_is_single_use() {
-        let (mut state, token, master_secret) = setup_with_known_key();
+    fn node_cert_verifies_against_node_ca() {
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
 
-        // Use the token
-        validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
-
-        // Generate a new token
-        let token2 = generate_new_join_token(&mut state, Duration::from_secs(900)).unwrap();
-
-        // New token works
-        validate_and_issue(&token2, "node-03", &mut state, &master_secret).unwrap();
+        crate::sesame::cert::verify_signature(&result.certificate_der, &result.node_ca_der)
+            .unwrap();
     }
 
     #[test]
-    fn node_cert_verifies_against_node_ca() {
-        let (mut state, token, master_secret) = setup_with_known_key();
+    fn issued_leaf_issuer_matches_the_stored_node_ca_subject() {
+        // PKI5: the issuer DN is derived from the stored Node CA, so the leaf's
+        // issuer field equals the CA's subject and the chain path-builds.
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
 
-        let result = validate_and_issue(&token, "node-02", &mut state, &master_secret).unwrap();
-
-        crate::sesame::cert::verify_signature(
-            &result.node_certificate.certificate_der,
-            &result.node_ca_der,
-        )
-        .unwrap();
+        let (_, leaf) = x509_parser::parse_x509_certificate(&result.certificate_der).unwrap();
+        let (_, ca_cert) = x509_parser::parse_x509_certificate(&result.node_ca_der).unwrap();
+        assert_eq!(leaf.issuer().to_string(), ca_cert.subject().to_string());
     }
 
     #[test]
