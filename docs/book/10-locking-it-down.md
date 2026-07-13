@@ -413,6 +413,167 @@ API tokens live in `SecurityState.api_tokens` and are managed through Raft. `rel
 
 Both list and revoke endpoints read from or write to the council's security state directly. The list endpoint formats each token's name, role, and creation timestamp. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
 
+## Enforcing what the tokens promise
+
+Here's an uncomfortable truth about a lot of security code: the machinery to check a rule and the place where the rule actually gets checked are two different things, and it's easy to build the first and forget the second. A token can carry a role and a scope, the code to compare them can exist and be tested, and yet no handler ever calls it. The promise is on the label; nobody reads the label at the door.
+
+That was Reliaburger's state for a while. Tokens had roles *and* scopes, `TokenScope::allows(app, namespace)` existed and passed its unit tests, and the middleware carried the scope into every request. But the handlers only ever checked the role. A CI token scoped to the `staging` namespace could stop your production database, because "may this caller deploy at all?" is a different question from "may this caller deploy *this*?", and only the first one was being asked.
+
+Let's fix five of these enforcement gaps. They all share a shape: the check exists, we just have to *call* it, at the boundary, and prove with a test that the boundary now says no.
+
+### Scopes, not just roles
+
+A role answers "how much power does this token have?" — Admin, Deployer, or ReadOnly. A scope answers "over which apps and namespaces?". The two multiply. A Deployer scoped to namespace `payments` is a Deployer *there* and a nobody everywhere else.
+
+The role check was already in every mutating handler. We add a scope check right after it:
+
+```rust
+pub fn authorize_scoped(
+    ctx: Option<&AuthContext>,
+    app: &str,
+    namespace: &str,
+) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(()); // pre-init: no tokens, no scope to enforce
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(()); // the service principal is confined elsewhere
+    }
+    let scope = TokenScope {
+        apps: ctx.scoped_apps.clone(),
+        namespaces: ctx.scoped_namespaces.clone(),
+    };
+    if scope.allows(app, namespace) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!("token scope does not allow {app} in namespace {namespace}"),
+        )
+            .into_response())
+    }
+}
+```
+
+Two bits of Rust worth naming for newcomers. `let Some(ctx) = ctx else { return Ok(()); };` is a **let-else**: bind `ctx` if the `Option` is `Some`, otherwise run the `else` block, which must diverge (here, return). It's the early-return idiom without a nested `if`. And `.into_response()` turns a `(StatusCode, String)` tuple into axum's `Response` type; axum knows how to render that tuple as an HTTP error, so we lean on it rather than hand-building a response.
+
+An unscoped token (no `apps`, no `namespaces`) allows everything, so the common "one admin token for everything" case is untouched. A scoped one gets a 403 the moment it reaches outside its box. We call `authorize_scoped` in `apply`, `stop`, `exec`, `rollback`, and the snapshot mutations. For `apply`, which can carry many apps in one manifest, we check *every* app, so one out-of-scope entry rejects the whole request rather than being silently dropped:
+
+```rust
+for (app_name, spec) in &config.app {
+    let namespace = spec.namespace.as_deref().unwrap_or("default");
+    authorize_scoped(auth.as_deref(), app_name, namespace)?;
+}
+```
+
+### The routes that were open by accident
+
+Snapshot mutation used to ride on "any authenticated caller". So did app rollback. Both mutate real state, so both should want a Deployer plus a matching scope. The fix is one role check and one scope check per handler, and a matching update to the route matrix so the audit table and the handlers agree. If you're wondering why we keep a separate table when the checks live in the handlers: the table is the thing a reviewer can read in one sitting, and a test fails if a mounted route is missing from it. The handlers do the work; the table is how we *notice* when a handler forgot to.
+
+### Fail closed, not open
+
+A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine — you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.
+
+So we refuse that combination at bind time:
+
+```rust
+fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
+    let Ok(address) = listen.parse::<std::net::SocketAddr>() else {
+        return Ok(()); // a hostname; leave classification to the resolver
+    };
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to bind the API to non-loopback address {address} while no user tokens exist: \
+         the API would be open to anyone who can reach it. bind a loopback address \
+         (e.g. 127.0.0.1:9117) and run `relish token create` to mint the first admin token, \
+         then restart with your intended --listen address"
+    )
+}
+```
+
+The recovery path is in the error itself, because a fail-closed check that leaves the operator guessing is a support ticket waiting to happen. Bind loopback, mint a token, restart wherever you meant to. Once a token exists the bootstrap window is closed and normal auth applies, so the non-loopback bind sails through.
+
+### A shared Admin token is a lateral-movement risk
+
+Nodes talk to each other. Batch work fans out, builds delegate, reports flow back to the leader. To authenticate those calls, every node derives the same *service token* from the cluster master key and presents it to its peers, which accept it as a special `__system` principal.
+
+Convenient. Also dangerous, if we're not careful. The service token maps to Admin, and it sits on every node's disk. Steal it off the least-hardened node in the fleet and, if `__system` is Admin *everywhere*, you can mint fresh user tokens and rotate the cluster's secret keys from that one foothold. That's textbook lateral movement: one compromised node becomes cluster-wide control.
+
+The fix isn't to weaken the node-to-node routes — those still need the service token to work. It's to stop `__system` from reaching the *user-management* routes it never legitimately calls. We split the authorisation helper in two. Node-to-node and node-reachable routes keep the old `authorize`, which still accepts `__system`. The genuinely operator-only routes (token create/list/revoke, secret rotate, image signing, chaos, fault) switch to `authorize_user`, which is `authorize` plus one guard:
+
+```rust
+pub fn authorize_user(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Response> {
+    if let Some(ctx) = ctx
+        && ctx.token_name == SYSTEM_PRINCIPAL
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the internal service principal may not call user-management routes",
+        )
+            .into_response());
+    }
+    authorize(ctx, required)
+}
+```
+
+Now a stolen service token can still do a node's job (that's unavoidable — the node has to do its job) but can't mint credentials or touch key material. The blast radius of one compromised node shrinks from "the whole cluster" to "one node's workloads".
+
+### Don't hash under a lock
+
+The last gap is a performance-and-availability one, and it's a nice illustration of how a lock in the wrong place turns a slow function into a denial of service.
+
+Argon2id is slow *on purpose*. That's what makes it a good password hash: an attacker who steals the hashes can't brute-force them cheaply. But we were verifying bearer tokens by running Argon2 **while holding the token-store read lock**, and against **every stored token in turn**. Two problems fall out of that. First, every authenticated request serialised behind every other one's hashing, and the Raft-driven token refresh (a writer) queued behind them all. Second, a flood of junk bearers meant a flood of concurrent Argon2 hashes, each one deliberately expensive, happily pinning every core.
+
+Three changes fix it. Clone the token list out from under the read lock and release the lock *before* hashing, so verification never blocks a writer:
+
+```rust
+let tokens = {
+    let guard = state.tokens.read().await;
+    guard.clone()
+};
+```
+
+Reject bearers that don't even *look* like ours before spending a single hash on them. Every token we mint is `rbrg_` followed by 64 hex characters, and that shape is not a secret, so a string check is a safe short-circuit:
+
+```rust
+pub fn looks_like_token(candidate: &str) -> bool {
+    let Some(hex) = candidate.strip_prefix("rbrg_") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+```
+
+And bound the real hashing with a semaphore, on a blocking thread so it never parks an async worker:
+
+```rust
+static VERIFY_PERMITS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_VERIFICATIONS));
+
+let permit = VERIFY_PERMITS.acquire().await?;
+let ctx = tokio::task::spawn_blocking(move || {
+    let _permit = permit;
+    authenticate(&candidate, &tokens)
+})
+.await?;
+```
+
+A `Semaphore` is a counter of permits: `acquire()` waits until one is free, and the permit is released when it drops. We hand it to the blocking closure so it's held for exactly the hashing and no longer. `spawn_blocking` moves CPU-heavy work off the async runtime's worker threads onto a dedicated pool; running Argon2 directly on an async task would stall every other task sharing that thread. Now a burst of bad bearers is turned away by a string check, the few that get through hash off-lock and at most four at a time, and an honest caller's request isn't stuck behind anyone's brute-force attempt.
+
+### Escaping for the context you're in
+
+One more, smaller and easy to get wrong. The dashboard embeds chart configuration as JSON inside a single-quoted HTML attribute: `data-chart-config='{...}'`. Our `escape_html` escaped `&`, `<`, `>`, and `"` — but not `'`. So a chart title or label derived from an app name containing an apostrophe could close the attribute early and inject markup. A value like `x' onload='alert(1)` is all it takes.
+
+Escaping is context-sensitive. What's safe between tags isn't necessarily safe inside a single-quoted attribute. The fix is one line, escape the apostrophe too, so the output is safe in either quote style:
+
+```rust
+.replace('\'', "&#39;")
+```
+
+The lesson generalises past this one attribute: match your escaping to the exact syntactic slot the value lands in, and when in doubt, escape both quote characters so a value can't jump contexts.
+
 ## Join token validation
 
 When a new node runs `relish join --token <token> <addr>`, the join handler on the receiving agent now validates the token against SecurityState. The flow:

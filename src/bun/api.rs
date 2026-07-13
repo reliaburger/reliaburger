@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::brioche::app_detail::render_app_detail;
 use crate::brioche::assets::static_asset_handler;
-use crate::brioche::dashboard::{DashboardApp, DashboardData, DashboardNode, render_dashboard};
+use crate::brioche::dashboard::{DashboardApp, DashboardData, render_dashboard};
 use crate::brioche::fragments;
 use crate::brioche::node_detail::render_node_detail;
 use crate::brioche::types::{AppDetailData, ChartConfig, NodeDetailData, safe_env};
@@ -918,6 +918,18 @@ async fn apply_handler(
             .into_response();
     }
 
+    // AUTH1: a scoped token may only deploy apps its scope covers. Check
+    // every app in the manifest, so one out-of-scope app rejects the whole
+    // apply rather than being silently dropped.
+    for (app_name, spec) in &config.app {
+        let namespace = spec.namespace.as_deref().unwrap_or("default");
+        if let Err(resp) =
+            crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
+        {
+            return resp;
+        }
+    }
+
     // Cluster mode (L1): apps, namespaces and permissions become desired
     // state in Raft; the leader schedules apps and every node's reconciler
     // converges. Jobs stay on the receiving node (cluster-wide job
@@ -1350,6 +1362,9 @@ async fn stop_handler(
     {
         return resp;
     }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
 
     if let Some(council) = state.council.clone() {
         return cluster_stop(state, council, app, namespace).await;
@@ -1772,6 +1787,9 @@ async fn exec_handler(
     {
         return resp;
     }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -2000,9 +2018,11 @@ async fn chaos_partition_handler(
     State(state): State<ApiState>,
     Json(body): Json<ChaosPartitionRequest>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
-    {
+    // AUTH4: fault injection is an operator action, not a node-to-node one.
+    if let Err(resp) = crate::sesame::auth::authorize_user(
+        auth.as_deref(),
+        crate::sesame::types::ApiRole::Deployer,
+    ) {
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -2043,9 +2063,10 @@ async fn chaos_heal_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
-    {
+    if let Err(resp) = crate::sesame::auth::authorize_user(
+        auth.as_deref(),
+        crate::sesame::types::ApiRole::Deployer,
+    ) {
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -2143,10 +2164,19 @@ fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
 }
 
 async fn snapshot_create_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app)): Path<(String, String)>,
     body: Option<Json<SnapshotCreateBody>>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let Json(body) = body.unwrap_or_default();
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
@@ -2211,10 +2241,19 @@ async fn snapshot_list_handler(
 }
 
 async fn snapshot_restore_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app)): Path<(String, String)>,
     Json(body): Json<SnapshotRestoreBody>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -2245,9 +2284,18 @@ async fn snapshot_restore_handler(
 }
 
 async fn snapshot_delete_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app, name)): Path<(String, String, String)>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -2283,9 +2331,10 @@ async fn fault_inject_handler(
     State(state): State<ApiState>,
     Json(request): Json<crate::smoker::types::FaultRequest>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
-    {
+    if let Err(resp) = crate::sesame::auth::authorize_user(
+        auth.as_deref(),
+        crate::sesame::types::ApiRole::Deployer,
+    ) {
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -2326,9 +2375,10 @@ async fn fault_clear_handler(
     State(state): State<ApiState>,
     Path(id): Path<u64>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
-    {
+    if let Err(resp) = crate::sesame::auth::authorize_user(
+        auth.as_deref(),
+        crate::sesame::types::ApiRole::Deployer,
+    ) {
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -2368,9 +2418,10 @@ async fn fault_clear_all_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
-    {
+    if let Err(resp) = crate::sesame::auth::authorize_user(
+        auth.as_deref(),
+        crate::sesame::types::ApiRole::Deployer,
+    ) {
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -2662,15 +2713,55 @@ async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
         (0, vec![])
     };
 
+    let nodes = gather_dashboard_nodes(state).await;
+    // The node count follows the real membership when we have it. A
+    // standalone node with no gossip table still shows itself as one node.
+    let node_count = if nodes.is_empty() { 1 } else { nodes.len() };
+
     DashboardData {
         cluster_name: String::new(),
-        node_count: 1,
+        node_count,
         app_count: apps.len(),
         alert_count,
         apps,
-        nodes: vec![],
+        nodes,
         alerts,
     }
+}
+
+/// Build the dashboard node rows from the live gossip membership (AUTH7).
+///
+/// The membership table only holds nodes gossip currently considers alive, so
+/// every row here is a live member. When the council is up we also count each
+/// node's assigned apps from the desired state, giving the same per-node app
+/// totals the placements endpoint serves. No membership table (standalone)
+/// yields an empty list, and the caller falls back to a single-node view.
+async fn gather_dashboard_nodes(state: &ApiState) -> Vec<crate::brioche::dashboard::DashboardNode> {
+    let Some(membership) = &state.membership else {
+        return vec![];
+    };
+    let members = membership.read().await;
+
+    // App counts per node, when we can see the desired state.
+    let mut app_counts: std::collections::HashMap<crate::meat::NodeId, usize> =
+        std::collections::HashMap::new();
+    if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        for placements in desired.scheduling.values() {
+            for placement in placements {
+                *app_counts.entry(placement.node_id.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    members
+        .iter()
+        .map(|member| crate::brioche::dashboard::DashboardNode {
+            name: member.node_id.0.clone(),
+            state: "alive".to_string(),
+            app_count: app_counts.get(&member.node_id).copied().unwrap_or(0),
+        })
+        .collect()
 }
 
 /// Return an HTML response.
@@ -2800,9 +2891,9 @@ async fn fragment_apps_handler(State(state): State<ApiState>) -> Response {
 }
 
 /// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.
-async fn fragment_nodes_handler(State(_state): State<ApiState>) -> Response {
-    // In single-node mode, the nodes list is empty.
-    let nodes: Vec<DashboardNode> = vec![];
+async fn fragment_nodes_handler(State(state): State<ApiState>) -> Response {
+    // AUTH7: reflect the real gossip membership, not a hardcoded empty list.
+    let nodes = gather_dashboard_nodes(&state).await;
     html_response(fragments::render_nodes_table_fragment(&nodes))
 }
 
@@ -3145,9 +3236,18 @@ async fn deploys_history_handler(
 /// targets the one before it. Re-applies through the same path as
 /// `apply` (Raft in cluster mode, local deploy otherwise).
 async fn rollback_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let Some(history) = &state.deploy_history else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3295,8 +3395,10 @@ async fn identity_sign_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
+    // AUTH4: a user-management route. The service principal must not sign
+    // images, even though it can present the cluster token.
     if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
     }
@@ -3350,7 +3452,7 @@ async fn token_list_handler(
     State(state): State<ApiState>,
 ) -> Response {
     if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
     }
@@ -3386,7 +3488,7 @@ async fn token_revoke_handler(
     body: String,
 ) -> Response {
     if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
     }
@@ -3440,8 +3542,10 @@ async fn token_create_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
+    // AUTH4: the highest-value lateral-movement target. A stolen service
+    // token must not be able to mint fresh user tokens.
     if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
     }
@@ -3538,8 +3642,10 @@ async fn secret_rotate_handler(
     State(state): State<ApiState>,
     body: String,
 ) -> Response {
+    // AUTH4: rotating the cluster's secret-encryption keys is user-admin
+    // work, not something the service principal should ever do.
     if let Err(resp) =
-        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
     }
@@ -4167,11 +4273,163 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Build a router whose store holds a Deployer token scoped to namespace
+    /// `ns`, so AUTH1 scope enforcement can be exercised end-to-end.
+    async fn setup_scoped_to_namespace(ns: &str) -> (Router, CancellationToken, String) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let scope = crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec![ns.to_string()]),
+        };
+        let created = crate::sesame::token::create_token(
+            "scoped",
+            crate::sesame::types::ApiRole::Deployer,
+            scope,
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // no council: local path
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        (app, shutdown, created.plaintext)
+    }
+
     #[tokio::test]
-    async fn service_principal_may_create_tokens() {
-        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
-        let council = seeded_council("role-system").await;
-        // A user token exists (enforcement on), but the service token wins.
+    async fn scoped_deployer_is_refused_stopping_outside_its_namespace() {
+        // AUTH1: a Deployer scoped to `a` clears the role gate but is refused
+        // on namespace `b`.
+        let (app, shutdown, tok) = setup_scoped_to_namespace("a").await;
+        let status = post_status(app, "/v1/stop/web/b", &tok, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn scoped_deployer_is_allowed_stopping_inside_its_namespace() {
+        let (app, shutdown, tok) = setup_scoped_to_namespace("a").await;
+        // In-scope: it passes authorisation (may 404 on a missing app, but
+        // never 403).
+        let status = post_status(app, "/v1/stop/web/a", &tok, "").await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn scoped_deployer_is_refused_applying_an_out_of_scope_app() {
+        // AUTH1 on apply: the manifest's namespace is out of scope.
+        let (app, shutdown, tok) = setup_scoped_to_namespace("a").await;
+        let manifest = "[app.web]\nimage = \"x:1\"\nnamespace = \"b\"\n";
+        let status = post_status(app, "/v1/apply", &tok, manifest).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn readonly_token_is_refused_mutating_a_snapshot() {
+        // AUTH2: snapshot mutation is no longer open to any authenticated
+        // caller. A ReadOnly token is refused.
+        let (app, shutdown, tok) =
+            setup_with_role("auth2-snap", crate::sesame::types::ApiRole::ReadOnly).await;
+        let status = post_status(app, "/v1/snapshots/default/web", &tok, "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn readonly_token_is_refused_rolling_back() {
+        // AUTH2: app rollback now requires a Deployer.
+        let (app, shutdown, tok) =
+            setup_with_role("auth2-rollback", crate::sesame::types::ApiRole::ReadOnly).await;
+        let status = post_status(app, "/v1/rollback/web/default", &tok, "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn dashboard_nodes_fragment_reflects_real_membership() {
+        // AUTH7: the nodes fragment lists the live gossip members by name,
+        // not a hardcoded empty list.
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let membership = Arc::new(RwLock::new(vec![
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("node-alpha"),
+                address: "127.0.0.1:9101".parse().unwrap(),
+            },
+            NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new("node-beta"),
+                address: "127.0.0.1:9102".parse().unwrap(),
+            },
+        ]));
+        // No token store, so the request is open; membership at position 11.
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(membership),
+            None,
+            9117,
+            None,
+        );
+        let (status, body) = get(app, "/ui/fragment/nodes").await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("node-alpha"), "html was: {html}");
+        assert!(html.contains("node-beta"), "html was: {html}");
+        shutdown.cancel();
+    }
+
+    /// Build a router around `council` whose store holds a user token plus a
+    /// known service token, so AUTH4's system-principal restriction can be
+    /// exercised end-to-end.
+    async fn setup_with_service_token(
+        tag: &str,
+    ) -> (Router, CancellationToken, Arc<crate::council::CouncilNode>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let council = seeded_council(tag).await;
+        // A user token exists so enforcement is on.
         let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
         let store = crate::sesame::auth::new_token_store();
         store.write().await.push(token);
@@ -4182,7 +4440,7 @@ mod tests {
             None,
             None,
             None,
-            Some(council),
+            Some(council.clone()),
             Some(store),
             Some("rbrg_service".to_string()),
             None,
@@ -4191,6 +4449,13 @@ mod tests {
             9117,
             None,
         );
+        (app, shutdown, council)
+    }
+
+    #[tokio::test]
+    async fn service_principal_is_refused_from_creating_tokens() {
+        // AUTH4: a stolen service token must not mint user tokens.
+        let (app, shutdown, _council) = setup_with_service_token("role-system-tok").await;
         let status = post_status(
             app,
             "/v1/token/create",
@@ -4198,7 +4463,35 @@ mod tests {
             &serde_json::json!({ "name": "x", "role": "deployer" }).to_string(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn service_principal_is_refused_from_rotating_secrets() {
+        // AUTH4: rotating the cluster's key material is not fan-out work.
+        let (app, shutdown, _council) = setup_with_service_token("role-system-rot").await;
+        let status = post_status(app, "/v1/secret/rotate", "rbrg_service", "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn service_principal_is_accepted_on_a_system_route() {
+        // AUTH4 must not weaken node-to-node fan-out: the service token still
+        // clears a System-tagged route (here batch/run). It passes the auth
+        // gate; the run itself may then fail on missing state, but not with a
+        // 403 (the authorisation refusal).
+        let (app, shutdown, _council) = setup_with_service_token("role-system-run").await;
+        let status = post_status(
+            app,
+            "/v1/batch/run",
+            "rbrg_service",
+            &serde_json::json!({}).to_string(),
+        )
+        .await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
     }
 
     #[tokio::test]

@@ -881,16 +881,20 @@ whole theme lands.
 
 ### 12b.3 — Secure every boundary
 
-- [ ] **API authorisation and Brioche** — enforce app/namespace scopes in reusable
+- [x] **API authorisation and Brioche** — enforce app/namespace scopes in reusable
   extractors; cover every mutation endpoint; refuse unsafe non-loopback bootstrap; replace
   the shared cluster-Admin service token with route-limited per-node capabilities; index and
   verify one Argon2 token in spawn_blocking under a concurrency bound; use real dashboard/node
   state and escape each HTML/attribute context including apostrophes (H4, D8, AUTH1-AUTH5, AUTH7-AUTH8).
   - [x] Authenticated read-only browser sessions + `/`+`/ui/*` route lockdown; env values
     masked (Stage 5, PR #77 — closes H6/AUTH6).
-  - [ ] Scope enforcement (AUTH1/H4), fail-closed bootstrap / non-loopback refusal (AUTH3),
-    per-node internal capabilities vs the shared Admin service token (AUTH2/AUTH4),
-    off-lock bounded Argon2 (AUTH5), real dashboard data (AUTH7), attribute-context XSS (AUTH8).
+  - [x] Scope enforcement (AUTH1/H4) via `authorize_scoped` on apply/stop/exec/rollback/snapshot;
+    fail-closed non-loopback bootstrap refusal at bind time (AUTH3); snapshot-mutate + rollback
+    now Deployer-gated (AUTH2); the `__system` service principal refused on token/secret/sign/
+    chaos/fault via `authorize_user` while node fan-out keeps its System routes (AUTH4);
+    off-lock bounded Argon2 with a format short-circuit + `spawn_blocking` semaphore (AUTH5);
+    dashboard/node fragments read the live gossip membership (AUTH7); `escape_html` now escapes
+    `'` for single-quoted chart attributes (AUTH8).
 - [ ] **Node PKI, join and mTLS** — the listener/identity half landed with Stage 5; what
   remains is the join hardening, peer binding and registry security below.
   - [x] Persist the bootstrap node leaf/key/Node CA/root CA + config paths; deliver a bundle

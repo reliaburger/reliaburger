@@ -137,11 +137,12 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/chaos/partition", Deployer),
     route(Post, "/v1/chaos/heal", Deployer),
     route(Get, "/v1/chaos/status", AnyToken),
-    // Snapshots. (Mutation still rides AnyToken today — AUTH2, 12b.3.)
+    // Snapshots. Reads are open to any caller; mutations need a Deployer
+    // (plus the token's app/namespace scope), enforced in the handlers.
     route(Get, "/v1/snapshots/{namespace}/{app}", AnyToken),
-    route(Post, "/v1/snapshots/{namespace}/{app}", AnyToken),
-    route(Post, "/v1/snapshots/{namespace}/{app}/restore", AnyToken),
-    route(Delete, "/v1/snapshots/{namespace}/{app}/{name}", AnyToken),
+    route(Post, "/v1/snapshots/{namespace}/{app}", Deployer),
+    route(Post, "/v1/snapshots/{namespace}/{app}/restore", Deployer),
+    route(Delete, "/v1/snapshots/{namespace}/{app}/{name}", Deployer),
     // Fault injection.
     route(Post, "/v1/fault", Deployer),
     route(Delete, "/v1/fault", Deployer),
@@ -162,7 +163,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/logs/sql", AnyToken),
     route(Get, "/v1/deploys/active", AnyToken),
     route(Get, "/v1/deploys/history/{app}", AnyToken),
-    route(Post, "/v1/rollback/{app}/{namespace}", AnyToken),
+    route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
     route(Get, "/v1/placements/{node_id}", AnyToken),
     route(Get, "/v1/images", AnyToken),
     // Batch + build. `run`/`report`/`track` are node-to-node (System).
@@ -176,7 +177,9 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/build/{id}", AnyToken),
     // GitOps + identity + tokens + secrets.
     route(Post, "/v1/gitops/webhook", AnyToken),
-    route(Post, "/v1/identity/sign", System),
+    // Operator-only (Admin). The service principal is refused here (AUTH4),
+    // so despite being a signing route it isn't a node-to-node one.
+    route(Post, "/v1/identity/sign", Admin),
     route(Post, "/v1/token/create", Admin),
     route(Get, "/v1/token/list", Admin),
     route(Post, "/v1/token/revoke", Admin),

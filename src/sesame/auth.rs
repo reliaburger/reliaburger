@@ -9,10 +9,28 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use super::token;
-use super::types::{ApiRole, ApiToken};
+use super::types::{ApiRole, ApiToken, TokenScope};
+
+/// Ceiling on concurrent Argon2 verifications across the whole process.
+///
+/// Argon2id is deliberately slow and memory-hungry, so a flood of bad bearers
+/// hashing in parallel would otherwise pin every CPU and exhaust memory (a
+/// trivial denial of service). We admit at most this many verifications at a
+/// time; the rest wait for a permit. Small enough to stay cheap, large enough
+/// that honest concurrent callers aren't serialised behind one another.
+const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+
+/// Process-wide permit pool bounding concurrent Argon2 work (AUTH5).
+///
+/// `LazyLock` initialises this the first time it's read and never again, so
+/// every request shares one semaphore. It replaces the old behaviour where
+/// verification ran synchronously while the token-store read lock was held,
+/// serialising every request behind one another's hashing.
+static VERIFY_PERMITS: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_VERIFICATIONS));
 
 /// Shared token store, readable by the auth middleware.
 ///
@@ -110,6 +128,58 @@ pub fn authenticate(
     })
 }
 
+/// Authenticate a bearer without holding the token-store lock (AUTH5).
+///
+/// Takes ownership of a cloned token list (the caller already released the
+/// read lock). A bearer that doesn't even look like one of our tokens is
+/// rejected by a string check, so a flood of junk never reaches Argon2. The
+/// real verification runs on a blocking thread under a process-wide semaphore,
+/// so concurrent bad bearers can't pin every core hashing in parallel.
+///
+/// `async fn` returning `Result` is Rust's way of saying "this may await and
+/// may fail"; `.await` on the `spawn_blocking` handle yields until the
+/// blocking thread finishes without parking the async worker.
+async fn authenticate_off_lock(
+    plaintext: &str,
+    tokens: Vec<ApiToken>,
+) -> Result<AuthContext, (StatusCode, String)> {
+    // Cheap shape check first: reject obviously-malformed bearers before we
+    // spend an Argon2 hash on them (the AUTH5 short-circuit index).
+    if !token::looks_like_token(plaintext) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
+
+    // Bound concurrent Argon2 work. The semaphore is a `static`, so its
+    // permits borrow for `'static` and can cross into the blocking closure.
+    let permit = match VERIFY_PERMITS.acquire().await {
+        Ok(permit) => permit,
+        // The semaphore is a `static` we never close, so this is unreachable
+        // in practice; treat a closed semaphore as a transient failure.
+        Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication temporarily unavailable".to_string(),
+            ));
+        }
+    };
+
+    let candidate = plaintext.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        authenticate(&candidate, &tokens)
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        // The blocking task panicked; don't leak the panic, fail closed.
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication failed".to_string(),
+        )),
+    }
+}
+
 /// Check that the authenticated context has sufficient role.
 pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusCode, String)> {
     token::check_role(ctx.role, required).map_err(|_| {
@@ -175,7 +245,18 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let tokens = state.tokens.read().await;
+    // Snapshot the token store under the read lock, then drop it (AUTH5).
+    //
+    // The old code held this read lock across the whole Argon2 verification.
+    // Argon2 is slow on purpose, so every authenticated request serialised
+    // behind every other one's hashing, and a Raft-driven token refresh (a
+    // writer) queued behind them all. We clone the small `Vec<ApiToken>` out
+    // and release the lock immediately; the hashing then happens off-lock and
+    // under a concurrency bound.
+    let tokens = {
+        let guard = state.tokens.read().await;
+        guard.clone()
+    };
 
     // No user tokens configured yet: allow all (pre-init / single-node mode).
     if tokens.is_empty() {
@@ -183,7 +264,7 @@ pub async fn auth_middleware(
     }
 
     if let Some(bearer_token) = bearer {
-        return match authenticate(bearer_token, &tokens) {
+        return match authenticate_off_lock(bearer_token, tokens).await {
             Ok(ctx) => {
                 request.extensions_mut().insert(ctx);
                 next.run(request).await
@@ -249,6 +330,69 @@ pub fn authorize(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Res
         Some(ctx) => {
             require_role(ctx, required).map_err(|(status, msg)| (status, msg).into_response())
         }
+    }
+}
+
+/// Like [`authorize`], but refuses the internal **system principal** (AUTH4).
+///
+/// The service token (`__system`) exists only for node-to-node fan-out, which
+/// lands on `System`-tagged routes guarded by [`require_system`]. A shared,
+/// cluster-wide Admin credential handed to every node is a lateral-movement
+/// risk: steal it off one node and you can mint user tokens or rotate secrets
+/// on the whole cluster. So the genuinely user-facing management routes (token
+/// create/list/revoke, secret rotate, identity sign, chaos, fault) authorise
+/// through this helper, which grants the role check to real users but never to
+/// `__system`. Node fan-out doesn't call these routes, so nothing breaks.
+#[allow(clippy::result_large_err)]
+pub fn authorize_user(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Response> {
+    if let Some(ctx) = ctx
+        && ctx.token_name == SYSTEM_PRINCIPAL
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the internal service principal may not call user-management routes",
+        )
+            .into_response());
+    }
+    authorize(ctx, required)
+}
+
+/// Enforce a token's app/namespace scope on a specific target (AUTH1).
+///
+/// The role check answers "may this caller deploy at all?"; this answers "may
+/// this caller deploy *this app in this namespace*?". A `Deployer` scoped to
+/// namespace `a` presenting a request against namespace `b` clears the role
+/// gate but fails here with 403. An unscoped token (no `apps`/`namespaces`
+/// restriction) allows everything, so the common case is unaffected.
+///
+/// Call it *after* the role check in every handler that mutates a named
+/// app/namespace. Pre-init requests (`None`) and the system principal pass:
+/// the former has no scope to enforce, the latter is already confined to
+/// node-to-node routes by [`authorize_user`].
+#[allow(clippy::result_large_err)]
+pub fn authorize_scoped(
+    ctx: Option<&AuthContext>,
+    app: &str,
+    namespace: &str,
+) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    let scope = TokenScope {
+        apps: ctx.scoped_apps.clone(),
+        namespaces: ctx.scoped_namespaces.clone(),
+    };
+    if scope.allows(app, namespace) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!("token scope does not allow {app} in namespace {namespace}"),
+        )
+            .into_response())
     }
 }
 
@@ -467,6 +611,68 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
+    // --- AUTH1 scope enforcement ---
+
+    fn scoped_ctx(apps: Option<Vec<&str>>, namespaces: Option<Vec<&str>>) -> AuthContext {
+        AuthContext {
+            token_name: "scoped".to_string(),
+            role: ApiRole::Deployer,
+            scoped_apps: apps.map(|a| a.into_iter().map(String::from).collect()),
+            scoped_namespaces: namespaces.map(|n| n.into_iter().map(String::from).collect()),
+        }
+    }
+
+    #[test]
+    fn scoped_deployer_is_refused_outside_its_namespace() {
+        let ctx = scoped_ctx(None, Some(vec!["a"]));
+        let err = authorize_scoped(Some(&ctx), "web", "b").unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scoped_deployer_is_allowed_inside_its_namespace() {
+        let ctx = scoped_ctx(None, Some(vec!["a"]));
+        assert!(authorize_scoped(Some(&ctx), "web", "a").is_ok());
+    }
+
+    #[test]
+    fn scoped_deployer_is_refused_outside_its_apps() {
+        let ctx = scoped_ctx(Some(vec!["web"]), None);
+        let err = authorize_scoped(Some(&ctx), "api", "default").unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn unscoped_token_is_allowed_everywhere() {
+        let ctx = scoped_ctx(None, None);
+        assert!(authorize_scoped(Some(&ctx), "anything", "anywhere").is_ok());
+    }
+
+    #[test]
+    fn pre_init_and_system_pass_the_scope_check() {
+        assert!(authorize_scoped(None, "web", "a").is_ok());
+        assert!(authorize_scoped(Some(&system_context()), "web", "a").is_ok());
+    }
+
+    // --- AUTH4 system principal restriction ---
+
+    #[test]
+    fn system_principal_is_refused_on_user_management_routes() {
+        let err = authorize_user(Some(&system_context()), ApiRole::Admin).unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn real_admin_still_passes_user_management_routes() {
+        let admin = AuthContext {
+            token_name: "alice".to_string(),
+            role: ApiRole::Admin,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        assert!(authorize_user(Some(&admin), ApiRole::Admin).is_ok());
+    }
+
     #[test]
     fn require_system_accepts_only_the_system_principal() {
         // The system principal passes.
@@ -482,6 +688,59 @@ mod tests {
         // The bootstrap window (no context) is refused too — internal
         // endpoints are never part of first-run setup.
         assert!(require_system(None).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_valid_bearer_authenticates_through_the_off_lock_path() {
+        let user = create_token("u", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store, None);
+        let header = format!("Bearer {}", user.plaintext);
+        let status = status_of(guarded_router(state), Some(&header)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_invalid_bearers_does_not_hold_the_store_lock() {
+        // The whole point of AUTH5: bad bearers must not serialise on the
+        // store lock. We hammer the middleware with junk bearers while a
+        // writer keeps grabbing the write lock; if the middleware held the
+        // read lock across Argon2, the writer would starve. Here it doesn't,
+        // because the middleware clones out and hashes off-lock.
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store.clone(), None);
+
+        // A writer that must make progress even under the auth burst.
+        let writer_store = store.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..20 {
+                let _guard = writer_store.write().await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // A burst of malformed bearers. `looks_like_token` rejects these
+        // before Argon2, so they can't pile up on permits either.
+        let mut requests = Vec::new();
+        for i in 0..32 {
+            let router = guarded_router(state.clone());
+            let header = format!("Bearer rbrg_not_a_real_token_{i}");
+            requests.push(tokio::spawn(async move {
+                status_of(router, Some(&header)).await
+            }));
+        }
+
+        // The writer completing promptly is the assertion that it wasn't
+        // starved behind the auth burst.
+        let writer_done = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
+        assert!(writer_done.is_ok(), "writer starved by the auth burst");
+
+        for req in requests {
+            assert_eq!(req.await.unwrap(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]

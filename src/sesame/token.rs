@@ -139,6 +139,26 @@ pub fn find_valid_token<'a>(
     Err(TokenError::ValidationFailed)
 }
 
+/// Length of the hex body of a well-formed token (`rbrg_` + 64 hex chars).
+const TOKEN_HEX_LEN: usize = 64;
+
+/// Cheap, non-secret shape check on a bearer before we hash it.
+///
+/// Every token we mint is `rbrg_` followed by 64 lower-case hex characters
+/// (see [`create_token`]). A bearer that doesn't fit that shape can't match
+/// any stored hash, so we can reject it without running Argon2 even once.
+/// This is the short-circuit "index" for AUTH5: a burst of junk bearers is
+/// turned away by a string check, not by an Argon2 hash per stored token.
+///
+/// The check reads only the untrusted input's shape, never a secret, so it
+/// leaks nothing an attacker doesn't already control.
+pub fn looks_like_token(candidate: &str) -> bool {
+    let Some(hex) = candidate.strip_prefix("rbrg_") else {
+        return false;
+    };
+    hex.len() == TOKEN_HEX_LEN && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Fixed HKDF salt for the internal service token. The salt may be public;
 /// the security comes from the master key (`ikm`) staying secret.
 const SERVICE_TOKEN_SALT: [u8; 32] = *b"reliaburger-service-token-salt!!";
@@ -258,5 +278,24 @@ mod tests {
         let tokens = vec![t1.token];
         let result = find_valid_token("rbrg_doesnotexist", &tokens);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn looks_like_token_accepts_a_minted_token() {
+        let created = create_token("t", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        assert!(looks_like_token(&created.plaintext));
+    }
+
+    #[test]
+    fn looks_like_token_rejects_junk() {
+        assert!(!looks_like_token(""));
+        assert!(!looks_like_token("rbrg_"));
+        assert!(!looks_like_token("nope"));
+        // Right prefix, wrong length.
+        assert!(!looks_like_token("rbrg_abc"));
+        // Right length, non-hex character.
+        assert!(!looks_like_token(&format!("rbrg_{}", "z".repeat(64))));
+        // No prefix.
+        assert!(!looks_like_token(&"a".repeat(64)));
     }
 }
