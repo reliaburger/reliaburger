@@ -326,6 +326,32 @@ impl StateMachineInner {
                     jt.consumed = true;
                 }
             }
+            RaftRequest::ConsumeJoinTokenForIssue { token_hash } => {
+                // Atomic consume + serial allocation (PKI5). Because the whole
+                // log applies serially on every node, exactly one entry for a
+                // given token finds it unconsumed; every racer and retry after
+                // that is refused, so a token can only ever mint one serial.
+                let token = self
+                    .state
+                    .security_state
+                    .join_tokens
+                    .iter_mut()
+                    .find(|jt| jt.token_hash == *token_hash);
+                let Some(token) = token else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "join token not found".to_string(),
+                    });
+                };
+                if token.consumed {
+                    return Some(CouncilResponse::Refused {
+                        reason: "join token already consumed".to_string(),
+                    });
+                }
+                token.consumed = true;
+                let serial = self.state.security_state.next_serial;
+                self.state.security_state.next_serial += 1;
+                return Some(CouncilResponse::JoinTokenConsumed { serial });
+            }
             RaftRequest::CreateApiToken(token) => {
                 self.state.security_state.api_tokens.push(token.clone());
             }
@@ -2240,6 +2266,49 @@ mod tests {
             token_hash: [0xAB; 32],
         });
         assert!(inner.state.security_state.join_tokens[0].consumed);
+    }
+
+    #[test]
+    fn consume_join_token_for_issue_is_atomic_and_single_use() {
+        // PKI5: one atomic entry consumes the token and allocates a serial.
+        // A second application of the same entry (a racer / retry) is refused,
+        // so a token can only ever mint one serial.
+        let mut inner = StateMachineInner::default();
+        inner.state.security_state.next_serial = 7;
+        let jt = crate::sesame::types::JoinToken {
+            token_hash: [0xCD; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: crate::sesame::types::AttestationMode::None,
+        };
+        inner.apply_request(&RaftRequest::CreateJoinToken(jt));
+
+        let first = inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [0xCD; 32],
+        });
+        assert_eq!(
+            first,
+            Some(CouncilResponse::JoinTokenConsumed { serial: 7 })
+        );
+        assert!(inner.state.security_state.join_tokens[0].consumed);
+        assert_eq!(inner.state.security_state.next_serial, 8);
+
+        // A second (racing) application finds it consumed → Refused, and the
+        // serial counter does not advance again.
+        let second = inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [0xCD; 32],
+        });
+        assert!(matches!(second, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(inner.state.security_state.next_serial, 8);
+    }
+
+    #[test]
+    fn consume_join_token_for_issue_refuses_an_unknown_token() {
+        let mut inner = StateMachineInner::default();
+        let resp = inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [0x11; 32],
+        });
+        assert!(matches!(resp, Some(CouncilResponse::Refused { .. })));
     }
 
     #[test]

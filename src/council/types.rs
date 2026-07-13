@@ -208,6 +208,15 @@ pub enum RaftRequest {
     },
     /// Remove a named permission grant.
     PermissionDelete { name: String },
+    /// Atomically consume a join token and allocate a certificate serial in
+    /// one committed entry (PKI5). Marking the token consumed and allocating
+    /// the serial were two separate Raft writes, so two racing joiners
+    /// presenting the same token could each pass the consumed check before
+    /// either write landed and double-issue. Applied against the replicated
+    /// log, exactly one of the racers gets `JoinTokenConsumed`; the other,
+    /// and every retry, gets `Refused`. The issuer signs only after this
+    /// commit returns a serial.
+    ConsumeJoinTokenForIssue { token_hash: [u8; 32] },
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +253,10 @@ pub enum CouncilResponse {
     BatchRegistered { batch_id: u64 },
     /// A `BuildRegister` entry was applied; carries the assigned build id.
     BuildRegistered { build_id: u64 },
+    /// A `ConsumeJoinTokenForIssue` entry was applied and this proposer won
+    /// the token: it carries the serial allocated for the node certificate
+    /// (PKI5). A racer that finds the token already consumed gets `Refused`.
+    JoinTokenConsumed { serial: u64 },
 }
 
 // ---------------------------------------------------------------------------

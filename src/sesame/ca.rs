@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SerialNumber as RcgenSerial,
+    KeyPair, KeyUsagePurpose, SanType, SerialNumber as RcgenSerial,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 
@@ -192,6 +192,21 @@ pub fn generate_intermediate_ca(
     })
 }
 
+/// The SPIFFE-style URI that binds a certificate to a specific node id.
+///
+/// A node cert carries this as a URI SAN so a verifier can assert the peer
+/// is the exact node it meant to reach, not merely *some* node the Node CA
+/// signed (PKI3). The form mirrors the workload SPIFFE URIs.
+pub fn node_spiffe_uri(node_id: &str) -> String {
+    format!("spiffe://reliaburger/node/{node_id}")
+}
+
+/// Extract the node id from a `spiffe://reliaburger/node/<id>` URI, if it is
+/// one. Returns `None` for any other URI shape.
+pub fn node_id_from_spiffe_uri(uri: &str) -> Option<&str> {
+    uri.strip_prefix("spiffe://reliaburger/node/")
+}
+
 /// Issue an end-entity certificate (e.g. node cert) signed by an intermediate CA.
 ///
 /// Returns `(certificate_der, private_key_der, serial)`.
@@ -257,25 +272,138 @@ pub fn issue_end_entity_cert(
 
 /// Issue a node certificate signed by the Node CA. Convenience wrapper
 /// around `issue_end_entity_cert` with the right key usage for mTLS.
+///
+/// The certificate carries the node-id URI SAN
+/// (`spiffe://reliaburger/node/<node_id>`) so a peer verifier can bind the
+/// connection to the specific node (PKI3), plus the node id as a DNS SAN
+/// for backwards compatibility with the CN-based checks.
 pub fn issue_node_cert(
     node_id: &str,
     serial: SerialNumber,
     ca_keypair: &KeyPair,
     ca_params: &CertificateParams,
 ) -> Result<(Vec<u8>, Vec<u8>, SerialNumber), CaError> {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
+    let private_key_der = key_pair.serialize_der();
+    let params = node_cert_params(node_id, serial)?;
+
+    let ca_cert = ca_params
+        .clone()
+        .self_signed(ca_keypair)
+        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
+    let certificate = params
+        .signed_by(&key_pair, &ca_cert, ca_keypair)
+        .map_err(|e| CaError::SignFailed(e.to_string()))?;
+
+    Ok((certificate.der().to_vec(), private_key_der, serial))
+}
+
+/// Validate a node CSR and sign it with the Node CA (PKI4).
+///
+/// The joiner generates its own keypair and CSR; only the CSR travels to the
+/// issuer, so the private key never leaves the joining node. As with workload
+/// CSRs (PKI6), the only thing taken from the CSR is its public key — every
+/// other field, the node-id URI SAN in particular, is rebuilt server-side from
+/// `node_id`, so a CSR that smuggles extra SANs never gets them signed.
+///
+/// Returns `(certificate_der, serial)`.
+pub fn sign_node_csr(
+    csr_der: &[u8],
+    node_id: &str,
+    serial: SerialNumber,
+    ca_keypair: &KeyPair,
+    ca_params: &CertificateParams,
+) -> Result<(Vec<u8>, SerialNumber), CaError> {
+    let csr_der_owned: Vec<u8> = csr_der.to_vec();
+    let csr_der_ref = rustls::pki_types::CertificateSigningRequestDer::from(csr_der_owned);
+    let csr_params = rcgen::CertificateSigningRequestParams::from_der(&csr_der_ref)
+        .map_err(|e| CaError::SignFailed(format!("failed to parse node CSR: {e}")))?;
+
+    let params = node_cert_params(node_id, serial)?;
+    let ca_cert = ca_params
+        .clone()
+        .self_signed(ca_keypair)
+        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
+    let certificate = params
+        .signed_by(&csr_params.public_key, &ca_cert, ca_keypair)
+        .map_err(|e| CaError::SignFailed(e.to_string()))?;
+
+    Ok((certificate.der().to_vec(), serial))
+}
+
+/// Build the certificate params for a node certificate (shared by the
+/// self-issued and CSR-signed paths).
+fn node_cert_params(node_id: &str, serial: SerialNumber) -> Result<CertificateParams, CaError> {
     let lifetime = Duration::from_secs(365 * 24 * 3600); // 1 year
-    issue_end_entity_cert(
-        node_id,
-        serial,
-        lifetime,
-        &[],
-        &[
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ],
-        ca_keypair,
-        ca_params,
-    )
+
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, node_id);
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
+
+    let uri = node_spiffe_uri(node_id);
+    let uri_san = SanType::URI(
+        uri.try_into()
+            .map_err(|e: rcgen::Error| CaError::CertGenFailed(e.to_string()))?,
+    );
+    let mut sans = vec![uri_san];
+    // The node id doubles as a DNS SAN for compatibility with CN-based checks.
+    if let Ok(dns) = node_id.to_string().try_into() {
+        sans.push(SanType::DnsName(dns));
+    }
+    params.subject_alt_names = sans;
+
+    params.not_before = rcgen::date_time_ymd(
+        time_to_year(SystemTime::now()),
+        time_to_month(SystemTime::now()),
+        time_to_day(SystemTime::now()),
+    );
+    let not_after_time = SystemTime::now() + lifetime;
+    params.not_after = rcgen::date_time_ymd(
+        time_to_year(not_after_time),
+        time_to_month(not_after_time),
+        time_to_day(not_after_time),
+    );
+    Ok(params)
+}
+
+/// Generate a node keypair and CSR (PKI4, joiner side).
+///
+/// Returns `(csr_der, private_key_der)`. The private key stays on the joiner;
+/// only the CSR is sent to the issuing cluster member.
+pub fn create_node_csr(node_id: &str) -> Result<(Vec<u8>, Vec<u8>), CaError> {
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
+    let private_key_der = key_pair.serialize_der();
+
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, node_id);
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::NoCa;
+
+    let uri = node_spiffe_uri(node_id);
+    let uri_san = SanType::URI(
+        uri.try_into()
+            .map_err(|e: rcgen::Error| CaError::CertGenFailed(e.to_string()))?,
+    );
+    params.subject_alt_names = vec![uri_san];
+
+    let csr = params
+        .serialize_request(&key_pair)
+        .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
+    Ok((csr.der().to_vec(), private_key_der))
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +514,27 @@ pub fn verify_join_token(token_plaintext: &str, stored_hash: &[u8; 32]) -> bool 
         return false;
     };
     let hash = ring::digest::digest(&ring::digest::SHA256, &token_bytes);
-    hash.as_ref() == stored_hash
+    constant_time_eq(hash.as_ref(), stored_hash)
+}
+
+/// Constant-time byte-slice equality (PKI10).
+///
+/// A plain `==` on a hash short-circuits at the first differing byte, so the
+/// time it takes to reject leaks how many leading bytes matched — enough to
+/// mount a byte-at-a-time forgery. This reads both slices fully and folds every
+/// byte difference into one accumulator, so the running time depends only on
+/// the length, not the contents. `ring::constant_time` is deprecated and
+/// pulling in `subtle` as a direct dependency isn't warranted for a 32-byte
+/// compare, so we spell it out.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -582,5 +730,100 @@ mod tests {
         let hash = [0u8; 32];
         assert!(!verify_join_token("not-a-token", &hash));
         assert!(!verify_join_token("rbrg_join_1_not-hex!", &hash));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_semantics_of_plain_eq() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+        assert!(!constant_time_eq(&[0xFF; 32], &[0x00; 32]));
+    }
+
+    #[test]
+    fn wrong_token_fails_via_constant_time_path() {
+        // PKI10: verify_join_token routes through the constant-time compare;
+        // a valid token verifies, a wrong one of the same shape does not.
+        let (token, hash) = generate_join_token().unwrap();
+        assert!(verify_join_token(&token, &hash));
+        let (other, _) = generate_join_token().unwrap();
+        assert!(!verify_join_token(&other, &hash));
+    }
+
+    #[test]
+    fn issued_node_cert_carries_the_node_id_uri_san() {
+        let hierarchy = generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (cert_der, _key, _serial) = issue_node_cert(
+            "node-07",
+            SerialNumber(10),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+
+        let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+        let sans: Vec<String> = cert
+            .subject_alternative_name()
+            .ok()
+            .flatten()
+            .map(|ext| {
+                ext.value
+                    .general_names
+                    .iter()
+                    .filter_map(|gn| match gn {
+                        x509_parser::extensions::GeneralName::URI(u) => Some(u.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            sans.contains(&node_spiffe_uri("node-07")),
+            "node cert should carry its node-id URI SAN, got: {sans:?}"
+        );
+    }
+
+    #[test]
+    fn sign_node_csr_binds_the_expected_node_id_not_the_csr_subject() {
+        let hierarchy = generate_ca_hierarchy("test", b"ikm").unwrap();
+        // The joiner asks for "node-evil" in its CSR, but the issuer signs for
+        // the node id *it* validated ("node-good"): the CSR subject/SAN is
+        // never trusted, only its public key.
+        let (csr_der, private_key_der) = create_node_csr("node-evil").unwrap();
+
+        let (cert_der, _serial) = sign_node_csr(
+            &csr_der,
+            "node-good",
+            SerialNumber(11),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+
+        // The private key never left the joiner: it is not derivable from the
+        // returned cert, and the returned material is a cert only.
+        assert!(!private_key_der.is_empty());
+
+        let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
+        assert!(cert.subject().to_string().contains("node-good"));
+        assert!(!cert.subject().to_string().contains("node-evil"));
+
+        // Chains to the Node CA that signed it.
+        crate::sesame::cert::verify_signature(&cert_der, &hierarchy.node.ca.certificate_der)
+            .unwrap();
+    }
+
+    #[test]
+    fn node_id_from_spiffe_uri_round_trips() {
+        assert_eq!(
+            node_id_from_spiffe_uri(&node_spiffe_uri("node-42")),
+            Some("node-42")
+        );
+        assert_eq!(
+            node_id_from_spiffe_uri("spiffe://reliaburger/app/foo"),
+            None
+        );
+        assert_eq!(node_id_from_spiffe_uri("https://example"), None);
     }
 }

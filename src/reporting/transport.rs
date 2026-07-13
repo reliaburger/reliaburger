@@ -149,6 +149,11 @@ impl ReportingTransport for InMemoryReportingTransport {
 /// Maximum reporting message size (1 MiB).
 const MAX_REPORT_SIZE: usize = 1_048_576;
 
+/// How long the accept side waits for a peer to complete its handshake and
+/// deliver a full framed message before dropping the connection (CP11). A
+/// stalled peer (partial length prefix, half-open TLS) must not hold the task.
+const REPORT_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Real TCP transport for reporting tree messages.
 ///
 /// Uses length-prefixed framing: 4-byte big-endian length + bincode payload.
@@ -241,13 +246,28 @@ impl TcpReportingTransport {
                                     tokio::spawn(async move {
                                         // A refused/failed handshake is dropped
                                         // silently; a rejected peer learns nothing.
-                                        if let Ok(tls) = acceptor.accept(stream).await {
-                                            Self::handle_connection(tls, peer, tx).await;
-                                        }
+                                        // One deadline covers the handshake and
+                                        // the framed read so a stalled peer can't
+                                        // pin the task (CP11).
+                                        let _ = tokio::time::timeout(
+                                            REPORT_ACCEPT_DEADLINE,
+                                            async {
+                                                if let Ok(tls) = acceptor.accept(stream).await {
+                                                    Self::handle_connection(tls, peer, tx).await;
+                                                }
+                                            },
+                                        )
+                                        .await;
                                     });
                                 }
                                 None => {
-                                    tokio::spawn(Self::handle_connection(stream, peer, tx));
+                                    tokio::spawn(async move {
+                                        let _ = tokio::time::timeout(
+                                            REPORT_ACCEPT_DEADLINE,
+                                            Self::handle_connection(stream, peer, tx),
+                                        )
+                                        .await;
+                                    });
                                 }
                             }
                         }
@@ -408,6 +428,28 @@ mod tests {
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
         })
+    }
+
+    #[tokio::test]
+    async fn handle_connection_never_completes_on_a_stalled_half_frame() {
+        // CP11: a peer that sends a partial length prefix then stalls would
+        // hold handle_connection open forever. Under a short timeout (standing
+        // in for REPORT_ACCEPT_DEADLINE) it is abandoned instead.
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(&[0u8, 0u8]).await.unwrap();
+
+        let (tx, _rx) = mpsc::channel(4);
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            TcpReportingTransport::handle_connection(server, addr(1), tx),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a stalled half-frame must be cut off by the deadline, not return"
+        );
     }
 
     #[tokio::test]

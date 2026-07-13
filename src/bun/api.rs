@@ -1956,24 +1956,39 @@ async fn ui_logout_handler(
         .into_response()
 }
 
-/// Request body for cluster join: a one-time token plus the joiner's node id.
+/// Request body for cluster join: a one-time token, the joiner's node id, and
+/// the joiner's CSR (PKI4 — the joiner keeps its private key).
 #[derive(Deserialize)]
 struct JoinRequest {
     token: String,
     node_id: String,
+    csr_b64: String,
 }
 
 /// Issue a certificate bundle to a joining node (issuer side).
 ///
-/// Public route: the join token is the credential. Returns the bundle the
-/// joiner persists as its identity.
+/// Public route: the join token is the credential. The joiner sends a CSR and
+/// keeps its private key (PKI4); we sign the CSR and return the leaf plus CA
+/// chain the joiner persists as its identity.
 async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
+    use base64::Engine as _;
+    let csr_der = match base64::engine::general_purpose::STANDARD.decode(&body.csr_b64) {
+        Ok(der) => der,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid CSR: {e}") })),
+            )
+                .into_response();
+        }
+    };
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::JoinIssue {
             token: body.token,
             node_id: body.node_id,
+            csr_der,
             response: resp_tx,
         })
         .await
@@ -4884,7 +4899,9 @@ mod tests {
                     .method("POST")
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"token":"abc123","node_id":"node-02"}"#))
+                    .body(Body::from(
+                        r#"{"token":"abc123","node_id":"node-02","csr_b64":""}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -4908,7 +4925,9 @@ mod tests {
                     .method("POST")
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"token":"whatever","node_id":"node-09"}"#))
+                    .body(Body::from(
+                        r#"{"token":"whatever","node_id":"node-09","csr_b64":""}"#,
+                    ))
                     .unwrap(),
             )
             .await

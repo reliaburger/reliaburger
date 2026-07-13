@@ -155,6 +155,9 @@ pub enum AgentCommand {
     JoinIssue {
         token: String,
         node_id: String,
+        /// DER PKCS#10 CSR the joiner generated (PKI4). The joiner keeps its
+        /// private key; the issuer only signs this request.
+        csr_der: Vec<u8>,
         response: oneshot::Sender<Result<crate::sesame::join::JoinBundle, BunError>>,
     },
     /// Inject a network partition (chaos testing).
@@ -2238,9 +2241,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::JoinIssue {
                 token,
                 node_id,
+                csr_der,
                 response,
             } => {
-                let result = self.handle_join_issue(&token, &node_id).await;
+                let result = self.handle_join_issue(&token, &node_id, &csr_der).await;
                 let _ = response.send(result);
             }
             AgentCommand::InjectPartition {
@@ -5063,6 +5067,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         token: &str,
         node_id: &str,
+        csr_der: &[u8],
     ) -> Result<crate::sesame::join::JoinBundle, BunError> {
         let cluster = self
             .cluster
@@ -5083,32 +5088,48 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reason: "no wrapping IKM available".to_string(),
             })?;
 
-        // Read security state and validate token
-        let mut security_state = council.security_state().await;
-
-        let join_result =
-            crate::sesame::join::validate_and_issue(token, node_id, &mut security_state, ikm)
-                .map_err(|e| BunError::SecurityError {
+        // Fast-fail check against the replicated state (unknown/expired/already
+        // consumed token). The authoritative consume happens atomically below.
+        let security_state = council.security_state().await;
+        let token_hash =
+            crate::sesame::join::check_join_token(token, &security_state).map_err(|e| {
+                BunError::SecurityError {
                     reason: format!("join validation failed: {e}"),
-                })?;
-
-        // Find the consumed token's hash for the Raft write
-        let token_hash = security_state
-            .join_tokens
-            .iter()
-            .find(|jt| jt.consumed && crate::sesame::ca::verify_join_token(token, &jt.token_hash))
-            .map(|jt| jt.token_hash)
-            .ok_or_else(|| BunError::SecurityError {
-                reason: "could not find consumed token hash".to_string(),
+                }
             })?;
 
-        // Persist token consumption to Raft
-        council
-            .write(crate::council::RaftRequest::ConsumeJoinToken { token_hash })
+        // Atomically consume the token and allocate a serial in one committed
+        // Raft entry (PKI5). Two racing joiners with the same token: exactly one
+        // gets a serial here; the loser is refused, so a token issues one cert.
+        let serial = match council
+            .write(crate::council::RaftRequest::ConsumeJoinTokenForIssue { token_hash })
             .await
             .map_err(|e| BunError::SecurityError {
-                reason: format!("failed to persist token consumption: {e}"),
-            })?;
+                reason: format!("failed to consume join token: {e}"),
+            })? {
+            crate::council::CouncilResponse::JoinTokenConsumed { serial } => {
+                crate::sesame::types::SerialNumber(serial)
+            }
+            crate::council::CouncilResponse::Refused { reason } => {
+                return Err(BunError::SecurityError {
+                    reason: format!("join refused: {reason}"),
+                });
+            }
+            other => {
+                return Err(BunError::SecurityError {
+                    reason: format!("unexpected council response to join: {other:?}"),
+                });
+            }
+        };
+
+        // Re-read the state after the commit so the CA material reflects the
+        // committed serial counter, then sign the joiner's CSR.
+        let security_state = council.security_state().await;
+        let join_result =
+            crate::sesame::join::sign_join_csr(csr_der, node_id, serial, &security_state, ikm)
+                .map_err(|e| BunError::SecurityError {
+                    reason: format!("join signing failed: {e}"),
+                })?;
 
         Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
     }

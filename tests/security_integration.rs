@@ -52,16 +52,40 @@ fn bootstrap_security_state() -> (SecurityState, String, [u8; 32]) {
 // Join token tests
 // ---------------------------------------------------------------------------
 
+/// Issue a node certificate the way the agent handler does: pre-check the
+/// token, mark it consumed and allocate a serial atomically (mirroring the
+/// Raft `ConsumeJoinTokenForIssue` step), then sign the joiner's CSR.
+fn issue_for(
+    state: &mut SecurityState,
+    token: &str,
+    node_id: &str,
+    ikm: &[u8],
+) -> Result<join::JoinResult, join::JoinError> {
+    join::check_join_token(token, state)?;
+    // Atomic consume + serial (single-node stand-in for the Raft entry).
+    let jt = state
+        .join_tokens
+        .iter_mut()
+        .find(|jt| ca::verify_join_token(token, &jt.token_hash))
+        .unwrap();
+    jt.consumed = true;
+    let serial = reliaburger::sesame::types::SerialNumber(state.next_serial);
+    state.next_serial += 1;
+
+    let (csr_der, _key) = ca::create_node_csr(node_id).unwrap();
+    join::sign_join_csr(&csr_der, node_id, serial, state, ikm)
+}
+
 #[test]
 fn join_token_single_use_enforced() {
     let (mut state, token, ikm) = bootstrap_security_state();
 
     // First use should succeed
-    let result = join::validate_and_issue(&token, "node-02", &mut state, &ikm);
+    let result = issue_for(&mut state, &token, "node-02", &ikm);
     assert!(result.is_ok());
 
     // Second use should fail — token is consumed
-    let result2 = join::validate_and_issue(&token, "node-03", &mut state, &ikm);
+    let result2 = issue_for(&mut state, &token, "node-03", &ikm);
     assert!(result2.is_err());
     let err = format!("{}", result2.unwrap_err());
     assert!(
@@ -103,7 +127,7 @@ fn join_token_expiry_enforced() {
         secret_seals: std::collections::BTreeMap::new(),
     };
 
-    let result = join::validate_and_issue(&token_plaintext, "node-02", &mut state, &wrapping_ikm);
+    let result = issue_for(&mut state, &token_plaintext, "node-02", &wrapping_ikm);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
     assert!(
@@ -250,10 +274,28 @@ async fn spawn_issuer(
         Json(body): Json<serde_json::Value>,
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
+        use base64::Engine as _;
         let token = body["token"].as_str().unwrap_or_default();
         let node_id = body["node_id"].as_str().unwrap_or_default();
+        let csr_der = base64::engine::general_purpose::STANDARD
+            .decode(body["csr_b64"].as_str().unwrap_or_default())
+            .unwrap_or_default();
+
         let mut state = issuer.state.lock().unwrap();
-        match join::validate_and_issue(token, node_id, &mut state, &issuer.ikm) {
+        let issued = (|| {
+            join::check_join_token(token, &state)?;
+            let jt = state
+                .join_tokens
+                .iter_mut()
+                .find(|jt| ca::verify_join_token(token, &jt.token_hash))
+                .ok_or(join::JoinError::InvalidToken)?;
+            jt.consumed = true;
+            let serial = reliaburger::sesame::types::SerialNumber(state.next_serial);
+            state.next_serial += 1;
+            join::sign_join_csr(&csr_der, node_id, serial, &state, &issuer.ikm)
+        })();
+
+        match issued {
             Ok(result) => Json(join::JoinBundle::from_result(&result)).into_response(),
             Err(e) => (
                 axum::http::StatusCode::BAD_REQUEST,
