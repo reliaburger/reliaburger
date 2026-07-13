@@ -679,6 +679,7 @@ mod tests {
             app_name: "web".to_string(),
             instance_id: 0,
             pid: 4242,
+            full_id: "default__web-0".to_string(),
         }]
     }
 

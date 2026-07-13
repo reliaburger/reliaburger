@@ -693,6 +693,39 @@ whole theme lands.
   retry/reschedule failures and rebuild applied state after restart. Move image/init/runtime/
   health waits outside Bun's command loop and honour surge, unavailable, drain and rollback
   semantics (H7/D10, DEP1-DEP6, codex-M3).
+  - [x] PR 1 — Namespaced instance identity + AppDelete-on-stop + durable applied-state
+    (DEP1/DEP2/DEP3).
+    - [x] `InstanceIdentity { namespace, app, generation: Option<u64>, ordinal }`
+      (`grill::mod`) with one canonical string form, `{namespace}__{app}[-g{gen}]-{ordinal}`
+      (`__` is illegal in a DNS-1123 label, so the namespace parses back out unambiguously
+      even for a hyphenated app name). Replaces both old formats (`{app}-{i}` and the canary
+      `{app}-g{gen}-{i}`) at every construction site (supervisor app/job, agent canary,
+      reporting ordinal, record replica-index, upgrade inventory). Round-trip + hyphenated-app
+      unit tests; DEP1 collision regression (two same-name apps in different namespaces
+      coexist in the supervisor).
+    - [x] Adoption compat: a pre-theme record (bare `web-0`) re-adopts under the canonical
+      key rebuilt from the record's structured `namespace`/`app_name`/`replica_index` fields,
+      while the runtime, identity dir and log stem stay keyed on the legacy runtime id the
+      container ran as — so an in-place upgrade across the change never orphans a workload.
+      The upgrade marker gained a `full_id` (serde-default) so a marker written pre-theme
+      still loads; fixture test pins it.
+    - [x] Cluster stop proposes `AppDelete` through Raft (`stop_handler` → `cluster_stop`,
+      leader-forwarded like `apply`), so desired state clears and no reconciler resurrects the
+      app; a leader with no local replica still clears cluster state (no spurious 404). The
+      local container stop is best-effort after the delete commits. Standalone mode keeps the
+      local-only stop. Gated 3-node test: deploy, stop through any node, desired state clears
+      and stays clear across reconcile ticks.
+    - [x] Durable, terminal-outcome applied-state (`cluster::applied`, DEP3/H7/D10): the
+      placement reconciler marks a placement applied only on the deploy's terminal `Complete`
+      event (a failed deploy is retried next tick), and persists the applied map to a
+      self-describing JSON checkpoint (atomic temp+rename, schema-versioned) reloaded on boot —
+      so a restart resumes converged work without double-deploying or forgetting in-flight
+      work. Unit tests: round-trip, corrupt-loads-empty, restart-skip-vs-redeploy semantics.
+    - [x] Snapshot compat: the identity/applied-state changes touch no council/Raft state, so a
+      pre-theme snapshot loads unchanged (the #83 envelope loader / existing fixture holds).
+    - [x] `make ci` green (fmt, clippy `-D warnings`, 2387-test default suite); gated
+      `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 2
+      (instance identity), chapter 7 (applied-means-done, AppDelete-on-stop).
 - [ ] **Complete declarative resources** — validate and apply apps, jobs, builds, namespaces
   and permissions through the same local/Raft/GitOps path; enforce namespace and permission
   resources plus build scope; reject or remove every parsed field that cannot affect the

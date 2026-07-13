@@ -671,6 +671,7 @@ async fn main() -> anyhow::Result<()> {
                 cmd_tx.clone(),
                 shutdown.clone(),
                 cluster_http.clone(),
+                Some(data_base.clone()),
             );
         }
     }

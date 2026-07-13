@@ -93,6 +93,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
 
     let data_dir = std::env::temp_dir().join(format!("rb-failover-{name}-{gossip_port}"));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let reconciler_state_dir = data_dir.clone();
 
     let (handle, cluster_runtime) = runtime::start(
         ClusterParams {
@@ -171,6 +172,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         cmd_tx.clone(),
         shutdown.clone(),
         reliaburger::cluster::ClusterHttp::plaintext(),
+        Some(reconciler_state_dir),
     );
 
     // HTTP API (serves /v1/placements for the reconcilers).

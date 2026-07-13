@@ -2151,6 +2151,40 @@ The fix is one mutable reservation cache per planning *pass*, not per app. Build
 
 Two more validations ride the same pass. Nodes mid-binary-upgrade are *cordoned* — marked not-ready in the cache before filtering, so a node being replaced takes no new work (the upgrade helper from Chapter 14 finally has a caller). And because the Raft write that commits a placement is `async`, a node can die between planning and committing; before each commit the pass re-checks the *latest* membership and drops any placement whose target has left. Plan against a snapshot, commit against the present.
 
+### An instance id that forgot which namespace it lived in
+
+Here's a bug that hid in plain sight for most of the project. A workload instance had an id like `api-0`: the app name, a hyphen, the replica index. Clean, readable, and wrong.
+
+Two teams can each run an app called `api`, one in the `default` namespace and one in `payments`. Same name, different namespace — that's the whole point of namespaces. But `default/api` and `payments/api` both produced the instance id `api-0`, and the supervisor keys its instance map by that string. So the second deploy silently overwrote the first. Stop `payments/api` and you might stop `default/api` instead. The two apps were never actually separate; they just looked separate until they collided.
+
+The fix is a structured identity. `InstanceIdentity` carries four parts — `namespace`, `app`, an optional `generation` (for the canary instances a blue-green deploy spins up), and the replica `ordinal` — and renders one *canonical* string:
+
+```rust
+pub struct InstanceIdentity {
+    pub namespace: String,
+    pub app: String,
+    pub generation: Option<u64>,
+    pub ordinal: u32,
+}
+```
+
+`default/api` replica 0 becomes `default__api-0`; `payments/api` replica 0 becomes `payments__api-0`. They can't collide any more, because the namespace is part of the id.
+
+Why two underscores? Because the separator has to be a character that can never appear inside a namespace or app name, or parsing the namespace back out would be ambiguous. Namespaces and app names are DNS-1123 labels — lowercase letters, digits and single hyphens only. An underscore isn't legal in a DNS label at all, so `__` is a separator no real name can forge. That matters because the app name itself can contain hyphens (`my-web-app`), so we can't just split on the first `-`. Splitting on `__` first peels off exactly the namespace, and only then do we parse the app-and-ordinal suffix.
+
+The interesting Rust here is `Option<u64>` doing real work. In C or Go you'd reach for a sentinel — generation `-1` or `0` means "no generation" — and then every reader has to remember the convention and hope nobody forgets it. Rust's `Option` makes "no generation" a distinct value the type system tracks: a steady-state instance is `None`, a canary is `Some(n)`, and a `match` on the two is exhaustive. There's no magic number to misread. The `match` in `app_suffix` is the whole distinction:
+
+```rust
+match self.generation {
+    Some(generation) => format!("{}-g{generation}-{}", self.app, self.ordinal),
+    None => format!("{}-{}", self.app, self.ordinal),
+}
+```
+
+One more thing had to work: upgrading a running cluster *across* this change. An older bun that's already running `api-0` writes an adoption record so a restarted bun can re-adopt the still-live process instead of killing and restarting it (Chapter 14 covers adoption in full). Those old records carry the legacy `api-0` string. If the new bun couldn't read them, every workload would be orphaned on upgrade — the exact failure adoption exists to prevent.
+
+So identity parsing has two doors. `parse` reads the new canonical form. `parse_legacy` reads the old namespace-less form, taking the namespace as a separate argument — which adoption always has, because the record stores `namespace`, `app_name` and `replica_index` as their own fields. The runtime keeps talking to the container by the id it was started under (the legacy one), while the supervisor keys the adopted instance under the fresh canonical id. Old workloads survive the upgrade; new ones are namespace-safe. A round-trip test pins both forms so a careless edit can't quietly break either.
+
 ## What we built
 
 Take a step back and look at what happened in this chapter. We started with a single-node container agent and turned it into a distributed system.

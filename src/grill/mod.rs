@@ -42,13 +42,152 @@ pub use state::ContainerState;
 
 /// Unique identifier for a workload instance on this node.
 ///
-/// Format: `"{app_name}-{replica_index}"`, e.g. `"web-3"`.
+/// The wrapped string is the instance's *canonical* form, which is
+/// namespace-qualified so two apps of the same name in different
+/// namespaces never collide (DEP1). Build it through
+/// [`InstanceIdentity::instance_id`] rather than formatting by hand — the
+/// raw string is opaque to everything that keys on it (the supervisor
+/// map, on-disk records, container ids, netns names, identity dirs).
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InstanceId(pub String);
 
 impl fmt::Display for InstanceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// The structured identity behind an [`InstanceId`].
+///
+/// An instance is uniquely identified by four parts:
+///
+/// - `namespace` — the namespace the app runs in (`default`, `payments`, …);
+/// - `app` — the app (or job) name;
+/// - `generation` — `Some(n)` for a canary/blue-green instance from deploy
+///   generation `n`, or `None` for a steady-state instance;
+/// - `ordinal` — the replica index within the app (`0`, `1`, …).
+///
+/// The canonical string form is
+/// `{namespace}__{app}-{ordinal}` (steady state) or
+/// `{namespace}__{app}-g{generation}-{ordinal}` (canary). The `__`
+/// separator can never appear inside a namespace or app name — both are
+/// DNS-1123 labels, which allow only `[a-z0-9-]` — so parsing the
+/// namespace back out is unambiguous even when the app name itself
+/// contains a hyphen.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct InstanceIdentity {
+    /// Namespace the app runs in.
+    pub namespace: String,
+    /// App (or job) name.
+    pub app: String,
+    /// Deploy generation for a canary instance, or `None` for steady state.
+    pub generation: Option<u64>,
+    /// Replica index within the app.
+    pub ordinal: u32,
+}
+
+/// The separator between the namespace prefix and the app-scoped suffix in
+/// a canonical instance id. Two underscores because a single underscore is
+/// already illegal in a DNS-1123 label, so this can't collide with any
+/// real app or namespace name.
+const NAMESPACE_SEPARATOR: &str = "__";
+
+impl InstanceIdentity {
+    /// A steady-state (non-canary) instance identity.
+    pub fn new(namespace: impl Into<String>, app: impl Into<String>, ordinal: u32) -> Self {
+        Self {
+            namespace: namespace.into(),
+            app: app.into(),
+            generation: None,
+            ordinal,
+        }
+    }
+
+    /// A canary instance identity carrying its deploy generation.
+    pub fn canary(
+        namespace: impl Into<String>,
+        app: impl Into<String>,
+        generation: u64,
+        ordinal: u32,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            app: app.into(),
+            generation: Some(generation),
+            ordinal,
+        }
+    }
+
+    /// The app-scoped suffix (`{app}-{ordinal}` or `{app}-g{gen}-{ordinal}`),
+    /// without the namespace prefix. This is the *legacy* string form, kept
+    /// only for parsing pre-theme records and container names.
+    pub fn app_suffix(&self) -> String {
+        match self.generation {
+            Some(generation) => format!("{}-g{generation}-{}", self.app, self.ordinal),
+            None => format!("{}-{}", self.app, self.ordinal),
+        }
+    }
+
+    /// The canonical, namespace-qualified [`InstanceId`].
+    pub fn instance_id(&self) -> InstanceId {
+        InstanceId(format!(
+            "{}{NAMESPACE_SEPARATOR}{}",
+            self.namespace,
+            self.app_suffix()
+        ))
+    }
+
+    /// Parse a canonical instance id back into its structured identity.
+    ///
+    /// Returns `None` for a string that isn't in canonical form (for
+    /// example a legacy `{app}-{ordinal}` id that predates this theme) —
+    /// use [`InstanceIdentity::parse_legacy`] for those.
+    pub fn parse(id: &str) -> Option<Self> {
+        let (namespace, suffix) = id.split_once(NAMESPACE_SEPARATOR)?;
+        let mut ident = Self::parse_legacy(suffix, namespace)?;
+        ident.namespace = namespace.to_string();
+        Some(ident)
+    }
+
+    /// Parse a legacy, namespace-less suffix (`{app}-{ordinal}` or
+    /// `{app}-g{generation}-{ordinal}`) with the namespace supplied
+    /// separately — the shape an old instance record or container name
+    /// carries. The app name may itself contain hyphens.
+    ///
+    /// The legacy format is inherently ambiguous when an app name's last
+    /// hyphenated segment looks like `g{digits}` (e.g. an app literally
+    /// named `worker-g5`). Adoption doesn't rely on this: it rebuilds the
+    /// identity from the record's separate `namespace`/`app_name` fields,
+    /// so this heuristic only ever matters for a bare container-name parse.
+    pub fn parse_legacy(suffix: &str, namespace: &str) -> Option<Self> {
+        let (head, ordinal_part) = suffix.rsplit_once('-')?;
+        let ordinal: u32 = ordinal_part.parse().ok()?;
+
+        // Canary form: the segment before the ordinal is `g{generation}`.
+        if let Some((app, gen_part)) = head.rsplit_once('-')
+            && let Some(gen_str) = gen_part.strip_prefix('g')
+            && let Ok(generation) = gen_str.parse::<u64>()
+        {
+            return Some(Self {
+                namespace: namespace.to_string(),
+                app: app.to_string(),
+                generation: Some(generation),
+                ordinal,
+            });
+        }
+
+        Some(Self {
+            namespace: namespace.to_string(),
+            app: head.to_string(),
+            generation: None,
+            ordinal,
+        })
+    }
+}
+
+impl fmt::Display for InstanceIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.instance_id())
     }
 }
 
@@ -475,4 +614,77 @@ async fn which_exists(name: &str) -> bool {
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steady_state_id_is_namespace_qualified() {
+        let id = InstanceIdentity::new("default", "api", 0).instance_id();
+        assert_eq!(id.0, "default__api-0");
+    }
+
+    #[test]
+    fn canary_id_carries_the_generation() {
+        let id = InstanceIdentity::canary("payments", "api", 5, 2).instance_id();
+        assert_eq!(id.0, "payments__api-g5-2");
+    }
+
+    #[test]
+    fn same_app_in_two_namespaces_does_not_collide() {
+        let a = InstanceIdentity::new("default", "api", 0).instance_id();
+        let b = InstanceIdentity::new("payments", "api", 0).instance_id();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn parse_round_trips_steady_state() {
+        let ident = InstanceIdentity::new("default", "api", 3);
+        let parsed = InstanceIdentity::parse(&ident.instance_id().0).expect("parses");
+        assert_eq!(parsed, ident);
+    }
+
+    #[test]
+    fn parse_round_trips_canary() {
+        let ident = InstanceIdentity::canary("payments", "web", 12, 4);
+        let parsed = InstanceIdentity::parse(&ident.instance_id().0).expect("parses");
+        assert_eq!(parsed, ident);
+    }
+
+    #[test]
+    fn parse_round_trips_hyphenated_app_name() {
+        let ident = InstanceIdentity::new("team-a", "my-web-app", 1);
+        let parsed = InstanceIdentity::parse(&ident.instance_id().0).expect("parses");
+        assert_eq!(parsed, ident);
+        assert_eq!(parsed.namespace, "team-a");
+        assert_eq!(parsed.app, "my-web-app");
+    }
+
+    #[test]
+    fn parse_rejects_legacy_bare_id() {
+        // A pre-theme id with no namespace prefix isn't canonical.
+        assert!(InstanceIdentity::parse("api-0").is_none());
+    }
+
+    #[test]
+    fn parse_legacy_recovers_steady_state() {
+        let ident = InstanceIdentity::parse_legacy("api-0", "default").expect("parses");
+        assert_eq!(ident, InstanceIdentity::new("default", "api", 0));
+    }
+
+    #[test]
+    fn parse_legacy_recovers_canary() {
+        let ident = InstanceIdentity::parse_legacy("api-g1234-0", "prod").expect("parses");
+        assert_eq!(ident, InstanceIdentity::canary("prod", "api", 1234, 0));
+    }
+
+    #[test]
+    fn parse_legacy_recovers_hyphenated_app() {
+        let ident = InstanceIdentity::parse_legacy("my-web-app-7", "default").expect("parses");
+        assert_eq!(ident.app, "my-web-app");
+        assert_eq!(ident.ordinal, 7);
+        assert_eq!(ident.generation, None);
+    }
 }
