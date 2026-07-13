@@ -42,6 +42,20 @@ const IDENTITY_RETRY_TICKS: u32 = 30;
 /// Grace period between SIGTERM and SIGKILL during shutdown.
 const SHUTDOWN_GRACE_SECS: u64 = 5;
 
+/// How long an ordinary stop waits for a container to exit after SIGTERM
+/// before it escalates to SIGKILL (DEP6).
+const STOP_GRACE_SECS: u64 = 10;
+
+/// Build a shared drain tracker for a new agent. The completion channel's
+/// receiver is dropped because the retire path polls `wait_drained` rather
+/// than consuming the notification stream.
+fn new_shared_drains() -> crate::wrapper::draining::SharedDrains {
+    let (complete_tx, _complete_rx) = mpsc::channel(64);
+    crate::wrapper::draining::SharedDrains::new(crate::wrapper::draining::DrainTracker::new(
+        complete_tx,
+    ))
+}
+
 /// The address to probe an instance's health check at.
 ///
 /// A container with its own IP (runc/apple per-container netns) is probed at
@@ -1117,6 +1131,11 @@ pub struct BunAgent<G: Grill> {
     /// Receiver the command loop drains to apply those deploy ops. Paired with
     /// `deploy_ops_tx`; kept here so `run` can `select!` on it.
     deploy_ops_rx: mpsc::Receiver<DeployOp>,
+    /// Shared drain tracker (DEP5). Handed to the Wrapper proxy so in-flight
+    /// requests to a retiring backend are counted; the retire path starts a
+    /// drain and waits for it to finish (or time out) before killing the
+    /// old container.
+    drains: crate::wrapper::draining::SharedDrains,
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
@@ -1200,6 +1219,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_retry_ticks: 0,
             deploy_ops_tx,
             deploy_ops_rx,
+            drains: new_shared_drains(),
         }
     }
 
@@ -1269,7 +1289,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_retry_ticks: 0,
             deploy_ops_tx,
             deploy_ops_rx,
+            drains: new_shared_drains(),
         }
+    }
+
+    /// A shared drain handle for the Wrapper proxy, so it counts in-flight
+    /// requests to backends this agent is retiring (DEP5). The completion
+    /// channel's receiver is dropped: the retire path waits via
+    /// `wait_drained`, not the notification stream.
+    pub fn drains_handle(&self) -> crate::wrapper::draining::SharedDrains {
+        self.drains.clone()
     }
 
     /// Get a shared handle to the deploy history for the API.
@@ -3461,6 +3490,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
     ) {
+        // DEP5: route new traffic to the fresh instances before we retire the
+        // old ones. We add the new backends to the service map alongside the
+        // old ones and rebuild the routing table, so the proxy starts picking
+        // the fresh instances. Then we drain the old instances (let in-flight
+        // requests finish, up to drain_timeout) and stop-and-wait-for-exit.
+        // Only after that do we tear their bookkeeping down.
+        let drain_timeout = spec
+            .deploy
+            .as_ref()
+            .map(crate::meat::deploy_types::DeployConfig::from_spec)
+            .unwrap_or_default()
+            .drain_timeout;
+        if spec.port.is_some() {
+            for new_id in new_ids {
+                if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
+                    let backend = crate::onion::types::BackendInstance {
+                        instance_id: new_id.0.clone(),
+                        node_ip: new_ips
+                            .get(new_id)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+                        host_port,
+                        healthy: true,
+                    };
+                    let _ = self.service_map.add_backend(app_name, backend);
+                }
+            }
+            self.rebuild_routing_table().await;
+        }
+        self.retire_with_drain(existing, drain_timeout).await;
+
         for old_id in existing {
             // NET6: lift the retiring instance's egress enforcement.
             self.clear_egress(old_id).await;
@@ -4703,15 +4764,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
 
-        // Stop via supervisor
+        // Stop via supervisor (moves the tracked state to Stopping).
         self.supervisor.stop_app(app_name, namespace).await?;
 
-        // Send stop to runtime
+        // DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
+        // SIGKILL on timeout. Only then do we record Stopped. Recording it
+        // before the process exits let container and supervisor state
+        // diverge — a "stopped" app whose process was still serving traffic.
         for id in &instances {
-            let _ = self.supervisor.grill().stop(id).await;
+            self.stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                .await;
         }
 
-        // Transition Stopping → Stopped
+        // Transition Stopping → Stopped now the exit is confirmed.
         for id in &instances {
             if let Some(instance) = self.supervisor.get_instance_mut(id)
                 && instance.state == ContainerState::Stopping
@@ -5327,6 +5392,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let output = self.supervisor.grill().exec(&instance_id, command).await?;
         Ok(output)
+    }
+
+    /// Stop one instance and wait for it to actually exit (DEP6).
+    ///
+    /// SIGTERM first, then poll the runtime until the container reports
+    /// `Stopped` or `grace` elapses, then SIGKILL whatever is still running.
+    /// Returns only once the runtime confirms the exit (or the kill lands),
+    /// so the supervisor never records `Stopped` for a process that is still
+    /// alive — container and supervisor state stay in step.
+    async fn stop_and_wait_for_exit(&self, id: &InstanceId, grace: std::time::Duration) {
+        let _ = self.supervisor.grill().stop(id).await;
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if matches!(
+                self.supervisor.grill().state(id).await,
+                Ok(ContainerState::Stopped)
+            ) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !matches!(
+            self.supervisor.grill().state(id).await,
+            Ok(ContainerState::Stopped)
+        ) {
+            let _ = self.supervisor.grill().kill(id).await;
+        }
+    }
+
+    /// Retire a set of old instances with connection draining (DEP5).
+    ///
+    /// New traffic is already routed away (the caller rebuilds the routing
+    /// table before this). For each instance we start a drain, let in-flight
+    /// requests finish (up to `drain_timeout`), then stop-and-wait-for-exit.
+    /// The Wrapper proxy shares this agent's drain tracker, so the wait
+    /// reflects real in-flight HTTP/WebSocket traffic.
+    async fn retire_with_drain(&self, ids: &[InstanceId], drain_timeout: std::time::Duration) {
+        for id in ids {
+            let cmd = crate::wrapper::draining::DrainCommand {
+                app_name: String::new(),
+                instance_id: id.0.clone(),
+                timeout: drain_timeout,
+            };
+            self.drains.start_drain(&cmd).await;
+        }
+        for id in ids {
+            self.drains.wait_drained(&id.0).await;
+            self.stop_and_wait_for_exit(id, drain_timeout).await;
+        }
     }
 
     /// Gracefully stop all instances.
@@ -7906,5 +8020,185 @@ mod tests {
         grill.set_adopt_result(&id, true);
 
         assert_eq!(agent.adopt_recorded_instances().await, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // DEP6: exit-aware stop.
+    // ---------------------------------------------------------------------
+
+    /// A stop must SIGTERM, wait for the runtime to confirm exit, and record
+    /// Stopped only then. If the process ignores SIGTERM the stop escalates
+    /// to SIGKILL rather than lying that the app is down.
+    #[tokio::test]
+    async fn stop_escalates_to_kill_when_process_ignores_sigterm() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        // The workload refuses SIGTERM: stop() records the call but leaves the
+        // state Running. The exit-aware stop must therefore kill().
+        grill.set_ignore_stop(true);
+        let id = InstanceId("default__web-0".to_string());
+        grill.set_state(&id, ContainerState::Running);
+
+        agent.stop_app("web", "default").await.unwrap();
+
+        let calls = grill.calls();
+        assert!(
+            calls.iter().any(|(op, i)| op == "stop" && i == &id),
+            "stop must SIGTERM first"
+        );
+        assert!(
+            calls.iter().any(|(op, i)| op == "kill" && i == &id),
+            "stop must escalate to SIGKILL when the process ignores SIGTERM"
+        );
+    }
+
+    /// A cooperative stop reports Stopped once the runtime confirms exit, and
+    /// does not needlessly escalate to kill.
+    #[tokio::test]
+    async fn stop_reports_stopped_after_exit_without_kill() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        agent.stop_app("web", "default").await.unwrap();
+
+        // The instance is recorded Stopped, and stop did not need to
+        // force-kill a cooperative process.
+        let id = InstanceId("default__web-0".to_string());
+        assert_eq!(
+            agent.supervisor.get_instance(&id).map(|i| i.state),
+            Some(ContainerState::Stopped),
+            "stopped instance should be recorded Stopped after exit"
+        );
+        let calls = grill.calls();
+        assert!(
+            calls.iter().any(|(op, i)| op == "stop" && i == &id),
+            "stop must SIGTERM"
+        );
+        assert!(
+            !calls.iter().any(|(op, i)| op == "kill" && i == &id),
+            "a cooperative stop must not escalate to SIGKILL"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // DEP5: drain / surge / max_unavailable.
+    // ---------------------------------------------------------------------
+
+    /// A retire waits for an in-flight request (tracked through the shared
+    /// drain tracker, as the live Wrapper proxy would report it) to finish
+    /// before the old container is killed.
+    #[tokio::test]
+    async fn retire_waits_for_in_flight_request_before_kill() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(config_with_health(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let id = InstanceId("default__web-0".to_string());
+        let drains = agent.drains_handle();
+
+        // Simulate the proxy holding an in-flight request open on the backend
+        // that is about to be retired: start the drain and bump its count.
+        drains
+            .start_drain(&crate::wrapper::draining::DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: id.0.clone(),
+                timeout: std::time::Duration::from_secs(30),
+            })
+            .await;
+        drains.increment_connections(&id.0).await;
+
+        // Kick off the retire on a task; it must block on the drain.
+        let agent_ref = &agent;
+        let retire = agent_ref.retire_with_drain(
+            std::slice::from_ref(&id),
+            std::time::Duration::from_secs(30),
+        );
+        tokio::pin!(retire);
+
+        // While the request is in flight, the retire has not killed anything.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut retire).await;
+        assert!(
+            early.is_err(),
+            "retire finished before the in-flight request drained"
+        );
+        assert!(
+            !grill.calls().iter().any(|(op, i)| op == "kill" && i == &id),
+            "old instance killed while a request was still in flight"
+        );
+
+        // The request finishes: the drain completes and the retire proceeds.
+        drains.decrement_connections(&id.0).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
+            .await
+            .expect("retire did not complete after the request drained");
+        let calls = grill.calls();
+        assert!(
+            calls.iter().any(|(op, i)| op == "stop" && i == &id),
+            "retire must stop the drained instance"
+        );
+    }
+
+    /// A rolling redeploy with `max_unavailable = 1` surges the new instances
+    /// up before retiring the old, so the serving-instance count never drops
+    /// below `replicas - max_unavailable`. With surge-first, the old instance
+    /// is only stopped after the new one is healthy.
+    #[tokio::test]
+    async fn rolling_redeploy_never_drops_below_target_availability() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let config = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\nport = 8080\nreplicas = 1\n\n[app.web.deploy]\nmax_unavailable = 1\ndrain_timeout = \"1s\"\n",
+        )
+        .unwrap();
+
+        // Fresh deploy.
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+
+        // Redeploy: rolling path. The new instance is created and started
+        // before the old one is stopped/killed.
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        // The first "start" of a new (gen-tagged) instance must come before the
+        // first "stop"/"kill" of the old default__web-0 — surge-first ordering.
+        let first_new_start = calls.iter().position(|(op, i)| {
+            op == "start" && i.0.contains("-g") && i.0.starts_with("default__web")
+        });
+        let first_old_retire = calls
+            .iter()
+            .position(|(op, i)| (op == "stop" || op == "kill") && i.0 == "default__web-0");
+        assert!(
+            first_new_start.is_some(),
+            "rolling redeploy never started a new instance"
+        );
+        assert!(
+            first_old_retire.is_some(),
+            "rolling redeploy never retired the old instance"
+        );
+        assert!(
+            first_new_start < first_old_retire,
+            "old instance was retired before the new one started — availability dropped below target"
+        );
     }
 }

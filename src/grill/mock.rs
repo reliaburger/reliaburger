@@ -23,6 +23,10 @@ pub struct MockGrill {
     /// Artificial delay applied inside `create`, simulating a slow image
     /// pull. Lets tests prove a slow deploy no longer wedges the agent loop.
     create_delay: Arc<Mutex<std::time::Duration>>,
+    /// When set, `stop` records the call but does NOT transition the instance
+    /// to `Stopped` — the process ignores SIGTERM. Lets tests prove the
+    /// exit-aware stop path escalates to SIGKILL (DEP6).
+    ignore_stop: Arc<Mutex<bool>>,
 }
 
 impl MockGrill {
@@ -86,6 +90,13 @@ impl MockGrill {
     pub fn set_create_delay(&self, delay: std::time::Duration) {
         *self.create_delay.lock().unwrap() = delay;
     }
+
+    /// Make `stop()` a no-op on state, simulating a process that ignores
+    /// SIGTERM. The exit-aware stop path must then escalate to SIGKILL.
+    #[allow(dead_code)]
+    pub fn set_ignore_stop(&self, value: bool) {
+        *self.ignore_stop.lock().unwrap() = value;
+    }
 }
 
 impl super::Grill for MockGrill {
@@ -114,13 +125,17 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
-        // Reflect the stop in state (unless a test pinned a specific state), so
-        // callers that poll for exit — e.g. shutdown_all — observe it.
-        self.state_overrides
-            .lock()
-            .unwrap()
-            .entry(instance.clone())
-            .or_insert(ContainerState::Stopped);
+        // A process that ignores SIGTERM stays as-is; the exit-aware stop path
+        // must escalate to kill(). Otherwise reflect the stop in state (unless
+        // a test pinned a specific state) so callers that poll for exit observe
+        // it.
+        if !*self.ignore_stop.lock().unwrap() {
+            self.state_overrides
+                .lock()
+                .unwrap()
+                .entry(instance.clone())
+                .or_insert(ContainerState::Stopped);
+        }
         Ok(())
     }
 

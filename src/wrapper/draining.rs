@@ -7,9 +7,82 @@
 /// connections are done (or the timeout expires), Wrapper tells
 /// Bun the drain is complete and the container can be stopped.
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
+
+/// A drain tracker shared between the live Wrapper proxy and Bun's deploy
+/// path.
+///
+/// The proxy holds a clone and bumps a draining backend's connection count
+/// as requests come and go; Bun holds another clone, starts a drain when it
+/// retires an old instance, and waits until that instance's in-flight count
+/// reaches zero (or the timeout expires) before killing the container. Both
+/// sides reach through the same `Arc<Mutex<DrainTracker>>`, so the tracker
+/// that was library-only in earlier phases now governs the real path.
+///
+/// `Arc<Mutex<…>>` is Rust's shared-mutable-state idiom for async code: the
+/// `Arc` (atomically reference-counted pointer) lets several tasks own a
+/// handle to the same tracker, and the tokio `Mutex` serialises access so
+/// only one task mutates it at a time. We use the tokio `Mutex`, not the
+/// std one, because it yields rather than blocking the runtime thread.
+#[derive(Clone)]
+pub struct SharedDrains(Arc<Mutex<DrainTracker>>);
+
+impl SharedDrains {
+    /// Wrap a tracker so several tasks can share it.
+    pub fn new(tracker: DrainTracker) -> Self {
+        Self(Arc::new(Mutex::new(tracker)))
+    }
+
+    /// Begin draining an instance. New traffic should already be routed away
+    /// (the caller rebuilds the routing table first); this only starts the
+    /// in-flight countdown.
+    pub async fn start_drain(&self, cmd: &DrainCommand) -> bool {
+        self.0.lock().await.start_drain(cmd)
+    }
+
+    /// True while `instance_id` is still draining.
+    pub async fn is_draining(&self, instance_id: &str) -> bool {
+        self.0.lock().await.is_draining(instance_id)
+    }
+
+    /// Record a request arriving at a draining backend.
+    pub async fn increment_connections(&self, instance_id: &str) {
+        self.0.lock().await.increment_connections(instance_id);
+    }
+
+    /// Record a request to a draining backend finishing.
+    pub async fn decrement_connections(&self, instance_id: &str) {
+        self.0.lock().await.decrement_connections(instance_id);
+    }
+
+    /// Sweep for completed drains, returning the instance IDs that are done.
+    pub async fn check_completions(&self) -> Vec<String> {
+        self.0.lock().await.check_completions().await
+    }
+
+    /// Wait until `instance_id` has drained (zero in-flight) or its deadline
+    /// passes, whichever comes first. Returns once the instance is no longer
+    /// tracked. Polls rather than blocks, so it never wedges the runtime.
+    pub async fn wait_drained(&self, instance_id: &str) {
+        loop {
+            let done = {
+                let mut tracker = self.0.lock().await;
+                if !tracker.is_draining(instance_id) {
+                    break;
+                }
+                tracker.check_completions().await;
+                !tracker.is_draining(instance_id)
+            };
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
 
 /// A command from Bun to Wrapper to drain a backend.
 #[derive(Debug, Clone)]
