@@ -39,6 +39,7 @@ struct HarnessOptions {
     builder_nodes: Vec<String>,
     registry_port: u16,
     pickle_catalog: Option<Arc<RwLock<reliaburger::pickle::types::ManifestCatalog>>>,
+    require_signatures: bool,
 }
 
 struct Harness {
@@ -112,7 +113,7 @@ impl Harness {
                 options.registry_port
             },
             256 * 1024 * 1024,
-            false,
+            options.require_signatures,
         );
         let server_shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -178,6 +179,71 @@ async fn single_node_leader() -> Arc<CouncilNode> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    node
+}
+
+/// A single-node leader council with a bootstrapped CA hierarchy + OIDC
+/// config, so it can sign the build-signer CSR (code-signing EKU) that
+/// `require_signatures` builds need.
+async fn single_node_leader_with_security() -> Arc<CouncilNode> {
+    let wrapping_ikm = b"test-wrapping-material-32bytes!!";
+    let router = InMemoryRaftRouter::new();
+    let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+    let node = CouncilNode::new(
+        1,
+        fast_config(),
+        network,
+        MemLogStore::new(),
+        CouncilStateMachine::new(),
+        Some(*wrapping_ikm),
+    )
+    .await
+    .unwrap();
+    router.register(1, node.raft().clone()).await;
+    let mut members = BTreeMap::new();
+    members.insert(
+        1u64,
+        CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
+    );
+    node.initialize(members).await.unwrap();
+    let node = Arc::new(node);
+    for _ in 0..40 {
+        if node.is_leader().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let hierarchy =
+        reliaburger::sesame::ca::generate_ca_hierarchy("test-cluster", wrapping_ikm).unwrap();
+    let oidc_config = reliaburger::sesame::oidc::generate_oidc_keypair(
+        "https://test.reliaburger.dev",
+        wrapping_ikm,
+    )
+    .unwrap();
+    let security_state = reliaburger::sesame::types::SecurityState {
+        certificate_authorities: vec![
+            reliaburger::sesame::types::CertificateAuthority {
+                private_key_wrapped: None,
+                ..hierarchy.root.ca
+            },
+            hierarchy.node.ca,
+            hierarchy.workload.ca,
+            hierarchy.ingress.ca,
+        ],
+        age_keypairs: vec![],
+        api_tokens: vec![],
+        join_tokens: vec![],
+        next_serial: 10,
+        oidc_signing_config: Some(oidc_config),
+        crl: reliaburger::sesame::types::Crl::default(),
+        secret_seals: std::collections::BTreeMap::new(),
+    };
+    node.write(reliaburger::council::types::RaftRequest::SecurityStateInit(
+        Box::new(security_state),
+    ))
+    .await
+    .unwrap();
     node
 }
 
@@ -778,6 +844,103 @@ async fn buildah_build_lands_in_the_catalog() {
         catalog.get_manifest_by_tag("hello", "v1").is_some(),
         "built image missing from the catalog"
     );
+
+    registry_shutdown.cancel();
+}
+
+/// Roadmap (12b.3 IMG2/IMG3/JOB7): a real build under `require_signatures`
+/// signs with the persistent build signer, and the pushed manifest carries a
+/// signature that passes the deploy-time check (build-sign → deploy-verify
+/// round-trip). Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
+#[tokio::test]
+async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
+    if std::env::var("RELIABURGER_BUILDAH_TESTS").is_err() {
+        eprintln!("skipping buildah test (set RELIABURGER_BUILDAH_TESTS=1 to enable)");
+        return;
+    }
+
+    let (registry_port, catalog, registry_shutdown, _dir) = start_registry().await;
+    let digest = upload_trivial_context(registry_port).await;
+
+    let council = single_node_leader_with_security().await;
+    let root_ca_der = council
+        .security_state()
+        .await
+        .get_ca(reliaburger::sesame::types::CaRole::Root)
+        .map(|ca| ca.certificate_der.clone())
+        .expect("root CA present");
+
+    let harness = Harness::start(HarnessOptions {
+        council: Some(Arc::clone(&council)),
+        node_name: Some("builder".to_string()),
+        registry_port,
+        pickle_catalog: Some(Arc::clone(&catalog)),
+        require_signatures: true,
+        ..Default::default()
+    })
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/build", harness.base_url))
+        .json(&serde_json::json!({
+            "name": "hello",
+            "context_digest": digest,
+            "spec": { "context": ".", "destination": "pickle://hello:v1" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202, "submit should accept");
+    let build_id = response.json::<serde_json::Value>().await.unwrap()["build_id"]
+        .as_u64()
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let status: serde_json::Value =
+            reqwest::get(format!("{}/v1/build/{build_id}", harness.base_url))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        match status["status"].as_str() {
+            // Completed only counts under require_signatures once signing
+            // succeeded (JOB7) — so reaching Completed already proves signing.
+            Some("completed") => break,
+            Some("failed") => panic!("build failed: {status}"),
+            _ => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "build did not finish: {status}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // The pushed manifest carries a signature that verifies under the
+    // deploy-time trust policy and the cluster root CA.
+    let manifest = {
+        let catalog = catalog.read().await;
+        catalog
+            .get_manifest_by_tag("hello", "v1")
+            .cloned()
+            .expect("built image missing from the catalog")
+    };
+    let signature = manifest
+        .signature
+        .expect("signed build must carry a signature");
+    reliaburger::pickle::signing::verify_signature(
+        &signature,
+        &manifest.digest,
+        &reliaburger::config::node::TrustPolicySection {
+            require_signatures: true,
+            keys: vec![],
+        },
+        Some(&root_ca_der),
+        None,
+    )
+    .expect("the build signature must verify on deploy");
 
     registry_shutdown.cancel();
 }

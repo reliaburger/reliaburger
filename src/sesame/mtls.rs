@@ -111,8 +111,11 @@ fn cert_error_to_rustls(err: CertError) -> rustls::Error {
         CertError::ParseFailed(_) => {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         }
-        CertError::ChainInvalid(_) => {
+        CertError::ChainInvalid(_) | CertError::IssuerMismatch(_) => {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)
+        }
+        CertError::NotCodeSigning => {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         }
     }
 }

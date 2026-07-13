@@ -3107,8 +3107,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Enforce the image trust policy for a workload before deploying it.
     ///
     /// Returns `Err(reason)` to reject the deploy. It's a no-op (`Ok(None)`)
-    /// when the policy doesn't require signatures, in single-node mode (no
-    /// council), or for external-registry images not in the Pickle catalogue.
+    /// when the policy doesn't require signatures or for a process workload
+    /// (no image to verify).
+    ///
+    /// When `require_signatures` is set and this node has no council handle,
+    /// it can't reach the manifest catalogue or the cluster root CA — the
+    /// verification material simply isn't here. That used to skip the check
+    /// (a fail-OPEN: an unsigned image sailed through on any worker or
+    /// standalone node). Now it fails CLOSED: an image deploy is refused
+    /// because the node can't prove the image is signed (IMG2). Cluster nodes
+    /// all run a `CouncilNode` that replicates this state, so only a genuine
+    /// standalone node hits this refusal.
+    ///
     /// For a Pickle-hosted image it verifies the signature against the cluster
     /// root CA and returns the digest-pinned reference (`repo@sha256:…`) the
     /// deploy must use, so the runtime pulls exactly the verified bytes — a
@@ -3117,8 +3127,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if !self.trust_policy.require_signatures {
             return Ok(None);
         }
-        let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+        // A process workload has no image; nothing to verify.
+        if spec.image.is_none() {
             return Ok(None);
+        }
+        let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+            return Err(format!(
+                "image {} requires a signature but this node has no cluster trust state to verify it against (require_signatures is enabled); run in cluster mode or disable require_signatures",
+                spec.image.as_deref().unwrap_or("<none>")
+            ));
         };
         let catalog = council.manifest_catalog().await;
         let security_state = council.security_state().await;
@@ -4994,7 +5011,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Submit CSR to council
         let result = council
-            .sign_workload_csr(&csr_der, &spiffe_uri, cluster_name, "local", &instance_id.0)
+            .sign_workload_csr(
+                &csr_der,
+                &spiffe_uri,
+                crate::sesame::identity::CertUsage::Mtls,
+                cluster_name,
+                "local",
+                &instance_id.0,
+            )
             .await;
 
         match result {
@@ -6692,9 +6716,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_node_deploy_ignores_the_trust_policy() {
-        // require_signatures is on, but there's no council to consult, so a
-        // single-node deploy is not gated — instances still come up.
+    async fn single_node_image_deploy_is_refused_without_trust_state() {
+        // require_signatures is on and there's no council to consult, so a
+        // standalone image deploy can't be verified. It fails CLOSED: no
+        // instances come up (IMG2). The old behaviour let it through.
         let (mut agent, tx, shutdown) = test_agent();
         agent.set_trust_policy(require_signatures_policy());
         let handle = tokio::spawn(async move {
@@ -6702,19 +6727,42 @@ mod tests {
         });
 
         let events = send_deploy(&tx, basic_config()).await;
-        let (created, _) = expect_complete(&events);
-        assert_eq!(created, 1);
+        assert!(
+            events.iter().any(|e| matches!(e, ApplyEvent::Error { .. })),
+            "an unverifiable image deploy must be refused, got: {events:?}"
+        );
+        let created = events.iter().find_map(|e| match e {
+            ApplyEvent::Complete { created, .. } => Some(*created),
+            _ => None,
+        });
+        assert_ne!(created, Some(1), "no instance should be created");
 
         shutdown.cancel();
         let _ = handle.await;
     }
 
     #[tokio::test]
-    async fn enforce_image_signature_allows_when_no_council() {
+    async fn enforce_image_signature_fails_closed_without_council() {
         let (mut agent, _tx, _shutdown) = test_agent();
         agent.set_trust_policy(require_signatures_policy());
         let spec: AppSpec = toml::from_str(r#"image = "myapp:v1""#).unwrap();
-        // No cluster/council → the gate can't (and shouldn't) enforce.
+        // No cluster/council → the gate can't obtain verification material, so
+        // it must refuse rather than skip (IMG2 fail-closed).
+        let result = agent.enforce_image_signature(&spec).await;
+        assert!(result.is_err(), "expected refusal, got {result:?}");
+        assert!(
+            result.unwrap_err().contains("requires a signature"),
+            "the refusal should name the missing verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_image_signature_allows_a_process_workload_without_council() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        agent.set_trust_policy(require_signatures_policy());
+        // A process workload has no image — nothing to verify, so it passes
+        // even with require_signatures on and no council.
+        let spec: AppSpec = toml::from_str(r#"command = ["echo", "hi"]"#).unwrap();
         assert!(agent.enforce_image_signature(&spec).await.is_ok());
     }
 
@@ -7882,6 +7930,7 @@ mod tests {
             &csr_der,
             &uri,
             crate::sesame::types::SerialNumber(42),
+            crate::sesame::identity::CertUsage::Mtls,
             &hierarchy.workload.signing_keypair,
             &hierarchy.workload.certificate_params,
             SystemTime::now(),

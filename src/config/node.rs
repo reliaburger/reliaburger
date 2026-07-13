@@ -559,8 +559,17 @@ pub struct ExternalRegistrySection {
 /// Image trust policy controlling signature requirements.
 ///
 /// When `require_signatures` is `true`, the scheduler refuses to
-/// schedule Pickle-hosted images that have no attached signature.
-/// Images from external registries are not checked.
+/// schedule Pickle-hosted images that have no attached signature, and a
+/// node that can't reach the cluster trust state to verify one refuses the
+/// deploy rather than skipping the check (fail-closed, IMG2). Images from
+/// external registries are not checked.
+///
+/// There is deliberately no `build_signer` key path to configure: the
+/// build signer is a persistent code-signing identity the council mints
+/// from the cluster's own Workload CA (one per namespace,
+/// `spiffe://…/job/build-signer`). Tying it to the cluster CA means the
+/// trust policy accepts it by construction, and there's no key material for
+/// an operator to provision or distribute.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrustPolicySection {

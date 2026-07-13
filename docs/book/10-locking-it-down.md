@@ -836,6 +836,106 @@ cargo test --test identity_demo -- --nocapture # the SPIFFE walkthrough, printed
 
 The `--nocapture` on the last one is the point: it turns the test into a guided tour of cluster init, CSR signing, JWT minting, and rotation, printed to your terminal.
 
+## Trust the image, or don't run it
+
+The first version of image trust worked in the demo and leaked in the corners. Three corners, actually. We went back and closed each one, and the shape of the bugs is worth your time because they're the classic ways a security check quietly stops being one.
+
+### Fail closed, not open, on workers
+
+Here's the check that gated a deploy under `require_signatures`:
+
+```rust
+async fn enforce_image_signature(&self, spec: &AppSpec) -> Result<Option<String>, String> {
+    if !self.trust_policy.require_signatures {
+        return Ok(None);
+    }
+    let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+        return Ok(None); // ← no council? allow it.
+    };
+    // ... verify against the cluster root CA ...
+}
+```
+
+Read that `let Some(...) else` again. It's Rust's let-else: bind `council` if the handle is there, otherwise run the `else` block, which must diverge (here it returns). Handy for the happy-path-or-bail pattern. And it bailed the wrong way. No council handle meant "return `Ok(None)`", which the caller reads as *allowed*. So a node without a local council handle skipped verification entirely and deployed whatever you gave it, signed or not.
+
+Who has no council handle? Not the voters (they run one). Not the non-voter workers in a cluster either (every clustered node runs a `CouncilNode` and replicates the state machine through Raft, catalogue and CA included). The one node that genuinely can't reach the verification material is a *standalone* node with no cluster at all. And that's exactly the node this code waved through. Turn on `require_signatures`, run single-node, and the policy you asked for silently doesn't apply.
+
+The fix is one word longer than the bug: refuse.
+
+```rust
+if spec.image.is_none() {
+    return Ok(None); // a process workload has no image to verify
+}
+let Some(council) = self.cluster.as_ref().and_then(|c| c.council.as_ref()) else {
+    return Err(format!(
+        "image {} requires a signature but this node has no cluster trust state \
+         to verify it against (require_signatures is enabled)",
+        spec.image.as_deref().unwrap_or("<none>")
+    ));
+};
+```
+
+If you can't prove the image is signed, you don't get to run it. A process workload (no image) has nothing to verify, so it still passes. Notice what this *didn't* need: no new field in `DesiredState`, no trust projection distributed over Raft. The trust anchors already reach every clustered node through the identity bundle. The only node missing them is the one that should refuse anyway. The smallest correct change was the fail-closed default, not a distribution mechanism.
+
+### A partial chain check is no check
+
+Keyless verification checked that the leaf was signed by the first intermediate, and that the last cert chained to the root. Everything in between? Unchecked. If your chain is `leaf → intermediate → root`, that's fine by accident, there's nothing in between. But present `leaf → evil → intermediate → root` and the old code verifies `leaf→evil`'s two ends and never asks whether `evil` was signed by `intermediate`. A chain is only as strong as its weakest link, and we weren't checking most of the links.
+
+The rewrite validates *every* adjacent pair, plus three things the old code skipped entirely:
+
+```rust
+// Every adjacent link's signature AND issuer binding, chaining to the anchor,
+// with every cert valid at `at`.
+crate::sesame::cert::validate_chain_at(chain, root_ca_cert_der, at)?;
+
+// The leaf must be authorised to sign artefacts, not just exist.
+crate::sesame::cert::check_code_signing_eku(leaf_cert_der)?;
+
+// The leaf must certify the identity the signature claims.
+if let SigningMethod::Keyless { identity, .. } = &sig.method {
+    let sans = crate::sesame::cert::subject_uri_sans(leaf_cert_der)?;
+    if !sans.iter().any(|s| s == identity) {
+        return Err(/* claimed signer identity not in the leaf */);
+    }
+}
+```
+
+The **EKU check** matters more than it looks. Extended Key Usage is the CA saying what a certificate is *for*. An mTLS workload cert carries `ServerAuth`/`ClientAuth`; a code signer carries `CodeSigning`. Without this check, any workload's mTLS cert could vouch for any image, because it chains to the same root. We now demand the leaf actually be a code-signing cert. The **issuer binding** is path-building: it checks each cert's issuer distinguished name equals its parent's subject, so a valid signature over a swapped-in intermediate with a colliding key still gets caught. And the **identity binding** ties the leaf's SPIFFE SAN to the identity the signature declares, so a genuine cert for workload A can't sign in the name of workload B.
+
+We didn't reimplement any of the chain logic. `validate_chain_at` loops `verify_signature` and `check_validity_at` (the same helpers Phase 4's mTLS uses) over the chain with an injected clock, so a test can assert "this expires in exactly one hour" by moving the clock, not by sleeping.
+
+Writing the issuer-binding check flushed out a real latent bug, by the way. The build-signing path reconstructed the Workload CA's distinguished name from a `cluster_name` string the caller passed. When that string didn't match the CA's actual name, the signed leaf carried the wrong issuer DN. Nobody noticed because the old verifier never compared DNs. The fix reads the issuer straight off the real CA certificate with `CertificateParams::from_ca_cert_der` instead of trusting a string. The stronger check found the weaker code.
+
+### Constraining the JWT
+
+OIDC verification checked the signature and `exp`. That's it. No issuer, no audience, no algorithm, no `iat`. A token minted for one audience replays against another; a token that declares a weaker algorithm gets trusted on its say-so. This path has no production caller yet, so this is defence-in-depth, hardening it *before* we wire it rather than after. But the checks are the standard JWT ones and worth stating:
+
+```rust
+// Check the JOSE header's alg (and kid, if pinned) BEFORE trusting the signature.
+let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+if alg != constraints.expected_algorithm {
+    return Err(OidcError::UnexpectedAlgorithm { /* … */ });
+}
+```
+
+Order is the point. Reject an unexpected algorithm *before* you verify, so an algorithm-confusion attacker can't nudge you into a scheme you didn't choose. Then the signature, then `iss` must match, `aud` must contain your value, and `iat` must be neither in the future (beyond a few minutes of skew) nor older than the token's lifetime (a replayed stale token). We only ever sign EdDSA, so the expected algorithm is a constant, not a negotiation.
+
+### A signer, not a fresh key per build
+
+The build signer used to mint a brand-new CSR for every single build. New key, new certificate, every artefact. That's wasteful, and worse, there's no stable "this is who signs our images" identity to build a policy around. Now the agent provisions one code-signing identity per namespace, caches it, and reuses it:
+
+```rust
+let mut guard = cache.lock().await;
+if let Some(existing) = guard.get(namespace) {
+    return Ok(existing.clone()); // reuse — not a fresh CSR
+}
+// … first time: CSR for spiffe://…/job/build-signer, with the CodeSigning EKU …
+```
+
+The identity is `spiffe://…/job/build-signer`, stable across builds, and its leaf carries the code-signing EKU, exactly what the tightened verifier now demands. The two halves fit: the signer produces what the verifier requires, and a build-sign → deploy-verify round-trip test proves a signature this signer makes passes the very check enforcement runs. The old ephemeral key wasn't just wasteful, it was decorative: it certified nothing stable. A persistent identity is the difference between a signature and a *signer*.
+
+The build-failure gate stayed exactly as it was. When `require_signatures` is on and signing can't produce a policy-trusted signature (no council, no Workload CA, no signer), the build *fails*. It doesn't report success with an unsigned image. A build that can't be trusted isn't a build that's done.
+
 ## What we deferred
 
 **TPM sealing** binds the master secret to specific hardware via the TPM chip's Platform Configuration Registers. If someone steals a disk, the master key is useless on different hardware. This is important for production hardening, but requires a TPM 2.0 device and the `tss-esapi` crate (Linux only). We've deferred it to v2.

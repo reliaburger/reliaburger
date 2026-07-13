@@ -850,15 +850,29 @@ mod tests {
     /// returning `(signature, root_ca_der)`.
     fn real_keyless_signature() -> (crate::pickle::types::ImageSignature, Vec<u8>) {
         use crate::pickle::types::Digest;
-        use crate::sesame::{ca, types::SerialNumber};
+        use crate::sesame::ca;
+        use crate::sesame::identity::{CertUsage, create_workload_csr, validate_and_sign_csr};
+        use crate::sesame::types::{SerialNumber, SpiffeUri, WorkloadType};
 
         let hierarchy =
             ca::generate_ca_hierarchy("test", b"test-ikm-32-bytes-padding-here!!").unwrap();
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "workload",
+        // A real code-signing leaf under the workload CA, matching the SPIFFE
+        // identity the signature declares (IMG3 identity binding).
+        let uri = SpiffeUri {
+            trust_domain: "test".to_string(),
+            namespace: "ci".to_string(),
+            workload_type: WorkloadType::Job,
+            name: "build-signer".to_string(),
+        };
+        let (csr_der, key_der) = create_workload_csr(&uri).unwrap();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
             SerialNumber(100),
+            CertUsage::CodeSigning,
             &hierarchy.workload.signing_keypair,
             &hierarchy.workload.certificate_params,
+            std::time::SystemTime::now(),
         )
         .unwrap();
         let digest = Digest::from_sha256_hex(
@@ -869,8 +883,8 @@ mod tests {
             &cert_der,
             &key_der,
             std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-            "https://test.reliaburger.dev",
-            "spiffe://test/ns/ci/job/build",
+            "reliaburger-council",
+            &uri.to_uri(),
         )
         .unwrap();
         (sig, hierarchy.root.ca.certificate_der)
