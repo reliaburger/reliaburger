@@ -918,11 +918,35 @@ whole theme lands.
     of the existing frame bounds, so a stalled peer is dropped (12b.3 — CP11).
   - [x] Constant-time join-token comparison (12b.3 — PKI10 slice; IMG1-IMG3 remain in the
     image-trust theme).
-- [ ] **Image trust policy** — distribute authoritative trust state to workers and
+- [x] **Image trust policy** — distribute authoritative trust state to workers and
   standalone mode and fail closed; validate every intermediate, time, revocation, EKU,
   issuer and SPIFFE/OIDC identity; enforce issuer/audience/algorithm/kid; use a persistent
   configured or workload key for build signing and require the signature write to apply.
   Use constant-time join-token comparison (IMG1-IMG3, PKI10, old keyless/OIDC Lows).
+  - [x] Fail-closed image verification: a node with `require_signatures` set that has no
+    council handle (a standalone node) can't reach the catalogue or root CA, so an image
+    deploy is *refused* rather than skipped; a process workload (no image) still passes. No
+    cluster-state distribution needed — clustered nodes already replicate the trust anchors
+    via the CouncilNode, so only genuine standalone mode hits the refusal (12b.3 — IMG2).
+  - [x] Full keyless chain validation: `verify_keyless` now walks every adjacent link
+    (signature + issuer-DN binding) to the trust anchor, checks each cert's validity at an
+    injected clock, requires the leaf's code-signing EKU, and binds the leaf's SPIFFE URI SAN
+    to the identity the signature declares — reusing `cert::validate_chain_at`,
+    `check_code_signing_eku`, `subject_uri_sans` and the existing CRL check (12b.3 — IMG3).
+  - [x] OIDC constraint hardening: `verify_jwt_with_constraints` checks the JOSE `alg`/`kid`
+    header *before* trusting the signature, then enforces `iss`, `aud`, and `iat` skew/age
+    bounds on top of the signature + `exp` (defence-in-depth: no production caller yet)
+    (12b.3 — PKI10 OIDC half).
+  - [x] Persistent build signer: one code-signing identity per namespace
+    (`spiffe://…/job/build-signer`) provisioned via the council and cached, reused across
+    builds instead of a fresh ephemeral CSR each time; its leaf carries the code-signing EKU
+    so a signature it produces passes the tightened deploy-time check (build-sign → deploy-
+    verify round-trip). The `require_signatures` build-failure gate is preserved: no
+    policy-trusted signature, no `Completed` (12b.3 — JOB7 follow-up).
+  - [x] Constant-time join-token comparison + CSR join landed in Theme 2 (#100).
+
+> **12b.3 "Secure every boundary" is complete** — all three themes done: API
+> authorisation and Brioche (#99); Node PKI, join and mTLS (#100); Image trust policy.
 
 ### 12b.4 — Finish the data plane
 

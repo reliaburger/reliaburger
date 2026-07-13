@@ -99,6 +99,33 @@ pub fn create_workload_csr(spiffe_uri: &SpiffeUri) -> Result<(Vec<u8>, Vec<u8>),
 // Council-side: CSR validation and signing
 // ---------------------------------------------------------------------------
 
+/// What a signed workload certificate is authorised to do.
+///
+/// The EKU set the council stamps onto the leaf is server-owned: a build
+/// signer gets code-signing, an mTLS workload gets server/client auth, and
+/// never the two shall mix. Image verification refuses a signature whose
+/// leaf lacks code-signing (IMG3), so a workload's mTLS cert can't be
+/// repurposed to vouch for an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertUsage {
+    /// Server + client auth, for the internal mTLS mesh (the default).
+    Mtls,
+    /// Code signing, for the build-signer identity.
+    CodeSigning,
+}
+
+impl CertUsage {
+    fn extended_key_usages(self) -> Vec<ExtendedKeyUsagePurpose> {
+        match self {
+            CertUsage::Mtls => vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ],
+            CertUsage::CodeSigning => vec![ExtendedKeyUsagePurpose::CodeSigning],
+        }
+    }
+}
+
 /// Validate a CSR and sign it with the Workload CA.
 ///
 /// The council calls this after verifying that the requesting node is
@@ -106,15 +133,16 @@ pub fn create_workload_csr(spiffe_uri: &SpiffeUri) -> Result<(Vec<u8>, Vec<u8>),
 /// certificate DER.
 ///
 /// The only thing taken from the CSR is its public key. Every other
-/// certificate field — the SAN list in particular — is rebuilt
-/// server-side from what the council *expects*, so a CSR smuggling
-/// extra SANs (another workload's SPIFFE URI, a DNS name) never gets
-/// them signed (PKI6). Validity is an exact timestamped window around
-/// `now` (injected for testability), not calendar dates.
+/// certificate field — the SAN list and the EKU set in particular — is
+/// rebuilt server-side from what the council *expects*, so a CSR smuggling
+/// extra SANs (another workload's SPIFFE URI, a DNS name) or a code-signing
+/// EKU it wasn't granted never gets them signed (PKI6). Validity is an exact
+/// timestamped window around `now` (injected for testability).
 pub fn validate_and_sign_csr(
     csr_der: &[u8],
     expected_spiffe_uri: &SpiffeUri,
     serial: SerialNumber,
+    usage: CertUsage,
     workload_ca_keypair: &KeyPair,
     workload_ca_params: &CertificateParams,
     now: SystemTime,
@@ -148,10 +176,7 @@ pub fn validate_and_sign_csr(
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyEncipherment,
     ];
-    params.extended_key_usages = vec![
-        ExtendedKeyUsagePurpose::ServerAuth,
-        ExtendedKeyUsagePurpose::ClientAuth,
-    ];
+    params.extended_key_usages = usage.extended_key_usages();
     params.subject_alt_names =
         vec![SanType::URI(expected_uri.try_into().map_err(
             |e: rcgen::Error| IdentityError::SignFailed(e.to_string()),
@@ -628,6 +653,7 @@ mod tests {
             &csr_der,
             &uri,
             SerialNumber(100),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),
@@ -657,6 +683,7 @@ mod tests {
             &csr_der,
             &wrong_uri,
             SerialNumber(100),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),
@@ -679,6 +706,7 @@ mod tests {
             &csr_der,
             &uri,
             SerialNumber(100),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),
@@ -704,9 +732,16 @@ mod tests {
 
         // Injected clock: a fixed instant with no sub-second noise.
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_752_000_000);
-        let cert_der =
-            validate_and_sign_csr(&csr_der, &uri, SerialNumber(9), &ca_kp, &ca_params, now)
-                .unwrap();
+        let cert_der = validate_and_sign_csr(
+            &csr_der,
+            &uri,
+            SerialNumber(9),
+            CertUsage::Mtls,
+            &ca_kp,
+            &ca_params,
+            now,
+        )
+        .unwrap();
 
         let (_, cert) = x509_parser::parse_x509_certificate(&cert_der).unwrap();
         let not_before = cert.validity().not_before.timestamp();
@@ -738,6 +773,7 @@ mod tests {
             &csr_der,
             &uri,
             SerialNumber(9),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             issued_at,
@@ -792,6 +828,7 @@ mod tests {
             csr.der(),
             &uri,
             SerialNumber(7),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),
@@ -826,6 +863,7 @@ mod tests {
             &csr_der,
             &uri,
             SerialNumber(100),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),
@@ -846,6 +884,7 @@ mod tests {
             &csr_der,
             &uri,
             SerialNumber(100),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),
@@ -881,6 +920,7 @@ mod tests {
             &csr_der,
             &uri,
             SerialNumber(100),
+            CertUsage::Mtls,
             &ca_kp,
             &ca_params,
             SystemTime::now(),

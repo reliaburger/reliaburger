@@ -651,48 +651,116 @@ pub async fn transfer_context_to_builder(
 // Signing
 // ---------------------------------------------------------------------------
 
-/// Sign a pushed manifest digest with a certificate issued by the
-/// cluster's Workload CA and attach the signature via Raft (JOB7).
+/// A persistent code-signing identity, provisioned once and reused across
+/// builds.
 ///
-/// The old path generated an ephemeral external key that no trust
-/// policy could ever list, so the signature was decorative. A keyless
-/// signature over a CA-issued certificate verifies against the
-/// cluster's root CA — the same check `require_signatures` deploys
-/// run. The signature is verified locally before it is attached, and
-/// an `AttachSignature` for a digest the catalogue doesn't know is
-/// refused by the state machine, not silently dropped.
-pub async fn sign_pushed_image(
-    council: &crate::council::CouncilNode,
-    digest: &crate::pickle::types::Digest,
-    namespace: &str,
-    build_name: &str,
-    node_name: &str,
-) -> Result<(), String> {
-    let uri = crate::sesame::types::SpiffeUri {
+/// The old path minted a fresh ephemeral CSR on *every* build. That's a new
+/// key and a new certificate per artefact — wasteful, and it means there's
+/// no stable "who signs our images" identity to pin a policy on. This holds
+/// one code-signing identity (private key, CA-issued leaf cert with the
+/// code-signing EKU, and the intermediate + root chain) so every build signs
+/// under the same SPIFFE identity, and IMG3's identity binding has something
+/// stable to check.
+#[derive(Clone)]
+pub struct BuildSigner {
+    /// SPIFFE URI this signer certifies as (`spiffe://…/job/build-signer`).
+    pub spiffe_uri: crate::sesame::types::SpiffeUri,
+    // NOTE: `private_key_der` is deliberately excluded from `Debug` (see the
+    // hand-written impl below) so key material never lands in a log line.
+    /// DER private key (kept in memory only, never persisted to Raft).
+    pub private_key_der: Vec<u8>,
+    /// The council-issued leaf certificate, carrying the code-signing EKU.
+    pub cert_der: Vec<u8>,
+    /// The Workload CA certificate (the leaf's issuer).
+    pub workload_ca_cert_der: Vec<u8>,
+    /// The Root CA certificate (the trust anchor).
+    pub root_ca_cert_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for BuildSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildSigner")
+            .field("spiffe_uri", &self.spiffe_uri)
+            .field("private_key_der", &"<redacted>")
+            .field("cert_der_len", &self.cert_der.len())
+            .finish()
+    }
+}
+
+/// The SPIFFE identity every build in a namespace signs under. Stable across
+/// builds so the persistent signer and IMG3's identity binding agree.
+pub fn build_signer_uri(namespace: &str) -> crate::sesame::types::SpiffeUri {
+    crate::sesame::types::SpiffeUri {
         trust_domain: "default".to_string(),
         namespace: namespace.to_string(),
         workload_type: crate::sesame::types::WorkloadType::Job,
-        name: build_name.to_string(),
-    };
+        name: "build-signer".to_string(),
+    }
+}
+
+/// Return the cached build signer for `namespace`, provisioning one via the
+/// council the first time. Reused across builds: two builds in the same
+/// namespace share a single signing identity rather than minting a fresh
+/// ephemeral CSR each time.
+pub async fn get_or_provision_build_signer(
+    cache: &tokio::sync::Mutex<HashMap<String, BuildSigner>>,
+    council: &crate::council::CouncilNode,
+    namespace: &str,
+    node_name: &str,
+) -> Result<BuildSigner, String> {
+    let mut guard = cache.lock().await;
+    if let Some(existing) = guard.get(namespace) {
+        return Ok(existing.clone());
+    }
+
+    let uri = build_signer_uri(namespace);
     let (csr_der, key_der) = crate::sesame::identity::create_workload_csr(&uri)
         .map_err(|e| format!("csr generation failed: {e}"))?;
+    // The leaf must carry the code-signing EKU so it can vouch for images.
     let signed = council
         .sign_workload_csr(
             &csr_der,
             &uri,
+            crate::sesame::identity::CertUsage::CodeSigning,
             "default",
             node_name,
-            &format!("build-{build_name}"),
+            "build-signer",
         )
         .await
         .map_err(|e| format!("csr signing failed: {e}"))?;
+
+    let signer = BuildSigner {
+        spiffe_uri: uri,
+        private_key_der: key_der,
+        cert_der: signed.cert_der,
+        workload_ca_cert_der: signed.workload_ca_cert_der,
+        root_ca_cert_der: signed.root_ca_cert_der,
+    };
+    guard.insert(namespace.to_string(), signer.clone());
+    Ok(signer)
+}
+
+/// Sign a pushed manifest digest with the persistent build-signer identity
+/// and attach the signature via Raft (JOB7).
+///
+/// The signer's leaf carries the code-signing EKU and a stable SPIFFE
+/// identity, so a keyless signature over it passes the full deploy-time
+/// check (IMG3): chain-to-root, validity, EKU, and identity binding. The
+/// signature is verified locally before it is attached, and an
+/// `AttachSignature` for a digest the catalogue doesn't know is refused by
+/// the state machine, not silently dropped.
+pub async fn sign_pushed_image(
+    council: &crate::council::CouncilNode,
+    signer: &BuildSigner,
+    digest: &crate::pickle::types::Digest,
+) -> Result<(), String> {
     let signature = crate::pickle::signing::create_keyless_signature(
         digest,
-        &signed.cert_der,
-        &key_der,
-        std::slice::from_ref(&signed.workload_ca_cert_der),
+        &signer.cert_der,
+        &signer.private_key_der,
+        std::slice::from_ref(&signer.workload_ca_cert_der),
         "reliaburger-council",
-        &uri.to_uri(),
+        &signer.spiffe_uri.to_uri(),
     )
     .map_err(|e| format!("signature creation failed: {e}"))?;
 
@@ -702,7 +770,7 @@ pub async fn sign_pushed_image(
         &signature,
         digest,
         &crate::config::node::TrustPolicySection::default(),
-        Some(&signed.root_ca_cert_der),
+        Some(&signer.root_ca_cert_der),
         None,
     )
     .map_err(|e| format!("signature failed verification against the cluster ca: {e}"))?;
@@ -875,7 +943,19 @@ async fn run_build_inner(
         (Some(council), Some(digest)) => {
             let namespace = request.spec.namespace.as_deref().unwrap_or("default");
             let node_name = state.node_name.as_deref().unwrap_or("local");
-            sign_pushed_image(council, &digest, namespace, &request.name, node_name).await
+            // Reuse a persistent code-signing identity across builds instead
+            // of minting a fresh ephemeral CSR each time.
+            match get_or_provision_build_signer(
+                state.build_signers.as_ref(),
+                council,
+                namespace,
+                node_name,
+            )
+            .await
+            {
+                Ok(signer) => sign_pushed_image(council, &signer, &digest).await,
+                Err(e) => Err(e),
+            }
         }
         (Some(_), None) => Err("pushed image not found in the catalogue".to_string()),
         (None, _) => Err("no council available for signing".to_string()),
@@ -1311,9 +1391,196 @@ pub async fn build_status_handler(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::reporting::aggregator::AggregatedState;
     use crate::reporting::types::{ResourceUsage, StateReport};
+
+    // --- Persistent build-signer (JOB7 follow-up) ---
+
+    /// A single-node leader council with a bootstrapped CA hierarchy, so it
+    /// can sign workload/build CSRs. Returns the council and the wrapping IKM.
+    async fn leader_with_security() -> Arc<crate::council::CouncilNode> {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
+
+        let wrapping_ikm = b"test-wrapping-material-32bytes!!";
+        let router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+        let node = crate::council::node::CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            Some(*wrapping_ikm),
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+        let members = std::collections::BTreeMap::from([(
+            1u64,
+            CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
+        )]);
+        node.initialize(members).await.unwrap();
+        for _ in 0..40 {
+            if node.is_leader().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("test-cluster", wrapping_ikm).unwrap();
+        let oidc_config = crate::sesame::oidc::generate_oidc_keypair(
+            "https://test.reliaburger.dev",
+            wrapping_ikm,
+        )
+        .unwrap();
+        let security_state = crate::sesame::types::SecurityState {
+            certificate_authorities: vec![
+                crate::sesame::types::CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca
+                },
+                hierarchy.node.ca,
+                hierarchy.workload.ca,
+                hierarchy.ingress.ca,
+            ],
+            age_keypairs: vec![],
+            api_tokens: vec![],
+            join_tokens: vec![],
+            next_serial: 10,
+            oidc_signing_config: Some(oidc_config),
+            crl: crate::sesame::types::Crl::default(),
+            secret_seals: std::collections::BTreeMap::new(),
+        };
+        node.write(RaftRequest::SecurityStateInit(Box::new(security_state)))
+            .await
+            .unwrap();
+        Arc::new(node)
+    }
+
+    #[tokio::test]
+    async fn two_builds_reuse_one_signing_identity() {
+        let council = leader_with_security().await;
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+
+        let first = get_or_provision_build_signer(&cache, &council, "default", "node-1")
+            .await
+            .unwrap();
+        let second = get_or_provision_build_signer(&cache, &council, "default", "node-1")
+            .await
+            .unwrap();
+
+        // Same identity, same key, same cert — not a fresh CSR each time.
+        assert_eq!(first.spiffe_uri, second.spiffe_uri);
+        assert_eq!(first.private_key_der, second.private_key_der);
+        assert_eq!(first.cert_der, second.cert_der);
+    }
+
+    #[tokio::test]
+    async fn build_signer_leaf_carries_code_signing_and_the_expected_identity() {
+        let council = leader_with_security().await;
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+        let signer = get_or_provision_build_signer(&cache, &council, "ci", "node-1")
+            .await
+            .unwrap();
+
+        // The council stamped the code-signing EKU onto the leaf.
+        crate::sesame::cert::check_code_signing_eku(&signer.cert_der).unwrap();
+        // And the leaf certifies the build-signer identity we expect.
+        let uri = build_signer_uri("ci").to_uri();
+        let sans = crate::sesame::cert::subject_uri_sans(&signer.cert_der).unwrap();
+        assert!(
+            sans.contains(&uri),
+            "leaf SANs {sans:?} should include {uri}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_a_signer_fails_when_the_council_has_no_workload_ca() {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+
+        // A leader with NO bootstrapped CA hierarchy: it cannot sign a
+        // code-signing CSR, so no trusted signer can be provisioned. Under
+        // require_signatures the caller turns this into a build failure.
+        let router = InMemoryRaftRouter::new();
+        let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+        let node = crate::council::node::CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            Some(*b"test-wrapping-material-32bytes!!"),
+        )
+        .await
+        .unwrap();
+        router.register(1, node.raft().clone()).await;
+        let members = std::collections::BTreeMap::from([(
+            1u64,
+            CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-1".to_string()),
+        )]);
+        node.initialize(members).await.unwrap();
+        for _ in 0..40 {
+            if node.is_leader().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let council = Arc::new(node);
+
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+        let result = get_or_provision_build_signer(&cache, &council, "default", "node-1").await;
+        assert!(
+            result.is_err(),
+            "a signer must not be provisioned without a Workload CA: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_sign_then_deploy_verify_round_trips() {
+        // The whole point: a signature this signer produces must pass the
+        // deploy-time check enforcement runs (verify_image_signature path).
+        let council = leader_with_security().await;
+        let cache = tokio::sync::Mutex::new(HashMap::new());
+        let signer = get_or_provision_build_signer(&cache, &council, "default", "node-1")
+            .await
+            .unwrap();
+
+        let digest = crate::pickle::types::Digest::from_sha256_hex(
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        );
+        let signature = crate::pickle::signing::create_keyless_signature(
+            &digest,
+            &signer.cert_der,
+            &signer.private_key_der,
+            std::slice::from_ref(&signer.workload_ca_cert_der),
+            "reliaburger-council",
+            &signer.spiffe_uri.to_uri(),
+        )
+        .unwrap();
+
+        // Verify under the deploy-time trust policy and the cluster root CA.
+        crate::pickle::signing::verify_signature(
+            &signature,
+            &digest,
+            &crate::config::node::TrustPolicySection {
+                require_signatures: true,
+                keys: vec![],
+            },
+            Some(&signer.root_ca_cert_der),
+            None,
+        )
+        .unwrap();
+    }
 
     fn running_record(name: &str) -> BuildRecord {
         BuildRecord {

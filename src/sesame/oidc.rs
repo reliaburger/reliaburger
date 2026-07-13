@@ -25,8 +25,55 @@ pub enum OidcError {
     Expired,
     #[error("invalid JWT format")]
     InvalidFormat,
+    #[error("unexpected JWT algorithm: got {got:?}, want {want:?}")]
+    UnexpectedAlgorithm { got: String, want: String },
+    #[error("unexpected JWT key id: got {got:?}, want {want:?}")]
+    UnexpectedKeyId { got: String, want: String },
+    #[error("wrong JWT issuer: got {got:?}, want {want:?}")]
+    WrongIssuer { got: String, want: String },
+    #[error("JWT audience does not contain the expected value {want:?}")]
+    WrongAudience { want: String },
+    #[error("JWT issued-at is out of bounds")]
+    BadIssuedAt,
     #[error("crypto error: {0}")]
     Crypto(#[from] crypto::CryptoError),
+}
+
+/// Constraints a JWT must satisfy, on top of a valid signature and unexpired
+/// `exp`. Hardens verification against tokens minted by the right key but for
+/// the wrong purpose: an attacker who obtains a token for one audience can't
+/// replay it against another, and a stale or future `iat` is rejected (PKI10).
+#[derive(Debug, Clone)]
+pub struct JwtConstraints {
+    /// The issuer the token's `iss` must equal.
+    pub expected_issuer: String,
+    /// A value the token's `aud` list must contain.
+    pub expected_audience: String,
+    /// The JOSE `alg` the header must declare. We only sign EdDSA.
+    pub expected_algorithm: String,
+    /// If set, the JOSE `kid` the header must declare.
+    pub expected_key_id: Option<String>,
+    /// Largest tolerated clock skew for a future `iat`, in seconds.
+    pub max_clock_skew_secs: u64,
+    /// Oldest tolerated `iat` (token age ceiling), in seconds.
+    pub max_age_secs: u64,
+}
+
+impl JwtConstraints {
+    /// Build the standard constraints for a token minted by `config`: the
+    /// config's issuer, `spiffe://<cluster>` audience, EdDSA, the config's
+    /// key id, and generous-but-bounded `iat` windows.
+    pub fn for_config(config: &OidcSigningConfig, cluster_name: &str) -> Self {
+        Self {
+            expected_issuer: config.issuer.clone(),
+            expected_audience: format!("spiffe://{cluster_name}"),
+            expected_algorithm: "EdDSA".to_string(),
+            expected_key_id: Some(config.key_id.clone()),
+            // Five minutes of clock skew, one hour of token age (the mint TTL).
+            max_clock_skew_secs: 300,
+            max_age_secs: 3600,
+        }
+    }
 }
 
 /// Generate an Ed25519 OIDC signing keypair.
@@ -101,11 +148,103 @@ pub fn mint_jwt(
     Ok(format!("{signing_input}.{sig_b64}"))
 }
 
-/// Verify a JWT signature and decode claims.
-///
-/// Checks the Ed25519 signature against the OIDC public key and
-/// validates that the token has not expired.
+/// Verify a JWT signature and decode claims, checking only the signature and
+/// `exp`. Prefer [`verify_jwt_with_constraints`] for anything security-
+/// sensitive: this omits issuer/audience/algorithm/kid/iat checks.
 pub fn verify_jwt(token: &str, config: &OidcSigningConfig) -> Result<WorkloadJwtClaims, OidcError> {
+    let claims = verify_signature_and_decode(token, config)?;
+
+    let now = unix_now();
+    if claims.exp < now {
+        return Err(OidcError::Expired);
+    }
+
+    Ok(claims)
+}
+
+/// Verify a JWT with full constraints (PKI10).
+///
+/// The order matters. We parse and check the JOSE header's `alg` and `kid`
+/// *before* trusting the signature: refusing an unexpected algorithm up front
+/// stops an algorithm-confusion attack where a token declares a weaker or
+/// attacker-chosen scheme. Then the Ed25519 signature is verified, the claims
+/// decoded, and `iss` / `aud` / `exp` / `iat` are checked against `constraints`.
+pub fn verify_jwt_with_constraints(
+    token: &str,
+    config: &OidcSigningConfig,
+    constraints: &JwtConstraints,
+) -> Result<WorkloadJwtClaims, OidcError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(OidcError::InvalidFormat);
+    }
+
+    // Parse the JOSE header and check alg/kid before trusting the signature.
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| OidcError::InvalidFormat)?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| OidcError::InvalidFormat)?;
+
+    let alg = header.get("alg").and_then(|v| v.as_str()).unwrap_or("");
+    if alg != constraints.expected_algorithm {
+        return Err(OidcError::UnexpectedAlgorithm {
+            got: alg.to_string(),
+            want: constraints.expected_algorithm.clone(),
+        });
+    }
+    if let Some(expected_kid) = &constraints.expected_key_id {
+        let kid = header.get("kid").and_then(|v| v.as_str()).unwrap_or("");
+        if kid != expected_kid {
+            return Err(OidcError::UnexpectedKeyId {
+                got: kid.to_string(),
+                want: expected_kid.clone(),
+            });
+        }
+    }
+
+    let claims = verify_signature_and_decode(token, config)?;
+
+    // Issuer and audience: a token minted for a different issuer or audience
+    // is not one we accept even if the signature checks out.
+    if claims.iss != constraints.expected_issuer {
+        return Err(OidcError::WrongIssuer {
+            got: claims.iss.clone(),
+            want: constraints.expected_issuer.clone(),
+        });
+    }
+    if !claims
+        .aud
+        .iter()
+        .any(|a| a == &constraints.expected_audience)
+    {
+        return Err(OidcError::WrongAudience {
+            want: constraints.expected_audience.clone(),
+        });
+    }
+
+    // Time bounds. `exp` in the past is expired; `iat` in the future (beyond
+    // skew) or too far in the past (a replayed stale token) is rejected.
+    let now = unix_now();
+    if claims.exp < now {
+        return Err(OidcError::Expired);
+    }
+    if claims.iat > now.saturating_add(constraints.max_clock_skew_secs) {
+        return Err(OidcError::BadIssuedAt);
+    }
+    if claims.iat < now.saturating_sub(constraints.max_age_secs) {
+        return Err(OidcError::BadIssuedAt);
+    }
+
+    Ok(claims)
+}
+
+/// Verify the Ed25519 signature over `header.payload` and decode the claims.
+/// Shared by both verify paths.
+fn verify_signature_and_decode(
+    token: &str,
+    config: &OidcSigningConfig,
+) -> Result<WorkloadJwtClaims, OidcError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(OidcError::InvalidFormat);
@@ -116,7 +255,6 @@ pub fn verify_jwt(token: &str, config: &OidcSigningConfig) -> Result<WorkloadJwt
         .decode(parts[2])
         .map_err(|_| OidcError::InvalidFormat)?;
 
-    // Verify signature
     let public_key = signature::UnparsedPublicKey::new(&signature::ED25519, &config.public_key_der);
     public_key
         .verify(signing_input.as_bytes(), &sig_bytes)
@@ -124,23 +262,21 @@ pub fn verify_jwt(token: &str, config: &OidcSigningConfig) -> Result<WorkloadJwt
             OidcError::VerifyFailed("Ed25519 signature verification failed".to_string())
         })?;
 
-    // Decode claims
     let claims_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|_| OidcError::InvalidFormat)?;
     let claims: WorkloadJwtClaims =
         serde_json::from_slice(&claims_bytes).map_err(|_| OidcError::InvalidFormat)?;
 
-    // Check expiry
-    let now = std::time::SystemTime::now()
+    Ok(claims)
+}
+
+/// Seconds since the Unix epoch, saturating to zero before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    if claims.exp < now {
-        return Err(OidcError::Expired);
-    }
-
-    Ok(claims)
+        .as_secs()
 }
 
 /// Build a JWKS response for the OIDC discovery endpoint.
@@ -306,5 +442,114 @@ mod tests {
 
         // No padding characters
         assert!(!encoded.contains('='));
+    }
+
+    // --- PKI10: constrained verification ---
+
+    /// A config whose issuer + cluster name line up with `test_claims`.
+    fn constrained_setup() -> (OidcSigningConfig, Vec<u8>, JwtConstraints) {
+        let ikm = test_wrapping_ikm();
+        let config = generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+        let constraints = JwtConstraints::for_config(&config, "test");
+        (config, ikm, constraints)
+    }
+
+    #[test]
+    fn constrained_verify_accepts_a_fully_correct_token() {
+        let (config, ikm, constraints) = constrained_setup();
+        let token = mint_jwt(&test_claims(), &config, &ikm).unwrap();
+        let decoded = verify_jwt_with_constraints(&token, &config, &constraints).unwrap();
+        assert_eq!(decoded, test_claims());
+    }
+
+    #[test]
+    fn constrained_verify_rejects_a_wrong_issuer() {
+        let (config, ikm, constraints) = constrained_setup();
+        let mut claims = test_claims();
+        claims.iss = "https://evil.example".to_string();
+        let token = mint_jwt(&claims, &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::WrongIssuer { .. })
+        ));
+    }
+
+    #[test]
+    fn constrained_verify_rejects_a_missing_audience() {
+        let (config, ikm, constraints) = constrained_setup();
+        let mut claims = test_claims();
+        claims.aud = vec!["spiffe://someone-else".to_string()];
+        let token = mint_jwt(&claims, &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::WrongAudience { .. })
+        ));
+    }
+
+    #[test]
+    fn constrained_verify_rejects_an_unexpected_algorithm() {
+        let (config, ikm, mut constraints) = constrained_setup();
+        // The token is minted with EdDSA; demand RS256 and it's refused before
+        // the signature is even trusted.
+        constraints.expected_algorithm = "RS256".to_string();
+        let token = mint_jwt(&test_claims(), &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::UnexpectedAlgorithm { .. })
+        ));
+    }
+
+    #[test]
+    fn constrained_verify_rejects_an_unexpected_key_id() {
+        let (config, ikm, mut constraints) = constrained_setup();
+        constraints.expected_key_id = Some("not-the-real-kid".to_string());
+        let token = mint_jwt(&test_claims(), &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::UnexpectedKeyId { .. })
+        ));
+    }
+
+    #[test]
+    fn constrained_verify_rejects_a_future_issued_at() {
+        let (config, ikm, constraints) = constrained_setup();
+        let mut claims = test_claims();
+        // An hour in the future, well past the 5-minute skew tolerance.
+        claims.iat = unix_now() + 3600;
+        claims.exp = claims.iat + 3600;
+        let token = mint_jwt(&claims, &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::BadIssuedAt)
+        ));
+    }
+
+    #[test]
+    fn constrained_verify_rejects_a_stale_issued_at() {
+        let (config, ikm, constraints) = constrained_setup();
+        let mut claims = test_claims();
+        // Issued two hours ago (older than max_age_secs) but not yet expired.
+        let now = unix_now();
+        claims.iat = now - 7200;
+        claims.exp = now + 3600;
+        let token = mint_jwt(&claims, &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::BadIssuedAt)
+        ));
+    }
+
+    #[test]
+    fn constrained_verify_rejects_an_expired_token() {
+        let (config, ikm, constraints) = constrained_setup();
+        let mut claims = test_claims();
+        let now = unix_now();
+        claims.iat = now - 100;
+        claims.exp = now - 10; // expired ten seconds ago
+        let token = mint_jwt(&claims, &config, &ikm).unwrap();
+        assert!(matches!(
+            verify_jwt_with_constraints(&token, &config, &constraints),
+            Err(OidcError::Expired)
+        ));
     }
 }

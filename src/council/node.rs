@@ -239,6 +239,7 @@ impl CouncilNode {
         &self,
         csr_der: &[u8],
         spiffe_uri: &SpiffeUri,
+        usage: crate::sesame::identity::CertUsage,
         cluster_name: &str,
         node_id: &str,
         instance_id: &str,
@@ -275,16 +276,16 @@ impl CouncilNode {
             rcgen::KeyPair::from_der_and_sign_algo(&ca_key_pki, &rcgen::PKCS_ECDSA_P256_SHA256)
                 .map_err(|e| CouncilError::SecurityError(format!("invalid CA keypair: {e}")))?;
 
-        // Minimal CA params for signing (DN used as issuer in signed cert)
-        let mut ca_params = rcgen::CertificateParams::default();
-        let mut dn = rcgen::DistinguishedName::new();
-        dn.push(
-            rcgen::DnType::CommonName,
-            format!("Reliaburger Workload CA - {cluster_name}"),
-        );
-        dn.push(rcgen::DnType::OrganizationName, "Reliaburger");
-        ca_params.distinguished_name = dn;
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+        // Rebuild the CA params from the REAL CA certificate, not from a
+        // reconstructed DN string. The issuer distinguished name the signed
+        // leaf carries must match the actual Workload CA's subject exactly —
+        // image verification now checks issuer binding (IMG3), so a DN derived
+        // from a caller-supplied `cluster_name` that differs from the CA's own
+        // name would produce a leaf that fails the binding. `from_ca_cert_der`
+        // reads the subject straight off the certificate.
+        let ca_cert_der_pki = rustls::pki_types::CertificateDer::from(workload_ca_cert_der.clone());
+        let ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der_pki)
+            .map_err(|e| CouncilError::SecurityError(format!("invalid CA cert DER: {e}")))?;
 
         // Allocate serial via Raft, reading the assigned value straight from the
         // write response so concurrent signings never derive the same serial.
@@ -305,6 +306,7 @@ impl CouncilNode {
             csr_der,
             spiffe_uri,
             serial,
+            usage,
             &ca_keypair,
             &ca_params,
             std::time::SystemTime::now(),
@@ -1060,7 +1062,14 @@ mod tests {
 
         // Sign it
         let result = node
-            .sign_workload_csr(&csr_der, &spiffe_uri, "test-cluster", "node-01", "api-0")
+            .sign_workload_csr(
+                &csr_der,
+                &spiffe_uri,
+                crate::sesame::identity::CertUsage::Mtls,
+                "test-cluster",
+                "node-01",
+                "api-0",
+            )
             .await
             .unwrap();
 

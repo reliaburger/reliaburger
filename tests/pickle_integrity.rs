@@ -316,18 +316,32 @@ async fn peer_pull_uses_the_verified_digest_when_the_tag_moves() {
     use reliaburger::config::node::TrustPolicySection;
     use reliaburger::meat::scheduler::{pin_image_reference, verify_image_signature};
     use reliaburger::pickle::types::AttachSignature;
-    use reliaburger::sesame::{ca, types::SerialNumber};
+    use reliaburger::sesame::ca;
+    use reliaburger::sesame::identity::{CertUsage, create_workload_csr, validate_and_sign_csr};
+    use reliaburger::sesame::types::{SerialNumber, SpiffeUri, WorkloadType};
 
     // Node 1 holds image A tagged web:v1, signed.
     let node1 = Registry::start(1).await;
     let (_, digest_a) = push_test_image(&node1.base_url(), "web", "v1", "image-a").await;
 
     let hierarchy = ca::generate_ca_hierarchy("test", b"test-ikm-32-bytes-padding-here!!").unwrap();
-    let (cert_der, key_der, _) = ca::issue_node_cert(
-        "workload",
+    // A real code-signing leaf whose SPIFFE identity matches the signature
+    // (IMG3: code-signing EKU + identity binding).
+    let uri = SpiffeUri {
+        trust_domain: "test".to_string(),
+        namespace: "ci".to_string(),
+        workload_type: WorkloadType::Job,
+        name: "build-signer".to_string(),
+    };
+    let (csr_der, key_der) = create_workload_csr(&uri).unwrap();
+    let cert_der = validate_and_sign_csr(
+        &csr_der,
+        &uri,
         SerialNumber(100),
+        CertUsage::CodeSigning,
         &hierarchy.workload.signing_keypair,
         &hierarchy.workload.certificate_params,
+        std::time::SystemTime::now(),
     )
     .unwrap();
     let signature = reliaburger::pickle::signing::create_keyless_signature(
@@ -335,8 +349,8 @@ async fn peer_pull_uses_the_verified_digest_when_the_tag_moves() {
         &cert_der,
         &key_der,
         std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-        "https://test.reliaburger.dev",
-        "spiffe://test/ns/ci/job/build",
+        "reliaburger-council",
+        &uri.to_uri(),
     )
     .unwrap();
     node1

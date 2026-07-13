@@ -125,6 +125,12 @@ pub struct ApiState {
     /// `Running` record without one means the node restarted mid-build
     /// and the record is terminated honestly (JOB4).
     pub active_builds: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
+    /// Persistent per-namespace build-signing identities. Provisioned once
+    /// via the council and reused across builds, so signing doesn't mint a
+    /// fresh ephemeral key per artefact (JOB7 follow-up).
+    pub build_signers: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, super::build_runner::BuildSigner>>,
+    >,
 }
 
 /// Build the API router.
@@ -231,6 +237,7 @@ pub fn router_with_upgrade(
         require_signatures,
         batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         active_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let auth_state = crate::sesame::auth::AuthState::new(

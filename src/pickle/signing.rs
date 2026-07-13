@@ -146,13 +146,43 @@ pub fn verify_signature(
     }
 }
 
-/// Verify a keyless signature by checking the certificate chain
-/// and verifying the ECDSA signature against the leaf cert's public key.
+/// Verify a keyless signature against the cluster root CA at "now".
+///
+/// See [`verify_keyless_at`] for the full list of checks. This wrapper
+/// pins the clock to the current time; tests inject a clock to assert
+/// exact validity windows.
 fn verify_keyless(
     sig: &ImageSignature,
     digest: &Digest,
     root_ca_cert_der: &[u8],
     crl: Option<&crate::sesame::types::Crl>,
+) -> Result<(), SigningError> {
+    verify_keyless_at(
+        sig,
+        digest,
+        root_ca_cert_der,
+        crl,
+        std::time::SystemTime::now(),
+    )
+}
+
+/// Verify a keyless signature by validating the full certificate chain and
+/// checking the ECDSA signature against the leaf cert's public key.
+///
+/// A partial chain check is no check: an attacker who controls one link can
+/// splice an unrelated intermediate and pass a leaf→first / last→root test
+/// while the middle never chains. So this validates *every* adjacent link,
+/// every certificate's validity window at `at`, and, on the leaf:
+/// - the code-signing extended key usage (an mTLS-only cert is not a signer);
+/// - a SPIFFE URI SAN matching the identity the signature declares.
+///
+/// The revocation (CRL) check is kept from Stage 5 (L17).
+fn verify_keyless_at(
+    sig: &ImageSignature,
+    digest: &Digest,
+    root_ca_cert_der: &[u8],
+    crl: Option<&crate::sesame::types::Crl>,
+    at: std::time::SystemTime,
 ) -> Result<(), SigningError> {
     let chain = match &sig.verification_material {
         VerificationMaterial::CertificateChain(chain) => chain,
@@ -167,19 +197,26 @@ fn verify_keyless(
 
     let leaf_cert_der = &chain[0];
 
-    // If we have intermediate CAs in the chain, verify leaf is signed by the first intermediate
-    if chain.len() >= 2 {
-        crate::sesame::cert::verify_signature(leaf_cert_der, &chain[1]).map_err(|e| {
-            SigningError::ChainVerifyFailed(format!("leaf cert not signed by intermediate: {e}"))
-        })?;
-    }
+    // Full chain: every adjacent signature + issuer binding, chaining to the
+    // trust anchor, and every cert valid at `at`.
+    crate::sesame::cert::validate_chain_at(chain, root_ca_cert_der, at)
+        .map_err(|e| SigningError::ChainVerifyFailed(e.to_string()))?;
 
-    // Verify the last cert in chain is signed by root CA
-    let last_cert = chain.last().unwrap();
-    if last_cert != root_ca_cert_der {
-        crate::sesame::cert::verify_signature(last_cert, root_ca_cert_der).map_err(|e| {
-            SigningError::ChainVerifyFailed(format!("chain does not chain to root CA: {e}"))
-        })?;
+    // The leaf must be authorised to sign artefacts.
+    crate::sesame::cert::check_code_signing_eku(leaf_cert_der)
+        .map_err(|e| SigningError::ChainVerifyFailed(e.to_string()))?;
+
+    // Identity binding: the leaf's SPIFFE URI SAN must match the identity the
+    // signature claims. Without this a valid CA-issued cert for workload A
+    // could vouch for a signature attributed to workload B.
+    if let SigningMethod::Keyless { identity, .. } = &sig.method {
+        let sans = crate::sesame::cert::subject_uri_sans(leaf_cert_der)
+            .map_err(|e| SigningError::ChainVerifyFailed(e.to_string()))?;
+        if !sans.iter().any(|s| s == identity) {
+            return Err(SigningError::ChainVerifyFailed(format!(
+                "leaf certificate does not carry the claimed signer identity {identity}"
+            )));
+        }
     }
 
     // Revocation: a signature is only as trustworthy as the certificate that
@@ -257,6 +294,58 @@ mod tests {
         pkcs8.as_ref().to_vec()
     }
 
+    /// The SPIFFE identity a test build signer certifies as.
+    fn build_signer_uri() -> crate::sesame::types::SpiffeUri {
+        crate::sesame::types::SpiffeUri {
+            trust_domain: "test".to_string(),
+            namespace: "ci".to_string(),
+            workload_type: crate::sesame::types::WorkloadType::Job,
+            name: "build-signer".to_string(),
+        }
+    }
+
+    /// Issue a code-signing leaf under the hierarchy's workload CA for the
+    /// given identity, returning `(cert_der, key_der)`. Mirrors what the
+    /// council does for the persistent build signer.
+    fn issue_codesigning_leaf(
+        hierarchy: &ca::CaHierarchy,
+        uri: &crate::sesame::types::SpiffeUri,
+        serial: u64,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let (csr_der, key_der) = crate::sesame::identity::create_workload_csr(uri).unwrap();
+        let cert_der = crate::sesame::identity::validate_and_sign_csr(
+            &csr_der,
+            uri,
+            crate::sesame::types::SerialNumber(serial),
+            crate::sesame::identity::CertUsage::CodeSigning,
+            &hierarchy.workload.signing_keypair,
+            &hierarchy.workload.certificate_params,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        (cert_der, key_der)
+    }
+
+    /// Build a well-formed code-signing keyless signature over `test_digest()`,
+    /// returning `(sig, root_ca_der)`.
+    fn codesigning_keyless_sig() -> (ImageSignature, Vec<u8>) {
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-wrapping-material-32bytes!").unwrap();
+        let uri = build_signer_uri();
+        let (cert_der, key_der) = issue_codesigning_leaf(&hierarchy, &uri, 100);
+        let digest = test_digest();
+        let sig = create_keyless_signature(
+            &digest,
+            &cert_der,
+            &key_der,
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
+            "reliaburger-council",
+            &uri.to_uri(),
+        )
+        .unwrap();
+        (sig, hierarchy.root.ca.certificate_der.clone())
+    }
+
     #[test]
     fn sign_and_verify_round_trip() {
         let pkcs8 = generate_test_keypair();
@@ -279,33 +368,10 @@ mod tests {
 
     #[test]
     fn create_keyless_signature_verifies() {
-        let wrapping_ikm = b"test-wrapping-material-32bytes!";
-        let hierarchy = ca::generate_ca_hierarchy("test", wrapping_ikm).unwrap();
-
-        // Use the workload CA to issue a cert (simulating the CSR flow)
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "test-workload",
-            crate::sesame::types::SerialNumber(100),
-            &hierarchy.workload.signing_keypair,
-            &hierarchy.workload.certificate_params,
-        )
-        .unwrap();
-
-        let digest = test_digest();
-        let sig = create_keyless_signature(
-            &digest,
-            &cert_der,
-            &key_der,
-            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-            "https://test.reliaburger.dev",
-            "spiffe://test/ns/ci/job/build",
-        )
-        .unwrap();
-
+        let (sig, root) = codesigning_keyless_sig();
         assert!(matches!(sig.method, SigningMethod::Keyless { .. }));
-
-        // Verify against root CA
-        verify_keyless(&sig, &digest, &hierarchy.root.ca.certificate_der, None).unwrap();
+        // Full IMG3 validation passes for a well-formed code-signing chain.
+        verify_keyless(&sig, &test_digest(), &root, None).unwrap();
     }
 
     #[test]
@@ -331,74 +397,125 @@ mod tests {
 
     #[test]
     fn verify_keyless_wrong_digest_fails() {
-        let wrapping_ikm = b"test-wrapping-material-32bytes!";
-        let hierarchy = ca::generate_ca_hierarchy("test", wrapping_ikm).unwrap();
-
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "test-workload",
-            crate::sesame::types::SerialNumber(100),
-            &hierarchy.workload.signing_keypair,
-            &hierarchy.workload.certificate_params,
-        )
-        .unwrap();
-
-        let digest = test_digest();
-        let sig = create_keyless_signature(
-            &digest,
-            &cert_der,
-            &key_der,
-            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-            "https://test.reliaburger.dev",
-            "spiffe://test/ns/ci/job/build",
-        )
-        .unwrap();
-
-        // Verify with a different digest — should fail
+        let (sig, root) = codesigning_keyless_sig();
         let wrong_digest = Digest::from_sha256_hex(
             "0000000000000000000000000000000000000000000000000000000000000000",
         );
-        let result = verify_keyless(
-            &sig,
-            &wrong_digest,
-            &hierarchy.root.ca.certificate_der,
-            None,
-        );
-        assert!(result.is_err());
+        assert!(verify_keyless(&sig, &wrong_digest, &root, None).is_err());
     }
 
     #[test]
     fn verify_keyless_wrong_ca_fails() {
-        let wrapping_ikm = b"test-wrapping-material-32bytes!";
-        let hierarchy = ca::generate_ca_hierarchy("test", wrapping_ikm).unwrap();
+        let (sig, _root) = codesigning_keyless_sig();
+        // Verify against an unrelated root CA — should fail.
+        let other = ca::generate_ca_hierarchy("other", b"test-wrapping-material-32bytes!").unwrap();
+        assert!(
+            verify_keyless(&sig, &test_digest(), &other.root.ca.certificate_der, None).is_err()
+        );
+    }
 
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "test-workload",
+    #[test]
+    fn verify_keyless_rejects_a_leaf_without_code_signing_eku() {
+        // A leaf issued as an mTLS workload cert (ServerAuth/ClientAuth) is not
+        // a code signer, so its signature is rejected (IMG3).
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-wrapping-material-32bytes!").unwrap();
+        let uri = build_signer_uri();
+        let (csr_der, key_der) = crate::sesame::identity::create_workload_csr(&uri).unwrap();
+        let cert_der = crate::sesame::identity::validate_and_sign_csr(
+            &csr_der,
+            &uri,
             crate::sesame::types::SerialNumber(100),
+            crate::sesame::identity::CertUsage::Mtls,
             &hierarchy.workload.signing_keypair,
             &hierarchy.workload.certificate_params,
+            std::time::SystemTime::now(),
         )
         .unwrap();
-
-        let digest = test_digest();
         let sig = create_keyless_signature(
-            &digest,
+            &test_digest(),
             &cert_der,
             &key_der,
             std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-            "https://test.reliaburger.dev",
-            "spiffe://test/ns/ci/job/build",
+            "reliaburger-council",
+            &uri.to_uri(),
         )
         .unwrap();
-
-        // Verify with a different root CA — should fail
-        let other_hierarchy = ca::generate_ca_hierarchy("other", wrapping_ikm).unwrap();
         let result = verify_keyless(
             &sig,
-            &digest,
-            &other_hierarchy.root.ca.certificate_der,
+            &test_digest(),
+            &hierarchy.root.ca.certificate_der,
             None,
         );
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "mTLS leaf should not sign images: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_keyless_rejects_a_mismatched_signer_identity() {
+        // The signature claims one identity but the leaf certifies another.
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-wrapping-material-32bytes!").unwrap();
+        let uri = build_signer_uri();
+        let (cert_der, key_der) = issue_codesigning_leaf(&hierarchy, &uri, 100);
+        let sig = create_keyless_signature(
+            &test_digest(),
+            &cert_der,
+            &key_der,
+            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
+            "reliaburger-council",
+            "spiffe://test/ns/ci/job/someone-else",
+        )
+        .unwrap();
+        let result = verify_keyless(
+            &sig,
+            &test_digest(),
+            &hierarchy.root.ca.certificate_der,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "identity mismatch must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_keyless_rejects_a_broken_intermediate_link() {
+        // Splice an unrelated workload CA between leaf and root: the leaf→CA
+        // signature no longer holds, so the every-link check fails (IMG3).
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-wrapping-material-32bytes!").unwrap();
+        let other = ca::generate_ca_hierarchy("other", b"test-wrapping-material-32bytes!").unwrap();
+        let uri = build_signer_uri();
+        let (cert_der, key_der) = issue_codesigning_leaf(&hierarchy, &uri, 100);
+        // Present the WRONG workload CA in the chain.
+        let sig = create_keyless_signature(
+            &test_digest(),
+            &cert_der,
+            &key_der,
+            std::slice::from_ref(&other.workload.ca.certificate_der),
+            "reliaburger-council",
+            &uri.to_uri(),
+        )
+        .unwrap();
+        let result = verify_keyless(
+            &sig,
+            &test_digest(),
+            &hierarchy.root.ca.certificate_der,
+            None,
+        );
+        assert!(result.is_err(), "broken chain must be rejected: {result:?}");
+    }
+
+    #[test]
+    fn verify_keyless_rejects_an_expired_chain() {
+        let (sig, root) = codesigning_keyless_sig();
+        // Ten years hence, the (one-hour) leaf has long expired.
+        let future =
+            std::time::SystemTime::now() + std::time::Duration::from_secs(10 * 365 * 24 * 3600);
+        assert!(verify_keyless_at(&sig, &test_digest(), &root, None, future).is_err());
     }
 
     /// Build a keyless signature over `test_digest()` whose leaf has the given
@@ -406,23 +523,17 @@ mod tests {
     fn keyless_sig_with_leaf_serial(
         leaf_serial: u64,
     ) -> (ImageSignature, Vec<u8>, crate::sesame::types::SerialNumber) {
-        let wrapping_ikm = b"test-wrapping-material-32bytes!";
-        let hierarchy = ca::generate_ca_hierarchy("test", wrapping_ikm).unwrap();
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "test-workload",
-            crate::sesame::types::SerialNumber(leaf_serial),
-            &hierarchy.workload.signing_keypair,
-            &hierarchy.workload.certificate_params,
-        )
-        .unwrap();
-        let digest = test_digest();
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-wrapping-material-32bytes!").unwrap();
+        let uri = build_signer_uri();
+        let (cert_der, key_der) = issue_codesigning_leaf(&hierarchy, &uri, leaf_serial);
         let sig = create_keyless_signature(
-            &digest,
+            &test_digest(),
             &cert_der,
             &key_der,
             std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-            "https://test.reliaburger.dev",
-            "spiffe://test/ns/ci/job/build",
+            "reliaburger-council",
+            &uri.to_uri(),
         )
         .unwrap();
         let workload_ca_serial =
@@ -513,37 +624,9 @@ mod tests {
 
     #[test]
     fn verify_dispatches_to_keyless() {
-        let wrapping_ikm = b"test-wrapping-material-32bytes!";
-        let hierarchy = ca::generate_ca_hierarchy("test", wrapping_ikm).unwrap();
-
-        let (cert_der, key_der, _) = ca::issue_node_cert(
-            "test-workload",
-            crate::sesame::types::SerialNumber(100),
-            &hierarchy.workload.signing_keypair,
-            &hierarchy.workload.certificate_params,
-        )
-        .unwrap();
-
-        let digest = test_digest();
-        let sig = create_keyless_signature(
-            &digest,
-            &cert_der,
-            &key_der,
-            std::slice::from_ref(&hierarchy.workload.ca.certificate_der),
-            "https://test.reliaburger.dev",
-            "spiffe://test/ns/ci/job/build",
-        )
-        .unwrap();
-
+        let (sig, root) = codesigning_keyless_sig();
         let policy = TrustPolicySection::default();
-        verify_signature(
-            &sig,
-            &digest,
-            &policy,
-            Some(&hierarchy.root.ca.certificate_der),
-            None,
-        )
-        .unwrap();
+        verify_signature(&sig, &test_digest(), &policy, Some(&root), None).unwrap();
     }
 
     #[test]
