@@ -7,11 +7,25 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::config::Config;
 use crate::config::app::AppSpec;
+use crate::config::{Config, NamespaceSpec, PermissionSpec};
 use crate::meat::types::AppId;
 
 use super::types::DiffSummary;
+
+/// The current declarative desired state a diff compares git against.
+///
+/// Grouping the three maps keeps `compute_diff`'s signature from growing
+/// a parameter per resource kind.
+#[derive(Debug)]
+pub struct CurrentState<'a> {
+    /// Apps currently in Raft, keyed by identity.
+    pub apps: &'a HashMap<AppId, AppSpec>,
+    /// Namespaces currently in Raft, keyed by name.
+    pub namespaces: &'a BTreeMap<String, NamespaceSpec>,
+    /// Permissions currently in Raft, keyed by name.
+    pub permissions: &'a BTreeMap<String, PermissionSpec>,
+}
 
 /// A single resource change to apply.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,8 +50,10 @@ pub enum ResourceChange {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangePayload {
     App(Box<AppSpec>),
-    // Job, Namespace, Permission, Build can be added as needed.
-    // For now, only apps are the primary autoscaler-aware case.
+    Namespace(Box<NamespaceSpec>),
+    Permission(Box<PermissionSpec>),
+    /// Jobs (run to completion) and builds (dispatched imperatively) are
+    /// not reconciled desired state, so their diff carries no spec.
     Generic,
 }
 
@@ -47,7 +63,7 @@ pub enum ChangePayload {
 /// the autoscaler's replica count when only non-replica fields changed.
 pub fn compute_diff(
     git_config: &Config,
-    current_apps: &HashMap<AppId, AppSpec>,
+    current: &CurrentState<'_>,
     _autoscale_overrides: &[(String, u32)],
 ) -> (Vec<ResourceChange>, DiffSummary) {
     let mut changes = Vec::new();
@@ -56,7 +72,8 @@ pub fn compute_diff(
     let mut removed = 0usize;
 
     // Build lookup for current apps
-    let current_by_name: BTreeMap<String, (&AppId, &AppSpec)> = current_apps
+    let current_by_name: BTreeMap<String, (&AppId, &AppSpec)> = current
+        .apps
         .iter()
         .map(|(id, spec)| (id.name.clone(), (id, spec)))
         .collect();
@@ -92,6 +109,69 @@ pub fn compute_diff(
         if !git_config.app.contains_key(name) {
             changes.push(ResourceChange::Remove {
                 resource_id: format!("app.{name}"),
+            });
+            removed += 1;
+        }
+    }
+
+    // Namespaces: add/update/remove against current desired state. A
+    // namespace present in git but not in Raft is an add; one whose spec
+    // changed is an update; one in Raft but not in git is removed (GitOps
+    // reconciles the whole repo, unlike additive manual apply).
+    for (name, git_ns) in &git_config.namespace {
+        match current.namespaces.get(name) {
+            None => {
+                changes.push(ResourceChange::Add {
+                    resource_id: format!("namespace.{name}"),
+                    spec: ChangePayload::Namespace(Box::new(git_ns.clone())),
+                });
+                added += 1;
+            }
+            Some(current_ns) if current_ns != git_ns => {
+                changes.push(ResourceChange::Update {
+                    resource_id: format!("namespace.{name}"),
+                    spec: ChangePayload::Namespace(Box::new(git_ns.clone())),
+                    replicas_changed: false,
+                });
+                modified += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    for name in current.namespaces.keys() {
+        if !git_config.namespace.contains_key(name) {
+            changes.push(ResourceChange::Remove {
+                resource_id: format!("namespace.{name}"),
+            });
+            removed += 1;
+        }
+    }
+
+    // Permissions: same add/update/remove reconcile.
+    for (name, git_perm) in &git_config.permission {
+        match current.permissions.get(name) {
+            None => {
+                changes.push(ResourceChange::Add {
+                    resource_id: format!("permission.{name}"),
+                    spec: ChangePayload::Permission(Box::new(git_perm.clone())),
+                });
+                added += 1;
+            }
+            Some(current_perm) if current_perm != git_perm => {
+                changes.push(ResourceChange::Update {
+                    resource_id: format!("permission.{name}"),
+                    spec: ChangePayload::Permission(Box::new(git_perm.clone())),
+                    replicas_changed: false,
+                });
+                modified += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    for name in current.permissions.keys() {
+        if !git_config.permission.contains_key(name) {
+            changes.push(ResourceChange::Remove {
+                resource_id: format!("permission.{name}"),
             });
             removed += 1;
         }
@@ -163,6 +243,20 @@ mod tests {
             .collect()
     }
 
+    /// A `CurrentState` over just apps; namespaces/permissions empty.
+    fn apps_state(apps: &HashMap<AppId, AppSpec>) -> CurrentState<'_> {
+        CurrentState {
+            apps,
+            namespaces: EMPTY_NS.get_or_init(BTreeMap::new),
+            permissions: EMPTY_PERM.get_or_init(BTreeMap::new),
+        }
+    }
+
+    static EMPTY_NS: std::sync::OnceLock<BTreeMap<String, NamespaceSpec>> =
+        std::sync::OnceLock::new();
+    static EMPTY_PERM: std::sync::OnceLock<BTreeMap<String, PermissionSpec>> =
+        std::sync::OnceLock::new();
+
     #[test]
     fn detects_added_app() {
         let git = parse_config(
@@ -172,7 +266,7 @@ mod tests {
             "#,
         );
         let current = HashMap::new();
-        let (changes, summary) = compute_diff(&git, &current, &[]);
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
         assert_eq!(summary.added, 1);
         assert_eq!(summary.modified, 0);
         assert!(
@@ -184,7 +278,7 @@ mod tests {
     fn detects_removed_app() {
         let git = parse_config("");
         let current = make_current_apps(&[("old", r#"image = "old:v1""#)]);
-        let (changes, summary) = compute_diff(&git, &current, &[]);
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
         assert_eq!(summary.removed, 1);
         assert!(
             matches!(&changes[0], ResourceChange::Remove { resource_id } if resource_id == "app.old")
@@ -200,7 +294,7 @@ mod tests {
             "#,
         );
         let current = make_current_apps(&[("web", r#"image = "myapp:v1""#)]);
-        let (changes, summary) = compute_diff(&git, &current, &[]);
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
         assert_eq!(summary.modified, 1);
         assert!(matches!(
             &changes[0],
@@ -221,7 +315,7 @@ mod tests {
             "#,
         );
         let current = make_current_apps(&[("web", r#"image = "myapp:v1""#)]);
-        let (changes, _) = compute_diff(&git, &current, &[]);
+        let (changes, _) = compute_diff(&git, &apps_state(&current), &[]);
         assert!(matches!(
             &changes[0],
             ResourceChange::Update {
@@ -240,7 +334,7 @@ mod tests {
             "#,
         );
         let current = make_current_apps(&[("web", r#"image = "myapp:v1""#)]);
-        let (changes, summary) = compute_diff(&git, &current, &[]);
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
         assert!(changes.is_empty());
         assert_eq!(summary.added, 0);
         assert_eq!(summary.modified, 0);

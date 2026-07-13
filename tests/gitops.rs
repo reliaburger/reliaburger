@@ -223,6 +223,138 @@ async fn webhook_triggers_immediate_sync() {
     council.shutdown().await.ok();
 }
 
+/// A repo with an app, a job, a namespace and a permission syncs every
+/// declarative kind through to Raft desired state (12b.2 T6). Before this
+/// theme, `resource_change_to_request` returned `None` for anything but an
+/// app, so namespaces and permissions were silently dropped.
+#[tokio::test]
+async fn sync_loop_applies_every_declarative_kind() {
+    if which_git().is_none() {
+        eprintln!("git not on PATH; skipping");
+        return;
+    }
+
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(
+        repo_dir.path(),
+        r#"
+        [namespace.prod]
+        cpu = "8000m"
+        max_apps = 50
+
+        [permission.deployer]
+        actions = ["deploy", "scale"]
+        namespaces = ["prod"]
+
+        [app.web]
+        image = "web:v1"
+        namespace = "prod"
+
+        [job.migrate]
+        image = "migrate:v1"
+    "#,
+    );
+
+    let council = single_node_leader().await;
+    let shutdown = CancellationToken::new();
+    let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+
+    let config = GitOpsConfig {
+        repo: repo_dir.path().to_string_lossy().to_string(),
+        branch: "main".to_string(),
+        path: "/".to_string(),
+        poll_interval_secs: 1,
+        require_signed_commits: false,
+        trusted_signing_keys: vec![],
+        webhook_secret: None,
+        recursive: false,
+        webhook_rate_limit: 10,
+    };
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        config,
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+    );
+
+    let council_check = Arc::clone(&council);
+    let converged = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&council_check);
+        Box::pin(async move {
+            let state = c.desired_state().await;
+            state.namespaces.contains_key("prod")
+                && state.permissions.contains_key("deployer")
+                && state.apps.contains_key(&AppId::new("web", "prod"))
+        })
+    })
+    .await;
+    assert!(
+        converged,
+        "gitops sync must apply namespace, permission and app to Raft"
+    );
+
+    // The commit advances only once everything committed (D12): a set
+    // that fully applied records last_applied_commit.
+    let sync_state = council.desired_state().await.gitops_sync_state;
+    assert!(
+        sync_state.and_then(|s| s.last_applied_commit).is_some(),
+        "a fully-applied sync must advance last_applied_commit"
+    );
+
+    shutdown.cancel();
+    council.shutdown().await.ok();
+}
+
+/// D12 atomicity: when a write in the change set fails, `apply_changes`
+/// stops and reports the failure so the caller does NOT advance
+/// `last_applied_commit`. A council that was never initialised isn't the
+/// leader, so every `write` is refused — a faithful stand-in for a mid-
+/// sync failure. Before the fix, the runner advanced the commit
+/// regardless, marking a failed write "applied" so it never retried.
+#[tokio::test]
+async fn apply_changes_stops_and_reports_on_write_failure() {
+    use reliaburger::lettuce::diff::{ChangePayload, ResourceChange};
+    use reliaburger::lettuce::runner::apply_changes;
+
+    // An uninitialised node: no leader, so client writes are refused.
+    let router = InMemoryRaftRouter::new();
+    let network = InMemoryRaftNetworkFactory::new(1, router.clone());
+    let node = CouncilNode::new(
+        1,
+        fast_config(),
+        network,
+        MemLogStore::new(),
+        CouncilStateMachine::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    router.register(1, node.raft().clone()).await;
+    let node = Arc::new(node);
+    assert!(!node.is_leader().await, "node must not be leader");
+
+    let spec = reliaburger::config::Config::parse("[app.web]\nimage = \"x:1\"\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    let changes = vec![ResourceChange::Add {
+        resource_id: "app.web".to_string(),
+        spec: ChangePayload::App(Box::new(spec)),
+    }];
+
+    let result = apply_changes(&node, &changes).await;
+    assert!(
+        matches!(result, Err(ref id) if id == "app.web"),
+        "a failed write must be reported, not swallowed: {result:?}"
+    );
+    // And the app never reached desired state.
+    assert!(node.desired_state().await.apps.is_empty());
+    node.shutdown().await.ok();
+}
+
 fn which_git() -> Option<()> {
     Command::new("git")
         .arg("--version")

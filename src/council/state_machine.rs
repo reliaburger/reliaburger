@@ -492,6 +492,18 @@ impl StateMachineInner {
                     });
                 }
             }
+            RaftRequest::NamespaceSpec { name, spec } => {
+                self.state.namespaces.insert(name.clone(), *spec.clone());
+            }
+            RaftRequest::NamespaceDelete { name } => {
+                self.state.namespaces.remove(name);
+            }
+            RaftRequest::PermissionSpec { name, spec } => {
+                self.state.permissions.insert(name.clone(), *spec.clone());
+            }
+            RaftRequest::PermissionDelete { name } => {
+                self.state.permissions.remove(name);
+            }
         }
         None
     }

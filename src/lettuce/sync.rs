@@ -5,14 +5,14 @@
 //! signatures, parses TOML, diffs against Raft state, and applies
 //! only changed resources.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use crate::config::Config;
 use crate::config::app::AppSpec;
+use crate::config::{Config, NamespaceSpec, PermissionSpec};
 use crate::meat::types::AppId;
 
-use super::diff::{self, ResourceChange};
+use super::diff::{self, CurrentState, ResourceChange};
 use super::git::GitRepo;
 use super::types::*;
 use super::verify;
@@ -53,6 +53,8 @@ pub fn execute_sync(
     repo: &GitRepo,
     config: &GitOpsConfig,
     current_apps: &HashMap<AppId, AppSpec>,
+    current_namespaces: &BTreeMap<String, NamespaceSpec>,
+    current_permissions: &BTreeMap<String, PermissionSpec>,
     autoscale_overrides: &[(String, u32)],
     last_applied_sha: Option<&str>,
 ) -> SyncOutcome {
@@ -171,7 +173,12 @@ pub fn execute_sync(
     let (git_config, file_errors) = parse_toml_files(&toml_files);
 
     // Step 4: Compute diff
-    let (changes, summary) = diff::compute_diff(&git_config, current_apps, autoscale_overrides);
+    let current = CurrentState {
+        apps: current_apps,
+        namespaces: current_namespaces,
+        permissions: current_permissions,
+    };
+    let (changes, summary) = diff::compute_diff(&git_config, &current, autoscale_overrides);
 
     // Step 5: Determine result
     let result = if file_errors.is_empty() {

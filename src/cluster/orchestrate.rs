@@ -144,10 +144,12 @@ pub fn spawn_leader_scheduler(
             }
             crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
 
-            // Quotas are injected. Namespace resources are not desired state
-            // until T6, so the production table is empty today and every app
-            // is admitted; the enforcement seam is wired and tested here.
-            let mut quotas = crate::meat::quota::QuotaLedger::default();
+            // Quotas come from desired-state namespaces (12b.2 T6). A
+            // cluster with no declared namespace budgets gets an empty
+            // ledger that admits everything; declaring a namespace with a
+            // CPU/memory/replica cap now rejects over-budget placements at
+            // deploy time, with the reason surfaced through the log.
+            let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
             let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
 
@@ -966,6 +968,68 @@ mod tests {
         assert!(
             decisions.is_empty(),
             "an app over its namespace quota must be refused: {decisions:?}"
+        );
+    }
+
+    /// The T6 handoff: a quota built from *desired-state namespaces*
+    /// (not a hand-injected table) rejects an over-budget app on the
+    /// apply path. This is what `ledger_from_namespaces` at
+    /// `orchestrate.rs:150` lights up.
+    #[test]
+    fn desired_state_namespace_quota_rejects_over_budget_app() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("big", 10000, BTreeMap::new()));
+
+        let mut desired = DesiredState::default();
+        desired.namespaces.insert(
+            "prod".to_string(),
+            crate::config::NamespaceSpec {
+                cpu: Some("1000m".to_string()),
+                memory: None,
+                gpu: None,
+                max_apps: None,
+                max_replicas: None,
+            },
+        );
+        let a = AppId::new("greedy", "prod");
+        desired.apps.insert(a.clone(), app_spec(800, 2)); // 1600m > 1000m
+
+        let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+        let alive = HashSet::from([NodeId::new("big")]);
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        assert!(
+            decisions.is_empty(),
+            "namespace budget from desired state must reject the app: {decisions:?}"
+        );
+    }
+
+    /// A namespace with headroom admits the app.
+    #[test]
+    fn desired_state_namespace_quota_admits_app_that_fits() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("big", 10000, BTreeMap::new()));
+
+        let mut desired = DesiredState::default();
+        desired.namespaces.insert(
+            "prod".to_string(),
+            crate::config::NamespaceSpec {
+                cpu: Some("2000m".to_string()),
+                memory: None,
+                gpu: None,
+                max_apps: None,
+                max_replicas: None,
+            },
+        );
+        let a = AppId::new("modest", "prod");
+        desired.apps.insert(a.clone(), app_spec(400, 2)); // 800m < 2000m
+
+        let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+        let alive = HashSet::from([NodeId::new("big")]);
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+        assert_eq!(
+            decisions.len(),
+            1,
+            "an app within its namespace budget must be admitted"
         );
     }
 }

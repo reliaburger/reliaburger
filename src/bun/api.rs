@@ -918,11 +918,13 @@ async fn apply_handler(
             .into_response();
     }
 
-    // Cluster mode (L1): apps become desired state in Raft; the leader
-    // schedules them and every node's reconciler converges. Jobs stay
-    // on the receiving node (cluster-wide job scheduling is later work).
+    // Cluster mode (L1): apps, namespaces and permissions become desired
+    // state in Raft; the leader schedules apps and every node's reconciler
+    // converges. Jobs stay on the receiving node (cluster-wide job
+    // scheduling is later work). A namespace/permission-only config still
+    // routes through the cluster path so its resources are committed.
     if let Some(council) = &state.council
-        && !config.app.is_empty()
+        && (!config.app.is_empty() || !config.namespace.is_empty() || !config.permission.is_empty())
     {
         return cluster_apply(state.clone(), Arc::clone(council), config, body).await;
     }
@@ -1001,34 +1003,49 @@ async fn cluster_apply(
         };
     }
 
+    // Permissions and builds may target a namespace an earlier apply
+    // created, not just one in this file. Validate against the union of
+    // this config's namespaces and those already committed, so a build
+    // scoped to an existing namespace validates and one targeting a ghost
+    // namespace is rejected before any write lands.
+    let known_namespaces: Vec<String> = council
+        .desired_state()
+        .await
+        .namespaces
+        .keys()
+        .cloned()
+        .collect();
+    if let Err(e) = config.validate_against(&known_namespaces) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
     let cmd_tx = state.cmd_tx.clone();
     tokio::spawn(async move {
         let mut committed = 0usize;
-        for (name, spec) in &config.app {
-            let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
-            let app_id = crate::meat::AppId::new(name, &namespace);
-            match council
-                .write(crate::council::types::RaftRequest::AppSpec {
-                    app_id,
-                    spec: Box::new(spec.clone()),
-                })
-                .await
-            {
+        // The one shared path: namespaces, then permissions, then apps.
+        // Lettuce writes the exact same set for the same config, so manual
+        // apply and GitOps can't diverge (12b.2 T6). A failed write is a
+        // hard stop — half an apply leaves desired state inconsistent.
+        for request in crate::council::config_to_desired_writes(&config) {
+            let describe = describe_write(&request);
+            match council.write(request).await {
                 Ok(_) => {
                     committed += 1;
                     let _ = event_tx
                         .send(ApplyEvent::Progress {
-                            message: format!(
-                                "app {name}: spec committed to the cluster; scheduling"
-                            ),
+                            message: format!("{describe}: committed to the cluster"),
                         })
                         .await;
                 }
                 Err(e) => {
                     let _ = event_tx
                         .send(ApplyEvent::Error {
-                            message: format!("app {name}: raft write failed: {e}"),
+                            message: format!("{describe}: raft write failed: {e}"),
                         })
                         .await;
                     return;
@@ -1073,6 +1090,17 @@ async fn cluster_apply(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
     Sse::new(stream).into_response()
+}
+
+/// A short human-readable label for an apply progress message.
+fn describe_write(request: &crate::council::types::RaftRequest) -> String {
+    use crate::council::types::RaftRequest;
+    match request {
+        RaftRequest::AppSpec { app_id, .. } => format!("app {}", app_id.name),
+        RaftRequest::NamespaceSpec { name, .. } => format!("namespace {name}"),
+        RaftRequest::PermissionSpec { name, .. } => format!("permission {name}"),
+        _ => "resource".to_string(),
+    }
 }
 
 /// Resolve the current leader's API base URL.

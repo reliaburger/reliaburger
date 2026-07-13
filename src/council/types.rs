@@ -192,6 +192,22 @@ pub enum RaftRequest {
         build_id: u64,
         state: crate::bun::build_runner::BuildState,
     },
+    /// Register or update a namespace's resource-quota specification
+    /// (12b.2 T6). Namespaces are declarative desired state: the leader's
+    /// scheduling pass builds its quota ledger from them.
+    NamespaceSpec {
+        name: String,
+        spec: Box<crate::config::NamespaceSpec>,
+    },
+    /// Remove a namespace's quota spec.
+    NamespaceDelete { name: String },
+    /// Register or update a named permission grant (12b.2 T6).
+    PermissionSpec {
+        name: String,
+        spec: Box<crate::config::PermissionSpec>,
+    },
+    /// Remove a named permission grant.
+    PermissionDelete { name: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +314,16 @@ pub struct DesiredState {
     /// pre-12b.2 snapshots load cleanly.
     #[serde(default)]
     pub recovery_epoch: u64,
+    /// Declared namespaces keyed by name (12b.2 T6). Their resource
+    /// budgets feed the scheduler's quota ledger. Uses a `BTreeMap` so
+    /// the JSON snapshot is deterministic. Defaults empty so pre-T6
+    /// snapshots load cleanly.
+    #[serde(default)]
+    pub namespaces: std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
+    /// Declared permission grants keyed by name (12b.2 T6). Defaults
+    /// empty so pre-T6 snapshots load cleanly.
+    #[serde(default)]
+    pub permissions: std::collections::BTreeMap<String, crate::config::PermissionSpec>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -503,6 +529,60 @@ mod tests {
             let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(*req, decoded);
         }
+    }
+
+    #[test]
+    fn namespace_and_permission_raft_requests_round_trip() {
+        let requests = vec![
+            RaftRequest::NamespaceSpec {
+                name: "team-backend".to_string(),
+                spec: Box::new(crate::config::NamespaceSpec {
+                    cpu: Some("8000m".to_string()),
+                    memory: Some("16Gi".to_string()),
+                    gpu: Some(2),
+                    max_apps: Some(50),
+                    max_replicas: Some(200),
+                }),
+            },
+            RaftRequest::NamespaceDelete {
+                name: "team-backend".to_string(),
+            },
+            RaftRequest::PermissionSpec {
+                name: "deployer".to_string(),
+                spec: Box::new(crate::config::PermissionSpec {
+                    actions: vec!["deploy".to_string(), "scale".to_string()],
+                    apps: vec!["web".to_string()],
+                    namespaces: Some(vec!["production".to_string()]),
+                }),
+            },
+            RaftRequest::PermissionDelete {
+                name: "deployer".to_string(),
+            },
+        ];
+        for req in &requests {
+            let json = serde_json::to_string(req).unwrap();
+            let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(*req, decoded);
+        }
+    }
+
+    #[test]
+    fn pre_theme_snapshot_without_namespaces_loads_cleanly() {
+        // A snapshot serialised before T6 added `namespaces`/`permissions`
+        // has neither key. The `#[serde(default)]` on both must fill them
+        // with empty maps rather than fail to deserialise (the #83 loader
+        // is strict, so a missing-field error here would brick startup).
+        let legacy = serde_json::json!({
+            "apps": [],
+            "scheduling": [],
+            "config": {},
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } }
+        });
+        let state: DesiredState = serde_json::from_value(legacy).unwrap();
+        assert!(state.namespaces.is_empty());
+        assert!(state.permissions.is_empty());
+        assert!(state.apps.is_empty());
     }
 
     #[test]

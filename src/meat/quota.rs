@@ -157,6 +157,42 @@ pub fn check_quota(
     Ok(())
 }
 
+/// Build a scheduler `NamespaceQuota` from a declared `NamespaceSpec`.
+///
+/// The config carries human strings (`"8000m"`, `"16Gi"`); the scheduler
+/// wants parsed integers. A budget string that fails to parse is dropped
+/// to `None` (no limit for that resource) rather than failing the whole
+/// pass — `Config::validate` already rejects a malformed budget at apply
+/// time, so a bad value can't reach here in practice.
+pub fn quota_from_spec(name: &str, spec: &crate::config::NamespaceSpec) -> NamespaceQuota {
+    let parse = |s: &Option<String>| {
+        s.as_ref()
+            .and_then(|v| crate::config::types::parse_resource_value(v).ok())
+    };
+    NamespaceQuota {
+        namespace: name.to_string(),
+        max_cpu_millicores: parse(&spec.cpu),
+        max_memory_bytes: parse(&spec.memory),
+        max_gpus: spec.gpu,
+        max_apps: spec.max_apps,
+        max_replicas: spec.max_replicas,
+    }
+}
+
+/// Build a `QuotaLedger` from the desired-state namespace table.
+///
+/// Namespaces with no configured limits still produce a quota entry, but
+/// one that admits everything — harmless and keeps the map complete.
+pub fn ledger_from_namespaces(
+    namespaces: &std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
+) -> QuotaLedger {
+    let quotas = namespaces
+        .iter()
+        .map(|(name, spec)| (name.clone(), quota_from_spec(name, spec)))
+        .collect();
+    QuotaLedger::new(quotas)
+}
+
 /// Per-namespace usage ledger for one scheduling pass.
 ///
 /// The leader plans every app in a single pass. Quotas are *cumulative*
@@ -344,6 +380,50 @@ mod tests {
                 .try_admit("anything", &Resources::new(9_999_999, 0, 0), 100, true)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn quota_from_spec_parses_resource_strings() {
+        let spec = crate::config::NamespaceSpec {
+            cpu: Some("8000m".to_string()),
+            memory: Some("16Gi".to_string()),
+            gpu: Some(2),
+            max_apps: Some(50),
+            max_replicas: Some(200),
+        };
+        let quota = quota_from_spec("team", &spec);
+        assert_eq!(quota.namespace, "team");
+        assert_eq!(quota.max_cpu_millicores, Some(8000));
+        assert_eq!(quota.max_memory_bytes, Some(16 * 1024 * 1024 * 1024));
+        assert_eq!(quota.max_gpus, Some(2));
+        assert_eq!(quota.max_apps, Some(50));
+        assert_eq!(quota.max_replicas, Some(200));
+    }
+
+    #[test]
+    fn ledger_from_namespaces_enforces_declared_budget() {
+        let mut namespaces = std::collections::BTreeMap::new();
+        namespaces.insert(
+            "prod".to_string(),
+            crate::config::NamespaceSpec {
+                cpu: Some("1000m".to_string()),
+                memory: None,
+                gpu: None,
+                max_apps: None,
+                max_replicas: None,
+            },
+        );
+        let mut ledger = ledger_from_namespaces(&namespaces);
+        assert!(!ledger.is_empty());
+        // 2 × 700m = 1400m > 1000m — rejected.
+        let err = ledger.try_admit("prod", &Resources::new(700, 0, 0), 2, true);
+        assert!(matches!(err, Err(QuotaError::CpuExceeded { .. })));
+    }
+
+    #[test]
+    fn empty_namespaces_produce_empty_ledger() {
+        let ledger = ledger_from_namespaces(&std::collections::BTreeMap::new());
+        assert!(ledger.is_empty());
     }
 
     #[test]
