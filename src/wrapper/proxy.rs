@@ -29,6 +29,32 @@ pub struct ProxyState {
     pub client: reqwest::Client,
     /// Per-client-IP token buckets, sharded to avoid a single global lock.
     pub rate_limiter: ShardedRateLimiter,
+    /// Shared drain tracker. When Bun retires an old backend it starts a
+    /// drain here; the proxy bumps that instance's in-flight count around
+    /// each forwarded request so Bun waits for it to reach zero before
+    /// killing the container (DEP5).
+    pub drains: Option<super::draining::SharedDrains>,
+}
+
+/// Decrements a draining backend's in-flight count when the request ends.
+///
+/// This is Rust's RAII pattern: hold the guard for the request's lifetime
+/// and `Drop` releases the count on every exit path, including early
+/// returns and errors. `Drop` can't be `async`, so it spawns a tiny task
+/// to do the (async) decrement — the count is released promptly regardless.
+struct DrainGuard {
+    drains: super::draining::SharedDrains,
+    instance_id: String,
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        let drains = self.drains.clone();
+        let instance_id = std::mem::take(&mut self.instance_id);
+        tokio::spawn(async move {
+            drains.decrement_connections(&instance_id).await;
+        });
+    }
 }
 
 /// A proxy whose listeners are bound but not yet serving.
@@ -58,6 +84,20 @@ pub async fn bind_proxy(
     routing_table: Arc<RwLock<RoutingTable>>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
+    bind_proxy_with_drains(config, routing_table, None, shutdown).await
+}
+
+/// Bind the listeners with a shared drain tracker (DEP5).
+///
+/// Bun passes the same `SharedDrains` it holds so the proxy can report
+/// in-flight requests to draining backends. Otherwise identical to
+/// [`bind_proxy`].
+pub async fn bind_proxy_with_drains(
+    config: WrapperConfig,
+    routing_table: Arc<RwLock<RoutingTable>>,
+    drains: Option<super::draining::SharedDrains>,
+    shutdown: CancellationToken,
+) -> Result<BoundProxy, WrapperError> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(32)
@@ -70,6 +110,7 @@ pub async fn bind_proxy(
         max_connections: config.max_connections,
         client,
         rate_limiter: ShardedRateLimiter::new(),
+        drains,
     });
 
     let http_listener = bind(config.http_port).await?;
@@ -256,7 +297,9 @@ async fn do_proxy(state: &ProxyState, remote: SocketAddr, req: Request<Body>) ->
         };
         (
             route.websocket,
-            route.select_backend().map(|b| b.addr),
+            route
+                .select_backend()
+                .map(|b| (b.instance_id.clone(), b.addr)),
             route.rate_limit.clone(),
         )
     };
@@ -280,9 +323,24 @@ async fn do_proxy(state: &ProxyState, remote: SocketAddr, req: Request<Body>) ->
     }
 
     // Select a backend
-    let backend = match backend {
+    let (instance_id, backend) = match backend {
         Some(b) => b,
         None => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+
+    // A backend can be selected right as it starts draining (routing rebuild
+    // and drain start aren't a single step). Count this request against the
+    // drain so Bun waits for it to finish before killing the container (DEP5).
+    // The guard drops on every return path, decrementing exactly once.
+    let _drain_guard = match &state.drains {
+        Some(drains) if drains.is_draining(&instance_id).await => {
+            drains.increment_connections(&instance_id).await;
+            Some(DrainGuard {
+                drains: drains.clone(),
+                instance_id: instance_id.clone(),
+            })
+        }
+        _ => None,
     };
 
     // WebSocket: delegate to the upgrade handler (no body buffering)
@@ -446,5 +504,131 @@ mod tests {
         assert!(tokens.contains("keep-alive"));
         assert!(tokens.contains("x-custom"));
         assert!(!tokens.contains("content-type"));
+    }
+
+    /// DEP5: the live proxy counts a request to a draining backend against
+    /// the shared drain tracker, so `check_completions` does not finish the
+    /// drain until the in-flight request returns. A slow backend keeps the
+    /// request open long enough to observe the tracker holding the count.
+    #[tokio::test]
+    async fn live_proxy_holds_drain_open_while_a_request_is_in_flight() {
+        use crate::onion::types::BackendInstance;
+        use crate::wrapper::draining::{DrainCommand, DrainTracker, SharedDrains};
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A slow backend: it accepts, waits, then replies. While it waits the
+        // proxy is still forwarding, so the drain must not complete.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = backend.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        // Routing table with one backend, reached over loopback.
+        let mut service_map = crate::onion::service_map::ServiceMap::new();
+        service_map
+            .register_app("web", "default", 80, None)
+            .unwrap();
+        service_map
+            .add_backend(
+                "web",
+                BackendInstance {
+                    instance_id: "default__web-0".to_string(),
+                    node_ip: Ipv4Addr::LOCALHOST,
+                    host_port: backend_port,
+                    healthy: true,
+                },
+            )
+            .unwrap();
+        let mut ingress = std::collections::HashMap::new();
+        ingress.insert(
+            "web".to_string(),
+            crate::config::app::IngressSpec {
+                host: "web.test".to_string(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+        let mut table = RoutingTable::new();
+        table.rebuild(&service_map, &ingress);
+        let routing_table = Arc::new(RwLock::new(table));
+
+        let drains = SharedDrains::new(DrainTracker::new(tokio::sync::mpsc::channel(8).0));
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_drains(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            routing_table,
+            Some(drains.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let http_port = bound.http_addr.port();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        // Mark the backend draining, then fire a request at it through the
+        // proxy. The slow backend keeps the request open for ~300ms.
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: "default__web-0".to_string(),
+                timeout: Duration::from_secs(30),
+            })
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{http_port}/");
+        let req =
+            tokio::spawn(async move { client.get(&url).header("host", "web.test").send().await });
+
+        // Give the request time to reach the backend and register with the
+        // tracker. While it's in flight, the drain must not complete.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            drains.check_completions().await.is_empty(),
+            "drain completed while a request was still in flight"
+        );
+        assert!(
+            drains.is_draining("default__web-0").await,
+            "backend stopped draining while a request was in flight"
+        );
+
+        // Once the request returns, the drain completes on the next sweep.
+        let _ = req.await.unwrap();
+        // Poll: the proxy's decrement runs on a spawned task after the guard
+        // drops, so give it a moment.
+        let mut completed = Vec::new();
+        for _ in 0..50 {
+            completed = drains.check_completions().await;
+            if !completed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            completed,
+            vec!["default__web-0".to_string()],
+            "drain never completed after the request finished"
+        );
+
+        shutdown.cancel();
     }
 }

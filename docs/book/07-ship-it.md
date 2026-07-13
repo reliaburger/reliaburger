@@ -339,6 +339,83 @@ Two things worth noticing. First, the step phase is updated *before* each operat
 
 Second, drain and stop errors are silently ignored (`let _ = ...`). A drain timeout means in-flight requests may get cut off, but the deploy should continue. A stop failure means the old container might linger, but the new one is already serving traffic. These are operator-visible problems, not deploy-blocking failures.
 
+## Wiring drain, surge and rollback into the live path
+
+Everything above describes the deploy *state machine* — the library that decides what should happen. For a long time that machine was the honest part and the live Bun agent was the shortcut. When you redeployed a running app, the agent started the new instances, then reached straight for `kill` on the old ones. No drain. In-flight HTTP and WebSocket traffic got the rug pulled out from under it mid-request. The `DrainTracker` we built in the Wrapper existed, had tests, and was wired to nothing.
+
+Two problems, then, and both are about the gap between "we told it to stop" and "it actually stopped".
+
+### The drain tracker reaches the real proxy
+
+The Wrapper proxy and the Bun agent are separate tasks. They already share one thing: the routing table, behind an `Arc<RwLock<RoutingTable>>`. When the agent rebuilds routes after a deploy, the proxy sees the new table on its next request. We give them a second shared thing — the drain tracker:
+
+```rust
+#[derive(Clone)]
+pub struct SharedDrains(Arc<Mutex<DrainTracker>>);
+```
+
+`Arc<Mutex<T>>` is Rust's way of sharing something mutable between tasks. The `Arc` (atomically reference-counted pointer) hands out cheap clones that all point at the same tracker; the `Mutex` makes sure only one task mutates it at a time. We reach for the *tokio* `Mutex`, not the one in `std`, because a tokio mutex yields the task while it waits for the lock instead of blocking the whole runtime thread. Blocking a runtime thread on a lock is the kind of thing that wedges an async system under load.
+
+The agent owns a `SharedDrains` and hands a clone to the proxy when it binds the ingress listeners. Now the two sides can cooperate. When a request arrives for a backend that's draining, the proxy bumps that instance's in-flight count, and drops it again when the response finishes:
+
+```rust
+let _drain_guard = match &state.drains {
+    Some(drains) if drains.is_draining(&instance_id).await => {
+        drains.increment_connections(&instance_id).await;
+        Some(DrainGuard { drains: drains.clone(), instance_id })
+    }
+    _ => None,
+};
+```
+
+`DrainGuard` is a small RAII type — hold it for the request's lifetime, and its `Drop` releases the count on *every* exit path, including the error returns and the early `502`s. Rust runs `Drop` deterministically when a value leaves scope, so there's no way to forget the decrement. There's one wrinkle: `Drop` can't be `async`, and our decrement is. So the guard's `Drop` spawns a tiny task to do the async release. It runs promptly; the count comes back down.
+
+### Retire means drain, then wait for exit
+
+With the proxy reporting in-flight traffic, the agent's retire path can finally do the right thing:
+
+```rust
+async fn retire_with_drain(&self, ids: &[InstanceId], drain_timeout: Duration) {
+    for id in ids {
+        self.drains.start_drain(&drain_command(id, drain_timeout)).await;
+    }
+    for id in ids {
+        self.drains.wait_drained(&id.0).await;
+        self.stop_and_wait_for_exit(id, drain_timeout).await;
+    }
+}
+```
+
+Before this runs, the rolling finaliser registers the *new* backends and rebuilds the routing table. So by the time we start draining, the proxy is already sending new requests to the fresh instances. The old ones only have to wait out the requests they were already handling. `wait_drained` polls until the instance's in-flight count hits zero or its deadline passes — new traffic already goes elsewhere, so this is a countdown, not a losing battle.
+
+This is also where surge and `max_unavailable` become real rather than aspirational. The rolling path brings every new replica up and healthy *before* it retires a single old one. So the count of serving instances never dips below the target: while the old ones drain, the new ones are already taking traffic. Retiring old instances one at a time, each after its drain, means we never yank more than we've already replaced. A redeploy of a one-replica app with `max_unavailable = 1` still starts the new instance before stopping the old — availability holds.
+
+### Stop must wait for the process to actually exit
+
+The second problem is subtler and it bit the ordinary `relish stop` too. The agent sent SIGTERM, then immediately marked the instance `Stopped` and moved on. But SIGTERM is a *request*. A process can take a moment to flush and exit, or ignore the signal entirely. Recording `Stopped` before the process is gone lets two sources of truth drift apart: the supervisor says "stopped", the container says "still running, still serving". That divergence is exactly the kind of lie that makes an orchestrator untrustworthy.
+
+The fix is to wait for the exit and escalate if it doesn't come:
+
+```rust
+async fn stop_and_wait_for_exit(&self, id: &InstanceId, grace: Duration) {
+    let _ = self.supervisor.grill().stop(id).await;   // SIGTERM
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(self.supervisor.grill().state(id).await, Ok(ContainerState::Stopped)) {
+            return;                                     // clean exit
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !matches!(self.supervisor.grill().state(id).await, Ok(ContainerState::Stopped)) {
+        let _ = self.supervisor.grill().kill(id).await; // SIGKILL
+    }
+}
+```
+
+SIGTERM, poll for the exit up to a grace period, then SIGKILL whatever's left. The `shutdown_all` path had this pattern already; now the ordinary stop and the rolling retire share it. Only once the runtime confirms the exit does the supervisor record `Stopped`. Container state and supervisor state can't diverge, because we don't write the second one down until the first one is true.
+
+The tests pin all three behaviours honestly. One holds an in-flight request open through the live proxy and asserts the drain doesn't complete until the request returns. One drives a rolling redeploy and asserts the new instance's `start` lands before the old instance's `stop` — surge-first, availability preserved. And one makes the mock runtime ignore SIGTERM, then asserts the stop escalates to `kill` rather than lying that the app is down.
+
 ## What we learned
 
 ### Traits earn their keep when you have two implementations

@@ -773,11 +773,15 @@ async fn main() -> anyhow::Result<()> {
     // them, sharing the routing table the agent rebuilds on deploys.
     if config.ingress.enabled {
         let routing_table = agent.routing_table_handle();
+        // Share the agent's drain tracker with the proxy so retiring backends
+        // drain in-flight traffic before the container is killed (DEP5).
+        let drains = agent.drains_handle();
         let wrapper_config = config.ingress.to_wrapper_config();
         let ingress_shutdown = shutdown.clone();
-        let bound = reliaburger::wrapper::proxy::bind_proxy(
+        let bound = reliaburger::wrapper::proxy::bind_proxy_with_drains(
             wrapper_config,
             routing_table,
+            Some(drains),
             ingress_shutdown,
         )
         .await

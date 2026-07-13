@@ -697,7 +697,7 @@ whole theme lands.
   - [x] Numeric overflow rejected (DEP9): `parse_num` uses checked multiplication (a huge
     memory string is a validation error, not a wrapped small value) and the quota arithmetic
     saturates throughout.
-- [ ] **Transactional desired state and deployment** — make instance identity include
+- [x] **Transactional desired state and deployment** — make instance identity include
   namespace/generation/ordinal; apply AppDelete through Raft on cluster stop; consume
   count/generation-aware reconstruction corrections; wait for terminal deploy/stop outcome,
   retry/reschedule failures and rebuild applied state after restart. Move image/init/runtime/
@@ -762,6 +762,35 @@ whole theme lands.
     - [x] `make ci` green (fmt, clippy `-D warnings`, default suite); gated
       `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 7
       (a slow deploy shouldn't freeze the node).
+  - [x] PR 3 — Deploy semantics: drain / surge / rollback and exit-aware stop (DEP5/DEP6).
+    - [x] The library-only `DrainTracker` now governs the live path. A `SharedDrains`
+      (`Arc<tokio::sync::Mutex<DrainTracker>>`) is owned by the agent and handed to the Wrapper
+      proxy (`bind_proxy_with_drains`, `agent.drains_handle()`). The proxy bumps a draining
+      backend's in-flight count around each forwarded request/WebSocket via a `DrainGuard` RAII
+      type whose `Drop` releases the count on every exit path; `select_backend` now carries the
+      `instance_id` so the count keys correctly.
+    - [x] DEP5 rolling retire drains through the live path: `finalise_rolling_deploy` registers
+      the new backends and rebuilds the routing table *first* (so the proxy routes new traffic to
+      the fresh instances), then `retire_with_drain` starts a per-instance drain, waits for
+      in-flight requests to finish (up to `drain_timeout`) via `wait_drained`, and only then does
+      an exit-aware stop. Surge-first ordering keeps the serving count from dipping below
+      `replicas - max_unavailable`; the existing unhealthy-replica auto-rollback path is
+      preserved.
+    - [x] DEP6 exit-aware stop: `stop_and_wait_for_exit` (SIGTERM → poll for exit up to
+      `STOP_GRACE_SECS` → SIGKILL) is shared by `stop_app`, the rolling retire and `shutdown_all`.
+      The supervisor records `Stopped` only after the runtime confirms the exit, so container and
+      supervisor state cannot diverge.
+    - [x] Failing-first tests: `retire_waits_for_in_flight_request_before_kill` and the live
+      `live_proxy_holds_drain_open_while_a_request_is_in_flight` (a real bound proxy holds an
+      in-flight request open and the drain does not complete until it returns);
+      `rolling_redeploy_never_drops_below_target_availability` (new `start` precedes old
+      `stop`/`kill`); `stop_escalates_to_kill_when_process_ignores_sigterm` and
+      `stop_reports_stopped_after_exit_without_kill` (`MockGrill::set_ignore_stop` simulates a
+      process that refuses SIGTERM). All fail against the pre-PR kill-immediately path.
+    - [x] `make ci` green (fmt, clippy `-D warnings`, 2405-test default suite); gated
+      `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 7
+      (wiring drain/surge/rollback into the live path, why stop must wait for exit). Theme
+      complete.
 - [ ] **Complete declarative resources** — validate and apply apps, jobs, builds, namespaces
   and permissions through the same local/Raft/GitOps path; enforce namespace and permission
   resources plus build scope; reject or remove every parsed field that cannot affect the
