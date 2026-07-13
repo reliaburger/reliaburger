@@ -59,16 +59,30 @@ pub fn council_info(snapshot: &MembershipSnapshot, port_offset: i32) -> (u64, Co
 /// (gossip doesn't carry per-node registry ports — a documented
 /// constraint). Shared by the heal loop, P2P image pulls, and the
 /// pull-through cache, so all three address peers identically.
+///
+/// The registry runs over TLS when the node has an mTLS identity (REG4),
+/// so peers are addressed as `https://…`; without an identity it's plain
+/// `http://`. Every caller derives its peers through this one function, so
+/// the scheme stays consistent with how the local registry actually serves.
 pub fn pickle_peers(
     members: &[MembershipSnapshot],
     registry_port: u16,
+) -> Vec<crate::pickle::replication::Peer> {
+    pickle_peers_scheme(members, registry_port, "http")
+}
+
+/// [`pickle_peers`] with an explicit URL scheme (`"http"` or `"https"`).
+pub fn pickle_peers_scheme(
+    members: &[MembershipSnapshot],
+    registry_port: u16,
+    scheme: &str,
 ) -> Vec<crate::pickle::replication::Peer> {
     members
         .iter()
         .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
         .map(|m| crate::pickle::replication::Peer {
             node_id: raft_id_from_name(&m.node_id.0),
-            base_url: format!("http://{}:{registry_port}", m.address.ip()),
+            base_url: format!("{scheme}://{}:{registry_port}", m.address.ip()),
         })
         .collect()
 }

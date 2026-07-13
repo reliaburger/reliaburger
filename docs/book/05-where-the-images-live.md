@@ -318,6 +318,92 @@ The July 2026 review found most of this chapter's machinery had no production ca
 
 The same pass fixed `relish build` (X1), whose context upload had been pointed at port 9117 — the Bun *API* port, which has no `/v2` routes — since the day it was written. It now uploads to the actual registry port, and `/v1/build` genuinely runs `buildah bud` and pushes the result back through the registry (or says plainly that it needs `buildah`, instead of returning an unconditional 501).
 
+## Making the registry durable (and safe to expose)
+
+The wiring pass connected the registry to the cluster, but a later review pointed at a harder question: is any of it actually *durable*, and is it safe to run outside a trusted network? The answer, honestly, was no on both counts. A push could tear on a crash, two nodes could serve different views of the same catalogue, and the listener spoke plain HTTP with no authentication at all. Six fixes closed the gap.
+
+### fsync, then rename, then fsync again
+
+"Atomic rename is your friend" is true, but incomplete. A rename is only atomic once the bytes it points at have actually reached the disk. The old `write_blob` did `std::fs::write` straight to the final path — no temp file, no fsync — so a crash mid-write left a half-written blob at exactly the name a reader trusts. And the catalogue's temp-and-rename used a *predictable* temp name (`catalog.json.tmp`), so two concurrent writers could stamp on each other's temp file.
+
+The durable write is a fixed little dance:
+
+```rust
+fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".{}.{:032x}.tmp", /* file name */, rand::random::<u128>()));
+    { let mut file = std::fs::File::create(&tmp)?; file.write_all(data)?; file.sync_all()?; }
+    std::fs::rename(&tmp, path)?;
+    if let Ok(dir) = std::fs::File::open(parent) { let _ = dir.sync_all(); }
+    Ok(())
+}
+```
+
+Four steps, in order: write to a *unique* temp (the random suffix means two writers never collide), `sync_all` the file so its bytes are on disk, rename over the target, then `sync_all` the *directory* so the rename itself survives a crash. That last fsync is the one everyone forgets. A rename is a change to the directory's metadata; without syncing the directory, the OS is free to lose the rename even though the file data is safe. You'd reboot to find the temp file present and the final name missing.
+
+Rust makes the "sync the directory" step feel odd — you `File::open` a *directory* and call `sync_all` on it. On Unix a directory is just another file descriptor, and syncing it flushes the directory entry. (On platforms where that isn't meaningful, the call is harmless.)
+
+### Don't trust a cached blob — re-verify it
+
+A blob on disk isn't automatically a *correct* blob. It could have been truncated by the very crash we just protected against, or rotted on a failing disk. The old peer-pull code short-circuited on `store.has_blob(digest)` — existence, not correctness. So a truncated cache entry would be served forever as if it were the real layer.
+
+`revalidate_blob` re-hashes the bytes and, if they no longer match, deletes them so the next pull refetches clean:
+
+```rust
+pub fn revalidate_blob(&self, digest: &Digest) -> bool {
+    let Ok(data) = std::fs::read(self.blob_path(digest)) else { return false };
+    if compute_sha256(&data).as_str() == digest.as_str() {
+        true
+    } else {
+        let _ = std::fs::remove_file(self.blob_path(digest)); // corrupt: drop it
+        false
+    }
+}
+```
+
+The deploy path (`image_available_locally`) and the peer pull both call this instead of `has_blob`. Re-hashing every blob on every read would be wasteful, so we do it where it matters: before trusting a cache for a deploy, and before short-circuiting a peer pull.
+
+### One rootfs per content, not per tag
+
+Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{repo}/{tag}/`, and unpacking *cleared and recreated* that directory. Now picture a tag move — `web:v1` re-pointed at new content — while a container is running out of the old rootfs. The re-extract does `remove_dir_all` on the directory the running container is living in. Two concurrent pushes to the same tag race the same way.
+
+The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory; the same content is idempotent (re-extracting rebuilds an identical tree in the same place). A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
+
+### One authoritative catalogue
+
+Pickle has two catalogues: the council's Raft-replicated `manifest_catalog`, and each node's local `PickleState::catalog`. The push path proposes to Raft; the read path — `manifest_get` and `tags_list` — read the *local* one. So a manifest a peer committed to Raft was invisible on a node that hadn't received the original PUT, until a heal tick happened to reconcile it. Push on node A, `docker pull` from node B, get a 404.
+
+The fix is a one-liner in spirit: read the authoritative catalogue. Both handlers now call `catalog_snapshot()`, which returns the council's Raft catalogue when clustered and the local one otherwise — exactly what the P2P pull path already used. The moment Raft applies a peer's commit, every node's tag list and manifest lookup see it.
+
+### Authenticate the writes, serve over TLS
+
+The registry listener was plain HTTP with no auth — fine behind a firewall, a liability anywhere else. Rather than invent a registry-specific credential, it reuses the cluster's existing `sesame::auth`: the same bearer tokens and internal service token that guard the agent API. Reads stay open (peers and clients pull freely); writes require a principal with at least `Deployer` role, or the service token that node-to-node replication presents. A fresh, tokenless cluster keeps the same fail-open bootstrap window the API uses, so single-node push works before an operator mints the first token.
+
+TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
+
+Two resource limits ride along. Storage **quotas** cap bytes per repository and across the whole registry (`0` means unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings — a registry with no quota and no session expiry is a disk-exhaustion waiting to happen.
+
+One more thing moved off the hot path: whole-blob hashing. Verifying a digest re-hashes the entire blob, which for a 500 MB layer is real CPU work. Running it on a Tokio worker would stall every other request on that thread, so it now runs under `spawn_blocking`:
+
+```rust
+tokio::task::spawn_blocking(move || store.write_blob(&data, &digest)).await?
+```
+
+The `move` closure takes ownership of the bytes, so nothing is borrowed across the `.await` — the borrow checker's way of proving the data outlives the blocking task.
+
+### Refusing an attacker's redirect
+
+Peer replication follows the OCI upload dance: POST to start an upload, read the `Location` header, PUT the blob there. The old code followed whatever absolute URL the peer returned. A compromised peer could therefore hand back `Location: http://attacker.example/collect` and make *this* node PUT the blob bytes — which may be a secret-bearing image — straight to the attacker. That's a textbook SSRF.
+
+`resolve_same_origin_location` constrains the redirect to the peer's own origin: a relative path is resolved against the peer's base URL; an absolute URL is accepted only if its scheme, host, and port all match; a protocol-relative `//host/…` (which quietly swaps the host) is refused outright. The PUT never leaves for anywhere but the peer we were already talking to. Peer body reads are bounded too — a hard cap and the request timeout, so a hostile peer can't stream an unbounded body to exhaust memory or hold the connection open with a slow trickle.
+
+### Honest push semantics
+
+The last one is about telling the truth. A push commits locally and to Raft, then the heal loop drives it up to `[images] redundancy` copies afterwards. So what should a push *report*? Not "durable" — it isn't yet. The manifest PUT now returns `201 Created` with an `OCI-Replication: pending` header when the commit is authoritative but replication is still owed, and a distinct `202 Accepted` with `OCI-Replication: raft-uncommitted` when a council member's Raft proposal failed (the bytes are stored, but the cluster catalogue doesn't know yet). A caller reading headers can tell acceptance from durability.
+
+The GC arbiter got stricter too. It used to recheck only sole-copy protection at deletion time. Now it rechecks against the *full catalogue reference set* immediately before approving: a blob any manifest still references — its config, a layer, or the manifest blob itself — is never approved for deletion, even if the nominating node saw it as an orphan when it built the report. A fresh push can re-reference a blob between nomination and approval; this serialised recheck is the last chance to refuse, and it takes it.
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.

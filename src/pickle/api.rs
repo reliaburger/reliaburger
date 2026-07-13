@@ -7,15 +7,24 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, head, patch, post, put};
+use axum::routing::get;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use super::registry_auth::{QuotaConfig, UploadSessions, WriteDenied};
 use super::store::{BlobStore, compute_sha256};
 use super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
+use crate::sesame::auth::AuthState;
+
+/// Maximum bytes buffered for a single registry request (REG4).
+///
+/// Layers are pushed monolithically or chunked; each PATCH/PUT body is
+/// bounded so one request can't buffer an unbounded blob in memory. Large
+/// layers arrive as multiple bounded chunks.
+const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 
 /// Shared state for Pickle API handlers.
 #[derive(Clone)]
@@ -32,6 +41,105 @@ pub struct PickleState {
     /// Where to persist the catalog after each mutation, so image
     /// metadata survives restarts. `None` disables persistence (tests).
     pub persist_path: Option<std::path::PathBuf>,
+    /// Authentication for registry *writes* (REG4). Reuses the cluster's
+    /// token store + service token — the same material the agent API uses.
+    /// `None` disables the auth gate (single-node/tests): writes are open.
+    pub auth: Option<AuthState>,
+    /// Storage quotas (REG4). Default is unlimited.
+    pub quota: QuotaConfig,
+    /// Chunked upload-session tracking for TTL expiry (REG8).
+    pub sessions: UploadSessions,
+}
+
+impl PickleState {
+    /// Extract the Bearer token from an axum request's headers, if any.
+    fn bearer(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_string)
+    }
+
+    /// Authorise a registry write (REG4). `Ok(())` means the request may
+    /// proceed; `Err(response)` is the 401/403 to return. No auth
+    /// configured means the gate is off (writes open).
+    async fn authorise_write(&self, headers: &HeaderMap) -> Result<(), Response> {
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        let bearer = Self::bearer(headers);
+        match super::registry_auth::authorise_write(auth, bearer.as_deref()).await {
+            Ok(()) => Ok(()),
+            Err(WriteDenied::Unauthenticated) => Err(oci_error(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "registry write requires authentication".to_string(),
+            )),
+            Err(WriteDenied::Forbidden) => Err(oci_error(
+                StatusCode::FORBIDDEN,
+                "DENIED",
+                "insufficient permissions to push to the registry".to_string(),
+            )),
+        }
+    }
+
+    /// The current stored size of a repository and of the whole registry,
+    /// from the authoritative catalogue (REG4 quota accounting).
+    async fn stored_sizes(&self, repository: &str) -> (u64, u64) {
+        let catalog = self.catalog_snapshot().await;
+        let mut repo_bytes = 0u64;
+        let mut total_bytes = 0u64;
+        for (_, manifest) in &catalog.manifests {
+            total_bytes = total_bytes.saturating_add(manifest.total_size);
+            if manifest.repository == repository {
+                repo_bytes = repo_bytes.saturating_add(manifest.total_size);
+            }
+        }
+        (repo_bytes, total_bytes)
+    }
+
+    /// Enforce the storage quota for admitting `incoming` bytes into
+    /// `repository` (REG4). `Ok(())` when unlimited or within limits;
+    /// `Err(response)` is the 413 to return.
+    async fn enforce_quota(&self, repository: &str, incoming: u64) -> Result<(), Response> {
+        if self.quota.is_unlimited() {
+            return Ok(());
+        }
+        let (repo_current, total_current) = self.stored_sizes(repository).await;
+        match super::registry_auth::check_quota(
+            &self.quota,
+            repository,
+            incoming,
+            repo_current,
+            total_current,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(oci_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "DENIED",
+                e.to_string(),
+            )),
+        }
+    }
+}
+
+/// Hash-and-store a blob off the async runtime (REG4).
+///
+/// `write_blob` re-hashes the whole blob to verify the digest — CPU-bound
+/// work that must not run on a Tokio worker, or a large push stalls the
+/// executor. `spawn_blocking` moves it to the blocking pool; the `move`
+/// closure takes ownership of the bytes so nothing is borrowed across the
+/// `.await`.
+async fn store_blob_off_runtime(
+    state: &PickleState,
+    data: Vec<u8>,
+    digest: Digest,
+) -> Result<(), super::types::PickleError> {
+    let store = Arc::clone(&state.store);
+    tokio::task::spawn_blocking(move || store.write_blob(&data, &digest))
+        .await
+        .map_err(|e| super::types::PickleError::CatalogPersist(format!("hash task failed: {e}")))?
 }
 
 impl PickleState {
@@ -46,16 +154,40 @@ impl PickleState {
     }
 }
 
+/// The durability a push achieved (REG7/D11).
+///
+/// The registry commits a push locally and to Raft, then the heal loop
+/// drives it up to the configured replica count. A push therefore reports
+/// what it *actually* achieved at commit time, never a durable-redundancy
+/// success it hasn't reached yet:
+///
+/// - `Authoritative` — committed to the cluster's Raft catalogue (or
+///   locally in single-node mode). Replication to the configured replica
+///   count is still pending and the heal loop will complete it.
+/// - `RaftUncommitted` — this node is a council member but the Raft
+///   proposal failed; the bytes are stored and the local catalogue is
+///   persisted, but the cluster catalogue does **not** yet know the push.
+///   The push is reported as accepted-but-not-durable, not a clean success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitOutcome {
+    Authoritative,
+    RaftUncommitted,
+}
+
 /// Record a committed manifest: apply to the local catalog, persist it
 /// to disk, and — when this node is a council member — propose it to
 /// Raft so the cluster-wide catalog tracks the real holder.
 ///
-/// The Raft propose is best-effort: workers outside the council can't
-/// write to Raft yet (proposal forwarding arrives with the scheduler
-/// wiring), and a failed propose must not fail the push — the local
-/// catalog is already persisted and the replication loop reconciles
-/// holder sets from it later.
-pub(crate) async fn record_commit(state: &PickleState, manifest: ImageManifest, tag: String) {
+/// Returns the [`CommitOutcome`] so the caller can reflect it honestly
+/// (D11). A failed Raft proposal on a council member is surfaced, not
+/// silently swallowed: the local catalogue is still persisted (so a
+/// restart and the heal loop can recover), but the push did not reach the
+/// authoritative catalogue.
+pub(crate) async fn record_commit(
+    state: &PickleState,
+    manifest: ImageManifest,
+    tag: String,
+) -> CommitOutcome {
     let commit = ManifestCommit {
         manifest,
         tag,
@@ -77,35 +209,153 @@ pub(crate) async fn record_commit(state: &PickleState, manifest: ImageManifest, 
         .await;
     }
 
-    if let Some(council) = &state.council
-        && let Err(e) = council
+    if let Some(council) = &state.council {
+        if let Err(e) = council
             .write(crate::council::types::RaftRequest::ManifestCommit(commit))
             .await
-    {
-        eprintln!(
-            "pickle: manifest commit not written to raft ({e}); \
-             local catalog persisted, replication will reconcile"
-        );
+        {
+            eprintln!(
+                "pickle: manifest commit not written to raft ({e}); \
+                 local catalog persisted, replication will reconcile"
+            );
+            return CommitOutcome::RaftUncommitted;
+        }
+        return CommitOutcome::Authoritative;
     }
+    // Single-node mode: the local catalogue *is* authoritative.
+    CommitOutcome::Authoritative
 }
 
 /// Build the OCI Distribution API router.
+///
+/// Repository names can be multi-segment (`team/app`, `cache/<host>/<repo>`
+/// — REG8). Axum can't put a wildcard *before* a fixed suffix like
+/// `/blobs/…`, so instead of one route per shape we capture the whole path
+/// after `/v2/` with a trailing wildcard and split off the OCI operation
+/// suffix ourselves in [`dispatch_v2`]. The repository name is then
+/// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
     Router::new()
         .route("/v2/", get(v2_check))
-        .route("/v2/{name}/blobs/{digest}", head(blob_head).get(blob_get))
-        .route("/v2/{name}/blobs/uploads/", post(blob_upload_initiate))
         .route(
-            "/v2/{name}/blobs/uploads/{upload_id}",
-            patch(blob_upload_patch).put(blob_upload_complete),
+            "/v2/{*rest}",
+            get(dispatch_v2)
+                .head(dispatch_v2)
+                .post(dispatch_v2)
+                .patch(dispatch_v2)
+                .put(dispatch_v2),
         )
-        .route(
-            "/v2/{name}/manifests/{reference}",
-            put(manifest_put).get(manifest_get),
-        )
-        .route("/v2/{name}/tags/list", get(tags_list))
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024)) // 512 MB for large layers
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state)
+}
+
+/// The parsed shape of an OCI `/v2/{name}/…` request.
+enum V2Route {
+    /// `/v2/{name}/blobs/{digest}`
+    Blob { name: String, digest: String },
+    /// `/v2/{name}/blobs/uploads/`
+    UploadInitiate { name: String },
+    /// `/v2/{name}/blobs/uploads/{upload_id}`
+    UploadSession { name: String, upload_id: String },
+    /// `/v2/{name}/manifests/{reference}`
+    Manifest { name: String, reference: String },
+    /// `/v2/{name}/tags/list`
+    Tags { name: String },
+}
+
+/// Parse the path after `/v2/` (with a leading `/` stripped) into a
+/// [`V2Route`], recovering the multi-segment repository name (REG8).
+///
+/// The repository name is everything before the recognised operation
+/// suffix. `rest` never contains the leading `/v2/` — axum's `{*rest}`
+/// captures only what follows.
+fn parse_v2_route(rest: &str) -> Option<V2Route> {
+    // `/v2/{name}/blobs/uploads/` and `…/uploads/{id}`
+    if let Some((name, tail)) = rest.rsplit_once("/blobs/uploads/") {
+        if tail.is_empty() {
+            return Some(V2Route::UploadInitiate {
+                name: name.to_string(),
+            });
+        }
+        // A further `/` in the upload id shape isn't expected; take the tail.
+        return Some(V2Route::UploadSession {
+            name: name.to_string(),
+            upload_id: tail.to_string(),
+        });
+    }
+    if let Some((name, digest)) = rest.rsplit_once("/blobs/") {
+        return Some(V2Route::Blob {
+            name: name.to_string(),
+            digest: digest.to_string(),
+        });
+    }
+    if let Some((name, reference)) = rest.rsplit_once("/manifests/") {
+        return Some(V2Route::Manifest {
+            name: name.to_string(),
+            reference: reference.to_string(),
+        });
+    }
+    if let Some(name) = rest.strip_suffix("/tags/list") {
+        return Some(V2Route::Tags {
+            name: name.to_string(),
+        });
+    }
+    None
+}
+
+/// Dispatch every `/v2/{name}/…` request, recovering the multi-segment
+/// repository name and routing to the concrete handler (REG8).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_v2(
+    State(state): State<PickleState>,
+    method: axum::http::Method,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    headers: HeaderMap,
+    Query(init_query): Query<InitiateUploadQuery>,
+    Query(complete_query): Query<CompleteUploadQueryOpt>,
+    body: axum::body::Bytes,
+) -> Response {
+    use axum::http::Method;
+
+    // Recover the path after `/v2/`. `OriginalUri` preserves percent
+    // encoding; we only split on literal ASCII markers, so a repository
+    // name that legitimately contains those markers is unaffected.
+    let path = uri.path();
+    let Some(rest) = path.strip_prefix("/v2/") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(route) = parse_v2_route(rest) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match (method, route) {
+        (Method::HEAD, V2Route::Blob { name, digest }) => blob_head(&state, &name, &digest).await,
+        (Method::GET, V2Route::Blob { name, digest }) => blob_get(&state, &name, &digest).await,
+        (Method::POST, V2Route::UploadInitiate { name }) => {
+            blob_upload_initiate(&state, &name, init_query, &headers, body).await
+        }
+        (Method::PATCH, V2Route::UploadSession { name, upload_id }) => {
+            blob_upload_patch(&state, &name, &upload_id, &headers, body).await
+        }
+        (Method::PUT, V2Route::UploadSession { name, upload_id }) => {
+            let Some(digest) = complete_query.digest else {
+                return oci_error(
+                    StatusCode::BAD_REQUEST,
+                    "DIGEST_INVALID",
+                    "upload completion requires a digest query parameter".to_string(),
+                );
+            };
+            blob_upload_complete(&state, &name, &upload_id, &digest, &headers, body).await
+        }
+        (Method::PUT, V2Route::Manifest { name, reference }) => {
+            manifest_put(&state, &name, &reference, &headers, body).await
+        }
+        (Method::GET, V2Route::Manifest { name, reference }) => {
+            manifest_get(&state, &name, &reference).await
+        }
+        (Method::GET, V2Route::Tags { name }) => tags_list(&state, &name).await,
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,11 +372,8 @@ async fn v2_check() -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// `HEAD /v2/{name}/blobs/{digest}` — check if a blob exists.
-async fn blob_head(
-    State(state): State<PickleState>,
-    Path((_name, digest_str)): Path<(String, String)>,
-) -> Response {
-    let Ok(digest) = Digest::new(&digest_str) else {
+async fn blob_head(state: &PickleState, _name: &str, digest_str: &str) -> Response {
+    let Ok(digest) = Digest::new(digest_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
@@ -148,11 +395,8 @@ async fn blob_head(
 }
 
 /// `GET /v2/{name}/blobs/{digest}` — download a blob.
-async fn blob_get(
-    State(state): State<PickleState>,
-    Path((_name, digest_str)): Path<(String, String)>,
-) -> Response {
-    let Ok(digest) = Digest::new(&digest_str) else {
+async fn blob_get(state: &PickleState, _name: &str, digest_str: &str) -> Response {
+    let Ok(digest) = Digest::new(digest_str) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
@@ -199,11 +443,17 @@ struct InitiateUploadQuery {
 /// the entire blob is in the POST body. Without the digest param, this
 /// starts a chunked upload session.
 async fn blob_upload_initiate(
-    State(state): State<PickleState>,
-    Path(name): Path<String>,
-    Query(query): Query<InitiateUploadQuery>,
+    state: &PickleState,
+    name: &str,
+    query: InitiateUploadQuery,
+    headers_in: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Registry writes require a principal once auth is configured (REG4).
+    if let Err(response) = state.authorise_write(headers_in).await {
+        return response;
+    }
+
     // Monolithic upload: body + digest in one POST
     if let Some(ref digest_str) = query.digest
         && !body.is_empty()
@@ -211,7 +461,11 @@ async fn blob_upload_initiate(
         let Ok(digest) = Digest::new(digest_str) else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        match state.store.write_blob(&body, &digest) {
+        // Quota: a monolithic blob is admitted whole (REG4).
+        if let Err(response) = state.enforce_quota(name, body.len() as u64).await {
+            return response;
+        }
+        match store_blob_off_runtime(state, body.to_vec(), digest.clone()).await {
             Ok(()) => {
                 let mut headers = HeaderMap::new();
                 headers.insert(
@@ -230,9 +484,13 @@ async fn blob_upload_initiate(
         }
     }
 
-    // Chunked upload: start a session
+    // Chunked upload: start a session and register it for TTL tracking.
     match state.store.initiate_upload().await {
         Ok(upload_id) => {
+            state
+                .sessions
+                .register(&upload_id, name, std::time::SystemTime::now())
+                .await;
             let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
             let mut headers = HeaderMap::new();
             headers.insert("location", location.parse().expect("ASCII header value"));
@@ -249,11 +507,31 @@ async fn blob_upload_initiate(
 
 /// `PATCH /v2/{name}/blobs/uploads/{upload_id}` — upload a chunk.
 async fn blob_upload_patch(
-    State(state): State<PickleState>,
-    Path((name, upload_id)): Path<(String, String)>,
+    state: &PickleState,
+    name: &str,
+    upload_id: &str,
+    headers_in: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    match state.store.write_upload_chunk(&upload_id, &body).await {
+    if let Err(response) = state.authorise_write(headers_in).await {
+        return response;
+    }
+    // An upload session that outlived its TTL is refused and swept (REG8),
+    // so an abandoned push can't dribble chunks into a stale temp forever.
+    let now = std::time::SystemTime::now();
+    if !state
+        .sessions
+        .touch(upload_id, body.len() as u64, now)
+        .await
+    {
+        state.store.cancel_upload(upload_id).await;
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_UNKNOWN",
+            "upload session unknown or expired".to_string(),
+        );
+    }
+    match state.store.write_upload_chunk(upload_id, &body).await {
         Ok(total) => {
             let mut headers = HeaderMap::new();
             // The OCI distribution spec requires a Location on every
@@ -286,19 +564,27 @@ async fn blob_upload_patch(
     }
 }
 
-#[derive(Deserialize)]
-struct CompleteUploadQuery {
-    digest: String,
+/// Query params for PUT upload completion. `digest` is optional here so
+/// the dispatcher can return a clean OCI error when it's missing, rather
+/// than axum's opaque 400.
+#[derive(Deserialize, Default)]
+struct CompleteUploadQueryOpt {
+    digest: Option<String>,
 }
 
 /// `PUT /v2/{name}/blobs/uploads/{upload_id}?digest=` — complete upload.
 async fn blob_upload_complete(
-    State(state): State<PickleState>,
-    Path((_name, upload_id)): Path<(String, String)>,
-    Query(query): Query<CompleteUploadQuery>,
+    state: &PickleState,
+    _name: &str,
+    upload_id: &str,
+    digest_str: &str,
+    headers_in: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let Ok(digest) = Digest::new(&query.digest) else {
+    if let Err(response) = state.authorise_write(headers_in).await {
+        return response;
+    }
+    let Ok(digest) = Digest::new(digest_str) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid digest"})),
@@ -308,7 +594,7 @@ async fn blob_upload_complete(
 
     // If there's a body with the PUT, write it first
     if !body.is_empty() {
-        match state.store.write_upload_chunk(&upload_id, &body).await {
+        match state.store.write_upload_chunk(upload_id, &body).await {
             Ok(_) => {}
             Err(super::types::PickleError::InvalidUploadId(_)) => {
                 return StatusCode::BAD_REQUEST.into_response();
@@ -317,7 +603,10 @@ async fn blob_upload_complete(
         }
     }
 
-    match state.store.complete_upload(&upload_id, &digest).await {
+    let result = state.store.complete_upload(upload_id, &digest).await;
+    // Whatever the outcome, the session is finished (REG8).
+    state.sessions.complete(upload_id).await;
+    match result {
         Ok(()) => {
             let mut headers = HeaderMap::new();
             // Location of the created blob (OCI distribution spec).
@@ -452,16 +741,36 @@ fn check_descriptor(
 /// sensible. Only then are the raw bytes stored as a content-addressed
 /// blob and the catalogue commit recorded.
 async fn manifest_put(
-    State(state): State<PickleState>,
-    Path((name, reference)): Path<(String, String)>,
-    headers: HeaderMap,
+    state: &PickleState,
+    name: &str,
+    reference: &str,
+    headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let manifest_digest = compute_sha256(&body);
+    // Registry writes require a principal once auth is configured (REG4).
+    if let Err(response) = state.authorise_write(headers).await {
+        return response;
+    }
+
+    // Hash the manifest bytes off the async runtime (REG4) — small for a
+    // manifest, but this keeps the whole write path off the executor.
+    let manifest_digest = {
+        let bytes = body.clone();
+        match tokio::task::spawn_blocking(move || compute_sha256(&bytes)).await {
+            Ok(digest) => digest,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "manifest hashing failed"})),
+                )
+                    .into_response();
+            }
+        }
+    };
 
     // A digest in the reference position (docker pushes sub-manifests
     // as `PUT …/manifests/sha256:…`) must name the bytes it carries.
-    if let Ok(reference_digest) = Digest::new(&reference)
+    if let Ok(reference_digest) = Digest::new(reference)
         && reference_digest != manifest_digest
     {
         return oci_error(
@@ -528,7 +837,7 @@ async fn manifest_put(
                 media_type: media_type.clone(),
             },
             layers: sub_manifests,
-            repository: name.clone(),
+            repository: name.to_string(),
             tags: std::collections::BTreeSet::new(),
             total_size,
             pushed_at: std::time::SystemTime::now(),
@@ -559,7 +868,7 @@ async fn manifest_put(
             digest: manifest_digest.clone(),
             config,
             layers,
-            repository: name.clone(),
+            repository: name.to_string(),
             tags: std::collections::BTreeSet::new(),
             total_size,
             pushed_at: std::time::SystemTime::now(),
@@ -574,17 +883,23 @@ async fn manifest_put(
         );
     };
 
-    // Validation passed: store the exact bytes (content addressing
-    // must see what the client sent, not a re-serialisation) and
-    // commit.
-    if let Err(e) = state.store.write_blob(&body, &manifest_digest) {
+    // Quota: charge the whole image (manifest + config + layers) against
+    // the repository and registry ceilings before committing (REG4).
+    if let Err(response) = state.enforce_quota(name, manifest.total_size).await {
+        return response;
+    }
+
+    // Validation passed: store the exact bytes (content addressing must
+    // see what the client sent, not a re-serialisation) off the runtime,
+    // then commit.
+    if let Err(e) = store_blob_off_runtime(state, body.to_vec(), manifest_digest.clone()).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to store manifest blob: {e}")})),
         )
             .into_response();
     }
-    record_commit(&state, manifest, reference.clone()).await;
+    let outcome = record_commit(state, manifest, reference.to_string()).await;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -594,20 +909,40 @@ async fn manifest_put(
             .parse()
             .expect("ASCII header value"),
     );
-    (StatusCode::CREATED, headers).into_response()
+    // Honest push semantics (REG7/D11): the manifest is committed, but
+    // replication to the configured replica count is driven by the heal
+    // loop afterwards. Advertise that so a client (or an operator reading
+    // headers) never mistakes acceptance for full redundancy. A Raft
+    // proposal that failed on a council member is reported distinctly —
+    // the push is accepted locally but is not yet authoritative.
+    match outcome {
+        CommitOutcome::Authoritative => {
+            headers.insert(
+                "oci-replication",
+                "pending".parse().expect("ASCII header value"),
+            );
+            (StatusCode::CREATED, headers).into_response()
+        }
+        CommitOutcome::RaftUncommitted => {
+            headers.insert(
+                "oci-replication",
+                "raft-uncommitted".parse().expect("ASCII header value"),
+            );
+            // 202 Accepted: stored and persisted, but not yet in the
+            // authoritative cluster catalogue — not a clean 201.
+            (StatusCode::ACCEPTED, headers).into_response()
+        }
+    }
 }
 
 /// `GET /v2/{name}/manifests/{reference}` — pull a manifest.
 ///
 /// `reference` can be a tag (e.g. `latest`) or a digest (e.g. `sha256:abc...`).
 /// Docker pulls sub-manifests by digest when resolving manifest lists.
-async fn manifest_get(
-    State(state): State<PickleState>,
-    Path((_name, reference)): Path<(String, String)>,
-) -> Response {
+async fn manifest_get(state: &PickleState, _name: &str, reference: &str) -> Response {
     // If the reference looks like a digest, try reading it directly
     // from the blob store (Docker pulls sub-manifests by digest).
-    if let Ok(digest) = Digest::new(&reference)
+    if let Ok(digest) = Digest::new(reference)
         && let Ok(data) = state.store.read_blob(&digest)
     {
         let content_type = detect_manifest_content_type(&data);
@@ -623,9 +958,13 @@ async fn manifest_get(
         return (StatusCode::OK, headers, data).into_response();
     }
 
-    // Try the catalog by tag
-    let catalog = state.catalog.read().await;
-    let manifest = catalog.get_manifest_by_tag(&_name, &reference);
+    // Try the catalogue by tag. Read the *authoritative* catalogue (the
+    // council's Raft-replicated one when clustered, local otherwise) so a
+    // manifest committed by a peer — or by a non-council push forwarded to
+    // Raft — is visible here even before a heal tick reconciles the local
+    // projection (REG2).
+    let catalog = state.catalog_snapshot().await;
+    let manifest = catalog.get_manifest_by_tag(_name, reference);
 
     match manifest {
         Some(m) => match state.store.read_blob(&m.digest) {
@@ -663,16 +1002,16 @@ fn detect_manifest_content_type(data: &[u8]) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// `GET /v2/{name}/tags/list` — list tags for a repository.
-async fn tags_list(
-    State(state): State<PickleState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let catalog = state.catalog.read().await;
-    let tags = catalog.tags_for_repository(&name);
+async fn tags_list(state: &PickleState, name: &str) -> Response {
+    // Read the authoritative catalogue (REG2): a repository a peer pushed
+    // must list its tags here too, not only where the PUT landed.
+    let catalog = state.catalog_snapshot().await;
+    let tags = catalog.tags_for_repository(name);
     Json(serde_json::json!({
         "name": name,
         "tags": tags,
     }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -695,6 +1034,9 @@ mod tests {
             node_raft_id: 7,
             council: None,
             persist_path: None,
+            auth: None,
+            quota: QuotaConfig::default(),
+            sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
         };
         (state, dir)
     }
@@ -1294,5 +1636,168 @@ mod tests {
             resp.headers()["content-length"].to_str().unwrap(),
             data.len().to_string()
         );
+    }
+
+    /// REG7/D11: a single-node push commits authoritatively and advertises
+    /// that replication is still pending — never a durable-redundancy
+    /// success it hasn't reached.
+    #[tokio::test]
+    async fn push_advertises_replication_pending() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        let config_data = b"config";
+        let config_digest = push_blob(&app, "myapp", config_data).await;
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": config_digest.as_str(), "size": config_data.len() },
+            "layers": []
+        });
+        let resp = put_manifest(
+            &app,
+            "/v2/myapp/manifests/latest",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            resp.headers().get("oci-replication").unwrap(),
+            "pending",
+            "push must honestly report replication is pending"
+        );
+    }
+
+    /// REG4: a push that would breach the repository quota is refused with
+    /// 413, and nothing is stored.
+    #[tokio::test]
+    async fn push_over_repository_quota_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlobStore::new(dir.path()));
+        let state = PickleState {
+            store: Arc::clone(&store),
+            catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+            node_raft_id: 7,
+            council: None,
+            persist_path: None,
+            auth: None,
+            quota: QuotaConfig {
+                per_repository_bytes: 4,
+                total_bytes: 0,
+            },
+            sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
+        };
+        let app = test_router(state);
+
+        // A monolithic blob larger than the 4-byte repository quota.
+        let blob = b"way too big for the quota".to_vec();
+        let digest = compute_sha256(&blob);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                    .body(Body::from(blob))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !store.has_blob(&digest),
+            "over-quota blob must not be stored"
+        );
+    }
+
+    /// REG8: a chunk against an expired upload session is refused, and the
+    /// stale temp is swept.
+    #[tokio::test]
+    async fn expired_upload_session_chunk_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlobStore::new(dir.path()));
+        let state = PickleState {
+            store: Arc::clone(&store),
+            catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+            node_raft_id: 7,
+            council: None,
+            persist_path: None,
+            auth: None,
+            quota: QuotaConfig::default(),
+            // A zero TTL: any session is immediately expired on the next
+            // chunk, which is exactly what we want to assert.
+            sessions: UploadSessions::new(std::time::Duration::ZERO),
+        };
+        let app = test_router(state.clone());
+
+        // Initiate a chunked upload.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
+
+        // The very next chunk is past the zero TTL: refused, not written.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(&location)
+                    .body(Body::from(b"data".to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// REG4: hashing a large blob runs off the async runtime, so it doesn't
+    /// stall other requests. We push a sizable monolithic blob while a
+    /// cheap request runs concurrently; the cheap one must not be blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_blob_hash_does_not_block_other_requests() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+
+        // 16 MiB monolithic blob → real hashing work.
+        let big = vec![0xABu8; 16 * 1024 * 1024];
+        let digest = compute_sha256(&big);
+        let push_app = app.clone();
+        let push = tokio::spawn(async move {
+            push_app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                        .body(Body::from(big))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        });
+
+        // A cheap GET /v2/ must complete promptly even while the hash runs.
+        let cheap = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert!(cheap.is_ok(), "cheap request blocked by hashing");
+        assert_eq!(cheap.unwrap().unwrap().status(), StatusCode::OK);
+        assert_eq!(push.await.unwrap(), StatusCode::CREATED);
     }
 }

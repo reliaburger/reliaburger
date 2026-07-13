@@ -203,21 +203,53 @@ impl ImageStore {
         let _ = self.cluster_source.set(source);
     }
 
-    /// Unpack pre-fetched layer blobs into a rootfs (tar extraction is
-    /// CPU-bound, so it runs on a blocking task).
+    /// Unpack pre-fetched layer blobs into an immutable, content-addressed
+    /// rootfs *generation* (REG5).
+    ///
+    /// The generation directory is named by a hash of the ordered layer
+    /// digests, so two different images (or two tags of the same repo that
+    /// point at different content) never share a rootfs. A tag move
+    /// therefore extracts into a *fresh* directory and cannot delete or
+    /// re-extract another generation while a container is running out of it
+    /// — the container keeps the path it was started with. Re-extracting the
+    /// same content is idempotent: the target is unique to that content, so
+    /// `unpack_layers`'s clear-and-recreate rebuilds an identical tree.
+    ///
+    /// Tar extraction is CPU-bound, so it runs on a blocking task.
     async fn unpack_to(
         &self,
         layer_paths: Vec<PathBuf>,
         rootfs: PathBuf,
     ) -> Result<PathBuf, ImageError> {
-        let rootfs_clone = rootfs.clone();
-        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &rootfs_clone))
+        let generation = self.rootfs_generation_path(&rootfs, &layer_paths);
+        let target = generation.clone();
+        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &target))
             .await
             .map_err(|e| ImageError::UnpackFailed {
                 digest: "join".to_string(),
                 reason: e.to_string(),
             })??;
-        Ok(rootfs)
+        Ok(generation)
+    }
+
+    /// The content-addressed rootfs generation directory for a set of
+    /// layer blobs (REG5).
+    ///
+    /// Sits under the tag's rootfs directory, in a `gen-{hash}` subdirectory
+    /// keyed by the ordered layer digests. Different content lands in a
+    /// different generation, so a concurrent push or a tag move never
+    /// clobbers a live container's filesystem.
+    pub fn rootfs_generation_path(&self, tag_rootfs: &Path, layer_paths: &[PathBuf]) -> PathBuf {
+        let mut hasher = Sha256::new();
+        for path in layer_paths {
+            // The blob filename is the layer's sha256 hex — immutable
+            // content identity. Hash the ordered set into one generation id.
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            hasher.update(name.as_bytes());
+            hasher.update(b"\n");
+        }
+        let generation = hex::encode(hasher.finalize());
+        tag_rootfs.join(format!("gen-{}", &generation[..16]))
     }
 
     /// Create a store using the default rootless location.
@@ -373,23 +405,16 @@ impl ImageStore {
             tokio::fs::write(&blob_path, &blob_data).await?;
         }
 
-        // Unpack layers into rootfs (base-first)
-        // Do this in a blocking task since tar extraction is CPU-bound
+        // Unpack layers into an immutable content-addressed generation
+        // (REG5), not the shared tag directory — a re-pull after a tag move
+        // gets a fresh generation and can't clobber a running container.
+        // Tar extraction is CPU-bound, so it runs on a blocking task.
         let layer_paths: Vec<PathBuf> = manifest
             .layers
             .iter()
             .map(|l| self.blob_path(&l.digest))
             .collect();
-        let rootfs_clone = rootfs.clone();
-
-        tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &rootfs_clone))
-            .await
-            .map_err(|e| ImageError::UnpackFailed {
-                digest: "join".to_string(),
-                reason: e.to_string(),
-            })??;
-
-        Ok(rootfs)
+        self.unpack_to(layer_paths, rootfs).await
     }
 }
 
@@ -701,6 +726,43 @@ mod tests {
         let store = ImageStore::new(PathBuf::from("/tmp/images"));
         let path = store.blob_path("abc123");
         assert_eq!(path, PathBuf::from("/tmp/images/blobs/sha256/abc123"));
+    }
+
+    /// REG5: two different layer sets for the same tag land in *different*
+    /// content-addressed generation directories, so a tag move or a
+    /// concurrent push can't clobber a running container's rootfs. The same
+    /// layer set is stable across calls (idempotent re-extract target).
+    #[test]
+    fn rootfs_generations_are_content_addressed_and_isolated() {
+        let store = ImageStore::new(PathBuf::from("/tmp/images"));
+        let tag_rootfs = PathBuf::from("/tmp/images/rootfs/docker.io/library/web/v1");
+
+        let gen_a = store.rootfs_generation_path(
+            &tag_rootfs,
+            &[
+                PathBuf::from("/b/sha256/aaaa"),
+                PathBuf::from("/b/sha256/bbbb"),
+            ],
+        );
+        let gen_a_again = store.rootfs_generation_path(
+            &tag_rootfs,
+            &[
+                PathBuf::from("/b/sha256/aaaa"),
+                PathBuf::from("/b/sha256/bbbb"),
+            ],
+        );
+        let gen_b = store.rootfs_generation_path(
+            &tag_rootfs,
+            &[
+                PathBuf::from("/b/sha256/cccc"),
+                PathBuf::from("/b/sha256/dddd"),
+            ],
+        );
+
+        assert_eq!(gen_a, gen_a_again, "same content must be stable");
+        assert_ne!(gen_a, gen_b, "different content must not share a rootfs");
+        assert!(gen_a.starts_with(&tag_rootfs));
+        assert!(gen_b.starts_with(&tag_rootfs));
     }
 
     #[test]

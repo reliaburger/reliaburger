@@ -318,9 +318,26 @@ impl ManifestCatalog {
     /// Returns the approved digests; the proposing node physically
     /// deletes only those. Untracked layers (no holder entry) are
     /// approved as orphans.
+    ///
+    /// The recheck runs against the **full catalogue reference set**
+    /// immediately before approval (REG7/D11), not only sole-copy: a
+    /// digest that any catalogued manifest still references — its config,
+    /// a layer, or the manifest blob itself — is never approved for
+    /// deletion, even if the nominating node saw it as an orphan when it
+    /// built the report. The nomination and the approval can be separated
+    /// by a fresh push that re-referenced the blob; this is the last,
+    /// serialised chance to refuse.
     pub fn apply_gc_report(&mut self, report: &GcReport) -> Vec<Digest> {
+        // The set of every digest a catalogued manifest pins right now.
+        let referenced = self.referenced_digest_set();
+
         let mut approved = Vec::new();
         for digest in &report.deleted_layers {
+            // Last-moment reference recheck: a still-referenced blob is
+            // never deleted, regardless of holder bookkeeping.
+            if referenced.contains(digest.as_str()) {
+                continue;
+            }
             let digest_str = &digest.0;
             match self
                 .layer_locations
@@ -344,17 +361,57 @@ impl ManifestCatalog {
         approved
     }
 
-    /// Serialise the catalog to a JSON file (crash-safe: write to a
-    /// temp file, then rename over the target).
+    /// Every digest that a catalogued manifest currently pins in the blob
+    /// store — each manifest's own blob, config and layers (REG7).
+    ///
+    /// Returns owned digest strings so the caller can borrow `self`
+    /// mutably afterwards.
+    pub fn referenced_digest_set(&self) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        for (_, manifest) in &self.manifests {
+            for digest in manifest.referenced_digests() {
+                set.insert(digest.0.clone());
+            }
+        }
+        set
+    }
+
+    /// Serialise the catalog to a JSON file crash-safely (REG5): write to
+    /// a *unique* temp file, fsync its bytes, rename over the target, then
+    /// fsync the parent directory so the rename itself is durable.
+    ///
+    /// A crash between the write and the rename leaves the old catalogue
+    /// intact — never a torn half-written file that would then fail to load
+    /// and orphan every stored blob. The temp name carries a random suffix
+    /// so two concurrent persists can't share (and clobber) one temp path.
     ///
     /// Single-node mode has no Raft to remember the catalog, and even
     /// cluster nodes want their local holder view back after a restart.
     pub fn persist_to(&self, path: &std::path::Path) -> Result<(), PickleError> {
+        use std::io::Write as _;
+
         let json = serde_json::to_vec_pretty(self)
             .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-        std::fs::rename(&tmp, path).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+
+        let tmp = parent.join(format!("catalog.{:032x}.json.tmp", rand::random::<u128>()));
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+            file.write_all(&json)
+                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(PickleError::CatalogPersist(e.to_string()));
+        }
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -532,6 +589,66 @@ mod tests {
         );
     }
 
+    /// REG5: a durable catalogue persist leaves no torn file and no
+    /// leftover temp — the reload sees exactly what was written, and a
+    /// crash between temp-write and rename would have kept the old file.
+    #[test]
+    fn catalog_persist_leaves_no_temp_and_reloads_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(
+                Digest(format!("sha256:{:0>64}", "feed")),
+                BTreeSet::from([1, 2]),
+            )],
+        });
+        catalog.persist_to(&path).unwrap();
+
+        // No stray temp files alongside the catalogue.
+        let temps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "persist left a temp file: {temps:?}");
+
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(
+            reloaded.layer_holders(&format!("sha256:{:0>64}", "feed")),
+            BTreeSet::from([1, 2])
+        );
+    }
+
+    /// REG5: an old catalogue survives a crash during a re-persist. A
+    /// leftover temp from an interrupted persist must never be mistaken
+    /// for the catalogue — the committed file still loads.
+    #[test]
+    fn catalog_persist_torn_write_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(Digest(format!("sha256:{:0>64}", "aa")), BTreeSet::from([1]))],
+        });
+        catalog.persist_to(&path).unwrap();
+
+        // Simulate an interrupted re-persist: a stray temp alongside.
+        std::fs::write(
+            dir.path().join(format!("catalog.{:032x}.json.tmp", 0u128)),
+            b"half-written {{{",
+        )
+        .unwrap();
+
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(
+            reloaded.layer_holders(&format!("sha256:{:0>64}", "aa")),
+            BTreeSet::from([1])
+        );
+    }
+
     #[test]
     fn catalog_load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -546,6 +663,40 @@ mod tests {
         std::fs::write(&path, b"not json at all {{{").unwrap();
         // Silently starting empty would orphan every stored blob.
         assert!(ManifestCatalog::load_from(&path).is_err());
+    }
+
+    /// REG7/D11: the GC apply rechecks the full catalogue reference set at
+    /// approval time. A blob nominated as an orphan, but re-referenced by a
+    /// manifest committed between nomination and approval, must NOT be
+    /// deleted — even though its holder set would otherwise allow it.
+    #[test]
+    fn gc_report_apply_refuses_a_still_referenced_blob() {
+        let mut catalog = ManifestCatalog::default();
+        let manifest = test_manifest("myapp", "mfst1");
+        let layer = manifest.layers[0].digest.clone();
+
+        // Two nodes hold the layer, so holder bookkeeping alone would
+        // approve a deletion — but the manifest still references it.
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1, 2]),
+        });
+
+        let approved = catalog.apply_gc_report(&GcReport {
+            node_id: 1,
+            deleted_layers: vec![layer.clone()],
+        });
+
+        assert!(
+            approved.is_empty(),
+            "a catalogued manifest's layer must never be approved for deletion"
+        );
+        // And the holder set is untouched — the layer stays put.
+        assert_eq!(
+            catalog.layer_holders(layer.as_str()),
+            BTreeSet::from([1, 2])
+        );
     }
 
     #[test]
@@ -807,20 +958,21 @@ mod tests {
     #[test]
     fn manifest_catalog_gc_report_removes_holder() {
         let mut catalog = ManifestCatalog::default();
-        let m = test_manifest("myapp", "mfst1");
 
-        catalog.apply_manifest_commit(&ManifestCommit {
-            manifest: m.clone(),
-            tag: "latest".to_string(),
-            holder_nodes: BTreeSet::from([1, 2, 3]),
+        // An *unreferenced* multi-holder layer (no manifest pins it), so
+        // the REG7 catalogue recheck doesn't protect it and the holder
+        // bookkeeping is exercised on its own.
+        let orphan = test_digest("looselayer");
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(orphan.clone(), BTreeSet::from([1, 2, 3]))],
         });
 
         catalog.apply_gc_report(&GcReport {
             node_id: 2,
-            deleted_layers: vec![m.layers[0].digest.clone()],
+            deleted_layers: vec![orphan.clone()],
         });
 
-        let holders = catalog.layer_holders(m.layers[0].digest.as_str());
+        let holders = catalog.layer_holders(orphan.as_str());
         assert_eq!(holders, BTreeSet::from([1, 3]));
     }
 

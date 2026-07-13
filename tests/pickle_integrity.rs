@@ -38,6 +38,11 @@ impl Registry {
             node_raft_id,
             council: None,
             persist_path: None,
+            auth: None,
+            quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
+            sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+                reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+            ),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -169,6 +174,7 @@ fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterS
         state: registry.state.clone(),
         members: None,
         registry_port: 0,
+        peer_scheme: "http".to_string(),
         concurrency: 4,
         client: reqwest::Client::new(),
         upstream: None,
@@ -405,4 +411,246 @@ async fn peer_pull_uses_the_verified_digest_when_the_tag_moves() {
         layer_bytes, b"layer-bytes-image-a",
         "the pulled layer must belong to the verified image"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REG4: registry auth
+// ---------------------------------------------------------------------------
+
+/// Build a registry whose writes require a `Deployer` principal, reusing
+/// the same `sesame::auth` material as the agent API.
+async fn start_authenticated_registry(deployer_plaintext: &mut String) -> Registry {
+    use reliaburger::sesame::auth::{AuthState, new_token_store};
+    use reliaburger::sesame::token::create_token;
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = new_token_store();
+    let created = create_token("ci", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+    *deployer_plaintext = created.plaintext.clone();
+    store.write().await.push(created.token);
+    let auth = AuthState::new(store, Some("rbrg_service".to_string()));
+
+    let state = PickleState {
+        store: Arc::new(BlobStore::new(dir.path().join("blobs"))),
+        catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+        node_raft_id: 1,
+        council: None,
+        persist_path: None,
+        auth: Some(auth),
+        quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
+        sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+            reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+        ),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let app = router(state.clone());
+    let serve_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
+    Registry {
+        state,
+        addr,
+        shutdown,
+        dir,
+    }
+}
+
+/// REG4: an anonymous push is refused once auth is configured; the same
+/// push with a `Deployer` bearer succeeds.
+#[tokio::test]
+async fn anonymous_push_is_refused_authenticated_push_succeeds() {
+    let mut deployer = String::new();
+    let registry = start_authenticated_registry(&mut deployer).await;
+    let base = registry.base_url();
+    let client = reqwest::Client::new();
+
+    let blob = b"a config blob".to_vec();
+    let digest = compute_sha256(&blob);
+
+    // Anonymous monolithic upload: refused with 401.
+    let resp = client
+        .post(format!(
+            "{base}/v2/web/blobs/uploads/?digest={}",
+            digest.as_str()
+        ))
+        .body(blob.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "anonymous push must be refused"
+    );
+    assert!(!registry.state.store.has_blob(&digest), "no blob stored");
+
+    // The same push with a Deployer bearer succeeds.
+    let resp = client
+        .post(format!(
+            "{base}/v2/web/blobs/uploads/?digest={}",
+            digest.as_str()
+        ))
+        .bearer_auth(&deployer)
+        .body(blob)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "authenticated push must succeed"
+    );
+    assert!(registry.state.store.has_blob(&digest));
+}
+
+// ---------------------------------------------------------------------------
+// REG2: one authoritative catalogue
+// ---------------------------------------------------------------------------
+
+/// REG2: a manifest committed to the council's Raft catalogue (as a peer
+/// would) is visible through `manifest_get`/`tags_list` on a node that
+/// never received the original PUT — because the read path now consults
+/// the authoritative catalogue, not the node-local one.
+#[tokio::test]
+async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogue() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use reliaburger::council::node::CouncilNode;
+    use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
+    use reliaburger::pickle::types::{ImageManifest, LayerDescriptor, ManifestCommit};
+
+    // A single-node council standing in for the cluster's Raft.
+    let raft_router = InMemoryRaftRouter::new();
+    let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
+    let raft_dir = tempfile::tempdir().unwrap();
+    let (log_store, _fresh, state_machine) =
+        reliaburger::cluster::runtime::open_raft_storage(raft_dir.path())
+            .await
+            .unwrap();
+    let council = CouncilNode::new(
+        1,
+        CouncilConfig::default(),
+        network,
+        log_store,
+        state_machine,
+        None,
+    )
+    .await
+    .unwrap();
+    raft_router.register(1, council.raft().clone()).await;
+    council
+        .initialize(BTreeMap::from([(
+            1,
+            CouncilNodeInfo {
+                addr: "127.0.0.1:9555".parse().unwrap(),
+                name: "n1".to_string(),
+            },
+        )]))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !council.is_leader().await {
+        assert!(tokio::time::Instant::now() < deadline, "no leader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let council = Arc::new(council);
+
+    // Commit a manifest via Raft directly — as a peer's push would.
+    let manifest_bytes = b"a peer-committed manifest".to_vec();
+    let manifest_digest = compute_sha256(&manifest_bytes);
+    let config_digest = compute_sha256(b"peer config");
+    let manifest = ImageManifest {
+        digest: manifest_digest.clone(),
+        config: LayerDescriptor {
+            digest: config_digest.clone(),
+            size: 11,
+            media_type: "application/vnd.oci.image.config.v1+json".to_string(),
+        },
+        layers: vec![],
+        repository: "team/service".to_string(),
+        tags: BTreeSet::new(),
+        total_size: 11,
+        pushed_at: std::time::SystemTime::UNIX_EPOCH,
+        pushed_by: 2, // a *different* node pushed it
+        signature: None,
+    };
+    council
+        .write(RaftRequest::ManifestCommit(ManifestCommit {
+            manifest: manifest.clone(),
+            tag: "v1".to_string(),
+            holder_nodes: BTreeSet::from([2]),
+        }))
+        .await
+        .unwrap();
+
+    // This node's registry: an *empty* local catalogue, but the council
+    // handle attached. It must still serve the peer's manifest bytes if
+    // present locally, and always list the tag from the authoritative
+    // catalogue.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlobStore::new(dir.path().join("blobs")));
+    // The manifest bytes happen to be local (a peer replicated them here),
+    // so the GET returns them; the tag visibility is the REG2 point.
+    store.write_blob(&manifest_bytes, &manifest_digest).unwrap();
+    let state = PickleState {
+        store,
+        catalog: Arc::new(RwLock::new(ManifestCatalog::default())), // empty local
+        node_raft_id: 1,
+        council: Some(council.clone()),
+        persist_path: None,
+        auth: None,
+        quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
+        sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+            reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+        ),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let app = router(state);
+    let serve_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // tags_list must report v1 even though the local catalogue is empty.
+    let resp = client
+        .get(format!("{base}/v2/team/service/tags/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["tags"],
+        serde_json::json!(["v1"]),
+        "a peer-committed tag must be visible (REG2)"
+    );
+
+    // manifest_get by tag resolves through the authoritative catalogue.
+    let resp = client
+        .get(format!("{base}/v2/team/service/manifests/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a peer-committed manifest must be fetchable by tag (REG2)"
+    );
+
+    shutdown.cancel();
 }
