@@ -449,6 +449,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
     pub fn grill(&self) -> &G {
         &self.grill
     }
+
+    /// Clone the port allocator. Cheap: the allocation set is behind an
+    /// `Arc<Mutex<_>>`, so the clone shares the same live reservation state.
+    /// A spawned deploy task allocates ports through this shared handle.
+    pub fn port_allocator(&self) -> PortAllocator {
+        self.port_allocator.clone()
+    }
 }
 
 #[cfg(test)]
