@@ -454,6 +454,65 @@ The app is *desired state* in Raft. The scheduler places it because the council 
 
 Both symptoms have one cause: stop wasn't going through Raft. Now it does. In cluster mode, `stop` proposes an `AppDelete` request to the council, exactly the way `apply` proposes an `AppSpec`. The desired state clears, the scheduler stops placing the app, and no reconciler resurrects it. The local container stop becomes best-effort cleanup that runs *after* the delete commits — and because a missing local replica is expected on a leader that holds none, it's no longer an error. Followers can't write to Raft (openraft doesn't forward client writes), so a stop received on a follower forwards to the leader's API, the same leader-forwarding dance `apply` already does. A gated three-node test proves the whole loop: deploy an app, stop it through any node, and watch the desired state clear and *stay* clear across several reconcile ticks.
 
+## A slow deploy shouldn't freeze the node
+
+Here's a bug you only notice under load. The Bun agent runs one central task, its command loop. A `select!` block waits on several things at once: incoming commands, a health-check timer that fires every second, snapshot requests from the cluster, and a shutdown signal. Whichever fires first wins; the loop handles it, then goes back to waiting. Simple, and for most commands it's fine, because most commands are fast.
+
+Deploy is not fast. Pulling an image can take tens of seconds. Init containers run to completion before the main container starts. A rolling redeploy waits for each new replica to report healthy before it retires an old one. And all of that used to run *inside* the command loop, because `handle_command` awaited the whole `deploy` call before returning to the `select!`.
+
+Think about what that means. While one app is pulling a 400MB image, the health-check timer is firing into a loop that can't answer it. Another app goes unhealthy and needs a restart? It waits. A `relish status` call? It waits. A second `apply`? It queues behind the first and can't even *start* until the pull finishes. One slow deploy freezes the whole node. On a busy cluster, that's the difference between a deploy and an outage.
+
+The fix is to get the blocking work off the loop. Each deploy now runs on its own spawned task:
+
+```rust
+let worker = DeployWorker {
+    grill: self.supervisor.grill().clone(),
+    port_allocator: self.supervisor.port_allocator(),
+    ops: DeployOps { tx: self.deploy_ops_tx.clone() },
+};
+tokio::spawn(async move {
+    worker.run_deploy(config, forward_tx).await;
+});
+```
+
+`tokio::spawn` hands a future to the runtime to run concurrently, the way you'd start a goroutine in Go or a thread in C — except it's cooperative, not pre-emptive, so it only ever yields at an `.await`. The command loop spawns the worker and returns to its `select!` immediately. The image pull now happens on the worker's task, and while it's parked at that `.await`, the loop is free to answer health checks, restarts, status, and further deploys. Two deploys land at once? Two tasks, both making progress. They interleave instead of queuing.
+
+But here's the catch, and it's the whole design problem. The blocking I/O — `grill.create`, `grill.start`, the init and health polls — can move to the worker, because the grill and the port allocator are cheap to clone (both wrap their real state in an `Arc`, so a clone shares it). The *supervisor state machine* cannot. There is exactly one supervisor, it lives on the command loop behind `&mut self`, and it must stay that way: it's the single source of truth for which instances exist and what state each is in. Health checks read it. Crash restarts mutate it. If a deploy task held its own copy, the two would drift, and drift in a state machine is how you get an instance the health checker thinks is running and the supervisor thinks was never born.
+
+So we split the work by who's allowed to touch what. The worker owns the slow grill I/O. Every state transition, every supervisor mutation, every service-map and networking change travels back to the loop as a message:
+
+```rust
+enum DeployOp {
+    PrepareFreshInstance { /* … */ reply: oneshot::Sender<Result<PreparedInstance, BunError>> },
+    ApplyEgressPreStart  { /* … */ reply: oneshot::Sender<Result<(), BunError>> },
+    TransitionState      { instance_id: InstanceId, to: ContainerState,
+                           reply: oneshot::Sender<Result<(), BunError>> },
+    FinishFreshInstance  { /* … */ reply: oneshot::Sender<Result<(), BunError>> },
+    // … one variant per authoritative step
+}
+```
+
+Each variant carries its arguments and a `oneshot::Sender` — a single-use channel the loop replies down. The worker sends an op, awaits the reply, and drives on. The loop drains these ops in a new `select!` arm, right next to the command and health-check arms, and dispatches each to the same `&mut self` method the old serial code called. No logic moved; only *where it runs* changed.
+
+Trace a fresh instance and you can see the two halves take turns:
+
+```rust
+// worker (off the loop)                    // loop (owns the supervisor)
+let prepared = self.ops
+    .prepare_fresh_instance(…).await?;   // → Preparing, build OCI spec, decrypt secrets
+self.grill.create(…).await?;             // the image pull — off the loop
+self.ops.apply_egress_pre_start(…).await?; // → program egress before anything runs (#86)
+// … init containers, polled here …
+self.ops.transition_state(…, Starting).await?;
+self.grill.start(…).await?;              // start — off the loop
+let ip = self.grill.container_ip(…).await;
+self.ops.finish_fresh_instance(…, ip).await?; // → HealthWait, register backend, networking
+```
+
+The worker sequences the deploy; the loop applies each authoritative step and stays free between them. Because the loop processes deploy ops in the *same* `select!` as health checks, a slow pull on one app never delays a health transition on another — the pull is parked on a task, and the loop is doing other work. That ordering — create, *then* program egress, *then* start — is exactly the pre-start networking sequence from Chapter 3, preserved to the letter: a replacement replica must never run ahead of its egress policy, off-loop or not.
+
+Two tests pin the behaviour down. The first deploys an app whose `create` sleeps for three seconds, then fires a `Status` command and asserts it's answered in well under that — proof the loop kept moving. The second starts two deploys whose creates both sleep, and checks that *both* creates are in flight before either finishes; serially, the second couldn't start until the first returned. Both tests fail against the old inline deploy and pass against the task-per-deploy one, which is exactly what you want a regression test to do.
+
 ## What we deferred
 
 Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.

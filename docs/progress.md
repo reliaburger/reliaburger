@@ -736,6 +736,32 @@ whole theme lands.
     - [x] `make ci` green (fmt, clippy `-D warnings`, 2387-test default suite); gated
       `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 2
       (instance identity), chapter 7 (applied-means-done, AppDelete-on-stop).
+  - [x] PR 2 — Deploy work off the command loop (DEP4/codex-M3).
+    - [x] Each `Deploy` command now spawns a `DeployWorker` task instead of awaiting `deploy`
+      inline in the command arm, so image preparation, init-container polling, runtime
+      create/start and the rolling health wait no longer block the Bun command loop. The loop
+      keeps servicing health checks, crash restarts, status and further deploys while a pull is
+      in flight; concurrent deploys interleave rather than serialise.
+    - [x] The supervisor state machine stays authoritative: the worker owns only the blocking
+      grill I/O (grill+port allocator are `Arc`-backed clones), and drives every state
+      transition and every supervisor / service-map / networking mutation back through a
+      `DeployOp` message channel (`deploy_ops_rx`) drained in the loop's `select!` and
+      dispatched to the same `&mut self` helpers the old serial path used. No deploy logic
+      moved — only where it runs.
+    - [x] Preserved behaviours: create → program-egress → start ordering (#86), the #87
+      per-instance identity lifecycle, health-gating, crash-restart, rolling rollback on an
+      unhealthy new replica, and PR 1's namespaced identity + durable applied-state. The fresh,
+      rolling and job paths were split into loop-side (`prepare_fresh_instance`,
+      `finish_fresh_instance`, `prepare_rolling_instance`, `finalise_rolling_deploy`,
+      `rollback_rolling_deploy`, `finish_job_instance`) and task-side (`drive_fresh_instance`,
+      `drive_job`, `rolling_redeploy`) halves.
+    - [x] Failing-first tests: `slow_deploy_does_not_block_the_command_loop` (a 3s image-pull
+      deploy still answers a `Status` in <500ms) and `concurrent_deploys_interleave` (two
+      deploys' creates are both in flight after one delay). `MockGrill::set_create_delay`
+      simulates a slow pull. Both fail against the old inline deploy.
+    - [x] `make ci` green (fmt, clippy `-D warnings`, default suite); gated
+      `RELIABURGER_CLUSTER_TESTS=1` `placement`/`cluster_failover` suites green. Book: chapter 7
+      (a slow deploy shouldn't freeze the node).
 - [ ] **Complete declarative resources** — validate and apply apps, jobs, builds, namespaces
   and permissions through the same local/Raft/GitOps path; enforce namespace and permission
   resources plus build scope; reject or remove every parsed field that cannot affect the

@@ -20,6 +20,9 @@ pub struct MockGrill {
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
+    /// Artificial delay applied inside `create`, simulating a slow image
+    /// pull. Lets tests prove a slow deploy no longer wedges the agent loop.
+    create_delay: Arc<Mutex<std::time::Duration>>,
 }
 
 impl MockGrill {
@@ -76,10 +79,21 @@ impl MockGrill {
     pub fn set_honours_cgroup_path(&self, value: bool) {
         *self.honours_cgroup_path.lock().unwrap() = value;
     }
+
+    /// Make `create()` sleep for `delay` before returning, simulating a slow
+    /// image pull. A deploy blocked here must not stall unrelated work.
+    #[allow(dead_code)]
+    pub fn set_create_delay(&self, delay: std::time::Duration) {
+        *self.create_delay.lock().unwrap() = delay;
+    }
 }
 
 impl super::Grill for MockGrill {
     async fn create(&self, instance: &InstanceId, _spec: &OciSpec) -> Result<(), GrillError> {
+        let delay = *self.create_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         self.calls
             .lock()
             .unwrap()
