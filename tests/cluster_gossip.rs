@@ -104,6 +104,7 @@ async fn start_node_with_mayo(
             identity: None,
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
+            self_disk_pressured_rx: None,
         },
         shutdown.clone(),
     )
@@ -212,16 +213,21 @@ async fn three_node_council_elects_leader_and_grows() {
         .collect();
 
     // Gossip converges, a leader emerges, and the council grows to all three.
+    // Wait for every node to agree on the 3-voter set with exactly one leader,
+    // not just for one node to see it: the membership change that admits the
+    // third voter commits on the leader a tick before it reaches the
+    // followers' Raft metrics, so a wait that stops at the first node to
+    // notice would race the followers under load.
     let grown = wait_until(Duration::from_secs(25), || {
-        handles
-            .iter()
-            .any(|h| voter_ids(h) == expected && thinks_it_is_leader(h))
+        handles.iter().all(|h| voter_ids(h) == expected)
+            && handles.iter().filter(|h| thinks_it_is_leader(h)).count() == 1
     })
     .await;
 
     if !grown {
         let sets: Vec<_> = handles.iter().map(|h| voter_ids(h)).collect();
-        panic!("council did not grow to 3 voters; voter sets: {sets:?}");
+        let leaders = handles.iter().filter(|h| thinks_it_is_leader(h)).count();
+        panic!("council did not converge on 3 voters; voter sets: {sets:?}, leaders: {leaders}");
     }
 
     // Exactly one leader, and every node agrees on the 3-voter set.

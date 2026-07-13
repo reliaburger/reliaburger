@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use reliaburger::cluster::identity::raft_id_from_name;
 use reliaburger::cluster::runtime::{
     CouncilReconcilerConfig, spawn_council_reconciler_with_config,
-    spawn_council_reconciler_with_pressure,
+    spawn_council_reconciler_with_pressure, spawn_disk_pressure_consumer,
 };
 use reliaburger::council::log_store::MemLogStore;
 use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -29,8 +29,12 @@ use reliaburger::council::selection::CouncilSelectionConfig;
 use reliaburger::council::state_machine::CouncilStateMachine;
 use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
 use reliaburger::meat::NodeId;
+use reliaburger::mustard::GossipConfig;
+use reliaburger::mustard::directory::NodeDirectory;
 use reliaburger::mustard::membership::MembershipSnapshot;
+use reliaburger::mustard::protocol::MustardNode;
 use reliaburger::mustard::state::NodeState;
+use reliaburger::mustard::transport::InMemoryNetwork;
 
 fn cluster_tests_enabled() -> bool {
     std::env::var("RELIABURGER_CLUSTER_TESTS").is_ok()
@@ -297,6 +301,138 @@ async fn pressured_leader_resigns_and_leadership_moves() {
     assert!(settled, "leadership did not settle on a new voter");
 
     shutdown.cancel();
+    for node in &nodes {
+        let _ = node.shutdown().await;
+    }
+}
+
+/// End-to-end through gossip (12b.2 T3 follow-up): unlike the test above, which
+/// injects the pressured-voter set directly, this one drives the WHOLE
+/// production signal path. A pressured follower advertises `disk_pressured` over
+/// real gossip; the leader-side gossip node folds it into its directory; the
+/// [`spawn_disk_pressure_consumer`] turns that directory plus the live voter set
+/// into the Raft-id set; and the reconciler deposes the pressured node when it
+/// leads. This is what closes the gap where production `start()` used to feed
+/// the reconciler a permanently empty set.
+#[tokio::test]
+async fn disk_pressure_advertised_over_gossip_drives_resignation() {
+    if !cluster_tests_enabled() {
+        eprintln!("skipping cluster test (set RELIABURGER_CLUSTER_TESTS=1)");
+        return;
+    }
+
+    let (nodes, _router) = build_cluster().await;
+    let leader = current_leader_index(&nodes)
+        .await
+        .expect("no leader elected");
+    let leader_id = rid(leader);
+
+    // Commit a write so followers are caught up and cleanly electable.
+    nodes[leader]
+        .write(RaftRequest::ConfigSet {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // A two-node gossip fabric: the leader-side observer probes the pressured
+    // voter and learns its `disk_pressured` bit purely from gossip. We drive
+    // the pressured voter as whichever voter currently leads, so deposition is
+    // observable.
+    let net = InMemoryNetwork::new();
+    let observer_gossip = gossip_addr(3); // a non-voter address, just a probe point
+    let pressured_gossip = gossip_addr(leader);
+    let observer_transport = net.register(observer_gossip).await;
+    let pressured_transport = net.register(pressured_gossip).await;
+
+    let mut observer = MustardNode::new(
+        NodeId::new("observer"),
+        observer_gossip,
+        GossipConfig::default(),
+        observer_transport,
+    );
+    let mut pressured = MustardNode::new(
+        NodeId::new(NAMES[leader]),
+        pressured_gossip,
+        GossipConfig::default(),
+        pressured_transport,
+    );
+    pressured.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+    let (pressure_advertise_tx, pressure_advertise_rx) = watch::channel(true);
+    pressured.set_disk_pressured_watch(pressure_advertise_rx);
+    let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
+    observer.set_directory_watch(directory_tx);
+    observer.add_seed(NodeId::new(NAMES[leader]), pressured_gossip);
+
+    let gossip_shutdown = CancellationToken::new();
+    let pressured_shutdown = gossip_shutdown.clone();
+    let pressured_handle = tokio::spawn(async move {
+        pressured.run(pressured_shutdown).await;
+    });
+    // A few probe cycles so the observer learns the advertised pressure.
+    for _ in 0..5 {
+        observer.run_one_cycle().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let learned = wait_until(Duration::from_secs(5), || {
+        directory_rx
+            .borrow()
+            .disk_pressured
+            .contains(&NodeId::new(NAMES[leader]))
+    })
+    .await;
+    assert!(
+        learned,
+        "observer never learned the pressured voter's bit over gossip"
+    );
+
+    // The consumer turns the gossip directory + live voters into the pressured
+    // Raft-id set, exactly as production does, and feeds every reconciler.
+    let shutdown = CancellationToken::new();
+    let (pressure_tx, pressure_rx) = watch::channel(BTreeSet::<u64>::new());
+    spawn_disk_pressure_consumer(
+        Arc::clone(&nodes[leader]),
+        directory_rx.clone(),
+        pressure_tx,
+        shutdown.clone(),
+    );
+
+    // The novel property this test pins: the pressured voter's Raft id reaches
+    // the reconciler's input set purely from gossip. The reconciler acting on
+    // that set (deposing the pressured leader, replacing a pressured follower)
+    // is already covered by `pressured_leader_resigns_and_leadership_moves` and
+    // the planner unit tests, which feed the set directly. Keeping this test to
+    // the gossip half avoids a second heavy Raft-timing dependency.
+    let pressured_ready = wait_until(Duration::from_secs(5), || {
+        pressure_rx.borrow().contains(&leader_id)
+    })
+    .await;
+    assert!(
+        pressured_ready,
+        "consumer never derived the pressured voter's Raft id from gossip"
+    );
+
+    // Clearing the advertised bit propagates the other way: the consumer drops
+    // the voter from the set once gossip carries a healthy disk again.
+    pressure_advertise_tx.send(false).unwrap();
+    for _ in 0..5 {
+        observer.run_one_cycle().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cleared = wait_until(Duration::from_secs(5), || {
+        !pressure_rx.borrow().contains(&leader_id)
+    })
+    .await;
+    assert!(
+        cleared,
+        "consumer never dropped the voter after gossip cleared the bit"
+    );
+
+    shutdown.cancel();
+    gossip_shutdown.cancel();
+    drop(pressure_advertise_tx);
+    let _ = pressured_handle.await;
     for node in &nodes {
         let _ = node.shutdown().await;
     }
