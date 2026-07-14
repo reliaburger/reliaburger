@@ -237,17 +237,21 @@ retain_versions = 3
         harness
     }
 
-    /// The current leader's node name, from the bootstrap node's council
-    /// view (the `leader` field is the node name).
-    async fn leader(&self) -> Option<String> {
+    async fn leader_from(&self, node: &ClusterNode) -> Option<String> {
         let response = self
             .client
-            .get(format!("http://{}/v1/cluster/council", self.nodes[0].api))
+            .get(format!("http://{}/v1/cluster/council", node.api))
             .send()
             .await
             .ok()?;
         let council: serde_json::Value = response.json().await.ok()?;
         council["leader"].as_str().map(String::from)
+    }
+
+    /// The current leader's node name, from the bootstrap node's council
+    /// view (the `leader` field is the node name).
+    async fn leader(&self) -> Option<String> {
+        self.leader_from(&self.nodes[0]).await
     }
 
     async fn wait_for_leader(&self) -> String {
@@ -268,6 +272,32 @@ retain_versions = 3
         self.nodes.iter().find(|n| n.name == name).unwrap()
     }
 
+    /// Wait until the leader agrees that it is the leader and has archived
+    /// the previous operation. Another node can observe the committed
+    /// completion slightly earlier, but the next write must go through the
+    /// leader's local Raft state.
+    async fn wait_for_idle_leader(&self) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            if let Some(leader) = self.leader().await {
+                let node = self.node(&leader);
+                let leader_agrees = self.leader_from(node).await.as_deref() == Some(&leader);
+                let upgrade_idle = self
+                    .cluster_state_from(node)
+                    .await
+                    .is_some_and(|state| state["active"].is_null());
+                if leader_agrees && upgrade_idle {
+                    return leader;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for an idle upgrade coordinator"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn node_version(&self, api: &str) -> Option<String> {
         let response = self
             .client
@@ -281,13 +311,12 @@ retain_versions = 3
 
     /// The upgrade-plan node list: the leader last, two council members,
     /// the remaining node labelled Worker (see the module note on roles).
-    async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
-        let leader = self.wait_for_leader().await;
+    fn plan_nodes_for(&self, leader: &str) -> (Vec<serde_json::Value>, String) {
         let worker = self
             .nodes
             .iter()
             .map(|n| n.name.clone())
-            .find(|name| *name != leader)
+            .find(|name| name != leader)
             .unwrap();
         let list = self
             .nodes
@@ -307,6 +336,12 @@ retain_versions = 3
                 })
             })
             .collect();
+        (list, worker)
+    }
+
+    async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
+        let leader = self.wait_for_leader().await;
+        let (list, worker) = self.plan_nodes_for(&leader);
         (list, leader, worker)
     }
 
@@ -411,20 +446,22 @@ retain_versions = 3
         }
     }
 
+    async fn cluster_state_from(&self, node: &ClusterNode) -> Option<serde_json::Value> {
+        let response = self
+            .client
+            .get(format!("http://{}/v1/upgrade/cluster", node.api))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
+    }
+
     async fn cluster_state(&self) -> Option<serde_json::Value> {
         for node in &self.nodes {
-            let Ok(response) = self
-                .client
-                .get(format!("http://{}/v1/upgrade/cluster", node.api))
-                .send()
-                .await
-            else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            if let Ok(value) = response.json::<serde_json::Value>().await {
+            if let Some(value) = self.cluster_state_from(node).await {
                 return Some(value);
             }
         }
@@ -630,7 +667,8 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
     harness.wait_for_versions("v0.2.0").await;
 
     // Roll the whole cluster back to v0.1.0.
-    let (nodes, leader, _) = harness.plan_nodes().await;
+    let leader = harness.wait_for_idle_leader().await;
+    let (nodes, _) = harness.plan_nodes_for(&leader);
     let request = serde_json::json!({ "target_version": "v0.1.0", "nodes": nodes });
     let response = harness
         .client
@@ -642,7 +680,9 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
         .send()
         .await
         .expect("cluster rollback");
-    assert_eq!(response.status().as_u16(), 202, "rollback refused");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status.as_u16(), 202, "rollback refused: {body}");
 
     let (_, phase) = harness.watch_upgrade(false).await;
     assert_eq!(phase, "Completed");
