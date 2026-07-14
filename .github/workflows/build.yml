@@ -11,6 +11,10 @@ permissions:
   contents: write
 
 jobs:
+  validate-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/ci.yml
+
   build-pdf:
     runs-on: ubuntu-latest
     steps:
@@ -76,7 +80,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-pdf, build-binaries]
+    needs: [validate-release, build-pdf, build-binaries]
     runs-on: ubuntu-latest
     steps:
       - name: Download PDF artifacts
