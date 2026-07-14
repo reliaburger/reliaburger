@@ -20,6 +20,58 @@ pub enum WrapperError {
     NotRunning,
 }
 
+/// How a route terminates TLS.
+///
+/// Parsed from `IngressSpec.tls`. A route with a mode other than
+/// [`TlsMode::Disabled`] must be reached over HTTPS: the plain-HTTP
+/// listener redirects it (see the proxy handler), it is never served in
+/// the clear. Unsupported modes (`auto`, `acme`) are rejected up front by
+/// [`TlsMode::parse`] rather than silently downgraded to plaintext.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TlsMode {
+    /// No TLS. The route is served over plain HTTP.
+    #[default]
+    Disabled,
+    /// The ingress certificate is issued from the cluster's Sesame Ingress
+    /// CA (air-gapped clusters). Clients must trust the cluster root.
+    Cluster,
+    /// The operator supplies the certificate and key explicitly, via
+    /// `WrapperConfig::tls_cert_path` / `tls_key_path`.
+    Explicit,
+}
+
+impl TlsMode {
+    /// Parse a `tls` field into a mode.
+    ///
+    /// `None`/`"none"`/`"off"` disable TLS. `"cluster"` uses the cluster
+    /// Ingress CA. `"explicit"` uses operator-supplied certs. Anything else
+    /// (including the not-yet-implemented `"auto"`/`"acme"`) is a config
+    /// error, so a TLS-requiring route can never quietly fall back to
+    /// plaintext.
+    pub fn parse(value: Option<&str>) -> Result<Self, TlsModeError> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("none") | Some("off") | Some("disabled") => {
+                Ok(TlsMode::Disabled)
+            }
+            Some("cluster") => Ok(TlsMode::Cluster),
+            Some("explicit") => Ok(TlsMode::Explicit),
+            Some(other) => Err(TlsModeError::Unsupported(other.to_string())),
+        }
+    }
+
+    /// Whether this route requires HTTPS (so plain HTTP must redirect).
+    pub fn requires_tls(self) -> bool {
+        !matches!(self, TlsMode::Disabled)
+    }
+}
+
+/// An unsupported or unimplemented TLS mode was requested in the config.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TlsModeError {
+    #[error("unsupported ingress tls mode {0:?}: expected \"cluster\", \"explicit\", or \"none\"")]
+    Unsupported(String),
+}
+
 /// Configuration for the Wrapper proxy.
 #[derive(Debug, Clone)]
 pub struct WrapperConfig {
@@ -36,6 +88,17 @@ pub struct WrapperConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Path to a TLS private key PEM file.
     pub tls_key_path: Option<PathBuf>,
+    /// Maximum size, in bytes, of a request body the proxy will forward.
+    /// A request whose body exceeds this is rejected with 413. Response
+    /// bodies stream and are not bounded by this (ING3).
+    pub max_request_body_bytes: usize,
+    /// Maximum number of TLS handshakes in progress at once. Slow or
+    /// malicious handshakers beyond this are dropped rather than allowed
+    /// to pile up tasks (ING2).
+    pub max_tls_handshakes: usize,
+    /// How long a single TLS handshake may take before the connection is
+    /// dropped (ING2).
+    pub tls_handshake_timeout: std::time::Duration,
 }
 
 impl Default for WrapperConfig {
@@ -47,6 +110,9 @@ impl Default for WrapperConfig {
             worker_threads: 4,
             tls_cert_path: None,
             tls_key_path: None,
+            max_request_body_bytes: 10 * 1024 * 1024,
+            max_tls_handshakes: 512,
+            tls_handshake_timeout: std::time::Duration::from_secs(10),
         }
     }
 }

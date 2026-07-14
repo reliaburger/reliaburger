@@ -58,6 +58,16 @@ impl SharedDrains {
         self.0.lock().await.decrement_connections(instance_id);
     }
 
+    /// Record a WebSocket splice opening to a draining backend (ING4).
+    pub async fn increment_websocket(&self, instance_id: &str) {
+        self.0.lock().await.increment_websocket(instance_id);
+    }
+
+    /// Record a WebSocket splice to a draining backend closing (ING4).
+    pub async fn decrement_websocket(&self, instance_id: &str) {
+        self.0.lock().await.decrement_websocket(instance_id);
+    }
+
     /// Sweep for completed drains, returning the instance IDs that are done.
     pub async fn check_completions(&self) -> Vec<String> {
         self.0.lock().await.check_completions().await
@@ -202,7 +212,12 @@ impl DrainTracker {
         let mut completed = Vec::new();
 
         for (id, entry) in &self.draining {
-            if entry.active_connections == 0 || now >= entry.deadline {
+            // A drain completes when both plain and WebSocket in-flight counts
+            // reach zero, or the deadline passes. Waiting on the WebSocket
+            // count too means a rolling deploy honours `drain_timeout` for a
+            // live WebSocket splice, not just HTTP requests (ING4).
+            let idle = entry.active_connections == 0 && entry.websocket_connections == 0;
+            if idle || now >= entry.deadline {
                 completed.push(id.clone());
                 let _ = self
                     .complete_tx
@@ -334,5 +349,48 @@ mod tests {
         let tracker = DrainTracker::new(tx);
 
         assert!(!tracker.is_draining("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn open_websocket_prevents_completion() {
+        // ING4: a live WebSocket splice holds the drain open even though the
+        // plain HTTP count is zero, so a rolling deploy waits for it.
+        let (tx, _rx) = mpsc::channel(16);
+        let mut tracker = DrainTracker::new(tx);
+
+        tracker.start_drain(&drain_cmd("web", "web-0", 30));
+        // A WebSocket bumps both the connection and the websocket counter.
+        tracker.increment_connections("web-0");
+        tracker.increment_websocket("web-0");
+
+        // The HTTP request part finishes, but the WebSocket is still spliced.
+        tracker.decrement_connections("web-0");
+        let completed = tracker.check_completions().await;
+        assert!(
+            completed.is_empty(),
+            "drain completed while a WebSocket was still open"
+        );
+        assert!(tracker.is_draining("web-0"));
+
+        // The WebSocket closes; now the drain can complete.
+        tracker.decrement_websocket("web-0");
+        let completed = tracker.check_completions().await;
+        assert_eq!(completed, vec!["web-0"]);
+    }
+
+    #[tokio::test]
+    async fn websocket_drain_times_out_if_never_closes() {
+        // ING4: a WebSocket that never closes still lets the deploy proceed
+        // once the drain deadline passes, rather than blocking forever.
+        let (tx, _rx) = mpsc::channel(16);
+        let mut tracker = DrainTracker::new(tx);
+
+        tracker.start_drain(&drain_cmd("web", "web-0", 0));
+        tracker.increment_connections("web-0");
+        tracker.increment_websocket("web-0");
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let completed = tracker.check_completions().await;
+        assert_eq!(completed, vec!["web-0"]);
     }
 }

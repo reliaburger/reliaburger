@@ -46,7 +46,19 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 /// upgraded connection to the backend socket with
 /// [`tokio::io::copy_bidirectional`]. Returns `502 Bad Gateway` if the
 /// backend refuses the upgrade or the connection fails.
-pub async fn handle_websocket_upgrade(mut req: Request<Body>, backend: SocketAddr) -> Response {
+///
+/// `permit` is the proxy's connection permit and `drain_guard` the optional
+/// drain accounting guard. Both are `Box<dyn Any>` so the WebSocket module
+/// doesn't depend on the proxy's private types. They move into the splice
+/// task and are dropped only when the splice ends, so the permit is held for
+/// the live connection (not released at the 101) and a draining backend
+/// isn't reported done while a WebSocket is still open (ING2/ING4).
+pub async fn handle_websocket_upgrade(
+    mut req: Request<Body>,
+    backend: SocketAddr,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    drain_guard: Option<Box<dyn std::any::Any + Send>>,
+) -> Response {
     // Capture the client-side upgrade future before consuming the request.
     // It resolves to the raw client stream once our 101 is written.
     let client_upgrade = hyper::upgrade::on(&mut req);
@@ -91,8 +103,13 @@ pub async fn handle_websocket_upgrade(mut req: Request<Body>, backend: SocketAdd
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    // Once the client connection upgrades, splice it to the backend.
+    // Once the client connection upgrades, splice it to the backend. The
+    // permit and drain guard are captured here and dropped when this task
+    // ends, i.e. when the WebSocket actually closes (ING2/ING4).
     tokio::spawn(async move {
+        // Bind the guards so they live for the whole splice, then release.
+        let _permit = permit;
+        let _drain_guard = drain_guard;
         let upgraded = match client_upgrade.await {
             Ok(u) => u,
             Err(_) => return,

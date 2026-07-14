@@ -10,11 +10,24 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use super::routing::RouteKey;
 use super::types::RateLimitConfig;
 
-/// Rate limiter state: a collection of per-IP token buckets.
+/// Bucket key: one token bucket per `(route, client IP)`.
+///
+/// Keying on the route as well as the IP means a client hitting `/api`
+/// doesn't spend the budget it would have for `/` on the same host (ING5).
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct BucketKey {
+    /// The route the request matched.
+    pub route: RouteKey,
+    /// The client IP.
+    pub client: IpAddr,
+}
+
+/// Rate limiter state: a collection of per-(route, IP) token buckets.
 pub struct RateLimiter {
-    buckets: HashMap<IpAddr, TokenBucket>,
+    buckets: HashMap<BucketKey, TokenBucket>,
     last_gc: Instant,
 }
 
@@ -48,12 +61,12 @@ impl RateLimiter {
         }
     }
 
-    /// Check whether a request from `client_ip` is allowed.
+    /// Check whether a request on `key` (route + client IP) is allowed.
     ///
     /// Refills the token bucket based on elapsed time, then tries
     /// to consume one token. If the bucket is empty, returns
     /// `Denied` with the time to wait for a token.
-    pub fn check(&mut self, client_ip: IpAddr, config: &RateLimitConfig) -> RateLimitResult {
+    pub fn check(&mut self, key: BucketKey, config: &RateLimitConfig) -> RateLimitResult {
         let now = Instant::now();
 
         // Run GC periodically
@@ -61,14 +74,11 @@ impl RateLimiter {
             self.gc(now);
         }
 
-        let bucket = self
-            .buckets
-            .entry(client_ip)
-            .or_insert_with(|| TokenBucket {
-                tokens: config.burst as f64,
-                last_refill: now,
-                last_used: now,
-            });
+        let bucket = self.buckets.entry(key).or_insert_with(|| TokenBucket {
+            tokens: config.burst as f64,
+            last_refill: now,
+            last_used: now,
+        });
 
         // Refill tokens based on elapsed time
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
@@ -129,22 +139,28 @@ impl ShardedRateLimiter {
         Self { shards }
     }
 
-    /// The shard responsible for a given client IP.
-    fn shard_for(&self, ip: IpAddr) -> &tokio::sync::Mutex<RateLimiter> {
+    /// The shard responsible for a given bucket key.
+    fn shard_for(&self, key: &BucketKey) -> &tokio::sync::Mutex<RateLimiter> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        ip.hash(&mut hasher);
+        key.hash(&mut hasher);
         let idx = (hasher.finish() as usize) % self.shards.len();
         &self.shards[idx]
     }
 
-    /// Check whether a request from `client_ip` is allowed, locking only the
-    /// shard that owns that IP.
-    pub async fn check(&self, client_ip: IpAddr, config: &RateLimitConfig) -> RateLimitResult {
-        self.shard_for(client_ip)
-            .lock()
-            .await
-            .check(client_ip, config)
+    /// Check whether a request on `route` from `client_ip` is allowed,
+    /// locking only the shard that owns that `(route, IP)` bucket (ING5).
+    pub async fn check(
+        &self,
+        route: &RouteKey,
+        client_ip: IpAddr,
+        config: &RateLimitConfig,
+    ) -> RateLimitResult {
+        let key = BucketKey {
+            route: route.clone(),
+            client: client_ip,
+        };
+        self.shard_for(&key).lock().await.check(key, config)
     }
 }
 
@@ -162,14 +178,22 @@ mod tests {
         RateLimitConfig { rps: 10, burst: 20 }
     }
 
+    fn key(host: &str, path: &str, ip: &str) -> BucketKey {
+        BucketKey {
+            route: RouteKey {
+                host: host.to_string(),
+                path_prefix: path.to_string(),
+            },
+            client: ip.parse().unwrap(),
+        }
+    }
+
     #[test]
     fn under_limit_passes() {
         let mut limiter = RateLimiter::new();
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-
         for _ in 0..20 {
             assert!(matches!(
-                limiter.check(ip, &config_10rps()),
+                limiter.check(key("h", "/", "192.168.1.1"), &config_10rps()),
                 RateLimitResult::Allowed
             ));
         }
@@ -178,16 +202,13 @@ mod tests {
     #[test]
     fn over_limit_denied() {
         let mut limiter = RateLimiter::new();
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-
         // Exhaust the burst
         for _ in 0..20 {
-            limiter.check(ip, &config_10rps());
+            limiter.check(key("h", "/", "192.168.1.1"), &config_10rps());
         }
-
         // Next request should be denied
         assert!(matches!(
-            limiter.check(ip, &config_10rps()),
+            limiter.check(key("h", "/", "192.168.1.1"), &config_10rps()),
             RateLimitResult::Denied { .. }
         ));
     }
@@ -195,13 +216,11 @@ mod tests {
     #[test]
     fn denied_includes_retry_after() {
         let mut limiter = RateLimiter::new();
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
-
         for _ in 0..20 {
-            limiter.check(ip, &config_10rps());
+            limiter.check(key("h", "/", "192.168.1.1"), &config_10rps());
         }
 
-        match limiter.check(ip, &config_10rps()) {
+        match limiter.check(key("h", "/", "192.168.1.1"), &config_10rps()) {
             RateLimitResult::Denied { retry_after_secs } => {
                 assert!(retry_after_secs >= 1, "retry_after should be at least 1s");
             }
@@ -212,20 +231,38 @@ mod tests {
     #[test]
     fn different_ips_independent() {
         let mut limiter = RateLimiter::new();
-        let ip1: IpAddr = "192.168.1.1".parse().unwrap();
-        let ip2: IpAddr = "192.168.1.2".parse().unwrap();
         let config = RateLimitConfig { rps: 1, burst: 1 };
 
         // ip1 exhausts its token
-        limiter.check(ip1, &config);
+        limiter.check(key("h", "/", "192.168.1.1"), &config);
         assert!(matches!(
-            limiter.check(ip1, &config),
+            limiter.check(key("h", "/", "192.168.1.1"), &config),
             RateLimitResult::Denied { .. }
         ));
 
         // ip2 should still be allowed
         assert!(matches!(
-            limiter.check(ip2, &config),
+            limiter.check(key("h", "/", "192.168.1.2"), &config),
+            RateLimitResult::Allowed
+        ));
+    }
+
+    #[test]
+    fn same_ip_different_routes_independent() {
+        // ING5: one IP hitting two routes on the same host has two budgets.
+        let mut limiter = RateLimiter::new();
+        let config = RateLimitConfig { rps: 1, burst: 1 };
+
+        // Exhaust the /api budget for this IP.
+        limiter.check(key("h", "/api", "10.0.0.1"), &config);
+        assert!(matches!(
+            limiter.check(key("h", "/api", "10.0.0.1"), &config),
+            RateLimitResult::Denied { .. }
+        ));
+
+        // The / route for the same IP still has its own token.
+        assert!(matches!(
+            limiter.check(key("h", "/", "10.0.0.1"), &config),
             RateLimitResult::Allowed
         ));
     }
@@ -233,10 +270,9 @@ mod tests {
     #[test]
     fn gc_removes_stale_buckets() {
         let mut limiter = RateLimiter::new();
-        let ip: IpAddr = "192.168.1.1".parse().unwrap();
         let config = config_10rps();
 
-        limiter.check(ip, &config);
+        limiter.check(key("h", "/", "192.168.1.1"), &config);
         assert_eq!(limiter.bucket_count(), 1);
 
         // Simulate time passing beyond TTL
@@ -251,11 +287,17 @@ mod tests {
         let config = config_10rps();
 
         for i in 1..=5u8 {
-            let ip: IpAddr = format!("192.168.1.{i}").parse().unwrap();
-            limiter.check(ip, &config);
+            limiter.check(key("h", "/", &format!("192.168.1.{i}")), &config);
         }
 
         assert_eq!(limiter.bucket_count(), 5);
+    }
+
+    fn route(host: &str, path: &str) -> RouteKey {
+        RouteKey {
+            host: host.to_string(),
+            path_prefix: path.to_string(),
+        }
     }
 
     #[tokio::test]
@@ -263,13 +305,14 @@ mod tests {
         let limiter = ShardedRateLimiter::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
         let config = RateLimitConfig { rps: 1, burst: 1 };
+        let r = route("h", "/");
 
         assert!(matches!(
-            limiter.check(ip, &config).await,
+            limiter.check(&r, ip, &config).await,
             RateLimitResult::Allowed
         ));
         assert!(matches!(
-            limiter.check(ip, &config).await,
+            limiter.check(&r, ip, &config).await,
             RateLimitResult::Denied { .. }
         ));
     }
@@ -278,22 +321,47 @@ mod tests {
     async fn sharded_limiter_keeps_ips_independent() {
         let limiter = ShardedRateLimiter::new();
         let config = RateLimitConfig { rps: 1, burst: 1 };
+        let r = route("h", "/");
 
         // Exhaust many distinct IPs; each keeps its own bucket regardless of
         // which shard it lands in.
         for i in 1..=50u8 {
             let ip: IpAddr = format!("10.0.0.{i}").parse().unwrap();
             assert!(
-                matches!(limiter.check(ip, &config).await, RateLimitResult::Allowed),
+                matches!(
+                    limiter.check(&r, ip, &config).await,
+                    RateLimitResult::Allowed
+                ),
                 "first request from a fresh IP must pass"
             );
             assert!(
                 matches!(
-                    limiter.check(ip, &config).await,
+                    limiter.check(&r, ip, &config).await,
                     RateLimitResult::Denied { .. }
                 ),
                 "second request from the same IP must be denied"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sharded_limiter_isolates_routes_for_one_ip() {
+        // ING5: the same IP on two routes has two independent budgets.
+        let limiter = ShardedRateLimiter::new();
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let config = RateLimitConfig { rps: 1, burst: 1 };
+
+        let api = route("h", "/api");
+        limiter.check(&api, ip, &config).await;
+        assert!(matches!(
+            limiter.check(&api, ip, &config).await,
+            RateLimitResult::Denied { .. }
+        ));
+
+        let root = route("h", "/");
+        assert!(matches!(
+            limiter.check(&root, ip, &config).await,
+            RateLimitResult::Allowed
+        ));
     }
 }

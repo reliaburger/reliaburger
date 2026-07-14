@@ -4914,7 +4914,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
 
         let mut table = self.routing_table.write().await;
-        table.rebuild(&merged, &self.ingress_configs);
+        // Invalid ingress configs (unsupported TLS mode, zero/overflow rate)
+        // are rejected here: their routes are skipped rather than installed,
+        // so a bad app can't serve TLS traffic in plaintext or divide by zero.
+        if let Err(e) = table.rebuild(&merged, &self.ingress_configs) {
+            eprintln!("wrapper: ingress routing rebuild rejected some routes: {e}");
+        }
         drop(table);
 
         // Publish the merged service-map snapshot for out-of-loop readers (DNS).
@@ -8286,6 +8291,64 @@ mod tests {
         assert!(
             calls.iter().any(|(op, i)| op == "stop" && i == &id),
             "retire must stop the drained instance"
+        );
+    }
+
+    /// ING4: a retire waits for an in-flight *WebSocket* splice, not just a
+    /// plain HTTP request. The WebSocket bumps both counters; the HTTP part of
+    /// the splice finishes first, but the live WebSocket must keep the drain
+    /// open until it closes, so the old container isn't killed mid-splice.
+    #[tokio::test]
+    async fn retire_waits_for_in_flight_websocket_before_kill() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(config_with_health(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let id = InstanceId("default__web-0".to_string());
+        let drains = agent.drains_handle();
+
+        // The proxy would bump both counters at the 101 for a WebSocket.
+        drains
+            .start_drain(&crate::wrapper::draining::DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: id.0.clone(),
+                timeout: std::time::Duration::from_secs(30),
+            })
+            .await;
+        drains.increment_connections(&id.0).await;
+        drains.increment_websocket(&id.0).await;
+
+        let agent_ref = &agent;
+        let retire = agent_ref.retire_with_drain(
+            std::slice::from_ref(&id),
+            std::time::Duration::from_secs(30),
+        );
+        tokio::pin!(retire);
+
+        // The HTTP half of the splice completes, but the WebSocket is still
+        // open, so the retire must not proceed.
+        drains.decrement_connections(&id.0).await;
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut retire).await;
+        assert!(
+            early.is_err(),
+            "retire finished while a WebSocket splice was still open"
+        );
+        assert!(
+            !grill.calls().iter().any(|(op, i)| op == "kill" && i == &id),
+            "old instance killed while a WebSocket was still spliced"
+        );
+
+        // The WebSocket closes: the drain completes and the retire proceeds.
+        drains.decrement_websocket(&id.0).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
+            .await
+            .expect("retire did not complete after the WebSocket closed");
+        assert!(
+            grill.calls().iter().any(|(op, i)| op == "stop" && i == &id),
+            "retire must stop the drained instance once the WebSocket closed"
         );
     }
 
