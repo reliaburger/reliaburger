@@ -38,6 +38,8 @@ jobs:
         run: make lint
       - name: Portable tests
         run: make test
+      - name: Verify JUnit output
+        run: test -s target/nextest/ci/junit.xml
       - name: No-default-feature tests
         run: make test-no-default
       - name: Doctests
@@ -48,7 +50,7 @@ jobs:
         with:
           name: junit-portable
           path: target/nextest/ci/junit.xml
-          if-no-files-found: error
+          if-no-files-found: warn
 
   slow:
     name: wall-clock acceptance

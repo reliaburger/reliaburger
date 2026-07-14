@@ -752,7 +752,7 @@ mod tests {
         for id in &["node-1", "node-2", "worker-alpha", "srv-prod-03"] {
             let idx = node_index_from_id(id);
             assert!(
-                idx >= 1 && idx <= MAX_NODE_INDEX,
+                (1..=MAX_NODE_INDEX).contains(&idx),
                 "index {idx} out of range for {id}"
             );
         }
