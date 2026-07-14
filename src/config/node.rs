@@ -65,6 +65,13 @@ pub struct DnsSection {
     pub listen: String,
     /// Upstream resolver for non-`.internal` names.
     pub upstream: String,
+    /// Namespace a bare `<app>.internal` query resolves within. Fully
+    /// qualified `<app>.<namespace>.internal` queries ignore it.
+    pub default_namespace: String,
+    /// Restrict the `.internal` zone to container-reachable (loopback /
+    /// private-range) sources. On by default so the internal topology
+    /// isn't exposed to public clients; disable only for debugging.
+    pub restrict_sources: bool,
 }
 
 impl Default for DnsSection {
@@ -73,6 +80,8 @@ impl Default for DnsSection {
             enabled: false,
             listen: "127.0.0.53:53".to_string(),
             upstream: "8.8.8.8:53".to_string(),
+            default_namespace: "default".to_string(),
+            restrict_sources: true,
         }
     }
 }
@@ -100,6 +109,10 @@ impl DnsSection {
             listen_addr,
             upstream,
             upstream_timeout: std::time::Duration::from_secs(2),
+            default_namespace: self.default_namespace.clone(),
+            source_acl: crate::onion::dns::SourceAcl {
+                restrict_to_private: self.restrict_sources,
+            },
         })
     }
 }

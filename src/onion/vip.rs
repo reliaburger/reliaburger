@@ -1,9 +1,11 @@
 /// Virtual IP allocation for Onion service discovery.
 ///
 /// Each service gets a deterministic virtual IP from the
-/// `127.128.0.0/16` range. The VIP is derived from the app name
-/// using SipHash-2-4 with fixed seeds, so the same app name always
-/// maps to the same VIP cluster-wide. No coordination needed.
+/// `127.128.0.0/16` range. The VIP is derived from the service's
+/// *namespace-qualified* identity using SipHash-2-4 with fixed seeds,
+/// so the same service always maps to the same VIP cluster-wide, and
+/// two apps of the same name in different namespaces get distinct VIPs
+/// (D3/codex-M1). No coordination needed.
 ///
 /// The `127.128.0.0/16` range lives within the loopback block
 /// (`127.0.0.0/8`), so it never conflicts with real network
@@ -15,22 +17,34 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 use siphasher::sip::SipHasher24;
 
+use super::service_id::ServiceId;
+
 /// A virtual IP address for a service.
 ///
-/// Deterministically derived from the app name. The same name always
-/// produces the same VIP. Lives in the `127.128.0.0/16` range.
+/// Deterministically derived from the service's namespace-qualified
+/// identity. The same service always produces the same VIP. Lives in
+/// the `127.128.0.0/16` range.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct VirtualIP(pub Ipv4Addr);
 
 impl VirtualIP {
-    /// Derive a VIP from an app name.
+    /// Derive a VIP from a namespace-qualified service identity.
     ///
-    /// Uses SipHash-2-4 with fixed seeds to distribute names across
+    /// Uses SipHash-2-4 with fixed seeds to distribute services across
     /// the `127.128.0.1` through `127.128.255.254` range (65,534
-    /// usable addresses). Deterministic: same name, same VIP.
-    pub fn from_app_name(name: &str) -> Self {
+    /// usable addresses). Deterministic: same identity, same VIP. Two
+    /// apps of the same name in different namespaces hash their distinct
+    /// qualified forms, so they never share a VIP.
+    pub fn from_service_id(id: &ServiceId) -> Self {
+        Self::from_qualified(&id.qualified())
+    }
+
+    /// Derive a VIP from a service's canonical qualified string
+    /// (`{namespace}__{name}`). Split out so the exhaustion/collision
+    /// walk in the service map can probe successor identities.
+    pub fn from_qualified(qualified: &str) -> Self {
         let mut hasher = SipHasher24::new_with_keys(0xDEAD_BEEF_CAFE_F00D, 0xBAAD_F00D_DEAD_BEEF);
-        name.hash(&mut hasher);
+        qualified.hash(&mut hasher);
         let hash = hasher.finish();
 
         // Map to range 1..=65534 (skip .0.0 and .255.255)
@@ -90,24 +104,37 @@ pub fn name_to_id(name: &str) -> u32 {
 mod tests {
     use super::*;
 
+    fn sid(namespace: &str, name: &str) -> ServiceId {
+        ServiceId::new(namespace, name)
+    }
+
     #[test]
-    fn from_app_name_deterministic() {
-        let a = VirtualIP::from_app_name("redis");
-        let b = VirtualIP::from_app_name("redis");
+    fn from_service_id_deterministic() {
+        let a = VirtualIP::from_service_id(&sid("default", "redis"));
+        let b = VirtualIP::from_service_id(&sid("default", "redis"));
         assert_eq!(a, b);
     }
 
     #[test]
-    fn from_app_name_different_names_different_vips() {
-        let redis = VirtualIP::from_app_name("redis");
-        let web = VirtualIP::from_app_name("web");
+    fn from_service_id_different_names_different_vips() {
+        let redis = VirtualIP::from_service_id(&sid("default", "redis"));
+        let web = VirtualIP::from_service_id(&sid("default", "web"));
         assert_ne!(redis, web);
     }
 
     #[test]
-    fn from_app_name_in_vip_range() {
+    fn same_name_different_namespaces_get_distinct_vips() {
+        // The D3/codex-M1 regression: default/api and payments/api must not
+        // hash to the same VIP.
+        let a = VirtualIP::from_service_id(&sid("default", "api"));
+        let b = VirtualIP::from_service_id(&sid("payments", "api"));
+        assert_ne!(a, b, "same-named apps in two namespaces shared a VIP");
+    }
+
+    #[test]
+    fn from_service_id_in_vip_range() {
         for name in &["redis", "web", "api", "postgres", "worker", "nginx"] {
-            let vip = VirtualIP::from_app_name(name);
+            let vip = VirtualIP::from_service_id(&sid("default", name));
             assert!(
                 VirtualIP::is_in_vip_range(vip.0),
                 "{name} produced VIP {vip} outside range"
@@ -117,14 +144,13 @@ mod tests {
 
     #[test]
     fn vip_avoids_zero_and_broadcast() {
-        // Run through many names and verify none produce .0.0 or .255.255
+        // Run through many identities and verify none produce .0.0 or .255.255
         for i in 0..10000 {
-            let name = format!("service-{i}");
-            let vip = VirtualIP::from_app_name(&name);
+            let vip = VirtualIP::from_service_id(&sid("default", &format!("service-{i}")));
             let octets = vip.0.octets();
             let low16 = ((octets[2] as u16) << 8) | octets[3] as u16;
-            assert_ne!(low16, 0, "{name} produced .0.0");
-            assert_ne!(low16, 0xFFFF, "{name} produced .255.255");
+            assert_ne!(low16, 0, "service-{i} produced .0.0");
+            assert_ne!(low16, 0xFFFF, "service-{i} produced .255.255");
         }
     }
 
@@ -157,7 +183,7 @@ mod tests {
 
     #[test]
     fn to_network_byte_order_round_trip() {
-        let vip = VirtualIP::from_app_name("redis");
+        let vip = VirtualIP::from_service_id(&sid("default", "redis"));
         let nbo = vip.to_network_byte_order();
         let back = VirtualIP::from_network_byte_order(nbo);
         assert_eq!(vip, back);

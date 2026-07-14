@@ -501,23 +501,23 @@ There's no IngressClass, no annotations, no separate cert-manager installation. 
 
 ## 10. Service Discovery (Onion)
 
-Onion is an eBPF program that intercepts the network stack at two points at the socket level:
+Onion resolves service names to virtual IPs, then rewrites connections to those VIPs onto live backends. It works at two points:
 
-1. **DNS interception:** When an app resolves a `.internal` name, the eBPF program responds directly from an in-kernel service map with a virtual IP. No DNS server process.
-2. **Connect interception:** When an app calls `connect()` with a virtual IP, the eBPF program rewrites the destination to a healthy backend's actual `host:port`. No proxy in the data path.
+1. **DNS resolution (userspace):** When an app resolves an `.internal` name, a small userspace responder that Bun runs answers from the service map with a virtual IP. We originally planned to intercept DNS in the kernel, but the cgroup `sendmsg4`/`recvmsg4` eBPF hooks can rewrite socket addresses, not read or synthesise DNS packet payloads, so an in-kernel DNS server isn't possible. The responder is authoritative for `.internal`, so those names never leak to a public resolver.
+2. **Connect interception (eBPF):** When an app calls `connect()` with a virtual IP, an eBPF program rewrites the destination to a healthy backend's actual `host:port`. No proxy in the data path.
 
 ```
-App calls getaddrinfo("redis.internal")
-  → eBPF responds with virtual IP 127.128.0.42
+App calls getaddrinfo("redis.payments.internal")
+  → userspace responder answers with virtual IP 127.128.0.42
 
 App calls connect(127.128.0.42, 6379)
   → eBPF rewrites to 10.0.1.5:30891 (real backend)
   → direct TCP connection, native performance
 ```
 
-From an application's perspective, connecting to another service is identical to any network service: `http://web.internal:8080`, `redis://redis.internal:6379`. The eBPF layer is completely invisible.
+From an application's perspective, connecting to another service is identical to any network service: `http://web.internal:8080`, `redis://redis.payments.internal:6379`. Names are namespace-qualified (`<app>.<namespace>.internal`); a bare `<app>.internal` resolves within the caller's own namespace. Two apps of the same name in different namespaces are distinct services with distinct VIPs. The connect-rewrite layer is completely invisible.
 
-Virtual IPs are allocated per service name (not per instance) from 127.128.0.0/16, within the loopback range so packets are guaranteed to be intercepted locally and never leak onto the network (~65K unique service names, expandable to /10 for ~4M). Because the eBPF program runs in the kernel, a Bun crash doesn't break existing connections. However, the service map becomes stale for new connections until Bun restarts. Systemd manages Bun with automatic restart (default: 5-second delay), `OOMScoreAdjust=-900` to protect it from the OOM killer, and re-populates the eBPF maps from the reporting tree on startup.
+Virtual IPs are allocated per namespace-qualified service (not per instance) from 127.128.0.0/16, within the loopback range so packets are guaranteed to be intercepted locally and never leak onto the network (~65K unique services, expandable to /10 for ~4M). The connect hook runs in the kernel, so a Bun crash doesn't break existing connections. The service map becomes stale for new connections until Bun restarts. Systemd manages Bun with automatic restart (default: 5-second delay), `OOMScoreAdjust=-900` to protect it from the OOM killer, and re-populates the eBPF maps from the reporting tree on startup.
 
 **External DNS:** Non-`.internal` names use the host's configured resolvers. Egress allowlists implicitly permit DNS (UDP/TCP port 53) to the host's configured nameservers.
 

@@ -167,6 +167,9 @@ pub enum OnionError {
     #[error("too many backends for {app_name:?}: limit is {MAX_BACKENDS}")]
     TooManyBackends { app_name: String },
 
+    #[error("virtual IP space exhausted allocating a VIP for {name:?}")]
+    VipSpaceExhausted { name: String },
+
     #[error("eBPF load failed: {reason}")]
     EbpfLoadFailed { reason: String },
 }

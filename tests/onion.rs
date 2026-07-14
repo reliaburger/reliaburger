@@ -15,6 +15,7 @@ use reliaburger::bun::api;
 use reliaburger::config::Config;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
+use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::vip::VirtualIP;
 use reliaburger::relish::client::BunClient;
 use tokio::sync::mpsc;
@@ -136,7 +137,7 @@ async fn deploy_app_with_port_registers_in_service_map() {
     assert_eq!(info.app_name, "redis");
     assert_eq!(info.port, 6379);
 
-    let expected_vip = VirtualIP::from_app_name("redis");
+    let expected_vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
     assert_eq!(info.vip, expected_vip.to_string());
 }
 

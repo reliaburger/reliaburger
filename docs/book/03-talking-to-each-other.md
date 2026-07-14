@@ -286,18 +286,39 @@ The DNS lookup adds ~50 microseconds (one localhost UDP round trip). The connect
 
 Each service gets a virtual IP from the `127.128.0.0/16` range. This lives within the loopback block (`127.0.0.0/8`), so it never conflicts with real network addresses. No packets with these addresses ever leave the node — the `connect()` hook rewrites them before the kernel acts on them.
 
-The VIP is derived deterministically from the app name using SipHash:
+Now, what's a "service"? Our first cut said: the app name. `redis` gets a VIP, `web` gets a VIP. That turned out to be a bug. Reliaburger has namespaces, and two teams can each run an app called `api` — one in `default`, one in `payments`. If the VIP is a hash of the bare name, both `api`s hash to the *same* VIP, and whichever registered last wins. One team's traffic silently lands on the other team's backends. Not great.
+
+So a service isn't a name, it's a `(namespace, name)` pair. We wrap that in a newtype:
 
 ```rust
-pub struct VirtualIP(pub Ipv4Addr);
+pub struct ServiceId {
+    pub namespace: String,
+    pub name: String,
+}
 
+impl ServiceId {
+    pub fn qualified(&self) -> String {
+        format!("{}__{}", self.namespace, self.name)
+    }
+}
+```
+
+A newtype is Rust's way of giving a plain pair of strings a name and a set of methods. `ServiceId` is a `struct`, not a type alias, so the compiler treats it as distinct from any other two-string pair — you can't accidentally pass a `(host, path)` where a `ServiceId` is expected. The canonical form joins the two with `__` (two underscores). Both a namespace and an app name are DNS-1123 labels, which only allow `[a-z0-9-]`, so an underscore can never appear inside either half. That makes `payments__api` unambiguous to split back apart, even when the app name itself contains a hyphen. It's the same separator our instance IDs use (Chapter 1's `InstanceIdentity`), so the two id schemes read the same way.
+
+The VIP is then derived deterministically from that qualified string using SipHash:
+
+```rust
 impl VirtualIP {
-    pub fn from_app_name(name: &str) -> Self {
+    pub fn from_service_id(id: &ServiceId) -> Self {
+        Self::from_qualified(&id.qualified())
+    }
+
+    pub fn from_qualified(qualified: &str) -> Self {
         let mut hasher = SipHasher24::new_with_keys(
             0xDEAD_BEEF_CAFE_F00D,
             0xBAAD_F00D_DEAD_BEEF,
         );
-        name.hash(&mut hasher);
+        qualified.hash(&mut hasher);
         let hash = hasher.finish();
 
         let offset = (hash % 65534) as u32 + 1;
@@ -307,9 +328,11 @@ impl VirtualIP {
 }
 ```
 
-Same name, same VIP, every time, on every node. No coordination needed. SipHash is a keyed hash function (the `new_with_keys` call) originally designed for hash table collision resistance. We use it here because it distributes names evenly across the 65,534 available addresses with very low collision probability. It's not cryptographic, but it doesn't need to be — we just need a good spread.
+`default__api` and `payments__api` hash to different bytes, so they get different VIPs. Same service, same VIP, every time, on every node. No coordination needed. SipHash is a keyed hash function (the `new_with_keys` call) originally designed for hash table collision resistance. We use it here because it distributes names evenly across the 65,534 available addresses with very low collision probability. It's not cryptographic, but it doesn't need to be — we just need a good spread.
 
 The `0xDEAD_BEEF_CAFE_F00D` and `0xBAAD_F00D_DEAD_BEEF` keys are fixed seeds. They're arbitrary constants, but using the same ones on every node is what makes the VIP deterministic cluster-wide.
+
+A good spread isn't a guarantee, though. With 65,534 slots, two *different* services will eventually hash to the same VIP (the birthday problem bites long before the space is full). So the service map keeps a set of allocated VIPs and, on the rare collision, probes deterministic successors — `payments__api#1`, `#2`, and so on — until it finds a free address. The collision is *resolved*, not silently shared. And when a service stops, we release its VIP back to the pool. Previously VIPs lingered forever, which is fine until you churn through enough deploys to notice the leak.
 
 ### The service map
 
@@ -317,7 +340,9 @@ Before we get to the eBPF programs, we need the data model they operate on. The 
 
 ```rust
 pub struct ServiceMap {
+    // Keyed by ServiceId::qualified(), e.g. "payments__api".
     entries: HashMap<String, ServiceEntry>,
+    allocated_vips: HashSet<VirtualIP>,
 }
 
 pub struct ServiceEntry {
@@ -337,7 +362,9 @@ pub struct BackendInstance {
 }
 ```
 
-When Bun deploys an app with a port, it calls `service_map.register_app("redis", "default", 6379, None)`. That computes the VIP and creates an entry with an empty backend list. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister_app()` removes everything.
+When Bun deploys an app with a port, it calls `service_map.register(&ServiceId::new("default", "redis"), 6379, None)`. That computes the namespaced VIP and creates an entry with an empty backend list. Every method that mutates or reads a service takes a `&ServiceId`, so the namespace is threaded through the whole path — the compiler won't let a call site forget it. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister()` removes everything and releases the VIP.
+
+There's one deliberate escape hatch. The `relish resolve <name>` CLI and Smoker's fault-injection targeting still take a bare name — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace. Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
 
 On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in the kernel. On macOS and for ProcessGrill, the map still works — it powers `relish resolve` — but there are no eBPF programs reading it.
 
@@ -345,7 +372,7 @@ On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in
 
 The eBPF programs don't call back to Bun. They read from kernel-resident hash maps that Bun populates. Three maps (plus a supplementary one for namespace isolation):
 
-**`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string (`redis.internal`), value is a 4-byte IPv4 address in network byte order. When the DNS interception program sees a `.internal` query, it looks up this map.
+**`dns_map`**: Maps service names to VIPs. Key is a 256-byte null-terminated string, value is a 4-byte IPv4 address in network byte order. It's a leftover from the abandoned in-kernel DNS design (see "Why userspace DNS" below) — the userspace responder resolves names straight from the `ServiceMap` instead, so this map isn't on the resolution path today.
 
 **`backend_map`**: Maps `(VIP, port)` pairs to backend arrays. Each entry holds up to 32 backends with their real IPs, ports, and health flags, plus a round-robin counter. When the connect hook intercepts a VIP connection, it looks up this map and picks a healthy backend.
 
@@ -444,17 +471,45 @@ The original design called for fully in-kernel DNS interception using `cgroup/se
 
 The problem is that these hooks let you modify the *destination address* of a UDP sendmsg, but they can't read the *packet payload*. You can redirect where a DNS query goes, but you can't parse the query name or synthesise a response. The BPF helper you'd need (`bpf_msg_pull_data`) only works with `SK_MSG` programs (stream parsers for TCP), not cgroup socket address hooks.
 
-So we run a userspace DNS responder instead. It's about 80 lines of code in `src/onion/dns.rs`: one `tokio::select!` loop reading from a UDP socket. Bun configures containers' `/etc/resolv.conf` to point at `127.0.0.53`, and the responder handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
+So we run a userspace DNS responder instead. It lives in `src/onion/dns.rs`: a `tokio::select!` loop reading from a UDP socket, plus a TCP listener for large answers. Bun configures containers' `/etc/resolv.conf` to point at the responder, and it handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
+
+Names are namespace-qualified: `<app>.<namespace>.internal`. A query for `api.payments.internal` resolves the `api` service in the `payments` namespace, and `api.default.internal` resolves the *other* `api` — each to its own VIP. A bare `<app>.internal` is a convenience: it resolves in the node's configured default namespace, because the userspace responder can't see which container asked (it has a source IP, not a cgroup). Mapping the stripped name to a `ServiceId` is a two-line match:
+
+```rust
+fn service_id_for(stripped: &str, default_namespace: &str) -> ServiceId {
+    match stripped.split_once('.') {
+        Some((app, namespace)) => ServiceId::new(namespace, app),
+        None => ServiceId::new(default_namespace, stripped),
+    }
+}
+```
+
+`split_once('.')` returns `Some((before, after))` on the first dot or `None` if there isn't one — exactly the "qualified vs bare" distinction we want, in one call.
 
 The cost is ~50 microseconds per DNS lookup (localhost UDP round trip). That's 10x faster than CoreDNS over the pod network, but it's not zero. Most applications cache DNS results anyway, so this hit happens once per connection lifetime, not per request.
 
 The connect rewrite — the part that actually matters for latency — is still fully in-kernel eBPF. Once your app has the VIP from DNS, every `connect()` call is rewritten at zero cost.
 
-### UDP only: a deliberate limitation
+### TCP, and who's allowed to ask
 
-The DNS responder only handles UDP queries. DNS over TCP (used when responses exceed 512 bytes or the server sets the TC truncation flag) goes to the upstream resolver, which doesn't know about `.internal` names.
+The responder answers `.internal` over both UDP and TCP. A resolver retries over TCP when a UDP reply comes back truncated (the TC bit set), so a UDP-only responder would leave that retry hanging with nobody home. Our answers are small — a single A record with a 4-byte VIP — so truncation is rare, but "rare" isn't "never," and a half-bound responder is a subtle way to lose DNS for one query in a thousand. TCP frames each message with a 2-byte length prefix; the listener reads the length, reads that many bytes, answers, and closes.
 
-This is safe because we control both sides. Our `.internal` names are short (under 253 characters) and our responses contain a single A record with a 4-byte VIP. There's nothing to truncate. TCP DNS fallback only triggers when responses are large — zone transfers, DNSSEC chains, many-record answers. We'll never produce those.
+Not everyone gets to ask, though. The `.internal` zone is a map of the cluster's internal topology, and that shouldn't be readable from the public internet. Every internal answer is gated by a source ACL: loopback and the private ranges containers live in (RFC 1918, plus the `100.64.0.0/10` CGNAT block Lima and runc bridges hand out) are served; a query from a public address gets REFUSED — not answered, not forwarded, refused. The check is a small method on the config:
+
+```rust
+pub fn allows(&self, src: IpAddr) -> bool {
+    match src {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || /* CGNAT, VIP range */
+        }
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+```
+
+### Fail closed, not open
+
+One more change worth calling out. The original responder was spawned as a detached best-effort task: if it couldn't bind its socket, the error was logged and the node carried on. That's the wrong default. A node that's advertising service discovery but has no resolver is worse than one that refuses to start — the apps deploy, look healthy, and then can't find each other. So `run_dns_responder` binds both UDP and TCP up front and *returns the error* if either bind fails; startup propagates it and the deploy fails closed. Config validation catches the related trap earlier still: a VIP the responder hands out only routes because the eBPF connect hook rewrites it, so enabling `[dns]` with `[ebpf]` turned off is rejected outright rather than deploying an app whose VIP silently goes nowhere.
 
 ### A DNS server that doesn't fall over
 
@@ -484,10 +539,23 @@ How do you test code that runs in the kernel? Two approaches, at different level
 #[test]
 fn register_and_resolve() {
     let mut map = ServiceMap::new();
-    let vip = map.register_app("redis", "default", 6379, None).unwrap();
-    let entry = map.resolve("redis").unwrap();
+    let id = ServiceId::new("default", "redis");
+    let vip = map.register(&id, 6379, None).unwrap();
+    let entry = map.resolve(&id).unwrap();
     assert_eq!(entry.vip, vip);
     assert!(entry.backends.is_empty());
+}
+```
+
+And the collision the whole refactor exists to kill gets its own test — the same name in two namespaces must produce two VIPs:
+
+```rust
+#[test]
+fn same_name_two_namespaces_get_distinct_vips() {
+    let mut map = ServiceMap::new();
+    let a = map.register(&ServiceId::new("default", "api"), 3000, None).unwrap();
+    let b = map.register(&ServiceId::new("payments", "api"), 3000, None).unwrap();
+    assert_ne!(a, b);
 }
 ```
 
@@ -630,6 +698,8 @@ pub struct RoutingTable {
 Each host maps to a list of path routes, sorted by path length descending. When a request arrives, we extract the `Host` header, find the matching host (case-insensitive), then walk the path routes looking for the first prefix match. Longest prefix wins — `/api/v1` matches before `/api`, which matches before `/`.
 
 The table is rebuilt from the `ServiceMap` whenever apps with ingress config are deployed, stopped, or have health changes. Rebuilding is cheap (microseconds for typical clusters) and writes are behind a `RwLock`. In-flight requests hold a read lock and are never blocked by a rebuild.
+
+The ingress specs the agent feeds into the rebuild are keyed by `(namespace, app_name)`, not the bare name — the same collision fix as the VIPs. Two teams both running an `api` app, each with its own ingress on its own host, need two independent routes. Keyed by name alone, the second would clobber the first; keyed by the pair, they coexist, and each rebuild looks its backends up through the namespaced `ServiceId`.
 
 ### What happens when things go wrong
 

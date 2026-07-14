@@ -540,7 +540,7 @@ mod tests {
             .unwrap();
         service_map
             .add_backend(
-                "web",
+                &crate::onion::service_id::ServiceId::new("default", "web"),
                 BackendInstance {
                     instance_id: "default__web-0".to_string(),
                     node_ip: Ipv4Addr::LOCALHOST,
@@ -551,7 +551,7 @@ mod tests {
             .unwrap();
         let mut ingress = std::collections::HashMap::new();
         ingress.insert(
-            "web".to_string(),
+            ("default".to_string(), "web".to_string()),
             crate::config::app::IngressSpec {
                 host: "web.test".to_string(),
                 path: None,
