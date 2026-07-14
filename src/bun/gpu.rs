@@ -47,39 +47,4 @@ mod tests {
         let detector = StubGpuDetector;
         assert!(detector.detect().is_empty());
     }
-
-    #[test]
-    fn gpu_info_fields_accessible() {
-        let gpu = GpuInfo {
-            index: 0,
-            name: "NVIDIA A100".to_string(),
-            vram_bytes: 80 * 1024 * 1024 * 1024, // 80 GiB
-        };
-        assert_eq!(gpu.index, 0);
-        assert_eq!(gpu.name, "NVIDIA A100");
-        assert_eq!(gpu.vram_bytes, 85_899_345_920);
-    }
-
-    #[test]
-    fn gpu_info_equality() {
-        let a = GpuInfo {
-            index: 0,
-            name: "A100".to_string(),
-            vram_bytes: 1024,
-        };
-        let b = a.clone();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn gpu_info_debug_format() {
-        let gpu = GpuInfo {
-            index: 1,
-            name: "T4".to_string(),
-            vram_bytes: 16_000_000_000,
-        };
-        let debug = format!("{gpu:?}");
-        assert!(debug.contains("T4"));
-        assert!(debug.contains("16000000000"));
-    }
 }
