@@ -942,13 +942,12 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
 
     // The pushed manifest carries a signature that verifies under the
     // deploy-time trust policy and the cluster root CA.
-    let manifest = {
-        let catalog = catalog.read().await;
-        catalog
-            .get_manifest_by_tag("hello", "v1")
-            .cloned()
-            .expect("built image missing from the catalog")
-    };
+    let manifest = council
+        .manifest_catalog()
+        .await
+        .get_manifest_by_tag("hello", "v1")
+        .cloned()
+        .expect("built image missing from the authoritative catalog");
     let signature = manifest
         .signature
         .expect("signed build must carry a signature");
