@@ -67,6 +67,11 @@ impl Registry {
             node_raft_id,
             council: None,
             persist_path,
+            auth: None,
+            quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
+            sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+                reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+            ),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -170,6 +175,48 @@ async fn push_records_real_holder_id() {
     );
 }
 
+/// REG8: a multi-segment `team/app` repository pushes and pulls end to
+/// end through the full route path — blobs, manifest PUT, manifest GET
+/// and tag list all recover the two-segment name.
+#[tokio::test]
+async fn multi_segment_repository_pushes_and_pulls() {
+    let registry = Registry::start(9, false).await;
+    let base = registry.base_url();
+    let (_config_digest, layer_digest) = push_test_image(&base, "team/app", "v1").await;
+
+    let client = reqwest::Client::new();
+
+    // Manifest GET by tag resolves the two-segment name.
+    let resp = client
+        .get(format!("{base}/v2/team/app/manifests/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "manifest get for team/app");
+
+    // The layer blob is retrievable under the multi-segment path.
+    let resp = client
+        .get(format!(
+            "{base}/v2/team/app/blobs/{}",
+            layer_digest.as_str()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "blob get for team/app");
+
+    // Tag list reports v1 for the two-segment repository.
+    let resp = client
+        .get(format!("{base}/v2/team/app/tags/list"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "team/app");
+    assert_eq!(body["tags"], serde_json::json!(["v1"]));
+}
+
 /// L10: the catalog must survive a restart (it used to be `default()`
 /// on every boot).
 #[tokio::test]
@@ -185,6 +232,11 @@ async fn catalog_survives_restart() {
             node_raft_id: 7,
             council: None,
             persist_path: Some(persist_path.clone()),
+            auth: None,
+            quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
+            sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+                reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+            ),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -465,6 +517,7 @@ fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterS
         state: registry.state.clone(),
         members: None,
         registry_port: 0,
+        peer_scheme: "http".to_string(),
         concurrency: 4,
         client: reqwest::Client::new(),
         upstream: None,

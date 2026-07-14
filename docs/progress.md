@@ -972,12 +972,32 @@ whole theme lands.
   permits through TLS/WebSocket lifetime; add handshake/idle timeouts. Replace untrusted
   forwarded headers, use boundary-correct deterministic route/rate keys, parse IPv6 Host
   correctly and wire deployment draining (D7/D10, ING1-ING5).
-- [ ] **Pickle storage and replication durability** — stream/hash off the async runtime;
+- [x] **Pickle storage and replication durability** — stream/hash off the async runtime;
   add authenticated principal/repository quotas and upload expiry; write unique temp files,
   fsync and rename; reverify cache and isolate immutable rootfs generations; constrain
   redirects to same-origin relative paths and bound peer reads. Recheck references at
   deletion, report degraded redundancy honestly, define acknowledged push semantics and
   support multi-segment repositories (D11, REG2/REG4-REG8, old cache/upload Lows).
+  - [x] REG5 — durable persistence: `write_blob`/catalogue `persist_to`/`complete_upload`
+    write a unique temp, fsync the file, rename, fsync the parent dir; cache hits and the
+    deploy path revalidate the digest (`revalidate_blob`); rootfs unpacks into an immutable
+    content-addressed `gen-{hash}` directory so a tag move can't clobber a live container.
+  - [x] REG2 — one authoritative catalogue: `manifest_get`/`tags_list` read
+    `catalog_snapshot()` (the council's Raft catalogue when clustered), so a peer's commit is
+    visible everywhere without waiting for a heal tick.
+  - [x] REG4 — auth, TLS, quotas, limits: registry writes reuse `sesame::auth` (bearer +
+    service token; Deployer role); the listener serves over TLS via `build_api_server_config`
+    when the node has an mTLS identity, peers address `https://`; per-repository/registry byte
+    quotas; whole-blob hashing moved to `spawn_blocking`; upload-session TTL + sweep (REG8).
+  - [x] REG6 — same-origin redirects + bounded reads: `resolve_same_origin_location` refuses
+    an absolute/cross-host/protocol-relative upload `location`; peer body reads are capped and
+    wrapped in the timeout.
+  - [x] REG7/D11 — honest push semantics: `record_commit` returns a `CommitOutcome`; the push
+    returns `201`+`OCI-Replication: pending` (authoritative, replication owed) or
+    `202`+`raft-uncommitted`; GC rechecks the full catalogue reference set before deletion.
+  - [x] REG8 — multi-segment repositories: the router captures the whole `/v2/*rest` path and
+    splits the OCI operation suffix, recovering `team/app` names end to end; upload sessions
+    expire.
 
 ### 12b.5 — Make automation and observability truthful
 

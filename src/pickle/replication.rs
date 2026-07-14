@@ -83,6 +83,18 @@ pub struct ReplicationResult {
     pub failed_nodes: Vec<(u64, String)>,
 }
 
+/// Whether the configured redundancy has actually been achieved (REG7/D11).
+///
+/// `holder_count` is the number of nodes now holding a full copy — the
+/// local node plus every peer that received it. Durable redundancy means
+/// at least `redundancy` distinct holders. A push to a cluster with no
+/// reachable peer sits at `holder_count == 1`, which is **not** durable
+/// redundancy when `redundancy > 1`: the caller must report "replication
+/// pending", never a durable success.
+pub fn redundancy_satisfied(holder_count: usize, redundancy: u32) -> bool {
+    holder_count >= redundancy as usize
+}
+
 /// Check which layers a peer already has.
 ///
 /// Returns the set of digests the peer already holds (via HEAD requests).
@@ -111,6 +123,54 @@ pub async fn check_peer_has_layers(
         }
     }
     has
+}
+
+/// Resolve an OCI upload `location` against the peer's base URL, refusing
+/// any destination that isn't the peer's own origin (REG6).
+///
+/// Returns the absolute URL to PUT to, or `None` when the location points
+/// somewhere else. Rules:
+/// - a relative path (`/v2/…`) is resolved against `base_url`;
+/// - an absolute URL is accepted only if its scheme + host + port match
+///   `base_url`;
+/// - anything with a different origin — an attacker host, a different
+///   scheme, a different port — is rejected.
+///
+/// `&str` in, `Option<String>` out: a borrow of the inputs, an owned URL
+/// only on success.
+pub(crate) fn resolve_same_origin_location(base_url: &str, location: &str) -> Option<String> {
+    // A relative path: must start with `/` (not `//`, which is
+    // protocol-relative and can change host). Resolve against the base.
+    if let Some(rest) = location.strip_prefix('/') {
+        if rest.starts_with('/') {
+            return None; // protocol-relative `//host/…`
+        }
+        let base = base_url.trim_end_matches('/');
+        return Some(format!("{base}/{rest}"));
+    }
+
+    // An absolute URL: accept only if its origin equals the peer's.
+    let base_origin = url_origin(base_url)?;
+    let loc_origin = url_origin(location)?;
+    if base_origin == loc_origin {
+        Some(location.to_string())
+    } else {
+        None
+    }
+}
+
+/// The `scheme://host[:port]` origin of a URL, lowercased. `None` if the
+/// input has no scheme (so it isn't an absolute URL we can compare).
+fn url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    // Authority ends at the first `/`, `?`, or `#`.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    Some(format!(
+        "{}://{}",
+        scheme.to_lowercase(),
+        authority.to_lowercase()
+    ))
 }
 
 /// Replicate a single layer to a peer via its OCI upload API.
@@ -158,12 +218,20 @@ pub async fn replicate_layer_to_peer(
         })?
         .to_string();
 
-    // Upload data + complete in one PUT
-    let complete_url = if location.starts_with("http") {
-        format!("{location}?digest={}", digest.as_str())
-    } else {
-        format!("{}{}?digest={}", peer.base_url, location, digest.as_str())
-    };
+    // Constrain the redirect to the peer's own origin (REG6). A compromised
+    // peer could otherwise return an absolute `location` pointing at an
+    // attacker host, making this node PUT the blob bytes there. We accept
+    // only a relative path (resolved against the peer's base URL) or an
+    // absolute URL whose origin matches the peer's — anything else is
+    // refused before the PUT leaves.
+    let complete_url =
+        resolve_same_origin_location(&peer.base_url, &location).ok_or_else(|| {
+            PickleError::ReplicationFailed(format!(
+                "peer {} returned a cross-origin upload location: {location}",
+                peer.node_id
+            ))
+        })?;
+    let complete_url = format!("{complete_url}?digest={}", digest.as_str());
 
     let resp = tokio::time::timeout(
         timeout,
@@ -432,6 +500,52 @@ mod tests {
                 base_url: "http://10.0.1.4:5000".to_string(),
             },
         ]
+    }
+
+    // --- REG6: same-origin redirect constraint ---
+
+    #[test]
+    fn relative_location_resolves_against_the_peer() {
+        let url = resolve_same_origin_location("http://10.0.1.5:5000", "/v2/app/blobs/uploads/abc")
+            .unwrap();
+        assert_eq!(url, "http://10.0.1.5:5000/v2/app/blobs/uploads/abc");
+    }
+
+    #[test]
+    fn same_origin_absolute_location_is_allowed() {
+        let url = resolve_same_origin_location(
+            "https://10.0.1.5:5000",
+            "https://10.0.1.5:5000/v2/app/blobs/uploads/abc",
+        )
+        .unwrap();
+        assert_eq!(url, "https://10.0.1.5:5000/v2/app/blobs/uploads/abc");
+    }
+
+    #[test]
+    fn cross_host_absolute_location_is_refused() {
+        // The classic SSRF: a compromised peer redirects the PUT elsewhere.
+        assert!(
+            resolve_same_origin_location("http://10.0.1.5:5000", "http://attacker.example/collect")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn different_port_or_scheme_is_refused() {
+        assert!(
+            resolve_same_origin_location("http://10.0.1.5:5000", "http://10.0.1.5:9999/x")
+                .is_none()
+        );
+        assert!(
+            resolve_same_origin_location("http://10.0.1.5:5000", "https://10.0.1.5:5000/x")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protocol_relative_location_is_refused() {
+        // `//attacker/…` keeps the scheme but swaps the host.
+        assert!(resolve_same_origin_location("http://10.0.1.5:5000", "//attacker/x").is_none());
     }
 
     #[test]

@@ -197,6 +197,10 @@ pub struct ClusterSource {
     pub members:
         Option<tokio::sync::watch::Receiver<Vec<crate::mustard::membership::MembershipSnapshot>>>,
     pub registry_port: u16,
+    /// URL scheme peers are addressed by (`"http"` or `"https"` when the
+    /// registry runs over TLS — REG4). Kept beside `registry_port` so the
+    /// derived peer URLs match how the local registry actually serves.
+    pub peer_scheme: String,
     /// Parallel fetches per image pull (`[images] p2p_concurrency`).
     pub concurrency: usize,
     pub client: reqwest::Client,
@@ -225,7 +229,11 @@ impl ClusterSource {
         tag: &str,
     ) -> Result<Option<Vec<PathBuf>>, PickleError> {
         let peers = match &self.members {
-            Some(rx) => crate::cluster::identity::pickle_peers(&rx.borrow(), self.registry_port),
+            Some(rx) => crate::cluster::identity::pickle_peers_scheme(
+                &rx.borrow(),
+                self.registry_port,
+                &self.peer_scheme,
+            ),
             None => Vec::new(),
         };
         self.ensure_image_local_with_peers(repository, tag, &peers)
@@ -306,7 +314,11 @@ impl ClusterSource {
         image: &crate::grill::image::ImageReference,
     ) -> Result<Option<Vec<PathBuf>>, PickleError> {
         let peers = match &self.members {
-            Some(rx) => crate::cluster::identity::pickle_peers(&rx.borrow(), self.registry_port),
+            Some(rx) => crate::cluster::identity::pickle_peers_scheme(
+                &rx.borrow(),
+                self.registry_port,
+                &self.peer_scheme,
+            ),
             None => Vec::new(),
         };
         self.ensure_external_image_with_peers(image, &peers).await

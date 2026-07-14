@@ -274,6 +274,11 @@ async fn start_registry() -> (
         node_raft_id: 1,
         council: None,
         persist_path: None,
+        auth: None,
+        quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
+        sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+            reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

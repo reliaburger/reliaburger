@@ -4,12 +4,58 @@
 //! same on-disk layout as `grill::image::ImageStore`, so blobs cached
 //! from Docker Hub are visible to Pickle and vice versa.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as Sha2Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use super::types::{Digest, PickleError};
+
+/// Write `data` to `path` durably: a unique temp file in the same
+/// directory, `fsync` the file, rename over the target, then `fsync` the
+/// parent directory so the rename itself survives a crash (REG5).
+///
+/// A crash at any point leaves either the old file or the new one, never a
+/// torn half-written final. The temp name carries a random suffix so two
+/// concurrent writers to the same digest never share a temp path.
+///
+/// `&Path`/`&[u8]` are borrows: this helper reads the bytes and the path
+/// without taking ownership, so the caller keeps using them afterwards.
+fn write_file_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let tmp = parent.join(format!(
+        ".{}.{:032x}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        rand::random::<u128>()
+    ));
+
+    // Scope the file handle so it closes before the rename.
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+
+    // If the rename fails, clean up the temp so it isn't nominated as an
+    // orphan later.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // fsync the directory so the rename (a directory-metadata change) is
+    // durable. A missing/inaccessible dir handle is non-fatal — the data
+    // file itself is already synced.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
 
 /// Reject any upload id that isn't in the exact shape we generate.
 ///
@@ -97,11 +143,35 @@ impl BlobStore {
         }
 
         let path = self.blob_path(expected_digest);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, data)?;
+        // Durable, crash-safe write: unique temp, fsync, rename, fsync dir
+        // (REG5). A concurrent write of the same digest is harmless — both
+        // rename identical content-addressed bytes over the same target.
+        write_file_durably(&path, data)?;
         Ok(())
+    }
+
+    /// Revalidate a cached blob against its digest, deleting it if it no
+    /// longer matches (REG5).
+    ///
+    /// A blob whose bytes were truncated by a crash mid-write, or corrupted
+    /// on disk, must not be served as if it were valid. The deploy/verify
+    /// path calls this before trusting a locally-cached blob. Returns `true`
+    /// when the blob is present and its content hashes to `digest`.
+    ///
+    /// Hashing runs on the caller's thread; whole-blob callers on the async
+    /// runtime should wrap this in `spawn_blocking`.
+    pub fn revalidate_blob(&self, digest: &Digest) -> bool {
+        let path = self.blob_path(digest);
+        let Ok(data) = std::fs::read(&path) else {
+            return false;
+        };
+        if compute_sha256(&data).as_str() == digest.as_str() {
+            true
+        } else {
+            // Corrupt: remove it so the next pull refetches clean bytes.
+            let _ = std::fs::remove_file(&path);
+            false
+        }
     }
 
     /// Delete a blob.
@@ -176,12 +246,22 @@ impl BlobStore {
             });
         }
 
-        // Move to blob store (atomic on same filesystem)
+        // Durable move to the blob store (REG5): re-read the verified
+        // upload bytes and write them through the fsync/rename transaction
+        // (`write_file_durably`), then remove the upload temp. The digest
+        // was already checked above, so these are the correct bytes. Runs on
+        // a blocking thread — the file reads, fsyncs and rename are blocking
+        // syscalls that must not sit on a Tokio worker.
         let blob_path = self.blob_path(expected_digest);
-        if let Some(parent) = blob_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::rename(&upload_path, &blob_path).await?;
+        let upload = upload_path.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let data = std::fs::read(&upload)?;
+            write_file_durably(&blob_path, &data)?;
+            let _ = std::fs::remove_file(&upload);
+            Ok(())
+        })
+        .await
+        .map_err(|e| PickleError::CatalogPersist(format!("blob commit task failed: {e}")))??;
 
         Ok(())
     }
@@ -396,6 +476,78 @@ mod tests {
         // Writing to cancelled session should fail
         let result = store.write_upload_chunk(&upload_id, b"more").await;
         assert!(result.is_err());
+    }
+
+    /// REG5: a durable write leaves no torn final file and no leftover
+    /// temp. After it returns, the blob is present and reads back exactly.
+    #[test]
+    fn durable_write_leaves_no_temp_and_a_complete_blob() {
+        let (store, _dir) = test_store();
+        let data = b"durable content";
+        let digest = compute_sha256(data);
+
+        store.write_blob(data, &digest).unwrap();
+        assert_eq!(store.read_blob(&digest).unwrap(), data);
+
+        // No stray temp files in the blob's directory.
+        let parent = store.blob_path(&digest).parent().unwrap().to_path_buf();
+        let leftovers: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "left a temp file behind: {leftovers:?}"
+        );
+    }
+
+    /// REG5: a crash between temp-write and rename must leave the *old*
+    /// blob intact. We simulate the interrupted write by dropping a stray
+    /// temp file next to an existing good blob and confirming the good
+    /// blob still reads back — the torn temp is never treated as the blob.
+    #[test]
+    fn torn_write_leaves_the_old_blob_intact() {
+        let (store, _dir) = test_store();
+        let data = b"the committed bytes";
+        let digest = compute_sha256(data);
+        store.write_blob(data, &digest).unwrap();
+
+        // A leftover temp from an interrupted write of the same digest.
+        let path = store.blob_path(&digest);
+        let parent = path.parent().unwrap();
+        let stray = parent.join(format!(
+            ".{}.{:032x}.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            0u128
+        ));
+        std::fs::write(&stray, b"half-written garbage").unwrap();
+
+        // The real blob is unaffected: the final path never held the temp.
+        assert_eq!(store.read_blob(&digest).unwrap(), data);
+    }
+
+    /// REG5: a cached blob whose bytes were corrupted on disk must be
+    /// rejected on revalidation, and removed so a refetch can replace it.
+    #[test]
+    fn corrupt_cached_blob_is_rejected_and_removed() {
+        let (store, _dir) = test_store();
+        let data = b"honest layer bytes";
+        let digest = compute_sha256(data);
+        store.write_blob(data, &digest).unwrap();
+        assert!(store.revalidate_blob(&digest));
+
+        // Corrupt the on-disk bytes behind the store's back.
+        std::fs::write(store.blob_path(&digest), b"tampered").unwrap();
+        assert!(!store.revalidate_blob(&digest), "corrupt blob accepted");
+        assert!(!store.has_blob(&digest), "corrupt blob was not removed");
+    }
+
+    #[test]
+    fn revalidate_missing_blob_is_false() {
+        let (store, _dir) = test_store();
+        let digest = compute_sha256(b"never stored");
+        assert!(!store.revalidate_blob(&digest));
     }
 
     #[test]

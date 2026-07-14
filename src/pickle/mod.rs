@@ -9,6 +9,7 @@ pub mod build;
 pub mod gc;
 pub mod p2p;
 pub mod pull;
+pub mod registry_auth;
 pub mod replication;
 pub mod signing;
 pub mod store;

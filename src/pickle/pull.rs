@@ -8,9 +8,20 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use futures_util::StreamExt as _;
+
 use super::replication::Peer;
 use super::store::{BlobStore, compute_sha256};
 use super::types::{Digest, ManifestCatalog, PickleError};
+
+/// Hard ceiling on a single blob pulled from a peer (REG6).
+///
+/// A compromised peer could otherwise stream an unbounded body and exhaust
+/// this node's memory. Real image layers are far smaller; a layer bigger
+/// than this is refused rather than buffered. The read is also wrapped in
+/// the caller's timeout, so a slow trickle can't hold the connection open
+/// forever either.
+const MAX_PEER_BLOB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Pull a layer from a peer node's OCI API.
 ///
@@ -24,8 +35,12 @@ pub async fn pull_layer_from_peer(
     client: &reqwest::Client,
     timeout: Duration,
 ) -> Result<(), PickleError> {
-    if store.has_blob(digest) {
-        return Ok(()); // Already cached locally
+    // Trust a cached blob only after re-verifying its digest (REG5). A
+    // blob truncated by a crash mid-write, or corrupted on disk, must not
+    // be served as valid — `revalidate_blob` removes it if it no longer
+    // hashes to `digest`, so we refetch clean bytes below.
+    if store.has_blob(digest) && store.revalidate_blob(digest) {
+        return Ok(()); // Already cached locally and verified
     }
 
     // Peer blob URLs flatten multi-segment names (see peer_blob_repo):
@@ -48,9 +63,42 @@ pub async fn pull_layer_from_peer(
         return Err(PickleError::BlobNotFound(digest.clone()));
     }
 
-    let data = resp.bytes().await.map_err(|e| {
-        PickleError::ReplicationFailed(format!("reading blob from peer {}: {e}", peer.node_id))
-    })?;
+    // Bound the peer body (REG6): stream chunks under the timeout, refusing
+    // anything past the hard cap so a hostile peer can't exhaust memory or
+    // hold the connection open with a slow trickle. If the peer advertised
+    // a Content-Length larger than the cap, reject before reading a byte.
+    if let Some(len) = resp.content_length()
+        && len > MAX_PEER_BLOB_BYTES as u64
+    {
+        return Err(PickleError::ReplicationFailed(format!(
+            "peer {} blob is {len} bytes, over the {MAX_PEER_BLOB_BYTES} cap",
+            peer.node_id
+        )));
+    }
+    let data = tokio::time::timeout(timeout, async {
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                PickleError::ReplicationFailed(format!(
+                    "reading blob from peer {}: {e}",
+                    peer.node_id
+                ))
+            })?;
+            if buf.len() + chunk.len() > MAX_PEER_BLOB_BYTES {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "peer {} blob exceeded the {MAX_PEER_BLOB_BYTES} byte cap",
+                    peer.node_id
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| {
+        PickleError::ReplicationFailed(format!("timeout reading blob from peer {}", peer.node_id))
+    })??;
 
     // Verify digest
     let actual = compute_sha256(&data);
@@ -121,12 +169,15 @@ pub fn image_available_locally(
         return false;
     };
 
-    // Everything the tag pins must be local — the manifest blob too
-    // (REG1), or this node cannot serve the manifest GET.
+    // Everything the tag pins must be local *and valid* — the manifest
+    // blob too (REG1), or this node cannot serve the manifest GET. On the
+    // deploy/verify path we revalidate rather than trust existence (REG5):
+    // a truncated or corrupt cached blob is not "available", and
+    // `revalidate_blob` removes it so the next pull refetches clean bytes.
     manifest
         .referenced_digests()
         .iter()
-        .all(|d| store.has_blob(d))
+        .all(|d| store.revalidate_blob(d))
 }
 
 #[cfg(test)]
@@ -139,6 +190,18 @@ mod tests {
 
     fn test_digest(suffix: &str) -> Digest {
         Digest(format!("sha256:{suffix:0>64}"))
+    }
+
+    /// A digest that actually matches `content`, so `revalidate_blob`
+    /// accepts a blob written with these bytes (REG5).
+    fn content_digest(content: &[u8]) -> Digest {
+        compute_sha256(content)
+    }
+
+    /// Write a blob whose stored bytes hash to its own digest, so the
+    /// REG5 revalidation on the deploy path accepts it.
+    fn write_valid_blob(store: &BlobStore, digest: &Digest, content: &[u8]) {
+        store.write_blob(content, digest).unwrap();
     }
 
     fn test_layer(suffix: &str) -> LayerDescriptor {
@@ -190,19 +253,48 @@ mod tests {
         assert!(find_peer_for_layer(&holders, &peers).is_none());
     }
 
+    /// A manifest whose every referenced digest matches real content, so
+    /// the REG5 revalidation on the deploy path can accept the blobs.
+    fn valid_manifest(repo: &str) -> (ImageManifest, Vec<(Digest, Vec<u8>)>) {
+        let config = content_digest(b"config-content");
+        let layer1 = content_digest(b"layer1-content");
+        let layer2 = content_digest(b"layer2-content");
+        let manifest_bytes = b"manifest-content".to_vec();
+        let manifest_digest = content_digest(&manifest_bytes);
+        let mk = |digest: Digest| LayerDescriptor {
+            digest,
+            size: 1024,
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+        };
+        let manifest = ImageManifest {
+            digest: manifest_digest.clone(),
+            config: mk(config.clone()),
+            layers: vec![mk(layer1.clone()), mk(layer2.clone())],
+            repository: repo.to_string(),
+            tags: BTreeSet::new(),
+            total_size: 3072,
+            pushed_at: SystemTime::UNIX_EPOCH,
+            pushed_by: 1,
+            signature: None,
+        };
+        let blobs = vec![
+            (manifest_digest, manifest_bytes),
+            (config, b"config-content".to_vec()),
+            (layer1, b"layer1-content".to_vec()),
+            (layer2, b"layer2-content".to_vec()),
+        ];
+        (manifest, blobs)
+    }
+
     #[test]
     fn image_available_locally_true_when_all_blobs_present() {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
 
-        let manifest = test_manifest("myapp");
-
-        // Write all blobs, including the manifest's own (REG1)
-        for digest in manifest.referenced_digests() {
-            // Write dummy data with matching digest structure
-            let path = store.blob_path(digest);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"data").unwrap();
+        let (manifest, blobs) = valid_manifest("myapp");
+        // Write all blobs with content matching their digest (REG5).
+        for (digest, content) in &blobs {
+            write_valid_blob(&store, digest, content);
         }
 
         let mut catalog = ManifestCatalog::default();
@@ -213,6 +305,34 @@ mod tests {
         });
 
         assert!(image_available_locally("myapp", "latest", &catalog, &store));
+    }
+
+    /// REG5: a locally-cached blob that got corrupted on disk means the
+    /// image is not "available" — the deploy path must refetch, not serve
+    /// truncated bytes.
+    #[test]
+    fn image_available_locally_false_when_a_cached_blob_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+
+        let (manifest, blobs) = valid_manifest("myapp");
+        for (digest, content) in &blobs {
+            write_valid_blob(&store, digest, content);
+        }
+        // Corrupt one layer's on-disk bytes.
+        let victim = &manifest.layers[0].digest;
+        std::fs::write(store.blob_path(victim), b"tampered").unwrap();
+
+        let mut catalog = ManifestCatalog::default();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        assert!(!image_available_locally(
+            "myapp", "latest", &catalog, &store
+        ));
     }
 
     #[test]
@@ -233,13 +353,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
 
-        let manifest = test_manifest("myapp");
-
-        // Config and layers present; the manifest blob itself missing.
-        for digest in manifest.all_digests() {
-            let path = store.blob_path(digest);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, b"data").unwrap();
+        let (manifest, blobs) = valid_manifest("myapp");
+        // Config and layers present (valid), the manifest blob absent.
+        let manifest_digest = manifest.digest.clone();
+        for (digest, content) in &blobs {
+            if digest != &manifest_digest {
+                write_valid_blob(&store, digest, content);
+            }
         }
 
         let mut catalog = ManifestCatalog::default();

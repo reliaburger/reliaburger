@@ -1294,13 +1294,47 @@ async fn main() -> anyhow::Result<()> {
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));
+    // Registry writes reuse the cluster's existing auth material (REG4):
+    // the same token store and service token that guard the agent API. In
+    // single-node/tokenless mode this stays `None` and writes are open.
+    let registry_auth = api_token_store.as_ref().map(|store| {
+        reliaburger::sesame::auth::AuthState::new(Arc::clone(store), service_token.clone())
+    });
+    // Storage quotas (REG4): a per-repository ceiling derived from
+    // `[images] max_storage` divided across repositories is more than an
+    // operator asked for; we apply `max_storage` as the registry-wide cap
+    // and leave per-repository unlimited unless configured.
+    let registry_quota = reliaburger::pickle::registry_auth::QuotaConfig {
+        per_repository_bytes: 0,
+        total_bytes: reliaburger::config::types::parse_resource_value(&config.images.max_storage)
+            .unwrap_or(0),
+    };
+    let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
+        reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+    );
     let pickle_state = PickleState {
         store: Arc::clone(&blob_store),
         catalog: Arc::clone(&pickle_catalog),
         node_raft_id,
         council: api_council.clone(),
         persist_path: Some(catalog_path.clone()),
+        auth: registry_auth,
+        quota: registry_quota,
+        sessions: upload_sessions.clone(),
     };
+    // The registry serves over TLS when this node has an mTLS identity
+    // (REG4), so peers must be addressed as https and the replication /
+    // P2P client must trust the cluster CA. Without an identity it's plain
+    // http, and a default client. The scheme is derived once and threaded
+    // through every peer-URL derivation so they stay consistent.
+    let registry_over_tls = api_identity.is_some();
+    let registry_scheme = if registry_over_tls { "https" } else { "http" };
+    let registry_client = match &api_identity {
+        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client(identity)
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        None => reqwest::Client::new(),
+    };
+
     // Cluster-first image pulls (Phase 12 C2): the grill consults the
     // Pickle catalog before any external registry, filling layers from
     // peers in parallel. Standalone nodes get local-catalog resolution
@@ -1318,8 +1352,9 @@ async fn main() -> anyhow::Result<()> {
                 state: pickle_state.clone(),
                 members: replication_membership.clone(),
                 registry_port: config.images.registry_port,
+                peer_scheme: registry_scheme.to_string(),
                 concurrency: config.images.p2p_concurrency,
-                client: reqwest::Client::new(),
+                client: registry_client.clone(),
                 upstream: Some(std::sync::Arc::new(
                     reliaburger::pickle::upstream::OciUpstream::new(credentials),
                 )),
@@ -1332,32 +1367,81 @@ async fn main() -> anyhow::Result<()> {
 
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
     let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
-    println!("bun: Pickle registry listening on {registry_addr}");
+    println!(
+        "bun: Pickle registry listening on {registry_addr} ({})",
+        if registry_over_tls {
+            "TLS, authenticated writes"
+        } else {
+            "plaintext, unauthenticated"
+        }
+    );
 
     // In cluster mode a loopback-bound registry silently disables peer
     // replication, healing, and P2P image pulls — peers address us as
-    // http://<gossip-ip>:<registry_port>. Warn loudly rather than fail:
-    // single-node-with-council setups are legitimate. Note the flip
-    // side before changing the bind: the registry has no auth/TLS yet,
-    // so a wider bind should stay behind the perimeter firewall's
-    // cluster-node allowlist. TODO(Phase 13+): registry auth/mTLS.
+    // <scheme>://<gossip-ip>:<registry_port>. Warn loudly rather than
+    // fail: single-node-with-council setups are legitimate.
     if api_council.is_some() && config.images.registry_bind == "127.0.0.1" {
         eprintln!(
             "bun: WARNING: [images] registry_bind is 127.0.0.1 in cluster mode — \
              image replication and P2P pulls between nodes will not work; \
-             set registry_bind to a peer-reachable address (the registry has \
-             no auth/TLS, so keep it firewalled to cluster nodes)"
+             set registry_bind to a peer-reachable address"
         );
     }
 
+    // Sweep expired upload sessions and their temp files (REG8) so an
+    // abandoned push doesn't leak a temp forever.
+    {
+        let sweep_sessions = upload_sessions.clone();
+        let sweep_store = Arc::clone(&blob_store);
+        let sweep_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = sweep_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        for id in sweep_sessions.sweep(std::time::SystemTime::now()).await {
+                            sweep_store.cancel_upload(&id).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Serve the registry over TLS when this node has an mTLS identity,
+    // reusing the same server config as the agent API (REG4). Client certs
+    // are optional — node-to-node replication presents the service token
+    // inside TLS, exactly like the API's node-to-node fan-out.
+    let pickle_acceptor = match (&api_identity, registry_over_tls) {
+        (Some(identity), true) => {
+            let crl = crl_refresh.clone().unwrap_or_default();
+            match reliaburger::sesame::mtls::build_api_server_config(identity, crl) {
+                Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
+                Err(e) => {
+                    eprintln!("bun: failed to build registry TLS config, serving plaintext: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let pickle_shutdown = shutdown.clone();
     let pickle_handle = tokio::spawn(async move {
-        axum::serve(pickle_listener, pickle_app)
-            .with_graceful_shutdown(async move {
-                pickle_shutdown.cancelled().await;
-            })
-            .await
-            .ok();
+        match pickle_acceptor {
+            Some(acceptor) => {
+                serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+            }
+            None => {
+                axum::serve(pickle_listener, pickle_app)
+                    .with_graceful_shutdown(async move {
+                        pickle_shutdown.cancelled().await;
+                    })
+                    .await
+                    .ok();
+            }
+        }
     });
 
     // Scheduled image GC (L10/M2): two-phase — nominate candidates,
@@ -1472,9 +1556,12 @@ async fn main() -> anyhow::Result<()> {
         let redundancy = config.images.redundancy.max(1);
         let registry_port = config.images.registry_port;
         let self_node = node_raft_id;
+        // Peers and the client must match the registry's scheme/TLS (REG4).
+        let heal_scheme = registry_scheme.to_string();
+        let heal_client = registry_client.clone();
 
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = heal_client;
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             ticker.tick().await;
             loop {
@@ -1489,7 +1576,11 @@ async fn main() -> anyhow::Result<()> {
                 let catalog = council.manifest_catalog().await;
                 let peers = {
                     let members = membership_rx.borrow();
-                    reliaburger::cluster::identity::pickle_peers(&members, registry_port)
+                    reliaburger::cluster::identity::pickle_peers_scheme(
+                        &members,
+                        registry_port,
+                        &heal_scheme,
+                    )
                 };
                 if peers.len() < 2 {
                     continue; // nobody to replicate to
