@@ -214,6 +214,12 @@ pub enum AgentCommand {
     ResolveAll {
         response: oneshot::Sender<Vec<crate::onion::types::ResolveResponse>>,
     },
+    /// Install the latest cluster-wide endpoint catalogue (12b.4), replicated
+    /// from the leader. The agent overlays it onto its local service map so
+    /// DNS and ingress resolve services running on other nodes.
+    SyncClusterCatalog {
+        catalog: Box<crate::onion::catalog::EndpointCatalog>,
+    },
     /// List all ingress routes.
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
@@ -1080,6 +1086,11 @@ pub struct BunAgent<G: Grill> {
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Cluster-wide endpoint catalogue (12b.4), replicated from the leader.
+    /// Overlaid onto the local `service_map` when publishing the DNS/routing
+    /// snapshot so this node resolves services whose backends live elsewhere.
+    /// Empty on a single node — the local map is then the whole picture.
+    cluster_catalog: crate::onion::catalog::EndpointCatalog,
     /// Publisher for service-map snapshots (DNS responder subscribes).
     service_map_tx: tokio::sync::watch::Sender<crate::onion::service_map::ServiceMap>,
     /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
@@ -1202,6 +1213,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
+            cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
             )
@@ -1266,6 +1278,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(feature = "ebpf")]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
+            cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
             )
@@ -2401,21 +2414,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             AgentCommand::Resolve { app_name, response } => {
                 // The CLI targets a service by bare name; resolve the first
-                // match in any namespace (PR 2 adds a namespace-qualified form).
-                let result = self
-                    .service_map
+                // match in any namespace, against the merged cluster view so a
+                // service running only on other nodes still resolves (12b.4).
+                let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+                let result = merged
                     .resolve_by_name(&app_name)
                     .map(|e| e.to_resolve_response());
                 let _ = response.send(result);
             }
             AgentCommand::ResolveAll { response } => {
-                let results = self
-                    .service_map
+                let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+                let results = merged
                     .resolve_all()
                     .iter()
                     .map(|e| e.to_resolve_response())
                     .collect();
                 let _ = response.send(results);
+            }
+            AgentCommand::SyncClusterCatalog { catalog } => {
+                // Only rebuild + republish when the catalogue actually moved;
+                // the reconciler pushes on every tick.
+                if self.cluster_catalog != *catalog {
+                    self.cluster_catalog = *catalog;
+                    self.rebuild_routing_table().await;
+                }
             }
             AgentCommand::Routes { response } => {
                 let table = self.routing_table.read().await;
@@ -4882,14 +4904,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Rebuild the Wrapper routing table from the current service map
     /// and ingress configs.
+    ///
+    /// Resolution uses the *merged* view: the local service map overlaid
+    /// with the replicated cluster catalogue (12b.4), so both DNS and the
+    /// ingress routing table can reach services whose backends live on other
+    /// nodes. The local map alone still drives eBPF backend-map syncing —
+    /// this merge only affects what DNS/ingress resolve.
     async fn rebuild_routing_table(&self) {
+        let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+
         let mut table = self.routing_table.write().await;
-        table.rebuild(&self.service_map, &self.ingress_configs);
+        table.rebuild(&merged, &self.ingress_configs);
         drop(table);
 
-        // Publish a service-map snapshot for out-of-loop readers (DNS).
+        // Publish the merged service-map snapshot for out-of-loop readers (DNS).
         // send() only errs when no receiver exists, which is fine.
-        let _ = self.service_map_tx.send(self.service_map.clone());
+        let _ = self.service_map_tx.send(merged);
     }
 
     /// Reconcile the perimeter firewall if cluster membership changed.

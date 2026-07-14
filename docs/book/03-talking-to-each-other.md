@@ -447,23 +447,52 @@ Wiring it in production comes down to three questions, and each has a slightly a
 
 The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Nine tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
 
-### How gossip keeps the service map consistent
+### Making the service map cluster-wide: the endpoint catalogue
 
-Everything above describes what happens on a single node. But a 10-node cluster has 10 service maps, and they all need to agree. When the scheduler places `redis-0` on node A, node B needs to know about it too — otherwise `curl redis.internal` from a container on node B goes nowhere.
+Everything above describes what happens on a single node. But a 10-node cluster has 10 service maps, and each one only knows about the backends running *on its own node*. When the scheduler places `redis-0` on node A, a container on node B asking for `redis.internal` gets nothing — node B's service map has never heard of redis.
 
-This is where the reporting tree from Chapter 2 comes back. Remember the hierarchy: worker nodes report to their assigned council member every 5 seconds, council members aggregate for the leader, and the leader pushes scheduling decisions back down. When the leader tells node A to run `redis-0`, node A starts the container, and the state change propagates through the reporting tree to every other node's Bun agent. Each agent updates its own service map and (on Linux) writes the corresponding BPF map entries.
+For a long time that was the actual behaviour, and the honest answer was "cross-node service discovery doesn't work yet." Fixing it is what the **endpoint catalogue** does. The idea is small: the leader already knows what's running where, so let it build one cluster-wide map of every service's backends and replicate it to every node.
 
-Gossip plays a different role. Mustard doesn't carry service map data directly — that would be too much traffic for O(log N) convergence with piggybacked updates. Instead, gossip handles *failure detection*. When node A crashes, Mustard marks it as Dead within a few probe cycles (typically 2-5 seconds depending on cluster size). Every Bun agent that receives the Dead notification can then scrub node A's backends from its service map. The backends were already unreachable — the crash took them down — but scrubbing the map means new connections stop trying.
+Where does the leader's knowledge come from? The reporting tree from Chapter 2. Every node reports its running instances — namespace, app name, host port, health — to its council parent every reporting interval; the council aggregates for the leader. The leader's scheduling loop already reads that aggregate. So building the catalogue is a walk over those reports:
 
-So the data flow is:
+```rust
+for (node_id, report) in &reports.reports {
+    let node_ip = node_ips[node_id];          // from gossip membership
+    for app in &report.running_apps {
+        let service_id = ServiceId::new(&app.namespace, &app.app_name);
+        // group this instance as a backend of its service…
+    }
+}
+EndpointCatalog::rebuild(grouped)              // allocate VIPs, cluster-wide
+```
 
-1. **Scheduling decisions** flow through the reporting tree (Raft → council → workers). This is how backend entries get *added*.
-2. **Failure detection** flows through gossip (Mustard SWIM protocol). This is how backend entries get *removed* when a node dies.
-3. **Health check results** are local to each node's Bun agent. They flip the `healthy` flag for backends running on that node.
+`EndpointCatalog::rebuild` does the cluster-wide VIP allocation: same namespaced hash as the local map, same collision-probing, but done *once* on the leader so every node agrees on which service owns which VIP. The catalogue is a `BTreeMap` keyed by the qualified service id — deterministic JSON, so it snapshots and diffs cleanly.
 
-Can you see why we need both? The reporting tree is accurate but slow — bounded by the 5-second reporting interval. Gossip is fast but coarse — it knows a node is dead, not which specific instance failed. Health checks are precise but local — they know exactly which instance is unhealthy, but only for instances running on the same node. Together, they cover all the failure modes: planned shutdowns (reporting tree), node crashes (gossip), and application bugs (health checks).
+Now, how does it reach every node? Through Raft. The leader writes the whole catalogue as one `PublishEndpoints` entry:
 
-There's a subtlety worth noting. During a network partition, a node might be marked Dead by gossip even though it's still running containers. If those containers are serving traffic to local clients (same-node connections don't go through the network), they'll keep working fine. The service map on the partitioned node still has the local backends. Only cross-node connections are affected, which is exactly what you'd expect from a partition. When the partition heals, Mustard's incarnation counter mechanism (remember that from Chapter 2?) ensures the node rejoins cleanly and its backends reappear in everyone's service maps.
+```rust
+RaftRequest::PublishEndpoints(Box<EndpointCatalog>)
+```
+
+Applying it just replaces `DesiredState.endpoint_catalog` — a wholesale swap, so the leader is the single source of truth and a follower never merges half a view. Because it lives in `DesiredState`, it rides the same replication and snapshot machinery as every other cluster fact, and it survives a leader change for free: the new leader inherits the last catalogue and republishes from its own reports on the next tick. The leader only writes when the catalogue actually changed, so a steady cluster isn't churning the log every couple of seconds.
+
+The last hop is getting the catalogue *into* each node's resolution path. Council voters read `DesiredState` directly; worker nodes outside the council don't, but they already poll the leader's `/v1/placements/{node}` endpoint every couple of seconds to learn their assignments. We piggyback the catalogue on that same response — one extra field, `#[serde(default)]` so an old node talking to a new leader (or vice versa) still parses. The node's reconciler hands the catalogue to its Bun agent, which overlays it onto the local service map:
+
+```rust
+let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+```
+
+`with_cluster_catalog` doesn't mutate the local map — that stays the source of truth for what this node runs and syncs to the eBPF backend map. It returns a *merged* view: local services keep their entry and gain any remote backends; a service running only elsewhere is added wholesale with the catalogue's cluster-agreed VIP. That merged view is what gets published to DNS and the ingress routing table. So the moment a service on node B lands in the catalogue, a container on node A resolves `redis.default.internal` to its VIP and the eBPF connect hook rewrites to node B's real address — with no change to the DNS or routing code, because both already read the service map snapshot.
+
+Gossip still plays its part. Mustard doesn't carry catalogue data — that would be too much traffic for O(log N) convergence. It handles *failure detection*: when a node crashes, Mustard marks it Dead within a few probe cycles, and the leader's next catalogue rebuild simply omits its backends (the reports for a dead node age out). So the data flow is:
+
+1. **What's running where** flows through the reporting tree into the leader's catalogue, then out via Raft (voters) and the placements poll (workers). This is how cross-node backends get *added*.
+2. **Failure detection** flows through gossip; a dead node's backends drop out of the next rebuild.
+3. **Health check results** are local to each node's Bun agent and flip the `healthy` flag for its own backends before it reports them.
+
+Can you see why we need all three? The reporting tree is accurate but bounded by the reporting interval. Gossip is fast but coarse — it knows a node is dead, not which instance failed. Health checks are precise but local. Together they cover planned shutdowns, node crashes, and application bugs.
+
+There's a subtlety worth noting. During a network partition, a node might be marked Dead by gossip even though it's still running containers. If those containers serve same-node clients (loopback connections never touch the network), they keep working — the partitioned node's *local* service map still has them, and the local map always wins in the merge. Only cross-node connections are affected, which is exactly what you'd expect from a partition. When it heals, Mustard's incarnation counter (remember that from Chapter 2?) rejoins the node cleanly and its backends reappear in the next catalogue.
 
 ### Why userspace DNS, not eBPF?
 

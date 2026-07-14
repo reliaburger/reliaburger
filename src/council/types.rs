@@ -217,6 +217,13 @@ pub enum RaftRequest {
     /// and every retry, gets `Refused`. The issuer signs only after this
     /// commit returns a serial.
     ConsumeJoinTokenForIssue { token_hash: [u8; 32] },
+    /// Publish the cluster-wide service endpoint catalogue (12b.4). The
+    /// leader rebuilds it from every node's health reports and replicates
+    /// the whole catalogue as one entry, so every node's DNS and ingress can
+    /// resolve services whose backends live on other nodes. Wholesale
+    /// replacement (not a delta) keeps the apply idempotent and the leader
+    /// authoritative — a follower never merges partial views.
+    PublishEndpoints(Box<crate::onion::catalog::EndpointCatalog>),
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +344,13 @@ pub struct DesiredState {
     /// empty so pre-T6 snapshots load cleanly.
     #[serde(default)]
     pub permissions: std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+    /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
+    /// services, their VIPs and healthy backends across all nodes. Built by
+    /// the leader from health reports and replicated so any node resolves
+    /// any service. Distinct from `manifest_catalog` (Pickle images).
+    /// Defaults empty so pre-12b.4 snapshots load cleanly.
+    #[serde(default)]
+    pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -596,6 +610,48 @@ mod tests {
         assert!(state.namespaces.is_empty());
         assert!(state.permissions.is_empty());
         assert!(state.apps.is_empty());
+        // 12b.4: the endpoint catalogue is serde-default too, so a snapshot
+        // that predates it loads with an empty catalogue rather than failing.
+        assert!(state.endpoint_catalog.is_empty());
+    }
+
+    #[test]
+    fn pre_theme_snapshot_without_endpoint_catalog_loads_cleanly() {
+        // A snapshot serialised after T6 but before 12b.4 has `namespaces`
+        // and `permissions` but no `endpoint_catalog`. The `#[serde(default)]`
+        // must fill it with an empty catalogue.
+        let legacy = serde_json::json!({
+            "apps": [],
+            "scheduling": [],
+            "config": {},
+            "namespaces": {},
+            "permissions": {},
+            "last_applied_log": null,
+            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } }
+        });
+        let state: DesiredState = serde_json::from_value(legacy).unwrap();
+        assert!(state.endpoint_catalog.is_empty());
+    }
+
+    #[test]
+    fn publish_endpoints_raft_request_round_trips() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        use crate::onion::service_id::ServiceId;
+
+        let catalog = EndpointCatalog::rebuild([(
+            ServiceId::new("payments", "api"),
+            3000,
+            vec![CatalogBackend {
+                node_id: "node-b".to_string(),
+                node_ip: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                host_port: 30002,
+                healthy: true,
+            }],
+        )]);
+        let req = RaftRequest::PublishEndpoints(Box::new(catalog));
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
     }
 
     #[test]

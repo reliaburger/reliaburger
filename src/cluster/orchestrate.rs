@@ -46,6 +46,12 @@ pub struct NodeAssignment {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeAssignments {
     pub apps: Vec<NodeAssignment>,
+    /// The cluster-wide service endpoint catalogue (12b.4), piggybacked on
+    /// the placements poll so every node — council voter or not — gets the
+    /// replicated catalogue over the one HTTP call it already makes.
+    /// `#[serde(default)]` so a node polling a pre-12b.4 leader still parses.
+    #[serde(default)]
+    pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
 }
 
 /// Spawn the leader's scheduling loop, with state reconstruction (L4).
@@ -74,6 +80,10 @@ pub fn spawn_leader_scheduler(
     tokio::spawn(async move {
         let mut reconstruction = ReconstructionController::new(reconstruction_config);
         let mut was_leader = false;
+        // The catalogue last replicated, so a tick that finds no change skips
+        // the Raft write — the reporting interval ticks often and most ticks
+        // don't move any backend.
+        let mut last_published: Option<crate::onion::catalog::EndpointCatalog> = None;
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
             tokio::select! {
@@ -101,6 +111,22 @@ pub fn spawn_leader_scheduler(
             let desired = council.desired_state().await;
             let members = membership_rx.borrow().clone();
             let reports = aggregated_rx.borrow().clone();
+
+            // Publish the cluster endpoint catalogue every tick the backends
+            // change (12b.4). This runs before the learning-period gate below:
+            // cross-node resolution shouldn't wait for a fresh leader to finish
+            // reconstructing placements — the reports already say what's
+            // running where, and a stale catalogue is worse than an early one.
+            let catalog = build_endpoint_catalog(&members, &reports, &desired);
+            if last_published.as_ref() != Some(&catalog) {
+                match council
+                    .write(RaftRequest::PublishEndpoints(Box::new(catalog.clone())))
+                    .await
+                {
+                    Ok(_) => last_published = Some(catalog),
+                    Err(e) => eprintln!("scheduler: failed to publish endpoint catalogue: {e}"),
+                }
+            }
 
             let alive: Vec<NodeId> = members
                 .iter()
@@ -437,6 +463,73 @@ async fn app_metric_utilisation(
     if n == 0 { None } else { Some(total / n as f64) }
 }
 
+/// Build the cluster-wide service endpoint catalogue from node reports.
+///
+/// Every node reports its `running_apps` (namespace, app, host port,
+/// health) through the reporting tree; the leader already reads the
+/// aggregated result. This walks those reports, groups the instances by
+/// namespaced [`ServiceId`], and records each as a backend — the real node
+/// IP from gossip membership, the host port and the health flag. The
+/// declared container port comes from the desired-state `AppSpec` (a
+/// report only carries the host port). VIPs are then allocated
+/// cluster-wide by [`EndpointCatalog::rebuild`], deterministically and
+/// collision-free, so every node resolves the same service to the same
+/// VIP and reaches its backends wherever they run.
+///
+/// Only services whose app declares a port appear: a portless app has no
+/// VIP and nothing to resolve.
+fn build_endpoint_catalog(
+    members: &[MembershipSnapshot],
+    reports: &AggregatedState,
+    desired: &crate::council::types::DesiredState,
+) -> crate::onion::catalog::EndpointCatalog {
+    use crate::onion::catalog::CatalogBackend;
+    use crate::onion::service_id::ServiceId;
+    use crate::reporting::types::ReportHealthStatus;
+
+    // node_id -> its IPv4 address, from gossip membership.
+    let node_ips: std::collections::HashMap<&NodeId, std::net::Ipv4Addr> = members
+        .iter()
+        .filter_map(|m| match m.address.ip() {
+            std::net::IpAddr::V4(v4) => Some((&m.node_id, v4)),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect();
+
+    // Qualified id -> (ServiceId, declared port, backends). A BTreeMap keyed
+    // by the qualified string keeps the build deterministic.
+    let mut grouped: BTreeMap<String, (ServiceId, u16, Vec<CatalogBackend>)> = BTreeMap::new();
+    for (node_id, report) in &reports.reports {
+        let Some(&node_ip) = node_ips.get(node_id) else {
+            continue; // no known IP (departed, or IPv6-only) — can't route to it
+        };
+        for app in &report.running_apps {
+            let Some(host_port) = app.port else {
+                continue; // portless instance: nothing to resolve
+            };
+            let service_id = ServiceId::new(&app.namespace, &app.app_name);
+            // The declared container port lives in the desired spec.
+            let app_id = crate::meat::types::AppId::new(&app.app_name, &app.namespace);
+            let Some(declared_port) = desired.apps.get(&app_id).and_then(|s| s.port) else {
+                continue;
+            };
+            let healthy = matches!(app.health_status, ReportHealthStatus::Healthy);
+            grouped
+                .entry(service_id.qualified())
+                .or_insert((service_id, declared_port, Vec::new()))
+                .2
+                .push(CatalogBackend {
+                    node_id: node_id.0.clone(),
+                    node_ip,
+                    host_port,
+                    healthy,
+                });
+        }
+    }
+
+    crate::onion::catalog::EndpointCatalog::rebuild(grouped.into_values())
+}
+
 /// Build the scheduler's view of the cluster from gossip membership
 /// (who is alive, labels, age) and aggregated reports (capacity and
 /// current commitments — real numbers since the reporting wiring).
@@ -568,6 +661,16 @@ pub fn spawn_placement_reconciler(
                 },
                 _ => continue, // leader unreachable; retry next tick
             };
+
+            // Install the replicated endpoint catalogue (12b.4). The agent
+            // ignores an unchanged one, so pushing every tick is cheap. Do
+            // this before converging placements: resolution shouldn't wait on
+            // a deploy that this tick happens to trigger.
+            let _ = cmd_tx
+                .send(AgentCommand::SyncClusterCatalog {
+                    catalog: Box::new(assignments.endpoint_catalog.clone()),
+                })
+                .await;
 
             let mut seen: HashSet<(String, String)> = HashSet::new();
             let mut changed = false;
@@ -731,6 +834,96 @@ mod tests {
     fn spec_from_toml(body: &str) -> AppSpec {
         let config = crate::config::Config::parse(body).unwrap();
         config.app.into_values().next().unwrap()
+    }
+
+    fn running_app(
+        namespace: &str,
+        name: &str,
+        host_port: u16,
+        healthy: bool,
+    ) -> crate::reporting::types::RunningApp {
+        use crate::reporting::types::{AppResourceUsage, ReportHealthStatus, RunningApp};
+        RunningApp {
+            app_name: name.to_string(),
+            namespace: namespace.to_string(),
+            instance_id: 0,
+            image: "x:1".to_string(),
+            port: Some(host_port),
+            health_status: if healthy {
+                ReportHealthStatus::Healthy
+            } else {
+                ReportHealthStatus::Starting
+            },
+            uptime: Duration::from_secs(1),
+            resource_usage: AppResourceUsage::default(),
+        }
+    }
+
+    #[test]
+    fn build_endpoint_catalog_aggregates_backends_across_nodes() {
+        use crate::onion::service_id::ServiceId;
+
+        // Two nodes each run one instance of the same service (`default/api`);
+        // the catalogue must carry both backends with each node's real IP.
+        let members = vec![member("node-a", 5001), member("node-b", 5002)];
+        let mut reports = AggregatedState {
+            reports: HashMap::new(),
+            stale_nodes: vec![],
+        };
+        let mut ra = report(4000, 100);
+        ra.running_apps = vec![running_app("default", "api", 30001, true)];
+        reports.reports.insert(NodeId::new("node-a"), ra);
+        let mut rb = report(4000, 100);
+        rb.running_apps = vec![running_app("default", "api", 30002, false)];
+        reports.reports.insert(NodeId::new("node-b"), rb);
+
+        // Declared container port comes from the desired spec.
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("api", "default"),
+            spec_from_toml("[app.api]\nimage = \"x:1\"\nport = 3000\n"),
+        );
+
+        let catalog = build_endpoint_catalog(&members, &reports, &desired);
+        let svc = catalog.resolve(&ServiceId::new("default", "api")).unwrap();
+        assert_eq!(svc.port, 3000, "declared port taken from the spec");
+        assert_eq!(svc.backends.len(), 2, "both nodes' backends present");
+        assert!(
+            svc.backends
+                .iter()
+                .any(|b| b.node_id == "node-a" && b.healthy)
+        );
+        assert!(
+            svc.backends
+                .iter()
+                .any(|b| b.node_id == "node-b" && !b.healthy)
+        );
+    }
+
+    #[test]
+    fn build_endpoint_catalog_skips_portless_and_unknown_apps() {
+        // A running app with no host port, and one with no desired spec, are
+        // both skipped — nothing to resolve.
+        let members = vec![member("node-a", 5001)];
+        let mut reports = AggregatedState {
+            reports: HashMap::new(),
+            stale_nodes: vec![],
+        };
+        let mut ra = report(4000, 100);
+        let mut portless = running_app("default", "batch", 0, true);
+        portless.port = None;
+        ra.running_apps = vec![
+            portless,
+            running_app("default", "orphan", 30001, true), // no spec
+        ];
+        reports.reports.insert(NodeId::new("node-a"), ra);
+
+        let desired = crate::council::types::DesiredState::default();
+        let catalog = build_endpoint_catalog(&members, &reports, &desired);
+        assert!(
+            catalog.is_empty(),
+            "portless and spec-less apps must be skipped"
+        );
     }
 
     #[test]

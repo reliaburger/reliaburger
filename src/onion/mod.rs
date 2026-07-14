@@ -9,6 +9,7 @@
 /// the data model for `relish resolve`. On Linux with the `ebpf`
 /// feature, the map is additionally synced to BPF hash maps in the
 /// kernel for zero-latency, zero-copy service discovery.
+pub mod catalog;
 pub mod dns;
 pub mod service_id;
 pub mod service_map;

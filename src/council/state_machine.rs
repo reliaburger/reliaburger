@@ -530,6 +530,11 @@ impl StateMachineInner {
             RaftRequest::PermissionDelete { name } => {
                 self.state.permissions.remove(name);
             }
+            RaftRequest::PublishEndpoints(catalog) => {
+                // Wholesale replacement: the leader is the single source of
+                // truth for the catalogue, so a later publish always wins.
+                self.state.endpoint_catalog = *catalog.clone();
+            }
         }
         None
     }
@@ -1439,6 +1444,76 @@ mod tests {
         let state = sm.desired_state().await;
         let placements = state.scheduling.get(&app_id).unwrap();
         assert_eq!(placements.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn apply_publish_endpoints_replaces_catalogue() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        use crate::onion::service_id::ServiceId;
+
+        let mut sm = CouncilStateMachine::new();
+        // Two same-named apps in different namespaces must both land in the
+        // replicated catalogue, with distinct VIPs (the D3 fix, cluster-wide).
+        let catalog = EndpointCatalog::rebuild([
+            (
+                ServiceId::new("default", "api"),
+                3000,
+                vec![CatalogBackend {
+                    node_id: "node-a".to_string(),
+                    node_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
+                    host_port: 30001,
+                    healthy: true,
+                }],
+            ),
+            (
+                ServiceId::new("payments", "api"),
+                3000,
+                vec![CatalogBackend {
+                    node_id: "node-b".to_string(),
+                    node_ip: std::net::Ipv4Addr::new(10, 0, 0, 2),
+                    host_port: 30002,
+                    healthy: true,
+                }],
+            ),
+        ]);
+        let entry = normal_entry(1, 1, RaftRequest::PublishEndpoints(Box::new(catalog)));
+        sm.apply(vec![entry]).await.unwrap();
+
+        let state = sm.desired_state().await;
+        let d = state
+            .endpoint_catalog
+            .resolve(&ServiceId::new("default", "api"))
+            .unwrap();
+        let p = state
+            .endpoint_catalog
+            .resolve(&ServiceId::new("payments", "api"))
+            .unwrap();
+        assert_ne!(
+            d.vip, p.vip,
+            "cluster catalogue shared a VIP across namespaces"
+        );
+        assert_eq!(d.backends[0].node_id, "node-a");
+        assert_eq!(p.backends[0].node_id, "node-b");
+
+        // A later publish wholly replaces the catalogue (leader is authoritative).
+        let replacement =
+            EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]);
+        let entry2 = normal_entry(2, 1, RaftRequest::PublishEndpoints(Box::new(replacement)));
+        sm.apply(vec![entry2]).await.unwrap();
+        let state = sm.desired_state().await;
+        assert!(
+            state
+                .endpoint_catalog
+                .resolve(&ServiceId::new("default", "api"))
+                .is_none(),
+            "stale service survived a wholesale republish"
+        );
+        assert!(
+            state
+                .endpoint_catalog
+                .resolve(&ServiceId::new("default", "web"))
+                .is_some()
+        );
     }
 
     #[tokio::test]

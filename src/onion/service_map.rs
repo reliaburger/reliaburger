@@ -228,6 +228,73 @@ impl ServiceMap {
         self.entries.values().collect()
     }
 
+    /// Produce a resolution view that overlays a cluster-wide endpoint
+    /// catalogue onto the local map, so DNS and ingress can resolve
+    /// services whose backends live on other nodes (12b.4).
+    ///
+    /// This does *not* mutate the local map: the local map stays the source
+    /// of truth for what this node runs and what it syncs to the eBPF
+    /// backend map. The returned map is a read-only merge for the DNS /
+    /// routing watch snapshot:
+    ///
+    /// - a service only in the catalogue (all its backends elsewhere) is
+    ///   added wholesale, using the catalogue's cluster-agreed VIP;
+    /// - a service present both locally and in the catalogue keeps the
+    ///   local entry (and its VIP) and gains any catalogue backends that
+    ///   aren't already local, deduplicated by `instance_id`.
+    ///
+    /// The catalogue is the leader's aggregate, which already includes this
+    /// node's own backends, so the dedupe keeps a local instance from
+    /// appearing twice.
+    pub fn with_cluster_catalog(&self, catalog: &super::catalog::EndpointCatalog) -> ServiceMap {
+        let mut merged = self.clone();
+        for (qualified, service) in &catalog.services {
+            match merged.entries.get_mut(qualified) {
+                Some(local) => {
+                    for backend in &service.backends {
+                        let instance_id = catalog_instance_id(backend);
+                        if local.backends.iter().any(|b| b.instance_id == instance_id) {
+                            continue;
+                        }
+                        local.backends.push(BackendInstance {
+                            instance_id,
+                            node_ip: backend.node_ip,
+                            host_port: backend.host_port,
+                            healthy: backend.healthy,
+                        });
+                    }
+                }
+                None => {
+                    let Some(id) = ServiceId::parse(qualified) else {
+                        continue;
+                    };
+                    let entry = ServiceEntry {
+                        app_name: id.name.clone(),
+                        namespace: id.namespace.clone(),
+                        namespace_id: name_to_id(&id.namespace),
+                        app_id: name_to_id(&id.name),
+                        vip: service.vip,
+                        port: service.port,
+                        backends: service
+                            .backends
+                            .iter()
+                            .map(|b| BackendInstance {
+                                instance_id: catalog_instance_id(b),
+                                node_ip: b.node_ip,
+                                host_port: b.host_port,
+                                healthy: b.healthy,
+                            })
+                            .collect(),
+                        firewall_allow_from: None,
+                    };
+                    merged.entries.insert(qualified.clone(), entry);
+                    merged.allocated_vips.insert(service.vip);
+                }
+            }
+        }
+        merged
+    }
+
     /// Number of registered services.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -237,6 +304,21 @@ impl ServiceMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// A stable synthetic instance id for a catalogue backend.
+///
+/// The catalogue doesn't carry the original per-instance id, but the
+/// merge needs a key to deduplicate against local backends. `{node}:{ip}:
+/// {port}` is unique per backend and stable across ticks, so a remote
+/// backend never duplicates and a local one it overlaps is matched by the
+/// local map's own `add_backend` dedupe path (both key on this string when
+/// the local id was built the same way — see the agent's merge).
+fn catalog_instance_id(backend: &super::catalog::CatalogBackend) -> String {
+    format!(
+        "{}:{}:{}",
+        backend.node_id, backend.node_ip, backend.host_port
+    )
 }
 
 /// Usable VIP slots in `127.128.0.0/16` (65,534: excludes .0.0 and .255.255).
@@ -552,5 +634,113 @@ mod tests {
         map.register(&sid("default", "redis"), 6379, None).unwrap();
         assert!(!map.is_empty());
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn with_cluster_catalog_adds_remote_only_service() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+
+        // Local map has nothing; the catalogue has a service whose backends
+        // all live on another node. The merged view must resolve it.
+        let local = ServiceMap::new();
+        let catalog = EndpointCatalog::rebuild([(
+            sid("payments", "api"),
+            3000,
+            vec![CatalogBackend {
+                node_id: "node-b".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 0, 2),
+                host_port: 30002,
+                healthy: true,
+            }],
+        )]);
+        let merged = local.with_cluster_catalog(&catalog);
+
+        let entry = merged.resolve(&sid("payments", "api")).unwrap();
+        assert_eq!(entry.namespace, "payments");
+        assert_eq!(entry.port, 3000);
+        assert_eq!(entry.backends.len(), 1);
+        assert_eq!(entry.backends[0].node_ip, Ipv4Addr::new(10, 0, 0, 2));
+        // The VIP is the cluster-agreed one from the catalogue.
+        assert_eq!(
+            entry.vip,
+            catalog.resolve(&sid("payments", "api")).unwrap().vip
+        );
+    }
+
+    #[test]
+    fn with_cluster_catalog_merges_remote_backend_into_local_service() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+
+        // The service runs locally with one backend; the catalogue also lists
+        // a backend on another node. The merged view must have both.
+        let mut local = ServiceMap::new();
+        local.register(&sid("default", "web"), 8080, None).unwrap();
+        local
+            .add_backend(
+                &sid("default", "web"),
+                test_backend("web-0", [10, 0, 0, 1], 30001),
+            )
+            .unwrap();
+        let local_vip = local.resolve(&sid("default", "web")).unwrap().vip;
+
+        let catalog = EndpointCatalog::rebuild([(
+            sid("default", "web"),
+            8080,
+            vec![CatalogBackend {
+                node_id: "node-b".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 0, 2),
+                host_port: 30002,
+                healthy: true,
+            }],
+        )]);
+        let merged = local.with_cluster_catalog(&catalog);
+
+        let entry = merged.resolve(&sid("default", "web")).unwrap();
+        // Local VIP is kept; the remote backend is added.
+        assert_eq!(entry.vip, local_vip);
+        assert_eq!(entry.backends.len(), 2);
+        assert!(
+            entry
+                .backends
+                .iter()
+                .any(|b| b.node_ip == Ipv4Addr::new(10, 0, 0, 2))
+        );
+    }
+
+    #[test]
+    fn with_cluster_catalog_does_not_duplicate_a_shared_backend() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+
+        // The catalogue includes this node's own backend (the leader's
+        // aggregate always does). Merging it must not duplicate the entry:
+        // the local backend was registered with the same synthetic id.
+        let mut local = ServiceMap::new();
+        local.register(&sid("default", "web"), 8080, None).unwrap();
+        local
+            .add_backend(
+                &sid("default", "web"),
+                BackendInstance {
+                    instance_id: "node-a:10.0.0.1:30001".to_string(),
+                    node_ip: Ipv4Addr::new(10, 0, 0, 1),
+                    host_port: 30001,
+                    healthy: true,
+                },
+            )
+            .unwrap();
+
+        let catalog = EndpointCatalog::rebuild([(
+            sid("default", "web"),
+            8080,
+            vec![CatalogBackend {
+                node_id: "node-a".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 0, 1),
+                host_port: 30001,
+                healthy: true,
+            }],
+        )]);
+        let merged = local.with_cluster_catalog(&catalog);
+
+        let entry = merged.resolve(&sid("default", "web")).unwrap();
+        assert_eq!(entry.backends.len(), 1, "shared backend was duplicated");
     }
 }

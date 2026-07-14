@@ -950,7 +950,7 @@ whole theme lands.
 
 ### 12b.4 — Finish the data plane
 
-- [ ] **Global namespaced service catalogue and DNS** — introduce ServiceId { namespace,
+- [x] **Global namespaced service catalogue and DNS** — introduce ServiceId { namespace,
   name } through Onion, DNS, eBPF, Wrapper, firewall and APIs; replicate healthy endpoints;
   allocate VIP/container IPs with collision, exhaustion and release handling; bind DNS on
   a container-reachable address and fail startup/deploy if unavailable. Add DNS TCP and
@@ -966,6 +966,20 @@ whole theme lands.
     `[ebpf]` rejected at config validation; whitepaper §10 D6 doc-drift fixed. Tests-first:
     distinct VIPs + independent resolve, VIP release, namespaced routes, DNS ACL refusal,
     fail-closed bind, config reject. `make ci` green.
+  - [x] **PR 2 — replicated global endpoint catalogue.** New `EndpointCatalog`
+    (`onion/catalog.rs`) — namespaced services → VIP + cluster-wide backends, cluster-wide
+    deterministic collision-free VIP allocation. Added a distinct, additive, serde-default
+    `endpoint_catalog` field to `DesiredState` (separate from Pickle's `manifest_catalog`)
+    plus a `RaftRequest::PublishEndpoints` variant + apply (wholesale replace); pre-theme
+    snapshots load cleanly (fixture test). The leader builds the catalogue from aggregated
+    health reports (namespace/app/port/health) + gossip node IPs and publishes it via Raft
+    only when it changes. Every node overlays it onto its local service map
+    (`ServiceMap::with_cluster_catalog`, non-mutating merge) so DNS + ingress resolve
+    services on other nodes with no DNS/routing changes; workers get it piggybacked on the
+    `/v1/placements` poll. Tests-first: catalogue rebuild/collision/JSON, non-mutating merge
+    (remote-only + merge-into-local + dedupe), leader build across nodes, apply + snapshot
+    fixture; gated (`RELIABURGER_CLUSTER_TESTS=1`) cross-node resolve that survives a leader
+    change. `make ci` green.
 - [ ] **Ingress transport and draining** — carry per-route TLS mode into routing; implement
   ACME/cluster-CA or the documented explicit certificate contract; redirect HTTP except
   challenges; stream request/response bodies with limits/backpressure; hold connection
