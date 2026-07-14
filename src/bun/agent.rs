@@ -7127,6 +7127,8 @@ mod tests {
             inst.health_config.is_some(),
             "redeploy dropped the health check"
         );
+
+        agent.stop_app("web", "default").await.unwrap();
     }
 
     #[tokio::test]
@@ -7184,6 +7186,8 @@ mod tests {
             crate::grill::state::ContainerState::Pending,
             "redeployed instance stayed wedged in Pending instead of re-creating"
         );
+
+        agent.stop_app("web", "default").await.unwrap();
     }
 
     #[tokio::test]
