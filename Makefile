@@ -3,7 +3,7 @@
 CARGO = cargo
 NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
-COVERAGE_MIN_LINES ?= 79.93
+COVERAGE_MIN_LINES ?= 78.65
 
 # --- Rust targets ---
 

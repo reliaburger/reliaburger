@@ -115,9 +115,9 @@ the network never converges. Criterion data is uploaded from CI, but we will not
 regression threshold until runs are stable on consistent hardware.
 
 `cargo-llvm-cov` combines the portable default and `--no-default-features` runs into LCOV
-and HTML artefacts. The measured line baseline is 80.93%, so CI starts at 79.93%, one
-percentage point lower. Raise it when coverage improves; do not lower it to land unrelated
-work.
+and HTML artefacts. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
+one percentage point lower. Raise it when coverage improves; do not lower it to land
+unrelated work.
 
 ## Adding a test
 

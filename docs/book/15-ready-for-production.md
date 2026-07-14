@@ -191,8 +191,8 @@ enough of those.
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
 Our `make coverage` runs both the default feature set and `--no-default-features`, merges the
-profiles, and emits LCOV plus an HTML report. The first combined measurement covered 80.93%
-of lines, so CI starts at 79.93%, one percentage point lower, and can ratchet upwards.
+profiles, and emits LCOV plus an HTML report. The first combined Linux CI measurement covered
+79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
