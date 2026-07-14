@@ -956,6 +956,16 @@ whole theme lands.
   a container-reachable address and fail startup/deploy if unavailable. Add DNS TCP and
   source ACLs, and either provide a portable non-eBPF VIP path or reject that configuration
   up front (H3/codex-M1, D3/D5/D6/D7-routes, old M5/M6).
+  - [x] **PR 1 — namespaced local service identity.** `ServiceId { namespace, name }`
+    (canonical `{namespace}__{name}`, aligned with `InstanceIdentity`) re-keys the
+    `ServiceMap` and all ~64 agent call sites; VIP derives from the qualified identity with
+    collision-probe + release-on-stop; DNS resolves `<app>.<namespace>.internal` (bare name
+    → default namespace), adds a TCP listener and a source ACL (public sources REFUSED), and
+    fails closed on bind; Wrapper ingress keyed by `(namespace, app)`; the eBPF `(vip,port)`
+    key is unchanged (namespaced VIP keeps it collision-free, no recompile); `[dns]` without
+    `[ebpf]` rejected at config validation; whitepaper §10 D6 doc-drift fixed. Tests-first:
+    distinct VIPs + independent resolve, VIP release, namespaced routes, DNS ACL refusal,
+    fail-closed bind, config reject. `make ci` green.
 - [ ] **Ingress transport and draining** — carry per-route TLS mode into routing; implement
   ACME/cluster-CA or the documented explicit certificate contract; redirect HTTP except
   challenges; stream request/response bodies with limits/backpressure; hold connection

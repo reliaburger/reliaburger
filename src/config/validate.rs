@@ -352,6 +352,22 @@ impl NodeConfig {
             });
         }
 
+        // Service discovery needs the eBPF data path. A VIP the DNS
+        // responder hands out only routes because the eBPF connect hook
+        // rewrites it to a live backend. With `[dns] enabled` but `[ebpf]`
+        // off, every resolved VIP is a black hole: the deploy would look
+        // fine and silently never route. Reject that up front rather than
+        // failing opaquely at connect time (12b.4, non-eBPF fallback).
+        if self.dns.enabled && !self.ebpf.enabled {
+            return Err(ConfigError::Validation {
+                field: "dns.enabled".to_string(),
+                context: "node config".to_string(),
+                reason: "service discovery needs the eBPF data path; \
+                         set [ebpf] enabled = true or disable [dns]"
+                    .to_string(),
+            });
+        }
+
         // Reserved resources must parse
         parse_resource_value(&self.resources.reserved_cpu).map_err(|_| {
             ConfigError::Validation {
@@ -495,6 +511,29 @@ mod tests {
     #[test]
     fn validate_valid_node_config_passes() {
         let nc = NodeConfig::default();
+        nc.validate().unwrap();
+    }
+
+    #[test]
+    fn dns_enabled_without_ebpf_rejected() {
+        // A DNS-served VIP only routes when the eBPF connect hook is loaded;
+        // enabling DNS without eBPF is a silent black hole, so it must fail
+        // config validation up front.
+        let mut nc = NodeConfig::default();
+        nc.dns.enabled = true;
+        nc.ebpf.enabled = false;
+        let err = nc.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "dns.enabled"),
+            "dns without ebpf must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn dns_enabled_with_ebpf_passes() {
+        let mut nc = NodeConfig::default();
+        nc.dns.enabled = true;
+        nc.ebpf.enabled = true;
         nc.validate().unwrap();
     }
 

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::onion::dns::{DnsConfig, bind_dns_responder, serve};
+use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::service_map::ServiceMap;
 use reliaburger::onion::vip::VirtualIP;
 use tokio::net::UdpSocket;
@@ -33,12 +34,13 @@ impl DnsHarness {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_millis(400),
+            ..DnsConfig::default()
         };
         let (socket, addr) = bind_dns_responder(&config).await.unwrap();
 
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            serve(config, socket, map_rx, serve_shutdown).await;
+            serve(Arc::new(config), socket, map_rx, serve_shutdown).await;
         });
 
         Self {
@@ -111,7 +113,7 @@ async fn resolves_registered_app_to_vip() {
 
     assert_eq!(rcode(&response), 0);
     assert_eq!(&response[6..8], &[0x00, 0x01], "expected one answer");
-    let vip = VirtualIP::from_app_name("redis");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
     let len = response.len();
     assert_eq!(&response[len - 4..], &vip.0.octets());
 }
@@ -226,6 +228,58 @@ async fn upstream_reply_with_wrong_id_yields_servfail() {
 }
 
 #[tokio::test]
+async fn run_dns_responder_fails_closed_when_it_cannot_bind() {
+    // Occupy a UDP port, then point the responder at it. `run_dns_responder`
+    // must return an error rather than swallowing the bind failure, so the
+    // caller (bun startup) fails the deploy closed instead of running without
+    // a resolver.
+    let occupier = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let taken = occupier.local_addr().unwrap();
+
+    let config = DnsConfig {
+        listen_addr: taken,
+        upstream: unroutable_upstream(),
+        upstream_timeout: Duration::from_millis(400),
+        ..DnsConfig::default()
+    };
+    let (_tx, rx) = watch::channel(ServiceMap::new());
+    let shutdown = CancellationToken::new();
+
+    let result = reliaburger::onion::dns::run_dns_responder(config, rx, shutdown).await;
+    assert!(
+        result.is_err(),
+        "responder must fail closed when the listen address is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn resolves_namespace_qualified_name_over_udp() {
+    // The end-to-end namespaced path: two `api` services in different
+    // namespaces, each qualified query resolving to its own VIP.
+    let mut map = ServiceMap::new();
+    map.register_app("api", "default", 3000, None).unwrap();
+    map.register_app("api", "payments", 3000, None).unwrap();
+    let default_vip = VirtualIP::from_service_id(&ServiceId::new("default", "api"));
+    let payments_vip = VirtualIP::from_service_id(&ServiceId::new("payments", "api"));
+
+    let harness = DnsHarness::start(unroutable_upstream(), map).await;
+
+    let r1 = harness
+        .query(&build_query("api.default.internal", QTYPE_A))
+        .await
+        .expect("no response");
+    assert_eq!(rcode(&r1), 0);
+    assert_eq!(&r1[r1.len() - 4..], &default_vip.0.octets());
+
+    let r2 = harness
+        .query(&build_query("api.payments.internal", QTYPE_A))
+        .await
+        .expect("no response");
+    assert_eq!(rcode(&r2), 0);
+    assert_eq!(&r2[r2.len() - 4..], &payments_vip.0.octets());
+}
+
+#[tokio::test]
 async fn service_map_updates_are_visible_without_restart() {
     let harness = DnsHarness::start(unroutable_upstream(), ServiceMap::new()).await;
 
@@ -239,7 +293,7 @@ async fn service_map_updates_are_visible_without_restart() {
     // …then the agent publishes a new snapshot (as it does on deploy).
     let mut map = ServiceMap::new();
     map.register_app("late", "default", 9000, None).unwrap();
-    let vip = map.resolve("late").unwrap().vip;
+    let vip = map.resolve(&ServiceId::new("default", "late")).unwrap().vip;
     harness.map_tx.send(map).unwrap();
 
     let response = harness

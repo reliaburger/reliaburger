@@ -326,6 +326,7 @@ enum DeployOp {
     /// Store an app's ingress config for the routing table.
     StoreIngress {
         app_name: String,
+        namespace: String,
         ingress: Box<crate::config::app::IngressSpec>,
         reply: oneshot::Sender<()>,
     },
@@ -582,10 +583,16 @@ impl DeployOps {
         .await
     }
 
-    async fn store_ingress(&self, app_name: &str, ingress: &crate::config::app::IngressSpec) {
+    async fn store_ingress(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        ingress: &crate::config::app::IngressSpec,
+    ) {
         self.call(
             |reply| DeployOp::StoreIngress {
                 app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
                 ingress: Box::new(ingress.clone()),
                 reply,
             },
@@ -1078,7 +1085,9 @@ pub struct BunAgent<G: Grill> {
     /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
-    ingress_configs: std::collections::HashMap<String, crate::config::app::IngressSpec>,
+    /// Ingress specs keyed by `(namespace, app_name)` so same-named apps
+    /// in different namespaces route independently (D3/codex-M1).
+    ingress_configs: std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set for firewall reconciliation. `None`
@@ -1464,44 +1473,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// backends (L8 completeness). Called after every service-map add /
     /// health change. A no-op without the eBPF data path loaded.
     #[cfg(feature = "ebpf")]
-    async fn sync_backend_ebpf(&self, app_name: &str) {
+    async fn sync_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
         };
-        let Some(entry) = self.service_map.resolve(app_name).cloned() else {
+        let Some(entry) = self.service_map.resolve(id).cloned() else {
             return;
         };
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
         if let Err(e) = bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry) {
-            eprintln!("onion: backend map sync failed for {app_name}: {e}");
+            eprintln!("onion: backend map sync failed for {id}: {e}");
         }
     }
 
     #[cfg(not(feature = "ebpf"))]
-    async fn sync_backend_ebpf(&self, _app_name: &str) {}
+    async fn sync_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
 
     /// Drop an app's `backend_map` entry. Must be called *before* the app
     /// is unregistered from the service map, while its VIP/port are still
     /// known. A no-op without the eBPF data path loaded.
     #[cfg(feature = "ebpf")]
-    async fn remove_backend_ebpf(&self, app_name: &str) {
+    async fn remove_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
         };
-        let Some(port) = self.service_map.resolve(app_name).map(|e| e.port) else {
+        // Read the VIP + port straight from the live entry: the VIP is
+        // whatever the map allocated (which may have probed off the natural
+        // hash on a collision), so we must not re-derive it here.
+        let Some((vip, port)) = self.service_map.resolve(id).map(|e| (e.vip, e.port)) else {
             return;
         };
-        let vip = crate::onion::vip::VirtualIP::from_app_name(app_name);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
         if let Err(e) = bpf.remove_backends_bpf(&mut ebpf, vip, port) {
-            eprintln!("onion: backend map removal failed for {app_name}: {e}");
+            eprintln!("onion: backend map removal failed for {id}: {e}");
         }
     }
 
     #[cfg(not(feature = "ebpf"))]
-    async fn remove_backend_ebpf(&self, _app_name: &str) {}
+    async fn remove_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
 
     /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
     ///
@@ -2389,9 +2400,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(summaries);
             }
             AgentCommand::Resolve { app_name, response } => {
+                // The CLI targets a service by bare name; resolve the first
+                // match in any namespace (PR 2 adds a namespace-qualified form).
                 let result = self
                     .service_map
-                    .resolve(&app_name)
+                    .resolve_by_name(&app_name)
                     .map(|e| e.to_resolve_response());
                 let _ = response.send(result);
             }
@@ -2919,8 +2932,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// comes from the service entry. Connect/bandwidth fault keys need both.
     #[cfg(feature = "ebpf")]
     fn fault_vip_port(&self, target_service: &str) -> Option<(u32, u16)> {
+        // Smoker targets a service by bare name; match the first entry in
+        // any namespace (PR 2 adds a namespace-qualified fault target).
         self.service_map
-            .resolve(target_service)
+            .resolve_by_name(target_service)
             .map(|e| (e.vip.to_network_byte_order(), e.port.to_be()))
     }
 
@@ -3245,9 +3260,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         instance_id: &InstanceId,
         app_name: &str,
+        namespace: &str,
         spec: &AppSpec,
     ) {
-        self.sync_backend_ebpf(app_name).await;
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        self.sync_backend_ebpf(&service_id).await;
         self.sync_firewall_ebpf().await;
         self.apply_egress(instance_id, spec).await;
     }
@@ -3405,10 +3422,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 host_port,
                 healthy: instance.state == ContainerState::Running,
             };
-            let _ = self.service_map.add_backend(app_name, backend);
+            let _ = self.service_map.add_backend(
+                &crate::onion::service_id::ServiceId::new(namespace, app_name),
+                backend,
+            );
         }
 
-        self.finish_instance_networking(instance_id, app_name, spec)
+        self.finish_instance_networking(instance_id, app_name, namespace, spec)
             .await;
         Ok(())
     }
@@ -3523,6 +3543,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default()
             .drain_timeout;
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         if spec.port.is_some() {
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
@@ -3536,7 +3557,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         healthy: true,
                     };
-                    let _ = self.service_map.add_backend(app_name, backend);
+                    let _ = self.service_map.add_backend(&service_id, backend);
                 }
             }
             self.rebuild_routing_table().await;
@@ -3549,11 +3570,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.cleanup_instance_identity(old_id);
         }
         self.supervisor.remove_app(app_name, namespace).await;
-        self.remove_backend_ebpf(app_name).await;
+        self.remove_backend_ebpf(&service_id).await;
         for old_id in existing {
             self.remove_instance_record(old_id);
         }
-        let _ = self.service_map.unregister_app(app_name);
+        let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
             let host_port = new_ports.get(new_id).copied().flatten();
@@ -3600,9 +3621,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(f.allow_from.clone())
                 }
             });
-            let _ = self
-                .service_map
-                .register_app(app_name, namespace, port, firewall);
+            let _ = self.service_map.register(&service_id, port, firewall);
 
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
@@ -3616,18 +3635,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         healthy: true,
                     };
-                    let _ = self.service_map.add_backend(app_name, backend);
+                    let _ = self.service_map.add_backend(&service_id, backend);
                 }
             }
         }
 
         for new_id in new_ids {
-            self.finish_instance_networking(new_id, app_name, spec)
+            self.finish_instance_networking(new_id, app_name, namespace, spec)
                 .await;
         }
         if let Some(ref ingress) = spec.ingress {
-            self.ingress_configs
-                .insert(app_name.to_string(), ingress.clone());
+            self.ingress_configs.insert(
+                (namespace.to_string(), app_name.to_string()),
+                ingress.clone(),
+            );
         }
 
         let entry = crate::meat::deploy_types::DeployHistoryEntry {
@@ -4367,40 +4388,51 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let transition = self.supervisor.process_health_result(&instance_id, status);
 
                 // Propagate health transitions to the service map, noting the
-                // app so we can re-sync its eBPF backend_map entry afterwards.
-                let mut health_changed_app: Option<String> = None;
+                // service so we can re-sync its eBPF backend_map entry afterwards.
+                let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
                 match &transition {
                     Ok(Some(ContainerState::Running)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let app = inst.app_name.clone();
-                            let _ = self
-                                .service_map
-                                .set_backend_health(&app, &instance_id.0, true);
-                            health_changed_app = Some(app);
+                            let service_id = crate::onion::service_id::ServiceId::new(
+                                inst.namespace.clone(),
+                                inst.app_name.clone(),
+                            );
+                            let _ = self.service_map.set_backend_health(
+                                &service_id,
+                                &instance_id.0,
+                                true,
+                            );
+                            health_changed_service = Some(service_id);
                         }
                     }
                     Ok(Some(ContainerState::Unhealthy)) => {
                         if let Some(inst) = self.supervisor.get_instance(&instance_id) {
                             let app = inst.app_name.clone();
                             let namespace = inst.namespace.clone();
-                            let _ =
-                                self.service_map
-                                    .set_backend_health(&app, &instance_id.0, false);
+                            let service_id = crate::onion::service_id::ServiceId::new(
+                                namespace.clone(),
+                                app.clone(),
+                            );
+                            let _ = self.service_map.set_backend_health(
+                                &service_id,
+                                &instance_id.0,
+                                false,
+                            );
                             self.record_event(
                                 crate::bun::events::EventKind::Health,
                                 crate::bun::events::EventSeverity::Warning,
-                                Some(app.clone()),
+                                Some(app),
                                 Some(namespace),
                                 format!("instance {} became unhealthy", instance_id.0),
                             )
                             .await;
-                            health_changed_app = Some(app);
+                            health_changed_service = Some(service_id);
                         }
                     }
                     _ => {}
                 }
-                if let Some(app) = health_changed_app {
-                    self.sync_backend_ebpf(&app).await;
+                if let Some(service_id) = health_changed_service {
+                    self.sync_backend_ebpf(&service_id).await;
                 }
 
                 // Handle restart if unhealthy
@@ -4729,6 +4761,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
                 instance.container_ip = container_ip;
             }
+            let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
             if let Some(port) = host_port {
                 let backend = crate::onion::types::BackendInstance {
                     instance_id: id.0.clone(),
@@ -4736,7 +4769,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     host_port: port,
                     healthy: true,
                 };
-                let _ = self.service_map.add_backend(&app_name, backend);
+                let _ = self.service_map.add_backend(&service_id, backend);
             }
             // Re-program the restarted instance's kernel networking. A restart
             // gives it a fresh cgroup, so egress must be re-applied too or a
@@ -4747,9 +4780,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .get(&(app_name.clone(), namespace.clone()))
                 .cloned()
             {
-                self.finish_instance_networking(&id, &app_name, &spec).await;
+                self.finish_instance_networking(&id, &app_name, &namespace, &spec)
+                    .await;
             } else {
-                self.sync_backend_ebpf(&app_name).await;
+                self.sync_backend_ebpf(&service_id).await;
                 self.sync_firewall_ebpf().await;
             }
 
@@ -4817,19 +4851,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // Remove backends and unregister from the service map
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         for id in &instances {
-            let _ = self.service_map.remove_backend(app_name, &id.0);
+            let _ = self.service_map.remove_backend(&service_id, &id.0);
             self.clear_egress(id).await;
             // Key material must not outlive the instance (PKI7): remove
             // the identity dir and unmount its tmpfs backing.
             self.cleanup_instance_identity(id);
         }
-        self.remove_backend_ebpf(app_name).await;
-        let _ = self.service_map.unregister_app(app_name);
+        self.remove_backend_ebpf(&service_id).await;
+        let _ = self.service_map.unregister(&service_id);
         // NET5: prune this app's cgroup-namespace + firewall entries now it's
         // gone, so a reused cgroup inode can't inherit its isolation identity.
         self.sync_firewall_ebpf().await;
-        self.ingress_configs.remove(app_name);
+        self.ingress_configs
+            .remove(&(namespace.to_string(), app_name.to_string()));
         self.rebuild_routing_table().await;
 
         self.record_event(
@@ -5608,19 +5644,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 firewall,
                 reply,
             } => {
-                let _ = self
-                    .service_map
-                    .register_app(&app_name, &namespace, port, firewall);
-                self.sync_backend_ebpf(&app_name).await;
+                let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
+                let _ = self.service_map.register(&service_id, port, firewall);
+                self.sync_backend_ebpf(&service_id).await;
                 self.sync_firewall_ebpf().await;
                 let _ = reply.send(());
             }
             DeployOp::StoreIngress {
                 app_name,
+                namespace,
                 ingress,
                 reply,
             } => {
-                self.ingress_configs.insert(app_name, *ingress);
+                self.ingress_configs.insert((namespace, app_name), *ingress);
                 let _ = reply.send(());
             }
             DeployOp::PrepareFreshInstance {
@@ -5955,7 +5991,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
 
             if let Some(ref ingress) = spec.ingress {
-                self.ops.store_ingress(app_name, ingress).await;
+                self.ops.store_ingress(app_name, namespace, ingress).await;
             }
 
             for id in &ids {
@@ -7021,7 +7057,7 @@ mod tests {
         // The service must have backends after the redeploy (was left empty).
         let entry = agent
             .service_map
-            .resolve("web")
+            .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
             .expect("web missing from service map");
         assert!(
             !entry.backends.is_empty(),
@@ -7122,7 +7158,10 @@ mod tests {
             "the runtime's container IP was not recorded on the instance"
         );
 
-        let entry = agent.service_map.resolve("web").expect("web not in map");
+        let entry = agent
+            .service_map
+            .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+            .expect("web not in map");
         assert!(
             entry.backends.iter().any(|b| b.node_ip == ip),
             "backend registered with loopback instead of the container IP"

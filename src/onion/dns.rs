@@ -13,14 +13,16 @@
 /// interception, which turned out to be infeasible: the cgroup
 /// sendmsg4/recvmsg4 hooks can modify socket addresses but can't
 /// read or synthesise DNS packet payloads.
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::service_id::ServiceId;
 use super::service_map::ServiceMap;
 use super::vip::VirtualIP;
 
@@ -39,6 +41,7 @@ const MAX_INFLIGHT_FORWARDS: usize = 64;
 const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
 const RCODE_NOTIMP: u8 = 4;
+const RCODE_REFUSED: u8 = 5;
 
 /// QTYPEs we care about.
 const QTYPE_A: u16 = 1;
@@ -52,6 +55,17 @@ pub struct DnsConfig {
     pub upstream: SocketAddr,
     /// How long to wait for an upstream reply before SERVFAIL.
     pub upstream_timeout: Duration,
+    /// Namespace a bare `<app>.internal` query resolves within.
+    ///
+    /// A container that asks for `redis.internal` (rather than the fully
+    /// qualified `redis.payments.internal`) means "redis in my namespace".
+    /// The userspace responder can't see the querying container's cgroup,
+    /// so it falls back to this namespace — set per-node to the namespace
+    /// the node predominantly serves, `default` otherwise. Fully qualified
+    /// `<app>.<namespace>.internal` queries ignore it.
+    pub default_namespace: String,
+    /// Which source addresses may query the `.internal` zone.
+    pub source_acl: SourceAcl,
 }
 
 impl Default for DnsConfig {
@@ -60,6 +74,54 @@ impl Default for DnsConfig {
             listen_addr: SocketAddr::new(Ipv4Addr::new(127, 0, 0, 53).into(), 53),
             upstream: SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53),
             upstream_timeout: Duration::from_secs(2),
+            default_namespace: "default".to_string(),
+            source_acl: SourceAcl::default(),
+        }
+    }
+}
+
+/// Which client addresses may resolve `.internal` service names.
+///
+/// The `.internal` zone exposes the cluster's internal topology, so only
+/// container-reachable clients should see it: loopback (the node's own
+/// resolver path) and the private ranges containers get addresses from
+/// (RFC 1918 plus the CGNAT block Lima/runc bridges use). A query from a
+/// public address is refused with REFUSED, never answered and never
+/// forwarded — internal names must not leak to, or be probed by, the
+/// outside world.
+#[derive(Debug, Clone)]
+pub struct SourceAcl {
+    /// When true, only loopback and private-range sources are served
+    /// internal answers. When false, every source is served (used only
+    /// in tests that drive the parser directly).
+    pub restrict_to_private: bool,
+}
+
+impl Default for SourceAcl {
+    fn default() -> Self {
+        Self {
+            restrict_to_private: true,
+        }
+    }
+}
+
+impl SourceAcl {
+    /// Whether `src` may resolve internal names under this ACL.
+    pub fn allows(&self, src: IpAddr) -> bool {
+        if !self.restrict_to_private {
+            return true;
+        }
+        match src {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    // 100.64.0.0/10 — CGNAT, used by Lima/runc bridges.
+                    || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+                    // VIP range itself, so a container reusing its resolver works.
+                    || VirtualIP::is_in_vip_range(v4)
+            }
+            // IPv6 loopback only; the networking model is IPv4 today.
+            IpAddr::V6(v6) => v6.is_loopback(),
         }
     }
 }
@@ -77,8 +139,23 @@ pub async fn run_dns_responder(
     service_map: watch::Receiver<ServiceMap>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let socket = Arc::new(UdpSocket::bind(config.listen_addr).await?);
-    serve(config, socket, service_map, shutdown).await;
+    // Bind UDP *and* TCP up front. Both must bind or the responder is only
+    // half up — a caller retrying a truncated answer over TCP would hang.
+    // Binding fails the whole startup (the caller fails the deploy closed)
+    // rather than silently serving UDP-only.
+    let udp = Arc::new(UdpSocket::bind(config.listen_addr).await?);
+    let tcp = TcpListener::bind(config.listen_addr).await?;
+    let config = Arc::new(config);
+
+    let tcp_task = {
+        let config = Arc::clone(&config);
+        let service_map = service_map.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { serve_tcp(config, tcp, service_map, shutdown).await })
+    };
+
+    serve(config, udp, service_map, shutdown).await;
+    tcp_task.abort();
     Ok(())
 }
 
@@ -94,9 +171,9 @@ pub async fn bind_dns_responder(
     Ok((socket, addr))
 }
 
-/// Serve DNS on an already-bound socket until shutdown.
+/// Serve DNS on an already-bound UDP socket until shutdown.
 pub async fn serve(
-    config: DnsConfig,
+    config: Arc<DnsConfig>,
     socket: Arc<UdpSocket>,
     service_map: watch::Receiver<ServiceMap>,
     shutdown: CancellationToken,
@@ -127,7 +204,8 @@ pub async fn serve(
                 };
 
                 if let Some(stripped) = name.strip_suffix(".internal") {
-                    let response = answer_internal(&service_map, &query, stripped, qtype);
+                    let response =
+                        answer_internal(&config, &service_map, &query, stripped, qtype, src.ip());
                     let _ = socket.send_to(&response, src).await;
                     continue;
                 }
@@ -153,19 +231,89 @@ pub async fn serve(
     }
 }
 
+/// Serve DNS over TCP until shutdown.
+///
+/// TCP exists for answers larger than a UDP datagram: a client that gets a
+/// truncated (TC-bit) UDP reply retries the whole query over TCP. Each DNS
+/// message is length-prefixed with a 2-byte big-endian length. We only
+/// answer `.internal` names here; a non-internal name over TCP gets
+/// SERVFAIL rather than a forwarded relay (upstream TCP relaying isn't
+/// needed for the internal zone this responder is authoritative for).
+async fn serve_tcp(
+    config: Arc<DnsConfig>,
+    listener: TcpListener,
+    service_map: watch::Receiver<ServiceMap>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                let Ok((mut stream, peer)) = accepted else { continue };
+                let config = Arc::clone(&config);
+                let service_map = service_map.clone();
+                tokio::spawn(async move {
+                    // One query-response per accepted connection is enough for
+                    // the resolver retry case; keep it simple and bounded.
+                    let mut len_buf = [0u8; 2];
+                    if stream.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let qlen = u16::from_be_bytes(len_buf) as usize;
+                    if qlen == 0 || qlen > UPSTREAM_BUFFER {
+                        return;
+                    }
+                    let mut query = vec![0u8; qlen];
+                    if stream.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    let Some((name, qtype)) = parse_query(&query) else { return };
+                    let response = match name.strip_suffix(".internal") {
+                        Some(stripped) => answer_internal(
+                            &config,
+                            &service_map,
+                            &query,
+                            stripped,
+                            qtype,
+                            peer.ip(),
+                        ),
+                        None => build_status_response(&query, RCODE_SERVFAIL),
+                    };
+                    let mut framed = Vec::with_capacity(response.len() + 2);
+                    framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+                    framed.extend_from_slice(&response);
+                    let _ = stream.write_all(&framed).await;
+                });
+            }
+        }
+    }
+}
+
 /// Answer a query for a name under `.internal`.
+///
+/// Enforces the source ACL first: a client outside the container-reachable
+/// ranges gets REFUSED, so the internal topology never leaks. The name is
+/// then resolved namespace-aware: `<app>.<namespace>` targets that exact
+/// service, while a bare `<app>` resolves in `config.default_namespace`.
 ///
 /// Authoritative: resolves A queries from the service map, returns an
 /// empty NOERROR for AAAA on known names (we only have IPv4 VIPs),
 /// NOTIMP for other query types, and NXDOMAIN for unknown names.
 /// Never forwarded — internal names must not leak upstream.
 fn answer_internal(
+    config: &DnsConfig,
     service_map: &watch::Receiver<ServiceMap>,
     query: &[u8],
-    app_name: &str,
+    stripped: &str,
     qtype: u16,
+    src: IpAddr,
 ) -> Vec<u8> {
-    let vip = service_map.borrow().resolve(app_name).map(|e| e.vip);
+    if !config.source_acl.allows(src) {
+        return build_status_response(query, RCODE_REFUSED);
+    }
+
+    let service_id = service_id_for(stripped, &config.default_namespace);
+    let vip = service_map.borrow().resolve(&service_id).map(|e| e.vip);
     match (vip, qtype) {
         (Some(vip), QTYPE_A) => build_a_response(query, vip),
         // The name exists but only as IPv4: empty NOERROR tells the
@@ -173,6 +321,19 @@ fn answer_internal(
         (Some(_), QTYPE_AAAA) => build_status_response(query, 0),
         (Some(_), _) => build_status_response(query, RCODE_NOTIMP),
         (None, _) => build_status_response(query, RCODE_NXDOMAIN),
+    }
+}
+
+/// Map the stripped `.internal` label(s) to a [`ServiceId`].
+///
+/// `<app>.<namespace>` becomes `ServiceId { namespace, app }`; a bare
+/// `<app>` (no dot) resolves in `default_namespace`. A name with more than
+/// two labels keeps the first as the app and the second as the namespace
+/// (deeper labels are ignored — there's no third level in the scheme).
+fn service_id_for(stripped: &str, default_namespace: &str) -> ServiceId {
+    match stripped.split_once('.') {
+        Some((app, namespace)) => ServiceId::new(namespace, app),
+        None => ServiceId::new(default_namespace, stripped),
     }
 }
 
@@ -505,24 +666,124 @@ mod tests {
         assert!(!name.ends_with(".internal"));
     }
 
+    /// A test config that serves every source (the ACL is exercised
+    /// separately), resolving bare names in `default`.
+    fn test_config() -> DnsConfig {
+        DnsConfig {
+            source_acl: SourceAcl {
+                restrict_to_private: false,
+            },
+            ..DnsConfig::default()
+        }
+    }
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
     #[test]
-    fn answer_internal_resolves_known_name_to_vip() {
+    fn service_id_for_qualified_name() {
+        let id = service_id_for("api.payments", "default");
+        assert_eq!(id.namespace, "payments");
+        assert_eq!(id.name, "api");
+    }
+
+    #[test]
+    fn service_id_for_bare_name_uses_default_namespace() {
+        let id = service_id_for("api", "team-b");
+        assert_eq!(id.namespace, "team-b");
+        assert_eq!(id.name, "api");
+    }
+
+    #[test]
+    fn answer_internal_resolves_qualified_name_to_vip() {
         let mut map = ServiceMap::new();
         map.register_app("redis", "default", 6379, None).unwrap();
-        let vip = map.resolve("redis").unwrap().vip;
+        let vip = map
+            .resolve(&ServiceId::new("default", "redis"))
+            .unwrap()
+            .vip;
+        let (_tx, rx) = watch::channel(map);
+
+        let query = build_dns_query("redis.default.internal");
+        let response = answer_internal(
+            &test_config(),
+            &rx,
+            &query,
+            "redis.default",
+            QTYPE_A,
+            LOOPBACK,
+        );
+        let len = response.len();
+        assert_eq!(&response[len - 4..], &vip.0.octets());
+    }
+
+    #[test]
+    fn answer_internal_bare_name_resolves_in_default_namespace() {
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let vip = map
+            .resolve(&ServiceId::new("default", "redis"))
+            .unwrap()
+            .vip;
         let (_tx, rx) = watch::channel(map);
 
         let query = build_dns_query("redis.internal");
-        let response = answer_internal(&rx, &query, "redis", QTYPE_A);
+        let response = answer_internal(&test_config(), &rx, &query, "redis", QTYPE_A, LOOPBACK);
         let len = response.len();
         assert_eq!(&response[len - 4..], &vip.0.octets());
+    }
+
+    #[test]
+    fn answer_internal_qualified_names_resolve_each_namespace_independently() {
+        // The D3/codex-M1 regression, at the DNS layer: `api` exists in two
+        // namespaces and each qualified query resolves to its own VIP.
+        let mut map = ServiceMap::new();
+        map.register_app("api", "default", 3000, None).unwrap();
+        map.register_app("api", "payments", 3000, None).unwrap();
+        let default_vip = map.resolve(&ServiceId::new("default", "api")).unwrap().vip;
+        let payments_vip = map.resolve(&ServiceId::new("payments", "api")).unwrap().vip;
+        assert_ne!(default_vip, payments_vip);
+        let (_tx, rx) = watch::channel(map);
+
+        let q1 = build_dns_query("api.default.internal");
+        let r1 = answer_internal(&test_config(), &rx, &q1, "api.default", QTYPE_A, LOOPBACK);
+        assert_eq!(&r1[r1.len() - 4..], &default_vip.0.octets());
+
+        let q2 = build_dns_query("api.payments.internal");
+        let r2 = answer_internal(&test_config(), &rx, &q2, "api.payments", QTYPE_A, LOOPBACK);
+        assert_eq!(&r2[r2.len() - 4..], &payments_vip.0.octets());
+    }
+
+    #[test]
+    fn answer_internal_refuses_non_container_source() {
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let (_tx, rx) = watch::channel(map);
+
+        // A public source address must be REFUSED, never answered — even for
+        // a name that exists.
+        let public = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let config = DnsConfig::default(); // restrict_to_private = true
+        let query = build_dns_query("redis.internal");
+        let response = answer_internal(&config, &rx, &query, "redis", QTYPE_A, public);
+        assert_eq!(response[3] & 0x0F, RCODE_REFUSED);
+    }
+
+    #[test]
+    fn source_acl_allows_private_and_loopback_rejects_public() {
+        let acl = SourceAcl::default();
+        assert!(acl.allows(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(acl.allows(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2))));
+        assert!(acl.allows(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))));
+        assert!(acl.allows(IpAddr::V4(Ipv4Addr::new(100, 88, 0, 1)))); // CGNAT
+        assert!(!acl.allows(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!acl.allows(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
     #[test]
     fn answer_internal_unknown_name_is_nxdomain() {
         let (_tx, rx) = watch::channel(ServiceMap::new());
         let query = build_dns_query("ghost.internal");
-        let response = answer_internal(&rx, &query, "ghost", QTYPE_A);
+        let response = answer_internal(&test_config(), &rx, &query, "ghost", QTYPE_A, LOOPBACK);
         assert_eq!(response[3] & 0x0F, RCODE_NXDOMAIN);
     }
 
@@ -533,7 +794,7 @@ mod tests {
         let (_tx, rx) = watch::channel(map);
 
         let query = build_dns_query_typed("redis.internal", QTYPE_AAAA);
-        let response = answer_internal(&rx, &query, "redis", QTYPE_AAAA);
+        let response = answer_internal(&test_config(), &rx, &query, "redis", QTYPE_AAAA, LOOPBACK);
         assert_eq!(response[3] & 0x0F, 0, "expected NOERROR");
         assert_eq!(&response[6..8], &[0x00, 0x00], "expected no answers");
     }
@@ -545,7 +806,7 @@ mod tests {
         let (_tx, rx) = watch::channel(map);
 
         let query = build_dns_query_typed("redis.internal", 15); // MX
-        let response = answer_internal(&rx, &query, "redis", 15);
+        let response = answer_internal(&test_config(), &rx, &query, "redis", 15, LOOPBACK);
         assert_eq!(response[3] & 0x0F, RCODE_NOTIMP);
     }
 }

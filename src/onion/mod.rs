@@ -10,6 +10,7 @@
 /// feature, the map is additionally synced to BPF hash maps in the
 /// kernel for zero-latency, zero-copy service discovery.
 pub mod dns;
+pub mod service_id;
 pub mod service_map;
 pub mod types;
 pub mod vip;
