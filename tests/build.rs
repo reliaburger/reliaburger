@@ -263,6 +263,19 @@ async fn start_registry() -> (
     CancellationToken,
     tempfile::TempDir,
 ) {
+    start_registry_with_council(None).await
+}
+
+/// A pickle registry backed by the supplied council when the test needs
+/// registry writes and subsequent Raft commands to share one catalogue.
+async fn start_registry_with_council(
+    council: Option<Arc<CouncilNode>>,
+) -> (
+    u16,
+    Arc<RwLock<reliaburger::pickle::types::ManifestCatalog>>,
+    CancellationToken,
+    tempfile::TempDir,
+) {
     use reliaburger::pickle::api::{PickleState, router as pickle_router};
     use reliaburger::pickle::store::BlobStore;
     use reliaburger::pickle::types::ManifestCatalog;
@@ -273,7 +286,7 @@ async fn start_registry() -> (
         store: Arc::new(BlobStore::new(dir.path().join("blobs"))),
         catalog: Arc::clone(&catalog),
         node_raft_id: 1,
-        council: None,
+        council,
         persist_path: None,
         auth: None,
         quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
@@ -867,10 +880,11 @@ async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
         "set RELIABURGER_BUILDAH_TESTS=1 after installing Buildah"
     );
 
-    let (registry_port, catalog, registry_shutdown, _dir) = start_registry().await;
+    let council = single_node_leader_with_security().await;
+    let (registry_port, catalog, registry_shutdown, _dir) =
+        start_registry_with_council(Some(Arc::clone(&council))).await;
     let digest = upload_trivial_context(registry_port).await;
 
-    let council = single_node_leader_with_security().await;
     let root_ca_der = council
         .security_state()
         .await
