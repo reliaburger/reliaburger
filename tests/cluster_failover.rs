@@ -54,8 +54,27 @@ struct NodeHarness {
     metrics_rx:
         watch::Receiver<openraft::RaftMetrics<u64, reliaburger::council::types::CouncilNodeInfo>>,
     aggregated_rx: watch::Receiver<AggregatedState>,
+    /// This node's agent command channel, so a test can resolve services
+    /// against the node's own (cluster-merged) service view.
+    cmd_tx: mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
     /// Cancelling this token kills THIS node only.
     shutdown: CancellationToken,
+}
+
+impl NodeHarness {
+    /// Resolve a service by name against this node's agent — the merged
+    /// local + cluster-catalogue view (12b.4).
+    async fn resolve(&self, app: &str) -> Option<reliaburger::onion::types::ResolveResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(reliaburger::bun::agent::AgentCommand::Resolve {
+                app_name: app.to_string(),
+                response: tx,
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
 }
 
 impl NodeHarness {
@@ -135,6 +154,8 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
 
     // Real agent answering reporting snapshots with real capacity.
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
+    // Kept for the harness so a test can resolve against this node's agent.
+    let resolve_cmd_tx = cmd_tx.clone();
     let mut agent = BunAgent::with_cluster(
         ProcessGrill::new(),
         PortAllocator::new(gossip_port + 100, gossip_port + 400),
@@ -210,6 +231,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         council,
         metrics_rx,
         aggregated_rx,
+        cmd_tx: resolve_cmd_tx,
         shutdown,
     }
 }
@@ -247,6 +269,150 @@ fn daemonset_spec(command_seconds: u32) -> reliaburger::config::app::AppSpec {
         "#
     ))
     .unwrap()
+}
+
+/// A single-replica app with a port, so it lands on exactly one node and
+/// becomes a resolvable service with a backend.
+fn ported_service_spec(name_port: u16) -> reliaburger::config::app::AppSpec {
+    toml::from_str(&format!(
+        r#"
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        replicas = 1
+        port = {name_port}
+        cpu = "100m-200m"
+        "#
+    ))
+    .unwrap()
+}
+
+/// Which node (by name) currently reports running `app`, if any.
+fn node_running_app(state: &AggregatedState, app: &str) -> Option<String> {
+    state
+        .reports
+        .iter()
+        .find(|(_, report)| report.running_apps.iter().any(|a| a.app_name == app))
+        .map(|(node_id, _)| node_id.0.clone())
+}
+
+/// 12b.4: a service deployed on node B resolves + routes from node A. Every
+/// node overlays the leader's replicated endpoint catalogue onto its local
+/// service map, so cross-node resolution works even though the backend runs
+/// elsewhere. Also proves the catalogue survives a leader change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn service_on_one_node_resolves_and_survives_leader_change_from_another() {
+    if !cluster_tests_enabled() {
+        eprintln!("skipping cluster integration test (set RELIABURGER_CLUSTER_TESTS=1)");
+        return;
+    }
+
+    let root = CancellationToken::new();
+    // Three nodes, all voters (cap is seven): killing the leader leaves a
+    // two-node quorum, so a survivor takes over cleanly. Three keeps the
+    // election light while still proving cross-node resolve + failover.
+    const N: usize = 3;
+    let mut nodes = Vec::with_capacity(N);
+    nodes.push(start_node(100, vec![], &root).await);
+    for index in 101..(100 + N) {
+        nodes.push(start_node(index, vec![local(BASE_PORT + 1000)], &root).await);
+    }
+
+    // Wait for the council to commit all three as voters before deploying:
+    // killing the leader before the voter set settles can leave the survivors
+    // without a committed quorum, and election stalls.
+    wait_until("three voters", Duration::from_secs(60), async || {
+        nodes[0].voter_count() == N
+    })
+    .await;
+    wait_until(
+        "all nodes reporting to the leader",
+        Duration::from_secs(60),
+        async || nodes[0].aggregated_rx.borrow().reports.len() == N,
+    )
+    .await;
+
+    // Deploy one replica of a ported service via the leader.
+    assert!(nodes[0].is_leader().await, "bootstrap node should lead");
+    nodes[0]
+        .council
+        .write(RaftRequest::AppSpec {
+            app_id: AppId::new("redis", "default"),
+            spec: Box::new(ported_service_spec(6379)),
+        })
+        .await
+        .unwrap();
+
+    // Wait until exactly one node reports it running.
+    wait_until(
+        "redis running on some node",
+        Duration::from_secs(90),
+        async || node_running_app(&nodes[0].aggregated_rx.borrow(), "redis").is_some(),
+    )
+    .await;
+    let host_node = node_running_app(&nodes[0].aggregated_rx.borrow(), "redis").unwrap();
+    eprintln!("redis landed on {host_node}");
+
+    // Pick a DIFFERENT node and resolve the service from it. The catalogue is
+    // replicated + polled, so this node reaches redis though it runs elsewhere.
+    let other = nodes
+        .iter()
+        .find(|n| n.name != host_node)
+        .expect("a node other than the host");
+    wait_until(
+        "redis resolves with a healthy backend from another node",
+        Duration::from_secs(60),
+        async || match other.resolve("redis").await {
+            Some(info) => info.healthy_backends >= 1,
+            None => false,
+        },
+    )
+    .await;
+    let info = other.resolve("redis").await.expect("resolves");
+    assert_eq!(info.app_name, "redis");
+    assert_eq!(info.port, 6379);
+    assert!(info.total_backends >= 1, "cross-node backend missing");
+
+    // Kill the leader; a survivor takes over. The replicated catalogue must
+    // survive the leader change: the same other-node resolution still works.
+    let old_leader = nodes[0].name.clone();
+    nodes[0].shutdown.cancel();
+    nodes[0].council.shutdown().await.ok();
+
+    let survivors: Vec<&NodeHarness> = nodes.iter().filter(|n| n.name != old_leader).collect();
+    let mut new_leader: Option<&NodeHarness> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while new_leader.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no new leader elected"
+        );
+        for node in &survivors {
+            if node.is_leader().await {
+                new_leader = Some(node);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // A surviving node that isn't the (possibly-relocated) host still resolves
+    // redis from the post-failover catalogue.
+    let resolver = survivors
+        .iter()
+        .find(|n| n.name != old_leader)
+        .expect("a surviving resolver");
+    wait_until(
+        "redis still resolves after the leader change",
+        Duration::from_secs(90),
+        async || match resolver.resolve("redis").await {
+            Some(info) => info.total_backends >= 1,
+            None => false,
+        },
+    )
+    .await;
+
+    root.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

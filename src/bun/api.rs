@@ -1195,7 +1195,13 @@ async fn placements_handler(
         });
     }
 
-    Json(crate::cluster::orchestrate::NodeAssignments { apps }).into_response()
+    Json(crate::cluster::orchestrate::NodeAssignments {
+        apps,
+        // Piggyback the replicated endpoint catalogue (12b.4) so the polling
+        // node can resolve services on other nodes.
+        endpoint_catalog: desired.endpoint_catalog.clone(),
+    })
+    .into_response()
 }
 
 /// List all instances.
