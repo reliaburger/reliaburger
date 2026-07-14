@@ -250,6 +250,20 @@ retain_versions = 3
         council["leader"].as_str().map(String::from)
     }
 
+    async fn wait_for_leader(&self) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            if let Some(leader) = self.leader().await {
+                return leader;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a cluster leader"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     fn node(&self, name: &str) -> &ClusterNode {
         self.nodes.iter().find(|n| n.name == name).unwrap()
     }
@@ -268,7 +282,7 @@ retain_versions = 3
     /// The upgrade-plan node list: the leader last, two council members,
     /// the remaining node labelled Worker (see the module note on roles).
     async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
-        let leader = self.leader().await.expect("a leader");
+        let leader = self.wait_for_leader().await;
         let worker = self
             .nodes
             .iter()
@@ -427,6 +441,26 @@ retain_versions = 3
         versions
     }
 
+    /// Wait until every replacement API is reachable and reports the target.
+    /// The coordinator records completion immediately before the final
+    /// leader's `exec`, so its HTTP listener can briefly be between processes.
+    async fn wait_for_versions(&self, expected: &str) -> HashMap<String, String> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let versions = self.versions().await;
+            if versions.len() == self.nodes.len()
+                && versions.values().all(|version| version == expected)
+            {
+                return versions;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for every node on {expected}: {versions:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     async fn shutdown(mut self) {
         for node in &mut self.nodes {
             let _ = node.stop_tx.send(true);
@@ -483,7 +517,7 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
     assert_eq!(phase, "Completed");
 
     // Every node ended on the target version.
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.2.0").await;
     for node in &harness.nodes {
         assert_eq!(
             versions.get(&node.name).map(String::as_str),
@@ -507,10 +541,7 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         Some(&old_leader),
         "old leader did not upgrade last: {healthy_order:?}"
     );
-    assert!(
-        harness.leader().await.is_some(),
-        "cluster lost its leader after the upgrade"
-    );
+    harness.wait_for_leader().await;
 
     harness.shutdown().await;
 }
@@ -541,15 +572,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
     assert!(phase.starts_with("Paused"), "expected a pause, got {phase}");
 
     // The worker reverted itself; nobody else was touched.
-    wait_for("worker back on v0.1.0", WAIT, || async {
-        harness
-            .node_version(&harness.node(&worker).api)
-            .await
-            .as_deref()
-            == Some("v0.1.0")
-    })
-    .await;
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.1.0").await;
     assert_eq!(
         versions.len(),
         harness.nodes.len(),
@@ -562,7 +585,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 
     // Cure the binary and resume: the run finishes.
     std::fs::remove_file(harness.node(&worker).bin_dir.join("bun-v0.2.0.fail-boot")).unwrap();
-    let leader = harness.leader().await.expect("a leader");
+    let leader = harness.wait_for_leader().await;
     let resume = harness
         .client
         .post(format!(
@@ -577,7 +600,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 
     let (_, phase) = harness.watch_upgrade(false).await;
     assert_eq!(phase, "Completed");
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.2.0").await;
     assert_eq!(
         versions.len(),
         harness.nodes.len(),
@@ -604,6 +627,7 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
     harness.start_upgrade().await;
     let (_, phase) = harness.watch_upgrade(false).await;
     assert_eq!(phase, "Completed");
+    harness.wait_for_versions("v0.2.0").await;
 
     // Roll the whole cluster back to v0.1.0.
     let (nodes, leader, _) = harness.plan_nodes().await;
@@ -622,7 +646,7 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
 
     let (_, phase) = harness.watch_upgrade(false).await;
     assert_eq!(phase, "Completed");
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.1.0").await;
     assert_eq!(
         versions.len(),
         harness.nodes.len(),
