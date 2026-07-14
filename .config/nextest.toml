@@ -20,6 +20,7 @@ junit = { path = "junit.xml" }
 host-network = { max-threads = 1 }
 cluster-heavy = { max-threads = 1 }
 process-heavy = { max-threads = 2 }
+upgrade-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'binary(ebpf) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
@@ -32,9 +33,14 @@ test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(self_upgrade) | binary(self_upgrade_cluster) | binary(integration) | binary(placement) | binary(chaos)'
+filter = 'binary(integration) | binary(placement) | binary(chaos)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = 'binary(self_upgrade) | binary(self_upgrade_cluster)'
+test-group = "upgrade-heavy"
+slow-timeout = { period = "120s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
 filter = 'binary(ebpf) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
@@ -47,6 +53,11 @@ test-group = "cluster-heavy"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.ci.overrides]]
-filter = 'binary(self_upgrade) | binary(self_upgrade_cluster) | binary(integration) | binary(placement) | binary(chaos)'
+filter = 'binary(integration) | binary(placement) | binary(chaos)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = 'binary(self_upgrade) | binary(self_upgrade_cluster)'
+test-group = "upgrade-heavy"
+slow-timeout = { period = "120s", terminate-after = 3 }

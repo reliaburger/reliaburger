@@ -27,6 +27,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: portable
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get remove -y -qq buildah
+          sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Format
         run: make fmt-check
       - name: Lint every target and feature
@@ -141,6 +146,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: coverage
+      - name: Remove provisioned container builder
+        run: sudo apt-get remove -y -qq buildah
       - run: make coverage
       - uses: actions/upload-artifact@v4
         with:
