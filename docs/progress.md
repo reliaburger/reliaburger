@@ -1107,7 +1107,7 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 - [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
 - [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption; pid+start-time fingerprinting; file-backed process logs). `[runc adoption unverified on Linux]`; AppleGrill adoption deferred (TODO in grill/apple.rs)
 - [x] Book chapter 14: "Changing the Tyres at Full Speed"
-- [x] All Phase 14 tests green (unit tests in the default suite; 5 single-node + 3 cluster real-binary integration tests gated behind `RELIABURGER_UPGRADE_TESTS=1`, too slow for the default test job). Single-node runs in the dedicated `upgrade-tests` CI job; the 4-node cluster suite is `make test-upgrade-cluster` on a real multi-core machine — it doesn't converge reliably on a contended 2-core CI runner (Raft membership-change RPC times out under load)
+- [x] All Phase 14 tests green (unit tests in the portable suite; 5 single-node + 3 cluster real-binary integration tests are ignored by default and owned by the required `upgrade-node` and `upgrade-cluster` CI jobs). The jobs use nextest resource groups and no retries, so contention or convergence flakes remain visible.
 
 Deferred wiring (seams marked with TODOs): scheduler cordoning awaits an
 in-binary `ClusterStateCache` (`meat::filter::apply_upgrade_cordon` is ready);
@@ -1120,10 +1120,28 @@ not yet gossip-rejoin explicitly.
 > Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
 > (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
 
+- [x] Test harness audit and suite taxonomy: nextest local/CI profiles, JUnit, timeouts,
+  zero retries, serial resources and no-tests-selected failures; portable, wall-clock,
+  privileged Linux, cluster, upgrade and manual Apple suites have explicit ownership
+- [x] Truthful gating and cleanup: platform code uses `#[cfg]`; provisioned tests use
+  reasoned `#[ignore]` plus failing preflight; duplicate/demo/field-access tests removed;
+  Relish has black-box exit/stdout/stderr coverage
+- [x] Deterministic async harness: fixed portable waits replaced by channels, watches,
+  notifications, barriers or bounded predicates; ProcessGrill and TCP reporting own and
+  cancel their child tasks; listeners use ephemeral ports and isolated temporary paths
+- [x] Benchmark and coverage split: deterministic seeded gossip simulation shared by
+  Criterion and scale acceptance; P2P correctness no longer has a host-speed threshold;
+  combined default/no-default LLVM coverage publishes LCOV and HTML artefacts
+- [x] Required CI and release validation: portable Linux/macOS, privileged Linux, cluster,
+  node/cluster upgrade, coverage and three benchmark/scale jobs; release publication waits
+  for the same reusable workflow. Apple Container remains a documented manual exception
 - [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
 - [ ] `relish test --chaos` (integration tests + Smoker fault injection)
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
 - [ ] `relish wtf` (automated cluster health diagnosis)
 - [ ] `relish trace` (end-to-end connectivity debugging)
-- [ ] Book chapter 15: "Ready for Production"
+- [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
+  versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
+- [ ] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
+  `trace`) when those commands land
 - [ ] All Phase 15 tests green

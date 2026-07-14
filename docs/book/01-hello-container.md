@@ -2768,7 +2768,11 @@ The `detect_runtime()` function now auto-detects rootless mode and configures pa
 
 The unit tests for `ImageReference::parse` and layer unpacking run unconditionally. They create synthetic gzipped tarballs in temp directories and verify that whiteouts, symlinks, and multi-layer ordering work correctly.
 
-The integration tests for actual image pulling are gated behind `RELIABURGER_IMAGE_PULL_TESTS=1` since they require network access. They pull `alpine:latest` from Docker Hub and verify that `/bin/sh` exists in the unpacked rootfs.
+The OCI protocol integration tests run against an in-process, digest-pinned registry fixture.
+The fixture serves a small synthetic manifest, config and compressed layer over loopback, so
+the tests can verify manifest fetching, digest checks, unpacking and cache reuse without a
+mutable Docker Hub tag or network access. The real runc acceptance remains a separate
+provisioned Linux suite because its promise is runtime execution, not registry protocol.
 
 ## What we built
 
