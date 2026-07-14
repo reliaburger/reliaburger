@@ -16,6 +16,7 @@
 //! elections are far past a 2-core CI budget. Run via
 //! `RELIABURGER_CLUSTER_TESTS=1 cargo test --test cluster_failover`.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,13 +98,13 @@ impl NodeHarness {
             .count()
     }
 
-    fn is_voter(&self) -> bool {
-        let metrics = self.metrics_rx.borrow();
-        metrics
+    fn voter_ids(&self) -> BTreeSet<u64> {
+        self.metrics_rx
+            .borrow()
             .membership_config
             .membership()
             .voter_ids()
-            .any(|id| id == self.raft_id)
+            .collect()
     }
 }
 
@@ -453,7 +454,14 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     )
     .await;
 
-    let workers: Vec<&NodeHarness> = nodes.iter().filter(|n| !n.is_voter()).collect();
+    // The leader's committed membership is authoritative. Individual nodes'
+    // metrics watches can trail that commit briefly, so counting each node's
+    // local opinion here produced a false third "worker" in CI.
+    let voter_ids = nodes[0].voter_ids();
+    let workers: Vec<&NodeHarness> = nodes
+        .iter()
+        .filter(|node| !voter_ids.contains(&node.raft_id))
+        .collect();
     assert_eq!(workers.len(), 2, "expected exactly two non-voter workers");
     for worker in &workers {
         assert!(
