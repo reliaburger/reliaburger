@@ -809,11 +809,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
     async fn setup_and_teardown_container_network() {
-        if !netns_tests_enabled() {
-            eprintln!("skipping netns test (set RELIABURGER_NETNS_TESTS=1 to enable)");
-            return;
-        }
+        assert!(
+            netns_tests_enabled(),
+            "set RELIABURGER_NETNS_TESTS=1 after provisioning Linux network tools and root access"
+        );
 
         let id = InstanceId("netns-test-0".to_string());
         // Clean up any leftovers from a previous failed run
@@ -867,11 +868,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
     async fn port_mapping_nftables() {
-        if !netns_tests_enabled() {
-            eprintln!("skipping netns test (set RELIABURGER_NETNS_TESTS=1 to enable)");
-            return;
-        }
+        assert!(
+            netns_tests_enabled(),
+            "set RELIABURGER_NETNS_TESTS=1 after provisioning Linux network tools and root access"
+        );
 
         let id = InstanceId("netns-portmap-0".to_string());
         // Clean up any leftovers from a previous failed run
@@ -933,11 +935,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Linux root and RELIABURGER_NETNS_TESTS=1"]
     async fn portmap_map_handles_1000_ports() {
-        if !netns_tests_enabled() {
-            eprintln!("skipping netns test (set RELIABURGER_NETNS_TESTS=1 to enable)");
-            return;
-        }
+        assert!(
+            netns_tests_enabled(),
+            "set RELIABURGER_NETNS_TESTS=1 after provisioning Linux network tools and root access"
+        );
 
         ensure_nft_table().await.expect("failed to ensure table");
         let executor = NftCommandExecutor;

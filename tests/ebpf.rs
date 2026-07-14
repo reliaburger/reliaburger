@@ -24,6 +24,10 @@ use reliaburger::onion::types::BackendInstance;
 use reliaburger::onion::vip::VirtualIP;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
+
 fn ebpf_tests_enabled() -> bool {
     std::env::var("RELIABURGER_EBPF_TESTS").is_ok()
 }
@@ -76,11 +80,12 @@ const CGROUP_PATH: &str = "/sys/fs/cgroup";
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_load_and_attach() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -91,11 +96,12 @@ async fn ebpf_load_and_attach() {
 }
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_backend_map_write_and_read() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -144,11 +150,12 @@ async fn ebpf_backend_map_write_and_read() {
 }
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_backend_map_remove() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -188,11 +195,12 @@ async fn ebpf_backend_map_remove() {
 }
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_service_map_sync_multiple() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -251,11 +259,12 @@ async fn ebpf_service_map_sync_multiple() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_connect_to_vip_rewrites_destination() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -313,11 +322,12 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
 }
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_connect_to_vip_no_backends_refused() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -356,11 +366,12 @@ async fn ebpf_connect_to_vip_no_backends_refused() {
 }
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_connect_non_vip_passes_through() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -390,7 +401,8 @@ async fn ebpf_connect_non_vip_passes_through() {
 /// app's backends into the kernel `backend_map` — the production path,
 /// not a manual `BpfServiceMap` write. Deploy through the agent command
 /// channel and read the map back.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_deploy_populates_backend_map() {
     use reliaburger::bun::agent::{AgentCommand, BunAgent};
     use reliaburger::config::Config;
@@ -400,10 +412,10 @@ async fn agent_deploy_populates_backend_map() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     // Keep our own clone of the handle to read the map after the deploy.
@@ -420,7 +432,8 @@ async fn agent_deploy_populates_backend_map() {
         shutdown.clone(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf));
-    tokio::spawn(async move { agent.run().await });
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
 
     let config = Config::parse(
         r#"
@@ -476,7 +489,8 @@ async fn agent_deploy_populates_backend_map() {
 /// the VIP has a backend, so a connect is *rewritten* (and refused by the
 /// absent listener with ECONNREFUSED, not EPERM); after the fault it is
 /// dropped (EPERM) regardless of backends.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn agent_drop_fault_refuses_vip_with_eperm() {
     use reliaburger::bun::agent::{AgentCommand, BunAgent};
     use reliaburger::config::Config;
@@ -488,10 +502,10 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let ebpf = Arc::new(Mutex::new(
@@ -507,7 +521,8 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
         shutdown.clone(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf));
-    tokio::spawn(async move { agent.run().await });
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
 
     let service_port: u16 = 8090;
     let config = Config::parse(&format!(
@@ -611,13 +626,14 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
 /// on the *test's own* cgroup — the process doing the connects — so the
 /// eBPF `bpf_get_current_cgroup_id()` matches what we program.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn egress_denied_by_default_allowed_when_listed() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -683,13 +699,14 @@ async fn egress_denied_by_default_allowed_when_listed() {
 /// performs (a `delete_egress_entry` per destination, then
 /// `clear_egress_enforced`) and asserts nothing survives.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -766,16 +783,17 @@ async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
 /// check. We enforce against the *test's own* cgroup so
 /// `bpf_get_current_cgroup_id()` matches what we program.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn namespace_isolation_denies_cross_namespace_by_default() {
     use reliaburger::onion::ebpf::maps::BpfServiceMap;
     use reliaburger::sesame::firewall::{
         self, FIREWALL_ALLOW, ResolvedFirewallRule, rules_to_bpf_entries,
     };
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -854,11 +872,12 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn dns_responder_resolves_internal_name() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let mut map = ServiceMap::new();
     map.register_app("redis", "default", 6379, None).unwrap();
@@ -907,11 +926,12 @@ async fn dns_responder_resolves_internal_name() {
 }
 
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn dns_responder_non_internal_times_out() {
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let (_map_tx, map_rx) = tokio::sync::watch::channel(ServiceMap::new());
     let shutdown = CancellationToken::new();
@@ -957,14 +977,15 @@ async fn dns_responder_non_internal_times_out() {
 /// and an unlisted one is denied with EPERM — the connect6 hook, driven
 /// against the test's own cgroup.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v6_key};
     use std::net::Ipv6Addr;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -1022,14 +1043,15 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
 /// destination stays reachable both natively and as a v4-mapped
 /// (::ffff:a.b.c.d) connect through the connect6 hook.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v4_key};
     use std::net::{Ipv6Addr, SocketAddrV6};
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -1107,14 +1129,15 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
 /// an allowed prefix connects on the listed port and is denied on any
 /// other port.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn cidr_egress_allowed_via_lpm_trie() {
     use reliaburger::sesame::egress::{self, EgressDestination, merge_cidr_ports};
     use std::net::IpAddr;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -1168,6 +1191,7 @@ async fn cidr_egress_allowed_via_lpm_trie() {
 /// NET8 sweep: kernel egress state for a cgroup with no live instance is
 /// planned stale and scrubbed across all four allow maps plus the flag.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn sweep_scrubs_orphaned_cgroup_state() {
     use reliaburger::sesame::egress::{
         self, EgressDestination, merge_cidr_ports, plan_egress_sweep,
@@ -1175,10 +1199,10 @@ async fn sweep_scrubs_orphaned_cgroup_state() {
     use std::collections::HashSet;
     use std::net::IpAddr;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let mut ebpf =
@@ -1243,6 +1267,7 @@ async fn sweep_scrubs_orphaned_cgroup_state() {
 /// enforcement being active for the cgroup path proves the pre-start
 /// ordering — there is no window in which the workload runs unpoliced.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn egress_programmed_before_start_via_cgroup_path() {
     use reliaburger::bun::agent::{AgentCommand, BunAgent};
     use reliaburger::config::Config;
@@ -1253,10 +1278,10 @@ async fn egress_programmed_before_start_via_cgroup_path() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let ebpf = Arc::new(Mutex::new(
@@ -1338,6 +1363,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
 /// leaves no running process — the mock grill records a create and a
 /// stop, but never a start.
 #[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
     use reliaburger::bun::agent::{AgentCommand, BunAgent};
     use reliaburger::config::Config;
@@ -1347,10 +1373,10 @@ async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    if !ebpf_tests_enabled() {
-        eprintln!("skipping eBPF test (set RELIABURGER_EBPF_TESTS=1)");
-        return;
-    }
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
 
     let obj_dir = find_bpf_obj_dir();
     let ebpf = Arc::new(Mutex::new(

@@ -24,6 +24,10 @@ use reliaburger::grill::{PortAllocator, ProcessGrill};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
+
 /// The internal `/v1/build/run` and `/v1/build/track` endpoints require
 /// the cluster service token; the harness configures one so those
 /// paths can be exercised as the system principal.
@@ -44,7 +48,7 @@ struct HarnessOptions {
 
 struct Harness {
     base_url: String,
-    shutdown: CancellationToken,
+    _tasks: TestTasks,
 }
 
 impl Harness {
@@ -56,7 +60,7 @@ impl Harness {
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
         let deploy_history = agent.deploy_history_handle();
-        tokio::spawn(async move {
+        let agent_task = tokio::spawn(async move {
             agent.run().await;
         });
 
@@ -116,7 +120,7 @@ impl Harness {
             options.require_signatures,
         );
         let server_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
                 .await
@@ -130,13 +134,10 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Self { base_url, shutdown }
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
+        Self {
+            base_url,
+            _tasks: TestTasks::new(shutdown, vec![agent_task, server_task]),
+        }
     }
 }
 
@@ -359,12 +360,12 @@ async fn start_mock_builder(refuse_runs: bool) -> (std::net::SocketAddr, Cancell
 
 /// Without buildah and without peers, a submit is an honest 503 — not
 /// the old 501, and not a hang.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_without_any_builder_is_503() {
-    if buildah_present() {
-        eprintln!("skipping: this host has buildah, the 503 path can't trigger");
-        return;
-    }
+    assert!(
+        !buildah_present(),
+        "this negative-path test requires a host without Buildah"
+    );
     let harness = Harness::start(HarnessOptions::default()).await;
 
     let response = reqwest::Client::new()
@@ -384,7 +385,7 @@ async fn submit_without_any_builder_is_503() {
 /// that smuggles a `registry_port` (trying to point a privileged Bun at
 /// an arbitrary localhost service) is rejected as a bad request, not
 /// silently honoured.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_submit_rejects_a_smuggled_registry_port() {
     let harness = Harness::start(HarnessOptions::default()).await;
     let response = reqwest::Client::new()
@@ -405,7 +406,7 @@ async fn build_submit_rejects_a_smuggled_registry_port() {
 /// that isn't a well-formed OCI digest — before the buildah check and before
 /// the digest is ever turned into a temp path. `sha256:../../x` must not be
 /// able to escape the build sandbox.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_run_rejects_a_traversal_context_digest() {
     let harness = Harness::start(HarnessOptions::default()).await;
 
@@ -436,7 +437,7 @@ async fn build_run_rejects_a_traversal_context_digest() {
 /// JOB1: `/v1/build/run` requires the system principal — a valid digest from a
 /// caller without the cluster service token is refused (403) before any build
 /// runs. (A malformed digest is rejected earlier with 400 by the test above.)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_run_requires_the_system_principal() {
     let harness = Harness::start(HarnessOptions::default()).await;
     let response = reqwest::Client::new()
@@ -454,7 +455,7 @@ async fn build_run_requires_the_system_principal() {
 
 /// The durable tracking endpoint is node-to-node only, like the other
 /// internal build/batch endpoints (JOB1).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_track_requires_the_system_principal() {
     let harness = Harness::start(HarnessOptions::default()).await;
     let response = reqwest::Client::new()
@@ -474,7 +475,7 @@ async fn build_track_requires_the_system_principal() {
 /// (`../../outside`) is rejected before Buildah runs. Driven through the
 /// system-principal `/v1/build/run` path so it exercises the real
 /// handler, not just the pure validator.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_run_rejects_a_dockerfile_escape() {
     let harness = Harness::start(HarnessOptions::default()).await;
     let response = reqwest::Client::new()
@@ -502,7 +503,7 @@ async fn build_run_rejects_a_dockerfile_escape() {
 }
 
 /// Unknown build ids are 404, not empty objects.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_build_id_is_404() {
     let harness = Harness::start(HarnessOptions::default()).await;
     let response = reqwest::get(format!("{}/v1/build/999", harness.base_url))
@@ -515,7 +516,7 @@ async fn unknown_build_id_is_404() {
 /// before the run request, so a builder whose registry has never seen
 /// the blob can still build. Exercised directly against two real
 /// registries — the source has the blob, the destination doesn't.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_transfer_copies_the_blob_to_the_builder_registry() {
     let (entry_port, _entry_catalog, entry_shutdown, _d1) = start_registry().await;
     let (builder_port, _builder_catalog, builder_shutdown, _d2) = start_registry().await;
@@ -569,12 +570,12 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
 /// submit path tries the next capable peer. The first mock builder
 /// refuses every run; the second accepts, and the delegated status
 /// read proxies through to it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builder_failure_retries_on_another_builder() {
-    if buildah_present() {
-        eprintln!("skipping: this host has buildah, the delegation path can't trigger");
-        return;
-    }
+    assert!(
+        !buildah_present(),
+        "this delegation test requires a host without Buildah"
+    );
     let (registry_port, _catalog, registry_shutdown, _dir) = start_registry().await;
     let digest = upload_trivial_context(registry_port).await;
 
@@ -631,7 +632,7 @@ async fn builder_failure_retries_on_another_builder() {
 /// JOB4: with a council, build records live in the Raft state machine.
 /// A new API process (a restarted node) still serves them, and the id
 /// counter keeps climbing — ids are never reused.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_records_survive_an_api_restart_and_ids_stay_monotonic() {
     let council = single_node_leader().await;
 
@@ -693,7 +694,7 @@ async fn build_records_survive_an_api_restart_and_ids_stay_monotonic() {
 /// JOB4: a `Running` record whose runner is this node, with no live
 /// runner task, means the node restarted mid-build. Reading its status
 /// terminates it honestly instead of reporting `Running` forever.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupted_build_reports_an_honest_failure() {
     let council = single_node_leader().await;
     let response = council
@@ -752,7 +753,7 @@ async fn interrupted_build_reports_an_honest_failure() {
 /// JOB6 residue: the CLI's build wait is bounded — a build stuck in
 /// `Running` (its runner is another node here, so no honest-failure
 /// rewrite fires) ends the wait with an error carrying the last state.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_build_wait_times_out_with_the_last_known_state() {
     let council = single_node_leader().await;
     let response = council
@@ -790,12 +791,13 @@ async fn cli_build_wait_times_out_with_the_last_known_state() {
 /// Roadmap (Phase 12): a real build — context blob in a real registry,
 /// buildah bud + push, manifest lands in the catalog — through the
 /// async submit/poll API. Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1"]
 async fn buildah_build_lands_in_the_catalog() {
-    if std::env::var("RELIABURGER_BUILDAH_TESTS").is_err() {
-        eprintln!("skipping buildah test (set RELIABURGER_BUILDAH_TESTS=1 to enable)");
-        return;
-    }
+    assert!(
+        std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok(),
+        "set RELIABURGER_BUILDAH_TESTS=1 after installing Buildah"
+    );
 
     let (registry_port, catalog, registry_shutdown, _dir) = start_registry().await;
     let digest = upload_trivial_context(registry_port).await;
@@ -857,12 +859,13 @@ async fn buildah_build_lands_in_the_catalog() {
 /// signs with the persistent build signer, and the pushed manifest carries a
 /// signature that passes the deploy-time check (build-sign → deploy-verify
 /// round-trip). Lima only (`RELIABURGER_BUILDAH_TESTS=1`).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Buildah and RELIABURGER_BUILDAH_TESTS=1"]
 async fn buildah_build_signs_and_the_signature_verifies_on_deploy() {
-    if std::env::var("RELIABURGER_BUILDAH_TESTS").is_err() {
-        eprintln!("skipping buildah test (set RELIABURGER_BUILDAH_TESTS=1 to enable)");
-        return;
-    }
+    assert!(
+        std::env::var("RELIABURGER_BUILDAH_TESTS").is_ok(),
+        "set RELIABURGER_BUILDAH_TESTS=1 after installing Buildah"
+    );
 
     let (registry_port, catalog, registry_shutdown, _dir) = start_registry().await;
     let digest = upload_trivial_context(registry_port).await;

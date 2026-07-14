@@ -6905,9 +6905,9 @@ mod tests {
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
         let handle = tokio::spawn(async move { agent.run().await });
 
-        // A deploy whose create() sleeps, simulating a slow image pull that
-        // would previously monopolise the loop for the whole duration.
-        grill_handle.set_create_delay(std::time::Duration::from_secs(3));
+        // Hold create() at a deterministic barrier, simulating a slow image
+        // pull without making the test wait for wall-clock time.
+        grill_handle.block_creates();
         let (ev_tx, _ev_rx) = mpsc::channel(64);
         tx.send(AgentCommand::Deploy {
             config: basic_config(),
@@ -6916,8 +6916,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Give the loop a moment to accept the Deploy and hand it to a task.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            grill_handle.wait_for_creates(1),
+        )
+        .await
+        .expect("deploy never entered create");
 
         // A Status command must round-trip well before the 3s pull finishes.
         // If the loop were blocked inside create() this would not be answered
@@ -6932,6 +6936,7 @@ mod tests {
             "status was not answered while a slow deploy was in flight — the deploy blocked the loop"
         );
 
+        grill_handle.release_creates(1);
         shutdown.cancel();
         let _ = handle.await;
     }
@@ -6950,7 +6955,7 @@ mod tests {
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
         let handle = tokio::spawn(async move { agent.run().await });
 
-        grill_handle.set_create_delay(std::time::Duration::from_secs(2));
+        grill_handle.block_creates();
 
         let config_a = Config::parse("[app.alpha]\nimage = \"a:v1\"\n").unwrap();
         let config_b = Config::parse("[app.beta]\nimage = \"b:v1\"\n").unwrap();
@@ -6970,11 +6975,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Wait less than two full create delays. If the two deploys ran
-        // serially, only alpha's create would have completed by now and beta's
-        // would still be queued behind it. Interleaved, both creates are in
-        // flight, so both instances appear in the recorded calls.
-        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        // If deploys were serial, the first blocked create would prevent the
+        // second from reaching this barrier.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            grill_handle.wait_for_creates(2),
+        )
+        .await
+        .expect("both deploys did not enter create concurrently");
 
         let created: std::collections::HashSet<String> = grill_handle
             .calls()
@@ -6984,9 +6992,10 @@ mod tests {
             .collect();
         assert!(
             created.contains("default__alpha-0") && created.contains("default__beta-0"),
-            "both deploys should be in flight after one create delay, got: {created:?}"
+            "both deploys should be in flight together, got: {created:?}"
         );
 
+        grill_handle.release_creates(2);
         shutdown.cancel();
         let _ = handle.await;
     }
@@ -7047,18 +7056,25 @@ mod tests {
                 .unwrap();
         let _ = send_deploy(&tx, config).await;
 
-        // Give the health tick (1s) a few cycles to detect the exit and restart.
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        tx.send(AgentCommand::Status { response: resp_tx })
-            .await
-            .unwrap();
-        let status = resp_rx.await.unwrap();
-        let crasher = status
-            .iter()
-            .find(|s| s.app_name == "crasher")
-            .expect("crasher not found");
+        let crasher = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                tx.send(AgentCommand::Status { response: resp_tx })
+                    .await
+                    .unwrap();
+                if let Some(crasher) = resp_rx
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|status| status.app_name == "crasher" && status.restart_count > 0)
+                {
+                    return crasher;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("crashed app was not restarted");
         assert!(
             crasher.restart_count > 0,
             "crashed app was never restarted (state: {})",

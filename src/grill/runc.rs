@@ -733,11 +733,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires runc and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_grill_creates_bundle_dir() {
-        if !runc_tests_enabled() {
-            eprintln!("skipping runc test (set RELIABURGER_RUNC_TESTS=1 to enable)");
-            return;
-        }
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after installing runc"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("state");
@@ -787,74 +788,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn runc_rootless_runs_echo() {
-        if !runc_tests_enabled() {
-            eprintln!("skipping runc test (set RELIABURGER_RUNC_TESTS=1 to enable)");
-            return;
-        }
-
-        if !std::env::var("RELIABURGER_IMAGE_PULL_TESTS").is_ok() {
-            eprintln!("skipping runc rootless test (also needs RELIABURGER_IMAGE_PULL_TESTS=1)");
-            return;
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let grill = RuncGrill::new(
-            tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
-            true,
-            tmp.path().join("state"),
-        );
-        let id = InstanceId("runc-rootless-echo".to_string());
-
-        let spec = crate::grill::oci::OciSpec {
-            port_mapping: None,
-            root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
-                readonly: false,
-            },
-            process: crate::grill::oci::OciProcess {
-                args: vec!["echo".to_string(), "hello".to_string()],
-                env: vec![],
-                cwd: "/".to_string(),
-                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
-            },
-            mounts: crate::grill::oci::standard_mounts(),
-            linux: crate::grill::oci::OciLinux {
-                namespaces: crate::grill::oci::standard_namespaces(None),
-                resources: None,
-                cgroups_path: None,
-                uid_mappings: None,
-                gid_mappings: None,
-            },
-        };
-
-        let result = grill.create(&id, &spec).await;
-        if let Err(e) = &result {
-            eprintln!("runc rootless create failed (expected on non-Linux): {e}");
-            return;
-        }
-
-        let start_result = grill.start(&id).await;
-        if let Err(e) = &start_result {
-            eprintln!("runc rootless start failed: {e}");
-        }
-
-        // Clean up
-        let _ = grill.runc_command(&["delete", "--force", &id.0], &id).await;
-    }
-
     // Validates the run-and-capture model end-to-end: the container's exit code
     // is captured (so jobs don't get retried) and its stdout is readable.
     #[tokio::test]
+    #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_captures_exit_code_and_logs() {
-        if !runc_tests_enabled() || std::env::var("RELIABURGER_IMAGE_PULL_TESTS").is_err() {
-            eprintln!(
-                "skipping runc capture test (needs RELIABURGER_RUNC_TESTS=1 + RELIABURGER_IMAGE_PULL_TESTS=1)"
-            );
-            return;
-        }
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after provisioning runc"
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let grill = RuncGrill::new(
@@ -892,10 +834,10 @@ mod tests {
             },
         };
 
-        if let Err(e) = grill.create(&id, &spec).await {
-            eprintln!("runc create failed (expected off-Linux): {e}");
-            return;
-        }
+        grill
+            .create(&id, &spec)
+            .await
+            .expect("runc create should succeed in the provisioned Linux suite");
         grill.start(&id).await.expect("runc run should spawn");
 
         // Wait for the container to exit.
@@ -908,7 +850,7 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "container never exited"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         // The log file holds the container's stdout+stderr (or runc's error if

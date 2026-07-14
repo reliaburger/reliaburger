@@ -401,13 +401,10 @@ mod tests {
 
     #[test]
     fn create_managed_volume_with_size_without_root() {
-        // This test only makes sense when NOT running as root.
-        // Under root (e.g. `sudo cargo test` in the dev VM),
-        // the code actually attempts fallocate + mkfs + mount.
-        if super::is_root() {
-            eprintln!("skipping: running as root");
-            return;
-        }
+        assert!(
+            !super::is_root(),
+            "the rootless fallback test requires a non-root runner"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let vm = VolumeManager::new(dir.path());
@@ -465,11 +462,12 @@ mod tests {
     /// assumptions about the host's disks.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
     fn btrfs_quota_blocks_writes_beyond_limit() {
-        if std::env::var("RELIABURGER_BTRFS_TESTS").is_err() {
-            eprintln!("skipping btrfs test (set RELIABURGER_BTRFS_TESTS=1 to enable)");
-            return;
-        }
+        assert!(
+            std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
+            "set RELIABURGER_BTRFS_TESTS=1 after provisioning Btrfs tools and root access"
+        );
 
         let scratch = tempfile::tempdir().unwrap();
         let img = scratch.path().join("btrfs.img");

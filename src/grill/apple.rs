@@ -350,13 +350,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
     async fn apple_container_grill_creates_instance() {
-        if !apple_tests_enabled() {
-            eprintln!(
-                "skipping Apple container test (set RELIABURGER_APPLE_CONTAINER_TESTS=1 to enable)"
-            );
-            return;
-        }
+        assert!(
+            apple_tests_enabled(),
+            "set RELIABURGER_APPLE_CONTAINER_TESTS=1 after installing and starting Apple Container"
+        );
 
         // This test requires Apple's container CLI installed and running
         let grill = AppleContainerGrill::new();

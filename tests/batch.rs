@@ -28,6 +28,10 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
+
 /// The internal node-to-node endpoints (`/v1/batch/run`, `/report`) require the
 /// cluster service token; the harness configures one so the dispatch path (and
 /// the direct tests below) can present it.
@@ -46,7 +50,7 @@ struct Harness {
     client: BunClient,
     base_url: String,
     port: u16,
-    shutdown: CancellationToken,
+    _tasks: TestTasks,
 }
 
 impl Harness {
@@ -64,7 +68,7 @@ impl Harness {
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
         let deploy_history = agent.deploy_history_handle();
 
-        tokio::spawn(async move {
+        let agent_task = tokio::spawn(async move {
             agent.run().await;
         });
 
@@ -129,7 +133,7 @@ impl Harness {
             false,
         );
         let server_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
                 .await
@@ -149,7 +153,7 @@ impl Harness {
             client,
             base_url,
             port,
-            shutdown,
+            _tasks: TestTasks::new(shutdown, vec![agent_task, server_task]),
         }
     }
 
@@ -165,14 +169,8 @@ impl Harness {
                 tokio::time::Instant::now() < deadline,
                 "batch {batch_id} not done in {secs}s: {summary}"
             );
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
     }
 }
 
@@ -224,7 +222,7 @@ fn jobs_from(toml: &str) -> std::collections::BTreeMap<String, reliaburger::conf
 
 /// Roadmap (Phase 12): submit a batch of process jobs; all run to
 /// completion and the tracker reports them done.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_of_proc_jobs_completes_locally() {
     let harness = Harness::start().await;
 
@@ -259,7 +257,7 @@ async fn batch_of_proc_jobs_completes_locally() {
 /// A job that runs and exits non-zero exhausts its retries (jobs get
 /// `RestartPolicy::for_job(3)`) and is reported failed — the tracker
 /// reaches a terminal state rather than pending forever.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_failing_job_reports_failed() {
     let harness = Harness::start().await;
 
@@ -280,7 +278,7 @@ async fn batch_failing_job_reports_failed() {
 }
 
 /// An empty batch is a client error, not a mysterious empty success.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_batch_is_rejected() {
     let harness = Harness::start().await;
     let result = harness
@@ -293,7 +291,7 @@ async fn empty_batch_is_rejected() {
 /// JOB3: a job in a non-default namespace completes — the namespace is
 /// resolved once at submit, so the deploy and the completion watcher
 /// agree on where to look. This used to strand the batch for an hour.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_in_a_non_default_namespace_completes() {
     let harness = Harness::start().await;
 
@@ -313,7 +311,7 @@ async fn batch_in_a_non_default_namespace_completes() {
 
 /// JOB3: a submission whose namespace disagrees with the job spec's is
 /// rejected — one authoritative namespace, or nothing.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conflicting_namespaces_are_rejected_at_submit() {
     let harness = Harness::start().await;
     let response = reqwest::Client::new()
@@ -337,7 +335,7 @@ async fn conflicting_namespaces_are_rejected_at_submit() {
 
 /// JOB3: unschedulable jobs appear in the batch result and its summary
 /// instead of being silently omitted.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unschedulable_jobs_appear_in_the_batch() {
     let harness = Harness::start().await;
 
@@ -386,7 +384,7 @@ async fn unschedulable_jobs_appear_in_the_batch() {
 /// URL. (The leader-side grouping that produces these requests is
 /// covered by the submit tests; the full two-node loop runs in the
 /// cluster acceptance runbook.)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_run_endpoint_runs_jobs_and_calls_back() {
     let submitter = Harness::start().await;
     let runner = Harness::start().await;
@@ -423,7 +421,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
             tokio::time::Instant::now() < deadline,
             "remote job never completed: {statuses:?}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // …and the report endpoint validates: an unknown batch id is a 404
@@ -442,7 +440,7 @@ async fn batch_run_endpoint_runs_jobs_and_calls_back() {
 /// JOB3: `/v1/batch/{id}/report` validates its input — forged states
 /// are 400, illegal transitions are 409, duplicates are an idempotent
 /// 200 that never double-counts.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_reports_are_validated_and_idempotent() {
     let harness = Harness::start().await;
 
@@ -508,7 +506,7 @@ async fn batch_reports_are_validated_and_idempotent() {
 /// JOB1: the internal `/v1/batch/run` and `/report` endpoints reject a caller
 /// that is not the system principal, so a ReadOnly/anonymous caller cannot run
 /// work or forge completion (and never reaches the service-token callback).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_internal_endpoints_require_the_system_principal() {
     let runner = Harness::start().await;
     let http = reqwest::Client::new();
@@ -552,7 +550,7 @@ async fn batch_internal_endpoints_require_the_system_principal() {
 /// JOB6 residue: the CLI's wait loop is bounded — a batch that never
 /// finishes ends the wait with a non-zero error carrying the last
 /// known state, not an infinite poll.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_batch_wait_times_out_with_the_last_known_state() {
     let harness = Harness::start().await;
 
@@ -580,7 +578,7 @@ async fn cli_batch_wait_times_out_with_the_last_known_state() {
 
 /// JOB4: with a council, batch ids come from the replicated counter —
 /// a fresh API process (a restarted leader) never reuses them.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn batch_ids_stay_monotonic_across_an_api_restart() {
     let council = single_node_leader().await;
 
@@ -624,7 +622,7 @@ async fn batch_ids_stay_monotonic_across_an_api_restart() {
 /// anyway. A fresh API process over the same council exercises the
 /// restart-resume path: the watcher respawns from the durable record
 /// on the first status read.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
     let council = single_node_leader().await;
 
@@ -701,7 +699,7 @@ async fn lost_callback_batch_still_terminates_via_the_pull_watcher() {
 /// right after dispatch). The job completes on the runner; a status
 /// read on the "new leader" spawns the pull watcher, which finds the
 /// terminal state and finishes the batch.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leader_restart_mid_batch_resumes_from_the_durable_record() {
     let council = single_node_leader().await;
 

@@ -22,6 +22,10 @@ use reliaburger::wrapper::types::WrapperConfig;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
+
 /// Agent + API + bound ingress listeners, all on ephemeral ports.
 struct IngressHarness {
     client: BunClient,
@@ -29,7 +33,7 @@ struct IngressHarness {
     https_addr: SocketAddr,
     #[allow(dead_code)]
     cmd_tx: mpsc::Sender<AgentCommand>,
-    shutdown: CancellationToken,
+    _tasks: TestTasks,
 }
 
 impl IngressHarness {
@@ -58,7 +62,7 @@ impl IngressHarness {
 
         // The proxy shares the routing table the agent rebuilds on deploys.
         let routing_table = agent.routing_table_handle();
-        tokio::spawn(async move {
+        let agent_task = tokio::spawn(async move {
             agent.run().await;
         });
 
@@ -73,7 +77,7 @@ impl IngressHarness {
             .unwrap();
         let http_addr = bound.http_addr;
         let https_addr = bound.https_addr;
-        tokio::spawn(async move {
+        let proxy_task = tokio::spawn(async move {
             bound.serve().await.ok();
         });
 
@@ -97,7 +101,7 @@ impl IngressHarness {
             None,
         );
         let server_shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     server_shutdown.cancelled().await;
@@ -119,7 +123,7 @@ impl IngressHarness {
             http_addr,
             https_addr,
             cmd_tx,
-            shutdown,
+            _tasks: TestTasks::new(shutdown, vec![agent_task, proxy_task, server_task]),
         }
     }
 
@@ -129,12 +133,6 @@ impl IngressHarness {
 
     fn https_url(&self, path: &str) -> String {
         format!("https://127.0.0.1:{}{path}", self.https_addr.port())
-    }
-}
-
-impl Drop for IngressHarness {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
     }
 }
 
@@ -154,12 +152,12 @@ async fn wait_for_status(
         {
             return response;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("proxy never returned {expected} for host {host} at {url}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_routes_request_to_healthy_backend() {
     let test_app = TestApp::start(TestAppMode::Healthy).await;
     let harness = IngressHarness::start_reaching(test_app.port()).await;
@@ -186,7 +184,7 @@ async fn ingress_routes_request_to_healthy_backend() {
     test_app.shutdown();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_returns_404_for_unknown_host() {
     let harness = IngressHarness::start().await;
 
@@ -200,7 +198,7 @@ async fn ingress_returns_404_for_unknown_host() {
     assert_eq!(response.status().as_u16(), 404);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_returns_502_when_backend_unreachable() {
     let harness = IngressHarness::start().await;
 
@@ -223,7 +221,7 @@ async fn ingress_returns_502_when_backend_unreachable() {
     assert_eq!(response.status().as_u16(), 502);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_rate_limit_returns_429_with_retry_after() {
     let test_app = TestApp::start(TestAppMode::Healthy).await;
     let harness = IngressHarness::start_reaching(test_app.port()).await;
@@ -289,7 +287,7 @@ async fn read_head(stream: &mut TcpStream) -> (String, Vec<u8>) {
     (String::from_utf8_lossy(&buf).into_owned(), Vec::new())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_reframes_chunked_backend_response() {
     // A raw backend that answers every request with a chunked body. Before
     // the header-hygiene fix, the proxy copied `Transfer-Encoding: chunked`
@@ -329,7 +327,7 @@ async fn ingress_reframes_chunked_backend_response() {
     assert_eq!(body, "hello", "chunked backend response was mis-framed");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_proxies_websocket_handshake_and_bytes() {
     // A raw WebSocket backend: completes the handshake with its own
     // Sec-WebSocket-Accept, then echoes bytes.
@@ -384,7 +382,7 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
         if status != 404 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // Raw client handshake through the proxy.
@@ -409,7 +407,7 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
     assert_eq!(&echo, b"ping", "WebSocket bytes were not proxied back");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_serves_https_with_self_signed_cert() {
     let test_app = TestApp::start(TestAppMode::Healthy).await;
     let harness = IngressHarness::start_reaching(test_app.port()).await;

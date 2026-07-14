@@ -150,16 +150,16 @@ where
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
 #[tokio::test]
 async fn manual_apply_and_gitops_converge_identically() {
-    if which_git().is_none() {
-        eprintln!("git not on PATH; skipping");
-        return;
-    }
+    assert!(
+        which_git().is_some(),
+        "git is required for the declarative-resource suite"
+    );
 
     // The config parses and validates (the same gate both paths run).
     let config = Config::parse(EVERY_KIND).unwrap();

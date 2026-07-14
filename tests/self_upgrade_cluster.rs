@@ -463,11 +463,12 @@ fn phase_label(value: &serde_json::Value) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
 async fn rolling_upgrade_walks_workers_council_then_leader() {
-    if !upgrade_tests_enabled() {
-        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
-        return;
-    }
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
@@ -515,11 +516,12 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
 }
 
 #[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
 async fn upgrade_failure_pauses_cluster_and_reverts_node() {
-    if !upgrade_tests_enabled() {
-        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
-        return;
-    }
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
@@ -590,11 +592,12 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 }
 
 #[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
 async fn cluster_rollback_returns_every_node_to_previous_version() {
-    if !upgrade_tests_enabled() {
-        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
-        return;
-    }
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 

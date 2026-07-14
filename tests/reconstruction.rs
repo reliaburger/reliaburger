@@ -149,8 +149,6 @@ async fn reconstruction_matching_state_no_corrections() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Read desired state from the new leader.
     let desired = leader.desired_state().await;
     assert!(desired.scheduling.contains_key(&AppId::new("web", "prod")));
@@ -221,7 +219,6 @@ async fn reconstruction_missing_app_detected() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
     let desired = leader.desired_state().await;
 
     // Actual: web/prod running on worker-1, but api/prod NOT running on worker-2.

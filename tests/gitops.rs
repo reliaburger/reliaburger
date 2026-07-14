@@ -95,16 +95,16 @@ where
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
 #[tokio::test]
 async fn sync_loop_applies_repo_apps_to_raft() {
-    if which_git().is_none() {
-        eprintln!("git not on PATH; skipping");
-        return;
-    }
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
 
     let repo_dir = tempfile::tempdir().unwrap();
     make_repo(
@@ -160,17 +160,17 @@ async fn sync_loop_applies_repo_apps_to_raft() {
 
 #[tokio::test]
 async fn webhook_triggers_immediate_sync() {
-    if which_git().is_none() {
-        eprintln!("git not on PATH; skipping");
-        return;
-    }
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
 
     let repo_dir = tempfile::tempdir().unwrap();
     make_repo(
         repo_dir.path(),
         r#"
-        [app.hooked]
-        image = "hook:v1"
+        [app.baseline]
+        image = "baseline:v1"
     "#,
     );
 
@@ -199,11 +199,40 @@ async fn webhook_triggers_immediate_sync() {
         shutdown.clone(),
     );
 
-    // Nudge via the webhook channel.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The runner always applies the first commit before waiting for a timer or
+    // webhook, so wait for that baseline before creating the change we mean
+    // to exercise.
+    let council_check = Arc::clone(&council);
+    let initial_sync = wait_for(Duration::from_secs(10), || {
+        let c = Arc::clone(&council_check);
+        Box::pin(async move {
+            c.desired_state()
+                .await
+                .apps
+                .contains_key(&AppId::new("baseline", "default"))
+        })
+    })
+    .await;
+    assert!(initial_sync, "initial GitOps sync did not complete");
+
+    std::fs::write(
+        repo_dir.path().join("apps.toml"),
+        r#"
+        [app.baseline]
+        image = "baseline:v1"
+
+        [app.hooked]
+        image = "hook:v1"
+    "#,
+    )
+    .unwrap();
+    git(repo_dir.path(), &["add", "."]);
+    git(repo_dir.path(), &["commit", "-q", "-m", "add hooked app"]);
+
+    // The next timer tick is an hour away, so only this notification can
+    // make the second commit visible during the test.
     webhook_tx.send(()).await.unwrap();
 
-    let council_check = Arc::clone(&council);
     let applied = wait_for(Duration::from_secs(10), || {
         let c = Arc::clone(&council_check);
         Box::pin(async move {
@@ -229,10 +258,10 @@ async fn webhook_triggers_immediate_sync() {
 /// app, so namespaces and permissions were silently dropped.
 #[tokio::test]
 async fn sync_loop_applies_every_declarative_kind() {
-    if which_git().is_none() {
-        eprintln!("git not on PATH; skipping");
-        return;
-    }
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
 
     let repo_dir = tempfile::tempdir().unwrap();
     make_repo(

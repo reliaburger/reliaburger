@@ -469,6 +469,30 @@ mod tests {
         &nodes[(leader_id - 1) as usize]
     }
 
+    async fn wait_for_all_states(
+        nodes: &[CouncilNode],
+        timeout: Duration,
+        predicate: impl Fn(&DesiredState) -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut all_match = true;
+            for node in nodes {
+                if !predicate(&node.desired_state().await) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if all_match {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Bootstrap tests
     // -----------------------------------------------------------------------
@@ -527,8 +551,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for replication.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| state
+                .apps
+                .contains_key(&AppId::new("web", "prod")))
+            .await,
+            "pre-growth entry did not replicate"
+        );
 
         // All three nodes should have the pre-growth entry.
         for node in &nodes {
@@ -577,7 +606,13 @@ mod tests {
             .change_membership(BTreeSet::from([1, 2, 3]))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| {
+                state.config.get("region").map(String::as_str) == Some("us-east")
+            })
+            .await,
+            "configuration did not replicate after cluster growth"
+        );
 
         for node in &nodes {
             let state = node.desired_state().await;
@@ -664,8 +699,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for replication.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| {
+                state.apps.contains_key(&app_id)
+            })
+            .await,
+            "app did not replicate"
+        );
 
         for node in &nodes {
             let state = node.desired_state().await;
@@ -695,7 +735,13 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| {
+                state.scheduling.contains_key(&app_id)
+            })
+            .await,
+            "scheduling decision did not replicate"
+        );
 
         for node in &nodes {
             let state = node.desired_state().await;
@@ -759,8 +805,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for replication.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| {
+                state.apps.contains_key(&AppId::new("web", "prod"))
+                    && state.config.get("env").map(String::as_str) == Some("production")
+            })
+            .await,
+            "state did not replicate before failover"
+        );
 
         // Kill the leader.
         leader.shutdown().await.unwrap();
@@ -923,8 +975,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for replication.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| {
+                state.config.get("before").map(String::as_str) == Some("partition")
+            })
+            .await,
+            "pre-partition write did not replicate"
+        );
 
         // Partition: isolate nodes 4 and 5 from nodes 1, 2, 3.
         // Also partition minority nodes from each other for cleaner test.
@@ -970,8 +1027,14 @@ mod tests {
 
         // Heal and verify convergence.
         router.heal().await;
-        // Give enough time for the minority to catch up.
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(5), |state| {
+                state.config.get("before").map(String::as_str) == Some("partition")
+                    && state.config.get("after").map(String::as_str) == Some("partition")
+            })
+            .await,
+            "minority did not catch up after the partition healed"
+        );
 
         for (i, node) in nodes.iter().enumerate() {
             let state = node.desired_state().await;
@@ -1017,8 +1080,11 @@ mod tests {
 
         let members = BTreeMap::from([(1, node_info(1))]);
         node.initialize(members).await.unwrap();
-        // Wait for leader (single-node cluster)
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            wait_for_leader(std::slice::from_ref(&node), Duration::from_secs(5)).await,
+            Some(1),
+            "single-node council did not elect itself"
+        );
 
         // Bootstrap SecurityState with a CA hierarchy
         let hierarchy =

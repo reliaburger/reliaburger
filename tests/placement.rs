@@ -20,6 +20,10 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
+
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -32,6 +36,8 @@ struct Node {
     handle: ClusterHandle,
     thinks_leader: watch::Receiver<bool>,
     rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
+    _runtime: runtime::ClusterRuntime,
+    _tasks: TestTasks,
 }
 
 use tokio::sync::watch;
@@ -89,9 +95,6 @@ async fn start_node(
     let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
     let directory_rx = cluster_runtime.directory_rx.clone();
 
-    // Leak the runtime for the whole test (its tasks must outlive us).
-    Box::leak(Box::new(cluster_runtime));
-
     // Real agent with a ProcessGrill, built with the cluster handle so
     // it answers reporting snapshots with real capacity.
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -110,7 +113,8 @@ async fn start_node(
     // Several agents share this host; don't spawn nft against the real
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
-    tokio::spawn(async move { agent.run().await });
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let mut tasks = vec![agent_task];
 
     // Membership table (peer API addresses = gossip IP + offset 3).
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
@@ -118,7 +122,7 @@ async fn start_node(
         let mut rx = membership_rx.clone();
         let table = Arc::clone(&membership_table);
         let sd = shutdown.clone();
-        tokio::spawn(async move {
+        let membership_task = tokio::spawn(async move {
             loop {
                 let snapshot: Vec<NodeMembershipInfo> = rx
                     .borrow()
@@ -136,6 +140,7 @@ async fn start_node(
                 }
             }
         });
+        tasks.push(membership_task);
     }
 
     // Leader scheduler + autoscaler (fast interval for the test).
@@ -197,17 +202,18 @@ async fn start_node(
         None,
     );
     let sd = shutdown.clone();
-    tokio::spawn(async move {
+    let api_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move { sd.cancelled().await })
             .await
             .ok();
     });
+    tasks.push(api_task);
 
     // Derive a leadership watch from the raft metrics.
     let (leader_tx, leader_rx) = watch::channel(false);
     if let Some(mut metrics_rx) = metrics_rx {
-        tokio::spawn(async move {
+        let leadership_task = tokio::spawn(async move {
             loop {
                 let is_leader = {
                     let m = metrics_rx.borrow();
@@ -219,6 +225,7 @@ async fn start_node(
                 }
             }
         });
+        tasks.push(leadership_task);
     }
 
     let client = BunClient::new(&format!("http://127.0.0.1:{api_port}"));
@@ -245,6 +252,8 @@ async fn start_node(
         },
         thinks_leader: leader_rx,
         rollup_store,
+        _runtime: cluster_runtime,
+        _tasks: TestTasks::new(shutdown.clone(), tasks),
     }
 }
 
@@ -286,6 +295,7 @@ async fn nodes_running_web(nodes: &[&Node]) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn apply_on_any_node_places_across_the_cluster() {
     let shutdown = CancellationToken::new();
 
@@ -406,6 +416,7 @@ async fn live_web_instances(nodes: &[&Node]) -> usize {
 /// gone from every council's `desired_state()` and no reconciler resurrects
 /// it on the next tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn cluster_stop_clears_desired_state_and_does_not_resurrect() {
     let shutdown = CancellationToken::new();
 
@@ -522,6 +533,7 @@ async fn total_scaler_instances(nodes: &[&Node]) -> usize {
 /// W8 (L3): a high metric drives the autoscaler to raise the replica
 /// override, and the scheduler + reconcilers grow the app to max.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn autoscaler_scales_up_on_high_metric() {
     use reliaburger::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
 
@@ -649,6 +661,7 @@ async fn autoscaler_scales_up_on_high_metric() {
 /// put two council members at risk — is rejected with a 4xx. Drives the
 /// binary path through `/v1/fault`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn fault_injection_rejected_when_quorum_at_risk() {
     use reliaburger::smoker::types::{FaultRequest, FaultType};
 
@@ -748,6 +761,7 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 /// the node rejoins. This drives the binary path: `/v1/chaos/partition`
 /// on the isolated node, membership observed through the peers' watch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn partition_isolates_a_node_for_real() {
     use reliaburger::mustard::state::NodeState;
 
