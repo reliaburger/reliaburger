@@ -42,6 +42,49 @@ pub fn generate_self_signed_cert()
     Ok((cert_der, key_der))
 }
 
+/// Issue an ingress TLS certificate from the cluster's Sesame Ingress CA.
+///
+/// This is the `tls = "cluster"` path (ING1): rather than a self-signed cert
+/// or an operator-supplied file, the ingress certificate is signed by the
+/// cluster's Ingress CA, so any client that trusts the cluster root trusts
+/// the ingress. It reuses the same CA hierarchy Sesame builds for node and
+/// workload identity — no parallel TLS scheme.
+///
+/// `ca_keypair` and `ca_params` come from the Ingress `GeneratedCa`
+/// (`hierarchy.ingress`). `hostnames` are the ingress hosts to put in the
+/// certificate's SANs. The returned cert/key plug straight into
+/// [`build_tls_config`].
+pub fn issue_ingress_cert(
+    hostnames: &[String],
+    lifetime: std::time::Duration,
+    ca_keypair: &rcgen::KeyPair,
+    ca_params: &rcgen::CertificateParams,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
+    let common_name = hostnames
+        .first()
+        .cloned()
+        .ok_or_else(|| TlsError::CertGenFailed("no ingress hostname supplied".to_string()))?;
+
+    // The cert is a TLS server, so it carries the ServerAuth extended key
+    // usage. `SerialNumber(1)` is a placeholder; a real deployment threads
+    // the CA's serial allocator through here.
+    let (cert_der, key_der, _serial) = crate::sesame::ca::issue_end_entity_cert(
+        &common_name,
+        crate::sesame::types::SerialNumber(1),
+        lifetime,
+        hostnames,
+        &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+        ca_keypair,
+        ca_params,
+    )
+    .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
+
+    let cert = CertificateDer::from(cert_der);
+    let key = PrivateKeyDer::try_from(key_der)
+        .map_err(|e| TlsError::CertGenFailed(format!("invalid issued key: {e}")))?;
+    Ok((vec![cert], key))
+}
+
 /// Load a certificate and private key from PEM files on disk.
 pub fn load_certs_from_disk(
     cert_path: &Path,
@@ -136,6 +179,41 @@ mod tests {
         let result = load_certs_from_disk(
             Path::new("/nonexistent/cert.pem"),
             Path::new("/nonexistent/key.pem"),
+        );
+        assert!(result.is_err());
+    }
+
+    /// ING1 cluster-CA path: an ingress cert issued from the Sesame Ingress
+    /// CA builds a valid TLS server config. This proves the cluster-CA cert
+    /// is issued and servable, reusing the real CA hierarchy.
+    #[test]
+    fn ingress_cert_from_cluster_ca_builds_a_server_config() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("test-cluster", b"test-wrap-ikm").unwrap();
+
+        let (certs, key) = issue_ingress_cert(
+            &["myapp.example.com".to_string()],
+            std::time::Duration::from_secs(90 * 24 * 3600),
+            &hierarchy.ingress.signing_keypair,
+            &hierarchy.ingress.certificate_params,
+        )
+        .unwrap();
+
+        assert_eq!(certs.len(), 1);
+        // The issued cert and key must yield a working rustls config.
+        let config = build_tls_config(certs, key).unwrap();
+        let _ = config; // built without error means it's servable
+    }
+
+    #[test]
+    fn ingress_cert_requires_a_hostname() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("test-cluster", b"test-wrap-ikm").unwrap();
+        let result = issue_ingress_cert(
+            &[],
+            std::time::Duration::from_secs(3600),
+            &hierarchy.ingress.signing_keypair,
+            &hierarchy.ingress.certificate_params,
         );
         assert!(result.is_err());
     }

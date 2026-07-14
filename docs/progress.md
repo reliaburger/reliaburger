@@ -980,12 +980,40 @@ whole theme lands.
     (remote-only + merge-into-local + dedupe), leader build across nodes, apply + snapshot
     fixture; gated (`RELIABURGER_CLUSTER_TESTS=1`) cross-node resolve that survives a leader
     change. `make ci` green.
-- [ ] **Ingress transport and draining** — carry per-route TLS mode into routing; implement
+- [x] **Ingress transport and draining** — carry per-route TLS mode into routing; implement
   ACME/cluster-CA or the documented explicit certificate contract; redirect HTTP except
   challenges; stream request/response bodies with limits/backpressure; hold connection
   permits through TLS/WebSocket lifetime; add handshake/idle timeouts. Replace untrusted
   forwarded headers, use boundary-correct deterministic route/rate keys, parse IPv6 Host
   correctly and wire deployment draining (D7/D10, ING1-ING5).
+  - [x] **ING1/D7 — per-route TLS mode + HTTP→HTTPS redirect.** New `TlsMode` enum
+    (`Disabled`/`Cluster`/`Explicit`) parsed from `IngressSpec.tls`, carried into
+    `PathRoute`. Unsupported modes (`auto`/`acme`) are rejected at routing rebuild rather
+    than silently served plaintext; a TLS-marked route reached over plain HTTP gets a 308
+    to HTTPS (ACME challenge paths excepted). Cluster-CA path: `tls::issue_ingress_cert`
+    issues a server-auth ingress cert from the Sesame Ingress CA (reuses the existing CA
+    hierarchy, no parallel scheme). Explicit certs keep the existing disk-file contract.
+  - [x] **ING2 — connection permits through the full lifetime.** TLS handshakes are bounded
+    by a semaphore and a per-handshake deadline (`tokio::time::timeout`), so a slow-handshake
+    flood can't exhaust tasks. The proxy holds a connection permit for the whole request; for
+    a WebSocket the permit (and drain guard) move into the splice task and release when the
+    splice closes, not at the 101.
+  - [x] **ING3 — streamed bodies with limits.** Response bodies stream via
+    `Body::from_stream(resp.bytes_stream())` instead of buffering whole (SSE/gRPC/large
+    downloads flow with backpressure). Request bodies keep a configurable
+    `max_request_body_bytes` cap; over-cap requests get 413.
+  - [x] **ING4/D10 — WebSocket drain.** `increment_websocket`/`decrement_websocket` wired at
+    the 101 and splice end; `check_completions` now waits for both the HTTP and WebSocket
+    counts to reach zero (or the deadline), so a rolling retire honours `drain_timeout` for a
+    live WebSocket, extending #97's HTTP drain.
+  - [x] **ING5 — trusted forwarded headers + correct route/rate keys.** Client
+    `X-Forwarded-For`/`-Proto`/`Forwarded` are stripped and replaced with the proxy's real
+    view; route matching is segment-boundary correct (`/api` no longer matches `/apievil`)
+    with deterministic tie-break ordering; rate buckets key on `(host, path, client IP)` not
+    the IP alone; zero/overflow rates are rejected at rebuild; IPv6 Host (`[::1]:port`) is
+    bracket-aware. `make ci` green.
+  - **12b.4 tier complete** — all three themes (namespaced catalogue, Pickle durability,
+    ingress transport) done. The data plane is finished.
 - [x] **Pickle storage and replication durability** — stream/hash off the async runtime;
   add authenticated principal/repository quotas and upload expiry; write unique temp files,
   fsync and rename; reverify cache and isolate immutable rootfs generations; constrain

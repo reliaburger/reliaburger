@@ -210,6 +210,7 @@ impl IngressSection {
             worker_threads: 4,
             tls_cert_path: self.tls_cert.clone(),
             tls_key_path: self.tls_key.clone(),
+            ..crate::wrapper::types::WrapperConfig::default()
         }
     }
 }

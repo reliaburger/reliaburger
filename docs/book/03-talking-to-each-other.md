@@ -730,6 +730,10 @@ The table is rebuilt from the `ServiceMap` whenever apps with ingress config are
 
 The ingress specs the agent feeds into the rebuild are keyed by `(namespace, app_name)`, not the bare name — the same collision fix as the VIPs. Two teams both running an `api` app, each with its own ingress on its own host, need two independent routes. Keyed by name alone, the second would clobber the first; keyed by the pair, they coexist, and each rebuild looks its backends up through the namespaced `ServiceId`.
 
+The prefix match has a sharp edge that's easy to get wrong. If `/api` is a route, does `/apievil` match it? `path.starts_with("/api")` says yes — and that's a routing bug that hands one app's traffic to another. A prefix should match on a path *segment* boundary: `/api` matches `/api` and `/api/v1`, but not `/apievil`. So the real check is `path == prefix || path.starts_with(&format!("{prefix}/"))`. Small helper, and one of those cases where the naive one-liner is subtly wrong in a way tests catch and eyeballs don't.
+
+One more subtlety in the lookup: stripping the port off the `Host` header. `myapp.com:8080` should look up `myapp.com`. The obvious `host.split(':').next()` works — right up until someone sends an IPv6 literal like `[::1]:8080`, where splitting on the first colon gives you `[`. You have to notice the bracket and keep everything up to the closing `]`. IPv6 punishes every parser that assumes a colon means "port".
+
 ### What happens when things go wrong
 
 Three error codes tell the client exactly what happened:
@@ -737,6 +741,7 @@ Three error codes tell the client exactly what happened:
 - **404 Not Found**: No route matches the `Host` header. The request is for a domain we don't know about.
 - **502 Bad Gateway**: A route matches, but all backends are unhealthy. The app is deployed but broken.
 - **503 Service Unavailable**: The connection limit was reached. We're overloaded.
+- **413 Payload Too Large**: The request body exceeded the configured cap (more on that below).
 
 ### Connection draining
 
@@ -750,17 +755,39 @@ When an app is being redeployed (rolling update), the old instances need to fini
 
 The app never drops below its replica count during a deploy. If you have 3 replicas and `max_surge = 1`, the sequence is: start replica 4, drain replica 1, start replica 4', drain replica 2, and so on.
 
+"All connections are done" is trickier than it sounds once WebSockets are in play. A plain HTTP request is short: it arrives, gets a response, and it's gone. A WebSocket is a *long-lived splice* — the client and backend exchange frames for minutes or hours after the initial `101 Switching Protocols`. If the drain only counts HTTP requests, it declares "done" the instant the last request returns, then kills a container that still has a chat session or a live log tail flowing through it. So the tracker keeps two counts, and a backend isn't drained until *both* the HTTP count and the WebSocket count reach zero (or the deadline fires). We'll come back to exactly how the proxy keeps that WebSocket count honest.
+
 ### Rate limiting
 
-Each client IP gets a token bucket. Tokens refill at a configured rate (requests per second). When the bucket is empty, the request gets a 429 Too Many Requests response with a `Retry-After` header telling the client exactly when to retry.
+Each client gets a token bucket. Tokens refill at a configured rate (requests per second). When the bucket is empty, the request gets a 429 Too Many Requests response with a `Retry-After` header telling the client exactly when to retry.
+
+There's a question hiding in "each client": keyed by what? Key by IP alone and one client's `/api` traffic spends the same budget as its `/` traffic — two routes with different limits share a bucket, which is wrong. So the bucket key is the pair `(route, client IP)`, where the route is `(host, path prefix)`. A client hammering `/api` can still load `/` at full rate. Same fix shape as the namespaced VIPs and routes: when two things should be independent, put both of them in the key.
+
+The config for a bucket also needs validating before it's ever used. A rate of zero requests per second isn't "unlimited", it's a divide-by-zero waiting to happen when we compute the retry-after. So we reject `rps == 0` (and a `burst` that would overflow when we derive its default) at routing-rebuild time — the route with the bad limit is simply never installed, and the operator gets told which app was rejected. Bad input caught at the door beats a panic in the hot path.
 
 Rate limiting is per-node, not cluster-wide. An attacker hitting all nodes gets N times the rate limit. For serious DDoS protection, you'd put something like Cloudflare or AWS Shield in front. Our rate limiter is there for reasonable load shedding, not nation-state defence.
 
 Stale token buckets (no requests for 5 minutes) are garbage collected every 60 seconds to bound memory growth.
 
-### TLS
+### TLS, per route
 
-Phase 3 ships with a TLS stub — we can listen on port 443 with self-signed certificates for testing. Real certificate management (ACME for Let's Encrypt, or cluster CA for air-gapped environments) comes in Phase 4 when we build Sesame, the PKI layer. TLS 1.0 and 1.1 are rejected; only 1.2 and 1.3 are accepted.
+Phase 3 shipped a TLS stub: listen on 443 with a self-signed certificate, good enough for tests. The gap the July 2026 review found was that the routing table didn't know which routes actually *wanted* TLS. HTTP and HTTPS shared one router, so a route configured with `tls = "cluster"` was served in plaintext on port 80 just as happily as on 443. Configuring TLS and getting plaintext is worse than no TLS — you *think* you're protected.
+
+The fix carries a `TlsMode` into each `PathRoute`:
+
+```rust
+pub enum TlsMode {
+    Disabled,
+    Cluster,
+    Explicit,
+}
+```
+
+`Disabled` is plain HTTP. `Cluster` issues the ingress certificate from the cluster's Sesame Ingress CA — the air-gapped case, where every client already trusts the cluster root. `Explicit` uses an operator-supplied certificate and key file. A route that asks for anything else — `auto`, `acme`, a typo — is a **config error**, rejected at rebuild, not silently downgraded to plaintext. That's the whole point: an unsupported mode must fail loudly, never fall back to the clear.
+
+Once a route knows it needs TLS, the plain-HTTP listener stops serving it. A request for a TLS route on port 80 gets a `308 Permanent Redirect` to the `https://` URL (308, not 301, because it preserves the method and body — a redirected POST stays a POST). The one exception is the ACME challenge path `/.well-known/acme-challenge/`, which has to stay on HTTP so a future issuer can answer it.
+
+For the cluster-CA path we reuse Sesame's Ingress CA rather than inventing a parallel certificate scheme. Sesame already builds a Root CA and three intermediates — Node, Workload, and Ingress — when a cluster is initialised. `issue_ingress_cert` asks the Ingress CA for an end-entity certificate carrying the ingress hostnames as SANs and the TLS server extended-key-usage, then hands the DER straight to rustls. One CA hierarchy, one trust root, ingress certs included. We deliberately did *not* build full ACME here — that's a lot of protocol for a speculative feature, and the explicit and cluster paths cover the real cases. TLS 1.0 and 1.1 are still rejected; only 1.2 and 1.3 are accepted.
 
 ### Switching the proxy on
 
@@ -898,6 +925,30 @@ Without `#[repr(C)]`, Rust will reorder struct fields for alignment efficiency. 
 Once the ingress proxy was actually serving traffic, an audit caught it copying headers too faithfully. A proxy sits between two separate HTTP connections, and some headers describe *the connection*, not *the message*: `Connection`, `Transfer-Encoding`, `Keep-Alive`, `Upgrade`. RFC 7230 calls these "hop-by-hop", and they must not be passed along. We were forwarding all of them, and worse, copying the backend's `Transfer-Encoding: chunked` onto a response whose body we'd already buffered into a fixed-size chunk. The client saw a header promising chunked framing over a body that wasn't. The fix is a small filter applied in both directions: drop the hop-by-hop set, drop anything the peer named in its own `Connection` header, and let the HTTP library compute framing for the body we actually send.
 
 The WebSocket path had a subtler hole. Our handler read the backend's `101 Switching Protocols`, then returned its own hand-written `101` to the client — without the `Sec-WebSocket-Accept` header the client needs to finish the handshake, and while quietly dropping the backend socket. It looked done in a code review and worked in no real browser. The real version takes the client's upgrade future (`hyper::upgrade::on`), relays the backend's *actual* handshake response verbatim, and then splices the two raw streams with `tokio::io::copy_bidirectional`. After the upgrade, Wrapper is a dumb pipe — it doesn't parse WebSocket frames, it just moves bytes. The lesson: a handshake stub that returns the right status code but the wrong headers is worse than no stub, because the tests that only check the status code go green.
+
+### Holding the permit for as long as it matters (post-audit fix)
+
+The connection limit I described earlier had a leak. The counter went up when the handler started and down when it *returned* — fine for a normal request, badly wrong for a WebSocket. A WebSocket handler returns at the `101`, the moment the splice *begins*. So the count dropped to zero while thousands of live WebSockets were still spliced, and the 10,000-connection ceiling protected nothing.
+
+The clean way to tie "resource held" to "work in progress" in Rust is a *permit* whose lifetime you control. We switched the counter to a `tokio::sync::Semaphore`: a handler acquires an owned permit (`try_acquire_owned` — it returns immediately with a 503 when the pool is empty rather than queueing), and the permit is a value that lives on the stack until it's dropped. For a normal request that's when the handler returns. For a WebSocket, we *move the permit into the splice task* — the same task running `copy_bidirectional` — so it's dropped only when the splice actually closes. Same trick for the drain guard, so a draining backend's WebSocket count stays honest for the life of the connection, not just the handshake. This is ownership doing exactly what it's for: the permit is released precisely when the last thing holding it goes away, and you can't forget to release it because there's no explicit release to forget.
+
+The `101`-then-splice tests are the ones that pin this down. It's not enough to check that a WebSocket connects. You open a WebSocket, hold it, and assert that a *second* connection is refused while the first is live — proving the permit didn't come back at the 101. Then close the first and assert the second now succeeds. A test that only opens one connection would pass against the buggy code.
+
+TLS handshakes got the same "bound the resource" treatment from the other side. Spawning a task per handshake (the fix from a couple of sections ago) stops one slow handshaker blocking the accept loop, but it doesn't stop *ten thousand* slow handshakers spawning ten thousand tasks. So the accept loop now grabs a handshake permit from a second semaphore before it spends any work, and wraps the handshake itself in a `tokio::time::timeout`. A peer that opens a socket and never sends a ClientHello is dropped on the deadline, and its permit returns to the pool. Bounded concurrency plus a deadline: a flood costs a fixed amount of memory and clears itself.
+
+### Streaming, not photocopying, the body (post-audit fix)
+
+The "translator not photocopier" section was about headers. The bodies had their own version of the same sin. The proxy buffered the whole request body (up to a hardcoded 10 MiB) and collected the *entire* backend response into memory before sending a byte to the client. For a server-sent-events stream or a gRPC call or a large file download, that's not a proxy, it's a bucket — the first byte reaches the client only after the last byte arrives, and a big response pins its whole size in RAM.
+
+The response side now streams. `reqwest` gives us `resp.bytes_stream()`, an async stream of chunks as they arrive off the backend socket; `axum::body::Body::from_stream` wires that straight into the response hyper sends to the client. Chunks flow through with backpressure — if the client reads slowly, the read from the backend slows to match, and memory stays flat regardless of body size. The request side keeps a *configurable* cap (not a magic 10 MiB) and rejects an over-cap body with `413 Payload Too Large`, so an unauthenticated client can't ask the proxy to buffer something enormous.
+
+The test for this is deliberately a bit odd: the backend sends a 5 MiB response through a proxy configured with a 1 KiB *request* cap, and we assert the client receives all 5 MiB. If the response were bounded by (or buffered to) the request cap, it would be truncated. Getting every byte back proves the response path is genuinely unbounded and streaming.
+
+### Don't let the client lie about who it is (post-audit fix)
+
+A backend behind a proxy often wants to know the real client's IP and whether the original request was HTTPS. The convention is the `X-Forwarded-For` and `X-Forwarded-Proto` headers, and the proxy is supposed to *set* them. Our header-copy loop forwarded them instead — including any the client sent. So a client could send `X-Forwarded-For: 10.0.0.1` and the backend would believe it came from `10.0.0.1`, defeating every IP allowlist or audit log that trusted the header.
+
+The rule for a forwarding header is: the proxy owns it. We strip whatever the client sent (`X-Forwarded-For`, `X-Forwarded-Proto`, and the RFC 7239 `Forwarded`) and replace them with the proxy's own view — the real peer IP from `ConnectInfo`, and `https` or `http` depending on which listener the request arrived on. The backend gets the truth, and nothing the client puts in those headers survives. The test sends a request with a forged `X-Forwarded-For` and asserts the backend sees the real loopback address, not the forgery.
 
 ## Test count
 
