@@ -339,11 +339,21 @@ impl ImageStore {
             }
         }
 
-        // Create the OCI distribution client. The default ClientConfig
-        // includes a platform resolver that picks the current host's
-        // architecture from multi-platform manifest lists.
+        // Keep remote registries on HTTPS. Loopback is the one exception:
+        // local development registries and the hermetic test fixture do not
+        // need a certificate merely to move bytes within the same host.
+        let protocol = if image_ref.registry.starts_with("127.0.0.1:")
+            || image_ref.registry.starts_with("localhost:")
+        {
+            oci_distribution::client::ClientProtocol::HttpsExcept(vec![image_ref.registry.clone()])
+        } else {
+            oci_distribution::client::ClientProtocol::Https
+        };
+
+        // The default ClientConfig also includes a platform resolver that
+        // picks the current host's architecture from manifest lists.
         let client_config = oci_distribution::client::ClientConfig {
-            protocol: oci_distribution::client::ClientProtocol::Https,
+            protocol,
             ..Default::default()
         };
         let client = oci_distribution::Client::new(client_config);
@@ -618,6 +628,12 @@ pub fn looks_like_image_ref(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::extract::{Request, State};
+    use axum::http::{Response, StatusCode, header};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
 
     // -- cluster_candidates ------------------------------------------------
 
@@ -1005,65 +1021,172 @@ mod tests {
         tar.into_inner().unwrap().finish().unwrap();
     }
 
-    // -- Integration tests (env-gated) -----------------------------------------
+    // -- Hermetic OCI distribution fixture ------------------------------------
 
-    fn image_pull_tests_enabled() -> bool {
-        std::env::var("RELIABURGER_IMAGE_PULL_TESTS").is_ok()
+    #[derive(Clone)]
+    struct RegistryState {
+        manifest_path: String,
+        manifest: Vec<u8>,
+        config_path: String,
+        config: Vec<u8>,
+        layer_path: String,
+        layer: Vec<u8>,
+        layer_requests: Arc<AtomicUsize>,
     }
 
-    #[tokio::test]
-    async fn pull_alpine_creates_rootfs() {
-        if !image_pull_tests_enabled() {
-            eprintln!("skipping image pull test (set RELIABURGER_IMAGE_PULL_TESTS=1 to enable)");
-            return;
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(tmp.path().to_path_buf());
-
-        let rootfs = store.pull_and_unpack("alpine:latest").await.unwrap();
-        assert!(rootfs.join("bin/sh").exists());
-        assert!(rootfs.join("etc/alpine-release").exists());
+    struct RegistryFixture {
+        reference: String,
+        layer_requests: Arc<AtomicUsize>,
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
     }
 
-    #[tokio::test]
-    async fn pull_cached_is_fast() {
-        if !image_pull_tests_enabled() {
-            eprintln!("skipping image pull test (set RELIABURGER_IMAGE_PULL_TESTS=1 to enable)");
-            return;
+    impl Drop for RegistryFixture {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+            self.task.abort();
+        }
+    }
+
+    async fn registry_response(
+        State(state): State<RegistryState>,
+        request: Request,
+    ) -> Response<Body> {
+        let path = request.uri().path();
+        if path == "/v2/" {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap();
         }
 
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(tmp.path().to_path_buf());
+        let (body, content_type) = if path == state.manifest_path {
+            (
+                state.manifest.clone(),
+                "application/vnd.oci.image.manifest.v1+json",
+            )
+        } else if path == state.config_path {
+            (
+                state.config.clone(),
+                "application/vnd.oci.image.config.v1+json",
+            )
+        } else if path == state.layer_path {
+            state.layer_requests.fetch_add(1, Ordering::SeqCst);
+            (
+                state.layer.clone(),
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            )
+        } else {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        };
 
-        // First pull
-        store.pull_and_unpack("alpine:latest").await.unwrap();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
 
-        // Second pull should reuse cached blobs
-        let start = std::time::Instant::now();
-        store.pull_and_unpack("alpine:latest").await.unwrap();
-        let elapsed = start.elapsed();
-
-        // Cached pull should be fast (manifest re-fetch + no blob downloads)
-        assert!(
-            elapsed.as_secs() < 30,
-            "cached pull took too long: {elapsed:?}"
+    async fn start_registry_fixture() -> RegistryFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("layer.tar.gz");
+        create_test_layer_with_dirs(
+            &layer_path,
+            &["bin/", "etc/"],
+            &[("bin/sh", b"fixture shell"), ("etc/os-release", b"fixture")],
         );
+        let layer = std::fs::read(layer_path).unwrap();
+        let layer_digest = format!("sha256:{}", sha256_hex(&layer));
+
+        let config =
+            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
+                .to_vec();
+        let config_digest = format!("sha256:{}", sha256_hex(&config));
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": config_digest,
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": layer_digest,
+                "size": layer.len(),
+            }],
+        }))
+        .unwrap();
+        let manifest_digest = format!("sha256:{}", sha256_hex(&manifest));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let layer_requests = Arc::new(AtomicUsize::new(0));
+        let state = RegistryState {
+            manifest_path: format!("/v2/fixture/manifests/{manifest_digest}"),
+            manifest,
+            config_path: format!("/v2/fixture/blobs/{config_digest}"),
+            config,
+            layer_path: format!("/v2/fixture/blobs/{layer_digest}"),
+            layer,
+            layer_requests: Arc::clone(&layer_requests),
+        };
+        let app = axum::Router::new()
+            .fallback(registry_response)
+            .with_state(state);
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                .await
+                .unwrap();
+        });
+
+        RegistryFixture {
+            reference: format!("{address}/fixture@{manifest_digest}"),
+            layer_requests,
+            shutdown,
+            task,
+        }
     }
 
     #[tokio::test]
-    async fn pull_nonexistent_image_errors() {
-        if !image_pull_tests_enabled() {
-            eprintln!("skipping image pull test (set RELIABURGER_IMAGE_PULL_TESTS=1 to enable)");
-            return;
-        }
-
+    async fn digest_pinned_local_registry_pull_creates_rootfs() {
+        let fixture = start_registry_fixture().await;
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf());
 
-        let result = store
-            .pull_and_unpack("reliaburger-nonexistent-image-for-testing:latest")
-            .await;
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert!(rootfs.join("bin/sh").exists());
+        assert!(rootfs.join("etc/os-release").exists());
+    }
+
+    #[tokio::test]
+    async fn repeated_pull_reuses_the_content_addressed_layer() {
+        let fixture = start_registry_fixture().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+        store.pull_and_unpack(&fixture.reference).await.unwrap();
+
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn local_registry_missing_manifest_is_an_error() {
+        let fixture = start_registry_fixture().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let registry = fixture.reference.split('/').next().unwrap();
+        let missing = format!("{registry}/missing@sha256:{}", "0".repeat(64));
+
+        let result = store.pull_and_unpack(&missing).await;
         assert!(result.is_err());
     }
 }
