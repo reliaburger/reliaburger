@@ -71,31 +71,36 @@ pub fn compute_diff(
     let mut modified = 0usize;
     let mut removed = 0usize;
 
-    // Build lookup for current apps
-    let current_by_name: BTreeMap<String, (&AppId, &AppSpec)> = current
-        .apps
+    // Apps diff on their full identity (namespace + name), not the bare
+    // name. Two apps called `web` in `prod` and `staging` are different
+    // resources; keying on the name alone let a `prod/web` deletion target
+    // `default/web`, so GitOps and manual apply diverged (GIT2). The git
+    // side derives the same `AppId` `config_to_desired_writes` does:
+    // `namespace` field, defaulting to `default`.
+    let git_apps: BTreeMap<AppId, &AppSpec> = git_config
+        .app
         .iter()
-        .map(|(id, spec)| (id.name.clone(), (id, spec)))
+        .map(|(name, spec)| (app_id_for(name, spec), spec))
         .collect();
 
-    // Check for added and modified apps
-    for (name, git_spec) in &git_config.app {
-        match current_by_name.get(name) {
+    // Check for added and modified apps.
+    for (app_id, git_spec) in &git_apps {
+        match current.apps.get(app_id) {
             None => {
                 changes.push(ResourceChange::Add {
-                    resource_id: format!("app.{name}"),
-                    spec: ChangePayload::App(Box::new(git_spec.clone())),
+                    resource_id: app_resource_id(app_id),
+                    spec: ChangePayload::App(Box::new((*git_spec).clone())),
                 });
                 added += 1;
             }
-            Some((_app_id, current_spec)) => {
+            Some(current_spec) => {
                 let replicas_changed = replicas_differ(git_spec, current_spec);
                 let other_fields_changed = non_replica_fields_differ(git_spec, current_spec);
 
                 if replicas_changed || other_fields_changed {
                     changes.push(ResourceChange::Update {
-                        resource_id: format!("app.{name}"),
-                        spec: ChangePayload::App(Box::new(git_spec.clone())),
+                        resource_id: app_resource_id(app_id),
+                        spec: ChangePayload::App(Box::new((*git_spec).clone())),
                         replicas_changed,
                     });
                     modified += 1;
@@ -104,11 +109,12 @@ pub fn compute_diff(
         }
     }
 
-    // Check for removed apps (in current but not in git)
-    for name in current_by_name.keys() {
-        if !git_config.app.contains_key(name) {
+    // Check for removed apps (in current but not in git), keyed by full
+    // identity so a removal deletes exactly the app git dropped.
+    for app_id in current.apps.keys() {
+        if !git_apps.contains_key(app_id) {
             changes.push(ResourceChange::Remove {
-                resource_id: format!("app.{name}"),
+                resource_id: app_resource_id(app_id),
             });
             removed += 1;
         }
@@ -177,18 +183,17 @@ pub fn compute_diff(
         }
     }
 
-    // Also diff jobs (simpler — no autoscaler interaction)
-    let current_job_names: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
-    // TODO: wire in current job state from Raft when available
-    for name in git_config.job.keys() {
-        if !current_job_names.contains(name) {
-            changes.push(ResourceChange::Add {
-                resource_id: format!("job.{name}"),
-                spec: ChangePayload::Generic,
-            });
-            added += 1;
-        }
-    }
+    // Jobs are deliberately absent from the diff. A job runs to
+    // completion; it isn't reconciled desired state, so there's no job
+    // map in Raft to compare against (see `config_to_desired_writes`).
+    // The old code compared every git job against an always-empty set,
+    // so it emitted an `Add` for every job on *every* sync — a change the
+    // applier then silently dropped (`ChangePayload::Generic` maps to no
+    // write) while inflating `summary.added`. That's the GIT2b bug: a job
+    // "removed" from git was never in the desired state to begin with, so
+    // it can't be re-added, and a job present in git is dispatched by the
+    // one-shot deploy path, not by reconciliation. Emitting nothing here
+    // keeps the summary honest and the applier free of no-op changes.
 
     let summary = DiffSummary {
         added,
@@ -197,6 +202,38 @@ pub fn compute_diff(
     };
 
     (changes, summary)
+}
+
+/// The `AppId` a git-declared app resolves to.
+///
+/// Mirrors `config_to_desired_writes`: the app's own `namespace` field,
+/// defaulting to `default`. Keeping the two derivations identical is what
+/// makes GitOps and manual apply converge on the same identity.
+fn app_id_for(name: &str, spec: &AppSpec) -> AppId {
+    let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+    AppId::new(name, namespace)
+}
+
+/// Encode an `AppId` into a diff `resource_id`.
+///
+/// The form is `app.<namespace>/<name>` so a removal carries the full
+/// identity, not just the bare name. `parse_app_resource_id` is the
+/// inverse.
+pub fn app_resource_id(app_id: &AppId) -> String {
+    format!("app.{}/{}", app_id.namespace, app_id.name)
+}
+
+/// Parse an `app.<namespace>/<name>` resource id back into an `AppId`.
+///
+/// Returns `None` for a resource id that isn't an app or doesn't carry a
+/// namespace segment.
+pub fn parse_app_resource_id(resource_id: &str) -> Option<AppId> {
+    let rest = resource_id.strip_prefix("app.")?;
+    let (namespace, name) = rest.split_once('/')?;
+    if namespace.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(AppId::new(name, namespace))
 }
 
 /// Check whether the `replicas` field differs between two app specs.
@@ -270,7 +307,7 @@ mod tests {
         assert_eq!(summary.added, 1);
         assert_eq!(summary.modified, 0);
         assert!(
-            matches!(&changes[0], ResourceChange::Add { resource_id, .. } if resource_id == "app.web")
+            matches!(&changes[0], ResourceChange::Add { resource_id, .. } if resource_id == "app.default/web")
         );
     }
 
@@ -281,7 +318,7 @@ mod tests {
         let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
         assert_eq!(summary.removed, 1);
         assert!(
-            matches!(&changes[0], ResourceChange::Remove { resource_id } if resource_id == "app.old")
+            matches!(&changes[0], ResourceChange::Remove { resource_id } if resource_id == "app.default/old")
         );
     }
 
@@ -356,6 +393,97 @@ mod tests {
         assert!(
             !non_replica_fields_differ(&a, &b),
             "should ignore replicas difference"
+        );
+    }
+
+    /// GIT2: a `prod/web` removed from git deletes `prod/web`, not
+    /// `default/web`. Keying the diff on the bare name used to collapse the
+    /// two, so a manual `default/web` was collateral damage of a `prod`
+    /// change (or the wrong app survived).
+    #[test]
+    fn removing_a_namespaced_app_targets_that_namespace() {
+        // Git declares nothing; Raft holds prod/web and default/web.
+        let git = parse_config("");
+        let mut current = HashMap::new();
+        let prod_web: AppSpec = toml::from_str(r#"image = "web:v1""#).unwrap();
+        let default_web: AppSpec = toml::from_str(r#"image = "web:v1""#).unwrap();
+        current.insert(AppId::new("web", "prod"), prod_web);
+        current.insert(AppId::new("web", "default"), default_web);
+
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
+        assert_eq!(summary.removed, 2, "both apps are absent from git");
+        let removed: std::collections::BTreeSet<&str> = changes
+            .iter()
+            .filter_map(|c| match c {
+                ResourceChange::Remove { resource_id } => Some(resource_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(removed.contains("app.prod/web"));
+        assert!(removed.contains("app.default/web"));
+    }
+
+    /// GIT2: two same-named apps in different namespaces converge
+    /// independently. Git keeps `prod/web`, drops `staging/web`; only the
+    /// staging one is removed and the prod one is untouched.
+    #[test]
+    fn same_named_apps_in_different_namespaces_converge_independently() {
+        let git = parse_config(
+            r#"
+            [app.web]
+            image = "web:v1"
+            namespace = "prod"
+            "#,
+        );
+        let mut current = HashMap::new();
+        // The prod/web spec carries the same `namespace = "prod"` git
+        // declares, so it's an exact match and produces no change.
+        current.insert(
+            AppId::new("web", "prod"),
+            toml::from_str::<AppSpec>("image = \"web:v1\"\nnamespace = \"prod\"").unwrap(),
+        );
+        current.insert(
+            AppId::new("web", "staging"),
+            toml::from_str::<AppSpec>(r#"image = "web:v1""#).unwrap(),
+        );
+
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
+        assert_eq!(summary.added, 0, "prod/web already matches");
+        assert_eq!(summary.modified, 0, "prod/web is unchanged");
+        assert_eq!(summary.removed, 1, "only staging/web is dropped");
+        assert!(matches!(
+            &changes[..],
+            [ResourceChange::Remove { resource_id }] if resource_id == "app.staging/web"
+        ));
+    }
+
+    /// GIT2b: a job in git produces no reconciled change. Jobs run to
+    /// completion; the diff must not manufacture an `Add` the applier then
+    /// silently drops (which also mis-inflated `summary.added`).
+    #[test]
+    fn jobs_produce_no_reconciled_change() {
+        let git = parse_config(
+            r#"
+            [job.migrate]
+            image = "migrate:v1"
+            "#,
+        );
+        let current = HashMap::new();
+        let (changes, summary) = compute_diff(&git, &apps_state(&current), &[]);
+        assert!(changes.is_empty(), "jobs are not reconciled desired state");
+        assert_eq!(summary.added, 0, "a job must not inflate the add count");
+    }
+
+    #[test]
+    fn app_resource_id_round_trips_through_the_parser() {
+        let id = AppId::new("web", "prod");
+        let encoded = app_resource_id(&id);
+        assert_eq!(encoded, "app.prod/web");
+        assert_eq!(parse_app_resource_id(&encoded), Some(id));
+        assert!(parse_app_resource_id("namespace.prod").is_none());
+        assert!(
+            parse_app_resource_id("app.web").is_none(),
+            "needs a namespace segment"
         );
     }
 }

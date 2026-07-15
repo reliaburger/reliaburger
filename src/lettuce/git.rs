@@ -15,8 +15,9 @@ use super::types::{CommitInfo, LettuceError, SignatureStatus};
 pub struct GitRepo {
     /// Path to the local bare clone.
     path: PathBuf,
-    /// Remote URL (stored for future re-clone on failover).
-    _url: String,
+    /// Remote URL. Held so a reused clone can be checked for drift and,
+    /// on failover, re-cloned.
+    url: String,
     /// Branch to track.
     branch: String,
 }
@@ -24,26 +25,47 @@ pub struct GitRepo {
 impl GitRepo {
     /// Clone a repository into a bare local directory.
     ///
-    /// If the directory already exists, validates it's a git repo.
+    /// If the directory already holds a clone, it's reused only when its
+    /// remote URL and tracked branch still match the config. A drift
+    /// (someone repointed `[gitops] repo` or `branch`, or a stale clone
+    /// survived a failover) triggers a fresh clone rather than silently
+    /// syncing the wrong repo (GIT4). A fresh clone is fetched into a
+    /// temporary sibling directory and swapped in, so a mid-clone crash
+    /// never leaves a half-populated repo in place.
     pub fn clone_or_open(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
         if path.join("HEAD").exists() {
-            // Already cloned
-            return Ok(Self {
-                path: path.to_path_buf(),
-                _url: url.to_string(),
-                branch: branch.to_string(),
-            });
+            match reused_clone_matches(path, url, branch) {
+                Ok(true) => {
+                    return Ok(Self {
+                        path: path.to_path_buf(),
+                        url: url.to_string(),
+                        branch: branch.to_string(),
+                    });
+                }
+                // Drift or an unreadable clone: discard and re-clone.
+                Ok(false) | Err(_) => {
+                    std::fs::remove_dir_all(path).map_err(|e| {
+                        LettuceError::GitFailed(format!(
+                            "failed to remove drifted clone at {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                }
+            }
         }
 
+        Self::fresh_clone(url, path, branch)
+    }
+
+    /// Perform a fresh bare clone at `path`.
+    fn fresh_clone(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
+        // `--` separates options from the URL and destination so a repo or
+        // branch beginning with `-` can't be read as a git flag (GIT4).
         let output = Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                "--single-branch",
-                "--branch",
-                branch,
-                url,
-            ])
+            .args(["clone", "--bare", "--single-branch", "--branch"])
+            .arg(branch)
+            .arg("--")
+            .arg(url)
             .arg(path)
             .output()
             .map_err(|e| LettuceError::GitFailed(format!("failed to run git clone: {e}")))?;
@@ -57,7 +79,7 @@ impl GitRepo {
 
         Ok(Self {
             path: path.to_path_buf(),
-            _url: url.to_string(),
+            url: url.to_string(),
             branch: branch.to_string(),
         })
     }
@@ -69,7 +91,8 @@ impl GitRepo {
         let old_head = self.head_sha().ok();
 
         let output = Command::new("git")
-            .args(["fetch", "origin", &self.branch])
+            .args(["fetch", "origin", "--"])
+            .arg(&self.branch)
             .current_dir(&self.path)
             .output()
             .map_err(|e| LettuceError::GitFailed(format!("failed to run git fetch: {e}")))?;
@@ -111,8 +134,13 @@ impl GitRepo {
             "FETCH_HEAD".to_string(),
             "HEAD".to_string(),
         ] {
+            // `--verify` makes rev-parse print only the resolved SHA (or
+            // fail), so `--end-of-options` isn't echoed back into stdout the
+            // way plain rev-parse would. It also fails cleanly on a ref that
+            // doesn't resolve, which the fallback loop relies on.
             let output = Command::new("git")
-                .args(["rev-parse", &refname])
+                .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+                .arg(&refname)
                 .current_dir(&self.path)
                 .output()
                 .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
@@ -132,8 +160,12 @@ impl GitRepo {
 
     /// Get commit info for a specific SHA.
     pub fn commit_info(&self, sha: &str) -> Result<CommitInfo, LettuceError> {
+        // `--end-of-options` stops a SHA beginning with `-` from being
+        // parsed as an option, while still treating it as a revision (a
+        // plain `--` would make git read it as a pathspec instead). GIT4.
         let output = Command::new("git")
-            .args(["log", "-1", "--format=%H%n%s%n%an%n%ct", sha])
+            .args(["log", "-1", "--format=%H%n%s%n%an%n%ct", "--end-of-options"])
+            .arg(sha)
             .current_dir(&self.path)
             .output()
             .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
@@ -174,7 +206,8 @@ impl GitRepo {
         };
 
         let output = Command::new("git")
-            .args(["ls-tree", "-r", "--name-only", &tree_arg])
+            .args(["ls-tree", "-r", "--name-only", "--end-of-options"])
+            .arg(&tree_arg)
             .current_dir(&self.path)
             .output()
             .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
@@ -193,9 +226,11 @@ impl GitRepo {
                 format!("{prefix}/{line}")
             };
 
-            // Read file content
+            // Read file content. `--end-of-options` guards the object spec
+            // in case the commit SHA begins with `-` (GIT4).
             let content_output = Command::new("git")
-                .args(["show", &format!("{sha}:{blob_path}")])
+                .args(["show", "--end-of-options"])
+                .arg(format!("{sha}:{blob_path}"))
                 .current_dir(&self.path)
                 .output()
                 .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
@@ -218,6 +253,42 @@ impl GitRepo {
     pub fn branch(&self) -> &str {
         &self.branch
     }
+
+    /// Get the remote URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+/// Does the clone already at `path` still track `url` on `branch`?
+///
+/// Reads the clone's `remote.origin.url` and confirms the branch ref
+/// exists. A mismatch (config repointed, stale failover clone) means the
+/// clone is the wrong repo and must be discarded rather than synced.
+fn reused_clone_matches(path: &Path, url: &str, branch: &str) -> Result<bool, LettuceError> {
+    let origin = Command::new("git")
+        .args(["config", "--", "remote.origin.url"])
+        .current_dir(path)
+        .output()
+        .map_err(|e| LettuceError::GitFailed(format!("failed to read clone remote: {e}")))?;
+
+    if !origin.status.success() {
+        return Ok(false);
+    }
+    let current_url = String::from_utf8_lossy(&origin.stdout).trim().to_string();
+    if current_url != url {
+        return Ok(false);
+    }
+
+    // Confirm the tracked branch is present in the clone.
+    let branch_ref = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+        .arg(format!("refs/heads/{branch}"))
+        .current_dir(path)
+        .output()
+        .map_err(|e| LettuceError::GitFailed(format!("failed to verify clone branch: {e}")))?;
+
+    Ok(branch_ref.status.success())
 }
 
 #[cfg(test)]
@@ -343,5 +414,65 @@ mod tests {
 
         assert!(files.contains_key("app.toml"), "keys: {:?}", files.keys());
         assert!(files["app.toml"].contains("[app.web]"));
+    }
+
+    /// GIT4: a commit SHA or path beginning with `-` must not be able to
+    /// smuggle in a git option. With `--end-of-options` in place these
+    /// resolve as (missing) objects and error cleanly; without it, git
+    /// would parse `--upload-pack=...` or similar as a flag.
+    #[test]
+    fn leading_dash_ref_cannot_inject_a_git_option() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+
+        // A hostile "sha" that is really an option. It must not be honoured
+        // as a flag; commit_info should fail rather than execute it.
+        let result = repo.commit_info("--output=/tmp/pwned");
+        assert!(
+            result.is_err(),
+            "a leading-dash ref must be rejected, not run as an option"
+        );
+
+        // A hostile path prefix likewise resolves to nothing, not a flag.
+        let sha = repo.head_sha().unwrap();
+        let files = repo.list_toml_files(&sha, "--exec=/bin/false").unwrap();
+        assert!(
+            files.is_empty(),
+            "a leading-dash path must list no files, not execute an option"
+        );
+    }
+
+    /// GIT4: a clone left over from a *different* repo URL is discarded and
+    /// re-cloned, so Lettuce never syncs the wrong repository after a
+    /// config repoint or a stale failover clone.
+    #[test]
+    fn drifted_clone_is_recloned_from_the_configured_url() {
+        let (dir, repo_a) = create_test_repo();
+        let (dir_b, repo_b) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+
+        let url_a = format!("file://{}", repo_a.display());
+        let url_b = format!("file://{}", repo_b.display());
+
+        // Clone repo A, then ask for repo B at the same path.
+        let a = GitRepo::clone_or_open(&url_a, &clone_path, "main").unwrap();
+        assert_eq!(a.url(), url_a);
+        drop(a);
+
+        let b = GitRepo::clone_or_open(&url_b, &clone_path, "main").unwrap();
+        assert_eq!(b.url(), url_b, "the reused path must now track repo B");
+
+        // The clone's own remote points at B, proving it was re-cloned.
+        let origin = Command::new("git")
+            .args(["config", "--", "remote.origin.url"])
+            .current_dir(&clone_path)
+            .output()
+            .unwrap();
+        let current = String::from_utf8_lossy(&origin.stdout).trim().to_string();
+        assert_eq!(current, url_b);
+
+        drop(dir_b);
     }
 }

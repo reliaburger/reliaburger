@@ -676,6 +676,136 @@ The caller advances `last_applied_commit` only on `Ok`. On `Err`, it leaves the 
 
 The test for this drives `apply_changes` against a council that was never made leader, so every write is refused. The function must stop at the first failure and report *which* change failed, and the app must never reach desired state. Run it against the old code and the commit advances over a wholesale failure; run it against the new code and the failure surfaces, the commit holds, and the next tick gets another go.
 
+## The namespace bug that got away
+
+We fixed the identity mismatch on the *write* side and celebrated. Then someone deleted an app from git and watched the wrong one disappear.
+
+Here's what we missed. The diff engine compares the repo against the current state to work out what changed, and to find *removals* it asks "which apps are in Raft but not in git?" The trouble was how it answered. It keyed everything on the bare app name:
+
+```rust
+let current_by_name: BTreeMap<String, _> =
+    current.apps.iter().map(|(id, spec)| (id.name.clone(), (id, spec))).collect();
+```
+
+Drop `id.namespace` on the floor and `prod/web` and `default/web` collapse into one key, `web`. So when git stopped mentioning `prod/web`, the diff couldn't tell which `web` to remove, and a removal aimed at `prod` could take out `default` instead. We'd fixed the door the app *walks in* through and left the door it *leaves* by broken.
+
+The fix is to diff on the whole identity, never the name alone. Git apps get keyed by the same `AppId` the write path builds:
+
+```rust
+let git_apps: BTreeMap<AppId, &AppSpec> = git_config
+    .app
+    .iter()
+    .map(|(name, spec)| (app_id_for(name, spec), spec))
+    .collect();
+
+for app_id in current.apps.keys() {
+    if !git_apps.contains_key(app_id) {
+        changes.push(ResourceChange::Remove { resource_id: app_resource_id(app_id) });
+    }
+}
+```
+
+And the `resource_id` a change carries now spells out the full identity — `app.prod/web`, not `app.web` — so by the time the runner turns it into an `AppDelete`, there's no namespace left to guess. `app_resource_id` and `parse_app_resource_id` are exact inverses; encode an `AppId`, parse it back, get the same `AppId`. The test seeds two same-named apps in different namespaces, drops one from git, and checks that exactly the right one is reconciled away while its twin is left alone.
+
+While we were in there, we killed a related zombie. Jobs were being compared against a set that was *always empty*:
+
+```rust
+let current_job_names: BTreeSet<&String> = BTreeSet::new();  // never filled
+for name in git_config.job.keys() {
+    if !current_job_names.contains(name) { /* always true → always "Add" */ }
+}
+```
+
+Every sync re-declared every job as new. But jobs run to completion; they aren't reconciled desired state, and there's no job map in Raft to compare against. So the applier quietly dropped these phantom "Adds" while the summary counted them anyway — every sync claimed it added jobs it never wrote. The honest fix is to emit nothing for jobs at all. A job that's present in git is dispatched by the one-shot deploy path; one that's absent was never desired state to re-add. Silence is the correct diff.
+
+## A webhook the whole internet can reach
+
+Polling git every thirty seconds works, but it's slow and wasteful. Every git host will happily *tell* you the moment something changes, if you give it a URL to POST to. So Lettuce exposes one: `POST /v1/gitops/webhook`. Push to the repo, GitHub fires the hook, and the sync runs in the second it takes to deliver, not on the next poll.
+
+There's an obvious problem. Every other route on the agent sits behind a bearer token — you prove who you are, or you get a 401. But GitHub has never heard of your bearer token and never will. It authenticates *its* way: an HMAC-SHA256 signature over the request body, in an `X-Hub-Signature-256` header, computed with a secret you configured on both ends. GitLab does its own thing (`X-Gitlab-Token`, the shared secret sent verbatim). Neither will send a Reliaburger token, so a route that demands one is a route no git host can call.
+
+So the webhook has to be *public* — exempt from the bearer-auth middleware — and yet it can't be *open*, because an unauthenticated "make the cluster sync now" button is a denial-of-service lever anyone on the internet can lean on. The resolution is to move the authentication *into the handler*. The router puts the route on the public side of the split, alongside health and the join endpoint:
+
+```rust
+let public = Router::new()
+    .route("/v1/health", get(health_handler))
+    .route("/v1/cluster/join", post(join_handler))
+    .route("/v1/gitops/webhook", post(gitops_webhook_handler))  // public, but HMAC-gated
+    .with_state(state.clone());
+```
+
+and the handler does the checking itself, over the raw bytes of the body, before it nudges anything:
+
+```rust
+async fn gitops_webhook_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(validator) = &state.gitops_webhook_validator else {
+        return service_unavailable("webhook secret not configured");  // fail closed
+    };
+    let mut guard = validator.lock().await;
+    match guard.validate(&body, signature, delivery_id, branch) {
+        Ok(_)  => { let _ = tx.send(()).await; accepted() }
+        Err(e) => unauthorized_or_rate_limited(e),
+    }
+}
+```
+
+Three checks, in order. The signature must verify against the configured secret — `ring::hmac::verify` does this in constant time, so a wrong signature leaks nothing about how close it was. The delivery id must be one we haven't seen, or a replayed POST (the same signed body, captured and re-sent) would trigger a fresh sync every time. And the request must fit under a rate limit, so a flood of valid hooks can't hammer the sync loop. Only when all three pass does the handler send `()` down the channel to wake the runner.
+
+Two design choices are worth pausing on. First, **fail closed**: if no `[gitops] webhook_secret` is configured, there's no validator, and the handler returns 503 rather than triggering an unauthenticated sync. A public route with no way to authenticate the caller is worse than no route at all. Second, the validator is `Arc<Mutex<WebhookValidator>>` — shared and *mutable*, because the replay set and the rate-limit window are state that changes on every request. `Mutex` here isn't guarding against data races in the C sense; it's making sure two hooks arriving at once can't both slip past the "have I seen this delivery id?" check. Rust's type system won't let you mutate shared state without saying how you're synchronising it, so the `Mutex` is the compiler asking you to be explicit, and the right answer.
+
+The tests exercise the whole contract with no bearer token in sight: a bad signature is a 401 and triggers no sync (observed by an empty channel), a missing signature is a 401, a replayed delivery id is a 401 the second time, a rate-limit flood is a 429, and a correctly-signed GitHub-shaped POST is a 202 that *does* nudge the channel. That last one is the point of the whole exercise — a real git host, sending exactly what it sends, gets through.
+
+## Refuses to be tricked by a filename
+
+Lettuce shells out to `git`. That's a deliberate choice — the `git` binary is always on the node, and it beats pulling in a large C library — but shelling out to a tool that takes both options and arguments on one line has a classic hazard. What if a branch name, a path, or a commit SHA begins with a dash?
+
+```
+git log -1 --format=... --upload-pack=/tmp/evil
+```
+
+If that `--upload-pack=…` came from a value you thought was a commit SHA, you've just handed `git` an option it will cheerfully obey. The repo URL, the branch, the path prefix, the SHA — several of these are ultimately attacker-influenceable, and none of them should ever be read as a flag.
+
+Git gives you two separators for exactly this. `--` says "everything after me is a pathspec, not an option." `--end-of-options` (git 2.24+) says "stop parsing options, but still treat what follows as revisions." They're not interchangeable: a commit SHA passed after `--` is read as a *filename*, which is wrong, so revision-carrying commands (`log`, `rev-parse`, `ls-tree`, `show`) get `--end-of-options`, while the pathspec on `fetch` gets `--`.
+
+```rust
+Command::new("git")
+    .args(["log", "-1", "--format=%H%n%s%n%an%n%ct", "--end-of-options"])
+    .arg(sha)   // even if it starts with '-', it's a revision now, not a flag
+```
+
+One subtlety cost us a test. `git rev-parse --end-of-options HEAD` *echoes the separator back* into its output, because rev-parse prints any token it can't resolve as a revision. Add `--verify` and it prints only the resolved SHA — or fails cleanly — which is what we wanted anyway. The test feeds a leading-dash "SHA" and a leading-dash path into the real functions and asserts they resolve to nothing rather than executing an option. Nothing dramatic happens, which is exactly the success condition.
+
+The same wrapper learned two more manners. A clone left over at the data path is now *checked* before it's reused — its `remote.origin.url` and tracked branch must still match the config — because a stale clone from a repointed `[gitops] repo`, or one left behind by a failover, would otherwise sync the wrong repository entirely. On a mismatch, Lettuce discards it and clones fresh. And the file merge, which used to `HashMap::extend` files in whatever order the hash felt like, now sorts by path first: two nodes handed the identical repo must converge on the identical config, and "last writer wins by hash order" is not a property you can reason about. A resource declared twice across files is reported as a duplicate against the later file rather than silently overwritten.
+
+## A broken sync you can actually see
+
+The last gap was quieter than the others, which is what made it dangerous. When a sync failed — the remote was unreachable, a commit didn't verify, a write was refused — the runner printed to stderr and moved on. Nothing in the cluster state changed. So `relish` and the dashboard, which read `SyncState` out of Raft, showed a sync that looked perfectly healthy while it had in fact been failing every thirty seconds for an hour.
+
+Now every hard failure is recorded where the tools can see it:
+
+```rust
+async fn record_failure(council: &CouncilNode, desired: &DesiredState, error: &str) {
+    let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
+    sync_state.phase = SyncPhase::Error;
+    sync_state.last_error = Some(error.to_string());
+    sync_state.consecutive_failures = sync_state.consecutive_failures.saturating_add(1);
+    sync_state.last_attempt_at = Some(now_millis());
+    council.write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state))).await.ok();
+}
+```
+
+`saturating_add` is worth a word for anyone coming from C: it adds, but clamps at the type's maximum instead of wrapping around to zero. A counter that silently resets to zero after enough failures would be a lie of its own, so we never let it overflow.
+
+The failure count does double duty. It feeds a *back-off*: instead of retrying a broken remote every poll interval and tight-looping against a dead server, the runner waits `poll × 2^failures`, capped, before the next attempt. The `backoff_delay` function was already written and tested — it just had no caller. Wiring it in is the difference between a sync loop that degrades gracefully and one that spins. When a sync finally succeeds, the count resets to zero, the error clears, and the applied commit advances (the atomicity rule from earlier).
+
+Success also stamps the *coordinator*: the runner elects a GitOps coordinator from the council membership and records who it is, so the UI can show which node is meant to be driving syncs. The election prefers a non-leader to spread load, falling back to the leader on a single node. It *complements* the leader rather than replacing it, because only the leader can write to Raft — so the leader still drives the sync, and the coordinator field is a signpost, not a second scheduler. That's a deliberate scope choice, documented here so the next person doesn't go looking for a coordinator that runs the loop.
+
+The test points the runner at a repo path that doesn't exist and waits for `SyncState` to carry a non-empty `last_error` and a non-zero failure count. Before the fix, it would wait forever: the failure never left stderr.
+
 ## Namespaces that actually say no
 
 There's a nice pay-off from making namespaces real desired state. Back when we built the scheduler, it already had a quota ledger — a per-namespace accountant that checks whether admitting an app would bust its CPU, memory, GPU, or replica budget. It was wired, tested, and completely inert, because it was fed an empty table: namespaces weren't desired state yet, so there were no budgets to enforce.

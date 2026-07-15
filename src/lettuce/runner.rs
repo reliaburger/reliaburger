@@ -14,13 +14,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::council::node::CouncilNode;
-use crate::council::types::RaftRequest;
-use crate::meat::types::AppId;
+use crate::council::types::{DesiredState, RaftRequest};
 
 use super::diff::{ChangePayload, ResourceChange};
 use super::git::GitRepo;
-use super::sync::execute_sync;
-use super::types::{GitOpsConfig, SyncResult};
+use super::sync::{SyncOutcome, execute_sync};
+use super::types::{GitOpsConfig, SyncPhase, SyncResult};
 
 /// Spawn the leader-only GitOps sync loop.
 ///
@@ -38,6 +37,11 @@ pub fn spawn_gitops_sync(
         let repo_dir = data_dir.join("gitops-repo");
         let poll = Duration::from_secs(config.poll_interval_secs.max(1));
         let mut ticker = tokio::time::interval(poll);
+
+        // Tracked locally so a run of failures backs off (GIT4): the delay
+        // is `poll * 2^failures`, capped, and is also mirrored into the
+        // durable `SyncState.consecutive_failures` so relish/the UI see it.
+        let mut consecutive_failures: u32 = 0;
 
         loop {
             tokio::select! {
@@ -92,11 +96,15 @@ pub fn spawn_gitops_sync(
             let outcome = match outcome {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(e)) => {
-                    eprintln!("gitops: repo access failed: {e}");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    record_failure(&council, &desired, &format!("repo access failed: {e}")).await;
+                    backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("gitops: sync task panicked: {e}");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    record_failure(&council, &desired, &format!("sync task panicked: {e}")).await;
+                    backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
             };
@@ -105,7 +113,9 @@ pub fn spawn_gitops_sync(
             match &outcome.result {
                 SyncResult::Skipped { .. } => continue,
                 SyncResult::Failure { error } => {
-                    eprintln!("gitops: sync failed: {error}");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    record_failure(&council, &desired, error).await;
+                    backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
                 SyncResult::Success | SyncResult::PartialSuccess { .. } => {}
@@ -129,32 +139,31 @@ pub fn spawn_gitops_sync(
             let applied = match apply_changes(&council, &outcome.changes).await {
                 Ok(applied) => applied,
                 Err(unapplied) => {
-                    eprintln!(
-                        "gitops: sync of {} failed at {unapplied}; commit not advanced, \
-                         will retry next tick",
-                        outcome
-                            .commit
-                            .as_ref()
-                            .map(|c| c.sha.as_str())
-                            .unwrap_or("?")
-                    );
+                    let sha = outcome
+                        .commit
+                        .as_ref()
+                        .map(|c| c.sha.as_str())
+                        .unwrap_or("?");
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    record_failure(
+                        &council,
+                        &desired,
+                        &format!(
+                            "apply of {sha} failed at {unapplied}; commit not advanced, \
+                             will retry"
+                        ),
+                    )
+                    .await;
+                    backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
             };
 
-            // Record the sync state (last applied commit → last_sha) only
-            // after every change committed cleanly.
-            if let Some(commit) = &outcome.commit {
-                let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
-                sync_state.last_applied_commit = Some(commit.clone());
-                sync_state.last_fetched_commit = Some(commit.clone());
-                if let Err(e) = council
-                    .write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state)))
-                    .await
-                {
-                    eprintln!("gitops: failed to record sync state: {e}");
-                }
-            }
+            // A clean cycle: reset the failure run and record the applied
+            // commit (D12) plus the elected coordinator, then clear the
+            // durable error.
+            consecutive_failures = 0;
+            record_success(&council, &desired, &outcome).await;
 
             if applied > 0 {
                 println!(
@@ -168,6 +177,100 @@ pub fn spawn_gitops_sync(
             }
         }
     });
+}
+
+/// Sleep for the back-off delay, waking early on shutdown.
+///
+/// A run of failures shouldn't tight-loop against a broken remote, so the
+/// delay grows with `consecutive_failures` (`backoff_delay`) instead of
+/// retrying every `poll` (GIT4).
+async fn backoff(poll: Duration, consecutive_failures: u32, shutdown: &CancellationToken) {
+    let delay = super::sync::backoff_delay(poll, consecutive_failures);
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = tokio::time::sleep(delay) => {}
+    }
+}
+
+/// Record a hard sync failure durably in `SyncState` (GIT4).
+///
+/// Before this, a failed sync only hit stderr, so relish and the UI
+/// couldn't tell a broken sync from a quiet one. Now the last error,
+/// failure count and attempt time land in Raft.
+async fn record_failure(council: &CouncilNode, desired: &DesiredState, error: &str) {
+    eprintln!("gitops: sync failed: {error}");
+    let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
+    sync_state.phase = SyncPhase::Error;
+    sync_state.last_error = Some(error.to_string());
+    sync_state.consecutive_failures = sync_state.consecutive_failures.saturating_add(1);
+    sync_state.last_attempt_at = Some(now_millis());
+    if let Err(e) = council
+        .write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state)))
+        .await
+    {
+        eprintln!("gitops: failed to record sync failure: {e}");
+    }
+}
+
+/// Record a clean sync in `SyncState`: advance the applied commit, clear
+/// the error, reset the failure count and stamp the elected coordinator.
+async fn record_success(council: &CouncilNode, desired: &DesiredState, outcome: &SyncOutcome) {
+    let Some(commit) = &outcome.commit else {
+        return;
+    };
+    let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
+    sync_state.last_applied_commit = Some(commit.clone());
+    sync_state.last_fetched_commit = Some(commit.clone());
+    sync_state.phase = SyncPhase::Idle;
+    sync_state.last_error = None;
+    sync_state.consecutive_failures = 0;
+    sync_state.last_sync_at = Some(now_millis());
+    sync_state.last_attempt_at = Some(now_millis());
+    sync_state.last_diff_summary = outcome.diff_summary.clone();
+    sync_state.file_errors = outcome.file_errors.clone();
+    // Elect the GitOps coordinator from the current council so relish/the
+    // UI can show who runs syncs. The leader still drives the sync (only
+    // it can write to Raft), so the coordinator *complements* leadership
+    // rather than replacing it — see chapter 7.
+    sync_state.coordinator_node_id = elect_coordinator(council).await;
+    if let Err(e) = council
+        .write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state)))
+        .await
+    {
+        eprintln!("gitops: failed to record sync state: {e}");
+    }
+}
+
+/// Elect the GitOps coordinator from the current council membership.
+///
+/// Prefers a non-leader member to spread load; falls back to the leader
+/// on a single-node cluster. Returns `None` if membership is unknown.
+async fn elect_coordinator(council: &CouncilNode) -> Option<String> {
+    let metrics = council.metrics().borrow().clone();
+    let leader_id = metrics.current_leader?;
+    let membership = metrics.membership_config.membership().clone();
+    let leader_name = membership
+        .nodes()
+        .find(|(id, _)| **id == leader_id)
+        .map(|(_, info)| info.name.clone())?;
+    let members: Vec<String> = membership
+        .nodes()
+        .map(|(_, info)| info.name.clone())
+        .collect();
+    super::coordinator::select_coordinator(
+        &members,
+        &leader_name,
+        super::types::CoordinatorElectionReason::Initial,
+    )
+    .map(|election| election.node_id)
+}
+
+/// Current Unix time in milliseconds.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Apply a sync's changes to Raft, stopping at the first failure.
@@ -215,15 +318,14 @@ fn change_to_request(change: &ResourceChange) -> Option<RaftRequest> {
 fn payload_to_request(resource_id: &str, payload: &ChangePayload) -> Option<RaftRequest> {
     match payload {
         ChangePayload::App(spec) => {
-            // Key on the spec's own namespace, exactly as
-            // `config_to_desired_writes` does — not a hardcoded `default`.
-            // Otherwise a `namespace = "prod"` app lands under `default`
-            // via GitOps but `prod` via manual apply: the two paths would
-            // diverge (caught by the T6 acceptance test).
-            let name = resource_id.strip_prefix("app.")?;
-            let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+            // The resource id already carries the full identity
+            // (`app.<namespace>/<name>`), derived the same way
+            // `config_to_desired_writes` derives its `AppId` (GIT2). Parse
+            // it back rather than re-deriving from the spec so add, update
+            // and remove all agree on one identity.
+            let app_id = super::diff::parse_app_resource_id(resource_id)?;
             Some(RaftRequest::AppSpec {
-                app_id: AppId::new(name, &namespace),
+                app_id,
                 spec: spec.clone(),
             })
         }
@@ -243,7 +345,7 @@ fn payload_to_request(resource_id: &str, payload: &ChangePayload) -> Option<Raft
 
 /// A removal `resource_id` → its `Delete` write.
 fn remove_to_request(resource_id: &str) -> Option<RaftRequest> {
-    if let Some(app_id) = app_id_from_resource(resource_id) {
+    if let Some(app_id) = super::diff::parse_app_resource_id(resource_id) {
         return Some(RaftRequest::AppDelete { app_id });
     }
     if let Some(name) = resource_id.strip_prefix("namespace.") {
@@ -259,12 +361,6 @@ fn remove_to_request(resource_id: &str) -> Option<RaftRequest> {
     None
 }
 
-/// Parse `"app.<name>"` into an `AppId` in the default namespace.
-fn app_id_from_resource(resource_id: &str) -> Option<AppId> {
-    let name = resource_id.strip_prefix("app.")?;
-    Some(AppId::new(name, "default"))
-}
-
 fn change_id(change: &ResourceChange) -> &str {
     match change {
         ResourceChange::Add { resource_id, .. }
@@ -276,25 +372,34 @@ fn change_id(change: &ResourceChange) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meat::types::AppId;
 
     #[test]
-    fn resource_id_parses_app_prefix() {
+    fn app_removal_parses_the_full_namespaced_identity() {
         assert_eq!(
-            app_id_from_resource("app.web"),
-            Some(AppId::new("web", "default"))
+            remove_to_request("app.prod/web"),
+            Some(RaftRequest::AppDelete {
+                app_id: AppId::new("web", "prod")
+            })
         );
-        assert!(app_id_from_resource("job.migrate").is_none());
+        // A bare-name id (no namespace segment) isn't a valid app id.
+        assert!(remove_to_request("app.web").is_none());
+        assert!(remove_to_request("job.migrate").is_none());
     }
 
     #[test]
-    fn app_payload_becomes_an_appspec_write() {
+    fn app_payload_becomes_a_namespaced_appspec_write() {
         let spec = crate::config::Config::parse("[app.web]\nimage = \"x:1\"\n")
             .unwrap()
             .app
             .remove("web")
             .unwrap();
-        let req = payload_to_request("app.web", &ChangePayload::App(Box::new(spec)));
-        assert!(matches!(req, Some(RaftRequest::AppSpec { .. })));
+        // The resource id carries the namespace; the write keys on it.
+        let req = payload_to_request("app.prod/web", &ChangePayload::App(Box::new(spec)));
+        assert!(matches!(
+            req,
+            Some(RaftRequest::AppSpec { app_id, .. }) if app_id == AppId::new("web", "prod")
+        ));
 
         // Generic payloads (jobs etc.) are skipped, not mis-applied.
         assert!(payload_to_request("job.x", &ChangePayload::Generic).is_none());
@@ -328,7 +433,7 @@ mod tests {
     fn removals_map_to_delete_writes_for_every_kind() {
         assert!(matches!(
             change_to_request(&ResourceChange::Remove {
-                resource_id: "app.web".to_string()
+                resource_id: "app.default/web".to_string()
             }),
             Some(RaftRequest::AppDelete { .. })
         ));

@@ -370,18 +370,158 @@ async fn apply_changes_stops_and_reports_on_write_failure() {
         .remove("web")
         .unwrap();
     let changes = vec![ResourceChange::Add {
-        resource_id: "app.web".to_string(),
+        resource_id: "app.default/web".to_string(),
         spec: ChangePayload::App(Box::new(spec)),
     }];
 
     let result = apply_changes(&node, &changes).await;
     assert!(
-        matches!(result, Err(ref id) if id == "app.web"),
+        matches!(result, Err(ref id) if id == "app.default/web"),
         "a failed write must be reported, not swallowed: {result:?}"
     );
     // And the app never reached desired state.
     assert!(node.desired_state().await.apps.is_empty());
     node.shutdown().await.ok();
+}
+
+/// GIT2: a `prod/web` removed from git deletes `prod/web`, and a
+/// same-named `default/web` that git never mentioned is untouched. Before
+/// the fix the diff keyed on the bare name, so a `prod` deletion could
+/// take out `default/web` (or spare the wrong app).
+#[tokio::test]
+async fn sync_deletes_the_namespaced_app_not_the_default_one() {
+    use reliaburger::config::Config;
+    use reliaburger::council::types::RaftRequest;
+
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
+
+    let council = single_node_leader().await;
+
+    // Seed two same-named apps in different namespaces directly into Raft,
+    // as if a previous sync (or manual apply) had created them.
+    for namespace in ["prod", "default"] {
+        let spec = Config::parse("[app.web]\nimage = \"web:v1\"\n")
+            .unwrap()
+            .app
+            .remove("web")
+            .unwrap();
+        council
+            .write(RaftRequest::AppSpec {
+                app_id: AppId::new("web", namespace),
+                spec: Box::new(spec),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Git declares only default/web, so prod/web must be reconciled away.
+    let repo_dir = tempfile::tempdir().unwrap();
+    make_repo(
+        repo_dir.path(),
+        r#"
+        [app.web]
+        image = "web:v1"
+    "#,
+    );
+
+    let shutdown = CancellationToken::new();
+    let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = GitOpsConfig {
+        repo: repo_dir.path().to_string_lossy().to_string(),
+        branch: "main".to_string(),
+        path: "/".to_string(),
+        poll_interval_secs: 1,
+        require_signed_commits: false,
+        trusted_signing_keys: vec![],
+        webhook_secret: None,
+        recursive: false,
+        webhook_rate_limit: 10,
+    };
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        config,
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+    );
+
+    let council_check = Arc::clone(&council);
+    let converged = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&council_check);
+        Box::pin(async move {
+            let apps = c.desired_state().await.apps;
+            // prod/web gone, default/web still present.
+            !apps.contains_key(&AppId::new("web", "prod"))
+                && apps.contains_key(&AppId::new("web", "default"))
+        })
+    })
+    .await;
+    assert!(
+        converged,
+        "gitops must delete prod/web and keep default/web"
+    );
+
+    shutdown.cancel();
+    council.shutdown().await.ok();
+}
+
+/// GIT4 durable errors: a sync that can't reach its repo records the
+/// failure in `SyncState` (last_error + a non-zero failure count) so
+/// relish and the UI can see a broken sync, not just stderr.
+#[tokio::test]
+async fn a_failed_sync_is_recorded_in_sync_state() {
+    assert!(
+        which_git().is_some(),
+        "git is required for the GitOps suite"
+    );
+
+    let council = single_node_leader().await;
+    let shutdown = CancellationToken::new();
+    let (_webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+    let data_dir = tempfile::tempdir().unwrap();
+
+    // A repo path that doesn't exist: the clone fails on every attempt.
+    let config = GitOpsConfig {
+        repo: "/nonexistent/repo/does/not/exist.git".to_string(),
+        branch: "main".to_string(),
+        path: "/".to_string(),
+        poll_interval_secs: 1,
+        require_signed_commits: false,
+        trusted_signing_keys: vec![],
+        webhook_secret: None,
+        recursive: false,
+        webhook_rate_limit: 10,
+    };
+    spawn_gitops_sync(
+        Arc::clone(&council),
+        config,
+        webhook_rx,
+        data_dir.path().to_path_buf(),
+        shutdown.clone(),
+    );
+
+    let council_check = Arc::clone(&council);
+    let recorded = wait_for(Duration::from_secs(15), || {
+        let c = Arc::clone(&council_check);
+        Box::pin(async move {
+            match c.desired_state().await.gitops_sync_state {
+                Some(state) => state.last_error.is_some() && state.consecutive_failures > 0,
+                None => false,
+            }
+        })
+    })
+    .await;
+    assert!(
+        recorded,
+        "a hard sync failure must be durable in SyncState, not stderr-only"
+    );
+
+    shutdown.cancel();
+    council.shutdown().await.ok();
 }
 
 fn which_git() -> Option<()> {
