@@ -406,6 +406,26 @@ mod tests {
     }
 
     #[test]
+    fn pending_with_missing_metric_falls_back_to_inactive() {
+        // OBS4: a *pending* alert whose data vanishes is inconclusive — we don't
+        // fire on nothing, so it drops back to inactive (only a firing alert is
+        // held through stale telemetry).
+        let rule = AlertRule {
+            for_duration: Duration::from_secs(3600), // long, so it stays pending
+            ..simple_rule("test", "cpu", 80.0, AlertOperator::GreaterThan)
+        };
+        let mut eval = AlertEvaluator::new(vec![rule]);
+
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
+        assert_eq!(eval.all_statuses()[0].state, "pending");
+
+        // Data disappears while pending.
+        let t = eval.evaluate(&HashMap::new());
+        assert!(t.is_empty(), "pending→inactive is not a firing transition");
+        assert_eq!(eval.all_statuses()[0].state, "inactive");
+    }
+
+    #[test]
     fn stale_telemetry_does_not_resolve_a_firing_alert() {
         // OBS4: an app that dies and stops emitting must not silently clear its
         // own alert. Once firing, a *missing* metric keeps it firing (we can't

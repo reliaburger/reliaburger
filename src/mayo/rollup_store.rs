@@ -933,4 +933,68 @@ mod tests {
         assert_eq!(results.len(), 1, "corrupt file broke an unrelated query");
         assert_eq!(results[0].3, 10.0);
     }
+
+    #[tokio::test]
+    async fn prune_removes_old_rollup_files() {
+        let (mut store, _dir) = test_store();
+        store.ingest(&make_rollup("n1", 1000, "cpu", 10.0));
+        store.flush().await.unwrap();
+
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 10_000;
+        assert_eq!(store.prune(future).unwrap(), 1);
+
+        // Pruning to the epoch keeps everything.
+        store.ingest(&make_rollup("n2", 1000, "cpu", 20.0));
+        store.flush().await.unwrap();
+        assert_eq!(store.prune(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn cluster_aggregate_avg_zero_count_is_none() {
+        let agg = ClusterAggregate {
+            timestamp: 1,
+            metric_name: "cpu".to_string(),
+            labels: "{}".to_string(),
+            min: 0.0,
+            max: 0.0,
+            sum: 0.0,
+            count: 0,
+        };
+        assert_eq!(agg.avg(), None);
+    }
+
+    #[tokio::test]
+    async fn cluster_aggregates_query_neutralises_injection() {
+        // OBS1: the aggregates path escapes the metric name too.
+        let (mut store, _dir) = test_store();
+        store.ingest(&make_rollup("n1", 1000, "cpu", 10.0));
+        store.flush().await.unwrap();
+
+        let injected = store
+            .query_cluster_aggregates("x' OR '1'='1", 0, 9999)
+            .await
+            .unwrap();
+        assert!(injected.is_empty(), "injection matched rows: {injected:?}");
+    }
+
+    #[tokio::test]
+    async fn idempotency_tracker_stays_bounded() {
+        // OBS2: the (node, window) tracker is pruned to a horizon so it doesn't
+        // grow without bound over a long-running process.
+        let (mut store, _dir) = test_store();
+        let horizon = IDEMPOTENCY_HORIZON_SECS;
+        // Ingest windows spread far apart so old ones fall past the horizon.
+        for i in 0..(MAX_SEEN_WINDOWS as u64 + 10) {
+            store.ingest(&make_rollup("n1", i * horizon, "cpu", 1.0));
+        }
+        assert!(
+            store.seen_windows.len() <= MAX_SEEN_WINDOWS,
+            "tracker grew past the cap: {}",
+            store.seen_windows.len()
+        );
+    }
 }

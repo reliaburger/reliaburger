@@ -902,7 +902,8 @@ async fn main() -> anyhow::Result<()> {
                     // instances and collect per-process CPU/memory for each one
                     // with a PID, labelled `namespace/app`. Without this only
                     // node-level metrics existed, so the autoscaler and the
-                    // per-app dashboards had no signal.
+                    // per-app dashboards had no signal. The labelling itself
+                    // lives in `collect_instance_metrics` so it's unit-tested.
                     let (status_tx, status_rx) = tokio::sync::oneshot::channel();
                     if collection_cmd_tx
                         .send(reliaburger::bun::agent::AgentCommand::Status { response: status_tx })
@@ -910,14 +911,11 @@ async fn main() -> anyhow::Result<()> {
                         .is_ok()
                         && let Ok(statuses) = status_rx.await
                     {
-                        for s in &statuses {
-                            if let Some(pid) = s.pid {
-                                let app_label = format!("{}/{}", s.namespace, s.app_name);
-                                samples.extend(
-                                    collector.collect_process_metrics(pid, &app_label),
-                                );
-                            }
-                        }
+                        let instances: Vec<(Option<u32>, &str, &str)> = statuses
+                            .iter()
+                            .map(|s| (s.pid, s.namespace.as_str(), s.app_name.as_str()))
+                            .collect();
+                        samples.extend(collector.collect_instance_metrics(&instances));
                     }
 
                     {
@@ -929,24 +927,13 @@ async fn main() -> anyhow::Result<()> {
 
                     flush_counter += 1;
                     // Flush to Parquet every 6 ticks (~60s at 10s interval).
-                    // Drain the buffer under the lock, then write outside it so
-                    // concurrent queries don't starve during the I/O (OBS5).
-                    if flush_counter.is_multiple_of(6) {
-                        let pending = {
-                            let mut store = collection_mayo.write().await;
-                            store.take_flush_batch()
-                        };
-                        match pending {
-                            Ok(Some(p)) => {
-                                if let Err(e) =
-                                    reliaburger::mayo::store::write_pending_flush(p).await
-                                {
-                                    eprintln!("bun: metrics flush error: {e}");
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => eprintln!("bun: metrics flush error: {e}"),
-                        }
+                    // `flush_off_lock` drains under a brief lock then writes
+                    // outside it, so concurrent queries don't starve (OBS5).
+                    if flush_counter.is_multiple_of(6)
+                        && let Err(e) =
+                            reliaburger::mayo::store::flush_off_lock(&collection_mayo).await
+                    {
+                        eprintln!("bun: metrics flush error: {e}");
                     }
                 }
             }

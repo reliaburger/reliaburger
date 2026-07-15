@@ -399,6 +399,17 @@ mod tests {
         }
     }
 
+    fn firing_warning_transition() -> AlertTransition {
+        AlertTransition {
+            rule_name: "memory_high".to_string(),
+            severity: AlertSeverity::Warning,
+            description: "Memory usage above 70%".to_string(),
+            kind: TransitionKind::Firing,
+            value: Some(75.0),
+            fired_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        }
+    }
+
     #[test]
     fn payload_json_matches_spec() {
         let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
@@ -485,6 +496,128 @@ mod tests {
         // A resolve carries the same dedup_key but no payload.
         assert!(json["dedup_key"].as_str().unwrap().contains("cpu_throttle"));
         assert!(json.get("payload").is_none() || json["payload"].is_null());
+    }
+
+    #[test]
+    fn slack_firing_warning_is_amber() {
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let json =
+            serde_json::to_value(dispatcher.build_slack_payload(&firing_warning_transition()))
+                .unwrap();
+        assert_eq!(json["attachments"][0]["color"], "warning");
+    }
+
+    #[test]
+    fn pagerduty_warning_severity_maps_through() {
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let dest = AlertDestination {
+            dest_type: "pagerduty".to_string(),
+            url: "https://events.pagerduty.com/v2/enqueue".to_string(),
+            severity: vec![],
+            secret: Some("rk".to_string()),
+        };
+        let json = serde_json::to_value(
+            dispatcher.build_pagerduty_payload(&dest, &firing_warning_transition()),
+        )
+        .unwrap();
+        assert_eq!(json["payload"]["severity"], "warning");
+    }
+
+    #[test]
+    fn body_for_dispatches_by_destination_type() {
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let make = |t: &str| AlertDestination {
+            dest_type: t.to_string(),
+            url: "https://example.com".to_string(),
+            severity: vec![],
+            secret: Some("rk".to_string()),
+        };
+
+        // Slack → attachments; PagerDuty → routing_key; anything else → the
+        // generic Mayo schema (version field).
+        let slack: serde_json::Value = serde_json::from_slice(
+            &dispatcher
+                .body_for(&make("slack"), &firing_transition())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(slack["attachments"].is_array());
+
+        let pd: serde_json::Value = serde_json::from_slice(
+            &dispatcher
+                .body_for(&make("pagerduty"), &firing_transition())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(pd["routing_key"].is_string());
+
+        for unknown in ["webhook", "something-else"] {
+            let generic: serde_json::Value = serde_json::from_slice(
+                &dispatcher
+                    .body_for(&make(unknown), &firing_transition())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                generic["version"], "1",
+                "{unknown} should get generic shape"
+            );
+        }
+    }
+
+    /// Integration test: a Slack destination receives an attachments body.
+    #[tokio::test]
+    async fn dispatch_slack_delivers_attachments() {
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let received_clone = Arc::clone(&received);
+        let app = Router::new().route(
+            "/slack",
+            post(move |body: axum::body::Bytes| {
+                let received = Arc::clone(&received_clone);
+                async move {
+                    received.lock().await.push(body.to_vec());
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let dest = AlertDestination {
+            dest_type: "slack".to_string(),
+            url: format!("http://{addr}/slack"),
+            severity: vec![],
+            secret: None,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let dispatcher = WebhookDispatcher::new(client, vec![dest], "prod".to_string());
+        dispatcher.dispatch(&firing_transition()).await;
+
+        // Poll for delivery instead of sleeping a fixed interval.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(b) = received.lock().await.first().cloned() {
+                break b;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("slack webhook not delivered");
+            }
+            tokio::task::yield_now().await;
+        };
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["attachments"].is_array());
+        assert_eq!(json["attachments"][0]["color"], "danger");
     }
 
     #[test]

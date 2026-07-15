@@ -83,6 +83,29 @@ pub struct PendingFlush {
     batch: RecordBatch,
 }
 
+/// Flush a shared store without holding its lock across the (blocking) write.
+///
+/// Drains the buffer under a brief write lock, releases it, then writes the
+/// Parquet file on the blocking pool (OBS5/M3). Returns `true` if a file was
+/// written, `false` if the buffer was empty. Extracted from the `bun`
+/// collection task so the drain-then-write-off-lock sequence is unit-testable
+/// instead of living only in the binary.
+pub async fn flush_off_lock(
+    store: &std::sync::Arc<tokio::sync::RwLock<MayoStore>>,
+) -> Result<bool, MayoError> {
+    let pending = {
+        let mut guard = store.write().await;
+        guard.take_flush_batch()?
+    };
+    match pending {
+        Some(p) => {
+            write_pending_flush(p).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Persist a [`PendingFlush`] to disk on the blocking pool. Runs with no lock
 /// held, so concurrent queries proceed while the write is in flight.
 pub async fn write_pending_flush(pending: PendingFlush) -> Result<(), MayoError> {
@@ -904,5 +927,101 @@ mod tests {
         let results = store.query("cpu", 0, 9999).await.unwrap();
         assert_eq!(results.len(), 1, "corrupt file broke an unrelated query");
         assert_eq!(results[0].3, 10.0);
+    }
+
+    #[tokio::test]
+    async fn flush_off_lock_writes_and_reports_emptiness() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RwLock::new(MayoStore::new(dir.path().to_path_buf())));
+
+        // Empty buffer: nothing written, reports false.
+        assert!(!flush_off_lock(&store).await.unwrap());
+
+        // With data: writes one Parquet file, reports true, clears the buffer.
+        store
+            .write()
+            .await
+            .insert(&MetricKey::simple("cpu"), Sample::at(1, 7.0));
+        assert!(flush_off_lock(&store).await.unwrap());
+        assert_eq!(store.read().await.buffer_len(), 0);
+
+        let files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "parquet")
+            })
+            .count();
+        assert_eq!(files, 1);
+
+        // The data is queryable afterwards.
+        let rows = store.read().await.query("cpu", 0, 9999).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, 7.0);
+    }
+
+    #[tokio::test]
+    async fn prune_removes_old_parquet_files() {
+        let (mut store, dir) = test_store();
+        store.insert(&MetricKey::simple("cpu"), Sample::at(1, 10.0));
+        store.flush().await.unwrap();
+        assert!(dir_has_parquet(dir.path()));
+
+        // A `before` far in the future prunes every file (they're older).
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 10_000;
+        let deleted = store.prune(future).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(!dir_has_parquet(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_recent_parquet_files() {
+        let (mut store, dir) = test_store();
+        store.insert(&MetricKey::simple("cpu"), Sample::at(1, 10.0));
+        store.flush().await.unwrap();
+
+        // A `before` of 0 keeps everything (nothing is older than the epoch).
+        let deleted = store.prune(0).unwrap();
+        assert_eq!(deleted, 0);
+        assert!(dir_has_parquet(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn query_avg_filters_by_app_label_and_window() {
+        let (mut store, _dir) = test_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut web = std::collections::BTreeMap::new();
+        web.insert("app".to_string(), "web".to_string());
+        let web_key = MetricKey::with_labels("cpu", web);
+        store.insert(&web_key, Sample::at(now - 5, 10.0));
+        store.insert(&web_key, Sample::at(now - 4, 30.0));
+
+        let mut other = std::collections::BTreeMap::new();
+        other.insert("app".to_string(), "other".to_string());
+        let other_key = MetricKey::with_labels("cpu", other);
+        store.insert(&other_key, Sample::at(now - 5, 100.0));
+        store.flush().await.unwrap();
+
+        // Average across web's two samples only: (10 + 30) / 2 = 20.
+        let avg = store.query_avg("cpu", "web", 60).await.unwrap();
+        assert_eq!(avg, Some(20.0));
+
+        // No data for an unknown app in the window → None.
+        let none = store.query_avg("cpu", "ghost", 60).await.unwrap();
+        assert_eq!(none, None);
     }
 }
