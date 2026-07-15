@@ -1053,6 +1053,18 @@ whole theme lands.
   old M3/M4/M19/M20/M24/X8, OBS1-OBS8).
   - [x] Cluster rollup metric-name queries escaped via `escape_sql_literal`, closing the
     `/v1/metrics/rollup` SQL injection where `params.name` was interpolated raw (OBS1).
+  - [x] **PR O1 — Metrics.** OBS1-remainder: `metrics_app_handler` escapes both `?name=` and
+    the `namespace/app` path before interpolation (injection can't bypass the tenant/time
+    predicate). OBS2 rollups: buffer bounded, windows epoch-aligned, ingest idempotent per
+    `(node, window)` so a re-sent window doesn't double-count, and the flush counter recovers
+    past existing files on restart (no clobber) with history read back from Parquet. OBS3:
+    the collection loop now collects per-app process metrics (labelled `namespace/app`) from
+    the agent's running instances, so autoscaling/dashboards have a signal. OBS4 alerts:
+    stale telemetry no longer resolves a firing alert (value-not-boolean state machine),
+    Slack (attachments) and PagerDuty (Events API v2) get provider-shaped payloads, and a
+    zero `evaluation_interval_secs` is rejected at startup. OBS5/M3: flush drains under a
+    brief lock then writes via `spawn_blocking` off the lock (queries proceed during a
+    flush), and a corrupt Parquet file is skipped per-file rather than failing every query.
 - [x] **GitOps convergence and webhook security** — expose a signature-validated HMAC
   webhook route with replay/rate controls; make diff namespace-aware and deterministic;
   apply every resource through the unified desired-state path; never advance last_applied

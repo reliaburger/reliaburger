@@ -318,6 +318,12 @@ async fn main() -> anyhow::Result<()> {
         .backup
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    // A zero alert interval would panic `tokio::time::interval` at startup
+    // (OBS4); reject it here with a clear message.
+    config
+        .alerts
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
     let port_allocator = PortAllocator::new(
@@ -880,6 +886,7 @@ async fn main() -> anyhow::Result<()> {
     let collection_mayo = Arc::clone(&mayo_store);
     let collection_interval = config.metrics.collection_interval_secs;
     let collection_shutdown = shutdown.clone();
+    let collection_cmd_tx = cmd_tx.clone();
     tokio::spawn(async move {
         let mut collector = SystemCollector::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
@@ -889,15 +896,42 @@ async fn main() -> anyhow::Result<()> {
                 _ = collection_shutdown.cancelled() => break,
                 _ = tick.tick() => {
                     collector.refresh();
-                    let metrics = collector.collect_node_metrics();
-                    let mut store = collection_mayo.write().await;
-                    for m in &metrics {
-                        store.insert_now(&m.key, m.value);
+                    let mut samples = collector.collect_node_metrics();
+
+                    // Per-app metrics (OBS3): ask the agent for its running
+                    // instances and collect per-process CPU/memory for each one
+                    // with a PID, labelled `namespace/app`. Without this only
+                    // node-level metrics existed, so the autoscaler and the
+                    // per-app dashboards had no signal. The labelling itself
+                    // lives in `collect_instance_metrics` so it's unit-tested.
+                    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+                    if collection_cmd_tx
+                        .send(reliaburger::bun::agent::AgentCommand::Status { response: status_tx })
+                        .await
+                        .is_ok()
+                        && let Ok(statuses) = status_rx.await
+                    {
+                        let instances: Vec<(Option<u32>, &str, &str)> = statuses
+                            .iter()
+                            .map(|s| (s.pid, s.namespace.as_str(), s.app_name.as_str()))
+                            .collect();
+                        samples.extend(collector.collect_instance_metrics(&instances));
                     }
+
+                    {
+                        let mut store = collection_mayo.write().await;
+                        for m in &samples {
+                            store.insert_now(&m.key, m.value);
+                        }
+                    }
+
                     flush_counter += 1;
-                    // Flush to Parquet every 6 ticks (~60s at 10s interval)
+                    // Flush to Parquet every 6 ticks (~60s at 10s interval).
+                    // `flush_off_lock` drains under a brief lock then writes
+                    // outside it, so concurrent queries don't starve (OBS5).
                     if flush_counter.is_multiple_of(6)
-                        && let Err(e) = store.flush().await
+                        && let Err(e) =
+                            reliaburger::mayo::store::flush_off_lock(&collection_mayo).await
                     {
                         eprintln!("bun: metrics flush error: {e}");
                     }

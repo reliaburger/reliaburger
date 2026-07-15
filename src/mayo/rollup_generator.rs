@@ -31,10 +31,16 @@ impl RollupGenerator {
 
     /// Generate a rollup from the local MayoStore.
     ///
-    /// Queries the store for the previous `window_secs` window ending
-    /// at `now`. When `extended` is true, covers 5 minutes instead of
-    /// 1 minute (used on first push to a new aggregator after
-    /// reassignment).
+    /// Queries the store for the window ending at `now`. When `extended` is
+    /// true, covers 5 minutes instead of 1 minute (used on first push to a new
+    /// aggregator after reassignment).
+    ///
+    /// The window start is aligned down to a multiple of
+    /// `DEFAULT_ROLLUP_WINDOW_SECS` (OBS2). Without alignment two nodes ticking
+    /// a few seconds apart stamp the same data with different `timestamp`s, so
+    /// the council can't tell one node's re-sent window from a genuinely new
+    /// one and can't deduplicate. Aligned windows give every node the same
+    /// `(node, window)` key for the same minute.
     pub async fn generate(
         &self,
         store: &MayoStore,
@@ -46,9 +52,13 @@ impl RollupGenerator {
         } else {
             DEFAULT_ROLLUP_WINDOW_SECS
         };
-        let start = now.saturating_sub(window);
+        // Align the window end down to a minute boundary, then step back one
+        // window. `now - (now % W)` is the start of the current minute; the
+        // completed window we roll up is the one before it.
+        let aligned_end = now - (now % DEFAULT_ROLLUP_WINDOW_SECS);
+        let start = aligned_end.saturating_sub(window);
 
-        let aggregates = store.query_window_aggregates(start, now).await?;
+        let aggregates = store.query_window_aggregates(start, aligned_end).await?;
 
         let entries = aggregates
             .into_iter()
@@ -96,16 +106,18 @@ mod tests {
     async fn generates_correct_aggregates() {
         let (mut store, _dir) = test_store();
         let key = MetricKey::simple("cpu_usage");
-        store.insert(&key, Sample::at(1000, 10.0));
-        store.insert(&key, Sample::at(1010, 20.0));
-        store.insert(&key, Sample::at(1020, 30.0));
+        // `now = 1080` aligns to window [1020, 1080); these three land inside.
+        store.insert(&key, Sample::at(1020, 10.0));
+        store.insert(&key, Sample::at(1040, 20.0));
+        store.insert(&key, Sample::at(1060, 30.0));
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1060, false).await.unwrap();
+        let rollup = generator.generate(&store, 1080, false).await.unwrap();
 
         assert_eq!(rollup.node_id, NodeId::new("node-1"));
-        assert_eq!(rollup.timestamp, 1000);
+        // The window start is aligned to a minute boundary.
+        assert_eq!(rollup.timestamp, 1020);
         assert_eq!(rollup.entries.len(), 1);
 
         let entry = &rollup.entries[0];
