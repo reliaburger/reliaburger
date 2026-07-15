@@ -417,17 +417,24 @@ The 104 tests in `src/pickle/` cover:
 - **OCI API** — `full_push_pull_round_trip` drives the real `/v2/` handlers end to end against an in-process server; plus the not-found paths (`blob_head_not_found`, `manifest_get_not_found`) that must return the right status codes. The manifest-validation contract gets a rejection matrix: invalid JSON, missing or unknown media type, size mismatch, malformed descriptor digest, missing referenced blob, and a happy path asserting the GET returns byte-identical bytes.
 - **Garbage collection** — the safety rails get a test each: `gc_protects_sole_copy`, `gc_protects_active_deployment_images`, `gc_protects_tagged_manifest_layers`, `gc_protects_within_retention_window`, and the positive case `gc_collects_unreferenced_blob`. These are the tests that let you trust GC won't eat your last copy of a layer. `gc_never_nominates_a_catalogued_manifests_own_blob` pins the REG1 fix, and `tests/pickle_integrity.rs` runs the full push → GC → peer-pull acceptance sequence against real in-process registries.
 
-### Gated tests — anything that touches a real image or runtime
+### Hermetic protocol tests, provisioned runtime tests
 
-Pulling a real image, or running one under a real container runtime, can't go in the default suite: Docker Hub rate-limits and flakes, runc needs Linux and root, Apple Container needs macOS. So those are gated behind environment variables and only run when you ask:
+The image-pull protocol belongs in the portable suite. An in-process registry serves a
+digest-pinned synthetic image over loopback, so manifest fetching, blob digest validation,
+unpacking and cache reuse don't depend on Docker Hub or a mutable tag.
+
+Real runtimes are different. runc needs Linux and kernel capabilities; Apple Container
+needs Apple silicon and nested virtualisation. Those tests compile with a reasoned
+`#[ignore]` and run through named targets:
 
 ```sh
-RELIABURGER_IMAGE_PULL_TESTS=1 cargo test     # pull a real image from Docker Hub (needs network)
-RELIABURGER_RUNC_TESTS=1 cargo test           # run under runc (Linux only)
-RELIABURGER_APPLE_CONTAINER_TESTS=1 cargo test # run under Apple Container (macOS only)
+sudo make test-linux  # runc plus the other provisioned Linux/kernel suites
+make test-apple       # manual Apple Container check
 ```
 
-The gating lives in `src/grill/{image,runc,apple}.rs`: each gated test reads its variable with `std::env::var(...)` at the top and returns early if it's unset. That keeps `cargo test` fast and hermetic for everyone, while the people who *can* run the heavy paths (a Linux CI box, a macOS laptop with Docker Desktop) get full coverage by flipping one switch.
+An explicitly requested suite asserts its prerequisites and fails if they are missing. It
+never returns early and appears green without running. Chapter 15 explains the distinction
+between `#[cfg]`, `#[ignore]` and an executed test in detail.
 
 For an end-to-end smoke test of a real push and pull through Pickle on macOS:
 

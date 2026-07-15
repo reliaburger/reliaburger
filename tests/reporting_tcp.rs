@@ -34,7 +34,10 @@ fn fast_config() -> ReportingTreeSection {
 }
 
 /// Answer snapshot requests with a fixed one-instance snapshot.
-fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: CancellationToken) {
+fn spawn_fake_agent(
+    mut rx: mpsc::Receiver<CollectSnapshotRequest>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -62,7 +65,7 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                 }
             }
         }
-    });
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -70,11 +73,11 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
     let shutdown = CancellationToken::new();
 
     // One aggregator (the "council member") on a real TCP socket.
-    let agg_addr = local(18301);
-    let agg_transport = TcpReportingTransport::bind(agg_addr, shutdown.clone())
+    let agg_transport = TcpReportingTransport::bind(local(0), shutdown.clone())
         .await
         .unwrap();
-    let (mut aggregator, watch_rx) = ReportAggregator::new(
+    let agg_addr = agg_transport.local_addr();
+    let (mut aggregator, mut watch_rx) = ReportAggregator::new(
         agg_transport,
         fast_config(),
         shutdown.clone(),
@@ -82,18 +85,18 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
         None,
         None,
     );
-    tokio::spawn(async move { aggregator.run().await });
+    let mut tasks = vec![tokio::spawn(async move { aggregator.run().await })];
 
     // Council list both workers see: the single aggregator.
     let council = vec![(NodeId::new("agg"), agg_addr)];
 
     // Two workers on their own real TCP sockets, each with a fake agent.
-    for (name, port) in [("w1", 18302u16), ("w2", 18303u16)] {
-        let transport = TcpReportingTransport::bind(local(port), shutdown.clone())
+    for name in ["w1", "w2"] {
+        let transport = TcpReportingTransport::bind(local(0), shutdown.clone())
             .await
             .unwrap();
         let (snap_tx, snap_rx) = mpsc::channel(16);
-        spawn_fake_agent(snap_rx, shutdown.clone());
+        tasks.push(spawn_fake_agent(snap_rx, shutdown.clone()));
         let (_council_tx, council_rx) = watch::channel(council.clone());
         let mut worker = ReportWorker::new(
             NodeId::new(name),
@@ -103,23 +106,28 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
             council_rx,
             shutdown.clone(),
         );
-        tokio::spawn(async move { worker.run().await });
+        tasks.push(tokio::spawn(async move { worker.run().await }));
     }
 
-    // Within a few report intervals, the aggregator should hold both reports.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut got_both = false;
-    while tokio::time::Instant::now() < deadline {
-        let have_both = {
-            let reports = &watch_rx.borrow().reports;
-            reports.contains_key(&NodeId::new("w1")) && reports.contains_key(&NodeId::new("w2"))
-        };
-        if have_both {
-            got_both = true;
-            break;
+    // Wait on the state channel itself. Polling used to miss updates on busy
+    // CI runners and produced the observed empty-report flake.
+    let got_both = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let have_both = {
+                let view = watch_rx.borrow_and_update();
+                view.reports.contains_key(&NodeId::new("w1"))
+                    && view.reports.contains_key(&NodeId::new("w2"))
+            };
+            if have_both {
+                return true;
+            }
+            if watch_rx.changed().await.is_err() {
+                return false;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    })
+    .await
+    .unwrap_or(false);
 
     assert!(
         got_both,
@@ -128,6 +136,12 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
     );
 
     shutdown.cancel();
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("reporting task did not stop after cancellation")
+            .expect("reporting task panicked");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +204,7 @@ async fn report_arrives(
             .await
             .unwrap();
     let agg_addr = agg_transport.local_addr();
-    let (mut aggregator, watch_rx) = ReportAggregator::new(
+    let (mut aggregator, mut watch_rx) = ReportAggregator::new(
         agg_transport,
         fast_config(),
         shutdown.clone(),
@@ -198,7 +212,7 @@ async fn report_arrives(
         None,
         None,
     );
-    tokio::spawn(async move { aggregator.run().await });
+    let aggregator_task = tokio::spawn(async move { aggregator.run().await });
 
     let (w_acc, w_con) = match worker_tls {
         Some((a, c)) => (Some(a), Some(c)),
@@ -208,7 +222,7 @@ async fn report_arrives(
         .await
         .unwrap();
     let (snap_tx, snap_rx) = mpsc::channel(16);
-    spawn_fake_agent(snap_rx, shutdown.clone());
+    let agent_task = spawn_fake_agent(snap_rx, shutdown.clone());
     let council = vec![(NodeId::new("agg"), agg_addr)];
     let (_council_tx, council_rx) = watch::channel(council);
     let mut worker = ReportWorker::new(
@@ -219,18 +233,31 @@ async fn report_arrives(
         council_rx,
         shutdown.clone(),
     );
-    tokio::spawn(async move { worker.run().await });
+    let worker_task = tokio::spawn(async move { worker.run().await });
 
-    let end = tokio::time::Instant::now() + deadline;
-    let mut arrived = false;
-    while tokio::time::Instant::now() < end {
-        if watch_rx.borrow().reports.contains_key(&NodeId::new("w1")) {
-            arrived = true;
-            break;
+    let arrived = tokio::time::timeout(deadline, async {
+        loop {
+            if watch_rx
+                .borrow_and_update()
+                .reports
+                .contains_key(&NodeId::new("w1"))
+            {
+                return true;
+            }
+            if watch_rx.changed().await.is_err() {
+                return false;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    })
+    .await
+    .unwrap_or(false);
     shutdown.cancel();
+    for task in [aggregator_task, agent_task, worker_task] {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("reporting task did not stop after cancellation")
+            .expect("reporting task panicked");
+    }
     arrived
 }
 

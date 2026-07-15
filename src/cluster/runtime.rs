@@ -874,6 +874,7 @@ pub fn spawn_council_reconciler_with_pressure(
 ) {
     tokio::spawn(async move {
         let mut tracker = HealthTracker::default();
+        let mut deposition_throttle = DepositionThrottle::default();
         let mut tick = tokio::time::interval(config.tick_interval);
         loop {
             tokio::select! {
@@ -888,6 +889,7 @@ pub fn spawn_council_reconciler_with_pressure(
                         &self_info,
                         &config,
                         &mut tracker,
+                        &mut deposition_throttle,
                         &disk_pressured,
                     )
                     .await;
@@ -895,6 +897,34 @@ pub fn spawn_council_reconciler_with_pressure(
             }
         }
     });
+}
+
+#[derive(Default)]
+struct DepositionThrottle {
+    last_attempt: Option<(u64, Instant)>,
+}
+
+impl DepositionThrottle {
+    fn allow(&mut self, leader: u64, now: Instant, cooldown: Duration) -> bool {
+        let allowed = self.last_attempt.is_none_or(|(previous, attempted_at)| {
+            previous != leader || now.duration_since(attempted_at) >= cooldown
+        });
+        if allowed {
+            self.last_attempt = Some((leader, now));
+        }
+        allowed
+    }
+
+    fn clear_when_resolved(&mut self, current_leader: Option<u64>, disk_pressured: &BTreeSet<u64>) {
+        let Some((attempted_leader, _)) = self.last_attempt else {
+            return;
+        };
+        if !disk_pressured.contains(&attempted_leader)
+            || current_leader.is_some_and(|leader| leader != attempted_leader)
+        {
+            self.last_attempt = None;
+        }
+    }
 }
 
 /// The Raft ids of current voters that gossip reports under sustained disk
@@ -968,6 +998,7 @@ async fn reconcile_council_once(
     self_info: &CouncilNodeInfo,
     config: &CouncilReconcilerConfig,
     tracker: &mut HealthTracker,
+    deposition_throttle: &mut DepositionThrottle,
     disk_pressured: &BTreeSet<u64>,
 ) {
     let now = Instant::now();
@@ -1025,11 +1056,18 @@ async fn reconcile_council_once(
     // leader is an ordinary voter the new leader's planner replaces. Runs on
     // followers (before the leader gate) so exactly the deposition target acts.
     let current_leader = metrics.current_leader;
+    deposition_throttle.clear_when_resolved(current_leader, disk_pressured);
     if let Some(leader) = current_leader
         && leader != self_id
         && disk_pressured.contains(&leader)
         && pick_deposition_target(&voters, &health, leader) == Some(self_id)
     {
+        // `trigger().elect()` starts a campaign; it does not wait for the
+        // election to settle. Retrying every reconciler tick continually
+        // advanced the term and could prevent any candidate from winning.
+        if !deposition_throttle.allow(leader, now, config.op_timeout) {
+            return;
+        }
         match council.raft().trigger().elect().await {
             Ok(()) => eprintln!(
                 "council reconciler: voter {self_id} campaigning to depose disk-pressured leader {leader}"
@@ -1222,6 +1260,25 @@ mod tests {
     }
 
     #[test]
+    fn deposition_throttle_waits_for_an_election_to_settle() {
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(1);
+        let pressured = BTreeSet::from([7]);
+        let mut throttle = DepositionThrottle::default();
+
+        assert!(throttle.allow(7, now, cooldown));
+        assert!(!throttle.allow(7, now + Duration::from_millis(999), cooldown));
+        assert!(throttle.allow(7, now + cooldown, cooldown));
+
+        // A leaderless election keeps the attempt throttled. Once another
+        // leader wins, a later deposition gets a fresh first attempt.
+        throttle.clear_when_resolved(None, &pressured);
+        assert!(!throttle.allow(7, now + cooldown, cooldown));
+        throttle.clear_when_resolved(Some(8), &pressured);
+        assert!(throttle.allow(7, now + cooldown, cooldown));
+    }
+
+    #[test]
     fn directory_maps_self_and_gossip_members() {
         let now = Instant::now();
         let self_info = info("leader", 9444);
@@ -1306,6 +1363,7 @@ mod tests {
         // tick performs at most one membership action.
         let config = fast_reconciler_config();
         let mut tracker = HealthTracker::default();
+        let mut deposition_throttle = DepositionThrottle::default();
         let no_pressure = BTreeSet::new();
         let expected: BTreeSet<u64> = names.iter().map(|n| raft_id_from_name(n)).collect();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1318,6 +1376,7 @@ mod tests {
                 &self_info,
                 &config,
                 &mut tracker,
+                &mut deposition_throttle,
                 &no_pressure,
             )
             .await;
@@ -1418,6 +1477,7 @@ mod tests {
 
         let config = fast_reconciler_config();
         let mut tracker = HealthTracker::default();
+        let mut deposition_throttle = DepositionThrottle::default();
         // A couple of ticks with an empty gossip view: the single-voter
         // council must stay exactly as it is.
         let no_pressure = BTreeSet::new();
@@ -1430,6 +1490,7 @@ mod tests {
                 &self_info,
                 &config,
                 &mut tracker,
+                &mut deposition_throttle,
                 &no_pressure,
             )
             .await;

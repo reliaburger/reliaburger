@@ -166,11 +166,12 @@ async fn current_leader_index(nodes: &[Arc<CouncilNode>]) -> Option<usize> {
 /// move; the recovery code chooses a healthy follower to campaign instead so
 /// the resigning leader actually hands off.
 #[tokio::test]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
 async fn trigger_elect_advances_term_and_can_move_leadership() {
-    if !cluster_tests_enabled() {
-        eprintln!("skipping cluster test (set RELIABURGER_CLUSTER_TESTS=1)");
-        return;
-    }
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
 
     let (nodes, _router) = build_cluster().await;
     let leader = current_leader_index(&nodes)
@@ -226,11 +227,12 @@ async fn trigger_elect_advances_term_and_can_move_leadership() {
 /// node keeps its Raft up (this is resignation, not death), so the council
 /// stays whole.
 #[tokio::test]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
 async fn pressured_leader_resigns_and_leadership_moves() {
-    if !cluster_tests_enabled() {
-        eprintln!("skipping cluster test (set RELIABURGER_CLUSTER_TESTS=1)");
-        return;
-    }
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
 
     let (nodes, _router) = build_cluster().await;
     let leader = current_leader_index(&nodes)
@@ -315,11 +317,12 @@ async fn pressured_leader_resigns_and_leadership_moves() {
 /// leads. This is what closes the gap where production `start()` used to feed
 /// the reconciler a permanently empty set.
 #[tokio::test]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
 async fn disk_pressure_advertised_over_gossip_drives_resignation() {
-    if !cluster_tests_enabled() {
-        eprintln!("skipping cluster test (set RELIABURGER_CLUSTER_TESTS=1)");
-        return;
-    }
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
 
     let (nodes, _router) = build_cluster().await;
     let leader = current_leader_index(&nodes)
@@ -448,11 +451,12 @@ async fn disk_pressure_advertised_over_gossip_drives_resignation() {
 /// self-healing reconciler regrows the council. The restored desired state
 /// still knows the apps that were registered before the loss.
 #[tokio::test]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
 async fn full_council_loss_recovers_from_backup() {
-    if !cluster_tests_enabled() {
-        eprintln!("skipping cluster test (set RELIABURGER_CLUSTER_TESTS=1)");
-        return;
-    }
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
 
     use reliaburger::council::backup::{BackupConfig, seal_snapshot, unseal_snapshot};
     use reliaburger::council::recovery::recover_from_desired_state;

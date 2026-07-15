@@ -73,8 +73,8 @@ Notes:
 - **Rootless mode** is supported — runs containers without sudo using user namespaces
 - Rootless stores bundles/images in `~/.local/share/reliaburger/`; root mode uses `/var/lib/reliaburger/`
 - OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
-- To run runc-specific tests: `RELIABURGER_RUNC_TESTS=1 cargo test`
-- To run image pull tests (requires network): `RELIABURGER_IMAGE_PULL_TESTS=1 cargo test`
+- To run provisioned Linux runtime tests: `sudo make test-linux`
+- OCI protocol tests use a local digest-pinned registry fixture; they need no public registry
 
 ### Apple Container (macOS)
 
@@ -99,7 +99,7 @@ container system start
 ```
 
 Notes:
-- To run Apple Container-specific tests: `RELIABURGER_APPLE_CONTAINER_TESTS=1 cargo test`
+- To run Apple Container-specific tests: `make test-apple`
 
 ### ProcessGrill (built-in fallback)
 
@@ -114,10 +114,12 @@ The [Makefile](../Makefile) provides all build targets:
 ```sh
 make build       # compile (debug)
 make release     # compile (optimised)
-make test        # run all tests
+make test        # portable nextest suite
+make test-doc    # Rust documentation examples
+make test-linux  # provisioned Linux runtime/kernel suite
 make lint        # clippy with warnings as errors
 make fmt         # format with rustfmt
-make ci          # fmt-check + lint + test + bench (what CI runs)
+make ci          # portable format, lint and test checks
 make clean       # remove build artefacts
 ```
 
@@ -130,42 +132,55 @@ cargo test
 
 ## Testing and benchmarking
 
-### Tests
+### Test suites
 
 ```sh
-make test          # run all tests (unit + integration)
-make ci            # fmt-check + lint + test + bench (what CI runs)
+make test                  # portable nextest suite
+make test-no-default       # portable suite without default features
+make test-doc              # doctests (nextest does not run them)
+make test-slow             # genuine wall-clock acceptance tests
+sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
+make test-cluster          # failover, healing, recovery, placement and chaos
+make test-upgrade-node     # real single-node binary replacement
+make test-upgrade-cluster  # real rolling cluster replacement
+make coverage              # combined HTML and LCOV coverage
 ```
 
-Some tests require specific runtimes or network access and are gated behind environment variables:
+`make test` runs only tests that can execute truthfully on an ordinary developer machine.
+Provisioned tests use `#[ignore = "requires …"]`; their named target enables the prerequisite,
+selects ignored tests only and fails if its filter finds no tests. Target-specific code uses
+`#[cfg(...)]`, so Linux-only tests are reported separately rather than pretending to pass on
+macOS. Retries are disabled.
 
-| Variable | What it enables |
-|----------|----------------|
-| `RELIABURGER_RUNC_TESTS=1` | runc container runtime tests (Linux only) |
-| `RELIABURGER_APPLE_CONTAINER_TESTS=1` | Apple Container tests (macOS only) |
-| `RELIABURGER_IMAGE_PULL_TESTS=1` | OCI image pull tests (requires network) |
-| `RELIABURGER_UPGRADE_TESTS=1` | real-binary self-upgrade tests (slow; also via `make test-upgrade`) |
-| `RELIABURGER_CLUSTER_TESTS=1` | 9-node in-process cluster failover acceptance (heavy; `cargo test --test cluster_failover`) |
-| `RELIABURGER_BTRFS_TESTS=1` | Btrfs quota + snapshot tests (Linux root; each test provisions its own loopback btrfs) |
-| `RELIABURGER_BUILDAH_TESTS=1` | real `buildah` image-build tests (Linux with buildah installed) |
-| `RELIABURGER_CLUSTER_TESTS=1` | in-process council self-healing acceptance tests (kill-a-voter, lagging learner, flap; a few seconds each) |
-| `RELIABURGER_EBPF_TESTS=1` | eBPF connect-hook, egress (IPv4/IPv6/CIDR) and kernel-sweep tests (Linux root, kernel 5.7+, `--features ebpf`; run via `relish dev test ebpf`) |
+Apple Container remains a manual Apple-silicon check because hosted macOS runners cannot
+provide the nested virtualisation it needs. See the [test harness design](design/test-harness.md)
+for the audit, exact suite contracts and CI mapping.
 
 ### Benchmarks
 
 Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statistical analysis with regression detection.
 
 ```sh
-make bench         # fast benchmarks: transport, single round, convergence 5-250 nodes (~2 min)
-make bench-large   # large cluster benchmarks: 500 and 1000 nodes (~10 min)
-make bench-10k     # 10,000 node convergence validation (~1 hour)
+make bench         # reproducible transport and 5-250 node measurements
+make bench-large   # reproducible 500 and 1,000 node measurements
+make bench-10k     # deterministic 10,000-member per-node scale acceptance
 ```
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 
-The large benchmarks (`cargo bench --bench gossip_large`) test the same convergence logic at 500 and 1000 nodes. These take longer because the simulation is O(N² log N) — all N nodes are driven sequentially each round.
+The large benchmarks (`cargo bench --bench gossip_large`) test the same convergence logic
+at 500 and 1000 nodes. They maintain a seeded, incrementally sorted peer index so the
+benchmark measures protocol work rather than repeatedly allocating and sorting membership
+snapshots. Setup and convergence are reported separately, and non-convergence fails rather
+than returning a sentinel duration.
 
-The 10k test (`make bench-10k`) is not a criterion benchmark but an ignored test that runs a single 10,000-node convergence simulation. It validates the whitepaper's scalability target and prints progress as membership knowledge spreads through the cluster. Run it when you want to verify the protocol scales, not on every commit.
+The 10k target checks the per-node production invariant: one real Mustard node ingests a
+10,000-member table through bounded gossip messages, can select a probe target and exposes
+every learned update through fixed-size dissemination batches. Full 10,000-node all-to-all
+simulation would allocate 100 million membership records on one runner. That measures one
+machine pretending to be a datacentre, and did not finish inside its 90-minute budget.
+CI uploads Criterion data; it does not enforce regression percentages until measurements
+are stable on consistent hardware.
 
 ## Running
 

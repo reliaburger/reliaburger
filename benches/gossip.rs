@@ -14,6 +14,9 @@ use reliaburger::mustard::{
     InMemoryTransport, MembershipUpdate, MustardNode, MustardTransport, NodeState,
 };
 
+#[path = "support/gossip.rs"]
+mod gossip_support;
+
 fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
@@ -102,78 +105,34 @@ fn bench_single_gossip_round(c: &mut Criterion) {
     });
 }
 
-/// Helper: create N nodes in a ring, run gossip rounds until all nodes
-/// know about all others, return the number of rounds needed.
-async fn rounds_to_converge(cluster_size: usize) -> usize {
-    let net = InMemoryNetwork::new();
-    let config = fast_config();
-
-    let mut nodes = Vec::new();
-    let mut addresses = Vec::new();
-
-    for i in 0..cluster_size {
-        let a = addr(1000 + i as u16);
-        addresses.push(a);
-        let t = net.register(a).await;
-        let node = MustardNode::new(NodeId::new(format!("n{i}")), a, config.clone(), t);
-        nodes.push(node);
-    }
-
-    // Ring topology
-    for i in 0..nodes.len() {
-        let next = (i + 1) % nodes.len();
-        let id = NodeId::new(format!("n{next}"));
-        let a = addresses[next];
-        nodes[i].add_seed(id, a);
-    }
-
-    for round in 1..2000 {
-        // Each node sends a PING
-        for node in &mut nodes {
-            if let Some((_id, target_addr)) = node.pick_probe_target() {
-                let updates = node.dissemination.select_updates();
-                let ping = GossipMessage::new(
-                    node.node_id.clone(),
-                    node.incarnation,
-                    GossipPayload::Ping { updates },
-                );
-                let _ = node.transport.send(target_addr, &ping).await;
-            }
-        }
-
-        // Drain messages twice (PINGs then ACKs)
-        for _ in 0..2 {
-            for node in &mut nodes {
-                while let Some((from, msg)) = node.transport.try_recv() {
-                    node.handle_message(from, msg).await;
-                }
-            }
-        }
-
-        // Check convergence
-        let converged = nodes
-            .iter()
-            .all(|n| n.membership.active_members().len() == cluster_size);
-        if converged {
-            return round;
-        }
-    }
-
-    2000 // didn't converge
-}
-
-/// Benchmark rounds-to-converge for different cluster sizes.
-/// Validates SWIM's O(log N) convergence property.
+/// Benchmark end-to-end convergence separately from cluster allocation.
 fn bench_convergence(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let mut group = c.benchmark_group("gossip_convergence");
-    // Larger clusters need more time per sample
+    let mut setup = c.benchmark_group("gossip_setup");
+    setup.sample_size(10);
+    setup.measurement_time(std::time::Duration::from_secs(5));
+    for &size in &[25, 100, 250] {
+        setup.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter(|| rt.block_on(gossip_support::GossipSimulation::new(size)));
+        });
+    }
+    setup.finish();
+
+    let mut group = c.benchmark_group("gossip_convergence_end_to_end");
     group.sample_size(10);
-    group.measurement_time(std::time::Duration::from_secs(20));
+    group.measurement_time(std::time::Duration::from_secs(5));
     for &size in &[5, 10, 25, 50, 100, 250] {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            b.iter(|| rt.block_on(rounds_to_converge(size)));
+            b.iter(|| {
+                rt.block_on(async {
+                    let mut simulation = gossip_support::GossipSimulation::new(size).await;
+                    simulation
+                        .converge(2_000)
+                        .await
+                        .unwrap_or_else(|error| panic!("{error}"))
+                })
+            });
         });
     }
     group.finish();

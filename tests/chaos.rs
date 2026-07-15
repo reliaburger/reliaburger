@@ -75,6 +75,7 @@ async fn wait_for_leader(nodes: &[CouncilNode], timeout: Duration) -> Option<u64
 
 /// Council partition 3/2: majority continues, minority can't write, heal converges.
 #[tokio::test]
+#[ignore = "slow multi-node chaos acceptance; run with make test-cluster"]
 async fn chaos_council_partition_majority_continues() {
     let (nodes, router) = create_cluster(5).await;
     init_cluster(&nodes).await;
@@ -172,6 +173,7 @@ async fn chaos_council_partition_majority_continues() {
 /// writes, the isolated node does NOT see that write, and healing lets it
 /// catch up.
 #[tokio::test]
+#[ignore = "slow multi-node chaos acceptance; run with make test-cluster"]
 async fn chaos_isolated_member_misses_writes_until_healed() {
     let (nodes, router) = create_cluster(3).await;
     init_cluster(&nodes).await;

@@ -13,7 +13,7 @@
 //! assert — workers first, council one at a time, leader last (in place)
 //! — are exactly the mechanics under test.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -53,11 +53,24 @@ struct ClusterHarness {
     external_pkcs8: Vec<u8>,
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+fn free_tcp_port(allocated: &mut HashSet<u16>) -> u16 {
+    loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if allocated.insert(port) {
+            return port;
+        }
+    }
+}
+
+fn free_udp_port(allocated: &mut HashSet<u16>) -> u16 {
+    loop {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        if allocated.insert(port) {
+            return port;
+        }
+    }
 }
 
 /// Copy the compiled bun in as `bun-{version}` with its `.version` sidecar.
@@ -94,6 +107,11 @@ impl ClusterHarness {
 
         let mut nodes = Vec::new();
         let mut seed_gossip: Option<u16> = None;
+        // Keep every endpoint numerically distinct for the lifetime of this
+        // harness. Binding port 0 and immediately dropping the socket can
+        // return the same number on the very next call; that made a node's
+        // registry collide with its API or Raft listener and crash-loop.
+        let mut allocated_ports = HashSet::new();
 
         for index in 0..count {
             let name = format!("n{index}");
@@ -104,11 +122,11 @@ impl ClusterHarness {
             install_version(&bin_dir, "v0.2.0");
             std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-            let api_port = free_port();
-            let gossip_port = free_port();
-            let raft_port = free_port();
-            let reporting_port = free_port();
-            let registry_port = free_port();
+            let api_port = free_tcp_port(&mut allocated_ports);
+            let gossip_port = free_udp_port(&mut allocated_ports);
+            let raft_port = free_tcp_port(&mut allocated_ports);
+            let reporting_port = free_tcp_port(&mut allocated_ports);
+            let registry_port = free_tcp_port(&mut allocated_ports);
             let join = match seed_gossip {
                 Some(seed) => format!("join = [\"127.0.0.1:{seed}\"]"),
                 None => "join = []".to_string(),
@@ -237,12 +255,10 @@ retain_versions = 3
         harness
     }
 
-    /// The current leader's node name, from the bootstrap node's council
-    /// view (the `leader` field is the node name).
-    async fn leader(&self) -> Option<String> {
+    async fn leader_from(&self, node: &ClusterNode) -> Option<String> {
         let response = self
             .client
-            .get(format!("http://{}/v1/cluster/council", self.nodes[0].api))
+            .get(format!("http://{}/v1/cluster/council", node.api))
             .send()
             .await
             .ok()?;
@@ -250,8 +266,54 @@ retain_versions = 3
         council["leader"].as_str().map(String::from)
     }
 
+    /// The current leader's node name, from the bootstrap node's council
+    /// view (the `leader` field is the node name).
+    async fn leader(&self) -> Option<String> {
+        self.leader_from(&self.nodes[0]).await
+    }
+
+    async fn wait_for_leader(&self) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            if let Some(leader) = self.leader().await {
+                return leader;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a cluster leader"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     fn node(&self, name: &str) -> &ClusterNode {
         self.nodes.iter().find(|n| n.name == name).unwrap()
+    }
+
+    /// Wait until the leader agrees that it is the leader and has archived
+    /// the previous operation. Another node can observe the committed
+    /// completion slightly earlier, but the next write must go through the
+    /// leader's local Raft state.
+    async fn wait_for_idle_leader(&self) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            if let Some(leader) = self.leader().await {
+                let node = self.node(&leader);
+                let leader_agrees = self.leader_from(node).await.as_deref() == Some(&leader);
+                let upgrade_idle = self
+                    .cluster_state_from(node)
+                    .await
+                    .is_some_and(|state| state["active"].is_null());
+                if leader_agrees && upgrade_idle {
+                    return leader;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for an idle upgrade coordinator"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn node_version(&self, api: &str) -> Option<String> {
@@ -267,13 +329,12 @@ retain_versions = 3
 
     /// The upgrade-plan node list: the leader last, two council members,
     /// the remaining node labelled Worker (see the module note on roles).
-    async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
-        let leader = self.leader().await.expect("a leader");
+    fn plan_nodes_for(&self, leader: &str) -> (Vec<serde_json::Value>, String) {
         let worker = self
             .nodes
             .iter()
             .map(|n| n.name.clone())
-            .find(|name| *name != leader)
+            .find(|name| name != leader)
             .unwrap();
         let list = self
             .nodes
@@ -293,6 +354,12 @@ retain_versions = 3
                 })
             })
             .collect();
+        (list, worker)
+    }
+
+    async fn plan_nodes(&self) -> (Vec<serde_json::Value>, String, String) {
+        let leader = self.wait_for_leader().await;
+        let (list, worker) = self.plan_nodes_for(&leader);
         (list, leader, worker)
     }
 
@@ -349,7 +416,7 @@ retain_versions = 3
     /// Poll the cluster upgrade until it completes (or a pause, if
     /// `allow_pause`), recording when each node first reports Healthy.
     /// Returns (first_healthy_order, final_phase).
-    async fn watch_upgrade(&self, allow_pause: bool) -> (Vec<String>, String) {
+    async fn watch_upgrade(&self, upgrade_id: &str, allow_pause: bool) -> (Vec<String>, String) {
         let mut healthy_order: Vec<String> = Vec::new();
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
@@ -373,14 +440,28 @@ retain_versions = 3
             };
 
             let (nodes_json, phase) = match cluster.get("active").filter(|a| !a.is_null()) {
-                Some(active) => (active["nodes"].clone(), phase_label(&active["phase"])),
+                Some(active) => {
+                    let Some(observed_id) = active["upgrade_id"].as_str() else {
+                        continue;
+                    };
+                    if !same_logical_upgrade(observed_id, upgrade_id) {
+                        continue;
+                    }
+                    (active["nodes"].clone(), phase_label(&active["phase"]))
+                }
                 None => {
-                    // Cleared: completed and archived to history.
-                    let last = cluster["history"]
-                        .as_array()
-                        .and_then(|h| h.last())
-                        .cloned()
-                        .unwrap_or_default();
+                    // A follower may still report no active operation just
+                    // after the leader accepts the start. Only this run's
+                    // archived record proves that it completed.
+                    let Some(last) = cluster["history"].as_array().and_then(|history| {
+                        history.iter().rev().find(|entry| {
+                            entry["upgrade_id"]
+                                .as_str()
+                                .is_some_and(|id| same_logical_upgrade(id, upgrade_id))
+                        })
+                    }) else {
+                        continue;
+                    };
                     for node in last["nodes"].as_array().into_iter().flatten() {
                         note_healthy(&mut healthy_order, node);
                     }
@@ -397,20 +478,22 @@ retain_versions = 3
         }
     }
 
+    async fn cluster_state_from(&self, node: &ClusterNode) -> Option<serde_json::Value> {
+        let response = self
+            .client
+            .get(format!("http://{}/v1/upgrade/cluster", node.api))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
+    }
+
     async fn cluster_state(&self) -> Option<serde_json::Value> {
         for node in &self.nodes {
-            let Ok(response) = self
-                .client
-                .get(format!("http://{}/v1/upgrade/cluster", node.api))
-                .send()
-                .await
-            else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            if let Ok(value) = response.json::<serde_json::Value>().await {
+            if let Some(value) = self.cluster_state_from(node).await {
                 return Some(value);
             }
         }
@@ -425,6 +508,26 @@ retain_versions = 3
             }
         }
         versions
+    }
+
+    /// Wait until every replacement API is reachable and reports the target.
+    /// The coordinator records completion immediately before the final
+    /// leader's `exec`, so its HTTP listener can briefly be between processes.
+    async fn wait_for_versions(&self, expected: &str) -> HashMap<String, String> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let versions = self.versions().await;
+            if versions.len() == self.nodes.len()
+                && versions.values().all(|version| version == expected)
+            {
+                return versions;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for every node on {expected}: {versions:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn shutdown(mut self) {
@@ -446,6 +549,10 @@ fn note_healthy(order: &mut Vec<String>, node: &serde_json::Value) {
     }
 }
 
+fn same_logical_upgrade(observed: &str, started: &str) -> bool {
+    observed == started || observed.starts_with(&format!("{started}-retry"))
+}
+
 fn phase_label(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
@@ -463,11 +570,12 @@ fn phase_label(value: &serde_json::Value) -> String {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
 async fn rolling_upgrade_walks_workers_council_then_leader() {
-    if !upgrade_tests_enabled() {
-        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
-        return;
-    }
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
@@ -477,12 +585,12 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
     // cluster the scheduler owns placement and a single-replica app on a
     // bouncing node is inherently at risk for its ~1s window, so it's the
     // wrong thing to pin here.
-    let (_, old_leader, worker) = harness.start_upgrade().await;
-    let (healthy_order, phase) = harness.watch_upgrade(false).await;
+    let (upgrade_id, old_leader, worker) = harness.start_upgrade().await;
+    let (healthy_order, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
 
     // Every node ended on the target version.
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.2.0").await;
     for node in &harness.nodes {
         assert_eq!(
             versions.get(&node.name).map(String::as_str),
@@ -506,24 +614,22 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
         Some(&old_leader),
         "old leader did not upgrade last: {healthy_order:?}"
     );
-    assert!(
-        harness.leader().await.is_some(),
-        "cluster lost its leader after the upgrade"
-    );
+    harness.wait_for_leader().await;
 
     harness.shutdown().await;
 }
 
 #[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
 async fn upgrade_failure_pauses_cluster_and_reverts_node() {
-    if !upgrade_tests_enabled() {
-        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
-        return;
-    }
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
-    let (_, _, worker) = {
+    let (upgrade_id, _, worker) = {
         // Poison ONLY the worker's v0.2.0 binary: it crash-loops, reverts
         // itself, and the leader pauses the run.
         let (_, _, worker) = harness.plan_nodes().await;
@@ -535,19 +641,11 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
         harness.start_upgrade().await
     };
 
-    let (_, phase) = harness.watch_upgrade(true).await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, true).await;
     assert!(phase.starts_with("Paused"), "expected a pause, got {phase}");
 
     // The worker reverted itself; nobody else was touched.
-    wait_for("worker back on v0.1.0", WAIT, || async {
-        harness
-            .node_version(&harness.node(&worker).api)
-            .await
-            .as_deref()
-            == Some("v0.1.0")
-    })
-    .await;
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.1.0").await;
     assert_eq!(
         versions.len(),
         harness.nodes.len(),
@@ -560,7 +658,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 
     // Cure the binary and resume: the run finishes.
     std::fs::remove_file(harness.node(&worker).bin_dir.join("bun-v0.2.0.fail-boot")).unwrap();
-    let leader = harness.leader().await.expect("a leader");
+    let leader = harness.wait_for_leader().await;
     let resume = harness
         .client
         .post(format!(
@@ -573,9 +671,9 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
         .expect("resume");
     assert_eq!(resume.status().as_u16(), 202, "resume refused");
 
-    let (_, phase) = harness.watch_upgrade(false).await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.2.0").await;
     assert_eq!(
         versions.len(),
         harness.nodes.len(),
@@ -590,20 +688,23 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
 }
 
 #[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and a multi-core host"]
 async fn cluster_rollback_returns_every_node_to_previous_version() {
-    if !upgrade_tests_enabled() {
-        eprintln!("skipping upgrade integration test (set RELIABURGER_UPGRADE_TESTS=1)");
-        return;
-    }
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 on a provisioned multi-core host"
+    );
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
-    harness.start_upgrade().await;
-    let (_, phase) = harness.watch_upgrade(false).await;
+    let (upgrade_id, _, _) = harness.start_upgrade().await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
+    harness.wait_for_versions("v0.2.0").await;
 
     // Roll the whole cluster back to v0.1.0.
-    let (nodes, leader, _) = harness.plan_nodes().await;
+    let leader = harness.wait_for_idle_leader().await;
+    let (nodes, _) = harness.plan_nodes_for(&leader);
     let request = serde_json::json!({ "target_version": "v0.1.0", "nodes": nodes });
     let response = harness
         .client
@@ -615,11 +716,17 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
         .send()
         .await
         .expect("cluster rollback");
-    assert_eq!(response.status().as_u16(), 202, "rollback refused");
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    assert_eq!(status.as_u16(), 202, "rollback refused: {body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("rollback response JSON");
+    let rollback_id = body["upgrade_id"]
+        .as_str()
+        .expect("rollback response upgrade_id");
 
-    let (_, phase) = harness.watch_upgrade(false).await;
+    let (_, phase) = harness.watch_upgrade(rollback_id, false).await;
     assert_eq!(phase, "Completed");
-    let versions = harness.versions().await;
+    let versions = harness.wait_for_versions("v0.1.0").await;
     assert_eq!(
         versions.len(),
         harness.nodes.len(),

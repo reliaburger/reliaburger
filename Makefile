@@ -1,6 +1,9 @@
-.PHONY: build test check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-no-default test-slow test-linux test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
+NEXTEST_PROFILE ?= default
+NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
+COVERAGE_MIN_LINES ?= 78.65
 
 # --- Rust targets ---
 
@@ -10,17 +13,38 @@ build: ## Compile all crates (debug)
 release: ## Compile all crates (optimised release)
 	$(CARGO) build --release
 
-test: ## Run all tests
+test: ## Run the portable suite with nextest (ignored suites are separate)
+	$(NEXTEST)
+
+test-cargo: ## Run the portable suite with Cargo's built-in runner
 	$(CARGO) test
 
-test-upgrade: ## Run the real-binary self-upgrade integration tests (slow: spawns real bun processes)
-	RELIABURGER_UPGRADE_TESTS=1 $(CARGO) test --test self_upgrade --test self_upgrade_cluster -- --test-threads=1
+test-doc: ## Run doctests (nextest does not run them)
+	$(CARGO) test --doc
 
-test-upgrade-node: ## Run only the single-node self-upgrade tests (what CI runs)
-	RELIABURGER_UPGRADE_TESTS=1 $(CARGO) test --test self_upgrade -- --test-threads=1
+test-no-default: ## Run the portable suite without default features
+	$(NEXTEST) --no-default-features
 
-test-upgrade-cluster: ## Run only the cluster self-upgrade tests (needs a real multi-core machine, not CI)
-	RELIABURGER_UPGRADE_TESTS=1 $(CARGO) test --test self_upgrade_cluster -- --test-threads=1
+test-slow: ## Run required wall-clock acceptance tests
+	$(NEXTEST) --run-ignored=only -E 'binary(integration)'
+
+test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | test(/(runc_|netns|btrfs_|identity_dir_is_tmpfs)/)'
+
+test-cluster: ## Run all real multi-node cluster acceptance suites
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(chaos)'
+
+test-upgrade: ## Run all real-binary self-upgrade acceptance tests
+	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
+
+test-upgrade-node: ## Run only the single-node self-upgrade tests
+	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade)'
+
+test-upgrade-cluster: ## Run only the cluster self-upgrade tests
+	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade_cluster)'
+
+test-apple: ## Run the manual Apple Container acceptance test on Apple silicon
+	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(apple_container_grill_creates_instance)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check
@@ -31,8 +55,8 @@ fmt: ## Format all Rust source with rustfmt
 fmt-check: ## Check formatting without modifying files
 	$(CARGO) fmt -- --check
 
-lint: ## Run clippy with warnings as errors
-	$(CARGO) clippy -- -D warnings
+lint: ## Run clippy for every target and feature with warnings as errors
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
 examples: build ## Dry-run every example config with relish
 	@failed=0; total=0; \
@@ -49,14 +73,23 @@ examples: build ## Dry-run every example config with relish
 	echo "$$total examples, $$failed failed."; \
 	[ $$failed -eq 0 ]
 
-bench: ## Run fast benchmarks (transport, single round, convergence 5-250)
+bench: ## Run reproducible transport and 5-250 node gossip benchmarks
 	$(CARGO) bench --bench gossip
 
-bench-large: ## Run large cluster benchmarks (500, 1000 nodes — ~10 min)
+bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
 
-bench-10k: ## Run 10k node convergence test (~1 hour)
+bench-10k: ## Run the deterministic 10k-member per-node scale acceptance
 	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
+
+coverage: ## Combine default and no-default nextest line coverage
+	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE)
+	$(CARGO) llvm-cov --no-clean --no-default-features nextest --profile $(NEXTEST_PROFILE)
+	mkdir -p target/coverage
+	$(CARGO) llvm-cov report --lcov --output-path target/coverage/lcov.info
+	$(CARGO) llvm-cov report --html --output-dir target/coverage/html
+	$(CARGO) llvm-cov report --fail-under-lines $(COVERAGE_MIN_LINES)
 
 deploy-demo: build ## Deploy an app, show history, lint config
 	./scripts/deploy-demo.sh
@@ -73,7 +106,7 @@ toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 pickle-test-macos: build ## Push/pull a real Docker image through Pickle (macOS + Docker Desktop)
 	./scripts/pickle-push-test.sh
 
-ci: fmt-check lint test ## Run CI checks (fmt, clippy, tests — no benchmarks)
+ci: fmt-check lint test test-doc test-no-default ## Run portable CI checks
 
 ci-full: fmt-check lint test bench ## Run everything including benchmarks
 

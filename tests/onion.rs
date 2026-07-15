@@ -21,10 +21,14 @@ use reliaburger::relish::client::BunClient;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
+
 /// Test harness: starts a real agent with ProcessGrill on an ephemeral port.
 struct TestHarness {
     client: BunClient,
-    shutdown: CancellationToken,
+    _tasks: TestTasks,
 }
 
 impl TestHarness {
@@ -37,7 +41,7 @@ impl TestHarness {
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
 
-        tokio::spawn(async move {
+        let agent_task = tokio::spawn(async move {
             agent.run().await;
         });
 
@@ -48,7 +52,7 @@ impl TestHarness {
         );
         let server_shutdown = shutdown.clone();
 
-        tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
                     server_shutdown.cancelled().await;
@@ -66,13 +70,10 @@ impl TestHarness {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        Self { client, shutdown }
-    }
-}
-
-impl Drop for TestHarness {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
+        Self {
+            client,
+            _tasks: TestTasks::new(shutdown, vec![agent_task, server_task]),
+        }
     }
 }
 
@@ -125,13 +126,10 @@ fn multi_app_config() -> Config {
 // Resolve tests
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deploy_app_with_port_registers_in_service_map() {
     let harness = TestHarness::start().await;
     harness.client.apply(&app_with_port_config()).await.unwrap();
-
-    // Give the agent a moment to process
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let info = harness.client.resolve("redis").await.unwrap();
     assert_eq!(info.app_name, "redis");
@@ -141,7 +139,7 @@ async fn deploy_app_with_port_registers_in_service_map() {
     assert_eq!(info.vip, expected_vip.to_string());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deploy_app_without_port_not_in_service_map() {
     let harness = TestHarness::start().await;
     harness
@@ -149,8 +147,6 @@ async fn deploy_app_without_port_not_in_service_map() {
         .apply(&app_without_port_config())
         .await
         .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let err = harness.client.resolve("worker").await.unwrap_err();
     // Should be a 404
@@ -162,7 +158,7 @@ async fn deploy_app_without_port_not_in_service_map() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_nonexistent_returns_not_found() {
     let harness = TestHarness::start().await;
 
@@ -175,12 +171,10 @@ async fn resolve_nonexistent_returns_not_found() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deploy_app_with_port_has_backend() {
     let harness = TestHarness::start().await;
     harness.client.apply(&app_with_port_config()).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let info = harness.client.resolve("redis").await.unwrap();
     // ProcessGrill apps get a backend after reaching Running
@@ -188,12 +182,10 @@ async fn deploy_app_with_port_has_backend() {
     assert_eq!(info.backends[0].instance_id, "default__redis-0");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_all_lists_deployed_services() {
     let harness = TestHarness::start().await;
     harness.client.apply(&multi_app_config()).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let all = harness.client.resolve_all().await.unwrap();
     assert_eq!(all.len(), 3);
@@ -204,7 +196,7 @@ async fn resolve_all_lists_deployed_services() {
     assert!(names.contains(&"api"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_all_empty_when_nothing_deployed() {
     let harness = TestHarness::start().await;
 
@@ -212,12 +204,10 @@ async fn resolve_all_empty_when_nothing_deployed() {
     assert!(all.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_app_removes_from_service_map() {
     let harness = TestHarness::start().await;
     harness.client.apply(&app_with_port_config()).await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify it's registered
     let info = harness.client.resolve("redis").await.unwrap();
@@ -225,8 +215,6 @@ async fn stop_app_removes_from_service_map() {
 
     // Stop it
     harness.client.stop("redis", "default").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
     // Should be gone
     let err = harness.client.resolve("redis").await.unwrap_err();
     match err {
@@ -237,7 +225,7 @@ async fn stop_app_removes_from_service_map() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vip_is_deterministic_across_agents() {
     // Two independent agents should assign the same VIP to the same app name
     let harness1 = TestHarness::start().await;
@@ -253,8 +241,6 @@ async fn vip_is_deterministic_across_agents() {
         .apply(&app_with_port_config())
         .await
         .unwrap();
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let vip1 = harness1.client.resolve("redis").await.unwrap().vip;
     let vip2 = harness2.client.resolve("redis").await.unwrap().vip;

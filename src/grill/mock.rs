@@ -5,6 +5,7 @@
 /// state and exit code responses for testing job completion and
 /// restart scenarios.
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::oci::OciSpec;
@@ -12,7 +13,7 @@ use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
 /// Records all calls to the Grill trait for test assertions.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MockGrill {
     calls: Arc<Mutex<Vec<(String, InstanceId)>>>,
     state_overrides: Arc<Mutex<HashMap<InstanceId, ContainerState>>>,
@@ -20,13 +21,31 @@ pub struct MockGrill {
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
-    /// Artificial delay applied inside `create`, simulating a slow image
-    /// pull. Lets tests prove a slow deploy no longer wedges the agent loop.
-    create_delay: Arc<Mutex<std::time::Duration>>,
+    /// Deterministic gate for tests that need `create()` to remain in flight.
+    block_create: Arc<AtomicBool>,
+    create_started: Arc<tokio::sync::Semaphore>,
+    create_release: Arc<tokio::sync::Semaphore>,
     /// When set, `stop` records the call but does NOT transition the instance
     /// to `Stopped` — the process ignores SIGTERM. Lets tests prove the
     /// exit-aware stop path escalates to SIGKILL (DEP6).
     ignore_stop: Arc<Mutex<bool>>,
+}
+
+impl Default for MockGrill {
+    fn default() -> Self {
+        Self {
+            calls: Arc::default(),
+            state_overrides: Arc::default(),
+            exit_codes: Arc::default(),
+            adopt_results: Arc::default(),
+            container_ip: Arc::default(),
+            honours_cgroup_path: Arc::default(),
+            block_create: Arc::new(AtomicBool::new(false)),
+            create_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            create_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            ignore_stop: Arc::default(),
+        }
+    }
 }
 
 impl MockGrill {
@@ -84,11 +103,27 @@ impl MockGrill {
         *self.honours_cgroup_path.lock().unwrap() = value;
     }
 
-    /// Make `create()` sleep for `delay` before returning, simulating a slow
-    /// image pull. A deploy blocked here must not stall unrelated work.
+    /// Hold future `create()` calls until [`Self::release_creates`] is called.
     #[allow(dead_code)]
-    pub fn set_create_delay(&self, delay: std::time::Duration) {
-        *self.create_delay.lock().unwrap() = delay;
+    pub fn block_creates(&self) {
+        self.block_create.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until `count` blocked `create()` calls have started.
+    #[allow(dead_code)]
+    pub async fn wait_for_creates(&self, count: u32) {
+        let permits = Arc::clone(&self.create_started)
+            .acquire_many_owned(count)
+            .await
+            .expect("create gate closed");
+        permits.forget();
+    }
+
+    /// Release `count` calls held by [`Self::block_creates`].
+    #[allow(dead_code)]
+    pub fn release_creates(&self, count: usize) {
+        self.block_create.store(false, Ordering::SeqCst);
+        self.create_release.add_permits(count);
     }
 
     /// Make `stop()` a no-op on state, simulating a process that ignores
@@ -101,14 +136,19 @@ impl MockGrill {
 
 impl super::Grill for MockGrill {
     async fn create(&self, instance: &InstanceId, _spec: &OciSpec) -> Result<(), GrillError> {
-        let delay = *self.create_delay.lock().unwrap();
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
         self.calls
             .lock()
             .unwrap()
             .push(("create".to_string(), instance.clone()));
+        if self.block_create.load(Ordering::SeqCst) {
+            self.create_started.add_permits(1);
+            let permit = self
+                .create_release
+                .acquire()
+                .await
+                .expect("create gate closed");
+            permit.forget();
+        }
         Ok(())
     }
 

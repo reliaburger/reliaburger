@@ -434,7 +434,7 @@ The test suite is the second codebase. You can learn almost as much from reading
 | `chaos.rs` | 2 | Council partition, worker isolation |
 | `reconstruction.rs` | 1 | State reconstruction with real Raft |
 | `reporting_tree.rs` | 2 | Reporting failover when council changes |
-| `gossip_10k.rs` | 1 | 10,000-node convergence (ignored by default, slow) |
+| `gossip_10k.rs` | 1 | One node handles 10,000-member protocol state (ignored by default) |
 
 **Benchmarks** in `benches/`: gossip protocol performance via criterion.
 

@@ -16,6 +16,7 @@
 //! elections are far past a 2-core CI budget. Run via
 //! `RELIABURGER_CLUSTER_TESTS=1 cargo test --test cluster_failover`.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,10 @@ use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::process::ProcessGrill;
 use reliaburger::meat::{AppId, NodeId};
 use reliaburger::reporting::aggregator::AggregatedState;
+
+#[path = "support/task_harness.rs"]
+mod task_harness;
+use task_harness::TestTasks;
 
 /// Whether the heavy cluster suite is enabled.
 fn cluster_tests_enabled() -> bool {
@@ -59,6 +64,8 @@ struct NodeHarness {
     cmd_tx: mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
     /// Cancelling this token kills THIS node only.
     shutdown: CancellationToken,
+    _runtime: runtime::ClusterRuntime,
+    _tasks: TestTasks,
 }
 
 impl NodeHarness {
@@ -91,13 +98,13 @@ impl NodeHarness {
             .count()
     }
 
-    fn is_voter(&self) -> bool {
-        let metrics = self.metrics_rx.borrow();
-        metrics
+    fn voter_ids(&self) -> BTreeSet<u64> {
+        self.metrics_rx
+            .borrow()
             .membership_config
             .membership()
             .voter_ids()
-            .any(|id| id == self.raft_id)
+            .collect()
     }
 }
 
@@ -150,8 +157,6 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         .expect("cluster mode has raft metrics");
     let aggregated_rx = cluster_runtime.aggregated_rx.clone();
     let directory_rx = cluster_runtime.directory_rx.clone();
-    Box::leak(Box::new(cluster_runtime));
-
     // Real agent answering reporting snapshots with real capacity.
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     // Kept for the harness so a test can resolve against this node's agent.
@@ -166,7 +171,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
     agent.set_node_capacity(8000, 16384);
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
-    tokio::spawn(async move { agent.run().await });
+    let agent_task = tokio::spawn(async move { agent.run().await });
 
     // Leader scheduler with a fast learning period, so a fresh leader
     // starts scheduling within seconds of gaining coverage.
@@ -218,7 +223,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         None,
     );
     let api_shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    let api_task = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(async move { api_shutdown.cancelled().await })
             .await
@@ -232,7 +237,9 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         metrics_rx,
         aggregated_rx,
         cmd_tx: resolve_cmd_tx,
-        shutdown,
+        shutdown: shutdown.clone(),
+        _runtime: cluster_runtime,
+        _tasks: TestTasks::new(shutdown, vec![agent_task, api_task]),
     }
 }
 
@@ -300,11 +307,12 @@ fn node_running_app(state: &AggregatedState, app: &str) -> Option<String> {
 /// service map, so cross-node resolution works even though the backend runs
 /// elsewhere. Also proves the catalogue survives a leader change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
 async fn service_on_one_node_resolves_and_survives_leader_change_from_another() {
-    if !cluster_tests_enabled() {
-        eprintln!("skipping cluster integration test (set RELIABURGER_CLUSTER_TESTS=1)");
-        return;
-    }
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
 
     let root = CancellationToken::new();
     // Three nodes, all voters (cap is seven): killing the leader leaves a
@@ -416,11 +424,12 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
 async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover() {
-    if !cluster_tests_enabled() {
-        eprintln!("skipping cluster integration test (set RELIABURGER_CLUSTER_TESTS=1)");
-        return;
-    }
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
 
     let root = CancellationToken::new();
     let mut nodes = Vec::with_capacity(NODE_COUNT);
@@ -445,7 +454,14 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     )
     .await;
 
-    let workers: Vec<&NodeHarness> = nodes.iter().filter(|n| !n.is_voter()).collect();
+    // The leader's committed membership is authoritative. Individual nodes'
+    // metrics watches can trail that commit briefly, so counting each node's
+    // local opinion here produced a false third "worker" in CI.
+    let voter_ids = nodes[0].voter_ids();
+    let workers: Vec<&NodeHarness> = nodes
+        .iter()
+        .filter(|node| !voter_ids.contains(&node.raft_id))
+        .collect();
     assert_eq!(workers.len(), 2, "expected exactly two non-voter workers");
     for worker in &workers {
         assert!(

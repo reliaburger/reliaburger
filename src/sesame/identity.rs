@@ -1055,11 +1055,12 @@ mod tests {
     /// backed by a real size-bounded tmpfs, and cleanup unmounts it.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires Linux root; run by make test-linux"]
     fn identity_dir_is_tmpfs_backed_under_root() {
-        if !nix::unistd::geteuid().is_root() {
-            eprintln!("skipping: requires root (run in the Lima VM)");
-            return;
-        }
+        assert!(
+            nix::unistd::geteuid().is_root(),
+            "the tmpfs identity test requires root"
+        );
 
         let volumes = tempfile::tempdir().unwrap();
         let dir = instance_identity_dir(volumes.path(), "web-0");

@@ -167,6 +167,7 @@ async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node gossip and council acceptance; run with make test-cluster"]
 async fn three_nodes_join_by_address_and_converge() {
     let shutdown = CancellationToken::new();
 
@@ -199,6 +200,7 @@ async fn three_nodes_join_by_address_and_converge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node gossip and council acceptance; run with make test-cluster"]
 async fn three_node_council_elects_leader_and_grows() {
     let shutdown = CancellationToken::new();
 
@@ -294,6 +296,7 @@ async fn seeded_mayo_store(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node gossip and council acceptance; run with make test-cluster"]
 async fn rollup_worker_delivers_node_rollups_to_the_leader() {
     let shutdown = CancellationToken::new();
 
@@ -389,6 +392,7 @@ async fn rollup_worker_delivers_node_rollups_to_the_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node gossip and council acceptance; run with make test-cluster"]
 async fn state_reports_carry_nonzero_capacity_and_usage() {
     let shutdown = CancellationToken::new();
 

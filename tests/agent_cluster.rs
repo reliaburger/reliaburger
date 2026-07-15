@@ -145,9 +145,14 @@ async fn agent_council_returns_raft_state() {
     members.insert(1, node_info(1, 9444));
     council.initialize(members).await.unwrap();
 
-    // Wait for leader
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(council.is_leader().await);
+    let mut metrics = council.metrics();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.borrow().current_leader != Some(1) {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("single-node council did not elect itself");
 
     // Write an app
     council
@@ -284,14 +289,23 @@ async fn mustard_node_publishes_membership_watch() {
     let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), config.clone(), t1);
     node1.add_seed(NodeId::new("n2"), addr(2));
 
-    let (membership_tx, membership_rx) = watch::channel(vec![]);
+    let (membership_tx, mut membership_rx) = watch::channel(vec![]);
     node1.set_membership_watch(membership_tx);
 
     let node_shutdown = shutdown.clone();
     let handle = tokio::spawn(async move { node1.run(node_shutdown).await });
 
-    // Wait for a gossip cycle to publish
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !membership_rx
+            .borrow()
+            .iter()
+            .any(|member| member.node_id == NodeId::new("n1"))
+        {
+            membership_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("membership watch never published the local node");
 
     let snapshot = membership_rx.borrow().clone();
     // Should have at least node1 itself

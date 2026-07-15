@@ -39,6 +39,33 @@ struct ProcessEntry {
     /// Base path for file-backed logs (`{stem}.stdout` / `{stem}.stderr`).
     log_stem: Option<PathBuf>,
     exit_code: Option<i32>,
+    /// In-memory workloads have no adoption path, so dropping their last
+    /// owner must not leave the process tree behind.
+    cleanup_on_drop: bool,
+}
+
+impl Drop for ProcessEntry {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+
+        if let Some(child) = self.child.as_mut()
+            && let Some(pid) = child.id()
+        {
+            #[cfg(unix)]
+            let pid = nix::unistd::Pid::from_raw(-(pid as i32));
+            #[cfg(not(unix))]
+            let pid = nix::unistd::Pid::from_raw(pid as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = child.start_kill();
+        } else if let Some(pid) = self.adopted_pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
 }
 
 use super::records::poll_adopted_process;
@@ -143,6 +170,7 @@ impl super::Grill for ProcessGrill {
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
                 log_stem: None,
                 exit_code: None,
+                cleanup_on_drop: self.log_dir.is_none(),
             },
         );
         Ok(())
@@ -177,9 +205,15 @@ impl super::Grill for ProcessGrill {
         };
 
         let mut cmd = Command::new(&effective_args[0]);
+        cmd.kill_on_drop(entry.cleanup_on_drop);
         if effective_args.len() > 1 {
             cmd.args(&effective_args[1..]);
         }
+        // A workload may be a shell that starts grandchildren. Giving each
+        // workload its own process group lets stop/kill reach the complete
+        // tree instead of orphaning the shell's children.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         // Set environment variables from OCI spec
         for env_str in &entry.spec.process.env {
@@ -276,14 +310,18 @@ impl super::Grill for ProcessGrill {
                 instance: instance.clone(),
             })?;
 
-        let pid = entry
-            .child
-            .as_ref()
-            .and_then(|c| c.id())
-            .or(entry.adopted_pid);
-        if let Some(pid) = pid {
+        if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
+            #[cfg(unix)]
+            let pid = nix::unistd::Pid::from_raw(-(pid as i32));
+            #[cfg(not(unix))]
             let pid = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+        } else if let Some(pid) = entry.adopted_pid {
+            // An adopted workload may not lead a process group created by us.
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
         }
         entry.state = ContainerState::Stopping;
         Ok(())
@@ -298,7 +336,17 @@ impl super::Grill for ProcessGrill {
             })?;
 
         if let Some(ref mut child) = entry.child {
-            let _ = child.kill().await;
+            if let Some(pid) = child.id() {
+                #[cfg(unix)]
+                let pid = nix::unistd::Pid::from_raw(-(pid as i32));
+                #[cfg(not(unix))]
+                let pid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+            // Reap the direct child after the group signal. The direct kill is
+            // a cross-platform backstop if group signalling raced an exit.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         } else if let Some(pid) = entry.adopted_pid {
             let pid = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
@@ -366,6 +414,7 @@ impl super::Grill for ProcessGrill {
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
                 log_stem: record.log_stem.clone(),
                 exit_code: None,
+                cleanup_on_drop: self.log_dir.is_none(),
             },
         );
         Ok(true)
@@ -554,6 +603,19 @@ mod tests {
         spec_with_args(vec!["sleep".to_string(), secs.to_string()])
     }
 
+    async fn wait_for_state(grill: &ProcessGrill, instance: &InstanceId, expected: ContainerState) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if grill.state(instance).await.unwrap() == expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{instance:?} did not reach {expected:?}"));
+    }
+
     fn record_for(instance: &InstanceId, pid: u32, started_at: u64) -> InstanceRecord {
         InstanceRecord {
             schema: 1,
@@ -596,6 +658,8 @@ mod tests {
 
         let state = grill.state(&id).await.unwrap();
         assert_eq!(state, ContainerState::Running);
+
+        grill.kill(&id).await.unwrap();
     }
 
     #[tokio::test]
@@ -624,14 +688,91 @@ mod tests {
         grill.start(&id).await.unwrap();
         grill.stop(&id).await.unwrap();
 
-        // After SIGTERM, process should exit (sleep responds to signals)
-        // Give it a moment
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let state = grill.state(&id).await.unwrap();
-        assert!(
-            state == ContainerState::Stopped || state == ContainerState::Stopping,
-            "expected stopped or stopping, got {state}"
-        );
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_terminates_shell_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        let grill = ProcessGrill::new();
+        let id = InstanceId("process-tree-0".to_string());
+
+        grill
+            .create(
+                &id,
+                &spec_with_args(vec!["sh".to_string(), "-c".to_string(), script]),
+            )
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+
+        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    break contents.trim().parse::<u32>().unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("shell did not report its child pid");
+
+        grill.stop(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while records::process_start_time(descendant_pid).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("stopping the workload left its shell descendant alive");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panicking_owner_terminates_in_memory_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let script = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        let task = tokio::spawn(async move {
+            let grill = ProcessGrill::new();
+            let id = InstanceId("panic-cleanup-0".to_string());
+            grill
+                .create(
+                    &id,
+                    &spec_with_args(vec!["sh".to_string(), "-c".to_string(), script]),
+                )
+                .await
+                .unwrap();
+            grill.start(&id).await.unwrap();
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !pid_file.is_file() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("shell did not report its child pid");
+            panic!("exercise unwind cleanup");
+        });
+
+        let error = task.await.expect_err("fixture task should panic");
+        assert!(error.is_panic());
+        let descendant_pid = std::fs::read_to_string(dir.path().join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while records::process_start_time(descendant_pid).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("panicking fixture owner left its process tree alive");
     }
 
     #[tokio::test]
@@ -666,11 +807,7 @@ mod tests {
         grill.create(&id, &spec).await.unwrap();
         grill.start(&id).await.unwrap();
 
-        // Wait for the short-lived process to exit
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let state = grill.state(&id).await.unwrap();
-        assert_eq!(state, ContainerState::Stopped);
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
     }
 
     #[tokio::test]
@@ -698,9 +835,17 @@ mod tests {
 
         grill.create(&id, &echo_spec("to file")).await.unwrap();
         grill.start(&id).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        let logged = grill.logs(&id).await.unwrap();
+        let logged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let logs = grill.logs(&id).await.unwrap();
+                if logs.contains("to file") {
+                    return logs;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("file-backed log was not written");
         assert!(logged.contains("to file"), "got {logged:?}");
         assert!(dir.path().join("test-0.stdout").is_file());
     }
@@ -791,8 +936,7 @@ mod tests {
         );
         assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
         assert_eq!(grill.exit_code(&id).await, Some(0));
         std::mem::forget(external); // already reaped via waitpid
     }

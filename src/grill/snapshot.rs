@@ -443,11 +443,12 @@ mod tests {
     /// restore from snapshot, verify data intact.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires Linux root, Btrfs tools, and RELIABURGER_BTRFS_TESTS=1"]
     fn snapshot_restore_recovers_corrupted_data() {
-        if std::env::var("RELIABURGER_BTRFS_TESTS").is_err() {
-            eprintln!("skipping btrfs test (set RELIABURGER_BTRFS_TESTS=1 to enable)");
-            return;
-        }
+        assert!(
+            std::env::var("RELIABURGER_BTRFS_TESTS").is_ok(),
+            "set RELIABURGER_BTRFS_TESTS=1 after provisioning Btrfs tools and root access"
+        );
 
         let scratch = tempfile::tempdir().unwrap();
         let img = scratch.path().join("btrfs.img");

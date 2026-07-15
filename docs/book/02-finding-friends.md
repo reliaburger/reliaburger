@@ -622,7 +622,17 @@ These numbers improved dramatically when we switched from `ceil(log2(N))` to `3 
 
 Run `cargo bench --bench gossip` to check for regressions. Criterion stores previous results in `target/criterion/` and reports whether performance changed. If you accidentally introduce an O(N²) loop where O(N) was expected, the benchmark will catch it before any user does.
 
-For larger clusters, `cargo bench --bench gossip_large` tests 500 and 1000 nodes (~10 minutes). And for the ultimate validation — 10,000 nodes, matching the whitepaper's scalability target — there's `make bench-10k`. That one takes about an hour because we're simulating all 10k nodes sequentially on a single thread. It's not something you run every commit, but it proves the protocol converges at the scale we promised. The test prints progress every 50 rounds so you can watch membership knowledge spread through the cluster in real time.
+For larger clusters, `cargo bench --bench gossip_large` measures full convergence at 500
+and 1000 nodes. It keeps a sorted peer index as nodes learn about each other, so we're timing
+the protocol rather than rebuilding and sorting every membership snapshot on every round.
+
+What about 10,000 nodes? A real cluster distributes one 10,000-entry table to each machine.
+Putting all 10,000 tables in one test process creates 100 million membership records and
+asks one hosted runner to impersonate a datacentre. We tried it. It couldn't finish inside
+90 minutes. `make bench-10k` therefore checks the real per-node contract: one Mustard node
+learns 10,000 members through fixed-size messages, selects a probe target and makes every
+update available in bounded dissemination batches. Full multi-node convergence remains
+covered at 1,000 nodes. Different tests, different claims. Much less hand-waving.
 
 ### What's next
 
@@ -1457,7 +1467,7 @@ pub struct GossipMessage {
 }
 ```
 
-`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). So the message body's bytes are *identical* to the old wire format. The UDP transport then appends the encoded extension after the message bytes in the same datagram. Old peers deserialise the message and never look at the trailing bytes (bincode's legacy `deserialize` ignores them — a behaviour we pin with a test that decodes a new datagram using a copy of the old struct). New peers read the message, notice the cursor hasn't consumed the whole datagram, and decode the extension from the remainder. Tolerant in both directions, and the 10,000-node gossip test doesn't change by a byte.
+`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). So the message body's bytes are *identical* to the old wire format. The UDP transport then appends the encoded extension after the message bytes in the same datagram. Old peers deserialise the message and never look at the trailing bytes (bincode's legacy `deserialize` ignores them — a behaviour we pin with a test that decodes a new datagram using a copy of the old struct). New peers read the message, notice the cursor hasn't consumed the whole datagram, and decode the extension from the remainder. Tolerant in both directions. Compatibility tests pin the old bytes, while the 10,000-member scale acceptance feeds the new messages through the same production handler.
 
 Authentication needed one extra step. The message HMAC (Phase 4) deliberately still covers only the message — otherwise old peers couldn't verify new datagrams. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
 

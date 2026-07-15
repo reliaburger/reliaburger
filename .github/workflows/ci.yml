@@ -1,85 +1,204 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+
 jobs:
-  ci:
+  portable:
+    name: portable Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Split out from `make ci` so each phase is timed separately in the
-      # Actions UI. Same fail-fast order as `ci: fmt-check lint test`.
-      - name: Format check
-        run: make fmt-check
-
-      - name: Lint (clippy)
-        run: make lint
-
-      - name: Test
-        run: make test
-
-  linux-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          key: linux-ebpf
-
-      - name: Install Linux test dependencies
+          key: portable
+      - name: Prepare portable build host
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq runc slirp4netns clang llvm libbpf-dev linux-headers-$(uname -r)
+          sudo apt-get remove -y -qq buildah
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Format
+        run: make fmt-check
+      - name: Lint every target and feature
+        run: make lint
+      - name: Portable tests
+        run: make test
+      - name: Verify JUnit output
+        run: test -s target/nextest/ci/junit.xml
+      - name: No-default-feature tests
+        run: make test-no-default
+      - name: Doctests
+        run: make test-doc
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-portable
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
 
-      - name: Run Linux-gated tests (netns, runc, eBPF)
-        run: |
-          sudo -E env PATH="$PATH" \
-            RELIABURGER_RUNC_TESTS=1 \
-            RELIABURGER_NETNS_TESTS=1 \
-            RELIABURGER_EBPF_TESTS=1 \
-            cargo test --features ebpf -- --test-threads=1
-
-  upgrade-tests:
-    # Real-binary self-upgrade tests: each spawns actual bun processes under
-    # a supervisor loop and takes minutes, so they run in their own job
-    # (off the critical path) rather than blocking `ci`/`linux-tests`. They
-    # use the process runtime, so no runc/netns setup is needed.
-    #
-    # Only the SINGLE-NODE suite runs here. The cluster suite
-    # (self_upgrade_cluster) forms a 4-node cluster of real bun processes —
-    # each with its own Raft TCP server and gossip — which does not converge
-    # reliably on a contended 2-core CI runner (the membership-change RPC
-    # times out under load and retries indefinitely). Run it on a real
-    # machine or the Lima dev cluster with `make test-upgrade`.
+  slow:
+    name: wall-clock acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          key: upgrade-tests
+          key: slow
+      - run: make test-slow
 
-      - name: Run single-node self-upgrade integration tests
+  linux:
+    name: privileged Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-privileged
+      - name: Install runtime and kernel test dependencies
         run: |
-          RELIABURGER_UPGRADE_TESTS=1 \
-            cargo test --test self_upgrade -- --test-threads=1
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs buildah clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns
+      - name: Run only provisioned Linux tests
+        run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
+
+  cluster:
+    name: multi-node cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cluster
+      - run: make test-cluster
+
+  upgrade-node:
+    name: single-node upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: upgrade-node
+      - run: make test-upgrade-node
+
+  upgrade-cluster:
+    name: cluster upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: upgrade-cluster
+      - run: make test-upgrade-cluster
+
+  macos:
+    name: portable macOS
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-portable
+      - run: make test
+      - run: make test-doc
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: Remove provisioned container builder
+        run: sudo apt-get remove -y -qq buildah
+      - run: make coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: target/coverage
+          if-no-files-found: error
+
+  benchmark-fast:
+    name: fast benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmark-fast
+      - run: make bench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: criterion-fast
+          path: target/criterion
+          if-no-files-found: error
+
+  benchmark-large:
+    name: large benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: benchmark-large
+      - run: make bench-large
+      - uses: actions/upload-artifact@v4
+        with:
+          name: criterion-large
+          path: target/criterion
+          if-no-files-found: error
+
+  scale-10k:
+    name: 10k-member scale acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: scale-10k
+      - run: make bench-10k

@@ -1269,15 +1269,21 @@ mod tests {
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // A slow backend: it accepts, waits, then replies. While it waits the
-        // proxy is still forwarding, so the drain must not complete.
+        // A gated backend: it signals after receiving the request, then waits
+        // for the test to release it. This proves the in-flight state without
+        // relying on a guessed wall-clock delay.
         let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
+        let request_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_backend = std::sync::Arc::new(tokio::sync::Notify::new());
+        let backend_started = std::sync::Arc::clone(&request_started);
+        let backend_release = std::sync::Arc::clone(&release_backend);
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = backend.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                backend_started.notify_one();
+                backend_release.notified().await;
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                     .await;
@@ -1350,9 +1356,9 @@ mod tests {
         let req =
             tokio::spawn(async move { client.get(&url).header("host", "web.test").send().await });
 
-        // Give the request time to reach the backend and register with the
-        // tracker. While it's in flight, the drain must not complete.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(2), request_started.notified())
+            .await
+            .expect("request did not reach the gated backend");
         assert!(
             drains.check_completions().await.is_empty(),
             "drain completed while a request was still in flight"
@@ -1363,6 +1369,7 @@ mod tests {
         );
 
         // Once the request returns, the drain completes on the next sweep.
+        release_backend.notify_one();
         let _ = req.await.unwrap();
         // Poll: the proxy's decrement runs on a spawned task after the guard
         // drops, so give it a moment.

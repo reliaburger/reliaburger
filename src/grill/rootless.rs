@@ -367,7 +367,7 @@ mod tests {
         let sys_mount = spec
             .mounts
             .iter()
-            .find(|m| m.destination == PathBuf::from("/sys"))
+            .find(|m| m.destination.as_path() == std::path::Path::new("/sys"))
             .unwrap();
 
         assert_eq!(sys_mount.mount_type, Some("none".to_string()));
