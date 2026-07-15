@@ -104,6 +104,7 @@ impl Harness {
                 .membership
                 .map(|members| Arc::new(RwLock::new(members))),
             None,
+            None,
             9117,
             None,
             None,

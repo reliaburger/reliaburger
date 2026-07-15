@@ -1118,9 +1118,21 @@ async fn main() -> anyhow::Result<()> {
     // GitOps (L13): if [gitops] is configured on a cluster node, spawn
     // the leader-only sync loop and hand the API a webhook sender that
     // nudges it. The webhook endpoint returns 503 without this.
+    // The webhook validator authenticates public webhook POSTs by the
+    // `[gitops] webhook_secret` HMAC (GIT3). Without a secret it stays
+    // `None`, and the public route fails closed.
+    let mut gitops_webhook_validator = None;
     let gitops_webhook_tx =
         if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
             let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
+            if let Some(secret) = gitops.webhook_secret.as_deref() {
+                gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                    reliaburger::lettuce::webhook::WebhookValidator::new(
+                        secret,
+                        gitops.webhook_rate_limit,
+                    ),
+                )));
+            }
             reliaburger::lettuce::runner::spawn_gitops_sync(
                 council,
                 gitops,
@@ -1171,6 +1183,7 @@ async fn main() -> anyhow::Result<()> {
         api_rollup_store,
         api_membership.clone(),
         gitops_webhook_tx,
+        gitops_webhook_validator,
         api_port,
         Some(event_store),
         upgrade_manager.clone().map(Arc::new),

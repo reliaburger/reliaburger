@@ -99,6 +99,15 @@ The GitOps coordinator is a council member role, elected via a Raft-replicated s
 - The replacement coordinator reads the last `SyncState` from Raft (which includes the last applied commit hash and the local bare clone path) and resumes the sync loop from where the previous coordinator left off.
 - The replacement coordinator must `git clone` the repository fresh if it doesn't already have a local clone. During this window (typically a few seconds), sync is paused but not lost -- the next poll after clone completion catches up.
 
+**Implementation status (12b.5).** The sync loop is currently **leader-driven**: only the
+Raft leader can write desired state, so the leader runs the sync and applies the diff. The
+coordinator election (`select_coordinator`) is wired and the elected coordinator is recorded
+in `SyncState.coordinator_node_id` for the UI, but it *complements* the leader rather than
+replacing it — the separate coordinator-driven loop with Raft-heartbeat failover above is the
+target model, not yet the implemented one. A reused local clone is verified against the
+configured remote URL and branch and re-cloned on drift, so a stale clone left by a leadership
+change never syncs the wrong repository.
+
 ### 3.3 TOML Parsing Pipeline
 
 Lettuce parses TOML files in a defined order to handle cross-references:
@@ -538,6 +547,19 @@ For instant deploys on push. The webhook endpoint is served on the cluster API p
 | 409 | Duplicate delivery (replay) |
 | 429 | Rate limited |
 | 503 | Coordinator unavailable (failover in progress) |
+
+**Implementation status (12b.5).** The webhook route is wired and HMAC-authenticated as
+described, with one deliberate simplification and two clarifications. The route is served
+on the cluster API port and is **public** in the router split — exempt from the 12b.3
+bearer-auth middleware, because a git provider sends `X-Hub-Signature-256`/`X-Gitlab-Token`,
+never a Reliaburger bearer token — but it is *authenticated inside the handler* by the HMAC
+signature over the raw body, replay and rate checks. Without a configured `webhook_secret`
+the route **fails closed** (503), since a public unauthenticated sync trigger is a DoS lever.
+A replay and any bad/missing signature currently return **401** (not 409), and rate-limit
+excess returns **429**; the `Retry-After` header and the wrong-branch 200 short-circuit are
+not yet implemented (the sync loop tracks the configured branch regardless). The validator
+holds a bounded replay set and per-minute trigger window in an `Arc<Mutex<WebhookValidator>>`
+shared with the handler.
 
 ### 5.3 Commit Signature Verification
 

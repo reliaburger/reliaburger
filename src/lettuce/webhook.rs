@@ -51,7 +51,47 @@ impl WebhookValidator {
         // HMAC validation
         self.verify_signature(body, signature_header)?;
 
-        // Replay detection
+        // Replay + rate limit.
+        self.check_replay_and_rate(delivery_id)?;
+
+        // Extract commit SHA from webhook body (simplified — real impl
+        // would parse the JSON from GitHub/GitLab/Gitea format)
+        let commit_sha = extract_head_commit(body).unwrap_or_default();
+
+        Ok(WebhookEvent {
+            branch: branch.to_string(),
+            commit_sha,
+            delivery_id: delivery_id.map(String::from),
+        })
+    }
+
+    /// Validate a GitLab webhook, whose `X-Gitlab-Token` carries the
+    /// shared secret verbatim rather than an HMAC signature.
+    ///
+    /// The token is compared to the configured secret in constant time,
+    /// then replay and rate-limit checks run exactly as for GitHub.
+    pub fn validate_gitlab(
+        &mut self,
+        body: &[u8],
+        token: &str,
+        delivery_id: Option<&str>,
+        branch: &str,
+    ) -> Result<WebhookEvent, LettuceError> {
+        if !constant_time_eq(token.as_bytes(), &self.secret) {
+            return Err(LettuceError::WebhookInvalid("token mismatch".to_string()));
+        }
+        self.check_replay_and_rate(delivery_id)?;
+
+        let commit_sha = extract_head_commit(body).unwrap_or_default();
+        Ok(WebhookEvent {
+            branch: branch.to_string(),
+            commit_sha,
+            delivery_id: delivery_id.map(String::from),
+        })
+    }
+
+    /// Run the replay and rate-limit checks shared by every provider.
+    fn check_replay_and_rate(&mut self, delivery_id: Option<&str>) -> Result<(), LettuceError> {
         if let Some(id) = delivery_id {
             if self.recent_ids.iter().any(|existing| existing == id) {
                 return Err(LettuceError::WebhookInvalid(
@@ -64,7 +104,6 @@ impl WebhookValidator {
             }
         }
 
-        // Rate limiting
         let now = Instant::now();
         let one_minute_ago = now - std::time::Duration::from_secs(60);
         while self
@@ -81,16 +120,7 @@ impl WebhookValidator {
             )));
         }
         self.recent_triggers.push_back(now);
-
-        // Extract commit SHA from webhook body (simplified — real impl
-        // would parse the JSON from GitHub/GitLab/Gitea format)
-        let commit_sha = extract_head_commit(body).unwrap_or_default();
-
-        Ok(WebhookEvent {
-            branch: branch.to_string(),
-            commit_sha,
-            delivery_id: delivery_id.map(String::from),
-        })
+        Ok(())
     }
 
     /// Verify the HMAC-SHA256 signature.
@@ -112,6 +142,24 @@ impl WebhookValidator {
         hmac::verify(&key, body, &expected_sig)
             .map_err(|_| LettuceError::WebhookInvalid("signature mismatch".to_string()))
     }
+}
+
+/// Constant-time byte-slice equality for the GitLab shared-secret token.
+///
+/// A plain `==` short-circuits at the first differing byte, leaking how
+/// many leading bytes matched — enough to forge a token byte by byte.
+/// This folds every byte difference into one accumulator, so the running
+/// time depends only on the length. (GitHub's HMAC path already gets this
+/// for free from `ring::hmac::verify`.)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract the head commit SHA from a webhook JSON body.
@@ -199,6 +247,42 @@ mod tests {
         let result = validator.validate(body, Some(&sig), Some("id-3"), "main");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("rate limit"));
+    }
+
+    #[test]
+    fn gitlab_token_accepted_and_wrong_token_rejected() {
+        let mut validator = WebhookValidator::new("shared-secret", 10);
+        let body = br#"{"after": "abc"}"#;
+
+        let event = validator
+            .validate_gitlab(body, "shared-secret", Some("uuid-1"), "main")
+            .unwrap();
+        assert_eq!(event.commit_sha, "abc");
+
+        let wrong = validator.validate_gitlab(body, "not-it", Some("uuid-2"), "main");
+        assert!(wrong.is_err());
+    }
+
+    #[test]
+    fn gitlab_replay_and_rate_limit_apply() {
+        let mut validator = WebhookValidator::new("s", 1);
+        let body = br#"{}"#;
+        validator
+            .validate_gitlab(body, "s", Some("d-1"), "main")
+            .unwrap();
+        // Same delivery id → replay.
+        let replay = validator.validate_gitlab(body, "s", Some("d-1"), "main");
+        assert!(replay.unwrap_err().to_string().contains("duplicate"));
+        // Fresh id, but the single per-minute slot is used → rate limited.
+        let flooded = validator.validate_gitlab(body, "s", Some("d-2"), "main");
+        assert!(flooded.unwrap_err().to_string().contains("rate limit"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 
     #[test]

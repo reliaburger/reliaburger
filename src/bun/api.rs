@@ -70,6 +70,14 @@ pub struct ApiState {
     pub pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     /// GitOps webhook signal channel (signals the Lettuce sync loop).
     pub gitops_webhook_tx: Option<mpsc::Sender<()>>,
+    /// GitOps webhook validator (HMAC signature, replay, rate limit).
+    /// Shared and mutable because it tracks recent delivery ids and
+    /// trigger timestamps across requests. `None` when no
+    /// `[gitops] webhook_secret` is configured — the route then refuses
+    /// every request (fail closed), since a public unauthenticated sync
+    /// trigger would be a denial-of-service lever (GIT3).
+    pub gitops_webhook_validator:
+        Option<Arc<tokio::sync::Mutex<crate::lettuce::webhook::WebhookValidator>>>,
     /// Council node reference (for JWKS and signing endpoints).
     pub council: Option<Arc<crate::council::CouncilNode>>,
     /// Council-side rollup store for cluster-wide metrics queries.
@@ -164,6 +172,7 @@ pub fn router(
         rollup_store,
         membership,
         gitops_webhook_tx,
+        None,
         api_port,
         events,
         None,
@@ -192,6 +201,9 @@ pub fn router_with_upgrade(
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
     membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
     gitops_webhook_tx: Option<mpsc::Sender<()>>,
+    gitops_webhook_validator: Option<
+        Arc<tokio::sync::Mutex<crate::lettuce::webhook::WebhookValidator>>,
+    >,
     api_port: u16,
     events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     upgrade: Option<Arc<crate::upgrade::manager::UpgradeManager>>,
@@ -215,6 +227,7 @@ pub fn router_with_upgrade(
         events,
         pickle_catalog,
         gitops_webhook_tx,
+        gitops_webhook_validator,
         council,
         rollup_store,
         membership,
@@ -255,6 +268,12 @@ pub fn router_with_upgrade(
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/ui/static/{*path}", get(static_asset_handler))
         .route("/v1/cluster/join", post(join_handler))
+        // The GitOps webhook is public: real providers (GitHub, GitLab)
+        // send `X-Hub-Signature-256`/`X-Gitlab-Token`, never a Reliaburger
+        // bearer token, so it can't sit behind the bearer-auth middleware.
+        // It's authenticated inside the handler by the HMAC signature over
+        // the raw body, with replay and rate-limit checks (GIT3).
+        .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .with_state(state.clone());
 
     // The login page and session exchange carry `AuthState` so they can
@@ -371,7 +390,6 @@ pub fn router_with_upgrade(
             "/v1/build/{id}",
             get(super::build_runner::build_status_handler),
         )
-        .route("/v1/gitops/webhook", post(gitops_webhook_handler))
         .route("/v1/identity/sign", post(identity_sign_handler))
         .route("/v1/token/create", post(token_create_handler))
         .route("/v1/token/list", get(token_list_handler))
@@ -3368,14 +3386,60 @@ async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
     Json(serde_json::json!({"images": images}))
 }
 
-/// GitOps webhook handler.
+/// GitOps webhook handler (public, HMAC-authenticated).
 ///
-/// Accepts POST from git hosting providers (GitHub, GitLab, Gitea).
-/// Signals the Lettuce sync loop to trigger an immediate sync.
-/// Returns 202 Accepted on success, 503 if GitOps is not configured.
-async fn gitops_webhook_handler(State(state): State<ApiState>) -> Response {
-    match &state.gitops_webhook_tx {
-        Some(tx) => {
+/// Accepts POST from git hosting providers (GitHub, GitLab, Gitea). The
+/// route is public because providers can't present a Reliaburger bearer
+/// token, so the request is authenticated here instead: the HMAC-SHA256
+/// signature over the raw body must match the `[gitops] webhook_secret`,
+/// the delivery id must not be a replay, and the rate limit must not be
+/// exceeded (GIT3). Only then is the sync loop nudged.
+///
+/// Returns 202 on success, 401 on a bad/missing signature or replay, 429
+/// when rate-limited, and 503 when GitOps or the webhook secret isn't
+/// configured.
+async fn gitops_webhook_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(tx) = &state.gitops_webhook_tx else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "gitops not configured" })),
+        )
+            .into_response();
+    };
+
+    // Fail closed: without a configured secret we can't authenticate the
+    // caller, and a public unauthenticated trigger is a DoS lever.
+    let Some(validator) = &state.gitops_webhook_validator else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "webhook secret not configured" })),
+        )
+            .into_response();
+    };
+
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    let gitlab_token = headers.get("x-gitlab-token").and_then(|v| v.to_str().ok());
+    let delivery_id = header_delivery_id(&headers);
+    let branch = header_branch(&headers).unwrap_or_else(|| "main".to_string());
+
+    let mut guard = validator.lock().await;
+    let result = if let Some(token) = gitlab_token {
+        // GitLab sends the shared secret verbatim in `X-Gitlab-Token`.
+        guard.validate_gitlab(&body, token, delivery_id.as_deref(), &branch)
+    } else {
+        // GitHub/Gitea sign the body: `X-Hub-Signature-256: sha256=<hex>`.
+        guard.validate(&body, signature, delivery_id.as_deref(), &branch)
+    };
+    drop(guard);
+
+    match result {
+        Ok(_) => {
             let _ = tx.send(()).await;
             (
                 StatusCode::ACCEPTED,
@@ -3383,12 +3447,37 @@ async fn gitops_webhook_handler(State(state): State<ApiState>) -> Response {
             )
                 .into_response()
         }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "gitops not configured" })),
-        )
-            .into_response(),
+        Err(e) => {
+            let message = e.to_string();
+            // A rate-limit rejection is a 429; everything else (bad
+            // signature, replay, missing header) is a 401.
+            let code = if message.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            (code, Json(serde_json::json!({ "error": message }))).into_response()
+        }
     }
+}
+
+/// The provider's delivery id header, if any (GitHub / Gitea).
+fn header_delivery_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-github-delivery")
+        .or_else(|| headers.get("x-gitlab-event-uuid"))
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+}
+
+/// The branch a push targeted, parsed from `X-Reliaburger-Branch` if the
+/// caller set it. Providers don't send the branch in a header, so this is
+/// advisory; the sync loop tracks the configured branch regardless.
+fn header_branch(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-reliaburger-branch")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -5127,6 +5216,236 @@ mod tests {
         // The login page itself must be reachable while logged out.
         let login_page = ui_get(&app, "/ui/login", &[("accept", "text/html")]).await;
         assert_eq!(login_page.status(), StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    // --- GitOps webhook (GIT3) ---------------------------------------------
+
+    /// A router whose GitOps webhook route is wired to a validator with the
+    /// given secret. Returns the app plus the receiver, so a test observes a
+    /// triggered sync by a real message on the channel rather than a sleep.
+    fn webhook_setup(
+        secret: &str,
+        rate_limit: u32,
+    ) -> (Router, mpsc::Receiver<()>, CancellationToken) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let (webhook_tx, webhook_rx) = mpsc::channel::<()>(4);
+        let validator = Arc::new(tokio::sync::Mutex::new(
+            crate::lettuce::webhook::WebhookValidator::new(secret, rate_limit),
+        ));
+        let app = router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(webhook_tx),
+            Some(validator),
+            9117,
+            None,
+            None,
+            None,
+            None,
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            256 * 1024 * 1024,
+            false,
+        );
+        (app, webhook_rx, shutdown)
+    }
+
+    fn github_signature(secret: &str, body: &[u8]) -> String {
+        use ring::hmac;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+        let tag = hmac::sign(&key, body);
+        format!("sha256={}", hex::encode(tag.as_ref()))
+    }
+
+    async fn post_webhook(app: &Router, body: &[u8], headers: &[(&str, String)]) -> StatusCode {
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/gitops/webhook");
+        for (name, value) in headers {
+            req = req.header(*name, value);
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body.to_vec())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_a_bad_signature_without_triggering_a_sync() {
+        let secret = "hooksecret";
+        let (app, mut rx, shutdown) = webhook_setup(secret, 10);
+        let body = br#"{"after":"abc"}"#;
+
+        let status = post_webhook(
+            &app,
+            body,
+            &[("x-hub-signature-256", "sha256=deadbeef".to_string())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // No sync was triggered.
+        assert!(rx.try_recv().is_err(), "a bad signature must not sync");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_a_missing_signature() {
+        let (app, mut rx, shutdown) = webhook_setup("hooksecret", 10);
+        let status = post_webhook(&app, br#"{}"#, &[]).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(rx.try_recv().is_err());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_valid_github_signed_webhook_triggers_a_sync_without_a_bearer_token() {
+        let secret = "hooksecret";
+        let (app, mut rx, shutdown) = webhook_setup(secret, 10);
+        let body = br#"{"after":"abc123","ref":"refs/heads/main"}"#;
+        let sig = github_signature(secret, body);
+
+        // No Authorization header at all — the provider never sends one.
+        let status = post_webhook(
+            &app,
+            body,
+            &[
+                ("x-hub-signature-256", sig),
+                ("x-github-delivery", "delivery-1".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        // Observable: the sync loop was nudged.
+        assert!(
+            rx.recv().await.is_some(),
+            "a valid webhook must trigger a sync"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_a_replayed_delivery_id() {
+        let secret = "hooksecret";
+        let (app, mut rx, shutdown) = webhook_setup(secret, 10);
+        let body = br#"{"after":"abc"}"#;
+        let sig = github_signature(secret, body);
+        let headers = [
+            ("x-hub-signature-256", sig),
+            ("x-github-delivery", "same-id".to_string()),
+        ];
+
+        assert_eq!(
+            post_webhook(&app, body, &headers).await,
+            StatusCode::ACCEPTED
+        );
+        assert!(rx.recv().await.is_some());
+        // The same delivery id a second time is a replay.
+        assert_eq!(
+            post_webhook(&app, body, &headers).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(rx.try_recv().is_err(), "a replay must not sync again");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_rate_limit_trips_on_a_flood() {
+        let secret = "hooksecret";
+        // One trigger per minute.
+        let (app, _rx, shutdown) = webhook_setup(secret, 1);
+        let body = br#"{"after":"abc"}"#;
+        let sig = github_signature(secret, body);
+
+        // First unique delivery is accepted.
+        assert_eq!(
+            post_webhook(
+                &app,
+                body,
+                &[
+                    ("x-hub-signature-256", sig.clone()),
+                    ("x-github-delivery", "d-1".to_string())
+                ]
+            )
+            .await,
+            StatusCode::ACCEPTED
+        );
+        // Second, fresh delivery id but the per-minute slot is used → 429.
+        assert_eq!(
+            post_webhook(
+                &app,
+                body,
+                &[
+                    ("x-hub-signature-256", sig),
+                    ("x-github-delivery", "d-2".to_string())
+                ]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_fails_closed_without_a_configured_secret() {
+        // A webhook tx but no validator (no `[gitops] webhook_secret`): the
+        // route must refuse rather than trigger unauthenticated syncs.
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let (webhook_tx, mut rx) = mpsc::channel::<()>(4);
+        let app = router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(webhook_tx),
+            None,
+            9117,
+            None,
+            None,
+            None,
+            None,
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            256 * 1024 * 1024,
+            false,
+        );
+        let status = post_webhook(&app, br#"{}"#, &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(rx.try_recv().is_err());
         shutdown.cancel();
     }
 }

@@ -1053,12 +1053,35 @@ whole theme lands.
   old M3/M4/M19/M20/M24/X8, OBS1-OBS8).
   - [x] Cluster rollup metric-name queries escaped via `escape_sql_literal`, closing the
     `/v1/metrics/rollup` SQL injection where `params.name` was interpolated raw (OBS1).
-- [ ] **GitOps convergence and webhook security** — expose a signature-validated HMAC
+- [x] **GitOps convergence and webhook security** — expose a signature-validated HMAC
   webhook route with replay/rate controls; make diff namespace-aware and deterministic;
   apply every resource through the unified desired-state path; never advance last_applied
   after skip, partial result or failed write; keep jobs stable. Verify reused clone
   remote/branch, terminate Git options safely and wire coordinator/backoff semantics
   (D12, GIT1-GIT4, old Git/Jobs Lows).
+  - [x] GIT2 namespaced convergence: the diff keys apps by full `AppId` (namespace + name),
+    and the `resource_id` encodes `app.<namespace>/<name>`, so a `prod/web` removed from git
+    deletes `prod/web` and never `default/web`. Two same-named apps in different namespaces
+    converge independently (`diff.rs`, `runner.rs`).
+  - [x] GIT2b jobs: dropped the phantom job `Add` the diff emitted every sync against an
+    always-empty set. Jobs run to completion (not reconciled desired state), so the diff
+    emits nothing for them — no re-add, no inflated `summary.added`.
+  - [x] GIT3 public HMAC webhook: `WebhookValidator` wired into the live handler; the route
+    is public (exempt from the 12b.3 bearer middleware — GitHub/GitLab can't send a bearer)
+    but HMAC-gated in the handler. Validates `X-Hub-Signature-256` (GitHub) or `X-Gitlab-Token`
+    (GitLab) over the raw body, rejects replayed delivery ids (401), and rate-limits (429).
+    Fails closed (503) with no `[gitops] webhook_secret`. Constant-time compares throughout
+    (`ring::hmac::verify`; explicit CT for the GitLab token).
+  - [x] GIT4 git safety: `--`/`--end-of-options` terminators before every user-controlled
+    ref/path/SHA (no option injection); reused clone verified against remote URL + branch
+    and re-cloned on drift; deterministic sorted-path file merge with a duplicate-resource
+    error instead of hash-order overwrite.
+  - [x] GIT4 durable errors + backoff + coordinator: hard sync failures recorded in
+    `SyncState` (`last_error`, `consecutive_failures`, `phase = Error`) so relish/UI see a
+    broken sync, not just stderr; `backoff_delay` wired into the retry; `select_coordinator`
+    wired to stamp the elected coordinator (complements leader-only sync — the leader still
+    drives writes).
+  - GIT1 (last_applied advances only on full success) already landed in #98; not redone.
 
 ### 12b.6 — Platform, upgrades and documentation
 

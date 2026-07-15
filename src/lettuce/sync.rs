@@ -201,26 +201,81 @@ pub fn execute_sync(
 /// Parse a set of TOML files into a merged Config.
 ///
 /// Returns the merged config and a map of per-file errors.
+///
+/// Files merge in **sorted path order**, not the arbitrary order a
+/// `HashMap` iterates in (GIT4). Two files declaring the same resource
+/// used to resolve to whichever the hash happened to visit last, so an
+/// identical repo could converge differently between nodes or runs. A
+/// deterministic order fixes that, and a duplicate resource across files
+/// is now surfaced as a per-file error naming the collision rather than
+/// silently overwritten.
 fn parse_toml_files(files: &HashMap<String, String>) -> (Config, HashMap<String, String>) {
     let mut merged = Config::default();
     let mut errors = HashMap::new();
 
-    for (path, content) in files {
-        match Config::parse(content) {
-            Ok(file_config) => {
-                merged.app.extend(file_config.app);
-                merged.job.extend(file_config.job);
-                merged.namespace.extend(file_config.namespace);
-                merged.permission.extend(file_config.permission);
-                merged.build.extend(file_config.build);
-            }
+    // Sort by path so the merge is deterministic across nodes and runs.
+    let mut ordered: Vec<(&String, &String)> = files.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (path, content) in ordered {
+        let file_config = match Config::parse(content) {
+            Ok(config) => config,
             Err(e) => {
                 errors.insert(path.clone(), e.to_string());
+                continue;
             }
+        };
+
+        // A resource named in two files is ambiguous: report it against
+        // this later-sorted file and let the earlier definition stand,
+        // rather than silently letting hash order pick a winner.
+        if let Some(duplicate) = first_duplicate(&merged, &file_config) {
+            errors.insert(
+                path.clone(),
+                format!("duplicate resource {duplicate} already declared in an earlier file"),
+            );
+            continue;
         }
+
+        merged.app.extend(file_config.app);
+        merged.job.extend(file_config.job);
+        merged.namespace.extend(file_config.namespace);
+        merged.permission.extend(file_config.permission);
+        merged.build.extend(file_config.build);
     }
 
     (merged, errors)
+}
+
+/// The first resource in `incoming` that `merged` already declares, if
+/// any. Returns a `kind.name` label for the error message.
+fn first_duplicate(merged: &Config, incoming: &Config) -> Option<String> {
+    for name in incoming.app.keys() {
+        if merged.app.contains_key(name) {
+            return Some(format!("app.{name}"));
+        }
+    }
+    for name in incoming.job.keys() {
+        if merged.job.contains_key(name) {
+            return Some(format!("job.{name}"));
+        }
+    }
+    for name in incoming.namespace.keys() {
+        if merged.namespace.contains_key(name) {
+            return Some(format!("namespace.{name}"));
+        }
+    }
+    for name in incoming.permission.keys() {
+        if merged.permission.contains_key(name) {
+            return Some(format!("permission.{name}"));
+        }
+    }
+    for name in incoming.build.keys() {
+        if merged.build.contains_key(name) {
+            return Some(format!("build.{name}"));
+        }
+    }
+    None
 }
 
 /// Compute the back-off delay for consecutive failures.
@@ -266,6 +321,30 @@ mod tests {
         assert_eq!(config.app.len(), 1, "good file should be parsed");
         assert_eq!(errors.len(), 1, "bad file should produce error");
         assert!(errors.contains_key("bad.toml"));
+    }
+
+    /// GIT4: a resource declared in two files resolves deterministically —
+    /// the earlier-sorted file wins, and the later one is reported as a
+    /// duplicate rather than silently overwriting via hash order.
+    #[test]
+    fn duplicate_resource_across_files_is_deterministic_and_reported() {
+        let mut files = HashMap::new();
+        files.insert(
+            "a-first.toml".to_string(),
+            "[app.web]\nimage = \"web:v1\"\n".to_string(),
+        );
+        files.insert(
+            "b-second.toml".to_string(),
+            "[app.web]\nimage = \"web:v2\"\n".to_string(),
+        );
+
+        let (config, errors) = parse_toml_files(&files);
+        // The alphabetically-earlier file's definition stands.
+        assert_eq!(config.app.len(), 1);
+        assert_eq!(config.app["web"].image.as_deref(), Some("web:v1"));
+        // The later file's collision is surfaced, not swallowed.
+        assert!(errors.contains_key("b-second.toml"));
+        assert!(errors["b-second.toml"].contains("duplicate resource app.web"));
     }
 
     #[test]
