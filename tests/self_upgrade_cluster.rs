@@ -13,7 +13,7 @@
 //! assert — workers first, council one at a time, leader last (in place)
 //! — are exactly the mechanics under test.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -53,11 +53,24 @@ struct ClusterHarness {
     external_pkcs8: Vec<u8>,
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+fn free_tcp_port(allocated: &mut HashSet<u16>) -> u16 {
+    loop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if allocated.insert(port) {
+            return port;
+        }
+    }
+}
+
+fn free_udp_port(allocated: &mut HashSet<u16>) -> u16 {
+    loop {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        if allocated.insert(port) {
+            return port;
+        }
+    }
 }
 
 /// Copy the compiled bun in as `bun-{version}` with its `.version` sidecar.
@@ -94,6 +107,11 @@ impl ClusterHarness {
 
         let mut nodes = Vec::new();
         let mut seed_gossip: Option<u16> = None;
+        // Keep every endpoint numerically distinct for the lifetime of this
+        // harness. Binding port 0 and immediately dropping the socket can
+        // return the same number on the very next call; that made a node's
+        // registry collide with its API or Raft listener and crash-loop.
+        let mut allocated_ports = HashSet::new();
 
         for index in 0..count {
             let name = format!("n{index}");
@@ -104,11 +122,11 @@ impl ClusterHarness {
             install_version(&bin_dir, "v0.2.0");
             std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-            let api_port = free_port();
-            let gossip_port = free_port();
-            let raft_port = free_port();
-            let reporting_port = free_port();
-            let registry_port = free_port();
+            let api_port = free_tcp_port(&mut allocated_ports);
+            let gossip_port = free_udp_port(&mut allocated_ports);
+            let raft_port = free_tcp_port(&mut allocated_ports);
+            let reporting_port = free_tcp_port(&mut allocated_ports);
+            let registry_port = free_tcp_port(&mut allocated_ports);
             let join = match seed_gossip {
                 Some(seed) => format!("join = [\"127.0.0.1:{seed}\"]"),
                 None => "join = []".to_string(),
@@ -398,7 +416,7 @@ retain_versions = 3
     /// Poll the cluster upgrade until it completes (or a pause, if
     /// `allow_pause`), recording when each node first reports Healthy.
     /// Returns (first_healthy_order, final_phase).
-    async fn watch_upgrade(&self, allow_pause: bool) -> (Vec<String>, String) {
+    async fn watch_upgrade(&self, upgrade_id: &str, allow_pause: bool) -> (Vec<String>, String) {
         let mut healthy_order: Vec<String> = Vec::new();
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
@@ -422,14 +440,28 @@ retain_versions = 3
             };
 
             let (nodes_json, phase) = match cluster.get("active").filter(|a| !a.is_null()) {
-                Some(active) => (active["nodes"].clone(), phase_label(&active["phase"])),
+                Some(active) => {
+                    let Some(observed_id) = active["upgrade_id"].as_str() else {
+                        continue;
+                    };
+                    if !same_logical_upgrade(observed_id, upgrade_id) {
+                        continue;
+                    }
+                    (active["nodes"].clone(), phase_label(&active["phase"]))
+                }
                 None => {
-                    // Cleared: completed and archived to history.
-                    let last = cluster["history"]
-                        .as_array()
-                        .and_then(|h| h.last())
-                        .cloned()
-                        .unwrap_or_default();
+                    // A follower may still report no active operation just
+                    // after the leader accepts the start. Only this run's
+                    // archived record proves that it completed.
+                    let Some(last) = cluster["history"].as_array().and_then(|history| {
+                        history.iter().rev().find(|entry| {
+                            entry["upgrade_id"]
+                                .as_str()
+                                .is_some_and(|id| same_logical_upgrade(id, upgrade_id))
+                        })
+                    }) else {
+                        continue;
+                    };
                     for node in last["nodes"].as_array().into_iter().flatten() {
                         note_healthy(&mut healthy_order, node);
                     }
@@ -517,6 +549,10 @@ fn note_healthy(order: &mut Vec<String>, node: &serde_json::Value) {
     }
 }
 
+fn same_logical_upgrade(observed: &str, started: &str) -> bool {
+    observed == started || observed.starts_with(&format!("{started}-retry"))
+}
+
 fn phase_label(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
@@ -549,8 +585,8 @@ async fn rolling_upgrade_walks_workers_council_then_leader() {
     // cluster the scheduler owns placement and a single-replica app on a
     // bouncing node is inherently at risk for its ~1s window, so it's the
     // wrong thing to pin here.
-    let (_, old_leader, worker) = harness.start_upgrade().await;
-    let (healthy_order, phase) = harness.watch_upgrade(false).await;
+    let (upgrade_id, old_leader, worker) = harness.start_upgrade().await;
+    let (healthy_order, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
 
     // Every node ended on the target version.
@@ -593,7 +629,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
-    let (_, _, worker) = {
+    let (upgrade_id, _, worker) = {
         // Poison ONLY the worker's v0.2.0 binary: it crash-loops, reverts
         // itself, and the leader pauses the run.
         let (_, _, worker) = harness.plan_nodes().await;
@@ -605,7 +641,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
         harness.start_upgrade().await
     };
 
-    let (_, phase) = harness.watch_upgrade(true).await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, true).await;
     assert!(phase.starts_with("Paused"), "expected a pause, got {phase}");
 
     // The worker reverted itself; nobody else was touched.
@@ -635,7 +671,7 @@ async fn upgrade_failure_pauses_cluster_and_reverts_node() {
         .expect("resume");
     assert_eq!(resume.status().as_u16(), 202, "resume refused");
 
-    let (_, phase) = harness.watch_upgrade(false).await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
     let versions = harness.wait_for_versions("v0.2.0").await;
     assert_eq!(
@@ -661,8 +697,8 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
     let _serial = SERIAL.lock().await;
     let harness = ClusterHarness::start(4).await;
 
-    harness.start_upgrade().await;
-    let (_, phase) = harness.watch_upgrade(false).await;
+    let (upgrade_id, _, _) = harness.start_upgrade().await;
+    let (_, phase) = harness.watch_upgrade(&upgrade_id, false).await;
     assert_eq!(phase, "Completed");
     harness.wait_for_versions("v0.2.0").await;
 
@@ -683,8 +719,12 @@ async fn cluster_rollback_returns_every_node_to_previous_version() {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     assert_eq!(status.as_u16(), 202, "rollback refused: {body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("rollback response JSON");
+    let rollback_id = body["upgrade_id"]
+        .as_str()
+        .expect("rollback response upgrade_id");
 
-    let (_, phase) = harness.watch_upgrade(false).await;
+    let (_, phase) = harness.watch_upgrade(rollback_id, false).await;
     assert_eq!(phase, "Completed");
     let versions = harness.wait_for_versions("v0.1.0").await;
     assert_eq!(
