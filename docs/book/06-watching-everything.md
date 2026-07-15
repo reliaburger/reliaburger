@@ -185,26 +185,36 @@ The `?` on `try_new` catches schema mismatches: if you pass three arrays when th
 
 ### The alert state machine
 
-The alert evaluator has three states and four transitions, all in a single `match`:
+The alert evaluator has three states, all decided in a single `match`. The first version matched on a boolean `breaching` flag. That had a bug we'll come back to, so here's the version we actually ship, which matches on the metric value itself (an `Option<f64>`):
 
 ```rust
-let new_state = match (&state, breaching) {
-    (AlertState::Inactive, true) => AlertState::Pending { since: now },
-    (AlertState::Pending { since }, true) => {
+let new_state = match (&prev_state, value) {
+    // No data at all: keep firing (can't prove recovery), else go inactive.
+    (_, None) => match &prev_state {
+        AlertState::Firing { .. } => prev_state.clone(),
+        _ => AlertState::Inactive,
+    },
+    (AlertState::Inactive, Some(v)) if rule.operator.eval(v, rule.threshold) => {
+        AlertState::Pending { since: now }
+    }
+    (AlertState::Pending { since }, Some(v)) if rule.operator.eval(v, rule.threshold) => {
         if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
             AlertState::Firing { since: *since }
         } else {
-            state.clone()
+            prev_state.clone()
         }
     }
-    (AlertState::Firing { .. }, true) => state.clone(),
-    (_, false) => AlertState::Inactive,
+    (AlertState::Firing { .. }, Some(v)) if rule.operator.eval(v, rule.threshold) => {
+        prev_state.clone()
+    }
+    // Data present and back in range: a genuine recovery.
+    (_, Some(_)) => AlertState::Inactive,
 };
 ```
 
-Four arms cover every case. The `since` field is set when the alert enters Pending and preserved when it moves to Firing — so you know when the breach *started*, not when it was confirmed. The wildcard `(_, false)` handles the recovery case: no matter what state you're in, if the metric is no longer breaching, go back to Inactive. No hysteresis, no debounce. Simple.
+The `since` field is set when the alert enters Pending and preserved when it moves to Firing, so you know when the breach *started*, not when it was confirmed. The `if rule.operator.eval(...)` bits are *match guards*: a `match` arm only fires when its pattern matches *and* the guard is true. Rust checks that the arms are still exhaustive with guards in place, so nothing slips through.
 
-If you're used to state machines in Go or Java, this might look too compact. Where are the separate `handleInactive()`, `handlePending()`, `handleFiring()` methods? Rust's pattern matching lets you collapse them into one expression. The compiler ensures you handle every combination — add a fourth state and every `match` in the codebase that doesn't handle it becomes a compilation error.
+If you're used to state machines in Go or Java, this might look too compact. Where are the separate `handleInactive()`, `handlePending()`, `handleFiring()` methods? Rust's pattern matching collapses them into one expression, and the compiler ensures you handle every combination. Add a fourth state and every `match` in the codebase that doesn't handle it becomes a compilation error.
 
 ### Sparse indexing: the write path
 
@@ -221,6 +231,48 @@ if offset_before / INDEX_INTERVAL != offset_after / INDEX_INTERVAL {
 Integer division does the heavy lifting. If both offsets are in the same 4KB block, the division produces the same result and we skip the index update. If they straddle a boundary, we record the offset. One comparison, no modular arithmetic, no counters to maintain.
 
 The cost: for a 100MB log file, the sparse index has about 25,000 entries (one per 4KB). Binary search finds any timestamp in ~15 comparisons. Sequential scan from there covers at most 4KB of log data. The combination gives us O(log n) time-range queries without maintaining a full index.
+
+## Hardening the metrics path
+
+The first cut of Mayo worked in the demo and passed its tests. A later review found five sharp edges that only bite in production, not in a thirty-second demo. They're worth walking through, because each one is a small change that fixes a whole class of failure.
+
+**SQL injection through a metric name.** The per-app query endpoint built its SQL by pasting the caller's `?name=` and the app's `namespace/app` straight into the string. Send `?name=x' OR '1'='1` and the injected quote closes the literal early, drops the tenant and time predicates, and hands back every app's metrics. The fix is the same one every database driver ships: escape the value. DataFusion follows standard SQL, so a `'` inside a literal is doubled:
+
+```rust
+pub(crate) fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+```
+
+Now `x' OR '1'='1` is matched *literally*, finds no metric by that name, and returns nothing. We escape every interpolated value, including the app and namespace, not just the obvious one.
+
+**Rollups that double-count.** Each worker rolls up its last minute of metrics and pushes the summary to a council member. After a reassignment a worker re-sends its recent windows as backfill, so the same `(node, window)` can arrive twice. The council was summing both, inflating the cluster total. Two changes fix it. First, we align every window to a minute boundary (`now - (now % 60)`), so two nodes ticking a few seconds apart stamp the same minute with the same timestamp. Second, we make ingest idempotent, keyed on `(node_id, window)`:
+
+```rust
+let key = (node_id.clone(), rollup.timestamp);
+if !self.seen_windows.insert(key) {
+    return false; // already ingested this window; drop it
+}
+```
+
+`HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call.
+
+**Rollups that vanished on restart.** The rollup store kept its flushed data in an in-memory `Vec<RecordBatch>` and named every Parquet file with a counter that reset to zero on start. So a restart both lost all history *and* overwrote `rollup_000000.parquet` with new data. We fixed both by making the rollup store read its history back from the Parquet directory (like the metrics store already did) and by seeding the flush counter one past the highest file on disk. Restart now recovers everything and appends rather than clobbering.
+
+**Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`.
+
+**A flush that froze every query.** The flush wrote Parquet while holding the store's write lock, and Arrow's writer is synchronous. So for the duration of the write, every query waited. Worse, blocking I/O on an async task stalls the whole tokio runtime. We split the flush in two: drain the buffer under a brief lock, then write outside it, on the blocking pool:
+
+```rust
+let pending = { store.write().await.take_flush_batch()? };  // brief lock
+if let Some(p) = pending {
+    write_pending_flush(p).await?;  // no lock held; runs on spawn_blocking
+}
+```
+
+While the write is in flight, queries hold a read lock and proceed. And a corrupt or truncated Parquet file (a flush killed mid-write) no longer poisons the directory: we read each file on its own and skip the bad one with a log, so one botched flush doesn't fail every unrelated read.
+
+The theme across all five: the happy path was fine, and the failure paths — an attacker, a reassignment, a restart, a dead app, a crash mid-flush — were where the bugs lived. That's usually where they live.
 
 ## What we learned
 
@@ -250,7 +302,7 @@ Almost everything in this chapter is a pure data transform: a sample becomes a `
 
 The three subsystems carry their own tests at the bottom of each source file:
 
-- **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state.
+- **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state. The hardening work added a matching set of failure-path tests, one per edge from the previous section: `query_metric_name_injection_is_neutralised` and `app_metrics_name_injection_cannot_bypass_predicate` (the SQL escape), `resent_window_does_not_double_count` and `restart_resumes_flush_counter_without_clobbering` (idempotent, durable rollups), `stale_telemetry_does_not_resolve_a_firing_alert` (the value-not-boolean state machine), `slack_payload_matches_provider_shape` and `pagerduty_payload_matches_events_v2_shape` (the provider webhook contracts), and `query_proceeds_during_flush` plus `corrupt_parquet_file_does_not_fail_query` (the off-lock flush and corrupt-file skip). Each names the failure it prevents.
 - **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, JSON field filtering, the sparse-index binary search, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`).
 - **Brioche (dashboard):** HTML rendering, and two security-flavoured tests worth calling out — `render_app_detail_escapes_html` (no stored-XSS through an app name) and `render_app_detail_masks_encrypted_env` (a secret never reaches the page). These are unit tests because the renderer is a pure function from data to a string; you assert on the string.
 
@@ -277,4 +329,4 @@ make observability-demo      # live, end-to-end
 
 The cross-node and aggregation pieces — querying logs across the whole cluster, hierarchical metric rollups, exporting to S3 — are *advanced* observability, and their integration tests (`tests/metrics_aggregation.rs`, `tests/logs_cross_node.rs`, `tests/log_export.rs`) belong to Chapter 11. This chapter is the single-node foundation they build on.
 
-Phase 6 adds 120 tests, bringing the total to 991.
+All of these run in the portable suite: `make test` (which drives them through nextest). No root, no eBPF, no network, no platform-specific runtime, and no fixed sleeps — the flush concurrency test drives both the write and the read to completion with `tokio::join!` rather than guessing at a delay. Chapter 15 covers the suite taxonomy and why a test that can pass without executing its promised behaviour is worse than no test.

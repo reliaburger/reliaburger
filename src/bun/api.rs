@@ -3207,16 +3207,23 @@ async fn metrics_app_handler(
     // full-domain unsigned range like `timestamp <= u64::MAX`.
     let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
-    // Filter by app label in the local store
-    let app_filter = format!("{namespace}/{app}");
+    // Filter by app label in the local store. Both the app/namespace path
+    // segments and the caller-supplied `name` reach the SQL literal, so escape
+    // every one (OBS1): without this a crafted `?name=x' OR '1'='1` or an app
+    // name carrying a quote would break out of the literal and drop the
+    // tenant/time predicate, leaking other apps' metrics.
+    let app_filter = crate::mayo::store::escape_sql_literal(&format!("{namespace}/{app}"));
     let sql = match &params.name {
-        Some(name) => format!(
-            "SELECT timestamp, metric_name, labels, value FROM metrics \
-             WHERE metric_name = '{name}' \
-             AND labels LIKE '%\"{app_filter}\"%' \
-             AND timestamp >= {start} AND timestamp <= {end} \
-             ORDER BY timestamp LIMIT 10000"
-        ),
+        Some(name) => {
+            let name = crate::mayo::store::escape_sql_literal(name);
+            format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE metric_name = '{name}' \
+                 AND labels LIKE '%\"{app_filter}\"%' \
+                 AND timestamp >= {start} AND timestamp <= {end} \
+                 ORDER BY timestamp LIMIT 10000"
+            )
+        }
         None => format!(
             "SELECT timestamp, metric_name, labels, value FROM metrics \
              WHERE labels LIKE '%\"{app_filter}\"%' \
@@ -3913,6 +3920,41 @@ mod tests {
             cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
         );
         (app, shutdown)
+    }
+
+    /// Build a router whose local `MayoStore` already holds `samples`
+    /// (`(metric_name, app_filter, value)` where `app_filter` is the
+    /// `namespace/app` label written under the `app` key). Used to drive the
+    /// per-app metrics endpoint through the real HTTP route.
+    async fn test_setup_with_metrics(
+        samples: &[(&str, &str, f64)],
+    ) -> (Router, CancellationToken, tempfile::TempDir) {
+        use crate::mayo::types::{MetricKey, Sample};
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        for (name, app_filter, value) in samples {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert("app".to_string(), app_filter.to_string());
+            let key = MetricKey::with_labels(*name, labels);
+            store.insert(&key, Sample::at(1000, *value));
+        }
+        store.flush().await.unwrap();
+        let mayo = Some(Arc::new(RwLock::new(store)));
+
+        let app = router(
+            cmd_tx, mayo, None, None, None, None, None, None, None, None, None, None, 9117, None,
+        );
+        (app, shutdown, dir)
     }
 
     /// Build a single-node council, initialised as leader and seeded with a
@@ -5446,6 +5488,65 @@ mod tests {
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(rx.try_recv().is_err());
+    #[tokio::test]
+    async fn app_metrics_name_injection_cannot_bypass_predicate() {
+        // OBS1-remainder: `metrics_app_handler` interpolated `?name=` and the
+        // `namespace/app` path into SQL raw. A crafted name like `x' OR '1'='1`
+        // must be matched literally (finding nothing), not executed as SQL that
+        // drops the WHERE predicate and leaks another app's rows.
+        let (app, shutdown, _dir) = test_setup_with_metrics(&[
+            ("cpu", "default/web", 1.0),
+            ("secret_metric", "default/web", 99.0),
+        ])
+        .await;
+
+        // Injection in the metric name.
+        let injected = "x%27%20OR%20%271%27%3D%271"; // x' OR '1'='1
+        let uri = format!("/v1/metrics/app/web/default?name={injected}");
+        let (status, body) = get(app, &uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert!(
+            parsed.data.is_empty(),
+            "injection leaked rows: {:?}",
+            parsed.data
+        );
+
+        // The benign path still returns the one matching row.
+        let (app, shutdown2, _dir2) = test_setup_with_metrics(&[
+            ("cpu", "default/web", 1.0),
+            ("secret_metric", "default/web", 99.0),
+        ])
+        .await;
+        let (status, body) = get(app, "/v1/metrics/app/web/default?name=secret_metric").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].value, 99.0);
+
+        shutdown.cancel();
+        shutdown2.cancel();
+    }
+
+    #[tokio::test]
+    async fn per_app_process_metric_is_queryable() {
+        // OBS3: per-app (app-labelled) process metrics must be collectible and
+        // then queryable through the per-app endpoint the dashboard and
+        // autoscaler use. The collection loop labels them `namespace/app`; this
+        // asserts that shape round-trips through the API's label filter.
+        let (app, shutdown, _dir) = test_setup_with_metrics(&[
+            ("process_cpu_percent", "default/web", 12.5),
+            ("process_cpu_percent", "default/other", 99.0),
+        ])
+        .await;
+
+        let (status, body) = get(app, "/v1/metrics/app/web/default?name=process_cpu_percent").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.data.len(), 1, "expected exactly web's metric");
+        assert_eq!(parsed.data[0].value, 12.5);
+        assert_eq!(parsed.data[0].metric_name, "process_cpu_percent");
+
         shutdown.cancel();
     }
 }

@@ -137,21 +137,39 @@ impl AlertEvaluator {
                 .unwrap_or(AlertState::Inactive);
             let value = latest_values.get(&rule.metric_name).copied();
 
-            let breaching = value
-                .map(|v| rule.operator.eval(v, rule.threshold))
-                .unwrap_or(false);
-
-            let new_state = match (&prev_state, breaching) {
-                (AlertState::Inactive, true) => AlertState::Pending { since: now },
-                (AlertState::Pending { since }, true) => {
+            // Three-way, not two-way (OBS4). A missing metric is *not* the same
+            // as a metric below threshold. If an app dies and stops emitting,
+            // its telemetry goes stale; treating that as "recovered" would let a
+            // firing alert silently clear itself exactly when something is
+            // wrong. So we only resolve on a real, in-range reading.
+            let new_state = match (&prev_state, value) {
+                // No data at all.
+                (_, None) => match &prev_state {
+                    // A firing alert with stale telemetry stays firing: we can't
+                    // prove recovery, so we don't clear it.
+                    AlertState::Firing { .. } => prev_state.clone(),
+                    // A pending alert whose data vanished is inconclusive; drop
+                    // back to inactive rather than fire on nothing.
+                    _ => AlertState::Inactive,
+                },
+                // Data present and breaching the threshold.
+                (AlertState::Inactive, Some(v)) if rule.operator.eval(v, rule.threshold) => {
+                    AlertState::Pending { since: now }
+                }
+                (AlertState::Pending { since }, Some(v))
+                    if rule.operator.eval(v, rule.threshold) =>
+                {
                     if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
                         AlertState::Firing { since: *since }
                     } else {
                         prev_state.clone()
                     }
                 }
-                (AlertState::Firing { .. }, true) => prev_state.clone(),
-                (_, false) => AlertState::Inactive,
+                (AlertState::Firing { .. }, Some(v)) if rule.operator.eval(v, rule.threshold) => {
+                    prev_state.clone()
+                }
+                // Data present and back in range: a genuine recovery.
+                (_, Some(_)) => AlertState::Inactive,
             };
 
             // Detect transitions for webhook dispatch.
@@ -384,6 +402,34 @@ mod tests {
         let mut eval = AlertEvaluator::new(vec![rule]);
 
         eval.evaluate(&HashMap::new()); // no metrics at all
+        assert_eq!(eval.firing_alerts().len(), 0);
+    }
+
+    #[test]
+    fn stale_telemetry_does_not_resolve_a_firing_alert() {
+        // OBS4: an app that dies and stops emitting must not silently clear its
+        // own alert. Once firing, a *missing* metric keeps it firing (we can't
+        // prove recovery); only a real in-range reading resolves it.
+        let rule = simple_rule("test", "cpu", 80.0, AlertOperator::GreaterThan);
+        let mut eval = AlertEvaluator::new(vec![rule]);
+
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
+        eval.evaluate(&make_values(&[("cpu", 95.0)])); // firing
+        assert_eq!(eval.firing_alerts().len(), 1);
+
+        // Telemetry stops (app died). No transition, still firing.
+        let t = eval.evaluate(&HashMap::new());
+        assert!(t.is_empty(), "stale telemetry must not emit a Resolved");
+        assert_eq!(
+            eval.firing_alerts().len(),
+            1,
+            "firing alert wrongly resolved on stale telemetry"
+        );
+
+        // A genuine in-range reading finally resolves it.
+        let t = eval.evaluate(&make_values(&[("cpu", 10.0)]));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].kind, TransitionKind::Resolved);
         assert_eq!(eval.firing_alerts().len(), 0);
     }
 

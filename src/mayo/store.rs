@@ -55,6 +55,50 @@ pub(crate) fn next_flush_counter(data_dir: &std::path::Path, prefix: &str) -> u6
     max_seen.map_or(0, |m| m + 1)
 }
 
+/// Write a single RecordBatch to a Parquet file at `path`.
+///
+/// Synchronous (Arrow's writer is blocking), so callers run it on
+/// `spawn_blocking` to keep the async runtime free (OBS5/M3).
+pub(crate) fn write_batch_parquet(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+) -> Result<(), MayoError> {
+    let file = std::fs::File::create(path).map_err(MayoError::Io)?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
+        .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    writer
+        .write(batch)
+        .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    writer
+        .close()
+        .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    Ok(())
+}
+
+/// A drained buffer ready to be written to Parquet, decoupled from the store so
+/// the caller can release its lock before the (blocking) write (OBS5/M3).
+pub struct PendingFlush {
+    data_dir: PathBuf,
+    path: PathBuf,
+    batch: RecordBatch,
+}
+
+/// Persist a [`PendingFlush`] to disk on the blocking pool. Runs with no lock
+/// held, so concurrent queries proceed while the write is in flight.
+pub async fn write_pending_flush(pending: PendingFlush) -> Result<(), MayoError> {
+    let PendingFlush {
+        data_dir,
+        path,
+        batch,
+    } = pending;
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&data_dir).map_err(MayoError::Io)?;
+        write_batch_parquet(&path, &batch)
+    })
+    .await
+    .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+}
+
 /// Whether `data_dir` contains at least one `.parquet` file.
 pub(crate) fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
     std::fs::read_dir(data_dir)
@@ -156,33 +200,37 @@ impl MayoStore {
         Ok(Some(batch))
     }
 
-    /// Flush the buffer: convert to RecordBatch, write Parquet, accumulate.
+    /// Flush the buffer: convert to RecordBatch, write Parquet, drop from
+    /// memory. The write runs on the blocking pool (OBS5/M3).
+    ///
+    /// This convenience keeps the whole operation under `&mut self`. Callers
+    /// holding a shared lock across many concurrent readers should instead use
+    /// [`take_flush_batch`](Self::take_flush_batch) + [`write_pending_flush`]
+    /// so the lock is released during the I/O and queries never starve.
     pub async fn flush(&mut self) -> Result<(), MayoError> {
-        let batch = self.buffer_to_batch()?;
-        let Some(batch) = batch else {
+        let Some(pending) = self.take_flush_batch()? else {
             return Ok(());
         };
+        write_pending_flush(pending).await
+    }
 
-        // Write Parquet file for persistence
-        std::fs::create_dir_all(&self.data_dir).map_err(MayoError::Io)?;
+    /// Drain the buffer into a self-contained [`PendingFlush`] the caller writes
+    /// later, outside any lock. Bumps the flush counter and clears the buffer
+    /// immediately, so the on-disk file name is reserved before the (slow)
+    /// write. Returns `None` when there's nothing to flush.
+    pub fn take_flush_batch(&mut self) -> Result<Option<PendingFlush>, MayoError> {
+        let Some(batch) = self.buffer_to_batch()? else {
+            return Ok(None);
+        };
         let filename = format!("metrics_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
-
-        let file = std::fs::File::create(&path).map_err(MayoError::Io)?;
-        let mut writer = ArrowWriter::try_new(file, Arc::new(metrics_schema()), None)
-            .map_err(|e| MayoError::Arrow(e.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|e| MayoError::Arrow(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| MayoError::Arrow(e.to_string()))?;
-
-        // The batch is durable on disk now; drop it from memory. Queries read
-        // it back from the Parquet directory (see `session`).
         self.buffer.clear();
         self.flush_counter += 1;
-        Ok(())
+        Ok(Some(PendingFlush {
+            data_dir: self.data_dir.clone(),
+            path,
+            batch,
+        }))
     }
 
     /// Build a DataFusion session exposing a `metrics` table over all data:
@@ -219,34 +267,62 @@ impl MayoStore {
         Ok(ctx)
     }
 
-    /// Read every `metrics_*.parquet` file in the data dir into RecordBatches,
-    /// normalised to the canonical `metrics_schema` (so the Parquet-inferred
-    /// nullability doesn't clash with the in-memory buffer's schema).
+    /// Read every intact `metrics_*.parquet` file in the data dir into
+    /// RecordBatches, normalised to the canonical `metrics_schema` (so the
+    /// Parquet-inferred nullability doesn't clash with the in-memory buffer's
+    /// schema).
+    ///
+    /// Each file is read on its own. A corrupt or truncated file is skipped
+    /// with a log instead of failing the whole query (OBS5): a single bad flush
+    /// must not make every unrelated read error out.
     async fn read_disk_batches(&self, ctx: &SessionContext) -> Result<Vec<RecordBatch>, MayoError> {
         if !dir_has_parquet(&self.data_dir) {
             return Ok(Vec::new());
         }
-        let dir = format!("{}/", self.data_dir.display());
-        ctx.register_parquet("metrics_disk", &dir, ParquetReadOptions::default())
-            .await
-            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-        let df = ctx
-            .sql("SELECT timestamp, metric_name, labels, value FROM metrics_disk")
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        // Re-cast to the canonical schema so a later UNION/MemTable is happy.
         let schema = Arc::new(metrics_schema());
-        let mut normalised = Vec::with_capacity(batches.len());
-        for batch in batches {
-            normalised.push(
-                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-                    .map_err(|e| MayoError::Arrow(e.to_string()))?,
-            );
+        let mut normalised = Vec::new();
+
+        let entries = std::fs::read_dir(&self.data_dir).map_err(MayoError::Io)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|x| x == "parquet") {
+                continue;
+            }
+            let table_name = "metrics_one";
+            let _ = ctx.deregister_table(table_name);
+            let file = path.to_string_lossy().to_string();
+            if ctx
+                .register_parquet(table_name, &file, ParquetReadOptions::default())
+                .await
+                .is_err()
+            {
+                eprintln!("mayo: skipping unreadable metrics file {file}");
+                continue;
+            }
+            let read = async {
+                let df = ctx
+                    .sql("SELECT timestamp, metric_name, labels, value FROM metrics_one")
+                    .await
+                    .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+                df.collect()
+                    .await
+                    .map_err(|e| MayoError::QueryFailed(e.to_string()))
+            }
+            .await;
+            let _ = ctx.deregister_table(table_name);
+            match read {
+                Ok(batches) => {
+                    for batch in batches {
+                        match RecordBatch::try_new(schema.clone(), batch.columns().to_vec()) {
+                            Ok(b) => normalised.push(b),
+                            Err(e) => {
+                                eprintln!("mayo: skipping malformed metrics batch in {file}: {e}")
+                            }
+                        }
+                    }
+                }
+                Err(_) => eprintln!("mayo: skipping corrupt metrics file {file}"),
+            }
         }
         Ok(normalised)
     }
@@ -767,5 +843,66 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].3, 10.0);
         assert_eq!(results[1].3, 20.0);
+    }
+
+    #[tokio::test]
+    async fn query_proceeds_during_flush() {
+        // OBS5: the flush I/O must not hold the store lock. We drain the buffer
+        // under a brief write lock, release it, then run the (blocking) write
+        // and a concurrent read at the same time. If the write held the lock,
+        // the read would block until it finished; because it doesn't, both
+        // complete together. No sleep — `join!` drives both to completion and
+        // the read asserting the flushed row proves it observed a consistent
+        // store while the write was in flight.
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RwLock::new(MayoStore::new(dir.path().to_path_buf())));
+
+        // Seed and flush one row so a query has something to read.
+        {
+            let mut s = store.write().await;
+            s.insert(&MetricKey::simple("m"), Sample::at(1, 10.0));
+            let pending = s.take_flush_batch().unwrap().unwrap();
+            drop(s); // lock released before the write
+            write_pending_flush(pending).await.unwrap();
+        }
+
+        // Now stage a second flush and run its write concurrently with a query.
+        let pending = {
+            let mut s = store.write().await;
+            s.insert(&MetricKey::simple("m"), Sample::at(2, 20.0));
+            s.take_flush_batch().unwrap().unwrap()
+        }; // write lock dropped here — the write below holds no store lock
+
+        let read_store = Arc::clone(&store);
+        let (write_res, read_res) = tokio::join!(write_pending_flush(pending), async move {
+            let s = read_store.read().await;
+            s.query("m", 0, 9999).await
+        });
+        write_res.unwrap();
+        // The read ran against the store while the flush write was in flight and
+        // returned the already-persisted first row without blocking.
+        let rows = read_res.unwrap();
+        assert!(
+            rows.iter().any(|r| r.3 == 10.0),
+            "concurrent query did not see persisted data: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_parquet_file_does_not_fail_query() {
+        // OBS5: a truncated/garbage Parquet file must be skipped on read, not
+        // fail an unrelated query.
+        let (mut store, dir) = test_store();
+        store.insert(&MetricKey::simple("cpu"), Sample::at(1, 10.0));
+        store.flush().await.unwrap();
+
+        std::fs::write(dir.path().join("metrics_999999.parquet"), b"garbage").unwrap();
+
+        let results = store.query("cpu", 0, 9999).await.unwrap();
+        assert_eq!(results.len(), 1, "corrupt file broke an unrelated query");
+        assert_eq!(results[0].3, 10.0);
     }
 }

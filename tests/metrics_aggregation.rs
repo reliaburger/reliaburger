@@ -41,10 +41,10 @@ async fn five_node_cluster_hierarchical_aggregation() {
     // --- 5 workers with deterministic metrics ---
     let worker_ids: Vec<NodeId> = (1..=5).map(|i| NodeId::new(format!("w{i}"))).collect();
     let cpu_values = [10.0, 20.0, 30.0, 40.0, 50.0];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // A fixed, minute-aligned `now` keeps the rollup window deterministic. The
+    // generator rolls up `[now-60, now)`, so the sample at `now-30` lands inside
+    // regardless of the wall clock (OBS2 epoch-aligned windows).
+    let now = 6000u64;
 
     // Generate rollups from each worker and ingest into the assigned
     // council member's RollupStore (same as what ReportAggregator does).
@@ -158,10 +158,8 @@ async fn partial_results_when_aggregator_down() {
 
     let worker_ids: Vec<NodeId> = (1..=5).map(|i| NodeId::new(format!("w{i}"))).collect();
     let cpu_values = [10.0, 20.0, 30.0, 40.0, 50.0];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // Minute-aligned fixed `now` for a deterministic rollup window (OBS2).
+    let now = 6000u64;
 
     // Track which workers go to which council member
     let mut per_council_sum = [0.0f64; 3];
@@ -239,10 +237,8 @@ async fn partial_results_when_aggregator_down() {
 /// Multiple metrics with labels produce separate entries in the rollup.
 #[tokio::test]
 async fn multi_metric_aggregation_with_labels() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // Minute-aligned fixed `now` for a deterministic rollup window (OBS2).
+    let now = 6000u64;
 
     // Two nodes, each with CPU and memory metrics
     for (node_name, cpu_val, mem_val) in [("n1", 25.0, 512.0), ("n2", 75.0, 1024.0)] {

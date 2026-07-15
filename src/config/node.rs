@@ -710,6 +710,23 @@ impl Default for AlertsSection {
     }
 }
 
+impl AlertsSection {
+    /// Reject a nonsensical config before anything is built on it (OBS4).
+    ///
+    /// A zero evaluation interval would make `tokio::time::interval` panic at
+    /// startup, so we fail loudly here with a clear message instead.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        if self.evaluation_interval_secs == 0 {
+            return Err(super::error::ConfigError::Validation {
+                field: "evaluation_interval_secs".to_string(),
+                context: "alerts".to_string(),
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A single webhook destination for alert notifications.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertDestination {
@@ -922,6 +939,21 @@ mod tests {
         assert_eq!(nc.metrics.retention_days, 30);
         assert_eq!(nc.metrics.object_store_url, "s3://my-bucket/metrics");
         assert!(!nc.metrics.alerts_enabled);
+    }
+
+    #[test]
+    fn alerts_default_interval_validates() {
+        assert!(AlertsSection::default().validate().is_ok());
+    }
+
+    #[test]
+    fn alerts_zero_interval_is_rejected() {
+        // OBS4: a zero interval would panic tokio's interval timer at startup.
+        let section = AlertsSection {
+            evaluation_interval_secs: 0,
+            destinations: vec![],
+        };
+        assert!(section.validate().is_err());
     }
 
     #[test]

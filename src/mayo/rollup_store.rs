@@ -5,6 +5,7 @@
 //! a different schema that includes node identity and aggregate columns
 //! (min, max, sum, count) instead of a single value.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -13,11 +14,31 @@ use datafusion::arrow::array::{Array, Float64Array, StringArray, UInt32Array, UI
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
-use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::*;
 
 use super::rollup::NodeRollup;
+use super::store::{dir_has_parquet, next_flush_counter, write_batch_parquet};
 use super::types::MayoError;
+
+/// Cap on un-flushed buffered rollup rows. A council member receives rollups
+/// from many workers; without a ceiling a flush that keeps failing (full disk,
+/// permissions) would let the buffer grow without bound and OOM the process
+/// (OBS2). When the cap is hit the oldest rows are dropped, trading the oldest
+/// un-persisted data for a bounded footprint.
+const MAX_BUFFER_ROWS: usize = 1_000_000;
+
+/// How far back the idempotency tracker remembers `(node, window)` keys. A
+/// worker only re-sends recent windows as reassignment backfill (the extended
+/// window is 5 minutes), so keys older than this can never arrive again and are
+/// safe to forget. Bounding the horizon keeps the tracker from growing without
+/// bound over a long-running process (OBS2). One hour is comfortably past any
+/// backfill.
+const IDEMPOTENCY_HORIZON_SECS: u64 = 3600;
+
+/// Prune the idempotency tracker once it exceeds this many keys. A generous
+/// ceiling: with hundreds of nodes on a 60s window an hour is a few thousand
+/// keys, so pruning is rare and ingest stays O(1) amortised.
+const MAX_SEEN_WINDOWS: usize = 100_000;
 
 /// Arrow schema for the rollup table.
 pub fn rollup_schema() -> Schema {
@@ -54,28 +75,62 @@ struct BufferedRollup {
 pub struct RollupStore {
     /// In-memory buffer of un-flushed rollup entries.
     buffer: Vec<BufferedRollup>,
-    /// Accumulated RecordBatches (flushed from buffer).
-    batches: Vec<RecordBatch>,
     /// Directory for Parquet files.
     data_dir: PathBuf,
-    /// Counter for unique Parquet file names.
+    /// Counter for unique Parquet file names. Seeded past any existing files so
+    /// a restart never clobbers a previous run's `rollup_NNNNNN.parquet`.
     flush_counter: u64,
+    /// `(node_id, window)` keys ingested within the recent backfill horizon. A
+    /// worker re-sends the same window after reassignment (extended backfill),
+    /// so the aggregator must ingest each `(node, window)` exactly once or the
+    /// cluster sum double-counts (OBS2). Pruned to stay bounded.
+    seen_windows: HashSet<(String, u64)>,
+    /// Newest window timestamp seen, used as the anchor for pruning
+    /// `seen_windows` (kept off the wall clock for determinism).
+    newest_window: u64,
 }
 
 impl RollupStore {
-    /// Create a new store writing Parquet to `data_dir`.
+    /// Open (or create) a store writing Parquet to `data_dir`.
+    ///
+    /// Existing `rollup_NNNNNN.parquet` files stay in place and remain
+    /// queryable; the flush counter resumes past the highest one so a restart
+    /// appends rather than overwriting.
     pub fn new(data_dir: PathBuf) -> Self {
+        let flush_counter = next_flush_counter(&data_dir, "rollup");
         Self {
             buffer: Vec::new(),
-            batches: Vec::new(),
             data_dir,
-            flush_counter: 0,
+            flush_counter,
+            seen_windows: HashSet::new(),
+            newest_window: 0,
         }
     }
 
     /// Ingest a `NodeRollup` into the buffer.
-    pub fn ingest(&mut self, rollup: &NodeRollup) {
+    ///
+    /// Idempotent per `(node_id, window)`: a window already ingested this
+    /// lifetime is dropped, so a re-sent rollup (worker reassignment backfill)
+    /// never double-counts. Returns `true` if the rollup was ingested, `false`
+    /// if it was a duplicate.
+    pub fn ingest(&mut self, rollup: &NodeRollup) -> bool {
         let node_id = rollup.node_id.0.clone();
+        let key = (node_id.clone(), rollup.timestamp);
+        if !self.seen_windows.insert(key) {
+            return false;
+        }
+
+        // Forget keys older than the backfill horizon so the tracker stays
+        // bounded. Pruned only occasionally (when the set grows large) to keep
+        // ingest O(1) amortised, and anchored on the newest window seen — not
+        // the wall clock — so it's deterministic and works with the historical
+        // timestamps used in tests.
+        self.newest_window = self.newest_window.max(rollup.timestamp);
+        if self.seen_windows.len() > MAX_SEEN_WINDOWS {
+            let cutoff = self.newest_window.saturating_sub(IDEMPOTENCY_HORIZON_SECS);
+            self.seen_windows.retain(|(_, window)| *window >= cutoff);
+        }
+
         for entry in &rollup.entries {
             let labels_json =
                 serde_json::to_string(&entry.labels).unwrap_or_else(|_| "{}".to_string());
@@ -90,6 +145,14 @@ impl RollupStore {
                 count_val: entry.aggregate.count,
             });
         }
+
+        // Bound the buffer: drop the oldest rows if a stuck flush let it grow
+        // past the cap.
+        if self.buffer.len() > MAX_BUFFER_ROWS {
+            let overflow = self.buffer.len() - MAX_BUFFER_ROWS;
+            self.buffer.drain(0..overflow);
+        }
+        true
     }
 
     /// Number of un-flushed entries in the buffer.
@@ -130,7 +193,13 @@ impl RollupStore {
         Ok(Some(batch))
     }
 
-    /// Flush the buffer: convert to RecordBatch, write Parquet, accumulate.
+    /// Flush the buffer: convert to a RecordBatch and persist it to Parquet.
+    ///
+    /// The batch is written on a blocking thread (`spawn_blocking`) so the
+    /// synchronous Arrow/Parquet encode never stalls the async runtime (OBS5).
+    /// Once on disk the rows are dropped from memory; queries read them back
+    /// from the Parquet directory, so a restart recovers all history and
+    /// memory stays bounded to the buffer.
     pub async fn flush(&mut self) -> Result<(), MayoError> {
         let batch = self.buffer_to_batch()?;
         let Some(batch) = batch else {
@@ -141,45 +210,103 @@ impl RollupStore {
         let filename = format!("rollup_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
 
-        let file = std::fs::File::create(&path).map_err(MayoError::Io)?;
-        let mut writer = ArrowWriter::try_new(file, Arc::new(rollup_schema()), None)
-            .map_err(|e| MayoError::Arrow(e.to_string()))?;
-        writer
-            .write(&batch)
-            .map_err(|e| MayoError::Arrow(e.to_string()))?;
-        writer
-            .close()
-            .map_err(|e| MayoError::Arrow(e.to_string()))?;
+        // Move the write off the async runtime. `spawn_blocking` runs the
+        // closure on tokio's blocking pool and hands back its result; the
+        // outer `?` on `.await` surfaces a join error, the inner one the
+        // write error.
+        tokio::task::spawn_blocking(move || write_batch_parquet(&path, &batch))
+            .await
+            .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))??;
 
-        self.batches.push(batch);
         self.buffer.clear();
         self.flush_counter += 1;
         Ok(())
     }
 
-    /// Build a DataFusion session with all data (flushed + unflushed buffer).
+    /// Build a DataFusion session exposing a `rollups` table over all data: the
+    /// on-disk Parquet directory unioned with the unflushed buffer.
     async fn session(&self) -> Result<SessionContext, MayoError> {
-        let ctx = SessionContext::new();
+        // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
+        // batches share the canonical schema with the in-memory buffer.
+        let config = SessionConfig::new().set_bool(
+            "datafusion.execution.parquet.schema_force_view_types",
+            false,
+        );
+        let ctx = SessionContext::new_with_config(config);
+        let schema = Arc::new(rollup_schema());
 
-        let mut all_batches = self.batches.clone();
+        let mut all_batches = self.read_disk_batches(&ctx).await?;
         if let Some(buffer_batch) = self.buffer_to_batch()? {
             all_batches.push(buffer_batch);
         }
 
         if all_batches.is_empty() {
-            let empty = RecordBatch::new_empty(Arc::new(rollup_schema()));
-            let table = MemTable::try_new(Arc::new(rollup_schema()), vec![vec![empty]])
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-            ctx.register_table("rollups", Arc::new(table))
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-        } else {
-            let table = MemTable::try_new(Arc::new(rollup_schema()), vec![all_batches])
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
-            ctx.register_table("rollups", Arc::new(table))
-                .map_err(|e| MayoError::DataFusion(e.to_string()))?;
+            all_batches.push(RecordBatch::new_empty(schema.clone()));
         }
 
+        let table = MemTable::try_new(schema, vec![all_batches])
+            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
+        ctx.register_table("rollups", Arc::new(table))
+            .map_err(|e| MayoError::DataFusion(e.to_string()))?;
         Ok(ctx)
+    }
+
+    /// Read every intact `rollup_*.parquet` file into RecordBatches, normalised
+    /// to the canonical schema. A corrupt or truncated file is skipped with a
+    /// log rather than failing the whole query (OBS5): one bad flush must not
+    /// take down every unrelated read.
+    async fn read_disk_batches(&self, ctx: &SessionContext) -> Result<Vec<RecordBatch>, MayoError> {
+        if !dir_has_parquet(&self.data_dir) {
+            return Ok(Vec::new());
+        }
+        let schema = Arc::new(rollup_schema());
+        let mut normalised = Vec::new();
+
+        let entries = std::fs::read_dir(&self.data_dir).map_err(MayoError::Io)?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|x| x == "parquet") {
+                continue;
+            }
+            // Register and read each file on its own so a single corrupt file
+            // can be skipped instead of poisoning a directory-wide scan.
+            let table_name = "rollup_one";
+            let _ = ctx.deregister_table(table_name);
+            let file = path.to_string_lossy().to_string();
+            if ctx
+                .register_parquet(table_name, &file, ParquetReadOptions::default())
+                .await
+                .is_err()
+            {
+                eprintln!("mayo: skipping unreadable rollup file {file}");
+                continue;
+            }
+            let read = async {
+                let df = ctx
+                    .sql("SELECT timestamp, node_id, metric_name, labels, min_val, max_val, sum_val, count_val FROM rollup_one")
+                    .await
+                    .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+                df.collect()
+                    .await
+                    .map_err(|e| MayoError::QueryFailed(e.to_string()))
+            }
+            .await;
+            let _ = ctx.deregister_table(table_name);
+            match read {
+                Ok(batches) => {
+                    for batch in batches {
+                        match RecordBatch::try_new(schema.clone(), batch.columns().to_vec()) {
+                            Ok(b) => normalised.push(b),
+                            Err(e) => {
+                                eprintln!("mayo: skipping malformed rollup batch in {file}: {e}")
+                            }
+                        }
+                    }
+                }
+                Err(_) => eprintln!("mayo: skipping corrupt rollup file {file}"),
+            }
+        }
+        Ok(normalised)
     }
 
     /// Query rollup data using SQL.
@@ -630,8 +757,14 @@ mod tests {
         // every metric. With escaping, the injected string is looked up
         // literally (matching nothing), not executed as SQL.
         let (mut store, _dir) = test_store();
-        store.ingest(&make_rollup("n1", 1000, "cpu", 10.0));
-        store.ingest(&make_rollup("n1", 1000, "secret_metric", 99.0));
+        // One node reports both metrics for the same window in a single rollup.
+        let mut rollup = make_rollup("n1", 1000, "cpu", 10.0);
+        rollup.entries.push(
+            make_rollup("n1", 1000, "secret_metric", 99.0)
+                .entries
+                .remove(0),
+        );
+        store.ingest(&rollup);
         store.flush().await.unwrap();
 
         let injected = store
@@ -651,8 +784,11 @@ mod tests {
     #[tokio::test]
     async fn metric_names_lists_distinct() {
         let (mut store, _dir) = test_store();
-        store.ingest(&make_rollup("n1", 1000, "beta", 1.0));
-        store.ingest(&make_rollup("n1", 1000, "alpha", 2.0));
+        // n1's window carries both metrics in one rollup; n2 carries beta.
+        let mut n1 = make_rollup("n1", 1000, "beta", 1.0);
+        n1.entries
+            .push(make_rollup("n1", 1000, "alpha", 2.0).entries.remove(0));
+        store.ingest(&n1);
         store.ingest(&make_rollup("n2", 1000, "beta", 3.0));
         store.flush().await.unwrap();
 
@@ -693,5 +829,108 @@ mod tests {
         assert_eq!(schema.field(5).name(), "max_val");
         assert_eq!(schema.field(6).name(), "sum_val");
         assert_eq!(schema.field(7).name(), "count_val");
+    }
+
+    #[tokio::test]
+    async fn resent_window_does_not_double_count() {
+        // OBS2: a worker re-sends the same (node, window) after reassignment
+        // (extended backfill). The council must ingest it exactly once, or the
+        // cluster sum doubles.
+        let (mut store, _dir) = test_store();
+        let rollup = make_rollup("n1", 1000, "cpu", 42.0);
+
+        let first = store.ingest(&rollup);
+        let second = store.ingest(&rollup); // exact resend
+        assert!(first, "first ingest should be accepted");
+        assert!(!second, "duplicate (node, window) must be dropped");
+
+        store.flush().await.unwrap();
+        let results = store.query_cluster_metric("cpu", 0, 9999).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].3, 42.0, "value must not double to 84");
+    }
+
+    #[tokio::test]
+    async fn distinct_windows_from_same_node_both_ingest() {
+        // Idempotency keys on (node, window), so a genuinely later window from
+        // the same node is not a duplicate.
+        let (mut store, _dir) = test_store();
+        assert!(store.ingest(&make_rollup("n1", 1000, "cpu", 10.0)));
+        assert!(store.ingest(&make_rollup("n1", 1060, "cpu", 20.0)));
+        assert_eq!(store.buffer_len(), 2);
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_flush_counter_without_clobbering() {
+        // OBS2: `flush_counter` was hardcoded to 0, so a restart overwrote
+        // `rollup_000000.parquet`. It must resume past the highest existing
+        // file, and prior data must still be queryable.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = RollupStore::new(dir.path().to_path_buf());
+            store.ingest(&make_rollup("n1", 1000, "cpu", 10.0));
+            store.flush().await.unwrap();
+            store.ingest(&make_rollup("n2", 1000, "cpu", 20.0));
+            store.flush().await.unwrap();
+        }
+        let count_parquet = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "parquet")
+                })
+                .count()
+        };
+        assert_eq!(count_parquet(dir.path()), 2);
+
+        // Restart over the same dir.
+        let mut store = RollupStore::new(dir.path().to_path_buf());
+        let prior = store.query_cluster_metric("cpu", 0, 9999).await.unwrap();
+        assert_eq!(prior.len(), 1, "persisted rollups not reloaded on restart");
+        assert_eq!(prior[0].3, 30.0);
+
+        store.ingest(&make_rollup("n3", 1000, "cpu", 30.0));
+        store.flush().await.unwrap();
+        assert_eq!(
+            count_parquet(dir.path()),
+            3,
+            "restart clobbered an existing rollup file"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_is_bounded() {
+        // OBS2: the buffer must not grow without bound if flushing stalls.
+        let (mut store, _dir) = test_store();
+        // Ingest more distinct windows than the cap; each carries one entry.
+        let over = MAX_BUFFER_ROWS + 100;
+        for i in 0..over {
+            store.ingest(&make_rollup("n1", i as u64, "cpu", 1.0));
+        }
+        assert!(
+            store.buffer_len() <= MAX_BUFFER_ROWS,
+            "buffer grew past the cap: {}",
+            store.buffer_len()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_parquet_file_does_not_fail_query() {
+        // OBS5: a truncated/garbage Parquet file in the data dir must be
+        // skipped, not fail an unrelated query.
+        let (mut store, dir) = test_store();
+        store.ingest(&make_rollup("n1", 1000, "cpu", 10.0));
+        store.flush().await.unwrap();
+
+        // Drop a corrupt file alongside the good one.
+        std::fs::write(dir.path().join("rollup_999999.parquet"), b"not parquet").unwrap();
+
+        let results = store.query_cluster_metric("cpu", 0, 9999).await.unwrap();
+        assert_eq!(results.len(), 1, "corrupt file broke an unrelated query");
+        assert_eq!(results[0].3, 10.0);
     }
 }

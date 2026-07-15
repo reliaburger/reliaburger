@@ -39,6 +39,49 @@ pub struct WebhookAlert {
 }
 
 // ---------------------------------------------------------------------------
+// Provider-specific payloads (Slack, PagerDuty)
+// ---------------------------------------------------------------------------
+
+/// Slack incoming-webhook body: one or more coloured attachments.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlackPayload {
+    pub attachments: Vec<SlackAttachment>,
+}
+
+/// A single Slack message attachment.
+#[derive(Debug, Clone, Serialize)]
+pub struct SlackAttachment {
+    /// `good`, `warning`, `danger`, or a hex colour.
+    pub color: String,
+    /// Plain-text summary shown in notifications.
+    pub fallback: String,
+    pub title: String,
+    pub text: String,
+}
+
+/// PagerDuty Events API v2 event.
+#[derive(Debug, Clone, Serialize)]
+pub struct PagerDutyPayload {
+    pub routing_key: String,
+    /// `trigger` or `resolve`.
+    pub event_action: String,
+    /// Stable key so a resolve closes the matching trigger.
+    pub dedup_key: String,
+    /// Required on `trigger`, omitted on `resolve`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<PagerDutyDetails>,
+}
+
+/// The `payload` object required on a PagerDuty `trigger`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PagerDutyDetails {
+    pub summary: String,
+    pub source: String,
+    /// `critical`, `error`, `warning`, or `info`.
+    pub severity: String,
+}
+
+// ---------------------------------------------------------------------------
 // HMAC signing
 // ---------------------------------------------------------------------------
 
@@ -90,21 +133,38 @@ impl WebhookDispatcher {
     }
 
     /// Dispatch a transition to all matching destinations.
+    ///
+    /// Each destination's payload matches its provider's contract (OBS4): a
+    /// generic webhook gets the Mayo schema, Slack gets an attachment, and
+    /// PagerDuty gets an Events API v2 event. One generic shape posted to all
+    /// three would be silently dropped by Slack and PagerDuty.
     pub async fn dispatch(&self, transition: &AlertTransition) {
-        let payload = self.build_payload(transition);
-        let body = match serde_json::to_vec(&payload) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("mayo: failed to serialise webhook payload: {e}");
-                return;
-            }
-        };
-
         for dest in &self.destinations {
             if !severity_matches(dest, transition.severity) {
                 continue;
             }
+            let body = match self.body_for(dest, transition) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("mayo: failed to serialise payload for {}: {e}", dest.url);
+                    continue;
+                }
+            };
             self.send_with_retry(dest, &body).await;
+        }
+    }
+
+    /// Serialise the provider-specific payload body for a destination.
+    fn body_for(
+        &self,
+        dest: &AlertDestination,
+        transition: &AlertTransition,
+    ) -> Result<Vec<u8>, serde_json::Error> {
+        match dest.dest_type.as_str() {
+            "slack" => serde_json::to_vec(&self.build_slack_payload(transition)),
+            "pagerduty" => serde_json::to_vec(&self.build_pagerduty_payload(dest, transition)),
+            // "webhook" and anything unknown fall back to the generic schema.
+            _ => serde_json::to_vec(&self.build_payload(transition)),
         }
     }
 
@@ -136,6 +196,63 @@ impl WebhookDispatcher {
             },
             cluster: self.cluster_name.clone(),
             timestamp: now,
+        }
+    }
+
+    /// Build a Slack incoming-webhook payload.
+    ///
+    /// Slack renders `attachments` with a coloured bar: red for a firing
+    /// critical, green when resolved. A firing warning is amber. The `text`
+    /// carries the human message; `fallback` is what Slack shows in
+    /// notifications.
+    fn build_slack_payload(&self, t: &AlertTransition) -> SlackPayload {
+        let firing = t.kind == TransitionKind::Firing;
+        let color = match (firing, t.severity) {
+            (false, _) => "good",
+            (true, AlertSeverity::Critical) => "danger",
+            (true, AlertSeverity::Warning) => "warning",
+        };
+        let status = if firing { "FIRING" } else { "RESOLVED" };
+        let title = format!("[{status}] {} ({})", t.rule_name, self.cluster_name);
+        let mut text = t.description.clone();
+        if let Some(v) = t.value {
+            text.push_str(&format!(" (value: {v})"));
+        }
+        SlackPayload {
+            attachments: vec![SlackAttachment {
+                color: color.to_string(),
+                fallback: title.clone(),
+                title,
+                text,
+            }],
+        }
+    }
+
+    /// Build a PagerDuty Events API v2 payload.
+    ///
+    /// A firing alert is a `trigger`; a resolved alert is a `resolve`. The
+    /// `dedup_key` ties the two together so PagerDuty auto-resolves the right
+    /// incident. `routing_key` is the destination's integration key, carried in
+    /// `secret`.
+    fn build_pagerduty_payload(
+        &self,
+        dest: &AlertDestination,
+        t: &AlertTransition,
+    ) -> PagerDutyPayload {
+        let firing = t.kind == TransitionKind::Firing;
+        let severity = match t.severity {
+            AlertSeverity::Critical => "critical",
+            AlertSeverity::Warning => "warning",
+        };
+        PagerDutyPayload {
+            routing_key: dest.secret.clone().unwrap_or_default(),
+            event_action: if firing { "trigger" } else { "resolve" }.to_string(),
+            dedup_key: format!("{}/{}", self.cluster_name, t.rule_name),
+            payload: firing.then(|| PagerDutyDetails {
+                summary: t.description.clone(),
+                source: self.cluster_name.clone(),
+                severity: severity.to_string(),
+            }),
         }
     }
 
@@ -296,6 +413,78 @@ mod tests {
         assert_eq!(json["alert"]["status"], "firing");
         assert_eq!(json["alert"]["value"], 95.3);
         assert_eq!(json["alert"]["fired_at"], 1_700_000_000u64);
+    }
+
+    #[test]
+    fn slack_payload_matches_provider_shape() {
+        // OBS4: Slack expects `attachments`, not the generic Mayo schema.
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let payload = dispatcher.build_slack_payload(&firing_transition());
+        let json = serde_json::to_value(&payload).unwrap();
+
+        let attachments = json["attachments"].as_array().expect("attachments array");
+        assert_eq!(attachments.len(), 1);
+        let a = &attachments[0];
+        // Firing critical is red.
+        assert_eq!(a["color"], "danger");
+        assert!(a["title"].as_str().unwrap().contains("FIRING"));
+        assert!(a["title"].as_str().unwrap().contains("cpu_throttle"));
+        assert!(a["fallback"].is_string());
+    }
+
+    #[test]
+    fn slack_resolved_is_green() {
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let payload = dispatcher.build_slack_payload(&resolved_transition());
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["attachments"][0]["color"], "good");
+        assert!(
+            json["attachments"][0]["title"]
+                .as_str()
+                .unwrap()
+                .contains("RESOLVED")
+        );
+    }
+
+    #[test]
+    fn pagerduty_payload_matches_events_v2_shape() {
+        // OBS4: PagerDuty's Events API v2 needs routing_key/event_action/
+        // dedup_key and a payload object with summary/source/severity.
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let dest = AlertDestination {
+            dest_type: "pagerduty".to_string(),
+            url: "https://events.pagerduty.com/v2/enqueue".to_string(),
+            severity: vec![],
+            secret: Some("routing-key-123".to_string()),
+        };
+        let json =
+            serde_json::to_value(dispatcher.build_pagerduty_payload(&dest, &firing_transition()))
+                .unwrap();
+
+        assert_eq!(json["routing_key"], "routing-key-123");
+        assert_eq!(json["event_action"], "trigger");
+        assert!(json["dedup_key"].as_str().unwrap().contains("cpu_throttle"));
+        assert_eq!(json["payload"]["severity"], "critical");
+        assert_eq!(json["payload"]["source"], "prod");
+        assert!(json["payload"]["summary"].is_string());
+    }
+
+    #[test]
+    fn pagerduty_resolve_omits_payload_and_keeps_dedup_key() {
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".to_string());
+        let dest = AlertDestination {
+            dest_type: "pagerduty".to_string(),
+            url: "https://events.pagerduty.com/v2/enqueue".to_string(),
+            severity: vec![],
+            secret: Some("routing-key-123".to_string()),
+        };
+        let json =
+            serde_json::to_value(dispatcher.build_pagerduty_payload(&dest, &resolved_transition()))
+                .unwrap();
+        assert_eq!(json["event_action"], "resolve");
+        // A resolve carries the same dedup_key but no payload.
+        assert!(json["dedup_key"].as_str().unwrap().contains("cpu_throttle"));
+        assert!(json.get("payload").is_none() || json["payload"].is_null());
     }
 
     #[test]
