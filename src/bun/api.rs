@@ -5488,6 +5488,8 @@ mod tests {
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn app_metrics_name_injection_cannot_bypass_predicate() {
         // OBS1-remainder: `metrics_app_handler` interpolated `?name=` and the
