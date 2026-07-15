@@ -178,9 +178,17 @@ busy.
 The correctness replacement uses several small, deterministic layers and asserts that every
 layer arrives through parallel fetches. Criterion owns the performance question. Criterion
 runs a function repeatedly, warms it up, samples its distribution and stores results under
-`target/criterion`. The fast and large gossip benchmarks now share one seeded simulation
-with the 10,000-node scale test. Setup and convergence are timed separately, and failure to
-converge is an error rather than a magic duration.
+`target/criterion`. The fast and large gossip benchmarks now share one seeded simulation.
+Setup and convergence are timed separately, and failure to converge is an error rather than
+a magic duration.
+
+The 10,000-member check asks a different question. Can one real Mustard node hold the full
+membership table, ingest it through fixed-size protocol messages, choose a peer and
+disseminate every update in bounded batches? Running 10,000 complete nodes in one process
+creates 100 million membership records. That's a single-machine stress test masquerading as
+a distributed-systems result (and it didn't finish inside 90 minutes). Full convergence
+remains covered through 1,000 real in-memory nodes; the 10k tier checks the per-node scale
+invariant honestly.
 
 We upload the data in CI but don't enforce a percentage regression yet. Hosted runners are
 noisy. Once the measurements settle on comparable hardware, a threshold will mean

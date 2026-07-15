@@ -63,7 +63,7 @@ be visible until we remove its race.
 | `make test-apple` | Apple Container runtime | Manual Apple-silicon MacBook check |
 | `make bench` | Criterion transport and 5–250-node measurements | Pull requests |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | Pull requests |
-| `make bench-10k` | Deterministic 10,000-node scale acceptance | Pull requests |
+| `make bench-10k` | Deterministic 10,000-member per-node scale acceptance | Pull requests |
 | `make coverage` | Combined default and no-default portable line coverage | Pull requests |
 
 Apple Container is the only manual runtime exception. GitHub's hosted macOS runners cannot
@@ -110,9 +110,12 @@ under five seconds was neither portable nor a correctness contract, so the test 
 parallel multilayer fetching without a wall-clock threshold.
 
 Criterion owns performance measurements. Fast and large gossip benchmarks share one seeded
-simulation with the 10k acceptance test, time setup separately from convergence, and fail if
-the network never converges. Criterion data is uploaded from CI, but we will not set a
-regression threshold until runs are stable on consistent hardware.
+simulation, time setup separately from convergence, and fail if the network never converges.
+The 10k acceptance exercises a single real node's 10,000-member production state through
+bounded protocol messages and dissemination batches. Simulating every membership table on
+one runner needs 100 million records and confuses distributed scale with single-process
+capacity. Criterion data is uploaded from CI, but we will not set a regression threshold
+until runs are stable on consistent hardware.
 
 `cargo-llvm-cov` combines the portable default and `--no-default-features` runs into LCOV
 and HTML artefacts. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,

@@ -192,9 +192,9 @@ jobs:
           if-no-files-found: error
 
   scale-10k:
-    name: 10k-node scale acceptance
+    name: 10k-member scale acceptance
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

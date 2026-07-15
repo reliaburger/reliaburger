@@ -1,13 +1,30 @@
-//! 10,000-node deterministic gossip convergence acceptance test.
+//! 10,000-member deterministic gossip scale acceptance.
 //!
-//! This validates convergence correctness rather than benchmarking a shared
-//! runner. It is ignored by default because the in-memory simulation is large.
+//! A real 10,000-node deployment distributes one membership table per
+//! machine. Allocating all 100 million membership records in one test process
+//! measures a laptop pretending to be a datacentre, not the protocol. The
+//! Criterion suites retain full multi-node convergence coverage through 1,000
+//! nodes; this test exercises the per-node 10,000-member invariant through the
+//! real message handler and dissemination queue.
+//!
 //! Run it with `make bench-10k`.
 
+use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::time::Instant;
+
+use reliaburger::meat::NodeId;
+use reliaburger::mustard::{
+    GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, MAX_PIGGYBACK_UPDATES,
+    MembershipUpdate, MustardNode, NodeState,
+};
 
 #[path = "../benches/support/gossip.rs"]
 mod gossip_support;
+
+fn address(index: usize) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, 1], index as u16 + 1_024))
+}
 
 #[tokio::test]
 async fn seeded_simulation_converges_without_a_sentinel_result() {
@@ -17,25 +34,68 @@ async fn seeded_simulation_converges_without_a_sentinel_result() {
 }
 
 #[tokio::test]
-#[ignore = "10,000-node scale acceptance test; run with make bench-10k"]
-async fn gossip_10k_nodes_converge() {
+#[ignore = "10,000-member scale acceptance test; run with make bench-10k"]
+async fn one_node_handles_10k_member_protocol_state() {
     let cluster_size = 10_000;
+    let network = InMemoryNetwork::new();
+    let transport = network.register(address(0)).await;
+    let mut observer = MustardNode::new(
+        NodeId::new("n0"),
+        address(0),
+        GossipConfig::default(),
+        transport,
+    );
 
-    eprintln!("setting up {cluster_size} nodes...");
-    let setup_started = Instant::now();
-    let mut simulation = gossip_support::GossipSimulation::new(cluster_size).await;
-    eprintln!("setup took {:.1?}", setup_started.elapsed());
+    let updates: Vec<_> = (1..cluster_size)
+        .map(|index| MembershipUpdate {
+            node_id: NodeId::new(format!("n{index}")),
+            address: address(index),
+            state: NodeState::Alive,
+            incarnation: 1,
+            lamport: index as u64,
+        })
+        .collect();
 
-    let convergence_started = Instant::now();
-    let rounds = simulation
-        .converge(5_000)
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
-    let elapsed = convergence_started.elapsed();
+    let ingest_started = Instant::now();
+    for chunk in updates.chunks(MAX_PIGGYBACK_UPDATES) {
+        observer
+            .handle_message(
+                address(1),
+                GossipMessage::new(
+                    NodeId::new("n1"),
+                    1,
+                    GossipPayload::Ping {
+                        updates: chunk.to_vec(),
+                    },
+                ),
+            )
+            .await;
+    }
+    let ingest_elapsed = ingest_started.elapsed();
 
-    eprintln!("converged in {rounds} rounds ({elapsed:.1?})");
+    assert_eq!(observer.membership.len(), cluster_size);
+    let (probe, _) = observer
+        .pick_probe_target()
+        .expect("a 10,000-member table has a probe target");
+    assert_ne!(probe, NodeId::new("n0"));
+
+    let dissemination_started = Instant::now();
+    let mut selected_nodes = HashSet::with_capacity(cluster_size - 1);
+    let mut batches = 0;
+    while selected_nodes.len() < cluster_size - 1 {
+        let batch = observer.dissemination.select_updates();
+        assert!(!batch.is_empty(), "updates expired before first broadcast");
+        assert!(batch.len() <= MAX_PIGGYBACK_UPDATES);
+        selected_nodes.extend(batch.into_iter().map(|update| update.node_id));
+        batches += 1;
+        assert!(
+            batches <= cluster_size * MAX_PIGGYBACK_UPDATES,
+            "dissemination did not expose every member in bounded batches"
+        );
+    }
+
     eprintln!(
-        "at the configured 50ms protocol interval, that represents {:.1}s of protocol time",
-        rounds as f64 * 0.05
+        "one node ingested {cluster_size} members in {ingest_elapsed:.1?}; first dissemination of every update took {:.1?} across {batches} batches",
+        dissemination_started.elapsed()
     );
 }

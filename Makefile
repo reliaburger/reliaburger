@@ -79,7 +79,7 @@ bench: ## Run reproducible transport and 5-250 node gossip benchmarks
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
 
-bench-10k: ## Run the deterministic 10k node convergence acceptance test
+bench-10k: ## Run the deterministic 10k-member per-node scale acceptance
 	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
 
 coverage: ## Combine default and no-default nextest line coverage

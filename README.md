@@ -115,7 +115,7 @@ The harness reports what actually ran instead of maintaining one headline total.
 audited macOS worktree, the portable profile executes 2,537 tests and identifies 36 ignored
 tests belonging to named slow, cluster, upgrade and manual suites. Linux compiles additional
 kernel/runtime tests, so its platform-specific inventory is reported by that job. Two
-Criterion targets and the 10k scale acceptance run separately. See the
+Criterion targets and the 10k-member scale acceptance run separately. See the
 [test harness design](docs/design/test-harness.md) for commands, gates, timings and CI
 ownership.
 

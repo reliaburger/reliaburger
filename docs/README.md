@@ -163,15 +163,22 @@ Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statis
 ```sh
 make bench         # reproducible transport and 5-250 node measurements
 make bench-large   # reproducible 500 and 1,000 node measurements
-make bench-10k     # deterministic 10,000 node scale acceptance
+make bench-10k     # deterministic 10,000-member per-node scale acceptance
 ```
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 
-The large benchmarks (`cargo bench --bench gossip_large`) test the same convergence logic at 500 and 1000 nodes. These take longer because the simulation is O(N² log N) — all N nodes are driven sequentially each round.
+The large benchmarks (`cargo bench --bench gossip_large`) test the same convergence logic
+at 500 and 1000 nodes. They maintain a seeded, incrementally sorted peer index so the
+benchmark measures protocol work rather than repeatedly allocating and sorting membership
+snapshots. Setup and convergence are reported separately, and non-convergence fails rather
+than returning a sentinel duration.
 
-The Criterion and 10k targets share one seeded simulation. Setup and convergence are
-reported separately, and non-convergence fails rather than returning a sentinel duration.
+The 10k target checks the per-node production invariant: one real Mustard node ingests a
+10,000-member table through bounded gossip messages, can select a probe target and exposes
+every learned update through fixed-size dissemination batches. Full 10,000-node all-to-all
+simulation would allocate 100 million membership records on one runner. That measures one
+machine pretending to be a datacentre, and did not finish inside its 90-minute budget.
 CI uploads Criterion data; it does not enforce regression percentages until measurements
 are stable on consistent hardware.
 

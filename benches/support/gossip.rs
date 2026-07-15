@@ -1,6 +1,7 @@
 //! Deterministic in-memory gossip simulation shared by benchmarks and the
-//! 10,000-node scale acceptance test.
+//! deterministic correctness tests.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use reliaburger::meat::NodeId;
@@ -28,6 +29,9 @@ fn fast_config() -> GossipConfig {
 /// A fully allocated gossip cluster ready to run protocol rounds.
 pub struct GossipSimulation {
     nodes: Vec<MustardNode<InMemoryTransport>>,
+    node_ids: Vec<NodeId>,
+    node_indices: HashMap<NodeId, u32>,
+    known_members: Vec<Vec<u32>>,
 }
 
 impl GossipSimulation {
@@ -37,17 +41,31 @@ impl GossipSimulation {
             cluster_size > 1,
             "gossip simulation needs at least two nodes"
         );
+        assert!(
+            u32::try_from(cluster_size).is_ok(),
+            "gossip simulation supports at most {} nodes",
+            u32::MAX
+        );
         let network = InMemoryNetwork::new();
         let config = fast_config();
         let mut nodes = Vec::with_capacity(cluster_size);
         let mut addresses = Vec::with_capacity(cluster_size);
+        let node_ids: Vec<_> = (0..cluster_size)
+            .map(|index| NodeId::new(format!("n{index}")))
+            .collect();
+        let node_indices = node_ids
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, node_id)| (node_id, index as u32))
+            .collect();
 
-        for index in 0..cluster_size {
+        for (index, node_id) in node_ids.iter().enumerate() {
             let address = node_addr(index);
             addresses.push(address);
             let transport = network.register(address).await;
             nodes.push(MustardNode::new(
-                NodeId::new(format!("n{index}")),
+                node_id.clone(),
                 address,
                 config.clone(),
                 transport,
@@ -56,10 +74,23 @@ impl GossipSimulation {
 
         for (index, node) in nodes.iter_mut().enumerate() {
             let next = (index + 1) % cluster_size;
-            node.add_seed(NodeId::new(format!("n{next}")), addresses[next]);
+            node.add_seed(node_ids[next].clone(), addresses[next]);
         }
 
-        Self { nodes }
+        let known_members = (0..cluster_size)
+            .map(|index| {
+                let mut known = vec![index as u32, ((index + 1) % cluster_size) as u32];
+                known.sort_unstable();
+                known
+            })
+            .collect();
+
+        Self {
+            nodes,
+            node_ids,
+            node_indices,
+            known_members,
+        }
     }
 
     /// Run protocol rounds until every node knows every member.
@@ -67,25 +98,25 @@ impl GossipSimulation {
         let cluster_size = self.nodes.len();
         for round in 1..=maximum_rounds {
             for (node_index, node) in self.nodes.iter_mut().enumerate() {
-                let mut candidates: Vec<_> = node
-                    .membership
-                    .active_members()
-                    .into_iter()
-                    .filter(|member| member.node_id != node.node_id)
-                    .map(|member| (member.node_id.clone(), member.address))
-                    .collect();
-                candidates.sort_by(|left, right| left.0.cmp(&right.0));
-                if candidates.is_empty() {
+                let known = &self.known_members[node_index];
+                if known.len() <= 1 {
                     continue;
                 }
-
-                // A reproducible pseudo-random walk. Benchmark runs now use
-                // identical peer choices instead of thread_rng noise.
-                let target = (round
+                let self_position = known.binary_search(&(node_index as u32)).unwrap();
+                let target_position = (round
                     .wrapping_mul(1_103_515_245)
                     .wrapping_add(node_index.wrapping_mul(12_345)))
-                    % candidates.len();
-                let (_, address) = &candidates[target];
+                    % (known.len() - 1);
+                let target = if target_position >= self_position {
+                    known[target_position + 1]
+                } else {
+                    known[target_position]
+                };
+
+                // The index is kept sorted as messages teach this node about
+                // peers. This preserves reproducible, uniform peer selection
+                // without allocating and sorting the complete membership on
+                // every protocol round.
                 let message = GossipMessage::new(
                     node.node_id.clone(),
                     node.incarnation,
@@ -94,15 +125,37 @@ impl GossipSimulation {
                     },
                 );
                 node.transport
-                    .send(*address, &message)
+                    .send(node_addr(target as usize), &message)
                     .await
                     .map_err(|error| format!("gossip send failed: {error}"))?;
             }
 
             for _ in 0..2 {
-                for node in &mut self.nodes {
+                for (receiver, node) in self.nodes.iter_mut().enumerate() {
                     while let Some((from, message)) = node.transport.try_recv() {
+                        let learned: Vec<_> = std::iter::once(&message.sender)
+                            .chain(
+                                message
+                                    .payload
+                                    .updates()
+                                    .iter()
+                                    .map(|update| &update.node_id),
+                            )
+                            .filter_map(|node_id| self.node_indices.get(node_id).copied())
+                            .collect();
                         node.handle_message(from, message).await;
+                        for learned_index in learned {
+                            if node
+                                .membership
+                                .get(&self.node_ids[learned_index as usize])
+                                .is_some()
+                            {
+                                let known = &mut self.known_members[receiver];
+                                if let Err(position) = known.binary_search(&learned_index) {
+                                    known.insert(position, learned_index);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -111,7 +164,7 @@ impl GossipSimulation {
                 && self
                     .nodes
                     .iter()
-                    .all(|node| node.membership.active_members().len() == cluster_size)
+                    .all(|node| node.membership.len() == cluster_size)
             {
                 return Ok(round);
             }
@@ -120,7 +173,7 @@ impl GossipSimulation {
         let minimum_members = self
             .nodes
             .iter()
-            .map(|node| node.membership.active_members().len())
+            .map(|node| node.membership.len())
             .min()
             .unwrap_or(0);
         Err(format!(
