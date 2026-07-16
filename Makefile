@@ -43,8 +43,8 @@ test-upgrade-node: ## Run only the single-node self-upgrade tests
 test-upgrade-cluster: ## Run only the cluster self-upgrade tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade_cluster)'
 
-test-apple: ## Run the manual Apple Container acceptance test on Apple silicon
-	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(apple_container_grill_creates_instance)'
+test-apple: ## Run the manual Apple Container acceptance tests on Apple silicon
+	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(apple_container_grill_creates_instance) | test(adopt_re_tracks_a_running_apple_container)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check

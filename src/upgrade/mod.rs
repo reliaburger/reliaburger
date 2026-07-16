@@ -16,6 +16,7 @@ pub mod manager;
 pub mod marker;
 pub mod metadata;
 pub mod orchestrator;
+pub mod plan;
 pub mod signing;
 pub mod store;
 pub mod types;

@@ -462,7 +462,6 @@ impl Grill for AnyGrill {
             AnyGrill::Process(g) => g.adopt(instance, record).await,
             #[cfg(target_os = "linux")]
             AnyGrill::Runc(g) => g.adopt(instance, record).await,
-            // TODO(Phase 14 follow-up): Apple Container adoption.
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.adopt(instance, record).await,
         }

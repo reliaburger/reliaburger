@@ -640,6 +640,38 @@ async fn upgrade_start_handler(
         )
             .into_response();
     }
+
+    // Derive each node's authoritative role + address server-side from
+    // gossip membership and the Raft voter set, then validate the client's
+    // claims against it (UPG2). A caller cannot upgrade a node under a
+    // false identity: an unknown node, a spoofed role or a mismatched
+    // address is rejected here rather than trusted into the plan.
+    let authoritative = match build_authoritative_view(&state, council).await {
+        Ok(view) => view,
+        Err(resp) => return resp,
+    };
+    let requested: Vec<crate::upgrade::plan::RequestedNode> = request
+        .nodes
+        .iter()
+        .map(|node| crate::upgrade::plan::RequestedNode {
+            node_id: node.node_id.clone(),
+            address: node.address.clone(),
+            role: node.role,
+        })
+        .collect();
+    let derived_nodes = match crate::upgrade::plan::derive_upgrade_nodes(&requested, |id| {
+        authoritative.get(id).cloned()
+    }) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     if council.desired_state().await.active_upgrade.is_some() {
         return (
             StatusCode::CONFLICT,
@@ -668,18 +700,7 @@ async fn upgrade_start_handler(
             .unwrap_or(crate::upgrade::types::UpgradeDirection::Upgrade),
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: request.registry_address,
-        nodes: request
-            .nodes
-            .into_iter()
-            .map(|node| crate::upgrade::types::NodeUpgradeRecord {
-                node_id: node.node_id,
-                address: node.address,
-                role: node.role,
-                from_version: None,
-                phase: crate::upgrade::types::NodeUpgradePhase::Pending,
-                since: None,
-            })
-            .collect(),
+        nodes: derived_nodes,
     };
 
     match council
@@ -701,6 +722,51 @@ async fn upgrade_start_handler(
         )
             .into_response(),
     }
+}
+
+/// Build the leader's authoritative view of every node for upgrade
+/// planning (UPG2): node id → its API address (from gossip membership) and
+/// role (from the Raft voter set + current leader). This is the source of
+/// truth the client's start request is validated against.
+///
+/// The role comes from Raft: the current leader is `Leader`, other voters
+/// are `Council`, and everything else `Worker`. Gossip identifies nodes by
+/// name; the Raft voter set by `raft_id_from_name(name)`, so we bridge them
+/// with that same stable hash.
+async fn build_authoritative_view(
+    state: &ApiState,
+    council: &Arc<crate::council::CouncilNode>,
+) -> Result<std::collections::HashMap<String, crate::upgrade::plan::AuthoritativeNode>, Response> {
+    use crate::cluster::identity::raft_id_from_name;
+    use crate::upgrade::plan::AuthoritativeNode;
+
+    let Some(membership) = &state.membership else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no gossip membership on this node" })),
+        )
+            .into_response());
+    };
+
+    let metrics = council.metrics().borrow().clone();
+    let voters: std::collections::BTreeSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+    let leader_id = metrics.current_leader;
+
+    let mut view = std::collections::HashMap::new();
+    for member in membership.read().await.iter() {
+        let name = member.node_id.0.clone();
+        let raft_id = raft_id_from_name(&name);
+        let role = crate::upgrade::plan::role_from_raft(raft_id, leader_id, &voters);
+        view.insert(
+            name,
+            AuthoritativeNode {
+                address: member.address.to_string(),
+                role,
+            },
+        );
+    }
+    Ok(view)
 }
 
 /// Cluster upgrade state, readable from any node (it's replicated).

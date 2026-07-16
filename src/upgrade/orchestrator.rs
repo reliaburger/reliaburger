@@ -66,8 +66,21 @@ pub struct StepContext {
     /// Computed by the driver from Raft metrics; council upgrades refuse
     /// to proceed while false.
     pub quorum_ok: bool,
+    /// Node ids gossip currently reports `Alive`. A node only reaches
+    /// [`NodeUpgradePhase::Healthy`] once it is BOTH HTTP-healthy at the
+    /// target version AND back in this set — an upgraded process that came
+    /// up but never rejoined the mesh is not "done" (UPG2). The leader
+    /// (`self_node_id`) is always treated as alive; it is running this code.
+    pub gossip_alive_ids: std::collections::BTreeSet<String>,
     /// Wall-clock now (injected so tests control timeouts).
     pub now: SystemTime,
+}
+
+impl StepContext {
+    /// Is this node back in the gossip mesh? The leader always is.
+    fn is_gossip_alive(&self, node_id: &str) -> bool {
+        node_id == self.self_node_id || self.gossip_alive_ids.contains(node_id)
+    }
 }
 
 /// Advance the upgrade by one tick.
@@ -203,7 +216,18 @@ async fn poll_and_drive_group<C: NodeControl>(
         }
 
         if probe.version == target && probe.healthy && !probe.upgrade_in_flight {
-            set_phase(record, NodeUpgradePhase::Healthy, context.now);
+            // HTTP-healthy at the target is necessary but not sufficient: a
+            // node that came back up but never rejoined the gossip mesh is
+            // isolated (its workloads take no traffic, its votes don't
+            // count). Hold it in Verifying until gossip sees it Alive
+            // again; the stuck-node timeout catches one that never does.
+            if context.is_gossip_alive(&record.node_id) {
+                set_phase(record, NodeUpgradePhase::Healthy, context.now);
+            } else if record.phase == NodeUpgradePhase::Directed {
+                set_phase(record, NodeUpgradePhase::Verifying, context.now);
+            } else {
+                check_timeout(record, context.now);
+            }
             continue;
         }
 
@@ -508,18 +532,66 @@ impl NodeControl for HttpNodeControl {
 
 /// Can the council afford to have one voter mid-restart?
 ///
-/// With `v` voters, quorum is `v/2 + 1`; taking one down leaves `v - 1`
-/// reachable, which still forms a quorum iff `v >= 3`. A single-voter
-/// council (`v == 1`) is also fine: the leader upgrading itself is the
-/// whole cluster restarting, there is no quorum to protect. `v == 2`
-/// (which the roadmap discourages) cannot lose either member.
+/// Quorum protection is about *live* voters, not configured ones. With `v`
+/// voters configured and `live` of them currently reachable, taking one
+/// more down during an upgrade leaves `live - 1` up, which must still form
+/// a quorum of the configured set: `live - 1 >= v/2 + 1`.
 ///
-/// Members that are ALREADY down aren't visible in the membership config;
-/// the per-node health polling in [`step`] covers the observable part.
-async fn quorum_headroom_ok(council: &crate::council::CouncilNode) -> bool {
+/// The old check counted configured voters and assumed all were live. That
+/// let an upgrade proceed on a 3-voter council with one voter *already*
+/// dead: upgrading a second one drops live voters to 1, below the quorum of
+/// 2, and the cluster loses its leader for the duration of the swap (or
+/// forever, if the swap fails). Counting live voters refuses that.
+///
+/// A single-voter council (`v == 1`) is a special case: the leader
+/// upgrading itself is the whole cluster restarting, there is no quorum to
+/// protect, so it always proceeds.
+///
+/// `live` counts voters that gossip reports `Alive`. A voter absent from
+/// the alive set — dead, suspect or left — does not count. The leader
+/// itself is always counted live: it is running this very code.
+pub fn live_quorum_headroom_ok(configured_voters: usize, live_voters: usize) -> bool {
+    if configured_voters <= 1 {
+        return true;
+    }
+    // Quorum of the configured set. Integer `v/2 + 1` is the majority.
+    let quorum = configured_voters / 2 + 1;
+    // After taking one more voter down for its swap, `live_voters - 1` remain.
+    live_voters.saturating_sub(1) >= quorum
+}
+
+/// Count configured voters, and how many of them gossip reports `Alive`.
+///
+/// Voter ids are Raft `u64`s; gossip identifies nodes by name. We bridge
+/// them with the same stable `raft_id_from_name` hash the whole cluster
+/// uses, so a voter counts as live iff some alive gossip member hashes to
+/// its id. `self_id` (the leader running this) is always counted: it need
+/// not appear in its own gossip snapshot to be alive.
+///
+/// Returns `(configured_voters, live_voters)`.
+fn count_live_voters(
+    council: &crate::council::CouncilNode,
+    membership: &[crate::mustard::membership::MembershipSnapshot],
+    self_id: u64,
+) -> (usize, usize) {
+    use crate::cluster::identity::raft_id_from_name;
+    use crate::mustard::state::NodeState;
+
     let metrics = council.metrics().borrow().clone();
-    let voters = metrics.membership_config.membership().voter_ids().count();
-    voters >= 3 || voters == 1
+    let voters: std::collections::BTreeSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+
+    let alive_ids: std::collections::BTreeSet<u64> = membership
+        .iter()
+        .filter(|m| m.state == NodeState::Alive)
+        .map(|m| raft_id_from_name(&m.node_id.0))
+        .collect();
+
+    let live = voters
+        .iter()
+        .filter(|id| **id == self_id || alive_ids.contains(id))
+        .count();
+    (voters.len(), live)
 }
 
 /// The long-lived orchestration loop, spawned once per cluster-mode bun.
@@ -533,10 +605,15 @@ pub async fn run_orchestrator(
     council: std::sync::Arc<crate::council::CouncilNode>,
     control: HttpNodeControl,
     self_node_id: String,
+    membership_rx: tokio::sync::watch::Receiver<
+        Vec<crate::mustard::membership::MembershipSnapshot>,
+    >,
     cancel: tokio_util::sync::CancellationToken,
 ) {
+    use crate::cluster::identity::raft_id_from_name;
     use crate::council::types::RaftRequest;
 
+    let self_raft_id = raft_id_from_name(&self_node_id);
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -567,9 +644,22 @@ pub async fn run_orchestrator(
             continue;
         }
 
+        // Count live voters against the current gossip snapshot: an upgrade
+        // that would drop the vote keeping quorum is refused (UPG1).
+        let (configured_voters, live_voters, gossip_alive_ids) = {
+            let membership = membership_rx.borrow();
+            let (configured, live) = count_live_voters(&council, &membership, self_raft_id);
+            let alive: std::collections::BTreeSet<String> = membership
+                .iter()
+                .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
+                .map(|m| m.node_id.0.clone())
+                .collect();
+            (configured, live, alive)
+        };
         let context = StepContext {
             self_node_id: self_node_id.clone(),
-            quorum_ok: quorum_headroom_ok(&council).await,
+            quorum_ok: live_quorum_headroom_ok(configured_voters, live_voters),
+            gossip_alive_ids,
             now: SystemTime::now(),
         };
         let next = step(upgrade.clone(), &control, &context).await;
@@ -708,10 +798,18 @@ mod tests {
         }
     }
 
+    /// A context in which every node the tests use is gossip-alive, so the
+    /// gossip-rejoin gate (UPG2) never blocks the transitions those tests
+    /// are about. The dedicated rejoin tests build their own contexts.
     fn context() -> StepContext {
+        context_alive(["w1", "w2", "w3", "c1", "c2", "leader"])
+    }
+
+    fn context_alive<const N: usize>(alive: [&str; N]) -> StepContext {
         StepContext {
             self_node_id: "leader".to_string(),
             quorum_ok: true,
+            gossip_alive_ids: alive.iter().map(|s| s.to_string()).collect(),
             now: SystemTime::now(),
         }
     }
@@ -978,6 +1076,70 @@ mod tests {
         // Nodes refuse ids they already reverted, so the retry must not
         // reuse the old one.
         assert_eq!(resumed.upgrade_id, "up-1-retry");
+    }
+
+    #[tokio::test]
+    async fn healthy_but_not_in_gossip_does_not_complete() {
+        let control = MockControl::default();
+        // w1 is HTTP-healthy at the target version, but gossip has NOT seen
+        // it rejoin the mesh — it must not be marked Healthy yet.
+        control.set("addr-w1", "0.2.0", true, false);
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Verifying)],
+            1,
+        );
+
+        let ctx = context_alive(["leader"]); // w1 absent from gossip
+        let state = step(state, &control, &ctx).await;
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Verifying);
+        assert_eq!(state.phase, ClusterUpgradePhase::UpgradingWorkers);
+    }
+
+    #[tokio::test]
+    async fn rejoining_gossip_completes_the_node() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        let state = cluster_state(
+            vec![record("w1", NodeRole::Worker, NodeUpgradePhase::Verifying)],
+            1,
+        );
+
+        // Same probe, but now gossip reports w1 Alive: it completes.
+        let ctx = context_alive(["leader", "w1"]);
+        let state = step(state, &control, &ctx).await;
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+        assert_eq!(state.phase, ClusterUpgradePhase::UpgradingCouncil);
+    }
+
+    #[test]
+    fn quorum_headroom_counts_live_voters_not_configured() {
+        // Three configured voters, all live: one may go down (2 remain >= 2).
+        assert!(live_quorum_headroom_ok(3, 3));
+        // Three configured, but one already dead: upgrading a second would
+        // leave 1 live, below the quorum of 2 — refuse.
+        assert!(!live_quorum_headroom_ok(3, 2));
+        // Five configured, one dead (4 live): taking one more leaves 3 >= 3.
+        assert!(live_quorum_headroom_ok(5, 4));
+        // Five configured, two dead (3 live): one more leaves 2 < 3 — refuse.
+        assert!(!live_quorum_headroom_ok(5, 3));
+    }
+
+    #[test]
+    fn single_voter_council_always_has_headroom() {
+        // A one-voter council is the whole cluster; the leader upgrading
+        // itself has no quorum to protect.
+        assert!(live_quorum_headroom_ok(1, 1));
+        assert!(live_quorum_headroom_ok(0, 0));
+    }
+
+    #[test]
+    fn two_voter_council_never_has_headroom() {
+        // v == 2, quorum 2: losing either member loses quorum, even fully
+        // live. (The roadmap discourages 2-voter councils for this reason.)
+        assert!(!live_quorum_headroom_ok(2, 2));
+        assert!(!live_quorum_headroom_ok(2, 1));
     }
 
     #[tokio::test]
