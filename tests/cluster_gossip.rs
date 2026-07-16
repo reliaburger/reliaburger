@@ -315,20 +315,26 @@ async fn rollup_worker_delivers_node_rollups_to_the_leader() {
     .await;
     assert!(elected, "no leader elected");
 
+    // L11: the aggregator must ingest rollups pushed by the workers. Leadership
+    // can settle on a different node than the first to claim it, and the workers
+    // push to whichever node is currently leader — so re-find the leader on every
+    // poll rather than binding it once. (Under the ci profile retries=0, a
+    // one-shot sample of a node that then loses leadership fails outright with 0.)
+    let ingested = wait_until(Duration::from_secs(20), || {
+        nodes
+            .iter()
+            .find(|n| thinks_it_is_leader(&n.0))
+            .and_then(|n| n.1.rollup_store.try_read().ok())
+            .map(|s| s.buffer_len() >= 3)
+            .unwrap_or(false)
+    })
+    .await;
+
     let leader = nodes
         .iter()
         .find(|n| thinks_it_is_leader(&n.0))
         .expect("leader exists");
     let rollup_store = std::sync::Arc::clone(&leader.1.rollup_store);
-
-    // L11: the aggregator must ingest rollups pushed by the workers.
-    let ingested = wait_until(Duration::from_secs(15), || {
-        rollup_store
-            .try_read()
-            .map(|s| s.buffer_len() >= 3)
-            .unwrap_or(false)
-    })
-    .await;
     assert!(
         ingested,
         "leader rollup store never ingested rollups from all nodes (have {})",
