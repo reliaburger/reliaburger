@@ -163,6 +163,40 @@ mod tests {
         assert_eq!(rollup.entries[0].aggregate.sum, 50.0);
     }
 
+    /// A sample seeded into a complete aligned minute is rolled up whatever
+    /// sub-minute phase `now` sits at when the worker pushes.
+    ///
+    /// This pins the invariant the `rollup_worker_delivers_node_rollups_to_the_leader`
+    /// cluster test relies on. That test used to seed a single sample at a
+    /// fixed `now - 30` offset, which fell inside the rolled-up previous minute
+    /// only when `now % 60 < 30`; in the second half of a minute the previous
+    /// window was empty, the leader ingested zero-entry rollups, and the test
+    /// flaked. Seeding whole minutes fixes it — this test proves the window
+    /// maths that makes that reliable.
+    #[tokio::test]
+    async fn seeded_previous_minute_is_rolled_up_at_any_phase() {
+        // A sample in minute [1020, 1080) — the aligned minute before 1080.
+        for phase in [0, 15, 29, 30, 45, 59] {
+            let (mut store, _dir) = test_store();
+            store.insert(&MetricKey::simple("cpu"), Sample::at(1050, 42.0));
+            store.flush().await.unwrap();
+
+            let generator = RollupGenerator::new(NodeId::new("node-1"));
+            // `now` lands anywhere inside minute [1080, 1140); the generator
+            // must always roll up the completed previous minute [1020, 1080).
+            let now = 1080 + phase;
+            let rollup = generator.generate(&store, now, false).await.unwrap();
+
+            assert_eq!(
+                rollup.entries.len(),
+                1,
+                "phase {phase}: the seeded previous-minute sample must be rolled up"
+            );
+            assert_eq!(rollup.timestamp, 1020);
+            assert_eq!(rollup.entries[0].aggregate.count, 1);
+        }
+    }
+
     #[tokio::test]
     async fn empty_store_produces_empty_rollup() {
         let (store, _dir) = test_store();

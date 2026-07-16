@@ -290,7 +290,27 @@ async fn seeded_mayo_store(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    store.insert(&MetricKey::simple("cpu"), Sample::at(now - 30, 42.0));
+
+    // The rollup generator rolls up one COMPLETE aligned minute — the minute
+    // before the one it pushes in (`[aligned_end - 60, aligned_end)`). A single
+    // sample at a fixed offset (the old `now - 30`) only lands inside that
+    // window for half the wall-clock phases: if the test happens to run in the
+    // second half of a minute, `now - 30` falls in the *current* minute, the
+    // rolled-up previous minute is empty, and the leader ingests rollups with
+    // zero entries forever (buffer_len stays 0). That is the flake — nothing to
+    // do with leader resolution or delivery, which both work every run.
+    //
+    // Seed one sample squarely inside each aligned minute the worker might roll
+    // up across the ~20s window (the previous minute and the current one, since
+    // a push can cross a boundary), so whichever complete minute the generator
+    // queries always has data.
+    let minute_start = now - (now % 60);
+    for &window_start in &[minute_start - 60, minute_start] {
+        store.insert(
+            &MetricKey::simple("cpu"),
+            Sample::at(window_start + 30, 42.0),
+        );
+    }
     store.flush().await.unwrap();
     std::sync::Arc::new(tokio::sync::RwLock::new(store))
 }

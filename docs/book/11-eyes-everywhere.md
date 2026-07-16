@@ -75,7 +75,7 @@ A typical node running 10 apps produces roughly 20-30 rollup entries per minute 
 
 ## Generating rollups
 
-The `RollupGenerator` sits on each node. Every 60 seconds, it queries the local `MayoStore` for the previous minute's data using a GROUP BY query:
+The `RollupGenerator` sits on each node. Every 60 seconds, it queries the local `MayoStore` for the previous *complete* minute and rolls it up with a GROUP BY query:
 
 ```rust
 pub async fn generate(
@@ -89,14 +89,22 @@ pub async fn generate(
     } else {
         DEFAULT_ROLLUP_WINDOW_SECS   // 60 seconds
     };
-    let start = now.saturating_sub(window);
+    // Align the window end down to a minute boundary, then step back one
+    // window. `now - (now % 60)` is the start of the current minute; the
+    // completed window we roll up is the one before it.
+    let aligned_end = now - (now % DEFAULT_ROLLUP_WINDOW_SECS);
+    let start = aligned_end.saturating_sub(window);
 
-    let aggregates = store.query_window_aggregates(start, now).await?;
+    let aggregates = store.query_window_aggregates(start, aligned_end).await?;
     // ... map to RollupEntry structs
 }
 ```
 
 The `extended` flag matters during reassignment. More on that shortly.
+
+Why align? Two nodes ticking a few seconds apart would otherwise stamp the same data with different `timestamp`s, and the council couldn't tell a re-sent window from a genuinely new one, so it couldn't deduplicate. Aligning to a minute boundary gives every node the same `(node, window)` key for the same minute.
+
+Alignment has a consequence worth spelling out, because it bit us in a test. The generator rolls up the minute *before* the one it's pushing in, never the current (incomplete) one. So a metric only appears in a rollup once its whole minute has closed. Our first cluster test seeded a single sample at `now - 30` and asserted the leader ingested it. That passed... about half the time. If the test happened to run in the first half of a wall-clock minute, `now - 30` landed in the previous (closed) minute and got rolled up. If it ran in the second half, `now - 30` was still inside the *current* minute, the previous minute was empty, and the leader dutifully ingested rollups with zero entries forever. Delivery worked perfectly every run; the data simply wasn't in the window the generator asked for. The fix was to seed a sample into each complete minute the worker might roll up, not one at a fixed offset that only sometimes lands in a closed window. The lesson: when you test a time-windowed pipeline, seed your fixtures relative to the window boundaries the code actually queries, not relative to "now".
 
 Under the hood, `query_window_aggregates` runs this SQL through DataFusion:
 
