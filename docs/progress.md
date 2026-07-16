@@ -1140,10 +1140,12 @@ whole theme lands.
 
 Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-tui.md)
 
-- [ ] Full interactive terminal UI (ratatui + crossterm)
-- [ ] Dashboard, apps, nodes, jobs, events, logs, routes, search, help views
-- [ ] Book chapter 13: "A Room with a View"
-- [ ] All Phase 13 tests green
+- [x] Full interactive terminal UI (ratatui + crossterm) — `src/relish/tui/`
+  (app loop, input/keys, navigation, live event/log streams, terminal, theme/palette)
+- [x] Dashboard, apps, nodes, jobs, events, logs, routes, search, help views
+  (plus app-detail and snapshots) under `src/relish/tui/views/`
+- [x] Book chapter 13: "A Room with a View"
+- [x] All Phase 13 tests green (TUI unit tests in the portable suite)
 
 ## Phase 14: Self-Upgrade
 
