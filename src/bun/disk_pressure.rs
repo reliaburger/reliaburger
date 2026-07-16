@@ -52,7 +52,10 @@ pub fn dir_parquet_size(dir: &Path) -> u64 {
 ///
 /// Returns `None` if no export destination is configured (pruning
 /// still happens based on retention_days).
-pub fn check_and_relieve(
+///
+/// Async because export ships to an object store (`s3://`/`gs://`/local)
+/// via `object_store`.
+pub async fn check_and_relieve(
     source_dir: &Path,
     export_dest: Option<&str>,
     node_id: &str,
@@ -70,7 +73,7 @@ pub fn check_and_relieve(
 
     // If we have a destination, export un-exported files first
     if let Some(dest) = export_dest
-        && let Ok(export_result) = export_logs(source_dir, dest, node_id, checkpoint)
+        && let Ok(export_result) = export_logs(source_dir, dest, node_id, checkpoint).await
         && export_result.files_exported > 0
     {
         result.exported = true;
@@ -119,9 +122,10 @@ pub fn check_and_relieve(
             let past_retention = retention_cutoff > 0 && *mtime < retention_cutoff;
             let over_pressure = max_bytes > 0 && remaining_size > max_bytes;
 
-            // Only prune if the file has been exported (or no export dest configured)
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let is_exported = export_dest.is_none() || checkpoint.exported_files.contains(filename);
+            // Only prune if this exact content has been exported (or no export
+            // dest configured). Keyed by durable id, so pruning never deletes a
+            // reused-filename file whose new bytes haven't shipped yet.
+            let is_exported = export_dest.is_none() || checkpoint.contains_file(path);
 
             if (past_retention || over_pressure)
                 && is_exported
@@ -225,15 +229,15 @@ mod tests {
         assert_eq!(dir_parquet_size(dir.path()), 0);
     }
 
-    #[test]
-    fn export_then_prune_under_pressure() {
+    #[tokio::test]
+    async fn export_then_prune_under_pressure() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
 
-        // Create files totalling 3000 bytes
+        // Create files with distinct bytes so their durable ids differ.
         std::fs::write(source.path().join("logs_000000.parquet"), vec![0u8; 1000]).unwrap();
-        std::fs::write(source.path().join("logs_000001.parquet"), vec![0u8; 1000]).unwrap();
-        std::fs::write(source.path().join("logs_000002.parquet"), vec![0u8; 1000]).unwrap();
+        std::fs::write(source.path().join("logs_000001.parquet"), vec![1u8; 1000]).unwrap();
+        std::fs::write(source.path().join("logs_000002.parquet"), vec![2u8; 1000]).unwrap();
 
         let mut checkpoint = ExportCheckpoint::default();
 
@@ -245,7 +249,8 @@ mod tests {
             &mut checkpoint,
             2000, // max bytes
             0,    // no retention limit
-        );
+        )
+        .await;
 
         // All 3 files exported
         assert!(result.exported);
@@ -256,8 +261,8 @@ mod tests {
         assert!(dir_parquet_size(source.path()) <= 2000);
     }
 
-    #[test]
-    fn no_prune_without_export_when_dest_set() {
+    #[tokio::test]
+    async fn no_prune_without_export_when_dest_set() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
 
@@ -274,7 +279,8 @@ mod tests {
             &mut checkpoint,
             500, // way under threshold
             0,
-        );
+        )
+        .await;
 
         assert!(result.exported);
         assert_eq!(result.files_exported, 1);
@@ -282,8 +288,8 @@ mod tests {
         assert!(result.files_pruned >= 1);
     }
 
-    #[test]
-    fn prune_without_export_dest() {
+    #[tokio::test]
+    async fn prune_without_export_dest() {
         let source = tempfile::tempdir().unwrap();
 
         std::fs::write(source.path().join("logs_000000.parquet"), vec![0u8; 2000]).unwrap();
@@ -291,14 +297,15 @@ mod tests {
         let mut checkpoint = ExportCheckpoint::default();
 
         // No export destination — just prune
-        let result = check_and_relieve(source.path(), None, "node-1", &mut checkpoint, 1000, 0);
+        let result =
+            check_and_relieve(source.path(), None, "node-1", &mut checkpoint, 1000, 0).await;
 
         assert!(!result.exported);
         assert_eq!(result.files_pruned, 1);
     }
 
-    #[test]
-    fn no_action_when_under_threshold() {
+    #[tokio::test]
+    async fn no_action_when_under_threshold() {
         let source = tempfile::tempdir().unwrap();
         std::fs::write(source.path().join("logs_000000.parquet"), vec![0u8; 100]).unwrap();
 
@@ -311,7 +318,8 @@ mod tests {
             &mut checkpoint,
             10000, // well above current usage
             0,
-        );
+        )
+        .await;
 
         assert_eq!(result.files_pruned, 0);
     }

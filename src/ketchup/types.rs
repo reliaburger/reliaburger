@@ -76,6 +76,8 @@ pub enum KetchupError {
     Io(#[from] std::io::Error),
     #[error("log not found for {app} in {namespace}")]
     NotFound { app: String, namespace: String },
+    #[error("query rejected: {reason}")]
+    QueryRejected { reason: String },
 }
 
 // ---------------------------------------------------------------------------

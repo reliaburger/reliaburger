@@ -16,7 +16,6 @@ use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
 use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
 use reliaburger::ketchup::log_store::LogStore;
-use reliaburger::ketchup::store::KetchupStore;
 use reliaburger::mayo::alert::AlertEvaluator;
 use reliaburger::mayo::collector::SystemCollector;
 use reliaburger::mayo::store::MayoStore;
@@ -843,7 +842,6 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(&fallback).expect("failed to create logs directory");
         fallback
     };
-    let _ketchup_store = Arc::new(RwLock::new(KetchupStore::new(&logs_dir)));
 
     // Create Arrow/DataFusion log store (SQL queries over logs)
     let log_store_dir = logs_dir.join("parquet");
@@ -974,20 +972,22 @@ async fn main() -> anyhow::Result<()> {
             config.logs.export_interval_secs
         );
         tokio::spawn(async move {
-            use reliaburger::ketchup::export::{ExportCheckpoint, export_logs};
+            use reliaburger::ketchup::export::{
+                CHECKPOINT_FILENAME, ExportCheckpoint, export_logs,
+            };
             let mut tick = tokio::time::interval(export_interval);
             // Skip first tick (fires immediately)
             tick.tick().await;
             let store_guard = export_store.read().await;
-            let checkpoint_path = store_guard.data_dir().join("_export_checkpoint.json");
+            let checkpoint_path = store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
             drop(store_guard);
             loop {
                 tokio::select! {
                     _ = export_shutdown.cancelled() => break,
                     _ = tick.tick() => {
-                        let store = export_store.read().await;
-                        match export_logs(store.data_dir(), &export_dest, &node_id, &mut checkpoint) {
+                        let data_dir = export_store.read().await.data_dir().to_path_buf();
+                        match export_logs(&data_dir, &export_dest, &node_id, &mut checkpoint).await {
                             Ok(result) if result.files_exported > 0 => {
                                 println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
                                 checkpoint.save(&checkpoint_path).ok();
@@ -1023,7 +1023,7 @@ async fn main() -> anyhow::Result<()> {
             use reliaburger::bun::disk_pressure::{
                 DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
             };
-            use reliaburger::ketchup::export::ExportCheckpoint;
+            use reliaburger::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint};
             let tick_period = std::time::Duration::from_secs(300);
             let mut tick = tokio::time::interval(tick_period);
             // Council resignation waits for two sustained ticks (~10 min) over
@@ -1033,13 +1033,13 @@ async fn main() -> anyhow::Result<()> {
             tick.tick().await; // skip first immediate tick
 
             let log_store_guard = dp_log_store.read().await;
-            let log_checkpoint_path = log_store_guard.data_dir().join("_export_checkpoint.json");
+            let log_checkpoint_path = log_store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let log_data_dir = log_store_guard.data_dir().to_path_buf();
             drop(log_store_guard);
             let mut log_checkpoint = ExportCheckpoint::load(&log_checkpoint_path);
 
             let mayo_store_guard = dp_mayo_store.read().await;
-            let mayo_checkpoint_path = mayo_store_guard.data_dir().join("_export_checkpoint.json");
+            let mayo_checkpoint_path = mayo_store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let mayo_data_dir = mayo_store_guard.data_dir().to_path_buf();
             drop(mayo_store_guard);
             let mut mayo_checkpoint = ExportCheckpoint::load(&mayo_checkpoint_path);
@@ -1056,7 +1056,8 @@ async fn main() -> anyhow::Result<()> {
                             &mut log_checkpoint,
                             log_max_bytes,
                             log_retention_days,
-                        );
+                        )
+                        .await;
                         if log_result.files_pruned > 0 {
                             println!(
                                 "bun: disk pressure — pruned {} log file(s), reclaimed {} bytes",
@@ -1073,7 +1074,8 @@ async fn main() -> anyhow::Result<()> {
                             &mut mayo_checkpoint,
                             metrics_max_bytes,
                             metrics_retention_days,
-                        );
+                        )
+                        .await;
                         if metrics_result.files_pruned > 0 {
                             println!(
                                 "bun: disk pressure — pruned {} metrics file(s), reclaimed {} bytes",
@@ -1693,6 +1695,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for everything to finish
     let _ = tokio::join!(agent_handle, server_handle, pickle_handle);
+
+    // OBS7: the flush loops break on cancellation and drop whatever they'd
+    // buffered since their last tick. Force one final flush of both stores so
+    // the last minute of metrics and logs is durable, not lost on a clean
+    // stop. The tasks that fed these buffers are joined above, so nothing is
+    // still appending.
+    if let Err(e) = reliaburger::mayo::store::flush_off_lock(&mayo_store).await {
+        eprintln!("bun: final metrics flush error: {e}");
+    }
+    if let Err(e) = reliaburger::ketchup::log_store::flush_shared(&log_store).await {
+        eprintln!("bun: final log flush error: {e}");
+    }
     println!("bun: shutdown complete");
 
     Ok(())

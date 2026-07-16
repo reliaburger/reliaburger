@@ -224,20 +224,24 @@ pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> 
                 ),
             });
         }
-        return logs_export_from(&alt_dir, dest, node_id);
+        return logs_export_from(&alt_dir, dest, node_id).await;
     }
 
-    logs_export_from(&log_dir, dest, node_id)
+    logs_export_from(&log_dir, dest, node_id).await
 }
 
-fn logs_export_from(source: &Path, dest: &Path, node_id: &str) -> Result<(), RelishError> {
-    use crate::ketchup::export::{ExportCheckpoint, export_logs};
+async fn logs_export_from(source: &Path, dest: &Path, node_id: &str) -> Result<(), RelishError> {
+    use crate::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
 
-    let checkpoint_path = source.join("_export_checkpoint.json");
+    // X8: share Bun's one authoritative checkpoint, not a competing Relish
+    // copy. Whichever process exports last records into the same file, so a
+    // manual `relish logs-export` and the agent's export loop can't
+    // double-ship or skip each other's files.
+    let checkpoint_path = source.join(CHECKPOINT_FILENAME);
     let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
 
     let dest_str = dest.to_str().unwrap_or(".");
-    match export_logs(source, dest_str, node_id, &mut checkpoint) {
+    match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
             if result.files_exported == 0 {
                 println!("no new files to export");
