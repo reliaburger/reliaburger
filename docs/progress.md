@@ -1043,7 +1043,7 @@ whole theme lands.
 
 ### 12b.5 — Make automation and observability truthful
 
-- [ ] **Metrics, logs and object storage** — parameterise every DataFusion query; add
+- [x] **Metrics, logs and object storage** — parameterise every DataFusion query; add
   typed/bounded raw-log access; push predicates into Parquet and move flush/compaction off
   async locks. Persist/prune epoch-aligned idempotent rollups; collect per-app/scraped
   metrics; distinguish stale telemetry in alerts; URL-encode fan-out and return partial
@@ -1065,6 +1065,20 @@ whole theme lands.
     zero `evaluation_interval_secs` is rejected at startup. OBS5/M3: flush drains under a
     brief lock then writes via `spawn_blocking` off the lock (queries proceed during a
     flush), and a corrupt Parquet file is skipped per-file rather than failing every query.
+  - [x] **PR O2 — Logs + object storage.** OBS5: `/v1/logs/sql` goes through a bounded path
+    (`query_sql_json_bounded`) — read-only `SELECT`/`WITH` only, `logs`-table-only session,
+    outer-`LIMIT` row cap and a working-memory limit; a rejected query is a `400`. OBS6
+    fan-out: `app`/`namespace` percent-encoded as path segments and query values through
+    reqwest's encoder (a `grep` with `&`/`?` travels intact); node HTTP/JSON/task failures
+    return a partial `FanOutResult` (which nodes failed) instead of silent empty; dedup keyed
+    on stable `(node, timestamp, stream, line)` identity, so two replicas' identical lines
+    survive while one node's retransmit collapses. OBS7/M20/X8: `export_logs` ships via
+    `object_store::parse_url` (`s3://`/`gs://`/`file://`/bare path), one Bun-owned checkpoint
+    shared with `relish logs-export` (`CHECKPOINT_FILENAME`), durable content-hash object ids
+    so a filename reused after retention isn't skipped, and a final shutdown flush of both
+    metrics and log buffers. OBS8/M24: the dead `KetchupStore` (+ its `index`/`json` modules
+    and `logs.max_file_size_mb`) removed; `LogStore` is the sole live path. Real S3/GCS lives
+    behind a named `#[ignore]` manual test, not a silent gate.
 - [x] **GitOps convergence and webhook security** — expose a signature-validated HMAC
   webhook route with replay/rate controls; make diff namespace-aware and deterministic;
   apply every resource through the unified desired-state path; never advance last_applied

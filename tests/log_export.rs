@@ -1,8 +1,8 @@
 /// Integration tests for Parquet log export and remote query.
 ///
 /// Verifies end-to-end: insert log entries into a LogStore, flush to
-/// Parquet, export to a destination directory, then query the exported
-/// files via DataFusion ListingTable.
+/// Parquet, export to a destination (a local `object_store` fixture — a
+/// temp dir), then query the exported files via DataFusion ListingTable.
 use reliaburger::ketchup::export::{ExportCheckpoint, export_logs};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::remote_query::{query_remote, query_remote_json};
@@ -30,6 +30,7 @@ async fn export_and_query_round_trip() {
         "node-1",
         &mut checkpoint,
     )
+    .await
     .unwrap();
 
     assert_eq!(result.files_exported, 1);
@@ -75,6 +76,7 @@ async fn query_exported_with_filter() {
         "node-1",
         &mut checkpoint,
     )
+    .await
     .unwrap();
 
     // Filter by app
@@ -119,6 +121,7 @@ async fn query_exported_aggregation() {
         "node-1",
         &mut checkpoint,
     )
+    .await
     .unwrap();
 
     let rows = query_remote_json(
@@ -135,7 +138,8 @@ async fn query_exported_aggregation() {
     assert_eq!(rows[1]["cnt"], 10);
 }
 
-/// Incremental export: second export only picks up new files.
+/// Incremental export: second export only picks up new files, and the
+/// checkpoint advances across calls.
 #[tokio::test]
 async fn incremental_export() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -153,8 +157,10 @@ async fn incremental_export() {
         "node-1",
         &mut checkpoint,
     )
+    .await
     .unwrap();
     assert_eq!(r1.files_exported, 1);
+    assert_eq!(checkpoint.exported_files.len(), 1);
 
     // Add more data and flush (creates a new Parquet file)
     store.append_at(2, "web", "default", LogStream::Stdout, "batch 2");
@@ -167,8 +173,14 @@ async fn incremental_export() {
         "node-1",
         &mut checkpoint,
     )
+    .await
     .unwrap();
     assert_eq!(r2.files_exported, 1);
+    assert_eq!(
+        checkpoint.exported_files.len(),
+        2,
+        "checkpoint did not advance"
+    );
 
     // Both batches queryable
     let entries = query_remote(

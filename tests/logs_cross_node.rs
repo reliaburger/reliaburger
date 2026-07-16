@@ -16,6 +16,14 @@ use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::query::fan_out_query;
 use reliaburger::ketchup::types::{LogQuery, LogStream};
 
+/// Pair each server URL with a stable node id, as the API layer does.
+fn nodes(urls: &[String]) -> Vec<(String, String)> {
+    urls.iter()
+        .enumerate()
+        .map(|(i, u)| (format!("node{}", i + 1), u.clone()))
+        .collect()
+}
+
 /// Query params matching the /v1/logs/entries endpoint.
 #[derive(Deserialize)]
 struct LogsParams {
@@ -103,29 +111,34 @@ async fn three_nodes_merge_sorted() {
 
     let client = reqwest::Client::new();
     let timeout = std::time::Duration::from_secs(5);
-    let result = fan_out_query(&query, &[url1, url2, url3], &client, timeout, None)
+    let result = fan_out_query(&query, &nodes(&[url1, url2, url3]), &client, timeout, None)
         .await
         .unwrap();
 
     // All 9 entries should be present, sorted by timestamp
-    assert_eq!(result.len(), 9);
-    for (i, entry) in result.iter().enumerate() {
+    assert!(result.failures.is_empty());
+    assert_eq!(result.entries.len(), 9);
+    for (i, entry) in result.entries.iter().enumerate() {
         assert_eq!(entry.timestamp, (i + 1) as u64);
     }
 }
 
-/// Two nodes with overlapping entries. Duplicates (same timestamp + line)
-/// should be removed.
+/// One node that reports the SAME line twice (a retransmit) collapses that
+/// duplicate — but an identical line from a DIFFERENT replica is a distinct
+/// event and survives (OBS6 / M4: dedup by (node, timestamp, line) identity).
 #[tokio::test]
-async fn deduplicates_overlapping_entries() {
+async fn per_node_duplicates_collapse_but_cross_replica_events_survive() {
     let dir1 = tempfile::tempdir().unwrap();
     let mut store1 = LogStore::new(dir1.path().to_path_buf());
     store1.append_at(1, "web", "default", LogStream::Stdout, "unique to node1");
+    // Same node reports the shared line twice — one real event, retransmitted.
+    store1.append_at(2, "web", "default", LogStream::Stdout, "shared line");
     store1.append_at(2, "web", "default", LogStream::Stdout, "shared line");
     store1.flush().await.unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     let mut store2 = LogStore::new(dir2.path().to_path_buf());
+    // A DIFFERENT replica logs an identical line at the same instant: distinct.
     store2.append_at(2, "web", "default", LogStream::Stdout, "shared line");
     store2.append_at(3, "web", "default", LogStream::Stdout, "unique to node2");
     store2.flush().await.unwrap();
@@ -145,7 +158,7 @@ async fn deduplicates_overlapping_entries() {
     let client = reqwest::Client::new();
     let result = fan_out_query(
         &query,
-        &[url1, url2],
+        &nodes(&[url1, url2]),
         &client,
         std::time::Duration::from_secs(5),
         None,
@@ -153,11 +166,15 @@ async fn deduplicates_overlapping_entries() {
     .await
     .unwrap();
 
-    // "shared line" at ts=2 should appear only once
-    assert_eq!(result.len(), 3);
-    assert_eq!(result[0].line, "unique to node1");
-    assert_eq!(result[1].line, "shared line");
-    assert_eq!(result[2].line, "unique to node2");
+    // node1's two "shared line" rows collapse to one; node2's "shared line" is
+    // a separate event. So: unique1, shared(node1), shared(node2), unique2 = 4.
+    let shared = result
+        .entries
+        .iter()
+        .filter(|e| e.line == "shared line")
+        .count();
+    assert_eq!(shared, 2, "one per replica should survive");
+    assert_eq!(result.entries.len(), 4);
 }
 
 /// Grep filter is applied per-node before merge.
@@ -191,7 +208,7 @@ async fn grep_filter_across_nodes() {
     let client = reqwest::Client::new();
     let result = fan_out_query(
         &query,
-        &[url1, url2],
+        &nodes(&[url1, url2]),
         &client,
         std::time::Duration::from_secs(5),
         None,
@@ -200,15 +217,16 @@ async fn grep_filter_across_nodes() {
     .unwrap();
 
     // Only ERROR lines from both nodes
-    assert_eq!(result.len(), 2);
-    assert!(result[0].line.contains("ERROR"));
-    assert!(result[1].line.contains("ERROR"));
-    assert_eq!(result[0].timestamp, 2);
-    assert_eq!(result[1].timestamp, 4);
+    assert_eq!(result.entries.len(), 2);
+    assert!(result.entries[0].line.contains("ERROR"));
+    assert!(result.entries[1].line.contains("ERROR"));
+    assert_eq!(result.entries[0].timestamp, 2);
+    assert_eq!(result.entries[1].timestamp, 4);
 }
 
-/// One node is unreachable. Results from the available node are
-/// still returned (graceful degradation).
+/// One node is unreachable. Results from the available node are still
+/// returned, AND the unreachable node is reported as a failure — not folded
+/// into a silent empty success (OBS6).
 #[tokio::test]
 async fn partial_results_when_node_unreachable() {
     let (s1, _d1) = store_with_entries(&[1, 2, 3], "node1").await;
@@ -226,7 +244,7 @@ async fn partial_results_when_node_unreachable() {
     let client = reqwest::Client::new();
     let result = fan_out_query(
         &query,
-        &[url1, url2],
+        &nodes(&[url1, url2]),
         &client,
         std::time::Duration::from_secs(2),
         None,
@@ -234,9 +252,11 @@ async fn partial_results_when_node_unreachable() {
     .await
     .unwrap();
 
-    // Only entries from node1 (node2 silently returns empty)
-    assert_eq!(result.len(), 3);
-    assert!(result[0].line.contains("node1"));
+    // Entries from node1, and node2 is a reported partial failure.
+    assert_eq!(result.entries.len(), 3);
+    assert!(result.entries[0].line.contains("node1"));
+    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.failures[0].node_id, "node2");
 }
 
 /// Time range filtering works across nodes.
@@ -259,7 +279,7 @@ async fn time_range_filter_across_nodes() {
     let client = reqwest::Client::new();
     let result = fan_out_query(
         &query,
-        &[url1, url2],
+        &nodes(&[url1, url2]),
         &client,
         std::time::Duration::from_secs(5),
         None,
@@ -268,8 +288,8 @@ async fn time_range_filter_across_nodes() {
     .unwrap();
 
     // node1: 200 in range. node2: 150, 250 in range.
-    assert_eq!(result.len(), 3);
-    assert_eq!(result[0].timestamp, 150);
-    assert_eq!(result[1].timestamp, 200);
-    assert_eq!(result[2].timestamp, 250);
+    assert_eq!(result.entries.len(), 3);
+    assert_eq!(result.entries[0].timestamp, 150);
+    assert_eq!(result.entries[1].timestamp, 200);
+    assert_eq!(result.entries[2].timestamp, 250);
 }

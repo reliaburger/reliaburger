@@ -29,7 +29,6 @@ use crate::brioche::types::{AppDetailData, ChartConfig, NodeDetailData, safe_env
 use crate::config::Config;
 use crate::ketchup::log_store::LogStore;
 use crate::ketchup::query::fan_out_query;
-use crate::ketchup::store::KetchupStore;
 use crate::ketchup::types::{LogEntry, LogQuery, LogQueryResult, LogQueryWarning};
 use crate::mayo::alert::AlertEvaluator;
 use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow, QueryWarning};
@@ -56,9 +55,7 @@ pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
     /// Shared metrics store (read-heavy, queries don't block the agent).
     pub mayo: Option<Arc<RwLock<MayoStore>>>,
-    /// Shared log store (flat files for follow mode).
-    pub ketchup: Option<Arc<RwLock<KetchupStore>>>,
-    /// Shared log store (Arrow/DataFusion for SQL queries).
+    /// Shared log store (Arrow/DataFusion for SQL queries + `/v1/logs/entries`).
     pub log_store: Option<Arc<RwLock<LogStore>>>,
     /// Alert evaluator.
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
@@ -220,7 +217,6 @@ pub fn router_with_upgrade(
     let state = ApiState {
         cmd_tx,
         mayo,
-        ketchup: None,
         log_store,
         alerts,
         deploy_history,
@@ -1715,13 +1711,17 @@ async fn logs_cross_node_handler(
 
         // Resolve NodeIds to HTTP URLs via membership table
         let members = membership.read().await;
-        let mut node_urls = Vec::new();
+        let mut nodes: Vec<(String, String)> = Vec::new();
         let mut warnings = Vec::new();
 
         for node_id in &node_ids {
             if let Some(info) = members.iter().find(|m| m.node_id == *node_id) {
-                node_urls.push(state.cluster_http.url(&info.address.to_string(), ""));
+                nodes.push((
+                    node_id.0.clone(),
+                    state.cluster_http.url(&info.address.to_string(), ""),
+                ));
             } else {
+                // No membership entry — can't even reach it. A partial failure.
                 warnings.push(LogQueryWarning::NodeUnresponsive {
                     node_id: node_id.0.clone(),
                 });
@@ -1729,20 +1729,28 @@ async fn logs_cross_node_handler(
         }
         drop(members);
 
-        let node_count = node_urls.len() + warnings.len();
+        let node_count = nodes.len() + warnings.len();
 
-        // Fan out to all nodes
+        // Fan out to all reachable nodes
         let timeout = std::time::Duration::from_secs(10);
         match fan_out_query(
             &log_query,
-            &node_urls,
+            &nodes,
             state.cluster_http.client(),
             timeout,
             state.service_token.as_deref(),
         )
         .await
         {
-            Ok(mut entries) => {
+            Ok(result) => {
+                let mut entries = result.entries;
+                // Each node that failed the fan-out becomes a warning, so the
+                // caller sees "some replicas were down", not a silent empty.
+                for failure in result.failures {
+                    warnings.push(LogQueryWarning::NodeUnresponsive {
+                        node_id: failure.node_id,
+                    });
+                }
                 // Apply tail after merge (fan_out already merge-sorted)
                 if let Some(tail) = query.tail
                     && entries.len() > tail
@@ -3025,8 +3033,15 @@ async fn logs_sql_handler(
     };
 
     let store = log_store.read().await;
-    match store.query_sql_json(sql).await {
+    // OBS5: bounded access — read-only, `logs`-table only, row- and
+    // memory-capped. A rejected query is a 400, not a 500.
+    match store.query_sql_json_bounded(sql).await {
         Ok(rows) => Json(rows).into_response(),
+        Err(e @ crate::ketchup::types::KetchupError::QueryRejected { .. }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

@@ -28,6 +28,50 @@ pub(crate) fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+/// Maximum rows the bounded raw-log SQL endpoint returns (OBS5).
+///
+/// The `/v1/logs/sql` endpoint wraps the caller's query in an outer `LIMIT`
+/// of this, so an unbounded `SELECT * FROM logs` can't stream the whole
+/// archive back through one response.
+pub const MAX_LOG_SQL_ROWS: usize = 10_000;
+
+/// Working-memory limit for a bounded raw-log SQL query (OBS5): 256 MiB.
+///
+/// A query that would need more than this to sort or aggregate errors rather
+/// than exhausting the agent's memory.
+pub const LOG_SQL_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Convert collected RecordBatches to JSON objects (one per row), mapping
+/// `UInt64`/`Utf8` columns to numbers/strings.
+fn batches_to_json(batches: &[RecordBatch]) -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            let mut obj = serde_json::Map::new();
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let col = batch.column(col_idx);
+                let value = if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+                    serde_json::Value::Number(arr.value(row).into())
+                } else if let Some(arr) = col
+                    .as_any()
+                    .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                {
+                    // COUNT(*) and other aggregates come back as Int64.
+                    serde_json::Value::Number(arr.value(row).into())
+                } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    serde_json::Value::String(arr.value(row).to_string())
+                } else {
+                    serde_json::Value::String(format!("{:?}", col))
+                };
+                obj.insert(field.name().clone(), value);
+            }
+            results.push(serde_json::Value::Object(obj));
+        }
+    }
+    results
+}
+
 /// Rows per Parquet row group for flushed log files.
 ///
 /// Logs are written in small row groups so that row-group statistics and
@@ -110,6 +154,22 @@ fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
                 .any(|e| e.path().extension().is_some_and(|x| x == "parquet"))
         })
         .unwrap_or(false)
+}
+
+/// Flush a shared log store, returning whether anything was written.
+///
+/// Extracted from the `bun` shutdown path (OBS7) so the "flush the shared
+/// buffer on stop" step is unit-tested here instead of living only in the
+/// binary. Returns `true` if the buffer held entries that were flushed.
+pub async fn flush_shared(
+    store: &std::sync::Arc<tokio::sync::RwLock<LogStore>>,
+) -> Result<bool, KetchupError> {
+    let mut guard = store.write().await;
+    if guard.buffer_len() == 0 {
+        return Ok(false);
+    }
+    guard.flush().await?;
+    Ok(true)
 }
 
 /// A buffered log entry waiting to be flushed.
@@ -248,13 +308,31 @@ impl LogStore {
     /// Build a DataFusion session exposing a `logs` table over the on-disk
     /// Parquet directory unioned with the unflushed buffer.
     async fn session(&self) -> Result<SessionContext, KetchupError> {
+        self.session_with_memory_limit(None).await
+    }
+
+    /// As [`session`](Self::session), optionally capping the query's working
+    /// memory. A limit makes a runaway aggregation or sort *error* instead of
+    /// exhausting the host (OBS5).
+    async fn session_with_memory_limit(
+        &self,
+        memory_limit_bytes: Option<usize>,
+    ) -> Result<SessionContext, KetchupError> {
         // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
         // batches share the canonical `log_schema` with the in-memory buffer.
         let config = SessionConfig::new().set_bool(
             "datafusion.execution.parquet.schema_force_view_types",
             false,
         );
-        let ctx = SessionContext::new_with_config(config);
+        let ctx = if let Some(limit) = memory_limit_bytes {
+            let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_limit(limit, 1.0)
+                .build_arc()
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+            SessionContext::new_with_config_rt(config, runtime)
+        } else {
+            SessionContext::new_with_config(config)
+        };
         let schema = Arc::new(log_schema());
 
         let mut all_batches = self.read_disk_batches(&ctx).await?;
@@ -321,27 +399,59 @@ impl LogStore {
             .await
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
 
-        let mut results = Vec::new();
-        for batch in &batches {
-            let schema = batch.schema();
-            for row in 0..batch.num_rows() {
-                let mut obj = serde_json::Map::new();
-                for (col_idx, field) in schema.fields().iter().enumerate() {
-                    let col = batch.column(col_idx);
-                    let value = if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
-                        serde_json::Value::Number(arr.value(row).into())
-                    } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                        serde_json::Value::String(arr.value(row).to_string())
-                    } else {
-                        serde_json::Value::String(format!("{:?}", col))
-                    };
-                    obj.insert(field.name().clone(), value);
-                }
-                results.push(serde_json::Value::Object(obj));
-            }
+        Ok(batches_to_json(&batches))
+    }
+
+    /// Query logs using SQL under safety bounds (OBS5).
+    ///
+    /// The public `/v1/logs/sql` endpoint used to hand `?q=` straight to
+    /// DataFusion with no guardrail. This method:
+    ///
+    /// - accepts only a read-only `SELECT`/`WITH` query (no `INSERT`,
+    ///   `CREATE`, `DROP`, `COPY`, …), so the endpoint can't mutate anything;
+    /// - runs against a session that registers only the `logs` table, so a
+    ///   reference to any other table fails to plan rather than reading it;
+    /// - caps the rows returned to [`MAX_LOG_SQL_ROWS`] by wrapping the query
+    ///   in an outer `LIMIT`; and
+    /// - runs under a [`LOG_SQL_MEMORY_LIMIT_BYTES`] working-memory limit, so a
+    ///   runaway aggregation errors rather than exhausting the host.
+    pub async fn query_sql_json_bounded(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<serde_json::Value>, KetchupError> {
+        let ctx = self
+            .session_with_memory_limit(Some(LOG_SQL_MEMORY_LIMIT_BYTES))
+            .await?;
+
+        // Reject non-read statements up front, before planning, so an error
+        // message names the problem clearly.
+        let trimmed = sql.trim_start();
+        let head = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if head != "SELECT" && head != "WITH" {
+            return Err(KetchupError::QueryRejected {
+                reason: "only read-only SELECT/WITH queries are allowed".to_string(),
+            });
         }
 
-        Ok(results)
+        // `logs` is the only table this session registers, so any reference to
+        // another table fails to plan below — a query can't escape the log
+        // table to read other data. Cap the result set by wrapping the query
+        // in an outer LIMIT, which bounds rows regardless of the inner query.
+        let bounded = format!("SELECT * FROM ({trimmed}) AS bounded LIMIT {MAX_LOG_SQL_ROWS}");
+        let df = ctx
+            .sql(&bounded)
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+
+        Ok(batches_to_json(&batches))
     }
 
     /// Query logs using SQL, returning structured LogEntry results.
@@ -473,6 +583,44 @@ mod tests {
         (store, dir)
     }
 
+    /// OBS7: a clean shutdown must flush whatever the buffer still holds, so
+    /// the last lines survive a restart instead of being dropped.
+    #[tokio::test]
+    async fn flush_shared_persists_the_buffer_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::RwLock::new(LogStore::new(
+            dir.path().to_path_buf(),
+        )));
+        store.write().await.append_at(
+            1,
+            "web",
+            "default",
+            LogStream::Stdout,
+            "last line before stop",
+        );
+
+        assert!(flush_shared(&store).await.unwrap(), "buffer should flush");
+        assert_eq!(store.read().await.buffer_len(), 0);
+
+        // A fresh store over the same dir sees the flushed line.
+        let reopened = LogStore::new(dir.path().to_path_buf());
+        let results = reopened
+            .query("web", "default", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line, "last line before stop");
+    }
+
+    #[tokio::test]
+    async fn flush_shared_reports_empty_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(tokio::sync::RwLock::new(LogStore::new(
+            dir.path().to_path_buf(),
+        )));
+        assert!(!flush_shared(&store).await.unwrap(), "nothing to flush");
+    }
+
     #[tokio::test]
     async fn append_and_query_without_flush() {
         let (mut store, _dir) = test_store();
@@ -485,6 +633,88 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line, "hello world");
         assert_eq!(results[0].timestamp, 1000);
+    }
+
+    // --- OBS5: bounded raw-log SQL ----------------------------------------
+
+    #[tokio::test]
+    async fn bounded_sql_runs_a_plain_select() {
+        let (mut store, _dir) = test_store();
+        store.append_at(1, "web", "default", LogStream::Stdout, "hello");
+        let rows = store
+            .query_sql_json_bounded("SELECT line FROM logs")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["line"], "hello");
+    }
+
+    #[tokio::test]
+    async fn bounded_sql_rejects_non_select() {
+        let (store, _dir) = test_store();
+        for sql in [
+            "DROP TABLE logs",
+            "INSERT INTO logs VALUES (1,'a','b','stdout','x')",
+            "CREATE TABLE evil AS SELECT * FROM logs",
+        ] {
+            let err = store.query_sql_json_bounded(sql).await.unwrap_err();
+            assert!(
+                matches!(err, KetchupError::QueryRejected { .. }),
+                "{sql} was not rejected: {err:?}"
+            );
+        }
+    }
+
+    /// A query naming any table other than `logs` must fail — whether the
+    /// bounded validator rejects it, or DataFusion refuses to plan an
+    /// unregistered table. Either way it must NOT return that table's data.
+    #[tokio::test]
+    async fn bounded_sql_rejects_other_tables() {
+        let (store, _dir) = test_store();
+        for sql in [
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM secrets",
+        ] {
+            assert!(
+                store.query_sql_json_bounded(sql).await.is_err(),
+                "{sql} was not rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_sql_runs_a_join_and_aggregate_over_logs_only() {
+        let (mut store, _dir) = test_store();
+        store.append_at(1, "web", "default", LogStream::Stdout, "a");
+        store.append_at(2, "web", "default", LogStream::Stdout, "b");
+        // A self-referential query over `logs` (a CTE) still plans and runs.
+        let rows = store
+            .query_sql_json_bounded(
+                "WITH c AS (SELECT app, COUNT(*) n FROM logs GROUP BY app) SELECT app, n FROM c",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["n"], 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_sql_caps_returned_rows() {
+        let (mut store, _dir) = test_store();
+        // More rows than the cap; an unbounded SELECT would return them all.
+        for i in 0..(MAX_LOG_SQL_ROWS as u64 + 500) {
+            store.append_at(i, "web", "default", LogStream::Stdout, "row");
+        }
+        let rows = store
+            .query_sql_json_bounded("SELECT timestamp FROM logs")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            MAX_LOG_SQL_ROWS,
+            "row cap not enforced (got {} rows)",
+            rows.len()
+        );
     }
 
     #[test]

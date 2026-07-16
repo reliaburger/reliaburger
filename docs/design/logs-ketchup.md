@@ -485,21 +485,20 @@ format = "jsonl.gz"
 interval = "1h"
 ```
 
-**Export pipeline:**
+**Export pipeline (as implemented):**
 
-1. Every `interval`, the export task identifies log files that have been modified since the last export checkpoint.
-2. For each file, it reads records from the last-exported offset to the current end of file.
-3. Each record is serialised to a JSON line (the full `LogEntry` structure) and written to a gzip-compressed output buffer.
-4. The output is uploaded to the destination. For S3/GCS, the upload uses multipart upload with 8 MB parts to handle large batches. For HTTP endpoints, the body is POST-ed as a gzip-compressed `application/x-ndjson` stream.
-5. On successful upload, the export checkpoint is advanced to the current offset.
+Logs are already stored as ZSTD-compressed Parquet (`logs_NNNNNN.parquet`). Export ships those files as-is rather than re-serialising to JSON lines, so an exported archive is queryable with the same DataFusion path as local logs.
+
+1. Every `interval`, the export task lists the local `.parquet` log files.
+2. For each file not yet recorded in the checkpoint, it reads the bytes and `put`s them to `{destination}/{node}/{filename}` through the `object_store` crate — one interface over a bare path, `file://`, `s3://` and `gs://`. Cloud credentials come from each backend's standard environment variables.
+3. On a successful upload, the file's **durable id** is recorded in the checkpoint.
 
 **Export file naming at the destination:**
 ```
-s3://my-bucket/logs/<node>/<app>/<YYYY-MM-DD>/<HH>.jsonl.gz
+s3://my-bucket/logs/<node>/logs_NNNNNN.parquet
 ```
-One file per app per node per hour, so downstream consumers can easily partition and query by time.
 
-**Export checkpoint persistence:** The last-exported offset per app per day file is stored in a small SQLite database at `/var/lib/reliaburger/logs/_export_state.db`. This survives Bun restarts and ensures exactly-once export semantics (modulo destination-side deduplication for retries after upload timeout).
+**Export checkpoint persistence:** The checkpoint is a small JSON file (`_export_checkpoint.json`) in the log data directory, holding a set of durable ids. A durable id is `{filename}@{sha256-prefix}` — the filename plus a hash of its contents — *not* the filename alone. Log-file names come from a counter that resumes past the highest file on disk, so retention pruning that empties the directory resets the counter and a later flush reuses `logs_000000.parquet` for different bytes; a filename-keyed checkpoint would skip that reused name forever. Hashing the contents makes the reused name a new object. Bun's export loop and disk-pressure task are the only writers, and `relish logs-export` shares the same checkpoint file, so there is exactly one authoritative record of what has shipped. The checkpoint survives Bun restarts.
 
 ### 5.5 Retention Management
 

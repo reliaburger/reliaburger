@@ -661,12 +661,10 @@ impl Default for MetricsSection {
 pub struct LogsSection {
     /// Days to retain log files before deletion.
     pub retention_days: u32,
-    /// Maximum size of a single log file in MB before rotation.
-    pub max_file_size_mb: u64,
-    /// Optional destination for Parquet log export. When set, log
-    /// files are periodically copied to this path. Can be a local
-    /// path (`/mnt/backup/logs/`) or an object store URL
-    /// (`s3://bucket/logs/`).
+    /// Optional destination for Parquet log export. When set, un-exported
+    /// log files are periodically shipped here via `object_store`. Can be a
+    /// local path (`/mnt/backup/logs/`), a `file://…` URL, or an object
+    /// store URL (`s3://bucket/logs/`, `gs://bucket/logs/`).
     pub export_path: Option<String>,
     /// How often to export logs (seconds). Default: 3600 (1 hour).
     pub export_interval_secs: u64,
@@ -679,7 +677,6 @@ impl Default for LogsSection {
     fn default() -> Self {
         Self {
             retention_days: 7,
-            max_file_size_mb: 100,
             export_path: None,
             export_interval_secs: 3600,
             max_storage_mb: 0,
@@ -960,7 +957,8 @@ mod tests {
     fn parse_logs_section_defaults() {
         let nc = NodeConfig::parse("").unwrap();
         assert_eq!(nc.logs.retention_days, 7);
-        assert_eq!(nc.logs.max_file_size_mb, 100);
+        assert_eq!(nc.logs.export_interval_secs, 3600);
+        assert!(nc.logs.export_path.is_none());
     }
 
     #[test]
@@ -968,11 +966,21 @@ mod tests {
         let toml_str = r#"
             [logs]
             retention_days = 14
-            max_file_size_mb = 500
+            export_path = "s3://bucket/logs"
+            export_interval_secs = 600
         "#;
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.logs.retention_days, 14);
-        assert_eq!(nc.logs.max_file_size_mb, 500);
+        assert_eq!(nc.logs.export_path.as_deref(), Some("s3://bucket/logs"));
+        assert_eq!(nc.logs.export_interval_secs, 600);
+    }
+
+    /// OBS8: the removed `logs.max_file_size_mb` field must not break existing
+    /// configs that still set it — serde ignores unknown keys here.
+    #[test]
+    fn parse_logs_section_ignores_removed_max_file_size() {
+        let nc = NodeConfig::parse("[logs]\nmax_file_size_mb = 500\n").unwrap();
+        assert_eq!(nc.logs.retention_days, 7);
     }
 
     #[test]
