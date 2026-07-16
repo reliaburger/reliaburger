@@ -219,6 +219,37 @@ impl FaultType {
 }
 
 // ---------------------------------------------------------------------------
+// FaultReversal
+// ---------------------------------------------------------------------------
+
+/// State captured when a persistent fault is applied, so clearing or expiring
+/// it can put the target back exactly as it was.
+///
+/// eBPF network faults reverse themselves through the BPF maps and process
+/// Kill has nothing to undo, so those carry `None`. Resource faults and Pause,
+/// which leave a durable change on the target instance's cgroup or process,
+/// record what to restore here. The field is runtime-only: it never crosses
+/// the wire (`#[serde(skip)]` on the rule), because a Bun restart already
+/// drops every active fault and starts clean.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum FaultReversal {
+    /// Nothing to undo (network faults, Kill, honest-rejection faults).
+    #[default]
+    None,
+    /// A CPU-stress cap: restore each instance's saved `cpu.max`.
+    CpuMax(Vec<(String, String)>),
+    /// A memory-pressure squeeze: restore each instance's saved `memory.high`.
+    MemoryHigh(Vec<(String, String)>),
+    /// A disk-I/O throttle: lift the `io.max` cap on each instance's cgroup.
+    DiskIo {
+        /// `(instance cgroup path, device major:minor)` pairs to un-throttle.
+        instances: Vec<(String, String)>,
+    },
+    /// A Pause: SIGCONT every instance that was frozen.
+    Pause(Vec<i32>),
+}
+
+// ---------------------------------------------------------------------------
 // FaultRule
 // ---------------------------------------------------------------------------
 
@@ -247,6 +278,10 @@ pub struct FaultRule {
     pub injected_by: String,
     /// Human-readable reason (from --reason flag).
     pub reason: Option<String>,
+    /// Runtime-only reversal state, captured when the fault is applied so
+    /// clear/expiry can undo a persistent effect. Never serialised.
+    #[serde(skip)]
+    pub reversal: FaultReversal,
 }
 
 impl FaultRule {
@@ -271,6 +306,7 @@ impl FaultRule {
             duration_ns,
             injected_by,
             reason: None,
+            reversal: FaultReversal::None,
         }
     }
 

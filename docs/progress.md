@@ -1140,10 +1140,30 @@ whole theme lands.
     capacity is not yet threaded through the reporting protocol (orchestrate seam) — the
     supervisor gate makes `gpu_enabled` effective in the meantime.
   - Deferred (not this theme): unsupported Apple/runtime adoption (Self-upgrade seam).
-- [ ] **Smoker effects and cleanup** — stop returning success for no-op memory, disk,
+- [x] **Smoker effects and cleanup** — stop returning success for no-op memory, disk,
   drain and node-kill faults; apply CPU stress to the target workload cgroup; make every
   persistent effect reversible on clear/expiry, including pause/resume. Acceptance measures
   each advertised effect and its removal (CHAOS1).
+  - [x] Thread instance ns/app/ordinal into `apply_fault` (`target_instance_cgroups`) so
+    resource faults target the workload's own cgroup, not a bare service name.
+  - [x] CPU stress caps the target cgroup's `cpu.max` (was: burning Bun's own CPU); the
+    saved quota is restored on clear/expiry.
+  - [x] Memory pressure lowers the target cgroup's `memory.high` toward `memory.max` (was:
+    a genuine no-op returning Ok); the saved soft limit is restored on clear/expiry. An
+    `oom` request is rejected as irreversible (use a Kill fault instead).
+  - [x] Disk-I/O throttle writes `io.max` on the target cgroup keyed by the volumes-dir
+    device; the throttle is lifted on clear/expiry.
+  - [x] Pause auto-resumes: the frozen PIDs are recorded and SIGCONT'd on clear/expiry
+    (`expire_faults` and both clear paths), so a paused workload never stays frozen.
+  - [x] Node drain / node kill return an honest rejection (a cluster-level operation, not a
+    node-local fault) instead of a fake Ok; the real effect lands with the self-healing/
+    upgrade themes that own the cluster machinery.
+  - [x] Reversal state (`FaultReversal`) rides on the registry's `FaultRule` (runtime-only,
+    `#[serde(skip)]`), captured at apply time via `record_reversal`/`get_mut`.
+  - [x] Portable tests cover cpu-quota computation, drain/kill/oom rejection, pause
+    auto-resume (real child + `waitpid`), off-Linux resource rejection and reversal
+    round-trip; Linux cgroup-effect + reversal tests are `#[ignore]` under
+    `make test-linux` (`cgroup_*`, `RELIABURGER_CGROUP_TESTS=1`).
 - [x] **Self-upgrade convergence and adoption** — wire scheduler cordon; calculate quorum
   headroom from live voters; derive roles/addresses server-side; prove gossip rejoin and
   finish Apple/rootless adoption. Make progress/book describe the implemented in-place or

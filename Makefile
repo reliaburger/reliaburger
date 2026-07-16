@@ -29,7 +29,7 @@ test-slow: ## Run required wall-clock acceptance tests
 	$(NEXTEST) --run-ignored=only -E 'binary(integration)'
 
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | test(/(runc_|netns|btrfs_|identity_dir_is_tmpfs)/)'
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(chaos)'

@@ -59,6 +59,14 @@ impl FaultRegistry {
         self.faults.iter().find(|f| f.id == id)
     }
 
+    /// Look up a fault by ID for mutation.
+    ///
+    /// The agent uses this to record a fault's [`super::types::FaultReversal`]
+    /// after applying it, so a later clear/expiry can undo the effect.
+    pub fn get_mut(&mut self, id: FaultId) -> Option<&mut FaultRule> {
+        self.faults.iter_mut().find(|f| f.id == id)
+    }
+
     /// Remove a fault by ID. Returns the removed rule if found.
     pub fn remove(&mut self, id: FaultId) -> Option<FaultRule> {
         if let Some(pos) = self.faults.iter().position(|f| f.id == id) {
@@ -371,6 +379,31 @@ mod tests {
         assert_eq!(reg.count_by_service("redis"), 2);
         assert_eq!(reg.count_by_service("api"), 1);
         assert_eq!(reg.count_by_service("web"), 0);
+    }
+
+    #[test]
+    fn get_mut_records_reversal_state() {
+        use crate::smoker::types::FaultReversal;
+
+        let mut reg = FaultRegistry::new();
+        let rule = reg.insert(&kill_request("redis"));
+        // Fresh faults carry no reversal state.
+        assert_eq!(reg.get(rule.id).unwrap().reversal, FaultReversal::None);
+
+        // The agent records reversal state after applying a fault.
+        reg.get_mut(rule.id).unwrap().reversal = FaultReversal::Pause(vec![42]);
+
+        // It survives in the registry and comes back out on clear, so the
+        // cleanup path can undo the effect.
+        let removed = reg.clear();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].reversal, FaultReversal::Pause(vec![42]));
+    }
+
+    #[test]
+    fn get_mut_missing_returns_none() {
+        let mut reg = FaultRegistry::new();
+        assert!(reg.get_mut(FaultId(99)).is_none());
     }
 
     #[test]
