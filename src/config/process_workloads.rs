@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 pub struct ProcessWorkloadsConfig {
     /// Binaries allowed to run as process workloads.
     ///
-    /// If empty, all binaries are allowed (opt-in restriction).
-    /// Paths must be absolute.
+    /// Host execution is **deny-by-default**: an empty or absent list
+    /// refuses every `exec`/`script` workload. A binary runs only when its
+    /// absolute path appears here. Container workloads (runc/apple) are
+    /// unaffected — this list gates only ProcessGrill host execution.
     pub allowed_binaries: Vec<PathBuf>,
 
     /// Enable mount namespace isolation for process workloads (Linux only).
@@ -44,12 +46,13 @@ impl Default for ProcessWorkloadsConfig {
 }
 
 impl ProcessWorkloadsConfig {
-    /// Check whether a binary is allowed by the allowlist.
+    /// Check whether a binary is allowed to run as a host process workload.
     ///
-    /// Returns `true` if the allowlist is empty (all allowed) or
-    /// if the binary path is in the list.
+    /// Deny-by-default: an empty allowlist refuses everything, and a
+    /// non-empty one admits only an exact path match. Nothing runs on the
+    /// host that an operator didn't name in `node.toml`.
     pub fn is_binary_allowed(&self, binary: &std::path::Path) -> bool {
-        self.allowed_binaries.is_empty() || self.allowed_binaries.iter().any(|b| b == binary)
+        self.allowed_binaries.iter().any(|b| b == binary)
     }
 }
 
@@ -58,11 +61,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_allows_all_binaries() {
+    fn default_denies_all_host_binaries() {
+        // Deny-by-default: with no allowlist configured, no host binary may
+        // run as a process workload. This is the security posture the design
+        // doc promised but the code used to invert.
         let config = ProcessWorkloadsConfig::default();
         assert!(config.allowed_binaries.is_empty());
-        assert!(config.is_binary_allowed(std::path::Path::new("/usr/bin/python3")));
-        assert!(config.is_binary_allowed(std::path::Path::new("/any/path")));
+        assert!(!config.is_binary_allowed(std::path::Path::new("/usr/bin/python3")));
+        assert!(!config.is_binary_allowed(std::path::Path::new("/any/path")));
     }
 
     #[test]

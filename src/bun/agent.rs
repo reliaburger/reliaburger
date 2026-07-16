@@ -1384,6 +1384,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.capacity_memory_mb = memory_mb;
     }
 
+    /// Thread the parsed `[process_workloads]` policy into the supervisor
+    /// (D17/H8). Without this the supervisor keeps its deny-by-default
+    /// constructor policy, so an operator's allowlist would be ignored.
+    pub fn set_process_config(
+        &mut self,
+        config: crate::config::process_workloads::ProcessWorkloadsConfig,
+    ) {
+        self.supervisor.set_process_config(config);
+    }
+
+    /// Record detected platform capabilities (GPUs, rootless mode) so the
+    /// supervisor refuses workloads this node can't honour (D15/M22).
+    pub fn set_platform_capabilities(
+        &mut self,
+        capabilities: crate::bun::supervisor::PlatformCapabilities,
+    ) {
+        self.supervisor.set_capabilities(capabilities);
+    }
+
     /// Set the base directory for managed volumes (`[storage] volumes`).
     /// The constructors default it; the binary overrides from config.
     pub fn set_volumes_dir(&mut self, dir: std::path::PathBuf) {

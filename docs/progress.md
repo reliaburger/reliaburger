@@ -16,7 +16,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Cargo workspace setup (binary `bun`, library `reliaburger`, test fixtures)
 - [x] TOML config parsing (App, Job, Secret, ConfigFile, Volume, Permission, Namespace)
 - [x] Grill container runtime interface (containerd/runc, OCI extraction, ports, cgroups)
-- [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection) — **restart re-drive broken for apps on all runtimes (`H1`); GPU detector is a stub (StubGpuDetector)**
+- [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection) — **restart re-drive broken for apps on all runtimes (`H1`); ~~GPU detector is a stub~~ (12b.6: real `NvidiaGpuDetector`; `gpu_enabled` now effective, GPU-request refused when unbacked)**
 - [x] Relish CLI skeleton (`apply`, `status`, `logs`, `exec`, `inspect`)
 - [x] ProcessGrill (cross-platform process-based runtime)
 - [x] RuncGrill (Linux-only, calls runc CLI)
@@ -34,7 +34,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill) — **`H13` runc/apple return `None`; successful jobs there get retried then Failed**
 - [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container, volumes, multi-app, full-featured)
 - [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts) — **`C1` CRITICAL: whiteout path traversal deletes host files outside rootfs**
-- [x] Rootless runc (user namespaces, UID/GID mapping, rootless cgroups v2, no-sudo containers) — **`M22` resource limits silently dropped (no systemd-run); slirp4netns unwired → empty netns, no connectivity**
+- [x] Rootless runc (user namespaces, UID/GID mapping, rootless cgroups v2, no-sudo containers) — **`M22` resource limits ~~silently dropped~~ (12b.6: a rootless node now *refuses* a limit-requiring workload rather than dropping the limit); slirp4netns still unwired → empty netns, no connectivity (deferred to the runc-create seam)**
 - [x] Streaming apply progress via SSE (real-time deploy feedback instead of blocking response)
 - [x] HostPath-style volumes (dual-mode: explicit source for hostPath, managed for auto-provisioned storage) — ~~`M21` managed mode half-wired~~ **fixed in Phase 12 E0**: the agent creates managed volume dirs (and loop mounts) before the OCI spec's bind mounts reference them; `[storage] volumes` config wired; volumes never deleted on Stop (reconciler rebalances would destroy data)
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
@@ -1111,11 +1111,35 @@ whole theme lands.
 
 ### 12b.6 — Platform, upgrades and documentation
 
-- [ ] **Process workloads and platform capabilities** — pass [process_workloads] into the
+- [x] **Process workloads and platform capabilities** — pass [process_workloads] into the
   supervisor; default-deny host exec/script; enforce executable allowlists and mount
   isolation before runtime creation. Implement or explicitly reject rootless networking/
   resource limits, GPU detection/device isolation and unsupported Apple/runtime adoption;
   make gpu_enabled effective (H8/D15/D17, old M22/M23).
+  - [x] D17/H8: `[process_workloads]` now reaches the supervisor. `bun.rs` calls
+    `agent.set_process_config(...)` → `WorkloadSupervisor::set_process_config`, so the
+    operator's allowlist governs host execution instead of the ignored constructor default.
+  - [x] Default-DENY host exec/script: `ProcessWorkloadsConfig::is_binary_allowed` no longer
+    treats an empty allowlist as all-allowed — an empty/absent list refuses every host
+    binary. A `script` is host execution of `/bin/sh`, so the interpreter must be allowlisted
+    too. Enforced in `WorkloadSupervisor::admit_process_workload` for both `deploy_app` and
+    `deploy_job`, before anything is allocated; container (runc/apple) workloads are
+    unaffected. Mount isolation is checked at admission: config asking for it on a non-Linux
+    node is refused rather than run unprotected.
+  - [x] D15 GPU: real `NvidiaGpuDetector` (probes `/dev/nvidia0`, parses `nvidia-smi
+    --query-gpu`, falls back cleanly to none, OS-guarded). `gpu_enabled` made effective —
+    the supervisor **rejects** a GPU-requesting workload when `gpu_enabled = false` or the
+    detector found no device, instead of silently scheduling onto a node reporting zero GPUs.
+    (OCI `/dev/nvidia*` device passthrough deferred; placement is now honest.)
+  - [x] M22 rootless: **reject** path chosen (runc.rs is out of this seam). A rootless node
+    refuses a workload declaring cpu/memory limits (rather than silently dropping them via
+    `make_rootless`'s `resources = None`), with a clear error naming the fix. slirp4netns
+    wiring remains deferred to the runc-create seam.
+  - [x] Reserved resources: `reserved_cpu`/`reserved_memory` were already wired
+    (`bun.rs::node_capacity` → `set_node_capacity`); confirmed, nothing dead to remove. GPU
+    capacity is not yet threaded through the reporting protocol (orchestrate seam) — the
+    supervisor gate makes `gpu_enabled` effective in the meantime.
+  - Deferred (not this theme): unsupported Apple/runtime adoption (Self-upgrade seam).
 - [ ] **Smoker effects and cleanup** — stop returning success for no-op memory, disk,
   drain and node-kill faults; apply CPU stress to the target workload cgroup; make every
   persistent effect reversible on clear/expiry, including pause/resume. Acceptance measures

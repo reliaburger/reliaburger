@@ -195,6 +195,63 @@ noisy. Once the measurements settle on comparable hardware, a threshold will mea
 something. Until then it would be another confident number with weak evidence. We've had
 enough of those.
 
+## A test that proves the door is locked
+
+Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
+process, not just a container. You tell it a binary path and it runs it. Obviously you don't
+want any config you deploy to be able to run *any* binary on the node, so there's an
+allowlist in `node.toml`: `[process_workloads] allowed_binaries`. Only those run.
+
+The allowlist worked. The tests passed. And yet an empty allowlist allowed everything.
+
+The check was `self.allowed_binaries.is_empty() || self.allowed_binaries.contains(binary)`.
+Read it as English: "allowed if the list is empty, or if the binary is in it." The empty-list
+case was meant as a convenience default, but it inverts the security posture. A fresh node
+with no `[process_workloads]` section would happily run whatever host binary a deploy named.
+The supervisor never even received the parsed config, so *every* production node ran the
+permissive default. The design doc had promised "deny-by-default" on page one. The code did
+the opposite, and the tests agreed with the code.
+
+The fix is one line of logic and a change of mind. Deny by default:
+
+```rust
+pub fn is_binary_allowed(&self, binary: &std::path::Path) -> bool {
+    self.allowed_binaries.iter().any(|b| b == binary)
+}
+```
+
+An empty list now matches nothing. A binary runs only if an operator named it. The same rule
+extends to inline scripts, because a script is just host execution of `/bin/sh` -- so the
+shell has to be allowlisted too, or the script is refused like any un-listed binary.
+
+The interesting part is the test. It isn't enough to assert that an allowlisted binary runs;
+that was already true. The test that earns its keep asserts the *refusal*, and asserts that
+the policy came from config rather than a built-in default:
+
+```rust
+#[tokio::test]
+async fn host_exec_not_allowlisted_is_refused() {
+    let mut sup = test_supervisor();               // no allowlist configured
+    let spec = exec_app_spec("/usr/bin/python3");
+    let err = sup.deploy_app("job", "default", &spec, Instant::now())
+        .await.unwrap_err();
+    assert!(matches!(err, BunError::DeployFailed { .. }));
+    assert_eq!(sup.list_instances().len(), 0, "nothing must be created");
+}
+```
+
+Two assertions, two promises: the deploy is refused, and nothing was created as a side effect
+before the refusal. A companion test allowlists the same binary and asserts it runs, so we
+know the gate opens as well as closes. This is the shape of every good security test in the
+suite. Don't just prove the happy path works. Prove the door is locked when it should be, and
+prove it's the operator's key that opens it.
+
+The same admission gate refuses two other silent lies while we're here: a workload asking for
+a GPU on a node that has none (or has `gpu_enabled = false`), and a workload asking for
+cpu/memory limits on a rootless node that can't enforce them. In each case the old behaviour
+was to accept the work and quietly deliver less than asked. The new behaviour is a clear
+error. A refusal you can see beats a guarantee you can't.
+
 ## Coverage is a map, not a target
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.

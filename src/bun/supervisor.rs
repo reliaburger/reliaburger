@@ -65,6 +65,26 @@ pub struct WorkloadInstance {
     pub identity_mount: Option<std::path::PathBuf>,
 }
 
+/// What the runtime on this node can actually enforce.
+///
+/// The supervisor refuses a workload up front when the node can't honour
+/// what it asks for, rather than starting it under weaker isolation than
+/// requested (the D15/M22 "silent lie" the review flagged).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlatformCapabilities {
+    /// GPUs the detector found on this node. A workload requesting a GPU on
+    /// a zero-GPU node is refused.
+    pub gpu_count: u32,
+    /// Whether `[resources] gpu_enabled` is set. When false, any
+    /// GPU-requesting workload is refused regardless of detected hardware.
+    pub gpu_enabled: bool,
+    /// Whether this node runs rootless (non-root uid). Rootless runc can't
+    /// set cgroup resource limits without a systemd user scope we don't
+    /// wire, so a limit-requiring workload is refused rather than run
+    /// silently unlimited.
+    pub rootless: bool,
+}
+
 /// Manages all workload instances on this node.
 ///
 /// Generic over `G: Grill` so tests can inject a mock runtime without
@@ -81,21 +101,24 @@ pub struct WorkloadSupervisor<G: Grill> {
     /// Process workload manager — validates exec binaries against the
     /// allowlist and manages script temp file lifecycle.
     process_manager: crate::grill::process_workload::ProcessManager,
+    /// What this node can actually enforce (GPU, rootless limits).
+    capabilities: PlatformCapabilities,
 }
 
 impl<G: Grill> WorkloadSupervisor<G> {
     /// Create a new supervisor with the given runtime and port allocator.
+    ///
+    /// Uses the default (deny-by-default) process-workloads policy and no
+    /// special platform capabilities. The binary calls
+    /// [`with_process_config`](Self::with_process_config) to feed the parsed
+    /// `[process_workloads]` config and [`set_capabilities`](Self::set_capabilities)
+    /// to record detected GPUs and rootless mode.
     pub fn new(grill: G, port_allocator: PortAllocator) -> Self {
-        Self {
+        Self::with_process_config(
             grill,
             port_allocator,
-            instances: HashMap::new(),
-            health_checker: HealthChecker::new(),
-            app_instances: HashMap::new(),
-            process_manager: crate::grill::process_workload::ProcessManager::new(
-                crate::config::process_workloads::ProcessWorkloadsConfig::default(),
-            ),
-        }
+            crate::config::process_workloads::ProcessWorkloadsConfig::default(),
+        )
     }
 
     /// Create a supervisor with a custom process workloads config.
@@ -111,7 +134,124 @@ impl<G: Grill> WorkloadSupervisor<G> {
             health_checker: HealthChecker::new(),
             app_instances: HashMap::new(),
             process_manager: crate::grill::process_workload::ProcessManager::new(process_config),
+            capabilities: PlatformCapabilities::default(),
         }
+    }
+
+    /// Record what this node can enforce (detected GPUs, rootless mode).
+    ///
+    /// The binary calls this at startup after GPU detection so the
+    /// supervisor can refuse workloads the node can't honour.
+    pub fn set_capabilities(&mut self, capabilities: PlatformCapabilities) {
+        self.capabilities = capabilities;
+    }
+
+    /// Replace the process-workloads policy (host-exec/script allowlist,
+    /// mount isolation, script dir). The binary feeds the parsed
+    /// `[process_workloads]` config here so the deny-by-default allowlist
+    /// comes from `node.toml`, not the constructor default.
+    pub fn set_process_config(
+        &mut self,
+        config: crate::config::process_workloads::ProcessWorkloadsConfig,
+    ) {
+        self.process_manager = crate::grill::process_workload::ProcessManager::new(config);
+    }
+
+    /// Full admission check for an app: host-exec/script allowlist, GPU
+    /// availability and rootless resource limits. Returns the first refusal.
+    fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
+        self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
+        self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
+        self.admit_rootless_limits(app_name, spec.memory.is_some() || spec.cpu.is_some())?;
+        Ok(())
+    }
+
+    /// Refuse an un-allowlisted host binary or script (D17/H8). Also enforces
+    /// mount isolation for scripts: when the config asks for it but the node
+    /// can't provide it, we don't silently write the temp file unprotected.
+    fn admit_process_workload(
+        &self,
+        app_name: &str,
+        exec: Option<&std::path::Path>,
+        script: Option<&str>,
+    ) -> Result<(), BunError> {
+        let reject =
+            |e: crate::grill::process_workload::ProcessWorkloadError| BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!("process workload rejected: {e}"),
+            };
+
+        if let Some(exec_path) = exec {
+            self.process_manager
+                .prepare_exec(exec_path)
+                .map_err(reject)?;
+        }
+        if script.is_some() && !self.process_manager.is_script_allowed() {
+            return Err(reject(
+                crate::grill::process_workload::ProcessWorkloadError::BinaryNotAllowed {
+                    path: std::path::PathBuf::from(
+                        crate::grill::process_workload::SCRIPT_INTERPRETER,
+                    ),
+                },
+            ));
+        }
+        // Mount isolation is a Linux-only guarantee. If an operator turned it
+        // on but the node isn't Linux, refuse rather than run a host process
+        // that can see every workload's volumes.
+        let is_host_workload = exec.is_some() || script.is_some();
+        if is_host_workload
+            && self.process_manager.config().mount_isolation
+            && !cfg!(target_os = "linux")
+        {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: "process workload requires mount isolation but this node is not Linux"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a GPU-requesting workload the node can't back (D15): either
+    /// `gpu_enabled = false` or the detector found no GPU. Makes
+    /// `gpu_enabled` effective instead of a silent lie.
+    fn admit_gpu(&self, app_name: &str, requested: u32) -> Result<(), BunError> {
+        if requested == 0 {
+            return Ok(());
+        }
+        if !self.capabilities.gpu_enabled {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: "workload requests a GPU but GPU support is disabled on this node \
+                         ([resources] gpu_enabled = false)"
+                    .to_string(),
+            });
+        }
+        if self.capabilities.gpu_count < requested {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: format!(
+                    "workload requests {requested} gpu(s) but this node has {} available",
+                    self.capabilities.gpu_count
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a limit-requiring workload on a rootless node (M22): rootless
+    /// runc can't set cgroup CPU/memory limits without a systemd user scope
+    /// we don't wire, so the limit would be silently dropped. Fail loudly.
+    fn admit_rootless_limits(&self, app_name: &str, has_limits: bool) -> Result<(), BunError> {
+        if self.capabilities.rootless && has_limits {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: "workload declares cpu/memory limits but this node is rootless and \
+                         cannot enforce cgroup limits; run bun as root or drop the limits"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Register an instance's health check with the health checker.
@@ -134,15 +274,10 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &AppSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
-        // Validate process workloads against the binary allowlist
-        if let Some(ref exec_path) = spec.exec {
-            self.process_manager
-                .prepare_exec(exec_path)
-                .map_err(|e| BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!("process workload rejected: {e}"),
-                })?;
-        }
+        // Refuse anything this node can't honour before we allocate a thing:
+        // an un-allowlisted host binary/script, a GPU we don't have, or a
+        // resource limit rootless can't enforce.
+        self.admit_app(app_name, spec)?;
 
         let replica_count = match spec.replicas {
             Replicas::Fixed(n) => n,
@@ -219,15 +354,10 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &JobSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
-        // Validate process workloads against the binary allowlist
-        if let Some(ref exec_path) = spec.exec {
-            self.process_manager
-                .prepare_exec(exec_path)
-                .map_err(|e| BunError::DeployFailed {
-                    app_name: job_name.to_string(),
-                    reason: format!("process workload rejected: {e}"),
-                })?;
-        }
+        // Same admission gate as apps (jobs have no GPU field, so only the
+        // host-exec/script allowlist and rootless-limit checks apply).
+        self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
+        self.admit_rootless_limits(job_name, spec.memory.is_some() || spec.cpu.is_some())?;
 
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
 
@@ -471,6 +601,23 @@ mod tests {
         let grill = MockGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
         WorkloadSupervisor::new(grill, port_allocator)
+    }
+
+    /// A supervisor whose process policy allowlists the given host binaries.
+    fn supervisor_with_allowlist(
+        binaries: Vec<std::path::PathBuf>,
+    ) -> WorkloadSupervisor<MockGrill> {
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        WorkloadSupervisor::with_process_config(
+            grill,
+            port_allocator,
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: binaries,
+                mount_isolation: false,
+                script_dir: std::env::temp_dir().join("reliaburger-sup-test-scripts"),
+            },
+        )
     }
 
     fn basic_app_spec(port: Option<u16>) -> AppSpec {
@@ -936,5 +1083,192 @@ mod tests {
 
         let instance = sup.get_instance(&ids[0]).unwrap();
         assert_eq!(instance.restart_policy.max_restarts, Some(3));
+    }
+
+    // -- process-workload admission (D17/H8) ---------------------------------
+
+    fn exec_app_spec(binary: &str) -> AppSpec {
+        let mut spec = basic_app_spec(None);
+        spec.image = None;
+        spec.exec = Some(std::path::PathBuf::from(binary));
+        spec
+    }
+
+    #[tokio::test]
+    async fn host_exec_not_allowlisted_is_refused() {
+        // Deny-by-default: with no allowlist configured, a host binary deploy
+        // is refused rather than run.
+        let mut sup = test_supervisor();
+        let spec = exec_app_spec("/usr/bin/python3");
+        let err = sup
+            .deploy_app("script-job", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+        assert_eq!(sup.list_instances().len(), 0, "nothing must be created");
+    }
+
+    #[tokio::test]
+    async fn allowlisted_host_exec_runs() {
+        // Policy from config, not a default: the same binary the previous
+        // test refused now deploys because it is allowlisted.
+        let mut sup = supervisor_with_allowlist(vec![std::path::PathBuf::from("/usr/bin/python3")]);
+        let spec = exec_app_spec("/usr/bin/python3");
+        let ids = sup
+            .deploy_app("runner", "default", &spec, Instant::now())
+            .await
+            .expect("allowlisted exec should deploy");
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_script_refused_without_interpreter_allowlisted() {
+        // A `script` workload is host execution of /bin/sh, so deny-by-default
+        // applies to it too — this used to slip past the exec-only check.
+        let mut sup = test_supervisor();
+        let mut spec = basic_app_spec(None);
+        spec.image = None;
+        spec.script = Some("echo hello".to_string());
+        let err = sup
+            .deploy_app("scripty", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn host_script_runs_when_interpreter_allowlisted() {
+        let mut sup = supervisor_with_allowlist(vec![std::path::PathBuf::from(
+            crate::grill::process_workload::SCRIPT_INTERPRETER,
+        )]);
+        let mut spec = basic_app_spec(None);
+        spec.image = None;
+        spec.script = Some("echo hello".to_string());
+        let ids = sup
+            .deploy_app("scripty", "default", &spec, Instant::now())
+            .await
+            .expect("allowlisted interpreter should let a script deploy");
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn container_workload_ignores_exec_allowlist() {
+        // A normal container app (image, no exec/script) is unaffected by the
+        // host-exec allowlist even when it's empty.
+        let mut sup = test_supervisor();
+        let spec = basic_app_spec(None); // has an image, no exec/script
+        let ids = sup
+            .deploy_app("web", "default", &spec, Instant::now())
+            .await
+            .expect("container workloads must not be gated by the host allowlist");
+        assert_eq!(ids.len(), 1);
+    }
+
+    // -- GPU admission (D15) --------------------------------------------------
+
+    #[tokio::test]
+    async fn gpu_workload_refused_on_node_without_gpu() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            gpu_count: 0,
+            gpu_enabled: true,
+            rootless: false,
+        });
+        let mut spec = basic_app_spec(None);
+        spec.gpu = Some(1);
+        let err = sup
+            .deploy_app("trainer", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn gpu_workload_refused_when_gpu_disabled() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            gpu_count: 4, // hardware present but disabled by config
+            gpu_enabled: false,
+            rootless: false,
+        });
+        let mut spec = basic_app_spec(None);
+        spec.gpu = Some(1);
+        let err = sup
+            .deploy_app("trainer", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn gpu_workload_runs_when_gpu_available() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            gpu_count: 2,
+            gpu_enabled: true,
+            rootless: false,
+        });
+        let mut spec = basic_app_spec(None);
+        spec.gpu = Some(1);
+        let ids = sup
+            .deploy_app("trainer", "default", &spec, Instant::now())
+            .await
+            .expect("a GPU workload should run where a device exists");
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_gpu_workload_unaffected_by_gpu_capability() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            gpu_count: 0,
+            gpu_enabled: false,
+            rootless: false,
+        });
+        let spec = basic_app_spec(None); // no gpu request
+        let ids = sup
+            .deploy_app("web", "default", &spec, Instant::now())
+            .await
+            .expect("a workload requesting no GPU must not be refused");
+        assert_eq!(ids.len(), 1);
+    }
+
+    // -- rootless resource limits (M22) --------------------------------------
+
+    #[tokio::test]
+    async fn rootless_node_refuses_limit_requiring_workload() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            gpu_count: 0,
+            gpu_enabled: false,
+            rootless: true,
+        });
+        let mut spec = basic_app_spec(None);
+        spec.memory =
+            Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").expect("valid range"));
+        let err = sup
+            .deploy_app("limited", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BunError::DeployFailed { .. }),
+            "rootless nodes must refuse cgroup-limit workloads, not silently drop the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn rootless_node_runs_unlimited_workload() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            gpu_count: 0,
+            gpu_enabled: false,
+            rootless: true,
+        });
+        let spec = basic_app_spec(None); // no cpu/memory limits
+        let ids = sup
+            .deploy_app("free", "default", &spec, Instant::now())
+            .await
+            .expect("a workload with no limits is fine on a rootless node");
+        assert_eq!(ids.len(), 1);
     }
 }

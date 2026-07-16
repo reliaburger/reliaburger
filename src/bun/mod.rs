@@ -18,7 +18,7 @@ pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
 
-pub use gpu::{GpuDetector, GpuInfo, StubGpuDetector};
+pub use gpu::{GpuDetector, GpuInfo, NvidiaGpuDetector, StubGpuDetector};
 pub use health::{HealthCheckConfig, HealthChecker, HealthCounters, HealthStatus, evaluate_result};
 pub use restart::RestartPolicy;
 pub use supervisor::{WorkloadInstance, WorkloadSupervisor};
