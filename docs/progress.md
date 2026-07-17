@@ -1224,12 +1224,34 @@ whole theme lands.
   progress annotations reconciled (DNS responder spawned, WebSocket proxy wired, Grill
   runtime). The headline test count already reads as a suite taxonomy (#106). X6 stays
   in Phase 13 (D6/D14-D15/D18/D20-D22).
-- [ ] **Phase 12b acceptance gate** — cargo fmt; clippy with warnings denied; complete
-  default suite; 8+ node/leader-failover and council-recovery tests; Linux eBPF/runc/Btrfs/
-  rootless/Buildah suites; macOS Apple runtime suite; real mTLS/auth matrix; registry
-  push-GC-peer-pull; GitOps partial failure; Smoker effect/clear; upgrade failed-voter/
-  rejoin/adoption tests. Record exact counts and platform skips in README, docs/README and
-  the relevant book chapters.
+- [x] **Phase 12b acceptance gate** — ran the full matrix on the merged programme
+  (main at #118). Results:
+  - [x] Sandbox suites (macOS host): `cargo fmt --check` clean; `cargo clippy
+    --all-targets -- -D warnings` clean (full `--all-features` clippy is Linux-only —
+    `aya`; it runs in CI); portable default suite **2628 passed / 39 skipped**;
+    `--no-default-features` **2609 passed**; doctests (no rustdoc examples); in-process
+    cluster (`RELIABURGER_CLUSTER_TESTS=1`: `cluster_failover`, `cluster_gossip`,
+    `council_self_healing`, `council_disaster_recovery`, `placement`, `chaos`) **20 passed**
+    — 8+ node leader-failover and council recovery; in-process upgrade
+    (`RELIABURGER_UPGRADE_TESTS=1`: `self_upgrade`, `self_upgrade_cluster`) **8 passed**
+    — failed-voter/gossip-rejoin/adoption; wall-clock acceptance (`make test-slow`)
+    **4 passed / 29 skipped**. The mTLS/auth, registry push-GC-peer-pull, GitOps
+    partial-failure and Smoker effect/clear checks run inside the portable + cluster
+    suites above.
+  - [x] Full CI on the merge commit: **all 11 test jobs green** — coverage floor
+    (`--fail-under-lines 78.65`) held, 10k-member scale, fast/large benchmarks,
+    multi-node cluster, single-node + cluster upgrade, wall-clock, portable Linux/macOS,
+    privileged Linux.
+  - [x] Linux platform gate: CI's **privileged Linux** job *is* `sudo -E … make test-linux`
+    (eBPF/runc/netns/Btrfs/Buildah/cgroups) — **green** on the merge commit. (A local Lima
+    run was redundant and only tripped a guest `~/.cargo` permission quirk, not code.)
+  - [x] Apple platform gate: `make test-apple` **2/2 passed on real Apple silicon**
+    (`apple_container_grill_creates_instance`, `adopt_re_tracks_a_running_apple_container`),
+    run twice back-to-back (idempotent). The gate caught the inspect-schema bug fixed in
+    #118 — a green unit test had hidden it.
+  - Gate findings fixed before close: DnsNxdomain userspace no-op (#117) and Apple
+    inspect-schema adoption failure (#118). This closes the entire Phase 12b review
+    programme (12b.1–12b.6).
 
 ## Phase 13: Relish TUI
 
