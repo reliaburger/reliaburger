@@ -893,9 +893,13 @@ async fn dns_responder_resolves_internal_name() {
         ..reliaburger::onion::dns::DnsConfig::default()
     };
 
+    let (_fault_tx, fault_rx) =
+        tokio::sync::watch::channel(reliaburger::onion::dns::DnsFaultState::default());
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        let _ = reliaburger::onion::dns::run_dns_responder(config, map_rx, shutdown_clone).await;
+        let _ =
+            reliaburger::onion::dns::run_dns_responder(config, map_rx, fault_rx, shutdown_clone)
+                .await;
     });
 
     // Give the responder a moment to bind
@@ -944,9 +948,13 @@ async fn dns_responder_non_internal_times_out() {
         ..reliaburger::onion::dns::DnsConfig::default()
     };
 
+    let (_fault_tx, fault_rx) =
+        tokio::sync::watch::channel(reliaburger::onion::dns::DnsFaultState::default());
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
-        let _ = reliaburger::onion::dns::run_dns_responder(config, map_rx, shutdown_clone).await;
+        let _ =
+            reliaburger::onion::dns::run_dns_responder(config, map_rx, fault_rx, shutdown_clone)
+                .await;
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;

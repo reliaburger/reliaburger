@@ -843,12 +843,17 @@ async fn main() -> anyhow::Result<()> {
     if config.dns.enabled {
         let dns_config = config.dns.to_dns_config()?;
         let service_map_rx = agent.service_map_watch();
+        let dns_faults_rx = agent.dns_faults_watch();
         let dns_shutdown = shutdown.clone();
         println!("bun: dns responder on {}", dns_config.listen_addr);
         tokio::spawn(async move {
-            if let Err(e) =
-                reliaburger::onion::dns::run_dns_responder(dns_config, service_map_rx, dns_shutdown)
-                    .await
+            if let Err(e) = reliaburger::onion::dns::run_dns_responder(
+                dns_config,
+                service_map_rx,
+                dns_faults_rx,
+                dns_shutdown,
+            )
+            .await
             {
                 eprintln!("bun: dns responder failed to bind: {e}");
             }

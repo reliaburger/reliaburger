@@ -13,6 +13,7 @@
 /// interception, which turned out to be infeasible: the cgroup
 /// sendmsg4/recvmsg4 hooks can modify socket addresses but can't
 /// read or synthesise DNS packet payloads.
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,50 @@ use tokio_util::sync::CancellationToken;
 use super::service_id::ServiceId;
 use super::service_map::ServiceMap;
 use super::vip::VirtualIP;
+
+/// Which services the Smoker is currently forcing NXDOMAIN for.
+///
+/// This is the userspace equivalent of the retired in-kernel DNS fault
+/// map. The Smoker's `DnsNxdomain` fault used to write a `fault_dns_map`
+/// entry into an eBPF object that was never loaded, so the fault did
+/// nothing. DNS resolution lives entirely in this responder now, so the
+/// fault lives here too: the agent publishes the set of faulted service
+/// names (with their expiry) on a `watch` channel, and [`answer_internal`]
+/// returns NXDOMAIN for any name that matches while the fault is live.
+///
+/// A fault targets a service by its bare app name (`redis`), the same way
+/// the Smoker keys every other fault, so a name is faulted in every
+/// namespace it appears in. Expiry is belt-and-braces: the agent removes
+/// a fault from the published set when it clears or expires, and the
+/// resolver also ignores any entry whose deadline has already passed, so
+/// a fault can never outlive its window even if a publish is missed.
+#[derive(Debug, Clone, Default)]
+pub struct DnsFaultState {
+    /// App name → expiry (`CLOCK_MONOTONIC` nanoseconds, matching the
+    /// Smoker registry's `expires_at_ns`). `0` means "no expiry".
+    faulted: BTreeMap<String, u64>,
+}
+
+impl DnsFaultState {
+    /// Build a fault state from `(app name, expiry_ns)` pairs.
+    pub fn from_faults(faults: impl IntoIterator<Item = (String, u64)>) -> Self {
+        Self {
+            faulted: faults.into_iter().collect(),
+        }
+    }
+
+    /// Whether `app` should be forced to NXDOMAIN right now.
+    ///
+    /// `now_ns` is the current `CLOCK_MONOTONIC` reading. A fault with a
+    /// non-zero expiry that has already passed is treated as gone even if
+    /// it's still in the map, so a stale publish can't keep a name dark.
+    pub fn is_faulted(&self, app: &str, now_ns: u64) -> bool {
+        match self.faulted.get(app) {
+            Some(&expires_ns) => expires_ns == 0 || now_ns < expires_ns,
+            None => false,
+        }
+    }
+}
 
 /// Practical EDNS0 UDP payload limit (RFC 6891 recommendation).
 const MAX_PACKET: usize = 1232;
@@ -137,6 +182,7 @@ impl SourceAcl {
 pub async fn run_dns_responder(
     config: DnsConfig,
     service_map: watch::Receiver<ServiceMap>,
+    dns_faults: watch::Receiver<DnsFaultState>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     // Bind UDP *and* TCP up front. Both must bind or the responder is only
@@ -150,11 +196,12 @@ pub async fn run_dns_responder(
     let tcp_task = {
         let config = Arc::clone(&config);
         let service_map = service_map.clone();
+        let dns_faults = dns_faults.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move { serve_tcp(config, tcp, service_map, shutdown).await })
+        tokio::spawn(async move { serve_tcp(config, tcp, service_map, dns_faults, shutdown).await })
     };
 
-    serve(config, udp, service_map, shutdown).await;
+    serve(config, udp, service_map, dns_faults, shutdown).await;
     tcp_task.abort();
     Ok(())
 }
@@ -176,6 +223,7 @@ pub async fn serve(
     config: Arc<DnsConfig>,
     socket: Arc<UdpSocket>,
     service_map: watch::Receiver<ServiceMap>,
+    dns_faults: watch::Receiver<DnsFaultState>,
     shutdown: CancellationToken,
 ) {
     let forwards = Arc::new(Semaphore::new(MAX_INFLIGHT_FORWARDS));
@@ -204,8 +252,15 @@ pub async fn serve(
                 };
 
                 if let Some(stripped) = name.strip_suffix(".internal") {
-                    let response =
-                        answer_internal(&config, &service_map, &query, stripped, qtype, src.ip());
+                    let response = answer_internal(
+                        &config,
+                        &service_map,
+                        &dns_faults,
+                        &query,
+                        stripped,
+                        qtype,
+                        src.ip(),
+                    );
                     let _ = socket.send_to(&response, src).await;
                     continue;
                 }
@@ -243,6 +298,7 @@ async fn serve_tcp(
     config: Arc<DnsConfig>,
     listener: TcpListener,
     service_map: watch::Receiver<ServiceMap>,
+    dns_faults: watch::Receiver<DnsFaultState>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -252,6 +308,7 @@ async fn serve_tcp(
                 let Ok((mut stream, peer)) = accepted else { continue };
                 let config = Arc::clone(&config);
                 let service_map = service_map.clone();
+                let dns_faults = dns_faults.clone();
                 tokio::spawn(async move {
                     // One query-response per accepted connection is enough for
                     // the resolver retry case; keep it simple and bounded.
@@ -272,6 +329,7 @@ async fn serve_tcp(
                         Some(stripped) => answer_internal(
                             &config,
                             &service_map,
+                            &dns_faults,
                             &query,
                             stripped,
                             qtype,
@@ -300,9 +358,16 @@ async fn serve_tcp(
 /// empty NOERROR for AAAA on known names (we only have IPv4 VIPs),
 /// NOTIMP for other query types, and NXDOMAIN for unknown names.
 /// Never forwarded — internal names must not leak upstream.
+///
+/// A Smoker `DnsNxdomain` fault against the queried app forces NXDOMAIN
+/// even for a name that would otherwise resolve. That's the whole point
+/// of the fault — make an operator prove their service tolerates its
+/// dependency's name going dark — so it's checked before the service map.
+#[allow(clippy::too_many_arguments)]
 fn answer_internal(
     config: &DnsConfig,
     service_map: &watch::Receiver<ServiceMap>,
+    dns_faults: &watch::Receiver<DnsFaultState>,
     query: &[u8],
     stripped: &str,
     qtype: u16,
@@ -313,6 +378,16 @@ fn answer_internal(
     }
 
     let service_id = service_id_for(stripped, &config.default_namespace);
+
+    // Smoker DNS fault: a targeted app is forced to NXDOMAIN regardless of
+    // whether it resolves. The fault is keyed by bare app name (matching
+    // how every Smoker fault targets a service), so it bites in whatever
+    // namespace the query lands in.
+    let now_ns = crate::smoker::types::monotonic_now_ns();
+    if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
+        return build_status_response(query, RCODE_NXDOMAIN);
+    }
+
     let vip = service_map.borrow().resolve(&service_id).map(|e| e.vip);
     match (vip, qtype) {
         (Some(vip), QTYPE_A) => build_a_response(query, vip),
@@ -679,6 +754,11 @@ mod tests {
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
+    /// A receiver carrying no active DNS faults (the normal case).
+    fn no_dns_faults() -> watch::Receiver<DnsFaultState> {
+        watch::channel(DnsFaultState::default()).1
+    }
+
     #[test]
     fn service_id_for_qualified_name() {
         let id = service_id_for("api.payments", "default");
@@ -707,6 +787,7 @@ mod tests {
         let response = answer_internal(
             &test_config(),
             &rx,
+            &no_dns_faults(),
             &query,
             "redis.default",
             QTYPE_A,
@@ -727,7 +808,15 @@ mod tests {
         let (_tx, rx) = watch::channel(map);
 
         let query = build_dns_query("redis.internal");
-        let response = answer_internal(&test_config(), &rx, &query, "redis", QTYPE_A, LOOPBACK);
+        let response = answer_internal(
+            &test_config(),
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis",
+            QTYPE_A,
+            LOOPBACK,
+        );
         let len = response.len();
         assert_eq!(&response[len - 4..], &vip.0.octets());
     }
@@ -744,12 +833,29 @@ mod tests {
         assert_ne!(default_vip, payments_vip);
         let (_tx, rx) = watch::channel(map);
 
+        let faults = no_dns_faults();
         let q1 = build_dns_query("api.default.internal");
-        let r1 = answer_internal(&test_config(), &rx, &q1, "api.default", QTYPE_A, LOOPBACK);
+        let r1 = answer_internal(
+            &test_config(),
+            &rx,
+            &faults,
+            &q1,
+            "api.default",
+            QTYPE_A,
+            LOOPBACK,
+        );
         assert_eq!(&r1[r1.len() - 4..], &default_vip.0.octets());
 
         let q2 = build_dns_query("api.payments.internal");
-        let r2 = answer_internal(&test_config(), &rx, &q2, "api.payments", QTYPE_A, LOOPBACK);
+        let r2 = answer_internal(
+            &test_config(),
+            &rx,
+            &faults,
+            &q2,
+            "api.payments",
+            QTYPE_A,
+            LOOPBACK,
+        );
         assert_eq!(&r2[r2.len() - 4..], &payments_vip.0.octets());
     }
 
@@ -764,7 +870,15 @@ mod tests {
         let public = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         let config = DnsConfig::default(); // restrict_to_private = true
         let query = build_dns_query("redis.internal");
-        let response = answer_internal(&config, &rx, &query, "redis", QTYPE_A, public);
+        let response = answer_internal(
+            &config,
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis",
+            QTYPE_A,
+            public,
+        );
         assert_eq!(response[3] & 0x0F, RCODE_REFUSED);
     }
 
@@ -783,7 +897,15 @@ mod tests {
     fn answer_internal_unknown_name_is_nxdomain() {
         let (_tx, rx) = watch::channel(ServiceMap::new());
         let query = build_dns_query("ghost.internal");
-        let response = answer_internal(&test_config(), &rx, &query, "ghost", QTYPE_A, LOOPBACK);
+        let response = answer_internal(
+            &test_config(),
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "ghost",
+            QTYPE_A,
+            LOOPBACK,
+        );
         assert_eq!(response[3] & 0x0F, RCODE_NXDOMAIN);
     }
 
@@ -794,7 +916,15 @@ mod tests {
         let (_tx, rx) = watch::channel(map);
 
         let query = build_dns_query_typed("redis.internal", QTYPE_AAAA);
-        let response = answer_internal(&test_config(), &rx, &query, "redis", QTYPE_AAAA, LOOPBACK);
+        let response = answer_internal(
+            &test_config(),
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis",
+            QTYPE_AAAA,
+            LOOPBACK,
+        );
         assert_eq!(response[3] & 0x0F, 0, "expected NOERROR");
         assert_eq!(&response[6..8], &[0x00, 0x00], "expected no answers");
     }
@@ -806,7 +936,108 @@ mod tests {
         let (_tx, rx) = watch::channel(map);
 
         let query = build_dns_query_typed("redis.internal", 15); // MX
-        let response = answer_internal(&test_config(), &rx, &query, "redis", 15, LOOPBACK);
+        let response = answer_internal(
+            &test_config(),
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis",
+            15,
+            LOOPBACK,
+        );
         assert_eq!(response[3] & 0x0F, RCODE_NOTIMP);
+    }
+
+    #[test]
+    fn dns_nxdomain_fault_forces_nxdomain_for_the_targeted_service() {
+        // Two services that both normally resolve; the fault targets only
+        // `redis`. `redis` must go NXDOMAIN while `api` still resolves.
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        map.register_app("api", "default", 3000, None).unwrap();
+        let api_vip = map.resolve(&ServiceId::new("default", "api")).unwrap().vip;
+        let (_map_tx, map_rx) = watch::channel(map);
+
+        // No expiry (0) — the fault is live until cleared.
+        let (_fault_tx, fault_rx) =
+            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 0)]));
+
+        let redis_query = build_dns_query("redis.internal");
+        let redis_resp = answer_internal(
+            &test_config(),
+            &map_rx,
+            &fault_rx,
+            &redis_query,
+            "redis",
+            QTYPE_A,
+            LOOPBACK,
+        );
+        assert_eq!(
+            redis_resp[3] & 0x0F,
+            RCODE_NXDOMAIN,
+            "faulted service must return NXDOMAIN even though it resolves to a VIP"
+        );
+
+        let api_query = build_dns_query("api.internal");
+        let api_resp = answer_internal(
+            &test_config(),
+            &map_rx,
+            &fault_rx,
+            &api_query,
+            "api",
+            QTYPE_A,
+            LOOPBACK,
+        );
+        assert_eq!(
+            &api_resp[api_resp.len() - 4..],
+            &api_vip.0.octets(),
+            "a service the fault doesn't target must still resolve"
+        );
+    }
+
+    #[test]
+    fn dns_nxdomain_fault_is_reversed_on_clear_and_expiry() {
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let vip = map
+            .resolve(&ServiceId::new("default", "redis"))
+            .unwrap()
+            .vip;
+        let (_map_tx, map_rx) = watch::channel(map);
+
+        let query = build_dns_query("redis.internal");
+        let resolves = |fault_rx: &watch::Receiver<DnsFaultState>| {
+            let resp = answer_internal(
+                &test_config(),
+                &map_rx,
+                fault_rx,
+                &query,
+                "redis",
+                QTYPE_A,
+                LOOPBACK,
+            );
+            resp[resp.len() - 4..] == vip.0.octets()
+        };
+
+        // Clear: the agent publishes an empty state, and the service resolves
+        // again immediately.
+        let (fault_tx, fault_rx) =
+            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 0)]));
+        assert!(!resolves(&fault_rx), "fault active — should not resolve");
+        fault_tx.send(DnsFaultState::default()).unwrap();
+        assert!(
+            resolves(&fault_rx),
+            "after clear the service resolves again"
+        );
+
+        // Expiry: an entry whose deadline has already passed is ignored even
+        // if a publish is missed. `1` ns is comfortably in the past for the
+        // monotonic clock (which reads seconds-since-boot).
+        let (_expired_tx, expired_rx) =
+            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 1)]));
+        assert!(
+            resolves(&expired_rx),
+            "an expired fault must not keep the name dark"
+        );
     }
 }

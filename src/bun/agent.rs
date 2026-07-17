@@ -1093,6 +1093,13 @@ pub struct BunAgent<G: Grill> {
     cluster_catalog: crate::onion::catalog::EndpointCatalog,
     /// Publisher for service-map snapshots (DNS responder subscribes).
     service_map_tx: tokio::sync::watch::Sender<crate::onion::service_map::ServiceMap>,
+    /// Publisher for the set of services under a Smoker `DnsNxdomain` fault.
+    ///
+    /// DNS lives in the userspace responder now (the in-kernel DNS eBPF
+    /// object was never loaded), so the fault does too: we republish this on
+    /// every apply/clear/expire and the responder returns NXDOMAIN for any
+    /// service in the set. See [`crate::onion::dns::DnsFaultState`].
+    dns_faults_tx: tokio::sync::watch::Sender<crate::onion::dns::DnsFaultState>,
     /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
@@ -1218,6 +1225,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 crate::onion::service_map::ServiceMap::new(),
             )
             .0,
+            dns_faults_tx: tokio::sync::watch::channel(crate::onion::dns::DnsFaultState::default())
+                .0,
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
             )),
@@ -1283,6 +1292,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 crate::onion::service_map::ServiceMap::new(),
             )
             .0,
+            dns_faults_tx: tokio::sync::watch::channel(crate::onion::dns::DnsFaultState::default())
+                .0,
             routing_table: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::wrapper::routing::RoutingTable::new(),
             )),
@@ -1369,6 +1380,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
     ) -> tokio::sync::watch::Receiver<crate::onion::service_map::ServiceMap> {
         self.service_map_tx.subscribe()
+    }
+
+    /// Subscribe to the set of services under an active `DnsNxdomain` fault.
+    ///
+    /// The DNS responder reads this alongside the service map: a service in
+    /// the set is answered with NXDOMAIN even if it resolves. The agent
+    /// republishes on every fault apply/clear/expire.
+    pub fn dns_faults_watch(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::onion::dns::DnsFaultState> {
+        self.dns_faults_tx.subscribe()
+    }
+
+    /// Republish the current `DnsNxdomain` fault set to the DNS responder.
+    ///
+    /// Rebuilt from the fault registry so it always reflects reality after an
+    /// apply, clear, or expiry. Keyed by bare service name (`target_service`),
+    /// which is how the resolver checks it. Cheap: the set is tiny and this
+    /// only runs when a fault changes.
+    fn publish_dns_faults(&self) {
+        let faults = self
+            .fault_registry
+            .iter()
+            .filter(|rule| {
+                matches!(
+                    rule.fault_type,
+                    crate::smoker::types::FaultType::DnsNxdomain
+                )
+            })
+            .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
+        let _ = self
+            .dns_faults_tx
+            .send(crate::onion::dns::DnsFaultState::from_faults(faults));
     }
 
     /// Set the image trust policy (from node config). When it requires
@@ -2414,6 +2458,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(rule) => {
                         self.delete_fault_bpf_entry(&rule).await;
                         self.reverse_fault(&rule).await;
+                        // A DnsNxdomain fault lives in the published set, not a
+                        // BPF map, so republish so the responder stops faulting
+                        // the target.
+                        self.publish_dns_faults();
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
                     None => format!("fault {fault_id} not found"),
@@ -2426,6 +2474,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.delete_fault_bpf_entry(rule).await;
                     self.reverse_fault(rule).await;
                 }
+                // Republish the (now empty) DnsNxdomain set for the responder.
+                self.publish_dns_faults();
                 let msg = format!("cleared {} fault(s)", removed.len());
                 let _ = response.send(Ok(msg));
             }
@@ -2859,10 +2909,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 })
             }
-            FaultType::Delay { .. }
-            | FaultType::Drop { .. }
-            | FaultType::DnsNxdomain
-            | FaultType::Bandwidth { .. } => {
+            FaultType::DnsNxdomain => {
+                // DNS resolution lives in the userspace responder
+                // (src/onion/dns.rs), so this fault does too. Republish the
+                // faulted-service set and the responder starts returning
+                // NXDOMAIN for the target. This used to write an eBPF
+                // `fault_dns_map` entry into an object that was never loaded,
+                // so the fault did nothing on any configuration (12b.6 gate).
+                self.publish_dns_faults();
+                Ok(())
+            }
+            FaultType::Delay { .. } | FaultType::Drop { .. } | FaultType::Bandwidth { .. } => {
                 // Packet-level network faults genuinely need the eBPF
                 // data path. Apply via BPF maps when it's loaded;
                 // otherwise reject honestly rather than record fake
@@ -3207,6 +3264,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn expire_faults(&mut self) {
         let now = crate::smoker::types::monotonic_now_ns();
         let expired = self.fault_registry.drain_expired(now);
+        let mut expired_dns = false;
         for rule in &expired {
             if !rule.target_service.is_empty() {
                 eprintln!(
@@ -3220,6 +3278,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // the process frozen and an expired resource fault left its cap in
             // place (CHAOS1).
             self.reverse_fault(rule).await;
+            expired_dns |= matches!(
+                rule.fault_type,
+                crate::smoker::types::FaultType::DnsNxdomain
+            );
+        }
+        // Republish the DnsNxdomain set only if one actually expired, so the
+        // responder drops the name (the resolver also self-corrects on
+        // expiry, but publishing keeps the set honest).
+        if expired_dns {
+            self.publish_dns_faults();
         }
     }
 
@@ -3326,20 +3394,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     value,
                 );
             }
-            FaultType::DnsNxdomain => {
-                let value = BpfDnsFaultValue {
-                    action: DNS_FAULT_NXDOMAIN,
-                    probability: 100,
-                    _pad: [0; 6],
-                    delay_ns: 0,
-                    expires_ns: expires,
-                };
-                let _ = bpf_maps::write_dns_fault(
-                    &mut ebpf.bpf,
-                    dns_fault_key(&rule.target_service),
-                    value,
-                );
-            }
             FaultType::Bandwidth { bytes_per_sec } => {
                 let Some((vip, port)) = require_vip() else {
                     return;
@@ -3396,10 +3450,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         &partition_fault_key(vip, port, *source_cgroup_id),
                     );
                 }
-            }
-            FaultType::DnsNxdomain => {
-                let _ =
-                    bpf_maps::delete_dns_fault(&mut ebpf.bpf, &dns_fault_key(&rule.target_service));
             }
             FaultType::Bandwidth { .. } => {
                 if let Some((vip, port)) = vip_port {

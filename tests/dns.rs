@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reliaburger::onion::dns::{DnsConfig, bind_dns_responder, serve};
+use reliaburger::onion::dns::{DnsConfig, DnsFaultState, bind_dns_responder, serve};
 use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::service_map::ServiceMap;
 use reliaburger::onion::vip::VirtualIP;
@@ -20,6 +20,7 @@ const QTYPE_AAAA: u16 = 28;
 struct DnsHarness {
     addr: std::net::SocketAddr,
     map_tx: watch::Sender<ServiceMap>,
+    fault_tx: watch::Sender<DnsFaultState>,
     shutdown: CancellationToken,
 }
 
@@ -28,6 +29,7 @@ impl DnsHarness {
     /// TEST-NET address when the test never expects forwarding).
     async fn start(upstream: std::net::SocketAddr, map: ServiceMap) -> Self {
         let (map_tx, map_rx) = watch::channel(map);
+        let (fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
         let shutdown = CancellationToken::new();
 
         let config = DnsConfig {
@@ -40,12 +42,13 @@ impl DnsHarness {
 
         let serve_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            serve(Arc::new(config), socket, map_rx, serve_shutdown).await;
+            serve(Arc::new(config), socket, map_rx, fault_rx, serve_shutdown).await;
         });
 
         Self {
             addr,
             map_tx,
+            fault_tx,
             shutdown,
         }
     }
@@ -116,6 +119,40 @@ async fn resolves_registered_app_to_vip() {
     let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
     let len = response.len();
     assert_eq!(&response[len - 4..], &vip.0.octets());
+}
+
+#[tokio::test]
+async fn dns_nxdomain_fault_forces_nxdomain_over_the_wire_then_reverses_on_clear() {
+    // End-to-end over a real UDP socket: a service that resolves goes
+    // NXDOMAIN while the Smoker publishes a DnsNxdomain fault for it, and
+    // resolves again the moment the fault is cleared (empty publish).
+    let harness = DnsHarness::start(unroutable_upstream(), map_with("redis")).await;
+
+    // Baseline: resolves.
+    let before = harness
+        .query(&build_query("redis.internal", QTYPE_A))
+        .await
+        .expect("no response");
+    assert_eq!(rcode(&before), 0, "service should resolve before the fault");
+
+    // Publish the fault (no expiry) and expect NXDOMAIN.
+    harness
+        .fault_tx
+        .send(DnsFaultState::from_faults([("redis".to_string(), 0)]))
+        .unwrap();
+    let during = harness
+        .query(&build_query("redis.internal", QTYPE_A))
+        .await
+        .expect("no response");
+    assert_eq!(rcode(&during), 3, "faulted service must return NXDOMAIN");
+
+    // Clear the fault and expect resolution again.
+    harness.fault_tx.send(DnsFaultState::default()).unwrap();
+    let after = harness
+        .query(&build_query("redis.internal", QTYPE_A))
+        .await
+        .expect("no response");
+    assert_eq!(rcode(&after), 0, "service resolves again after clear");
 }
 
 #[tokio::test]
@@ -243,9 +280,10 @@ async fn run_dns_responder_fails_closed_when_it_cannot_bind() {
         ..DnsConfig::default()
     };
     let (_tx, rx) = watch::channel(ServiceMap::new());
+    let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
     let shutdown = CancellationToken::new();
 
-    let result = reliaburger::onion::dns::run_dns_responder(config, rx, shutdown).await;
+    let result = reliaburger::onion::dns::run_dns_responder(config, rx, fault_rx, shutdown).await;
     assert!(
         result.is_err(),
         "responder must fail closed when the listen address is unavailable"
