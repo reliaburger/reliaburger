@@ -2413,6 +2413,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 {
                     Some(rule) => {
                         self.delete_fault_bpf_entry(&rule).await;
+                        self.reverse_fault(&rule).await;
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
                     None => format!("fault {fault_id} not found"),
@@ -2423,6 +2424,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let removed = self.fault_registry.clear();
                 for rule in &removed {
                     self.delete_fault_bpf_entry(rule).await;
+                    self.reverse_fault(rule).await;
                 }
                 let msg = format!("cleared {} fault(s)", removed.len());
                 let _ = response.send(Ok(msg));
@@ -2810,11 +2812,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if pids.is_empty() {
                     return Err(format!("no running instances of {}", rule.target_service));
                 }
+                // Remember which PIDs we froze so clear/expiry can SIGCONT
+                // them. Without this a paused workload stayed frozen forever
+                // once the fault expired (CHAOS1); Resume was a separate
+                // manual fault the operator had to remember to send.
+                let mut paused = Vec::new();
                 for pid in pids {
                     if let Err(e) = crate::smoker::process::pause_process(pid as i32) {
                         eprintln!("smoker: pause {pid} failed: {e}");
+                    } else {
+                        paused.push(pid as i32);
                     }
                 }
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::Pause(paused));
                 Ok(())
             }
             FaultType::Resume => {
@@ -2826,28 +2836,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Ok(())
             }
-            FaultType::CpuStress { percentage, cores } => {
-                // Burn CPU in spawned blocking tasks for the fault's
-                // lifetime. Bounded by the rule's remaining duration.
-                let config = crate::smoker::resource::CpuBurnConfig::new(*percentage, *cores);
-                let duration = rule.remaining().max(std::time::Duration::from_millis(1));
-                let core_count = cores.unwrap_or(1).max(1);
-                for _ in 0..core_count {
-                    let burn_us = config.burn_duration_us();
-                    let sleep_us = config.sleep_duration_us();
-                    tokio::task::spawn_blocking(move || {
-                        let deadline = std::time::Instant::now() + duration;
-                        while std::time::Instant::now() < deadline {
-                            let spin_until = std::time::Instant::now()
-                                + std::time::Duration::from_micros(burn_us);
-                            while std::time::Instant::now() < spin_until {
-                                std::hint::spin_loop();
-                            }
-                            std::thread::sleep(std::time::Duration::from_micros(sleep_us));
-                        }
-                    });
-                }
-                Ok(())
+            FaultType::CpuStress { percentage, .. } => {
+                // Cap the TARGET instance's `cpu.max` quota instead of
+                // burning cycles in Bun's own cgroup (CHAOS1). The old code
+                // spun blocking tasks that competed for whatever CPU the Bun
+                // process could get, which starved Bun — not the workload —
+                // and could not be lifted before the deadline. Now the
+                // workload keeps only `100 - percentage` of a core, and clear
+                // /expiry restores its original quota.
+                self.apply_cgroup_fault(rule, |cgroup| {
+                    let saved =
+                        crate::smoker::resource::read_cpu_max(cgroup).map_err(|e| e.to_string())?;
+                    crate::smoker::resource::apply_cpu_stress(cgroup, *percentage)
+                        .map_err(|e| e.to_string())?;
+                    Ok(saved)
+                })
+                .await
+                .map(|saved| {
+                    self.record_reversal(
+                        rule.id,
+                        crate::smoker::types::FaultReversal::CpuMax(saved),
+                    );
+                })
             }
             FaultType::Delay { .. }
             | FaultType::Drop { .. }
@@ -2869,21 +2879,80 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.fault_type
                 ))
             }
-            FaultType::MemoryPressure { .. } | FaultType::DiskIoThrottle { .. } => {
-                // cgroup-based; Linux only. Honest error elsewhere.
-                #[cfg(target_os = "linux")]
-                {
-                    Ok(()) // TODO(Phase 10): apply cgroup limits
+            FaultType::MemoryPressure { percentage, oom } => {
+                // Squeeze the TARGET instance's `memory.high` toward its hard
+                // limit so the kernel forces reclaim/allocation stalls on the
+                // workload (CHAOS1 — this used to be a genuine no-op that
+                // reported success). `oom` isn't a reversible cgroup edit —
+                // it would lower `memory.max` to trigger the kill — so we
+                // reject it here rather than pretend; the supervisor's normal
+                // OOM/restart path is the honest way to test that.
+                if *oom {
+                    return Err(
+                        "memory oom is not a reversible fault; use a Kill fault to crash an instance"
+                            .to_string(),
+                    );
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Err(format!("{} requires Linux cgroups", rule.fault_type))
-                }
+                self.apply_cgroup_fault(rule, |cgroup| {
+                    let saved = crate::smoker::resource::read_memory_high(cgroup)
+                        .map_err(|e| e.to_string())?;
+                    crate::smoker::resource::apply_memory_pressure(cgroup, *percentage)
+                        .map_err(|e| e.to_string())?;
+                    Ok(saved)
+                })
+                .await
+                .map(|saved| {
+                    self.record_reversal(
+                        rule.id,
+                        crate::smoker::types::FaultReversal::MemoryHigh(saved),
+                    );
+                })
+            }
+            FaultType::DiskIoThrottle {
+                bytes_per_sec,
+                write_only,
+            } => {
+                // Throttle the TARGET instance's block-I/O via `io.max`
+                // (CHAOS1). The device major:minor is read from the workload's
+                // volumes dir so the throttle lands on the disk the workload
+                // actually writes to; clear/expiry lifts it.
+                let device = self.io_device_major_minor();
+                let dev_for_reverse = device.clone();
+                self.apply_cgroup_fault(rule, |cgroup| {
+                    crate::smoker::resource::apply_disk_io_throttle(
+                        cgroup,
+                        *bytes_per_sec,
+                        *write_only,
+                        &device,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(cgroup.to_string_lossy().into_owned())
+                })
+                .await
+                .map(|paths| {
+                    let instances = paths
+                        .into_iter()
+                        .map(|(_, path)| (path, dev_for_reverse.clone()))
+                        .collect();
+                    self.record_reversal(
+                        rule.id,
+                        crate::smoker::types::FaultReversal::DiskIo { instances },
+                    );
+                })
             }
             FaultType::NodeDrain | FaultType::NodeKill { .. } => {
-                // Node-level faults are orchestrated by the chaos
-                // controller, not a per-instance action here.
-                Ok(())
+                // Honest rejection (CHAOS1). A node drain/kill is a
+                // cluster-level operation — cordon + evict local replicas, or
+                // terminate the node's workloads — driven by the scheduler and
+                // membership machinery, not a per-instance action here. Rather
+                // than record a fake success that changes nothing (the old
+                // behaviour), refuse the fault so the operator gets a clear
+                // 4xx instead of a lie. The real effect lands with the
+                // upgrade/self-healing themes that own that machinery.
+                Err(format!(
+                    "{} is a cluster-level operation and cannot be applied as a node-local fault; drain or stop the node through the scheduler instead",
+                    rule.fault_type
+                ))
             }
             FaultType::Partition { .. } => {
                 // Handled by InjectPartition via transport blocklists.
@@ -2916,6 +2985,187 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         pids
+    }
+
+    /// The `(instance id, cgroup path)` pairs a resource fault should target.
+    ///
+    /// A resource fault names a service (and optionally one instance); the
+    /// cgroup a limit must be written to is `cgroup_path(namespace, app,
+    /// ordinal)` for each matching running instance. We take namespace and app
+    /// straight from the `WorkloadInstance`, and recover the ordinal from the
+    /// canonical instance id (falling back to `0` for a legacy id). This is
+    /// what threads instance metadata into `apply_fault` (CHAOS1): the fault
+    /// arrives with only a service name, and we turn it into concrete cgroups.
+    #[cfg(target_os = "linux")]
+    fn target_instance_cgroups(
+        &self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Vec<(InstanceId, std::path::PathBuf)> {
+        self.supervisor
+            .list_instances()
+            .iter()
+            .filter(|i| {
+                i.app_name == rule.target_service
+                    && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
+            })
+            .map(|i| {
+                let ordinal = crate::grill::InstanceIdentity::parse(&i.id.0)
+                    .map(|ident| ident.ordinal)
+                    .unwrap_or(0);
+                let path = crate::grill::cgroup::cgroup_path(&i.namespace, &i.app_name, ordinal);
+                (i.id.clone(), path)
+            })
+            .collect()
+    }
+
+    /// Apply a cgroup-writing fault to every target instance and collect the
+    /// per-instance saved state the closure returns (for later reversal).
+    ///
+    /// Returns an honest error when there are no running instances to target,
+    /// or on any platform without cgroup v2. The closure runs once per target
+    /// cgroup; the first failure aborts and is surfaced to the caller so the
+    /// fault is never recorded as active while it changed nothing.
+    #[cfg(target_os = "linux")]
+    async fn apply_cgroup_fault<F>(
+        &self,
+        rule: &crate::smoker::types::FaultRule,
+        mut per_instance: F,
+    ) -> Result<Vec<(String, String)>, String>
+    where
+        F: FnMut(&std::path::Path) -> Result<String, String>,
+    {
+        let targets = self.target_instance_cgroups(rule);
+        if targets.is_empty() {
+            return Err(format!("no running instances of {}", rule.target_service));
+        }
+        let mut saved = Vec::with_capacity(targets.len());
+        for (id, cgroup) in targets {
+            let value = per_instance(&cgroup)?;
+            saved.push((id.0, value));
+        }
+        Ok(saved)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn apply_cgroup_fault<F>(
+        &self,
+        rule: &crate::smoker::types::FaultRule,
+        _per_instance: F,
+    ) -> Result<Vec<(String, String)>, String>
+    where
+        F: FnMut(&std::path::Path) -> Result<String, String>,
+    {
+        Err(format!("{} requires Linux cgroups", rule.fault_type))
+    }
+
+    /// Record a fault's reversal state in the registry after it was applied,
+    /// so a later clear/expiry can undo the persistent effect.
+    fn record_reversal(
+        &mut self,
+        id: crate::smoker::types::FaultId,
+        reversal: crate::smoker::types::FaultReversal,
+    ) {
+        if let Some(rule) = self.fault_registry.get_mut(id) {
+            rule.reversal = reversal;
+        }
+    }
+
+    /// The block device (`major:minor`) backing this node's workload storage,
+    /// used to key an `io.max` throttle. cgroup v2 `io.max` is per-device, so
+    /// a throttle must name one. We resolve the device under the volumes dir
+    /// where workloads write; if it can't be determined we fall back to the
+    /// common `8:0` (first SCSI/SATA disk), which the operator can override by
+    /// running on a host whose data disk is `8:0`.
+    fn io_device_major_minor(&self) -> String {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&self.volumes_dir) {
+                let dev = meta.dev();
+                // Linux encodes major:minor in st_dev; unpack per libc rules.
+                let major = (dev >> 8) & 0xfff;
+                let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
+                return format!("{major}:{minor}");
+            }
+        }
+        "8:0".to_string()
+    }
+
+    /// Reverse a cleared or expired fault's persistent effect.
+    ///
+    /// eBPF network faults are undone by `delete_fault_bpf_entry`; this handles
+    /// everything else that leaves a durable change — a paused process (SIGCONT
+    /// it), a capped `cpu.max`, a squeezed `memory.high` or an `io.max`
+    /// throttle (restore the saved value). Best-effort: an instance that has
+    /// since exited simply has nothing left to restore.
+    async fn reverse_fault(&self, rule: &crate::smoker::types::FaultRule) {
+        use crate::smoker::types::FaultReversal;
+        match &rule.reversal {
+            FaultReversal::None => {}
+            FaultReversal::Pause(pids) => {
+                for pid in pids {
+                    if let Err(e) = crate::smoker::process::resume_process(*pid) {
+                        // A process that exited while paused is fine; anything
+                        // else is worth a line so a stuck workload is visible.
+                        eprintln!("smoker: resume (auto) pid {pid} failed: {e}");
+                    }
+                }
+            }
+            FaultReversal::CpuMax(saved) => {
+                for (_id, cgroup, value) in Self::rejoin_cgroups(rule, saved) {
+                    if let Err(e) = crate::smoker::resource::restore_cpu_max(&cgroup, &value) {
+                        eprintln!(
+                            "smoker: restore cpu.max on {} failed: {e}",
+                            cgroup.display()
+                        );
+                    }
+                }
+            }
+            FaultReversal::MemoryHigh(saved) => {
+                for (_id, cgroup, value) in Self::rejoin_cgroups(rule, saved) {
+                    if let Err(e) = crate::smoker::resource::restore_memory_high(&cgroup, &value) {
+                        eprintln!(
+                            "smoker: restore memory.high on {} failed: {e}",
+                            cgroup.display()
+                        );
+                    }
+                }
+            }
+            FaultReversal::DiskIo { instances } => {
+                for (path, device) in instances {
+                    let cgroup = std::path::PathBuf::from(path);
+                    if let Err(e) =
+                        crate::smoker::resource::remove_disk_io_throttle(&cgroup, device)
+                    {
+                        eprintln!("smoker: lift io.max on {path} failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pair each saved `(instance id, value)` with the instance's cgroup path.
+    ///
+    /// The cgroup path is recomputed from the *current* target-instance list so
+    /// reversal writes to the same directory the fault wrote to. An instance
+    /// that has since gone away is dropped (nothing to restore).
+    fn rejoin_cgroups(
+        rule: &crate::smoker::types::FaultRule,
+        saved: &[(String, String)],
+    ) -> Vec<(String, std::path::PathBuf, String)> {
+        saved
+            .iter()
+            .filter_map(|(id, value)| {
+                let ident = crate::grill::InstanceIdentity::parse(id)?;
+                let path =
+                    crate::grill::cgroup::cgroup_path(&ident.namespace, &ident.app, ident.ordinal);
+                // A specific instance target still restores only its own cgroup.
+                if rule.target_instance.as_ref().is_some_and(|t| t != id) {
+                    return None;
+                }
+                Some((id.clone(), path, value.clone()))
+            })
+            .collect()
     }
 
     /// Build the current chaos state for the API (legacy format).
@@ -2965,6 +3215,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 );
             }
             self.delete_fault_bpf_entry(rule).await;
+            // Undo persistent non-eBPF effects too: SIGCONT a paused
+            // workload, lift a cgroup cap. Without this an expired Pause left
+            // the process frozen and an expired resource fault left its cap in
+            // place (CHAOS1).
+            self.reverse_fault(rule).await;
         }
     }
 
@@ -8441,5 +8696,143 @@ mod tests {
             first_new_start < first_old_retire,
             "old instance was retired before the new one started — availability dropped below target"
         );
+    }
+
+    // -- Smoker effects and cleanup (CHAOS1) ----------------------------------
+
+    fn fault_rule(fault_type: crate::smoker::types::FaultType) -> crate::smoker::types::FaultRule {
+        crate::smoker::types::FaultRule::new(
+            crate::smoker::types::FaultId(1),
+            fault_type,
+            "web".into(),
+            std::time::Duration::from_secs(30),
+            "test".into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn node_drain_is_rejected_not_faked() {
+        // CHAOS1: a node-drain fault used to return Ok while doing nothing.
+        // It's a cluster-level operation, so a node-local fault must refuse
+        // honestly rather than lie about applying it.
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::NodeDrain);
+        let result = agent.apply_fault(&rule).await;
+        let err = result.expect_err("node drain must be rejected, not silently accepted");
+        assert!(
+            err.contains("cluster-level"),
+            "unexpected rejection reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_kill_is_rejected_not_faked() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::NodeKill {
+            kill_containers: true,
+        });
+        let result = agent.apply_fault(&rule).await;
+        assert!(
+            result.is_err(),
+            "node kill must be rejected as a node-local fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_oom_is_rejected_as_irreversible() {
+        // An OOM squeeze isn't a reversible cgroup edit, so we refuse it and
+        // point the operator at a Kill fault instead of pretending.
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::MemoryPressure {
+            percentage: 100,
+            oom: true,
+        });
+        let err = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("memory oom must be rejected");
+        assert!(err.contains("reversible"), "unexpected reason: {err}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn resource_faults_reject_off_linux() {
+        // Off Linux there are no cgroups, so a resource fault reports an
+        // honest error instead of recording a fake success.
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::CpuStress {
+            percentage: 80,
+            cores: None,
+        });
+        let err = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("cpu stress must reject without cgroups");
+        assert!(err.contains("Linux cgroups"), "unexpected reason: {err}");
+    }
+
+    /// Reversing a Pause fault SIGCONTs the frozen process.
+    ///
+    /// We freeze a real child with SIGSTOP, then drive `reverse_fault` with
+    /// the same `Pause` reversal the apply path records. If reversal resumes
+    /// the process it exits and `waitpid` reaps it; if it doesn't, the child
+    /// stays stopped and the bounded wait never sees an exit — the test fails
+    /// on the assertion, not a sleep.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clearing_a_pause_resumes_the_process() {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use nix::unistd::Pid;
+
+        // A child that exits immediately once it's allowed to run. We reap it
+        // via `waitpid` below rather than `Child::wait`, so drop the handle's
+        // reaping responsibility to avoid the double-wait clippy flags.
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id() as i32;
+        std::mem::forget(child);
+        let nix_pid = Pid::from_raw(pid);
+
+        // Freeze it before it can finish.
+        crate::smoker::process::pause_process(pid).expect("pause");
+
+        let mut rule = fault_rule(crate::smoker::types::FaultType::Pause);
+        rule.reversal = crate::smoker::types::FaultReversal::Pause(vec![pid]);
+
+        let (agent, _tx, _shutdown) = test_agent();
+        agent.reverse_fault(&rule).await;
+
+        // Bounded observable wait: poll waitpid until the resumed child exits.
+        let mut exited = false;
+        for _ in 0..200 {
+            match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(WaitStatus::StillAlive) | Ok(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            exited,
+            "paused process was never resumed by reverse_fault — it stayed frozen"
+        );
+    }
+
+    /// A Pause fault with no reversal recorded (e.g. cleared before it ever
+    /// applied) is a no-op, not a panic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reversing_a_pause_without_state_is_a_noop() {
+        let (agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::Pause);
+        // reversal defaults to None; must not panic or error.
+        agent.reverse_fault(&rule).await;
     }
 }

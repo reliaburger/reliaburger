@@ -61,15 +61,19 @@ Every fault has a mandatory expiry. If you don't pass `--duration`, it defaults 
 
 Cleanup happens through two independent mechanisms:
 
-1. **Userspace expiry.** Every health tick (1 second), the agent calls `drain_expired()`, which pops entries from the min-heap and removes them from the registry.
+1. **Userspace expiry.** Every health tick (1 second), the agent calls `drain_expired()`, which pops entries from the min-heap and removes them from the registry. For any fault that left a durable change — a frozen process, a capped `cpu.max`, a squeezed `memory.high`, an `io.max` throttle — the agent then *reverses* it. Expiry isn't just forgetting the fault; it's putting the target back the way it was.
 
 2. **eBPF-level expiry.** For network faults, the BPF programs check `bpf_ktime_get_ns()` against the entry's `expires_ns` field on every `connect()`. Even if the userspace timer is delayed, the kernel stops applying the fault at the right time.
+
+The reversal is the part that's easy to get wrong, and it's worth being blunt about why. A chaos experiment that can't undo itself isn't an experiment, it's an outage you scheduled. Every persistent fault records what it needs to restore at the moment it's applied — the saved cgroup value, the list of PIDs it froze — and stashes that on the registry entry. When the fault is cleared (`relish fault clear <id>`), cleared en masse, or expires on its own, the same reversal runs. Three doors, one exit.
 
 The registry is wrapped in `Arc<tokio::sync::Mutex<FaultRegistry>>` because the agent event loop and the expiry background task both need access. We use `tokio::sync::Mutex`, not `std::sync::Mutex`. In async code, a standard mutex can block the tokio runtime if the lock is held across an `.await` point. The tokio mutex yields instead.
 
 ## Process faults: the easy ones
 
-The simplest faults are process signals. `relish fault kill web-3` sends SIGKILL to the container's main process. `relish fault pause web` sends SIGSTOP, which freezes the process. Health checks fail after the configured timeout, triggering the restart logic. `--resume` sends SIGCONT.
+The simplest faults are process signals. `relish fault kill web-3` sends SIGKILL to the container's main process. `relish fault pause web` sends SIGSTOP, which freezes the process. Health checks fail after the configured timeout, triggering the restart logic.
+
+A pause used to be a trap. SIGSTOP froze the process, but nothing ever un-froze it — expiry deleted the registry entry and left the workload wedged. You had to remember to send a separate `--resume` (SIGCONT) fault by hand. That's exactly the kind of "cleanup that doesn't clean up" a chaos tool must not have. Now a pause records the PIDs it froze, and when the fault clears or expires the agent SIGCONTs them automatically. The manual resume still exists, but you no longer *need* it: the process comes back on its own when the fault's time is up.
 
 ```rust
 pub fn kill_process(pid: i32) -> Result<(), ProcessFaultError> {
@@ -91,32 +95,34 @@ These faults work on all Unix platforms — no eBPF, no cgroups, no Linux-specif
 
 ## Resource faults: cgroup control
 
-Resource faults use the same cgroup hierarchy that Bun already manages for container isolation. CPU stress spawns a burn loop inside the target's cgroup. Memory pressure allocates and `mlock`s pages. Disk I/O throttle writes to the `io.max` cgroup file.
+Resource faults use the same cgroup hierarchy that Bun already manages for container isolation. The key word is *target*: the limit has to land on the workload's own cgroup, not on Bun. The first version of this code got that wrong for CPU. It spawned burn loops on `spawn_blocking` threads and let them fight for whatever CPU the Bun process could get. That starved the orchestrator, not the app, and it couldn't be lifted before its deadline. It looked like a chaos fault and behaved like a self-inflicted wound.
 
-The CPU burn loop is a tight arithmetic loop with `std::hint::black_box` to prevent the compiler from optimising it away:
+So how does a fault find its target's cgroup? A resource fault arrives naming only a service, e.g. `web`. Bun keeps a list of the instances it runs, each carrying its namespace, app name and ordinal, and the cgroup for an instance is `/sys/fs/cgroup/reliaburger/{namespace}/{app}/{ordinal}`. Threading that instance metadata into the fault is what turns "throttle web" into "write this file for `default/web/0` and `default/web/1`". No instances match? The fault is rejected, not silently dropped.
+
+**CPU stress** caps `cpu.max`. A cgroup-v2 `cpu.max` is `"{quota_us} {period_us}"` — how many microseconds of CPU the group may use per period. To steal 80% we leave the workload 20% of one core:
 
 ```rust
-pub struct CpuBurnConfig {
-    pub percentage: u8,
-    pub cores: Option<u32>,
-    pub window_us: u64,  // 10ms default
+pub fn cpu_stress_quota(percentage: u8) -> String {
+    let remaining = 100u64.saturating_sub(percentage as u64).max(1);
+    let quota_us = remaining * CPU_PERIOD_US / 100;   // 100_000us period
+    format!("{quota_us} {CPU_PERIOD_US}")             // e.g. "20000 100000"
 }
 ```
 
-For 50% CPU stress, each thread burns for 5ms and sleeps for 5ms in a 10ms window. Because the burn process runs inside the same cgroup as the application, they compete for CPU time exactly as a real noisy-neighbour workload would.
+The `.max(1)` is a deliberate floor: 100% would wedge the process entirely, and a process that can't run at all is a Kill, not a stress. Before we write the cap we *read* the current `cpu.max` and save it. That saved string is the reversal — clear or expire the fault and the original quota goes straight back.
 
-Memory pressure uses `mmap` + `mlock`. We allocate anonymous pages inside the target's memory cgroup and lock them so the kernel can't reclaim them. At 90%, the application has only 10% of its headroom remaining. This triggers the same kernel memory pressure signals (PSI, `memory.high` events) as real contention.
+**Memory pressure** squeezes `memory.high`, the soft limit. The kernel forces a workload into reclaim (and, past its working set, allocation stalls) as it approaches `memory.high`, without the outright OOM kill a lowered `memory.max` would cause. We set it to a percentage of the hard `memory.max`, so 90% pressure leaves a 10% headroom band, and we save the previous soft limit to restore later. A cgroup with no hard limit can't be squeezed this way, so the fault is refused rather than pretending. And an `--oom` request? That one genuinely isn't reversible — it kills — so we reject it and point you at a Kill fault, which is the honest way to test the OOM/restart path.
 
-Disk I/O throttle uses cgroupv2's `io.max` file — the kernel's native I/O throttling:
+**Disk I/O throttle** writes cgroupv2's `io.max`, the kernel's native per-device throttle:
 
 ```rust
 let value = format!("{device_major_minor} rbps={bytes_per_sec} wbps={bytes_per_sec}");
 std::fs::write(&io_max_path, value.as_bytes())?;
 ```
 
-One write to a cgroup file. The kernel handles everything else.
+`io.max` is per-device, so the throttle has to name a `major:minor`. We resolve it from the disk backing the node's volumes directory, where workloads actually write. Reversal writes `rbps=max wbps=max` back to the same file.
 
-All resource faults are Linux-only. On macOS, the functions return `ResourceFaultError::UnsupportedPlatform`. The unit tests for configuration logic (burn durations, pressure calculations) run everywhere.
+All resource faults are Linux-only. On macOS, the functions return `ResourceFaultError::UnsupportedPlatform`, and `apply_fault` turns that into a clear "requires Linux cgroups" rejection rather than a fake success. The pure computation (the quota arithmetic) is unit-tested everywhere; the actual cgroup writes and their reversal are tested against real cgroup files under `make test-linux`.
 
 ## Network faults: eBPF
 
@@ -264,9 +270,9 @@ That's worse than useless. A chaos tool that lies about what it did teaches you 
 
 Each fault type now maps to a mechanism, and the mechanism is the truth:
 
-- **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT`. These work on every platform because signals are POSIX, not Linux-specific.
-- **CPU stress** spawns burn loops on `spawn_blocking` threads, sized by the requested percentage, running for the fault's remaining lifetime. No kernel support needed — just honest arithmetic and a spin loop.
-- **Memory pressure and disk-IO throttle** need cgroups, so they work on Linux and return a clear error elsewhere.
+- **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT`. A pause now records its frozen PIDs and auto-resumes them on clear or expiry, so a paused workload can't be left wedged. These work on every platform because signals are POSIX, not Linux-specific.
+- **CPU stress, memory pressure and disk-IO throttle** cap the *target* instance's cgroup — `cpu.max`, `memory.high`, `io.max` — after threading the workload's namespace/app/ordinal into the fault. The pre-limit value is saved and restored on clear or expiry. They need cgroups, so they work on Linux and return a clear "requires Linux cgroups" error elsewhere.
+- **Node drain and node kill** are cluster-level operations, not node-local faults, so the agent rejects them honestly (a 4xx with a clear reason) rather than recording a success that changes nothing. The real effect belongs with the scheduler and self-healing machinery.
 - **Delay, drop, DNS NXDOMAIN, bandwidth** need the eBPF data path from Chapter 3. Without the `ebpf` feature loaded, the API now *rejects* these with "requires the eBPF data path, which is not loaded on this node" instead of recording a fault it can't enforce. A 400, not a fake 200.
 - **Partition** populates the real transport blocklists.
 
