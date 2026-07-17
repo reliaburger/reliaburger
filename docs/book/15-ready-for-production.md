@@ -252,6 +252,40 @@ cpu/memory limits on a rootless node that can't enforce them. In each case the o
 was to accept the work and quietly deliver less than asked. The new behaviour is a clear
 error. A refusal you can see beats a guarantee you can't.
 
+## The gate that runs on real hardware
+
+A unit test is only as honest as its fixture. If you invent the shape of the world and then
+assert your code handles that shape, all you've proved is that your code agrees with your
+imagination. Two bugs slipped through exactly this way, and the thing that caught them was a
+final acceptance gate that ran the whole programme against the real world before we called it
+done.
+
+The first was a chaos fault that did nothing. Reliaburger can inject a DNS NXDOMAIN fault, so
+you can test how your app behaves when a dependency stops resolving. The fault wrote its
+target into an eBPF map. The unit tests wrote to that map and read it back, and everything
+agreed. But DNS resolution had long since moved to a userspace resolver, and that resolver
+never looked at the map. So the fault wrote a note nobody would ever read. Every test passed;
+the feature was a placebo. The fix moved the fault into the userspace resolver, where DNS
+actually happens, and the test now drives a real query through the resolver and asserts it
+comes back NXDOMAIN. Ask the thing that answers, not the thing that used to.
+
+The second only showed up on an actual Mac. Apple's `container inspect` tells you whether a
+container is running, and after a self-upgrade Bun re-adopts its surviving workloads by asking
+exactly that. The parser had been written against a guessed JSON shape -- `State.Status`, an
+object -- and the fixtures matched the guess, so the unit tests were green. The real `container`
+CLI returns an *array*, and puts the status at a lowercase top-level `status`. On real
+hardware the parser matched none of its paths, decided a running container was "unknown", and
+declined to adopt it. No fixture could have caught this, because the fixture *was* the bug.
+Only `make test-apple`, run on Apple silicon, exercised the real CLI -- so that's where it
+surfaced, and where we captured the true schema and pinned the fixtures to it.
+
+Neither bug was subtle once you saw it. Both were invisible from inside the test suite,
+because both suites tested a model of the world rather than the world. That's the whole reason
+the acceptance gate exists: run the portable suite, then the cluster and upgrade suites
+in-process, then the privileged Linux suite in CI, then the Apple suite on a real Mac, and
+only *then* believe the green. A passing test earns trust in proportion to how much of the
+real world it touched.
+
 ## Coverage is a map, not a target
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
