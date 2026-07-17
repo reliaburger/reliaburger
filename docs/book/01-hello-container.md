@@ -1478,7 +1478,7 @@ pub fn for_job(max_restarts: u32) -> Self {
 
 ## GPU detection: traits for optional dependencies
 
-Some nodes have GPUs. Most don't. We need to know which GPUs are available so the scheduler can place GPU workloads on the right nodes. But GPU detection requires vendor-specific libraries (NVIDIA's NVML, for instance), and we don't want to pull those in as hard dependencies.
+Some nodes have GPUs. Most don't. We need to know which GPUs are available so the scheduler can place GPU workloads on the right nodes. GPU detection is inherently vendor- and platform-specific (an NVIDIA card, a macOS laptop with none), and we don't want that mess leaking into the scheduler. So we hide it behind a trait. The concrete NVIDIA detector we ship later (`NvidiaGpuDetector`) probes `/dev/nvidia0` and shells out to `nvidia-smi` rather than linking a vendor library, which keeps the binary dependency-free; here in Phase 1 we start with the trait and a stub.
 
 ### The trait approach
 
@@ -1505,14 +1505,14 @@ impl GpuDetector for StubGpuDetector {
 The alternative would be conditional compilation:
 
 ```rust
-#[cfg(feature = "nvml")]
-fn detect_gpus() -> Vec<GpuInfo> { /* real NVML calls */ }
+#[cfg(feature = "nvidia")]
+fn detect_gpus() -> Vec<GpuInfo> { /* probe /dev/nvidia0, run nvidia-smi */ }
 
-#[cfg(not(feature = "nvml"))]
+#[cfg(not(feature = "nvidia"))]
 fn detect_gpus() -> Vec<GpuInfo> { Vec::new() }
 ```
 
-Both work, but they have different testing properties. With `#[cfg(feature)]`, your CI either compiles with the `nvml` feature (and tests the real GPU path, which requires actual GPU hardware) or without it (and tests nothing interesting). You can't test GPU-aware scheduling on a macOS laptop because the code literally doesn't exist in the binary.
+Both work, but they have different testing properties. With `#[cfg(feature)]`, your CI either compiles with the `nvidia` feature (and tests the real GPU path, which requires actual GPU hardware) or without it (and tests nothing interesting). You can't test GPU-aware scheduling on a macOS laptop because the code literally doesn't exist in the binary.
 
 With a trait, you can write a `FakeGpuDetector` that reports synthetic GPUs:
 

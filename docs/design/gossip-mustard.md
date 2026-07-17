@@ -22,7 +22,7 @@ Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a de
 
 1. Gossip messages are fixed-size. Variable-size runtime state flows through the reporting tree, not through Mustard. This is non-negotiable for scaling to 10,000 nodes.
 2. Raft membership is dynamic. Any node can join or leave the council. There are no statically assigned "server" nodes.
-3. The cluster can survive total council loss via a pre-seeded deterministic recovery mechanism. No vote or election is needed -- the priority order was established before the failure.
+3. The cluster can survive total council loss. Today this is an operator-triggered restore from a sealed backup that re-bootstraps a fresh council (`relish council recover`; see §5.5). A fully-automatic pre-seeded recovery, where the priority order is established before the failure so no vote is needed, is the proposed evolution documented in §5.5, not yet shipped.
 4. The data plane is never interrupted by a control plane event. Apps keep running during leader elections, state reconstruction, and network partitions.
 
 ---
@@ -808,7 +808,9 @@ When a new leader is elected, it must rebuild its understanding of the cluster's
 
 ### 5.5 Catastrophic Recovery
 
-When the entire Raft council is lost simultaneously (all 3-7 members fail at once), the pre-seeded recovery mechanism activates.
+> **Status — what ships vs what's proposed.** Full-council loss recovery ships as an **operator-triggered** flow, not the fully-automatic pre-seeded election described below. `relish council recover` runs against a stopped survivor (`src/council/recovery.rs`): it restores the desired state from the last sealed external backup (`src/council/backup.rs`) or the node's own durable snapshot, re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council from healthy members. Anything written after the last backup is lost, which is why a human confirms the restore. The pre-seeded recovery-candidate machinery in steps 1–5 below — priority-ordered candidates, the encrypted gossip candidate blob, and a survivor assuming leadership *without* an election — remains an **architecture proposal** (a later phase); it is documented here as the target design, not current behaviour. The learning period in §5.4, the backup/restore, and disk-pressure council step-down all ship today.
+
+When the entire Raft council is lost simultaneously (all 3-7 members fail at once), the *proposed* pre-seeded recovery mechanism activates as follows.
 
 **Normal operation (preparation):**
 

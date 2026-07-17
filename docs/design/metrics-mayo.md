@@ -447,8 +447,8 @@ Bun's metrics collector gathers infrastructure metrics at the configured collect
 | `app_network_receive_bytes_total` | `/proc/[pid]/net/dev` | Counter |
 | `app_network_transmit_bytes_total` | `/proc/[pid]/net/dev` | Counter |
 | `app_restarts_total` | Bun restart tracker | Counter |
-| `app_gpu_utilization_percent` | NVML / `nvidia-smi` equivalent | Gauge |
-| `app_gpu_vram_usage_bytes` | NVML | Gauge |
+| `app_gpu_utilization_percent` | `nvidia-smi` | Gauge |
+| `app_gpu_vram_usage_bytes` | `nvidia-smi` | Gauge |
 
 GPU metrics are only collected for apps with a GPU allocation. Apps without GPU allocation do not incur any GPU metric collection overhead.
 
@@ -464,8 +464,8 @@ GPU metrics are only collected for apps with a GPU allocation. Apps without GPU 
 | `node_network_receive_bytes_total{device=...}` | `/proc/net/dev` | Counter |
 | `node_network_transmit_bytes_total{device=...}` | `/proc/net/dev` | Counter |
 | `node_running_apps` | Bun app tracker | Gauge |
-| `node_gpu_utilization_percent{device=...}` | NVML | Gauge |
-| `node_gpu_temperature_celsius{device=...}` | NVML | Gauge |
+| `node_gpu_utilization_percent{device=...}` | `nvidia-smi` | Gauge |
+| `node_gpu_temperature_celsius{device=...}` | `nvidia-smi` | Gauge |
 
 **Per-ingress-route metrics** (emitted by the Wrapper ingress proxy):
 

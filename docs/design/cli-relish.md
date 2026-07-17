@@ -7,7 +7,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. It's a single Rus
 Relish operates in two modes:
 
 - **CLI mode:** When invoked with a subcommand (`relish status`, `relish plan production/`, `relish wtf`), it executes the command, prints output, and exits. Suitable for scripting, CI pipelines, and quick one-off operations.
-- **TUI mode:** When invoked with no arguments (`relish`), it launches a full-screen interactive terminal UI similar to k9s or htop. This is the primary operational interface for day-to-day cluster management. It provides real-time views of apps, nodes, jobs, events, logs, and routes with keyboard-driven navigation.
+- **TUI mode (Phase 13):** When invoked with no arguments (`relish`), it launches a full-screen interactive terminal UI similar to k9s or htop, intended as the primary operational interface for day-to-day cluster management. It provides real-time views of apps, nodes, jobs, events, logs, and routes with keyboard-driven navigation. This is the Phase 13 deliverable (`src/relish/tui/`); the earlier phases ship the CLI mode above, and bare `relish` returned a usage error until Phase 13 wired the TUI in.
 
 Both modes use the same underlying API client and output formatting. Anything visible in the TUI can also be retrieved via CLI commands, and anything scriptable via the CLI is navigable in the TUI.
 
