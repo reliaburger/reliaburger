@@ -681,25 +681,41 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
         let mut refresher_rx = membership_rx;
+        // Each node advertises its real API endpoint over gossip (the
+        // directory, 12b.2). Prefer that authoritative `api_address`: a
+        // single host can run several nodes on distinct, independently
+        // chosen gossip/API ports, so the local node's fixed
+        // gossip→API offset is NOT a peer's offset. The offset is only a
+        // fallback for a peer whose directory extension hasn't arrived yet.
+        let mut refresher_directory_rx = directory_rx.clone();
         let refresher_shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let snapshot: Vec<api::NodeMembershipInfo> = refresher_rx
-                    .borrow()
-                    .iter()
-                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                    .map(|m| api::NodeMembershipInfo {
-                        node_id: m.node_id.clone(),
-                        address: std::net::SocketAddr::new(
-                            m.address.ip(),
-                            (m.address.port() as i32 + gossip_to_api_offset) as u16,
-                        ),
-                    })
-                    .collect();
+                let snapshot: Vec<api::NodeMembershipInfo> = {
+                    let directory = refresher_directory_rx.borrow();
+                    refresher_rx
+                        .borrow()
+                        .iter()
+                        .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
+                        .map(|m| api::NodeMembershipInfo {
+                            node_id: m.node_id.clone(),
+                            address: directory.api_address(
+                                &m.node_id,
+                                m.address,
+                                gossip_to_api_offset,
+                            ),
+                        })
+                        .collect()
+                };
                 *membership_table.write().await = snapshot;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
                     changed = refresher_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    changed = refresher_directory_rx.changed() => {
                         if changed.is_err() {
                             break;
                         }
