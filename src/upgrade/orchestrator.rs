@@ -192,19 +192,24 @@ async fn poll_and_drive_group<C: NodeControl>(
         1
     };
 
-    // Pass 1: poll everything already in flight (and Pending nodes, to
-    // skip ones that are somehow already at target — the resume story).
+    // Pass 1: poll everything not already in a terminal *failure* state.
+    // Healthy nodes are re-polled too: a crash-looping node can look
+    // momentarily Healthy at the target between boot attempts (it did exec
+    // into the new binary before the fail-boot hook crashed it), and if we
+    // latched that and moved on, the next node would upgrade PAST a failure
+    // the reverting node is about to report. Re-checking Healthy catches the
+    // subsequent revert and pauses the run instead.
     for record in state.nodes.iter_mut().filter(|n| n.role == role) {
         match record.phase {
-            NodeUpgradePhase::Healthy
-            | NodeUpgradePhase::Failed { .. }
-            | NodeUpgradePhase::RolledBack => continue,
+            NodeUpgradePhase::Failed { .. } | NodeUpgradePhase::RolledBack => continue,
             _ => {}
         }
 
         let Some(probe) = control.probe(&record.address).await else {
             // Unreachable is normal mid-swap (the exec blip); the timeout
-            // below catches nodes that never come back.
+            // below catches nodes that never come back. A Healthy node that
+            // briefly stops answering is left Healthy (its check_timeout is a
+            // no-op), so a transient blip doesn't undo a completed node.
             check_timeout(record, context.now);
             continue;
         };
@@ -214,11 +219,15 @@ async fn poll_and_drive_group<C: NodeControl>(
         }
 
         // The node itself says it attempted and reverted this run: failed,
-        // regardless of which phase we thought it was in.
+        // regardless of which phase we thought it was in — INCLUDING a node
+        // we already marked Healthy on a lucky mid-crash-loop poll. This is
+        // the guard that stops the walk advancing past a fail-boot node.
         if probe.failed_upgrade_ids.contains(&state_upgrade_id)
             && matches!(
                 record.phase,
-                NodeUpgradePhase::Directed | NodeUpgradePhase::Verifying
+                NodeUpgradePhase::Directed
+                    | NodeUpgradePhase::Verifying
+                    | NodeUpgradePhase::Healthy
             )
         {
             set_phase(
@@ -268,14 +277,43 @@ async fn poll_and_drive_group<C: NodeControl>(
                     context.now,
                 );
             }
+            NodeUpgradePhase::Healthy if probe.version != target && !probe.upgrade_in_flight => {
+                // A node we already marked Healthy is now stably back on the
+                // old version: it reverted after a lucky mid-crash-loop poll
+                // latched it. Re-fail it so the walk pauses rather than
+                // advancing past a node that didn't really upgrade.
+                set_phase(
+                    record,
+                    NodeUpgradePhase::Failed {
+                        reason: format!(
+                            "node {} reverted to {} after reporting healthy (upgrade to {target} failed)",
+                            record.node_id, probe.version
+                        ),
+                    },
+                    context.now,
+                );
+            }
             _ => check_timeout(record, context.now),
         }
     }
 
+    // A failure detected in pass 1 pauses the run (the caller checks
+    // `first_failure` right after this returns). We must NOT direct a new
+    // node in the same tick: a node that just failed frees its in-flight
+    // slot, and directing the next Pending node here would upgrade it PAST
+    // the failure before the pause takes effect — exactly the "only the
+    // failing node should have been attempted" invariant the cluster
+    // rollback test pins. Any Failed node in the group stops pass 2.
+    let group_has_failure = state
+        .nodes
+        .iter()
+        .any(|n| n.role == role && matches!(n.phase, NodeUpgradePhase::Failed { .. }));
+
     // Pass 2: fill the concurrency budget with Pending nodes — but only
-    // when allowed to start a new one (the council quorum gate). When
-    // `may_direct_new` is false we leave Pending nodes untouched; pass 1
-    // above has already polled and failed-detected everything in flight.
+    // when allowed to start a new one (the council quorum gate) and no node
+    // in this group has failed this run. When `may_direct_new` is false or a
+    // failure is present we leave Pending nodes untouched; pass 1 above has
+    // already polled and failed-detected everything in flight.
     let in_flight = state
         .nodes
         .iter()
@@ -287,7 +325,7 @@ async fn poll_and_drive_group<C: NodeControl>(
                 )
         })
         .count();
-    let mut slots = if may_direct_new {
+    let mut slots = if may_direct_new && !group_has_failure {
         budget.saturating_sub(in_flight)
     } else {
         0
@@ -948,6 +986,114 @@ mod tests {
 
         assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Pending);
         assert!(control.directed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_pauses_before_a_sibling_upgrades() {
+        // The cluster-test scenario at the unit level: the first council
+        // node is a fail-boot node. It must pause the run BEFORE the second
+        // council node is ever directed, so "only the failing node was
+        // attempted" holds — no node upgrades past a failure.
+        let control = MockControl::default();
+        let mut state = cluster_state(
+            vec![
+                record("c1", NodeRole::Council, NodeUpgradePhase::Pending),
+                record("c2", NodeRole::Council, NodeUpgradePhase::Pending),
+            ],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+
+        // Tick 1: c1 is on the old version, healthy. It gets directed; c2
+        // must stay Pending (one at a time).
+        control.set("addr-c1", "0.1.0", true, false);
+        control.set("addr-c2", "0.1.0", true, false);
+        let state = step(state, &control, &context()).await;
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Directed);
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
+
+        // Tick 2: c1 reports the upgrade in flight (crash-looping); c2 still
+        // Pending, still not directed.
+        control.set("addr-c1", "0.1.0", true, true);
+        let state = step(state, &control, &context()).await;
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Verifying);
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
+
+        // Tick 3: c1 reverted — back on the old version, reporting our id in
+        // failed_upgrade_ids. The run pauses; c2 was never directed.
+        control.set_failed("addr-c1", "0.1.0", "up-1");
+        let state = step(state, &control, &context()).await;
+        assert!(matches!(
+            state.nodes[0].phase,
+            NodeUpgradePhase::Failed { .. }
+        ));
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+        // c1 was the only node ever directed.
+        assert_eq!(control.directed(), vec!["addr-c1"]);
+    }
+
+    #[tokio::test]
+    async fn a_node_that_reverts_after_reporting_healthy_is_re_failed() {
+        // Guard against the "lucky mid-crash-loop poll" race: if a node was
+        // marked Healthy but a later poll shows it reverted our upgrade id,
+        // it must go back to Failed and pause the run — not stay Healthy and
+        // let the walk advance past a node that didn't really upgrade.
+        let control = MockControl::default();
+        let mut state = cluster_state(
+            vec![record("c1", NodeRole::Council, NodeUpgradePhase::Healthy)],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+        control.set_failed("addr-c1", "0.1.0", "up-1");
+
+        let state = step(state, &control, &context()).await;
+
+        assert!(matches!(
+            state.nodes[0].phase,
+            NodeUpgradePhase::Failed { .. }
+        ));
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_node_reverting_to_old_version_is_re_failed() {
+        // Same guard, but the node quietly reverted without reporting a
+        // failed id: it is stably back on the old version. Still a failure.
+        let control = MockControl::default();
+        let mut state = cluster_state(
+            vec![record("c1", NodeRole::Council, NodeUpgradePhase::Healthy)],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+        control.set("addr-c1", "0.1.0", true, false);
+
+        let state = step(state, &control, &context()).await;
+
+        assert!(matches!(
+            state.nodes[0].phase,
+            NodeUpgradePhase::Failed { .. }
+        ));
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_node_with_a_transient_blip_stays_healthy() {
+        // A completed node that briefly stops answering (probe None) must
+        // NOT be demoted — only a stable revert fails it.
+        let control = MockControl::default();
+        let mut state = cluster_state(
+            vec![record("c1", NodeRole::Council, NodeUpgradePhase::Healthy)],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+        // No entry for addr-c1 → probe returns None (unreachable blip).
+
+        let state = step(state, &control, &context()).await;
+
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+        // A single healthy council node is done → advances past the group.
+        assert_ne!(state.phase, ClusterUpgradePhase::UpgradingCouncil);
     }
 
     #[tokio::test]
