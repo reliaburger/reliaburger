@@ -128,12 +128,13 @@ All resource faults are Linux-only. On macOS, the functions return `ResourceFaul
 
 This is where Smoker earns its keep. Network faults operate at the kernel level, in the same eBPF programs that Onion uses for service discovery.
 
-We add four new BPF maps alongside Onion's existing maps:
+We add three new BPF maps alongside Onion's existing maps:
 
 - `fault_connect_map` — per-service connection faults (drop, delay, partition)
-- `fault_dns_map` — per-service DNS faults (NXDOMAIN)
 - `fault_bw_map` — per-service bandwidth throttling
 - `fault_state_map` — per-CPU PRNG state for probabilistic faults
+
+There's no `fault_dns_map`. DNS resolution moved out of the kernel and into a userspace responder (Chapter 3), so the DNS fault lives there too. More on that in a moment — it's a good lesson in keeping a fault pointed at the code that actually runs.
 
 The Rust-side structs use `#[repr(C)]` with explicit padding to match the C layouts exactly:
 
@@ -181,9 +182,63 @@ A partition between service A and service B uses the `source_cgroup_id` field in
 
 Bidirectional partitions require two map entries (A→B and B→A). Unidirectional partitions are one entry — A can't reach B, but B can still reach A.
 
-### DNS NXDOMAIN
+### DNS NXDOMAIN (and a fault that did nothing)
 
-The DNS interception hook checks `fault_dns_map` before the normal `dns_map` lookup. If the service name has a fault entry of type NXDOMAIN, the application's `getaddrinfo()` call fails with `EAI_NONAME`. From the application's perspective, the service simply doesn't exist.
+Here's a fault that taught us a lesson. The `DnsNxdomain` fault is meant to make a service's name stop resolving: you point it at `redis`, and any container that asks for `redis.internal` gets NXDOMAIN back, exactly as if Redis had never been deployed. It's how you prove your app survives a dependency vanishing from DNS.
+
+For a long time it did nothing at all.
+
+The original plan put the fault in the kernel: a `fault_dns_map` that the in-kernel DNS interception hook would check before resolving. But that in-kernel DNS path never shipped. As Chapter 3 explains, cgroup socket hooks can rewrite an address but can't read or synthesise a DNS packet payload, so DNS resolution moved to a small **userspace** responder (`src/onion/dns.rs`). The fault, though, stayed pointed at the kernel map — a map that lived only in an eBPF object we never load. So applying `DnsNxdomain` dutifully wrote an entry into a map nobody reads, reported success, and changed nothing. The acceptance gate in Chapter 15 caught it: an advertised fault that's a silent no-op is worse than no fault, because you *think* you tested something.
+
+The fix is to put the fault where the code actually runs. The responder resolves `.internal` names; the fault belongs in that lookup. We give the responder a read-only handle to "which services are currently faulted", and it checks that handle before it answers:
+
+```rust
+use std::collections::BTreeMap;
+
+/// Which services the Smoker is currently forcing NXDOMAIN for.
+#[derive(Debug, Clone, Default)]
+pub struct DnsFaultState {
+    /// App name → expiry (CLOCK_MONOTONIC nanoseconds). 0 means "no expiry".
+    faulted: BTreeMap<String, u64>,
+}
+
+impl DnsFaultState {
+    pub fn is_faulted(&self, app: &str, now_ns: u64) -> bool {
+        match self.faulted.get(app) {
+            Some(&expires_ns) => expires_ns == 0 || now_ns < expires_ns,
+            None => false,
+        }
+    }
+}
+```
+
+`BTreeMap` is Rust's ordered map (a balanced tree, like C++'s `std::map`); we use it rather than the hash-based `HashMap` because the set is tiny and an ordered map serialises and prints deterministically, which is easier to reason about. The `is_faulted` method returns `true` only while a fault is live: an entry whose deadline has already passed is treated as gone even if it's still sitting in the map. That's a belt-and-braces guard, and it's why the fault can't outlive its window even if a message goes missing.
+
+How does the responder *get* this state? The same way it gets the service map: a `watch` channel. A `watch` channel in tokio is a single-writer, many-reader broadcast of the *latest* value — readers don't get a history, they get whatever's current, which is exactly right for "the set of faults right now". The agent owns the writer (`watch::Sender<DnsFaultState>`); the responder holds a `watch::Receiver<DnsFaultState>` and reads the newest value on each query with `borrow()`. When a fault is applied, cleared, or expires, the agent rebuilds the set from its fault registry and sends it:
+
+```rust
+fn publish_dns_faults(&self) {
+    let faults = self
+        .fault_registry
+        .iter()
+        .filter(|rule| matches!(rule.fault_type, FaultType::DnsNxdomain))
+        .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
+    let _ = self.dns_faults_tx.send(DnsFaultState::from_faults(faults));
+}
+```
+
+The resolver check itself is three lines, sitting right after the source-ACL check and before the service-map lookup:
+
+```rust
+let now_ns = crate::smoker::types::monotonic_now_ns();
+if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
+    return build_status_response(query, RCODE_NXDOMAIN);
+}
+```
+
+The application's `getaddrinfo("redis.internal")` now fails with `EAI_NONAME`. From the application's perspective, the service simply doesn't exist — which is the whole point.
+
+Two things fall out of this. First, `DnsNxdomain` no longer counts as an "eBPF fault": it works wherever the responder runs, so `requires_ebpf()` returns `false` for it. The faults that genuinely need the kernel data path (delay, drop, partition, bandwidth) still return `true` and still get rejected honestly on a node without eBPF. Second, reversal is free: clearing or expiring the fault removes it from the registry, we republish the smaller set, and the name resolves again on the very next query. No kernel map to clean up, because there never should have been one.
 
 ## Network security
 
@@ -273,7 +328,8 @@ Each fault type now maps to a mechanism, and the mechanism is the truth:
 - **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT`. A pause now records its frozen PIDs and auto-resumes them on clear or expiry, so a paused workload can't be left wedged. These work on every platform because signals are POSIX, not Linux-specific.
 - **CPU stress, memory pressure and disk-IO throttle** cap the *target* instance's cgroup — `cpu.max`, `memory.high`, `io.max` — after threading the workload's namespace/app/ordinal into the fault. The pre-limit value is saved and restored on clear or expiry. They need cgroups, so they work on Linux and return a clear "requires Linux cgroups" error elsewhere.
 - **Node drain and node kill** are cluster-level operations, not node-local faults, so the agent rejects them honestly (a 4xx with a clear reason) rather than recording a success that changes nothing. The real effect belongs with the scheduler and self-healing machinery.
-- **Delay, drop, DNS NXDOMAIN, bandwidth** need the eBPF data path from Chapter 3. Without the `ebpf` feature loaded, the API now *rejects* these with "requires the eBPF data path, which is not loaded on this node" instead of recording a fault it can't enforce. A 400, not a fake 200.
+- **Delay, drop, bandwidth** need the eBPF data path from Chapter 3. Without the `ebpf` feature loaded, the API now *rejects* these with "requires the eBPF data path, which is not loaded on this node" instead of recording a fault it can't enforce. A 400, not a fake 200.
+- **DNS NXDOMAIN** acts in the userspace `.internal` responder (see above), so it needs no eBPF — it takes effect wherever the responder runs, and reverses on clear or expiry by republishing the faulted-service set.
 - **Partition** populates the real transport blocklists.
 
 That last one is worth dwelling on, because it turns out you don't need eBPF to partition a cluster honestly. The gossip transport (Chapter 2) and the Raft network (also Chapter 2) each consult a shared blocklist before sending or accepting a datagram: if the peer's address is in the set, the packet is dropped. The set is normally empty. A partition fault resolves the target peer names to their gossip addresses and inserts them into both blocklists; healing clears them. Because the check sits on both the send and receive paths, cutting one node off from two peers is symmetric — the isolated node stops answering SWIM probes, its peers stop hearing from it, and within the failure-detection window they mark it Dead. Heal, and it rejoins. The `partition_isolates_a_node_for_real` integration test drives exactly this through the HTTP API on a three-node cluster: no kernel, no eBPF, a genuine network partition.

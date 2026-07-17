@@ -60,34 +60,6 @@ mod inner {
         Ok(())
     }
 
-    /// Write a DNS fault entry.
-    pub fn write_dns_fault(
-        bpf: &mut aya::Ebpf,
-        key: BpfDnsFaultKey,
-        value: BpfDnsFaultValue,
-    ) -> Result<(), BpfMapError> {
-        let mut map: HashMap<_, BpfDnsFaultKey, BpfDnsFaultValue> =
-            HashMap::try_from(bpf.map_mut("fault_dns_map").ok_or_else(|| {
-                BpfMapError::MapNotFound {
-                    map_name: "fault_dns_map".into(),
-                }
-            })?)?;
-        map.insert(key, value, 0)?;
-        Ok(())
-    }
-
-    /// Delete a DNS fault entry.
-    pub fn delete_dns_fault(bpf: &mut aya::Ebpf, key: &BpfDnsFaultKey) -> Result<(), BpfMapError> {
-        let mut map: HashMap<_, BpfDnsFaultKey, BpfDnsFaultValue> =
-            HashMap::try_from(bpf.map_mut("fault_dns_map").ok_or_else(|| {
-                BpfMapError::MapNotFound {
-                    map_name: "fault_dns_map".into(),
-                }
-            })?)?;
-        map.remove(key)?;
-        Ok(())
-    }
-
     /// Write a bandwidth fault entry.
     pub fn write_bw_fault(
         bpf: &mut aya::Ebpf,
@@ -124,7 +96,7 @@ mod inner {
     /// Called on Bun startup to ensure a clean state after a crash.
     pub fn cleanup_all_fault_maps(bpf: &mut aya::Ebpf) {
         // Best-effort cleanup — log warnings but don't fail startup.
-        for map_name in &["fault_connect_map", "fault_dns_map", "fault_bw_map"] {
+        for map_name in &["fault_connect_map", "fault_bw_map"] {
             if let Some(map_ref) = bpf.map_mut(map_name) {
                 // We can't easily iterate and delete from a generic map
                 // without knowing the key type. For startup cleanup, the
@@ -158,17 +130,6 @@ mod inner {
     }
 
     pub fn delete_connect_fault(_key: &BpfConnectFaultKey) -> Result<(), BpfMapError> {
-        Err(BpfMapError::Unsupported)
-    }
-
-    pub fn write_dns_fault(
-        _key: BpfDnsFaultKey,
-        _value: BpfDnsFaultValue,
-    ) -> Result<(), BpfMapError> {
-        Err(BpfMapError::Unsupported)
-    }
-
-    pub fn delete_dns_fault(_key: &BpfDnsFaultKey) -> Result<(), BpfMapError> {
         Err(BpfMapError::Unsupported)
     }
 
@@ -209,21 +170,6 @@ mod tests {
             expires_ns: 0,
         };
         let result = write_connect_fault(key, value);
-        assert!(matches!(result, Err(BpfMapError::Unsupported)));
-    }
-
-    #[cfg(not(feature = "ebpf"))]
-    #[test]
-    fn dns_stub_returns_unsupported() {
-        let key = dns_fault_key("redis");
-        let value = BpfDnsFaultValue {
-            action: DNS_FAULT_NXDOMAIN,
-            probability: 100,
-            _pad: [0; 6],
-            delay_ns: 0,
-            expires_ns: 0,
-        };
-        let result = write_dns_fault(key, value);
         assert!(matches!(result, Err(BpfMapError::Unsupported)));
     }
 

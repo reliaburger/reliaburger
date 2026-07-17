@@ -70,7 +70,7 @@ Smoker is not a standalone subsystem. It extends three existing components:
 
 Smoker's network faults are implemented by extending the same eBPF programs that Onion uses for service discovery. The DNS interception hook (attached to `sock_ops` for UDP+TCP port 53) and the connect interception hook (attached to `connect4` / `sock_ops`) already intercept every relevant system call. Smoker adds fault map lookups to these existing programs -- it does not load new eBPF programs.
 
-The existing Onion maps (`dns_map`, `backend_map`, `firewall_map`) are unmodified. Smoker adds four new BPF maps (`fault_dns_map`, `fault_connect_map`, `fault_bw_map`, `fault_state_map`) that the eBPF programs check before or after the normal service map lookup.
+The existing Onion maps (`dns_map`, `backend_map`, `firewall_map`) are unmodified. Smoker adds three BPF maps (`fault_connect_map`, `fault_bw_map`, `fault_state_map`) that the eBPF programs check around the normal service map lookup. (The DNS fault is the exception: DNS resolution runs in userspace, so `DnsNxdomain` is applied there rather than through a BPF map — see §5.1.3.)
 
 ### 2.2 Bun (Node Agent)
 
@@ -678,9 +678,11 @@ int smoker_drop_connect4(struct bpf_sock_addr *ctx) {
 
 #### 5.1.3 DNS NXDOMAIN
 
-> **Status.** DNS resolution moved to a userspace responder (`src/onion/dns.rs`; see [discovery-onion.md](discovery-onion.md) §1), so the in-kernel eBPF DNS-fault path described below is part of the *original* in-kernel DNS design, not the shipped resolution path. The intended behaviour is unchanged (a targeted service returns NXDOMAIN); the fault belongs in the userspace responder's lookup, which already knows how to answer an unknown `.internal` name with NXDOMAIN. The kernel listing is kept for teaching.
+> **Status (shipped).** DNS resolution moved to a userspace responder (`src/onion/dns.rs`; see [discovery-onion.md](discovery-onion.md) §1), so the `DnsNxdomain` fault acts *there*, not in the kernel. The agent publishes the set of faulted service names on a `watch` channel (`DnsFaultState`); the responder returns NXDOMAIN for any queried service in that set, before it consults the service map. Clear and expiry remove the service from the set (the resolver also self-corrects past a fault's expiry), so it reverses like every other Smoker fault. `DnsNxdomain` therefore does **not** require the eBPF data path — it takes effect wherever the responder runs. The `fault_dns_map` in the never-loaded in-kernel DNS object was dead code and has been removed; the eBPF listing below is kept only to teach how the same effect would look in the kernel.
 
-The DNS interception hook checks `fault_dns_map` before the normal `dns_map` lookup. If the service name has a fault entry of type NXDOMAIN, the eBPF program constructs an NXDOMAIN DNS response directly in the kernel and returns it to the application. The application's `getaddrinfo()` call fails with `EAI_NONAME` -- indistinguishable from a real DNS resolution failure.
+The userspace check is one lookup: strip `.internal`, key the query by its bare app name (the same way every Smoker fault targets a service), and if that name is in the faulted set, answer NXDOMAIN. The application's `getaddrinfo()` call then fails with `EAI_NONAME` -- indistinguishable from a real DNS resolution failure.
+
+The original in-kernel design checked `fault_dns_map` before the normal `dns_map` lookup and constructed the NXDOMAIN response directly in the kernel:
 
 ```c
 // eBPF pseudocode: DNS NXDOMAIN fault in DNS hook
@@ -1286,8 +1288,9 @@ fn cleanup_fault(fault: &FaultRule) {
             bpf_map_delete_elem(&fault_connect_map_fd, &key);
         }
         FaultType::DnsNxdomain => {
-            let key = build_dns_fault_key(fault);
-            bpf_map_delete_elem(&fault_dns_map_fd, &key);
+            // Userspace fault: republish the (now smaller) faulted-service
+            // set so the DNS responder stops returning NXDOMAIN for it.
+            republish_dns_faults();
         }
         FaultType::Bandwidth { .. } => {
             let key = build_bw_fault_key(fault);

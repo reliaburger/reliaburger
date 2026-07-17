@@ -1158,6 +1158,13 @@ whole theme lands.
   - [x] Node drain / node kill return an honest rejection (a cluster-level operation, not a
     node-local fault) instead of a fake Ok; the real effect lands with the self-healing/
     upgrade themes that own the cluster machinery.
+  - [x] `DnsNxdomain` acts in the userspace `.internal` resolver (was: wrote a `fault_dns_map`
+    entry into a never-loaded eBPF object, so it did nothing on any config — caught by the
+    12b.6 gate). The agent publishes the faulted-service set on a `watch` channel
+    (`onion::dns::DnsFaultState`); the responder returns NXDOMAIN for a targeted service before
+    the service-map lookup, and clear/expiry republish the smaller set so it reverses like every
+    other fault. `requires_ebpf()` is now `false` for `DnsNxdomain`; the dead `fault_dns_map`
+    (Rust + eBPF C) is removed. Portable tests drive the resolver and the full UDP path.
   - [x] Reversal state (`FaultReversal`) rides on the registry's `FaultRule` (runtime-only,
     `#[serde(skip)]`), captured at apply time via `record_reversal`/`get_mut`.
   - [x] Portable tests cover cpu-quota computation, drain/kill/oom rejection, pause

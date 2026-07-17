@@ -15,7 +15,6 @@
  * Only UDP DNS is intercepted; TCP DNS bypasses Onion entirely.
  */
 #include "onion_common.h"
-#include "smoker_common.h"
 
 /* ---------- Map definitions --------------------------------------------- */
 
@@ -35,14 +34,9 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } dns_pending_map SEC(".maps");
 
-/* Smoker DNS fault map — checked before normal resolution */
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, struct fault_dns_key);
-    __type(value, struct fault_dns_value);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-} fault_dns_map SEC(".maps");
+/* The Smoker DNS fault lives in the userspace responder now, not the
+ * kernel: this object was never loaded, so its fault_dns_map was dead.
+ * See src/onion/dns.rs::DnsFaultState. */
 
 /* ---------- Helpers ----------------------------------------------------- */
 

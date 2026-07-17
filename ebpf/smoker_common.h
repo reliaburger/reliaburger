@@ -14,9 +14,8 @@
 #define FAULT_ACTION_DELAY      2
 #define FAULT_ACTION_PARTITION  3
 
-#define DNS_FAULT_NONE          0
-#define DNS_FAULT_NXDOMAIN      1
-#define DNS_FAULT_DELAY         2
+/* DNS faults act in the userspace .internal responder, not the kernel, so
+ * there is no fault_dns_map. See src/onion/dns.rs::DnsFaultState. */
 
 /* ---------- fault_connect_map -------------------------------------------- */
 
@@ -35,22 +34,6 @@ struct fault_connect_value {
     __u8  _pad[6];
     __u64 delay_ns;           /* nanoseconds (FAULT_ACTION_DELAY) */
     __u64 jitter_ns;          /* +/- random range (FAULT_ACTION_DELAY) */
-    __u64 expires_ns;         /* CLOCK_MONOTONIC ns, 0 = no expiry */
-};
-
-/* ---------- fault_dns_map ------------------------------------------------ */
-
-/* Key: 4 bytes */
-struct fault_dns_key {
-    __u32 service_name_hash;  /* FNV-1a hash of the service name */
-};
-
-/* Value: 24 bytes */
-struct fault_dns_value {
-    __u8  action;             /* DNS_FAULT_* */
-    __u8  probability;        /* 0-100 */
-    __u8  _pad[6];
-    __u64 delay_ns;           /* nanoseconds (DNS_FAULT_DELAY) */
     __u64 expires_ns;         /* CLOCK_MONOTONIC ns, 0 = no expiry */
 };
 

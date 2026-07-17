@@ -17,12 +17,9 @@ pub const FAULT_ACTION_DELAY: u8 = 2;
 /// Block connections from a specific source cgroup.
 pub const FAULT_ACTION_PARTITION: u8 = 3;
 
-/// DNS fault: no fault.
-pub const DNS_FAULT_NONE: u8 = 0;
-/// DNS fault: return NXDOMAIN.
-pub const DNS_FAULT_NXDOMAIN: u8 = 1;
-/// DNS fault: delay the response.
-pub const DNS_FAULT_DELAY: u8 = 2;
+// DNS faults act in the userspace `.internal` responder, not in the kernel,
+// so there is no DNS fault map here (see `crate::onion::dns::DnsFaultState`).
+// The in-kernel DNS eBPF object was never loaded, so its fault map was dead.
 
 // ---------------------------------------------------------------------------
 // fault_connect_map
@@ -59,36 +56,6 @@ pub struct BpfConnectFaultValue {
     pub delay_ns: u64,
     /// Jitter in nanoseconds (action = DELAY). Actual delay = delay_ns +/- rand(jitter_ns).
     pub jitter_ns: u64,
-    /// Expiry timestamp (CLOCK_MONOTONIC, nanoseconds). 0 = no expiry.
-    pub expires_ns: u64,
-}
-
-// ---------------------------------------------------------------------------
-// fault_dns_map
-// ---------------------------------------------------------------------------
-
-/// Key for `fault_dns_map`.
-///
-/// BPF map type: `BPF_MAP_TYPE_HASH`, max_entries: 1024.
-/// Uses FNV-1a hash of the service name for compact lookup.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct BpfDnsFaultKey {
-    /// FNV-1a hash of the service name (e.g. hash("redis")).
-    pub service_name_hash: u32,
-}
-
-/// Value for `fault_dns_map`.
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct BpfDnsFaultValue {
-    /// Fault action: DNS_FAULT_NONE/NXDOMAIN/DELAY.
-    pub action: u8,
-    /// Probability 0-100 (100 = always apply).
-    pub probability: u8,
-    pub _pad: [u8; 6],
-    /// Delay in nanoseconds (only used when action = DNS_FAULT_DELAY).
-    pub delay_ns: u64,
     /// Expiry timestamp (CLOCK_MONOTONIC, nanoseconds). 0 = no expiry.
     pub expires_ns: u64,
 }
@@ -165,10 +132,6 @@ unsafe impl aya::Pod for BpfConnectFaultKey {}
 #[cfg(feature = "ebpf")]
 unsafe impl aya::Pod for BpfConnectFaultValue {}
 #[cfg(feature = "ebpf")]
-unsafe impl aya::Pod for BpfDnsFaultKey {}
-#[cfg(feature = "ebpf")]
-unsafe impl aya::Pod for BpfDnsFaultValue {}
-#[cfg(feature = "ebpf")]
 unsafe impl aya::Pod for BpfBandwidthFaultKey {}
 #[cfg(feature = "ebpf")]
 unsafe impl aya::Pod for BpfBandwidthFaultValue {}
@@ -176,29 +139,6 @@ unsafe impl aya::Pod for BpfBandwidthFaultValue {}
 unsafe impl aya::Pod for BpfFaultStateKey {}
 #[cfg(feature = "ebpf")]
 unsafe impl aya::Pod for BpfFaultStateValue {}
-
-// ---------------------------------------------------------------------------
-// Helper: FNV-1a hash (matches the eBPF-side implementation)
-// ---------------------------------------------------------------------------
-
-/// FNV-1a hash of a byte slice, matching the eBPF-side implementation.
-///
-/// Used to hash service names into `BpfDnsFaultKey.service_name_hash`.
-pub fn fnv1a_hash(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5; // FNV offset basis
-    for &byte in data {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(0x0100_0193); // FNV prime
-    }
-    hash
-}
-
-/// Build a DNS fault key from a service name.
-pub fn dns_fault_key(service_name: &str) -> BpfDnsFaultKey {
-    BpfDnsFaultKey {
-        service_name_hash: fnv1a_hash(service_name.to_ascii_lowercase().as_bytes()),
-    }
-}
 
 /// Build a connect fault key for a service VIP + port (all callers).
 pub fn connect_fault_key(virtual_ip: u32, port: u16) -> BpfConnectFaultKey {
@@ -255,16 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn dns_fault_key_size() {
-        assert_eq!(std::mem::size_of::<BpfDnsFaultKey>(), 4);
-    }
-
-    #[test]
-    fn dns_fault_value_size() {
-        assert_eq!(std::mem::size_of::<BpfDnsFaultValue>(), 24); // 8 header + 2x u64
-    }
-
-    #[test]
     fn bandwidth_fault_key_size() {
         assert_eq!(std::mem::size_of::<BpfBandwidthFaultKey>(), 8);
     }
@@ -318,34 +248,7 @@ mod tests {
         assert_eq!(&val.expires_ns as *const _ as usize - base, 24);
     }
 
-    // FNV-1a hash tests
-
-    #[test]
-    fn fnv1a_empty_string() {
-        assert_eq!(fnv1a_hash(b""), 0x811c_9dc5);
-    }
-
-    #[test]
-    fn fnv1a_known_value() {
-        // FNV-1a of "redis" — verify deterministic
-        let h1 = fnv1a_hash(b"redis");
-        let h2 = fnv1a_hash(b"redis");
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
-    fn fnv1a_different_names_differ() {
-        assert_ne!(fnv1a_hash(b"redis"), fnv1a_hash(b"api"));
-    }
-
     // Key builder tests
-
-    #[test]
-    fn dns_fault_key_normalises_case() {
-        let k1 = dns_fault_key("Redis");
-        let k2 = dns_fault_key("redis");
-        assert_eq!(k1.service_name_hash, k2.service_name_hash);
-    }
 
     #[test]
     fn connect_fault_key_all_callers() {

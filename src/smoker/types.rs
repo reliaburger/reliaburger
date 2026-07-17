@@ -32,11 +32,13 @@ impl fmt::Display for FaultId {
 
 /// The type of fault being injected.
 ///
-/// Network faults (Delay, Drop, DnsNxdomain, Partition, Bandwidth)
-/// require eBPF on Linux. Resource faults (CpuStress, MemoryPressure,
-/// DiskIoThrottle) require cgroups on Linux. Process faults (Kill,
-/// Pause, Resume) and node faults (NodeDrain, NodeKill) work on all
-/// platforms.
+/// Packet-level network faults (Delay, Drop, Partition, Bandwidth)
+/// require eBPF on Linux. DnsNxdomain is a network fault too, but it
+/// acts in the userspace DNS responder (Onion's `.internal` resolver),
+/// not the kernel, so it works wherever the responder runs. Resource
+/// faults (CpuStress, MemoryPressure, DiskIoThrottle) require cgroups on
+/// Linux. Process faults (Kill, Pause, Resume) and node faults
+/// (NodeDrain, NodeKill) work on all platforms.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum FaultType {
@@ -197,13 +199,19 @@ impl fmt::Display for FaultType {
 }
 
 impl FaultType {
-    /// Whether this fault type requires eBPF (Linux only with ebpf feature).
+    /// Whether this fault type requires the eBPF data path (Linux only with
+    /// the `ebpf` feature).
+    ///
+    /// `DnsNxdomain` is deliberately *not* here. DNS resolution moved to the
+    /// userspace `.internal` responder (the in-kernel DNS eBPF object was
+    /// never loaded), so the fault takes effect there and needs no eBPF. It
+    /// used to be listed, which made it look implemented while it silently did
+    /// nothing (the 12b.6 gate caught this).
     pub fn requires_ebpf(&self) -> bool {
         matches!(
             self,
             Self::Delay { .. }
                 | Self::Drop { .. }
-                | Self::DnsNxdomain
                 | Self::Partition { .. }
                 | Self::Bandwidth { .. }
         )
@@ -622,7 +630,8 @@ mod tests {
             .requires_ebpf()
         );
         assert!(FaultType::Drop { probability: 10 }.requires_ebpf());
-        assert!(FaultType::DnsNxdomain.requires_ebpf());
+        // DnsNxdomain acts in the userspace resolver, not the kernel.
+        assert!(!FaultType::DnsNxdomain.requires_ebpf());
         assert!(!FaultType::Kill { count: 1 }.requires_ebpf());
         assert!(!FaultType::Pause.requires_ebpf());
         assert!(!FaultType::NodeDrain.requires_ebpf());
