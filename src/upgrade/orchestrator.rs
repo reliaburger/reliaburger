@@ -105,7 +105,7 @@ pub async fn step<C: NodeControl>(
         }
 
         ClusterUpgradePhase::UpgradingWorkers => {
-            poll_and_drive_group(&mut state, control, context, NodeRole::Worker).await;
+            poll_and_drive_group(&mut state, control, context, NodeRole::Worker, true).await;
             if let Some(reason) = first_failure(&state) {
                 state.phase = ClusterUpgradePhase::Paused { reason };
             } else if group_done(&state, NodeRole::Worker) {
@@ -115,9 +115,20 @@ pub async fn step<C: NodeControl>(
         }
 
         ClusterUpgradePhase::UpgradingCouncil => {
-            if context.quorum_ok || group_in_flight(&state, NodeRole::Council) > 0 {
-                poll_and_drive_group(&mut state, control, context, NodeRole::Council).await;
-            }
+            // Always poll and detect failures; only START a new council
+            // upgrade while quorum has headroom. Gating the whole call on
+            // quorum (as an earlier version did) stalled recovery: a dead
+            // voter flips `quorum_ok` false, and with no council node yet in
+            // flight the failing node was never polled, so the run never
+            // paused. Separating the two fixes that.
+            poll_and_drive_group(
+                &mut state,
+                control,
+                context,
+                NodeRole::Council,
+                context.quorum_ok,
+            )
+            .await;
             if let Some(reason) = first_failure(&state) {
                 state.phase = ClusterUpgradePhase::Paused { reason };
             } else if group_done(&state, NodeRole::Council) {
@@ -144,7 +155,7 @@ pub async fn step<C: NodeControl>(
         }
 
         ClusterUpgradePhase::UpgradingLeader => {
-            poll_and_drive_group(&mut state, control, context, NodeRole::Leader).await;
+            poll_and_drive_group(&mut state, control, context, NodeRole::Leader, true).await;
             if let Some(reason) = first_failure(&state) {
                 state.phase = ClusterUpgradePhase::Paused { reason };
             } else if group_done(&state, NodeRole::Leader) {
@@ -157,11 +168,19 @@ pub async fn step<C: NodeControl>(
 
 /// Poll every non-terminal node of `role`; direct new ones up to the
 /// group's concurrency budget (workers: `parallel`; everyone else: 1).
+///
+/// `may_direct_new` gates ONLY the "send a directive to the next Pending
+/// node" step (pass 2). Polling in-flight nodes and detecting failures
+/// (pass 1) and re-sending to already-Directed nodes (pass 3) always run,
+/// whatever `may_direct_new` says — so the quorum gate that stops a council
+/// upgrade from *starting* another node cannot also stall failure detection
+/// or block recovery of an already-troubled cluster.
 async fn poll_and_drive_group<C: NodeControl>(
     state: &mut ClusterUpgradeState,
     control: &C,
     context: &StepContext,
     role: NodeRole,
+    may_direct_new: bool,
 ) {
     let target = state.target_version.clone();
     let direction = state.direction;
@@ -253,7 +272,10 @@ async fn poll_and_drive_group<C: NodeControl>(
         }
     }
 
-    // Pass 2: fill the concurrency budget with Pending nodes.
+    // Pass 2: fill the concurrency budget with Pending nodes — but only
+    // when allowed to start a new one (the council quorum gate). When
+    // `may_direct_new` is false we leave Pending nodes untouched; pass 1
+    // above has already polled and failed-detected everything in flight.
     let in_flight = state
         .nodes
         .iter()
@@ -265,7 +287,11 @@ async fn poll_and_drive_group<C: NodeControl>(
                 )
         })
         .count();
-    let mut slots = budget.saturating_sub(in_flight);
+    let mut slots = if may_direct_new {
+        budget.saturating_sub(in_flight)
+    } else {
+        0
+    };
     let mut directed_this_tick = Vec::new();
 
     for record in state.nodes.iter_mut().filter(|n| n.role == role) {
@@ -367,20 +393,6 @@ fn group_done(state: &ClusterUpgradeState, role: NodeRole) -> bool {
         .iter()
         .filter(|n| n.role == role)
         .all(|n| n.phase == NodeUpgradePhase::Healthy)
-}
-
-fn group_in_flight(state: &ClusterUpgradeState, role: NodeRole) -> usize {
-    state
-        .nodes
-        .iter()
-        .filter(|n| {
-            n.role == role
-                && matches!(
-                    n.phase,
-                    NodeUpgradePhase::Directed | NodeUpgradePhase::Verifying
-                )
-        })
-        .count()
 }
 
 /// Un-pause a paused upgrade: failed nodes go back to Pending (they are
@@ -935,6 +947,61 @@ mod tests {
         let state = step(state, &control, &ctx).await;
 
         assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Pending);
+        assert!(control.directed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn low_quorum_still_detects_a_failed_council_node_and_pauses() {
+        // The scenario that stalled a real cluster: a council node is in
+        // flight and reverts itself. Meanwhile a voter has died, so
+        // `quorum_ok` is false. The quorum gate must NOT stop us polling the
+        // in-flight node and pausing on its failure — otherwise the run
+        // stalls in UpgradingCouncil forever and the cluster never recovers.
+        let control = MockControl::default();
+        // c1 went through the swap and came back on the OLD version: reverted.
+        control.set("addr-c1", "0.1.0", true, false);
+        let mut state = cluster_state(
+            vec![record("c1", NodeRole::Council, NodeUpgradePhase::Verifying)],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+        state.nodes[0].from_version = Some(v("0.1.0"));
+
+        let mut ctx = context();
+        ctx.quorum_ok = false;
+        let state = step(state, &control, &ctx).await;
+
+        assert!(matches!(
+            state.nodes[0].phase,
+            NodeUpgradePhase::Failed { .. }
+        ));
+        assert!(matches!(state.phase, ClusterUpgradePhase::Paused { .. }));
+    }
+
+    #[tokio::test]
+    async fn low_quorum_does_not_direct_a_new_council_node_but_still_polls() {
+        // The other side of the gate: with quorum at risk and a Pending
+        // council node, we must not START its upgrade (no directive sent),
+        // yet a healthy in-flight peer is still polled to completion.
+        let control = MockControl::default();
+        control.set("addr-c1", "0.2.0", true, false); // in flight, now at target
+        control.set("addr-c2", "0.1.0", true, false); // pending, must stay put
+        let mut state = cluster_state(
+            vec![
+                record("c1", NodeRole::Council, NodeUpgradePhase::Verifying),
+                record("c2", NodeRole::Council, NodeUpgradePhase::Pending),
+            ],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingCouncil;
+
+        let mut ctx = context();
+        ctx.quorum_ok = false;
+        let state = step(state, &control, &ctx).await;
+
+        // c1 was polled and completed; c2 was NOT directed (quorum preserved).
+        assert_eq!(state.nodes[0].phase, NodeUpgradePhase::Healthy);
+        assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Pending);
         assert!(control.directed().is_empty());
     }
 
