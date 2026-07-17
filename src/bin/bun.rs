@@ -576,6 +576,34 @@ async fn main() -> anyhow::Result<()> {
     // used to carry zeroes).
     let (capacity_cpu, capacity_memory) = node_capacity(&config);
     agent.set_node_capacity(capacity_cpu, capacity_memory);
+
+    // Thread the `[process_workloads]` policy into the supervisor (D17/H8).
+    // Without this the supervisor keeps its deny-by-default constructor
+    // policy and an operator's allowlist would be silently ignored — a
+    // config deploy could run an arbitrary host binary through ProcessGrill.
+    agent.set_process_config(config.process_workloads.clone());
+
+    // Detect GPUs and record what this node can enforce, so the supervisor
+    // refuses a GPU request or rootless resource limit it can't back (D15/M22)
+    // instead of silently scheduling under weaker guarantees.
+    let gpu_count = if config.resources.gpu_enabled {
+        use reliaburger::bun::GpuDetector;
+        reliaburger::bun::NvidiaGpuDetector.detect().len() as u32
+    } else {
+        0
+    };
+    if config.resources.gpu_enabled {
+        println!("bun: GPU support enabled, {gpu_count} device(s) detected");
+    }
+    #[cfg(target_os = "linux")]
+    let rootless = reliaburger::grill::rootless::is_rootless();
+    #[cfg(not(target_os = "linux"))]
+    let rootless = false;
+    agent.set_platform_capabilities(reliaburger::bun::supervisor::PlatformCapabilities {
+        gpu_count,
+        gpu_enabled: config.resources.gpu_enabled,
+        rootless,
+    });
     // Wire [storage] volumes — the agent constructors default it, which
     // left the config key dead (review M21's second half).
     agent.set_volumes_dir(config.storage.volumes.clone());

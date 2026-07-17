@@ -831,7 +831,7 @@ pub struct UpgradeConfig {
 
 1. Receive `AppSpec` from WorkloadSupervisor. Verify `WorkloadSource` is `Exec` or `Script`.
 2. Transition to `Pending`.
-3. **Validate binary (Preparing):** For `Exec`, check that the binary path appears in `node.toml`'s `[process_workloads] allowed_binaries`. If `allow_globs = false`, reject any pattern-matched entries. If the binary is not in the allowlist, transition to `Failed` with a clear error and emit an event. For `Script`, no binary validation is needed (the script runs via the declared shebang interpreter, which itself must be in a default-visible path like `/usr/bin`).
+3. **Admission (deny-by-default):** Before anything is allocated, the WorkloadSupervisor refuses a workload this node can't honour. Host execution is **deny-by-default**: an `Exec` binary runs only if its absolute path appears in `node.toml`'s `[process_workloads] allowed_binaries`, and a `Script` runs only if the interpreter (`/bin/sh`) is allowlisted too — a script is just host execution of the shell, so an empty allowlist refuses it exactly like an un-listed binary. An empty or absent allowlist therefore denies every host workload, not allows it. (Container workloads via runc/apple are unaffected; the allowlist gates only ProcessGrill host execution.) The refusal is a `DeployFailed` error surfaced to the caller, not a silent drop. Mount isolation is enforced here too: if the config asks for it on a node that can't provide it (a non-Linux host), the deploy is refused rather than run with a host process that can see every workload's volumes.
 4. **Write inline script (Script only):** Write the script content to a temporary file in a Bun-managed temp directory (outside any workload's mount namespace). Mark it executable (`chmod 0755`). Compute and record the SHA-256 hash for the event log.
 5. **Allocate port:** Same as container workloads -- request from PortAllocator if the workload declares a port.
 6. **Create cgroup:** Identical to container workloads (step 5 of 5.1).
@@ -847,6 +847,8 @@ pub struct UpgradeConfig {
 12. **Drop privileges:** Switch to the `burger` user. Apply granted capabilities (if any) via `prctl(PR_CAP_AMBIENT)`.
 13. **Exec the binary (Starting):** `execve()` the binary with args (for Exec), or the temp script file (for Script). Capture stdout/stderr and pipe to Ketchup.
 14. **Health wait, running, health checking:** Identical to container workloads (steps 12-15 of 5.1).
+
+**GPU and rootless admission.** The same admission gate rejects two more silent lies the review flagged. A workload requesting a GPU (`gpu = N`) is refused when `[resources] gpu_enabled = false` or when GPU detection found fewer than `N` devices on the node -- `gpu_enabled` is now effective rather than a node that reports zero GPUs quietly accepting the work. GPU detection is real: Bun probes `/dev/nvidia0` and, when present, parses `nvidia-smi --query-gpu` to count cards, falling back cleanly to "no GPUs" on any node without the hardware or the tool. (OCI `/dev/nvidia*` device passthrough into the container spec is a follow-up; this pass makes placement honest rather than passing an ungoverned device set.) On a **rootless** node, a workload declaring cpu/memory limits is refused rather than run silently unlimited: rootless runc can't set cgroup limits without a systemd user scope Bun doesn't yet wire, so the honest answer is to fail the deploy and tell the operator to run as root or drop the limits.
 
 **Stop a process workload:**
 

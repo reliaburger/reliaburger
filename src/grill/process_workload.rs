@@ -20,6 +20,11 @@ pub struct ProcessManager {
     config: ProcessWorkloadsConfig,
 }
 
+/// The interpreter host scripts run through. An inline `script` workload is
+/// host execution of this binary, so it must appear in the allowlist just
+/// like any `exec` binary before a script may run.
+pub const SCRIPT_INTERPRETER: &str = "/bin/sh";
+
 /// A prepared process workload, ready to be passed to ProcessGrill.
 #[derive(Debug, Clone)]
 pub struct PreparedWorkload {
@@ -58,10 +63,10 @@ impl ProcessManager {
 
     /// Prepare an exec workload (host binary).
     ///
-    /// Validates the binary against the allowlist. Returns a
-    /// `PreparedWorkload` with the binary path and no temp file.
+    /// Enforces the deny-by-default allowlist: the binary runs only when its
+    /// absolute path is named in `node.toml`. Returns a `PreparedWorkload`
+    /// with the binary path and no temp file.
     pub fn prepare_exec(&self, binary: &Path) -> Result<PreparedWorkload, ProcessWorkloadError> {
-        // Check allowlist
         if !self.config.is_binary_allowed(binary) {
             return Err(ProcessWorkloadError::BinaryNotAllowed {
                 path: binary.to_path_buf(),
@@ -75,6 +80,24 @@ impl ProcessManager {
         })
     }
 
+    /// Whether inline scripts may run on this node: true only when the
+    /// interpreter (`/bin/sh`) is in the allowlist. Lets the supervisor
+    /// refuse a script deploy up front without writing a temp file.
+    pub fn is_script_allowed(&self) -> bool {
+        self.config
+            .is_binary_allowed(std::path::Path::new(SCRIPT_INTERPRETER))
+    }
+
+    fn ensure_script_allowed(&self) -> Result<(), ProcessWorkloadError> {
+        if self.is_script_allowed() {
+            Ok(())
+        } else {
+            Err(ProcessWorkloadError::BinaryNotAllowed {
+                path: PathBuf::from(SCRIPT_INTERPRETER),
+            })
+        }
+    }
+
     /// Prepare a script workload (inline script content).
     ///
     /// Writes the script to a temp file in the configured script dir,
@@ -86,6 +109,11 @@ impl ProcessManager {
         script_content: &str,
         name: &str,
     ) -> Result<PreparedWorkload, ProcessWorkloadError> {
+        // A script is host execution of the interpreter, so it is subject to
+        // the same deny-by-default allowlist. The operator opts into scripts
+        // by naming `/bin/sh` in `node.toml`.
+        self.ensure_script_allowed()?;
+
         // Ensure script directory exists
         std::fs::create_dir_all(&self.config.script_dir)
             .map_err(ProcessWorkloadError::ScriptCreateFailed)?;
@@ -162,10 +190,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_exec_empty_allowlist_allows_all() {
+    fn prepare_exec_empty_allowlist_denies_all() {
+        // Deny-by-default: an empty allowlist refuses every host binary.
         let mgr = manager_with_allowlist(vec![]);
-        let workload = mgr.prepare_exec(Path::new("/any/binary")).unwrap();
-        assert_eq!(workload.binary, PathBuf::from("/any/binary"));
+        let result = mgr.prepare_exec(Path::new("/any/binary"));
+        assert!(matches!(
+            result,
+            Err(ProcessWorkloadError::BinaryNotAllowed { .. })
+        ));
     }
 
     #[test]
@@ -179,8 +211,19 @@ mod tests {
     }
 
     #[test]
-    fn prepare_script_creates_temp_file() {
+    fn prepare_script_denied_without_interpreter_allowlisted() {
+        // A script is host execution of /bin/sh, so deny-by-default applies.
         let mgr = manager_with_allowlist(vec![]);
+        let result = mgr.prepare_script("echo hi", "test-app");
+        assert!(matches!(
+            result,
+            Err(ProcessWorkloadError::BinaryNotAllowed { .. })
+        ));
+    }
+
+    #[test]
+    fn prepare_script_creates_temp_file() {
+        let mgr = manager_with_allowlist(vec![PathBuf::from(SCRIPT_INTERPRETER)]);
         let workload = mgr.prepare_script("echo hello world", "test-app").unwrap();
 
         assert_eq!(workload.binary, PathBuf::from("/bin/sh"));
@@ -199,7 +242,7 @@ mod tests {
 
     #[test]
     fn prepare_script_temp_file_is_executable() {
-        let mgr = manager_with_allowlist(vec![]);
+        let mgr = manager_with_allowlist(vec![PathBuf::from(SCRIPT_INTERPRETER)]);
         let workload = mgr
             .prepare_script("#!/bin/sh\necho ok", "exec-test")
             .unwrap();
