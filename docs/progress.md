@@ -15,7 +15,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 - [x] Cargo workspace setup (binary `bun`, library `reliaburger`, test fixtures)
 - [x] TOML config parsing (App, Job, Secret, ConfigFile, Volume, Permission, Namespace)
-- [x] Grill container runtime interface (containerd/runc, OCI extraction, ports, cgroups)
+- [x] Grill container runtime interface (runc/Apple/process backends, driven directly — no containerd; OCI extraction, ports, cgroups)
 - [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection) — **restart re-drive broken for apps on all runtimes (`H1`); ~~GPU detector is a stub~~ (12b.6: real `NvidiaGpuDetector`; `gpu_enabled` now effective, GPU-request refused when unbacked)**
 - [x] Relish CLI skeleton (`apply`, `status`, `logs`, `exec`, `inspect`)
 - [x] ProcessGrill (cross-platform process-based runtime)
@@ -92,7 +92,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
   - [x] Agent lifecycle wiring (deploy/health/stop → service map)
   - [x] eBPF C programs and Rust loader scaffolding (Linux only) — **`[lib-only]` `L8` `onion_ebpf` is permanently `None`; `ebpf` feature not in default build; `.bpf.o` never installed**
   - [x] Wire aya loader for connect rewrite (cgroup/connect4) — **`[lib-only]` `L8` only loaded inside the feature-gated test binary**
-  - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis) — **`[lib-only]` `L9` `run_dns_responder` never spawned; see `M8` fragility**
+  - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis) — ~~`[lib-only]` `L9` `run_dns_responder` never spawned~~ (now spawned from `src/bin/bun.rs` when `[dns]` is enabled, and containers get their `resolv.conf` nameserver pointed at it)
   - [x] `relish dev test` runs Linux + eBPF tests from macOS via Lima
   - [x] eBPF integration tests (load/attach, map read/write, connect rewrite, DNS responder)
 - [x] Wrapper ingress proxy (host/path routing, load balancing, draining, rate limiting) — **`[lib-only]` `L7` the proxy never runs: `run_proxy` has no caller, no listener is bound**
@@ -197,7 +197,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Lettuce GitOps engine (sync loop, git ops, signature verification, diff engine, webhook endpoint, coordinator election, Raft integration, node config) — **`[lib-only]` `L13` nothing spawns the sync loop; webhook endpoint always 503; `[gitops]` config never read; `H12` trusted-key check always passes**
 - [x] Kubernetes migration (`relish import`, `relish export` via k8s-openapi, resource correlation, migration reports, optional `kubernetes` feature) — **`M17` import silently drops `command`/`args`, `env.valueFrom`, and namespace**
 - [x] `relish compile`, `relish diff`, `relish fmt` — **`H11` `relish fmt` corrupts nested-table configs (writes invalid TOML over the file)**
-- [x] WebSocket upgrade proxying in Wrapper ingress (detection, dispatch, close frame, draining) — **`[lib-only]` `L7` proxy never runs; handshake stub drops the backend stream and omits `Sec-WebSocket-Accept`**
+- [x] WebSocket upgrade proxying in Wrapper ingress (detection, dispatch, close frame, draining) — ~~`[lib-only]` `L7` proxy never runs; handshake stub drops the backend stream~~ (12b.4: the Wrapper proxy runs the 101 upgrade and splices the backend stream; a live splice holds the drain open until it ends — `src/wrapper/proxy.rs`, `draining.rs`, ING2/ING4)
 - [x] Book chapter 9: "The Full Package"
 - [x] All Phase 9 tests green (1271 tests)
 
@@ -1198,11 +1198,21 @@ whole theme lands.
     describe the shipped authenticated-HTTP / `GET /v1/version` poll / leader-last-in-place
     implementation (no leadership transfer, same order on rollback), and the book chapter 14
     matches.
-- [ ] **Documentation and book truth pass** — correct userspace DNS, Grill/container
-  runtime, JSON compatibility, ingress topology, security and upgrade prose; remove
-  contradictory historical designs; qualify TUI, GPU, scale, automatic TLS and recovery
-  until acceptance tests exist. Reconcile stale earlier progress annotations and test
-  counts. X6 stays in Phase 13 (D6/D14-D15/D18/D20-D22).
+- [x] **Documentation and book truth pass** — corrected to the shipped reality:
+  userspace DNS in whitepaper §10 and `discovery-onion.md` (the in-kernel `onion_dns`
+  program is now clearly a decision-log note, not live behaviour); Grill drives
+  runc/Apple/process directly, not containerd (`agent-bun.md` overview, dependency
+  table, decision-log note); the Raft log/RPC/snapshot use self-describing JSON, so
+  book ch.2a/10/14 no longer teach the stale bincode-index rule; GPU qualified to the
+  real `/dev/nvidia0`+`nvidia-smi` detector with effective `gpu_enabled` and refusal
+  (OCI device passthrough still deferred) in whitepaper §2, `agent-bun.md` §5.4 and
+  book ch.1; batch dispatch/completion marked a Phase 12 deliverable in `scheduler-meat.md`
+  §5.2 and whitepaper §5.2; recovery §§8.2–8.3 split into shipped (learning period,
+  backup/restore, disk-pressure step-down) vs the pre-seeded-candidate architecture
+  proposal; process-workload deny-by-default made explicit in whitepaper Q6. Stale
+  progress annotations reconciled (DNS responder spawned, WebSocket proxy wired, Grill
+  runtime). The headline test count already reads as a suite taxonomy (#106). X6 stays
+  in Phase 13 (D6/D14-D15/D18/D20-D22).
 - [ ] **Phase 12b acceptance gate** — cargo fmt; clippy with warnings denied; complete
   default suite; 8+ node/leader-failover and council-recovery tests; Linux eBPF/runc/Btrfs/
   rootless/Buildah suites; macOS Apple runtime suite; real mTLS/auth matrix; registry

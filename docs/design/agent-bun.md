@@ -13,7 +13,7 @@ Bun is the per-node agent that runs on every node in a Reliaburger cluster. It i
 
 Bun's responsibilities on every node:
 
-- **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer over containerd/runc.
+- **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer. Grill drives the runtimes directly (runc on Linux, Apple Container on macOS, and a `process` mode with no runtime at all); it does not shell through containerd.
 - **Process workload management:** Start, stop, health-check, and isolate non-container workloads (host binaries and inline scripts) using Linux namespaces and cgroups.
 - **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000-60000) and map them to container-internal ports.
 - **eBPF service discovery (Onion):** Load and maintain the Onion eBPF programs and kernel maps for socket-level service discovery and firewall enforcement.
@@ -29,9 +29,11 @@ Bun's responsibilities on every node:
 - **Fault injection (Smoker):** Execute fault injection commands by writing to eBPF maps and cgroup controls.
 - **Self-upgrade:** Stage, verify, and apply rolling binary upgrades with automatic rollback.
 - **nftables management:** Maintain perimeter firewall rules (cluster boundary, management access, egress allowlists).
-- **GPU detection:** Detect GPUs at startup via NVML and report them as schedulable resources.
+- **GPU detection:** Detect NVIDIA GPUs at startup (probe `/dev/nvidia0`, parse `nvidia-smi`) and report them as schedulable resources.
 
-Grill is Bun's container runtime interface -- the abstraction layer between Bun's workload management logic and the underlying container runtime (containerd + runc). Grill handles OCI image unpacking, container creation, network namespace setup, cgroup configuration, port mapping, and stdio stream attachment. The name follows the Reliaburger convention: Grill is where containers get cooked.
+Grill is Bun's container runtime interface -- the abstraction layer between Bun's workload management logic and the underlying runtime. Grill handles OCI image unpacking, container creation, network namespace setup, cgroup configuration, port mapping, and stdio stream attachment. The name follows the Reliaburger convention: Grill is where containers get cooked.
+
+> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and calls `runc create`/`start`/`state` itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
 
 **Key design decisions:**
 
@@ -51,8 +53,8 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 
 | Component | Dependency Type | Why |
 |-----------|----------------|-----|
-| **containerd** | Runtime (external process) | OCI container lifecycle, image management, container state persistence across Bun restarts |
-| **runc** | Runtime (external process, via containerd) | Low-level container execution (namespaces, cgroups, seccomp) |
+| **runc** | Runtime (external binary, Linux) | Low-level OCI container execution (namespaces, cgroups, seccomp). Grill writes the OCI bundle and calls `runc` directly; its `state` persists container liveness across Bun restarts. No containerd. |
+| **Apple Container** | Runtime (external, macOS) | OCI container lifecycle on macOS. Grill re-adopts a running workload via `container inspect` after a Bun exec. |
 | **Linux kernel 5.7+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
 | **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
@@ -60,7 +62,7 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 | **Onion (eBPF)** | Internal subsystem | Bun loads and manages the Onion eBPF programs and kernel maps. Onion depends on Bun for map updates when workloads start/stop or health checks change state. |
 | **Pickle (image registry)** | Internal subsystem | Image pull/push, binary distribution during self-upgrade. Bun participates as a Pickle storage node. |
 | **Sesame (PKI)** | Via council members | Node certificate issuance (at join), workload certificate issuance (CSR model), CA trust chain distribution. |
-| **NVML** | Optional runtime library | GPU detection and enumeration. Auto-detected at startup. If absent, GPU scheduling is disabled on this node. |
+| **`nvidia-smi`** | Optional runtime tool | GPU detection and enumeration. Bun probes `/dev/nvidia0` and shells out to `nvidia-smi` at startup (Linux only); no vendor library is linked into the binary. If either is absent, the node reports zero GPUs and GPU workloads are refused there. |
 | **nftables** | Runtime (kernel + userspace) | Perimeter firewall rules. Bun manages a dedicated nftables table. |
 | **Btrfs / ext4 / xfs** | Filesystem | Volume management. Btrfs preferred (subvolume quotas, instant CoW snapshots). ext4/xfs supported with loop-mount fallback. |
 
@@ -612,7 +614,7 @@ pub struct NodeIdentity {
     pub name: String,
     /// Arbitrary key-value labels for placement constraints.
     /// `gpu = "true"` and `gpu_model = "<model>"` are added
-    /// automatically by NVML detection.
+    /// automatically by GPU detection (`/dev/nvidia0` + `nvidia-smi`).
     pub labels: HashMap<String, String>,
 }
 
@@ -640,7 +642,7 @@ pub struct ResourceReservation {
     pub reserved_memory: u64,    // default: 512 MiB
     /// Disk reserved for system.
     pub reserved_disk: u64,      // default: 10 GiB
-    /// Whether to auto-detect GPUs via NVML.
+    /// Whether to auto-detect GPUs (via `/dev/nvidia0` + `nvidia-smi`).
     pub gpu_enabled: bool,       // default: true
 }
 
@@ -957,9 +959,8 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 
 **GPU device isolation:**
 
-- Bun detects GPUs at startup via NVML and creates device allow-lists in the cgroup.
-- `devices.allow` is written with the specific `/dev/nvidia{N}` device for the allocated GPU.
-- NVML environment variables (`NVIDIA_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) are set in the workload's environment to the allocated device index.
+- Bun detects NVIDIA GPUs at startup by probing `/dev/nvidia0` and parsing `nvidia-smi --query-gpu` (Linux only, no vendor library linked in), and admission refuses a GPU workload when GPU support is off or fewer cards exist than requested (see the admission gate in §5.3.1).
+- Writing `devices.allow` for the specific `/dev/nvidia{N}` device, and setting `NVIDIA_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` in the workload's environment, is the OCI passthrough follow-up: placement is honest today, but the allocated device is not yet plumbed into the container spec. **TODO(Phase-follow-up):** OCI `/dev/nvidia*` device passthrough.
 
 ### 5.5 Self-Upgrade Sequence
 
@@ -1075,7 +1076,7 @@ Bun parses `/etc/reliaburger/node.toml` at startup. The parsing sequence:
 4. **Auto-detect missing values:**
    - `node.name`: read from `gethostname()`.
    - `network.advertise_address`: detect from the default route interface.
-   - GPU labels (`gpu = "true"`, `gpu_model = "a100"`): detect via NVML if `resources.gpu_enabled` is true.
+   - GPU labels (`gpu = "true"`, `gpu_model = "a100"`): detect via `/dev/nvidia0` + `nvidia-smi` if `resources.gpu_enabled` is true.
 5. **Create storage directories** if they do not exist. Set ownership to the `reliaburger` system user.
 6. **Hot reload:** Bun watches `node.toml` via `inotify`. On change, it re-parses and applies non-disruptive changes (labels, image config, log retention, metrics intervals). Changes to `storage.*` paths, `network.port_range`, or `cluster.join` require a Bun restart and are logged as warnings.
 
@@ -1105,7 +1106,7 @@ join = ["10.0.1.5:9443"]
 | `[resources]` | `reserved_cpu` | `"500m"` | resource string (millicores) | CPU reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_memory` | `"512Mi"` | resource string (bytes) | Memory reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
-| `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect GPUs via NVML at startup. |
+| `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect NVIDIA GPUs (probe `/dev/nvidia0`, parse `nvidia-smi`) at startup. When false, GPU workloads are refused on this node. |
 | `[network]` | `advertise_address` | auto-detect | IP address | IP address this node advertises to the cluster. |
 | `[network]` | `port_range` | `"10000-60000"` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
 | `[images]` | `max_storage` | `"50Gi"` | resource string (bytes) | Maximum disk space for Pickle image layers. |

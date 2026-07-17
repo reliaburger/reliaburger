@@ -3,17 +3,19 @@
 **Component:** Onion
 **Subsystem:** Service discovery, namespace firewall enforcement
 **Whitepaper reference:** Section 10 (Service Discovery), Section 11.3 (Network Security)
-**Status:** Design
+**Status:** Design. **DNS is served in userspace, not in the kernel** (see the note below and book chapter 3). The connect-rewrite half is in-kernel eBPF as described; the in-kernel DNS listings in §§3–4 are the *original* design we abandoned, kept for teaching and clearly marked.
 
 ---
 
 ## 1. Overview
 
-Onion is Reliaburger's service discovery layer. It replaces DNS servers (CoreDNS, Consul DNS) and proxy processes (Envoy, kube-proxy, linkerd-proxy) with two eBPF programs loaded into the kernel by the Bun agent on each node.
+Onion is Reliaburger's service discovery layer. It replaces DNS servers (CoreDNS, Consul DNS) and proxy processes (Envoy, kube-proxy, linkerd-proxy). Name resolution runs in a small userspace responder that Bun hosts; connection steering runs in an eBPF program loaded into the kernel by the Bun agent on each node.
 
-The core insight is that service discovery can be implemented entirely at the socket level, before any packets are created. When an application calls `getaddrinfo("redis.internal")`, the resulting DNS query never leaves the node -- an eBPF program intercepts it in the socket layer, looks up the name in an in-kernel hash map, and responds with a virtual IP address. When the application subsequently calls `connect()` with that virtual IP, a second eBPF program intercepts the syscall, selects a healthy backend from the service map, and rewrites the destination to the real `host:port` of a running instance. The application's `connect()` completes with a direct TCP connection to the backend. No proxy sits in the data path. No DNS server process exists.
+Service discovery happens in two steps. When an application calls `getaddrinfo("redis.internal")`, Bun's userspace UDP responder answers from the service map with a virtual IP; the container's `/etc/resolv.conf` points `.internal` lookups at that responder, so `.internal` names never leak to a public resolver. When the application subsequently calls `connect()` with that virtual IP, an eBPF program intercepts the syscall, selects a healthy backend from the service map, and rewrites the destination to the real `host:port` of a running instance. The application's `connect()` completes with a direct TCP connection to the backend. No proxy sits in the data path.
 
-This eliminates an entire category of infrastructure: no DNS server to operate, no proxy process consuming memory and adding latency, no iptables/IPVS rules to manage, no listening ports to allocate. The eBPF programs persist in the kernel even if the Bun agent crashes, so running applications continue to resolve names and reach backends. Only service map updates pause until Bun restarts.
+Why answer DNS in userspace when the rest of Onion lives in the kernel? We tried the in-kernel route first, and it doesn't work: the cgroup `sendmsg4`/`recvmsg4` eBPF hooks can rewrite a socket's destination address, but they can't read or synthesise the DNS *packet payload*, so an eBPF program can't tell which name was queried or build a reply. So DNS is the one piece that stays in userspace. The trade-off is tiny (a ~50µs resolver hop that any real application never notices) and the latency-critical part, the `connect()` rewrite, is still zero-cost in the kernel. That split is deliberate: pragmatism over purity.
+
+This still eliminates an entire category of infrastructure: no separate DNS server to operate, no proxy process in the data path, no iptables/IPVS rules to manage. The connect-rewrite eBPF program persists in the kernel even if the Bun agent crashes, so existing connections keep flowing; only service map updates and new `.internal` resolutions pause until Bun restarts.
 
 Onion also enforces namespace isolation and per-app firewall rules at the `connect()` interception point. Because the eBPF program already intercepts every outbound connection, checking whether the caller is authorised to reach the destination is a natural extension, not a separate mechanism. This is described in the Security Considerations section below.
 
@@ -23,7 +25,7 @@ Onion also enforces namespace isolation and per-app firewall rules at the `conne
 
 ### Kernel
 
-- **Linux kernel 5.7+** (mandatory). Onion requires `BPF_CGROUP_UDP4_SENDMSG` and `BPF_CGROUP_INET4_CONNECT` hook types, both available since kernel 5.7. Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
+- **Linux kernel 5.7+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7. (The `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
 - **BPF Type Format (BTF)** enabled in the kernel (`CONFIG_DEBUG_INFO_BTF=y`). Required for CO-RE (Compile Once, Run Everywhere) portability of eBPF programs across kernel versions. Most distribution kernels since Ubuntu 20.10, Fedora 33, and Debian 12 ship with BTF enabled.
 - **cgroup v2** mounted at `/sys/fs/cgroup`. Required for cgroup-scoped eBPF program attachment and for identifying the source application by cgroup ID in the firewall path.
 
@@ -45,11 +47,13 @@ The hierarchical reporting tree is the source of truth for service map updates. 
 
 ## 3. Architecture
 
-Onion consists of two eBPF programs and three BPF hash maps, all managed by the Bun agent process.
+Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that feed it, plus a userspace DNS responder, all managed by the Bun agent process.
+
+> **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it (the hooks can't read the DNS payload; see §1). The live implementation is a userspace UDP responder (`src/onion/dns.rs`) that Bun answers from directly, with the container's `resolv.conf` rewritten to point `.internal` at it. The kernel listings are preserved here for teaching, not as a description of the running binary; `dns_map` survives in the source as a leftover but is off the resolution path.
 
 ### eBPF Programs
 
-**Program 1: `onion_dns` (DNS interception)**
+**Program 1: `onion_dns` (DNS interception) — superseded, not shipped (see the decision-log note above)**
 
 - Hook type: `BPF_CGROUP_UDP4_SENDMSG` (for UDP DNS) and `BPF_CGROUP_UDP4_RECVMSG` (for response injection)
 - Attachment point: root cgroup v2 (`/sys/fs/cgroup`)

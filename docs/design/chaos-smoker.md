@@ -678,6 +678,8 @@ int smoker_drop_connect4(struct bpf_sock_addr *ctx) {
 
 #### 5.1.3 DNS NXDOMAIN
 
+> **Status.** DNS resolution moved to a userspace responder (`src/onion/dns.rs`; see [discovery-onion.md](discovery-onion.md) §1), so the in-kernel eBPF DNS-fault path described below is part of the *original* in-kernel DNS design, not the shipped resolution path. The intended behaviour is unchanged (a targeted service returns NXDOMAIN); the fault belongs in the userspace responder's lookup, which already knows how to answer an unknown `.internal` name with NXDOMAIN. The kernel listing is kept for teaching.
+
 The DNS interception hook checks `fault_dns_map` before the normal `dns_map` lookup. If the service name has a fault entry of type NXDOMAIN, the eBPF program constructs an NXDOMAIN DNS response directly in the kernel and returns it to the application. The application's `getaddrinfo()` call fails with `EAI_NONAME` -- indistinguishable from a real DNS resolution failure.
 
 ```c

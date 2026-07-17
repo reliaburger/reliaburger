@@ -395,7 +395,7 @@ pub struct NodeCapacity {
     pub process_workloads_enabled: bool,
     /// Allowed binaries for process workloads.
     pub allowed_binaries: Vec<String>,
-    /// Number of GPU devices available (detected via NVML).
+    /// Number of GPU devices available (detected via `/dev/nvidia0` + `nvidia-smi`).
     pub gpu_count: u32,
     /// GPU model string (e.g., "a100", "h100"). Auto-detected.
     pub gpu_model: Option<String>,
@@ -655,6 +655,8 @@ When `replicas = "*"` is specified, Meat does not run the placement pipeline. In
 Daemon mode is not bin-packed -- every qualifying node gets exactly one instance regardless of its current load. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
 
 ### 5.2 Batch Job Allocation (Delegated Model)
+
+> **Status (Phase 12).** The allocator itself ships — `meat::batch::schedule_batch` bin-packs an instance count across eligible nodes weighted by free capacity. The full delegated pipeline (dispatch via the reporting tree, per-node execution, then `BatchCompletionReport` aggregation and lifecycle) is a Phase 12 deliverable and isn't wired end to end yet. Read this section as the target design for high-throughput batch, not as an operable path today. On-demand and scheduled Jobs (the non-batch path) do run.
 
 The 100M jobs/day target (approximately 1,150 jobs/sec sustained) requires a fundamentally different approach than scheduling each job individually through Raft.
 

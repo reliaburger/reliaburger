@@ -175,7 +175,9 @@ Snapshots serialise the entire `DesiredState` to JSON. Followers that fall behin
 Two implementations, mirroring the gossip layer:
 
 - `InMemoryRaftRouter`: routes RPCs between in-process Raft nodes. Supports partition simulation via a blocklist. This is what makes the Raft tests possible without real TCP.
-- `TcpRaftNetworkFactory` + `TcpRaftNetwork`: length-prefixed bincode over TCP for production. The `serve_raft_rpc` function runs the server side.
+- `TcpRaftNetworkFactory` + `TcpRaftNetwork`: length-prefixed frames over TCP for production. The `serve_raft_rpc` function runs the server side.
+
+> **Where this went later.** This is the Phase 2 snapshot, so it describes what the code *was*. Two things changed by Phase 12b: the Raft log became disk-backed (`durable_log.rs`, redb), and the log entries and RPC frames moved from bincode to **self-describing JSON**, because `RaftRequest` embeds flexible config types (`replicas = "*"`) that need serde's `deserialize_any` — a positional format like bincode can't answer "what's actually here?". Chapter 14 tells that story in full.
 
 The in-memory router's partition simulation is used in the `partition_majority_continues_minority_cannot_write` test, which is one of the most satisfying tests in the codebase. It proves that a 3-of-5 majority can keep writing while the minority is isolated, and everything converges when the partition heals.
 

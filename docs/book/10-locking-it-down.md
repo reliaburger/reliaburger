@@ -679,7 +679,7 @@ The operator's re-encrypt step (encrypt against the new public key, `relish appl
 
 Is the record proof? No — it's the write-time assumption made explicit. Re-apply an unchanged config and the seal updates without any real re-encryption. What it catches is the case that actually eats data: finalising while a secret demonstrably hasn't been touched since the old generation.
 
-One more rule rounds it off: **one rotation at a time.** A second `RotateSecretKey` while a read-only key still exists for the scope is refused (finalise or re-encrypt first); a duplicate delivery of the *same* rotation is recognised by its generation number and accepted idempotently. Both refusals travel as a new `CouncilResponse::Refused { reason }` variant — appended to the enum, never inserted, because responses cross the bincode-encoded wire where variants are identified by index.
+One more rule rounds it off: **one rotation at a time.** A second `RotateSecretKey` while a read-only key still exists for the scope is refused (finalise or re-encrypt first); a duplicate delivery of the *same* rotation is recognised by its generation number and accepted idempotently. Both refusals travel as a new `CouncilResponse::Refused { reason }` variant. Like `RaftRequest`, `CouncilResponse` is serialised as self-describing JSON (serde tags variants by name), so a new variant is safe to add; the rule that bites is renaming or removing one, which would leave an old peer unable to decode it. New variant, added — not a rename in sight.
 
 ## Certificate revocation
 

@@ -120,7 +120,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 
 **100 million jobs per day** demands a scheduler (Meat) that can make placement decisions at high throughput without becoming a bottleneck. At a sustained rate, this is over a thousand jobs dispatched per second. The design implications (batch scheduling, delegated execution, and asynchronous reporting) are detailed in [design/scheduler-meat.md](design/scheduler-meat.md).
 
-**GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. The Bun agent detects GPUs at startup via NVML and reports them as schedulable resources alongside CPU and memory.
+**GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. The Bun agent detects NVIDIA GPUs at startup (it probes `/dev/nvidia0` and parses `nvidia-smi`, so no vendor library is linked into the binary) and reports them as schedulable resources alongside CPU and memory. Placement is honest today: a workload that asks for a GPU is refused on a node where GPU support is off or where fewer cards exist than requested. Passing the `/dev/nvidia*` devices into the container's OCI spec is a follow-up (see [design/agent-bun.md](design/agent-bun.md) §5.4), so treat whole-device passthrough as scheduled but not yet plumbed end to end.
 
 **Automatic recovery from the loss of any single node, the leader, or the entire council** means that none of these failures interrupts the data plane. Applications continue running when the control plane is unavailable. Surviving nodes can reconstruct the full state. The cluster self-heals without operator intervention.
 
@@ -247,7 +247,7 @@ image = "cleanup:latest"
 schedule = "0 3 * * *"
 ```
 
-**High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions.
+**High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions. The bin-packing allocator ships; the full delegated dispatch-and-completion pipeline is a Phase 12 deliverable (see [design/scheduler-meat.md](design/scheduler-meat.md) §5.2). On-demand and scheduled Jobs run today.
 
 **Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `build_push_to` field that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
 
@@ -353,7 +353,7 @@ $ relish apply -f myapp.toml
 ✓ All health checks passing. https://myapp.com → ready
 ```
 
-Three commands from bare metal to a running, TLS-secured production application (assuming the `relish` binary and `containerd` are installed).
+Three commands from bare metal to a running, TLS-secured production application (assuming the `relish` binary and a container runtime are installed). Reliaburger drives the runtime through its Grill abstraction, so "a container runtime" means runc on Linux or Apple Container on macOS; the `--runtime process` mode needs no runtime at all.
 
 > For the full `node.toml` reference, storage path design, and resource configuration, see [design/agent-bun.md](design/agent-bun.md).
 
@@ -461,13 +461,15 @@ When a new leader is elected, it enters a learning period, during which it colle
 
 ### 8.3 Catastrophic Recovery
 
-Pre-seeded recovery candidates (stable nodes outside the council, selected for diversity) enable deterministic recovery when the entire council is lost. The highest-priority surviving candidate assumes leadership without an election. An encrypted candidate list in gossip prevents attackers from targeting recovery nodes. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, and the catastrophic recovery path activates only after a configurable timeout with no quorum detected. Nodes on the minority side of a partition operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
+Losing a *majority* of the council is survivable automatically: the reconciler regrows the council from healthy members while a quorum still stands. Losing *every* voter at once is the case there's nothing left to elect from, and that recovery is deliberately operator-triggered rather than automatic, because it discards the dead cluster's Raft history. A surviving node restores the desired state from the last sealed backup (or from its own durable snapshot if it was a voter), re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council. The cost is honest: anything written after the last backup is lost. Network partitions can't cause split-brain: Raft requires a majority quorum to elect a leader, so a minority side simply has no quorum. Nodes on the minority side operate in data-plane-only mode (apps continue running, no new deploys) until the partition heals.
+
+> **Design note (fully-automatic recovery).** The original design called for *pre-seeded* recovery candidates chosen for zone diversity, gossiped as an encrypted list, so the highest-priority survivor could assume leadership with no operator in the loop. That remains an architecture proposal, not shipped behaviour: the operator-triggered restore above is what the binary does today (`relish council recover`, [design/gossip-mustard.md](design/gossip-mustard.md)). We chose to ship the operator-in-the-loop path first because full-council loss is the one failure where discarding history is unavoidable, and a human confirming *which* backup to restore is cheaper than getting an automated tie-break wrong.
 
 **Partition degradation:** During a sustained partition, isolated nodes experience progressive degradation. The eBPF service map becomes stale for new cross-partition connections (immediate), certificate rotation fails (at 30 minutes), and workload certificates expire (at 1 hour, or 4 hours with the grace period). Apps with existing connections and valid certificates continue operating throughout.
 
 **Clock synchronisation:** Reliaburger assumes nodes have reasonably synchronised clocks (NTP or equivalent). Certificate validation, token TTLs, and cron scheduling depend on clock accuracy within a few seconds.
 
-**Backup and restore:** For disaster recovery from total cluster loss, you should back up the Raft state snapshot and CA key material to an external location. `relish backup` exports an encrypted snapshot suitable for off-cluster storage.
+**Backup and restore:** For disaster recovery from total cluster loss, the leader periodically exports an encrypted state-machine snapshot to external object storage (`file://`, `s3://` or `gs://`), sealed with a key derived from the cluster master key. You configure the destination and cadence under `[cluster.backup]`; the export runs automatically on the leader, no command to remember. To recover after losing the whole council, `relish council recover` restores from the latest sealed backup on a stopped survivor (see §8.3 above).
 
 **Disk exhaustion:** Council nodes monitor available disk space and proactively step down from the council when storage falls below a configurable threshold (default: 1 GB), preventing Raft from stalling on failed log writes. The node rejoins the council automatically once disk pressure is resolved.
 
@@ -707,7 +709,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish init` | Bootstrap a new cluster | `kubeadm init` |
 | `relish join` | Join a node to the cluster | `kubeadm join` |
 | `relish drain <node>` | Safely evacuate a node | `kubectl drain` |
-| `relish backup` | Export encrypted cluster snapshot | `etcdctl snapshot save` |
+| `relish council recover` | Restore a lost council from a sealed backup | `etcdctl snapshot restore` |
 | `relish secret rotate` | Rotate encryption keys | (none — requires Sealed Secrets re-encrypt) |
 | `relish volume snapshot` | Snapshot a local volume | (none — requires CSI snapshotter) |
 | `relish import -f <k8s-yaml>` | Convert K8s manifests to Reliaburger TOML | (none) |
@@ -767,7 +769,7 @@ Reliaburger compiles its test and benchmark suite into the binary. `relish test`
 
 ## 20. Self-Upgrades
 
-Since Reliaburger is a single binary, upgrading means replacing the binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist; wire formats stay backward compatible within one major version (append-only Raft log variants, versioned gossip datagrams, and self-describing JSON snapshots — see the Phase 14 notes in [design/agent-bun.md](design/agent-bun.md)).
+Since Reliaburger is a single binary, upgrading means replacing the binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist; wire formats stay backward compatible within one major version (self-describing JSON for the Raft log, RPC and snapshots so variants can be added without renaming, plus versioned gossip datagrams — see the Phase 14 notes in [design/agent-bun.md](design/agent-bun.md)).
 
 Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Automatic rollback triggers if a node fails to start on the new version.
 
@@ -902,7 +904,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **Autoscaling** | HPA (separate config) | Same as K8s | External | No | **Built-in** |
 | **Time to first deploy** | Hours to days | Minutes to 30 min | 30 min to hours | Minutes | **< 5 min** |
 | **Written in** | Go | Go | Go | Go | **Rust** |
-| **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Built-in (NVML auto-detect)** |
+| **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Built-in (NVIDIA auto-detect via `nvidia-smi`)** |
 | **Secret management** | Built-in (basic) or External (Vault, Sealed Secrets) | Same as K8s | Vault integration | Docker secrets | **Encrypted-in-git (built-in)** |
 | **Workload identity** | Separate (SPIRE, cert-manager) | Same | Consul Connect | None | **Built-in (SPIFFE-compatible, auto-rotated)** |
 | **Non-container jobs** | No | No | Yes (exec driver) | No | **Yes (cgroup + namespace isolated)** |
@@ -963,7 +965,7 @@ No. The new leader enters a learning period where it accepts StateReports from n
 
 ### Q6: Aren't exec (non-container) jobs a massive security risk?
 
-They would be, without constraints. Process workloads are locked down by default: they require an explicit `admin` or `host-exec` Permission grant, run as a dedicated unprivileged user (`burger`), have a restrictive seccomp profile, a restricted mount namespace, and cgroup resource limits. Crucially, you must configure an explicit binary allowlist in `node.toml`. Process workloads are disabled on any node without an allowlist. This deny-by-default posture ensures that no host binary can execute without explicit operator approval. The security posture is closer to a cron job running under a locked-down service account than to unrestricted shell access.
+They would be, without constraints. Process workloads are locked down by default: they require an explicit `admin` or `host-exec` Permission grant, run as a dedicated unprivileged user (`burger`), have a restrictive seccomp profile, a restricted mount namespace, and cgroup resource limits. On top of that, you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. This deny-by-default posture ensures that no host binary can execute without explicit operator approval. The security posture is closer to a cron job running under a locked-down service account than to unrestricted shell access.
 
 ### Q7: How does Pickle ensure image durability?
 

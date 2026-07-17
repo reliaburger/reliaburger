@@ -42,7 +42,7 @@ Integration tests:
 1. **Cargo workspace setup.** Binary crate (`bun`), library crate (`reliaburger`), test fixtures.
 2. **TOML config parsing.** Define all 7 resource types (App, Job, Secret, ConfigFile, Volume, Permission, Namespace) with serde, including `[[app.*.init]]` blocks.
 3. **Grill container runtime interface.** containerd/runc integration, OCI image extraction, port mapping, cgroup management.
-4. **Bun agent core.** Process supervisor loop, health checks, restart logic, GPU detection via NVML.
+4. **Bun agent core.** Process supervisor loop, health checks, restart logic, GPU detection (probe `/dev/nvidia0`, parse `nvidia-smi`).
 5. **Relish CLI skeleton.** `apply`, `status`, `logs` (with `--tail` and `--follow`), `exec`, `inspect` (clap derive API, single-node mode).
 6. **OCI image pulling.** Pull real images from Docker Hub via `oci-distribution`, unpack layers into rootfs with whiteout support, content-addressed blob caching.
 7. **Rootless runc.** User namespace mapping, rootless cgroups v2, `--root` state directory, no-sudo container execution.
