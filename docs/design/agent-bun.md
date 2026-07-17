@@ -963,122 +963,89 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 
 ### 5.5 Self-Upgrade Sequence
 
-The self-upgrade mechanism replaces the Bun binary on every node in a rolling fashion. Bun is the orchestrator for its own upgrade.
+The self-upgrade mechanism replaces the Bun binary on every node in a rolling fashion. Bun is the orchestrator for its own upgrade. This section describes the shipped implementation (Phase 14, `src/upgrade/`); the design rationale for the choices below lives in `docs/plans/2026-07-06-plan-self-upgrade.md`.
 
-> **Implementation notes (July 2026, Phase 14).** The shipped implementation
-> deviates from this section in three places, each recorded with its rationale
-> in `docs/plans/2026-07-06-plan-self-upgrade.md`:
->
-> 1. **Directives travel over the node HTTP API, not the reporting tree.**
->    The reporting tree is upstream-only (reports and acks); adding a
->    downstream path would have changed its bincode wire format mid-phase.
->    The leader POSTs to each node's token-authenticated `/v1/upgrade/apply`.
-> 2. **Version discovery polls `GET /v1/version`, not gossip.** Adding a
->    version field to `MembershipUpdate` breaks bincode decoding for old
->    nodes during the exact mixed-version window upgrades create.
-> 3. **The leader upgrades in place; there is no leadership transfer.**
->    openraft 0.9 has no graceful transfer, and a naive
->    `raft.trigger().elect()` on a follower cannot win against a live
->    leader's heartbeats (anti-disruption / leader-stickiness). So the
->    leader execs itself last: exec is sub-second, a council of ≥3 keeps
->    quorum through the bounce, and the returning node re-establishes
->    leadership and completes the run via the orchestrator's poll-first
->    idempotency. (`POST /v1/cluster/elect` remains a manual admin
->    recovery tool but is not used by the upgrade path.)
->
-> Additionally: rollback runs the SAME order as upgrade (workers → council →
-> leader last) rather than the reverse order suggested below — leader-last is
-> the invariant that keeps the orchestrator coordinated; and nodes remember
-> reverted upgrade ids and refuse to re-attempt them (retries via
-> `relish upgrade resume` are issued under a fresh id), which closes a
-> re-delivery crash-loop this section did not anticipate.
+Three decisions shape everything that follows, and each earns its keep against the alternatives an earlier draft assumed:
 
-**Node-level upgrade sequence (executed on each node):**
+1. **Directives travel over the node HTTP API, not the reporting tree.** The reporting tree is upstream-only (reports and acks flow towards the leader). Adding a downstream command path would have changed its bincode wire format mid-phase, and mixed-version wire formats are exactly what an upgrade creates. So the leader POSTs to each node's token-authenticated `/v1/upgrade/apply` instead.
+2. **Version discovery polls `GET /v1/version`, not gossip.** Adding a version field to the gossip `MembershipUpdate` would break bincode decoding for the old nodes still running during the mixed-version window. Polling an HTTP endpoint carries no such wire-format risk. Rejoin is confirmed separately (see the orchestrator's completion gate below): a node is only "done" once it is back in the gossip mesh *and* HTTP-healthy at the target version.
+3. **The leader upgrades in place; there is no leadership transfer.** openraft 0.9 has no graceful transfer, and a naive `raft.trigger().elect()` on a follower can't win against a live leader's heartbeats (anti-disruption / leader-stickiness). So the leader execs itself LAST: exec is sub-second, a council of ≥3 keeps quorum through the bounce, and the returning node re-establishes leadership and finishes the run via the orchestrator's poll-first idempotency. (`POST /v1/cluster/elect` stays a manual admin recovery tool; the upgrade path does not use it.)
+
+**Node-level upgrade sequence (executed on each node that receives a directive):**
 
 ```
-1. Receive upgrade directive from the leader (via reporting tree).
-   Directive contains:
-     - target_version: "v1.4.0"
-     - binary_hash: [u8; 32]  (SHA-256)
-     - embedded_signature: Vec<u8>  (Ed25519, from release key set)
-     - external_signature: Vec<u8>  (Ed25519, from external key in node.toml)
+1. Receive the upgrade directive at POST /v1/upgrade/apply (leader → node,
+   bearer-token authenticated). Directive (UpgradeDirective) contains:
+     - upgrade_id           idempotency key
+     - target_version       e.g. "v1.4.0"
+     - binary_sha256        content address in Pickle
+     - embedded_signature   Ed25519, from the release key set
+     - external_signature   Ed25519, from the operator's external key
+                            (mandatory for network upgrades; None air-gapped)
+     - source               Pickle { registry_address } or LocalFile { path }
 
-2. Fetch the binary from Pickle (content-addressed by hash).
-   The leader already stored it in Pickle after download and verification.
+   Re-delivering the same upgrade_id while it is in flight is a no-op; a
+   node that already REVERTED this id refuses to re-attempt it (the
+   crash-loop guard). A retry via `relish upgrade resume` is issued under a
+   fresh id so it looks like a new run.
 
-3. Verify integrity:
-   a. SHA-256 of received binary must match binary_hash.
-   b. Verify embedded_signature against the signing key set compiled
-      into the CURRENT running binary.
-   c. If node.toml has external_signing_key:
-      verify external_signature against that key.
-      (For network upgrades, external_signing_key is required.)
-   d. If any verification fails: abort, report failure to leader, do NOT
-      proceed.
+2. Fetch the binary from Pickle, content-addressed by binary_sha256 (the
+   leader stored it there before starting the run). Air-gapped upgrades read
+   the local file instead.
 
-4. Mark self as draining (stop accepting new work).
-   Running containers continue serving.
+3. Verify integrity, in this order:
+   a. SHA-256 of the received bytes matches binary_sha256.
+   b. embedded_signature verifies against the key set compiled into the
+      CURRENT running binary.
+   c. external_signature verifies against external_signing_key in node.toml
+      (required for network upgrades).
+   Any failure aborts before staging: the node reports failure and does NOT
+   swap.
 
-5. Write the new binary to a staging path:
-   /usr/local/bin/reliaburger-v1.4.0
+4. Stage the binary and its detached signature under the version store,
+   then flip the current symlink atomically to the new version.
 
-6. Write the detached signature:
-   /usr/local/bin/reliaburger-v1.4.0.sig
+5. Exec the new binary in place (execve). The PID does not change; running
+   containers keep serving. On startup the new Bun ADOPTS its still-running
+   workloads from on-disk instance records (see 5.1 reconnect / grill
+   adopt) rather than restarting them, re-attaches log capture, resumes
+   health checking, re-populates the Onion service map and rejoins gossip.
 
-7. Update the symlink atomically:
-   /usr/local/bin/reliaburger -> reliaburger-v1.4.0
-
-8. Exec the new binary:
-   execve("/usr/local/bin/reliaburger", ["reliaburger", "agent", ...])
-   This replaces the current process in-place. The PID does not change.
-
-9. New Bun starts up:
-   a. Read node.toml.
-   b. Reconnect to running containers via containerd (see 5.1 reconnect).
-   c. Re-attach to stdout/stderr streams for log capture.
-   d. Resume health checking.
-   e. Re-populate the Onion service map.
-   f. Rejoin the Mustard gossip mesh.
-   g. Report healthy on the new version to the reporting tree.
-
-10. If the new Bun fails to start (exits within 30s, or fails to rejoin
-    gossip within 60s):
-    a. The systemd unit (or equivalent) restarts Bun.
-    b. On restart, Bun detects that the previous version is still present.
-    c. Bun reverts the symlink to the previous version.
-    d. Bun execs the previous version.
-    e. Previous Bun starts, reconnects to containers, reports failure
-       to the leader.
-    f. Leader pauses the upgrade.
+6. Automatic rollback on a failed swap: if the new binary crashes or fails
+   its boot checks, the node reverts the symlink to the previous version,
+   execs it, and records the reverted upgrade_id so the leader observes the
+   revert on its next version poll and pauses the run.
 ```
 
-**Cluster-level upgrade orchestration (executed by the leader):**
+**Cluster-level upgrade orchestration (leader-side, `src/upgrade/orchestrator.rs`).**
+
+The whole rolling walk lives in Raft under `DesiredState.active_upgrade`, so a leader change mid-run is a *resume*, not a restart: whichever node holds leadership drives the loop from the replicated state. Each tick polls reality first (`GET /v1/version` per node) and takes at most one round of actions, which makes every directive idempotent by observation.
 
 ```
-1. Leader downloads the new binary from the release CDN (or receives
-   it via --binary for air-gapped).
-2. Leader verifies:
-   a. SHA-256 checksum against release metadata.
-   b. Embedded signature against the compiled-in key set.
-   c. External signature against the external_signing_key in node.toml.
-3. Leader stores the verified binary in Pickle.
-4. Upgrade workers (configurable parallelism, default --parallel 1):
-   For each batch of N worker nodes:
-     a. Send upgrade directive to each node in the batch.
-     b. Wait for all nodes in the batch to report healthy on the new version.
-     c. If any node fails: pause the upgrade, alert the operator.
-     d. If all nodes in the batch succeed: proceed to the next batch.
-5. Upgrade council members (always one at a time):
-   For each non-leader council member:
-     a. Send upgrade directive.
-     b. Wait for the node to report healthy.
-     c. Verify Raft quorum is maintained.
-     d. Proceed to the next council member.
-6. Upgrade the leader (last):
-   a. Transfer leadership to an already-upgraded council member.
-   b. The new leader sends the upgrade directive to the former leader.
-   c. Former leader upgrades itself.
-   d. Former leader reports healthy. Upgrade complete.
+1. Start: relish verifies the binary (SHA-256 + dual signatures) and pushes
+   it to the leader's Pickle. The leader records the plan in Raft. The plan's
+   per-node ROLE and ADDRESS are derived server-side from gossip membership
+   and the Raft voter set — a client can't upgrade a node under a false
+   identity (a spoofed address or a mislabelled leader is rejected).
+
+2. Workers, in batches of --parallel (default 1):
+   direct each, then wait until it polls back healthy at the target AND
+   gossip reports it Alive again. Any failure pauses the run.
+
+3. Council members, strictly one at a time, and only while quorum has
+   headroom. Headroom counts LIVE voters (configured voters cross-referenced
+   against gossip Alive), not just configured ones: with a voter already
+   down, upgrading another that would drop live voters below quorum is
+   refused.
+
+4. Leader last, in place (see decision 3 above): the current leader directs
+   its own /v1/upgrade/apply, execs, and the returning process finishes the
+   run. No leadership handoff.
+
+A node reaches "Healthy" only when it is on the target version, HTTP-healthy,
+AND back in the gossip mesh. A node that comes up HTTP-healthy but never
+rejoins gossip is held (and eventually times out and pauses the run) — it is
+isolated, not done.
 ```
 
 **Rollback:**
@@ -1087,10 +1054,9 @@ The self-upgrade mechanism replaces the Bun binary on every node in a rolling fa
 $ relish upgrade rollback [version]
 ```
 
-- Same rolling sequence as upgrade (workers -> council -> leader), but in reverse order.
-- Previous binary is already on disk -- no download required.
-- The leader rolls back last.
-- Faster than the initial upgrade because there is no Pickle distribution step.
+- Runs the SAME order as an upgrade (workers → council → leader last), not the reverse. Leader-last is the invariant that keeps the orchestrator coordinated, and it holds in both directions.
+- The previous binary is already on every node's disk, so there is no download or Pickle distribution step — rollback is faster than the initial upgrade.
+- The leader rolls back last, in place, exactly as it upgrades last.
 
 ### 5.6 `node.toml` Parsing
 

@@ -1144,10 +1144,40 @@ whole theme lands.
   drain and node-kill faults; apply CPU stress to the target workload cgroup; make every
   persistent effect reversible on clear/expiry, including pause/resume. Acceptance measures
   each advertised effect and its removal (CHAOS1).
-- [ ] **Self-upgrade convergence and adoption** — wire scheduler cordon; calculate quorum
+- [x] **Self-upgrade convergence and adoption** — wire scheduler cordon; calculate quorum
   headroom from live voters; derive roles/addresses server-side; prove gossip rejoin and
   finish Apple/rootless adoption. Make progress/book describe the implemented in-place or
   leadership-transfer sequence consistently (D20, UPG1-UPG2).
+  - [x] Scheduler cordon (UPG1, verified): `meat::filter::apply_upgrade_cordon` IS called
+    from the leader scheduling loop (`cluster/orchestrate.rs`) against a `ClusterStateCache`
+    fed from Raft — a node in `Directed`/`Verifying` takes no new placements. (The audit's
+    "no caller" was stale.)
+  - [x] Live-voter quorum headroom (UPG1): `upgrade::orchestrator::quorum` now counts LIVE
+    reachable voters — configured voters cross-referenced against gossip `Alive` via the
+    stable `raft_id_from_name` hash — not just configured ones. With one voter already dead,
+    upgrading another that would drop live voters below quorum is refused
+    (`live_quorum_headroom_ok`, unit-tested for the 3-voter one-dead and 5-voter two-dead
+    boundaries).
+  - [x] Server-derived roles/addresses (UPG2): `upgrade::plan::derive_upgrade_nodes` rebuilds
+    each node's role (from the Raft voter set + current leader) and address (from gossip
+    membership) server-side and validates the client's start request against it. A spoofed
+    address or a claim that crosses the leader boundary is rejected; a worker↔council relabel
+    among non-leaders is corrected to the authoritative role. The plan the orchestrator walks
+    never depends on the client's claim.
+  - [x] Gossip-rejoin verification (UPG2): a node reaches `Healthy` only when it is on the
+    target version, HTTP-healthy AND back in the gossip mesh (`Alive`). One that comes up
+    HTTP-healthy but never rejoins gossip is held (and times out → pauses the run), not
+    counted done. Unit-tested both ways.
+  - [x] Apple Container adoption (UPG2): `grill::apple::AppleContainerGrill::adopt` re-tracks
+    a running Apple workload via `container inspect` (the VM survives bun's exec; the workload
+    is not a bun child pid, so pid-liveness doesn't apply). An adopted Apple instance survives
+    an exec-in-place swap instead of restarting; a removed container declines adoption. Parse
+    logic unit-tested; end-to-end adoption gated behind `make test-apple`. (Rootless is a
+    spec-modifier over runc, not a separate adoption path — n/a.)
+  - [x] D20 prose reconciled: `docs/design/agent-bun.md` §5.5 and the Phase 14 lines below now
+    describe the shipped authenticated-HTTP / `GET /v1/version` poll / leader-last-in-place
+    implementation (no leadership transfer, same order on rollback), and the book chapter 14
+    matches.
 - [ ] **Documentation and book truth pass** — correct userspace DNS, Grill/container
   runtime, JSON compatibility, ingress topology, security and upgrade prose; remove
   contradictory historical designs; qualify TUI, GPU, scale, automatic TLS and recovery
@@ -1176,19 +1206,19 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 > Detailed implementation plan: [2026-07-06-plan-self-upgrade.md](plans/2026-07-06-plan-self-upgrade.md)
 > (12 commit-sized steps, decision log, type definitions, test inventory, gotchas checklist).
 
-- [x] Rolling binary replacement (exec-in-place; workers → council → leader-last; state in Raft; `relish upgrade` command set) — **post-Phase-12 audit: production does not perform the leadership-transfer sequence previously claimed; cordon, live-quorum headroom and gossip-rejoin verification remain Phase 12b**
+- [x] Rolling binary replacement (exec-in-place; workers → council → leader-last; state in Raft; `relish upgrade` command set). There is no leadership transfer: the leader upgrades itself last, in place (openraft 0.9 can't gracefully hand off against a live leader), and the returning process finishes the run via poll-first idempotency. Cordon, live-voter quorum headroom, server-derived identity and gossip-rejoin verification landed in 12b.6 (see above).
 - [x] Dual-signature verification (embedded Ed25519 release key set + external operator key from node.toml; air-gapped `--binary` needs embedded only)
 - [x] Automatic rollback on failure (crash-loop boot budget reverts the symlink; nodes refuse previously-reverted upgrade ids; leader pauses the run; `upgrade resume` retries with a fresh id)
 - [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
-- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption; pid+start-time fingerprinting; file-backed process logs). `[runc adoption unverified on Linux]`; AppleGrill adoption deferred (TODO in grill/apple.rs)
+- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption + Apple `container inspect` adoption; pid+start-time fingerprinting for pid-based runtimes, container liveness for Apple VMs; file-backed process logs). `[runc adoption unverified on Linux; Apple adoption gated behind make test-apple]`
 - [x] Book chapter 14: "Changing the Tyres at Full Speed"
 - [x] All Phase 14 tests green (unit tests in the portable suite; 5 single-node + 3 cluster real-binary integration tests are ignored by default and owned by the required `upgrade-node` and `upgrade-cluster` CI jobs). The jobs use nextest resource groups and no retries, so contention or convergence flakes remain visible.
 
-Deferred wiring (seams marked with TODOs): scheduler cordoning awaits an
-in-binary `ClusterStateCache` (`meat::filter::apply_upgrade_cordon` is ready);
-node API addresses are derived `gossip-ip:9117` until gossip advertises API
-ports; cluster-mode post-upgrade verification checks adopted workloads but
-not yet gossip-rejoin explicitly.
+The Phase 14 deferred seams are closed in 12b.6: scheduler cordoning is wired
+against a live `ClusterStateCache`, quorum headroom counts live voters, node
+roles/addresses are derived server-side from gossip + Raft, and post-upgrade
+verification now requires gossip rejoin explicitly (see the "Self-upgrade
+convergence and adoption" theme under 12b.6).
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 

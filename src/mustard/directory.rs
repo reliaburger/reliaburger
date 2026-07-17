@@ -102,6 +102,31 @@ impl NodeDirectory {
         newer
     }
 
+    /// Resolve a node's API endpoint, preferring the address it advertised
+    /// over gossip and falling back to `gossip_address` shifted by
+    /// `gossip_to_api_offset` when no extension has arrived yet.
+    ///
+    /// The fallback exists only for the brief window before a peer's first
+    /// directory extension lands. It must not be trusted long-term: a single
+    /// host can run several nodes on distinct, independently chosen
+    /// gossip/API ports, so one node's offset is not another's. Whatever
+    /// address the rest of the control plane compares against and dials — the
+    /// upgrade orchestrator most sharply — has to be this advertised one.
+    pub fn api_address(
+        &self,
+        node_id: &NodeId,
+        gossip_address: SocketAddr,
+        gossip_to_api_offset: i32,
+    ) -> SocketAddr {
+        match self.endpoints.get(node_id) {
+            Some(endpoints) => endpoints.api_address,
+            None => SocketAddr::new(
+                gossip_address.ip(),
+                (gossip_address.port() as i32 + gossip_to_api_offset) as u16,
+            ),
+        }
+    }
+
     /// Drop endpoint entries for reaped members. Returns `true` if any were
     /// removed. The leader hint is kept even if the leader was reaped — a
     /// higher-term hint from the next leader replaces it.
@@ -265,6 +290,32 @@ mod tests {
         // Recovering clears it and reports a change.
         assert!(dir.observe(&extension_with_disk_pressure("n1", 9117, false)));
         assert!(!dir.disk_pressured.contains(&NodeId::new("n1")));
+    }
+
+    #[test]
+    fn api_address_prefers_advertised_over_offset() {
+        // The peer advertised its API endpoint on port 9200, but its gossip
+        // address is on 7777 and the LOCAL node's offset would derive 7780.
+        // The advertised address must win — this is exactly the gossip-vs-API
+        // conflation that broke the cluster upgrade: a per-node offset is not
+        // a peer's offset, and the orchestrator dials the advertised port.
+        let mut dir = NodeDirectory::default();
+        dir.observe(&extension("n1", 9200, None));
+        let gossip = SocketAddr::from(([127, 0, 0, 1], 7777));
+        assert_eq!(
+            dir.api_address(&NodeId::new("n1"), gossip, 3),
+            addr(9200),
+            "advertised API address must be preferred over the local offset"
+        );
+    }
+
+    #[test]
+    fn api_address_falls_back_to_offset_before_extension_arrives() {
+        // No extension for this node yet: the offset fallback bridges the
+        // gap until the first directory extension lands.
+        let dir = NodeDirectory::default();
+        let gossip = SocketAddr::from(([127, 0, 0, 1], 7777));
+        assert_eq!(dir.api_address(&NodeId::new("n1"), gossip, 3), addr(7780));
     }
 
     #[test]

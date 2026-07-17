@@ -669,10 +669,18 @@ async fn main() -> anyhow::Result<()> {
         .map(reliaburger::sesame::token::derive_service_token)
         .transpose()?;
 
+    // Gossip membership watch for the upgrade orchestrator's live-voter
+    // quorum check (UPG1). Captured out of `orchestration` before the
+    // refresher task consumes its copy, so it outlives that block.
+    let mut upgrade_membership_rx: Option<
+        tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
+    > = None;
+
     // L1 orchestration: the leader schedules desired apps into
     // placements, every node keeps a fresh peer-API table, and every
     // node reconciles its instances against its assignments.
     if let Some((membership_rx, metrics_rx, aggregated_rx, directory_rx)) = orchestration {
+        upgrade_membership_rx = Some(membership_rx.clone());
         if let Some(council) = &api_council {
             reliaburger::cluster::orchestrate::spawn_leader_scheduler(
                 Arc::clone(council),
@@ -701,25 +709,41 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(RwLock::new(Vec::new()));
         api_membership = Some(Arc::clone(&membership_table));
         let mut refresher_rx = membership_rx;
+        // Each node advertises its real API endpoint over gossip (the
+        // directory, 12b.2). Prefer that authoritative `api_address`: a
+        // single host can run several nodes on distinct, independently
+        // chosen gossip/API ports, so the local node's fixed
+        // gossip→API offset is NOT a peer's offset. The offset is only a
+        // fallback for a peer whose directory extension hasn't arrived yet.
+        let mut refresher_directory_rx = directory_rx.clone();
         let refresher_shutdown = shutdown.clone();
         tokio::spawn(async move {
             loop {
-                let snapshot: Vec<api::NodeMembershipInfo> = refresher_rx
-                    .borrow()
-                    .iter()
-                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                    .map(|m| api::NodeMembershipInfo {
-                        node_id: m.node_id.clone(),
-                        address: std::net::SocketAddr::new(
-                            m.address.ip(),
-                            (m.address.port() as i32 + gossip_to_api_offset) as u16,
-                        ),
-                    })
-                    .collect();
+                let snapshot: Vec<api::NodeMembershipInfo> = {
+                    let directory = refresher_directory_rx.borrow();
+                    refresher_rx
+                        .borrow()
+                        .iter()
+                        .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
+                        .map(|m| api::NodeMembershipInfo {
+                            node_id: m.node_id.clone(),
+                            address: directory.api_address(
+                                &m.node_id,
+                                m.address,
+                                gossip_to_api_offset,
+                            ),
+                        })
+                        .collect()
+                };
                 *membership_table.write().await = snapshot;
                 tokio::select! {
                     _ = refresher_shutdown.cancelled() => break,
                     changed = refresher_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    changed = refresher_directory_rx.changed() => {
                         if changed.is_err() {
                             break;
                         }
@@ -744,8 +768,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Rolling-upgrade orchestrator: dormant unless this node is the Raft
-    // leader with an active upgrade in DesiredState (Phase 14).
-    if let Some(council) = api_council.clone() {
+    // leader with an active upgrade in DesiredState (Phase 14). Needs the
+    // gossip membership watch to count live voters for quorum (UPG1); it
+    // only runs in cluster mode, where that watch is always present.
+    if let (Some(council), Some(membership_rx)) =
+        (api_council.clone(), upgrade_membership_rx.clone())
+    {
         let control = reliaburger::upgrade::orchestrator::HttpNodeControl::with_http(
             service_token.clone(),
             cluster_http.clone(),
@@ -757,6 +785,7 @@ async fn main() -> anyhow::Result<()> {
                 council,
                 control,
                 orchestrator_node,
+                membership_rx,
                 orchestrator_cancel,
             )
             .await;

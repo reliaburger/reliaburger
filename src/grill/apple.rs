@@ -81,6 +81,34 @@ impl AppleContainerGrill {
             })
     }
 
+    /// Map an Apple `container inspect` JSON document to a [`ContainerState`].
+    ///
+    /// Apple's CLI has moved the status field around between releases, so we
+    /// try the paths we've seen (`State.Status`, `state.status`, `Status`).
+    /// Pulled out of `state()` so the adoption and status logic can be
+    /// tested against fixture JSON without a running Apple Container.
+    fn parse_state(
+        inspect_json: &serde_json::Value,
+        instance: &InstanceId,
+    ) -> Result<ContainerState, GrillError> {
+        let status = inspect_json["State"]["Status"]
+            .as_str()
+            .or_else(|| inspect_json["state"]["status"].as_str())
+            .or_else(|| inspect_json["Status"].as_str())
+            .unwrap_or("unknown");
+
+        match status {
+            "created" => Ok(ContainerState::Pending),
+            "running" => Ok(ContainerState::Running),
+            "exited" | "stopped" | "dead" => Ok(ContainerState::Stopped),
+            "paused" => Ok(ContainerState::Stopping),
+            other => Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("unknown container state: {other}"),
+            }),
+        }
+    }
+
     /// Run a container CLI command and return its output.
     async fn container_command(
         args: &[&str],
@@ -104,10 +132,55 @@ impl Default for AppleContainerGrill {
 }
 
 impl super::Grill for AppleContainerGrill {
-    // TODO(Phase 14 follow-up): Apple Container adoption. The trait default
-    // declines adopt(), so Apple workloads restart after a self-upgrade.
     fn runtime_kind(&self) -> super::records::RuntimeKind {
         super::records::RuntimeKind::Apple
+    }
+
+    /// Adopt a running Apple Container instance after a bun exec or restart
+    /// (UPG2). Unlike runc/process, an Apple workload runs *inside a VM*
+    /// managed by the `container` daemon, not as a child pid of bun, so the
+    /// pid-based liveness check doesn't apply. The recoverable handle is the
+    /// container itself: `container inspect <id>` reporting `running` means
+    /// the VM survived our restart, so we re-track the entry (rebuilt from
+    /// the record's OCI spec) and re-discover its IP instead of tearing the
+    /// workload down and starting fresh.
+    async fn adopt(
+        &self,
+        instance: &InstanceId,
+        record: &super::records::InstanceRecord,
+    ) -> Result<bool, GrillError> {
+        // The container must still exist and be running for adoption to make
+        // sense; otherwise the caller reschedules through the normal path.
+        match self.state(instance).await {
+            Ok(ContainerState::Running) => {}
+            Ok(_) => return Ok(false),
+            // NotFound: the VM is gone. Anything else is a real error, but
+            // adoption is best-effort, so decline rather than wedge startup.
+            Err(_) => return Ok(false),
+        }
+
+        let mut entries = self.entries.lock().await;
+        entries.insert(
+            instance.clone(),
+            AppleEntry {
+                spec: record.oci_spec.clone(),
+                image: record.image.clone(),
+                container_ip: None,
+            },
+        );
+        drop(entries);
+
+        // Re-discover the IP the same way `start()` does; a failure here is
+        // non-fatal (the container is adopted, service discovery re-resolves
+        // it on the next inspect).
+        if let Ok(ip) = Self::discover_container_ip(instance).await {
+            let mut entries = self.entries.lock().await;
+            if let Some(entry) = entries.get_mut(instance) {
+                entry.container_ip = Some(ip);
+            }
+        }
+
+        Ok(true)
     }
 
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
@@ -296,23 +369,7 @@ impl super::Grill for AppleContainerGrill {
                 reason: format!("failed to parse container inspect: {e}"),
             })?;
 
-        // Apple container inspect returns a JSON object with a "State" field
-        let status = inspect_json["State"]["Status"]
-            .as_str()
-            .or_else(|| inspect_json["state"]["status"].as_str())
-            .or_else(|| inspect_json["Status"].as_str())
-            .unwrap_or("unknown");
-
-        match status {
-            "created" => Ok(ContainerState::Pending),
-            "running" => Ok(ContainerState::Running),
-            "exited" | "stopped" | "dead" => Ok(ContainerState::Stopped),
-            "paused" => Ok(ContainerState::Stopping),
-            other => Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("unknown container state: {other}"),
-            }),
-        }
+        Self::parse_state(&inspect_json, instance)
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
@@ -347,6 +404,46 @@ mod tests {
 
     fn apple_tests_enabled() -> bool {
         std::env::var("RELIABURGER_APPLE_CONTAINER_TESTS").is_ok()
+    }
+
+    #[test]
+    fn parse_state_recognises_running_for_adoption() {
+        // The `State.Status` shape adoption keys off: a running container is
+        // adoptable, an exited one is not.
+        let id = InstanceId("apple-0".to_string());
+        let running = serde_json::json!({ "State": { "Status": "running" } });
+        assert_eq!(
+            AppleContainerGrill::parse_state(&running, &id).unwrap(),
+            ContainerState::Running
+        );
+        let exited = serde_json::json!({ "State": { "Status": "exited" } });
+        assert_eq!(
+            AppleContainerGrill::parse_state(&exited, &id).unwrap(),
+            ContainerState::Stopped
+        );
+    }
+
+    #[test]
+    fn parse_state_accepts_alternate_json_shapes() {
+        let id = InstanceId("apple-0".to_string());
+        // Lower-case nested and top-level variants Apple has shipped.
+        let lower = serde_json::json!({ "state": { "status": "running" } });
+        assert_eq!(
+            AppleContainerGrill::parse_state(&lower, &id).unwrap(),
+            ContainerState::Running
+        );
+        let flat = serde_json::json!({ "Status": "created" });
+        assert_eq!(
+            AppleContainerGrill::parse_state(&flat, &id).unwrap(),
+            ContainerState::Pending
+        );
+    }
+
+    #[test]
+    fn parse_state_rejects_unknown_status() {
+        let id = InstanceId("apple-0".to_string());
+        let weird = serde_json::json!({ "State": { "Status": "banana" } });
+        assert!(AppleContainerGrill::parse_state(&weird, &id).is_err());
     }
 
     #[tokio::test]
@@ -391,5 +488,78 @@ mod tests {
 
         // Clean up
         let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
+    async fn adopt_re_tracks_a_running_apple_container() {
+        assert!(
+            apple_tests_enabled(),
+            "set RELIABURGER_APPLE_CONTAINER_TESTS=1 after installing and starting Apple Container"
+        );
+
+        let id = InstanceId("apple-adopt-0".to_string());
+        let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
+            root: crate::grill::oci::OciRoot {
+                path: "alpine:latest".to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                args: vec!["sleep".to_string(), "300".to_string()],
+                env: vec![],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: vec![],
+            linux: crate::grill::oci::OciLinux {
+                namespaces: vec![],
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+
+        // One grill starts the container; a FRESH grill (as after a bun
+        // exec, with empty in-memory state) adopts it.
+        let starter = AppleContainerGrill::new();
+        starter.create(&id, &spec).await.expect("create");
+        starter.start(&id).await.expect("start");
+
+        let record = crate::grill::records::InstanceRecord {
+            schema: 1,
+            instance_id: id.0.clone(),
+            namespace: "default".to_string(),
+            app_name: "apple-adopt".to_string(),
+            replica_index: 0,
+            is_job: false,
+            image: "alpine:latest".to_string(),
+            runtime: crate::grill::records::RuntimeKind::Apple,
+            pid: 0,
+            pid_started_at: 0,
+            runc_container_id: None,
+            log_stem: None,
+            host_port: None,
+            app_spec: None,
+            oci_spec: spec.clone(),
+        };
+
+        let fresh = AppleContainerGrill::new();
+        let adopted = fresh.adopt(&id, &record).await.expect("adopt");
+        assert!(adopted, "a running Apple container should be adopted");
+        assert_eq!(
+            fresh.state(&id).await.ok(),
+            Some(ContainerState::Running),
+            "adopted container should still be running"
+        );
+
+        // A vanished container declines adoption.
+        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        let after_removal = AppleContainerGrill::new()
+            .adopt(&id, &record)
+            .await
+            .expect("adopt after removal");
+        assert!(!after_removal, "a removed container must not be adopted");
     }
 }
