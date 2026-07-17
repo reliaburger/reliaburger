@@ -1200,7 +1200,11 @@ whole theme lands.
     is not a bun child pid, so pid-liveness doesn't apply). An adopted Apple instance survives
     an exec-in-place swap instead of restarting; a removed container declines adoption. Parse
     logic unit-tested; end-to-end adoption gated behind `make test-apple`. (Rootless is a
-    spec-modifier over runc, not a separate adoption path — n/a.)
+    spec-modifier over runc, not a separate adoption path — n/a.) The 12b acceptance gate ran
+    `make test-apple` on real Apple silicon and caught that the inspect parser had guessed the
+    wrong JSON shape: the CLI returns a single-element array with a top-level lowercase `status`
+    and the IPv4 address as CIDR under `networks[0].ipv4Address`. Parser corrected against the
+    real output (fixtures replaced with the captured schema), so adoption now works on hardware.
   - [x] D20 prose reconciled: `docs/design/agent-bun.md` §5.5 and the Phase 14 lines below now
     describe the shipped authenticated-HTTP / `GET /v1/version` poll / leader-last-in-place
     implementation (no leadership transfer, same order on rollback), and the book chapter 14

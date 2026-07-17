@@ -63,38 +63,58 @@ impl AppleContainerGrill {
                 reason: format!("failed to parse container inspect: {e}"),
             })?;
 
-        // Try common JSON paths for the IP address
-        let ip_str = inspect["NetworkSettings"]["IPAddress"]
-            .as_str()
-            .or_else(|| inspect["networkSettings"]["ipAddress"].as_str())
-            .or_else(|| inspect["network"]["ip"].as_str())
-            .ok_or_else(|| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: "no IP address found in container inspect output".to_string(),
-            })?;
+        Self::parse_container_ip(&inspect).ok_or_else(|| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: "no IPv4 address found in container inspect output".to_string(),
+        })
+    }
 
-        ip_str
-            .parse::<Ipv4Addr>()
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("invalid IP address from inspect: {e}"),
-            })
+    /// Apple's `container inspect` returns a single-element JSON array. Return
+    /// the first object so the field lookups work whether the CLI hands us the
+    /// array or (in older shapes) a bare object.
+    fn inspect_root(inspect_json: &serde_json::Value) -> &serde_json::Value {
+        inspect_json
+            .as_array()
+            .and_then(|entries| entries.first())
+            .unwrap_or(inspect_json)
+    }
+
+    /// Extract the container's IPv4 address from an inspect document.
+    ///
+    /// The `container` CLI reports it at `networks[0].ipv4Address` as a CIDR
+    /// string (e.g. `192.168.64.3/24`), so we keep only the address part. The
+    /// older guessed paths stay as fallbacks in case the schema shifts again.
+    /// Pulled out of `discover_container_ip` so it's testable against fixture
+    /// JSON without a running Apple Container.
+    fn parse_container_ip(inspect_json: &serde_json::Value) -> Option<Ipv4Addr> {
+        let root = Self::inspect_root(inspect_json);
+        let ip_str = root["networks"][0]["ipv4Address"]
+            .as_str()
+            .or_else(|| root["NetworkSettings"]["IPAddress"].as_str())
+            .or_else(|| root["networkSettings"]["ipAddress"].as_str())
+            .or_else(|| root["network"]["ip"].as_str())?;
+        // Strip the `/prefix` suffix; vmnet hands out addresses as CIDR.
+        let address = ip_str.split('/').next().unwrap_or(ip_str);
+        address.parse::<Ipv4Addr>().ok()
     }
 
     /// Map an Apple `container inspect` JSON document to a [`ContainerState`].
     ///
-    /// Apple's CLI has moved the status field around between releases, so we
-    /// try the paths we've seen (`State.Status`, `state.status`, `Status`).
-    /// Pulled out of `state()` so the adoption and status logic can be
-    /// tested against fixture JSON without a running Apple Container.
+    /// Apple's CLI reports the status at the top level of each inspect entry
+    /// as a lowercase `status` (e.g. `running`, `stopped`). Older/other shapes
+    /// (`State.Status`, `state.status`, `Status`) stay as fallbacks. Pulled out
+    /// of `state()` so the adoption and status logic can be tested against
+    /// fixture JSON without a running Apple Container.
     fn parse_state(
         inspect_json: &serde_json::Value,
         instance: &InstanceId,
     ) -> Result<ContainerState, GrillError> {
-        let status = inspect_json["State"]["Status"]
+        let root = Self::inspect_root(inspect_json);
+        let status = root["status"]
             .as_str()
-            .or_else(|| inspect_json["state"]["status"].as_str())
-            .or_else(|| inspect_json["Status"].as_str())
+            .or_else(|| root["State"]["Status"].as_str())
+            .or_else(|| root["state"]["status"].as_str())
+            .or_else(|| root["Status"].as_str())
             .unwrap_or("unknown");
 
         match status {
@@ -380,11 +400,15 @@ impl super::Grill for AppleContainerGrill {
             return None;
         }
         let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-        // Try the common inspect JSON paths for the exit code.
-        inspect["State"]["ExitCode"]
+        // Apple's `container inspect` does not currently surface the process
+        // exit code, so this normally yields None; we still probe the shapes we
+        // might see if a future CLI adds it.
+        let root = Self::inspect_root(&inspect);
+        root["State"]["ExitCode"]
             .as_i64()
-            .or_else(|| inspect["state"]["exitCode"].as_i64())
-            .or_else(|| inspect["ExitCode"].as_i64())
+            .or_else(|| root["state"]["exitCode"].as_i64())
+            .or_else(|| root["exitCode"].as_i64())
+            .or_else(|| root["ExitCode"].as_i64())
             .map(|code| code as i32)
     }
 
@@ -408,17 +432,22 @@ mod tests {
 
     #[test]
     fn parse_state_recognises_running_for_adoption() {
-        // The `State.Status` shape adoption keys off: a running container is
-        // adoptable, an exited one is not.
+        // The real `container inspect` shape adoption keys off: a JSON array
+        // whose entry carries a top-level lowercase `status`. A running
+        // container is adoptable, a stopped one is not.
         let id = InstanceId("apple-0".to_string());
-        let running = serde_json::json!({ "State": { "Status": "running" } });
+        let running = serde_json::json!([{
+            "id": "apple-0",
+            "status": "running",
+            "networks": [{ "ipv4Address": "192.168.64.3/24" }]
+        }]);
         assert_eq!(
             AppleContainerGrill::parse_state(&running, &id).unwrap(),
             ContainerState::Running
         );
-        let exited = serde_json::json!({ "State": { "Status": "exited" } });
+        let stopped = serde_json::json!([{ "id": "apple-0", "status": "stopped" }]);
         assert_eq!(
-            AppleContainerGrill::parse_state(&exited, &id).unwrap(),
+            AppleContainerGrill::parse_state(&stopped, &id).unwrap(),
             ContainerState::Stopped
         );
     }
@@ -426,7 +455,8 @@ mod tests {
     #[test]
     fn parse_state_accepts_alternate_json_shapes() {
         let id = InstanceId("apple-0".to_string());
-        // Lower-case nested and top-level variants Apple has shipped.
+        // Bare-object and nested variants kept as fallbacks in case the CLI
+        // schema shifts again.
         let lower = serde_json::json!({ "state": { "status": "running" } });
         assert_eq!(
             AppleContainerGrill::parse_state(&lower, &id).unwrap(),
@@ -437,6 +467,27 @@ mod tests {
             AppleContainerGrill::parse_state(&flat, &id).unwrap(),
             ContainerState::Pending
         );
+    }
+
+    #[test]
+    fn parse_container_ip_reads_the_networks_cidr_address() {
+        // Real inspect shape: a single-element array with the IPv4 address as
+        // CIDR under `networks[0].ipv4Address`. The prefix must be stripped.
+        let inspect = serde_json::json!([{
+            "id": "apple-0",
+            "status": "running",
+            "networks": [{
+                "ipv4Address": "192.168.64.3/24",
+                "ipv4Gateway": "192.168.64.1"
+            }]
+        }]);
+        assert_eq!(
+            AppleContainerGrill::parse_container_ip(&inspect),
+            Some("192.168.64.3".parse().unwrap())
+        );
+        // No network information yields None rather than a bogus address.
+        let empty = serde_json::json!([{ "id": "apple-0", "status": "running" }]);
+        assert_eq!(AppleContainerGrill::parse_container_ip(&empty), None);
     }
 
     #[test]
@@ -520,6 +571,10 @@ mod tests {
                 gid_mappings: None,
             },
         };
+
+        // Best-effort cleanup of any leftover from an earlier aborted run, so
+        // the test is idempotent (Apple keeps stopped containers around).
+        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
 
         // One grill starts the container; a FRESH grill (as after a bun
         // exec, with empty in-memory state) adopts it.
