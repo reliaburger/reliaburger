@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-no-default test-slow test-linux test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-no-default test-slow test-linux test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -57,6 +57,14 @@ fmt-check: ## Check formatting without modifying files
 
 lint: ## Run clippy for every target and feature with warnings as errors
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
+
+audit: ## Fail on new RustSec findings or an expired advisory exception
+	@today=$$(date -u +%Y%m%d); expiry=20260818; \
+	if [ "$$today" -gt "$$expiry" ]; then \
+		echo "dependency advisory exceptions expired on 2026-08-18; review .cargo/audit.toml" >&2; \
+		exit 1; \
+	fi
+	$(CARGO) audit
 
 examples: build ## Dry-run every example config with relish
 	@failed=0; total=0; \

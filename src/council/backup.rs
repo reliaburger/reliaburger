@@ -20,6 +20,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -200,7 +201,9 @@ impl BackupStore {
             .unwrap_or_default()
             .as_millis();
         // Zero-pad so string order matches time order for the next ~300 years.
-        self.prefix.child(format!("council-{millis:016}.backup"))
+        self.prefix
+            .clone()
+            .join(format!("council-{millis:016}.backup"))
     }
 
     /// Upload one sealed backup.

@@ -82,7 +82,8 @@ pub struct ApiState {
     /// Cluster membership for cross-node queries (populated from gossip).
     pub membership: Option<Arc<RwLock<Vec<NodeMembershipInfo>>>>,
     /// API token store, seeded from the council's `SecurityState` and refreshed
-    /// live. Read by the auth middleware.
+    /// live. Read by the auth middleware. Production Bun always supplies one;
+    /// `None` remains available to small embedded/test routers.
     pub token_store: Option<crate::sesame::auth::TokenStore>,
     /// The cluster's internal service token, presented on cross-node fan-out
     /// calls so peers accept them as the system principal. `None` single-node.

@@ -298,6 +298,32 @@ webhook test accidentally exercised startup, or whether a five-second performanc
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
 lines, but read the covered tests too.
 
+## Dependencies are code too
+
+The lockfile is part of the programme. A perfectly tested call into a vulnerable archive
+parser remains a vulnerable call, and an optional crate can sit in `Cargo.lock` without
+appearing in the compiled graph. We need both facts. `cargo audit` compares every locked
+crate with the current RustSec database; `cargo tree -i package` walks backwards from a
+package to show why it exists.
+
+That distinction mattered immediately. `tar` handled real image and build archives, so we
+patched it. `quick-xml` arrived through the cloud object-store client and parsed remote
+responses, so we upgraded `object_store` and migrated its changed Rust API. `quinn-proto`
+was locked behind reqwest's optional HTTP/3 support, but `cargo tree --target all` found no
+enabled path. We patched it anyway. Cheap uncertainty is still uncertainty.
+
+Two findings had no clean compatible fix. Parquet brings in an unpatched Thrift allocation
+issue, and ratatui brings in an `lru::IterMut` soundness issue. The latter affected method
+isn't called by ratatui's layout cache. The former can parse a crafted Parquet object when an
+operator points the remote log-query command at it, so trusted storage is a compensating
+control, not a fix. We wrote both decisions down, named an owner and gave them an expiry.
+
+The repository audit denies every new vulnerability and maintenance warning. Its short
+exception list expires on 18 August 2026, and the Make target fails after that date until we
+review it. CI runs the audit on changes and releases; a weekly job catches a new advisory
+even when nobody changes the source. An exception without an owner and an alarm is just a
+quieter way to forget a problem.
+
 Now a green portable run means something narrow and valuable: the portable behaviour ran,
 without retries, on this machine. The privileged, cluster, upgrade, slow and benchmark jobs
 make their own claims. Smaller claims. Better evidence.

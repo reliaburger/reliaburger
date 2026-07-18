@@ -65,10 +65,19 @@ be visible until we remove its race.
 | `make bench-large` | Criterion 500- and 1,000-node measurements | Pull requests |
 | `make bench-10k` | Deterministic 10,000-member per-node scale acceptance | Pull requests |
 | `make coverage` | Combined default and no-default portable line coverage | Pull requests |
+| `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 
 Apple Container is the only manual runtime exception. GitHub's hosted macOS runners cannot
 provide its nested virtualisation. Everything else runs on a pull request and release tags
 must pass the same reusable validation workflow before publication.
+
+The dependency audit refreshes its database on every run. It denies new
+vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.
+The repository-local exception list names only reviewed findings whose affected
+API is unreachable or whose upstream has no compatible fix. Those exceptions
+aren't permanent configuration: `make audit` rejects all of them after 18
+August 2026, forcing a new reachability and upgrade review. GitHub Dependabot
+continues to track ecosystem advisories that RustSec doesn't carry.
 
 ## Gating rules
 

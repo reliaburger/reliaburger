@@ -1,0 +1,17 @@
+# The CI gate denies every RustSec warning that is not named here. Each
+# exception is owned by Phase 15a / M2 and expires on 18 August 2026; `make
+# audit` enforces that date before running cargo-audit. Reachability and
+# compensating controls are recorded in the Phase 15a follow-up plan.
+[advisories]
+ignore = [
+  "RUSTSEC-2024-0370", # proc-macro-error: build-time dependency through age
+  "RUSTSEC-2024-0436", # paste: build-time dependency through DataFusion/ratatui
+  "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained, replacement migration pending
+  "RUSTSEC-2025-0141", # bincode 1: unmaintained, durable-format migration required
+  "RUSTSEC-2026-0002", # lru::IterMut: affected API is not called by ratatui 0.29
+  "RUSTSEC-2026-0190", # anyhow::Error::downcast_mut: affected API is not called
+]
+
+[output]
+deny = ["warnings"]
+quiet = false

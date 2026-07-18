@@ -63,6 +63,7 @@ See [docs/README.md](docs/README.md) for prerequisites, container runtime setup,
 
 ```sh
 make test                    # run the portable nextest suite
+make audit                   # reject new RustSec dependency findings
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
