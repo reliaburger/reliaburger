@@ -1388,5 +1388,8 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   compressed in release builds) and browsed through the shared reader; each
   file's first line is its styled path so fuzzy search covers paths and
   content; `relish source ebpf` opens with the query pre-seeded.
-- [ ] README revamp — pitch-first top-level README; reference material moves
-  into the manual.
+- [x] README revamp — pitch-first top-level README (one-binary story,
+  setup/manual/source showcase with an asciicast placeholder, prominent
+  book); the components table and repo layout moved into a new
+  "Under the hood" manual chapter; the status wall replaced by a
+  progress.md link.
