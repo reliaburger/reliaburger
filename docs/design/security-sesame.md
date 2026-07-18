@@ -730,7 +730,28 @@ This is the single most security-critical operation. It generates all root key m
 12. Write the sealed root CA backup to the admin's filesystem.
 13. Delete the root CA private key from memory.
 14. Generate a one-time join token and output it to stderr only.
-15. Start accepting connections with mTLS.
+15. Write the first node config with `require_mtls = true`; when Bun starts
+    with that file, it refuses to enter cluster mode without the identity and
+    brings up the authenticated transports.
+
+The master key and security-bootstrap files are both written with mode `0600`.
+Bun enforces that at load time, so a generated bootstrap never relies on a
+world-readable interval or asks the operator to repair permissions manually.
+
+This is the normal path. Explicit development generators are the exception:
+`relish init --development-plaintext` and `relish dev create` write
+`require_mtls = false`, embed a development-only warning in the file and print
+the same warning; Bun repeats it at every cluster start. The Lima dev cluster
+keeps this temporary limitation because its provisioning path doesn't enrol a
+separate node identity in each VM yet. Don't reuse those configs elsewhere.
+
+The transport contract has one deliberate split. Raft and reporting require a
+valid, unrevoked node certificate at the TLS handshake. The agent API also
+presents a node certificate, and node-to-node clients present theirs, so peer
+calls are mutually authenticated. Relish and browsers don't hold node keys,
+so the API listener permits an absent client certificate and authorises those
+requests with bearer tokens or session cookies. Gossip is UDP and uses the
+cluster-master-key-derived HMAC instead of TLS.
 
 **Output to admin:**
 

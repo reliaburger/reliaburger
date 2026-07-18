@@ -7,8 +7,8 @@
 //! the cluster CA. `ClusterHttp` bundles both, built once at startup and shared
 //! so every peer call is consistent.
 //!
-//! It carries no client certificate: node-to-node calls still authenticate
-//! with the service token, which now rides inside TLS.
+//! It presents the node certificate so the transport is mutually
+//! authenticated. Route authorisation remains the service token's job.
 
 use reqwest::Client;
 
