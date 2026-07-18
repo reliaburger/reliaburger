@@ -1,8 +1,7 @@
 //! The agent API served over mTLS.
 //!
-//! Proves the API server config (optional client auth) and the cluster HTTP
-//! client (CA-trusting, no client cert) interoperate over a real HTTPS round
-//! trip — the "relish/browser without a node cert" case the API must accept.
+//! Proves the API server config and cluster HTTP client complete a mutually
+//! authenticated HTTPS round trip with issued node identities.
 
 use std::time::{Duration, SystemTime};
 
@@ -41,6 +40,7 @@ fn identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> NodeIdentity
 async fn spawn_tls_api(
     acceptor: tokio_rustls::TlsAcceptor,
     shutdown: CancellationToken,
+    saw_client_certificate: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::net::SocketAddr {
     use tower::Service;
 
@@ -56,12 +56,20 @@ async fn spawn_tls_api(
                 accepted = listener.accept() => {
                     let Ok((tcp, _)) = accepted else { continue };
                     let acceptor = acceptor.clone();
+                    let saw_client_certificate = saw_client_certificate.clone();
                     let service = match make_service.call(()).await {
                         Ok(s) => s,
                         Err(infallible) => match infallible {},
                     };
                     tokio::spawn(async move {
                         let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        saw_client_certificate.store(
+                            tls.get_ref()
+                                .1
+                                .peer_certificates()
+                                .is_some_and(|certificates| !certificates.is_empty()),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         let svc = hyper_util::service::TowerToHyperService::new(service);
                         let _ = hyper_util::server::conn::auto::Builder::new(
                             hyper_util::rt::TokioExecutor::new(),
@@ -77,19 +85,19 @@ async fn spawn_tls_api(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_serves_https_and_accepts_a_client_without_a_client_cert() {
+async fn peer_api_round_trip_presents_the_calling_nodes_identity() {
     let hierarchy = ca::generate_ca_hierarchy("api-tls-test", b"ikm").unwrap();
     let server_id = identity(&hierarchy, "node-01", 10);
+    let client_id = identity(&hierarchy, "node-02", 11);
 
     let acceptor = tokio_rustls::TlsAcceptor::from(
         build_api_server_config(&server_id, CrlHandle::default()).unwrap(),
     );
     let shutdown = CancellationToken::new();
-    let addr = spawn_tls_api(acceptor, shutdown.clone()).await;
+    let saw_client_certificate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let addr = spawn_tls_api(acceptor, shutdown.clone(), saw_client_certificate.clone()).await;
 
-    // The cluster HTTP client trusts the cluster CA and presents no client
-    // certificate — exactly how a peer or relish reaches the API under mTLS.
-    let client = build_cluster_http_client(&server_id).unwrap();
+    let client = build_cluster_http_client(&client_id, CrlHandle::default()).unwrap();
     let resp = client
         .get(format!("https://{addr}/ping"))
         .send()
@@ -97,6 +105,10 @@ async fn api_serves_https_and_accepts_a_client_without_a_client_cert() {
         .expect("HTTPS request should succeed");
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "pong");
+    assert!(
+        saw_client_certificate.load(std::sync::atomic::Ordering::SeqCst),
+        "the peer API call completed without presenting its configured node identity"
+    );
 
     shutdown.cancel();
 }
@@ -110,7 +122,12 @@ async fn a_client_that_does_not_trust_the_cluster_ca_is_refused() {
         build_api_server_config(&server_id, CrlHandle::default()).unwrap(),
     );
     let shutdown = CancellationToken::new();
-    let addr = spawn_tls_api(acceptor, shutdown.clone()).await;
+    let addr = spawn_tls_api(
+        acceptor,
+        shutdown.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await;
 
     // A stock client doesn't trust our private CA, so the TLS handshake fails.
     let stock = reqwest::Client::builder()

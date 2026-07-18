@@ -298,7 +298,11 @@ fn generate_node_config(node_name: &str, node_ip: &str, first_node_ip: Option<&s
     };
 
     format!(
-        r#"[node]
+        r#"# WARNING: DEVELOPMENT-ONLY PLAINTEXT CLUSTER TRANSPORTS.
+# `relish dev create` isolates these nodes in local Lima VMs. Do not reuse
+# this config on a shared or production network.
+
+[node]
 name = "{node_name}"
 
 [network]
@@ -312,6 +316,7 @@ reporting_port = 9445
 
 [security]
 master_key_path = "/etc/reliaburger/master.key"{bootstrap_line}
+require_mtls = false
 "#
     )
 }
@@ -459,6 +464,7 @@ pub async fn create(
     // gets the security bootstrap (it seeds SecurityState into Raft, which then
     // replicates to the rest). Both are written 0600 and installed 0600.
     println!("  generating security material...");
+    println!("  WARNING: dev-cluster internal transports are plaintext inside the Lima network");
     let sec_dir = std::env::temp_dir().join(format!("{name}-dev-security"));
     std::fs::create_dir_all(&sec_dir)?;
     let init = crate::sesame::init::initialize_cluster(name, &cluster.nodes[0].name, &sec_dir)
@@ -1040,6 +1046,13 @@ mod tests {
             assert!(config.contains("[security]"));
             assert!(config.contains(r#"master_key_path = "/etc/reliaburger/master.key""#));
         }
+    }
+
+    #[test]
+    fn generate_node_config_marks_the_deliberate_development_plaintext_mode() {
+        let config = generate_node_config("reliaburger-1", "192.168.105.2", None);
+        assert!(config.contains("DEVELOPMENT-ONLY PLAINTEXT CLUSTER TRANSPORTS"));
+        assert!(config.contains("require_mtls = false"));
     }
 
     #[test]

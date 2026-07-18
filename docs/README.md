@@ -235,6 +235,46 @@ hostname listeners are rejected before subsystem startup. Initialise an
 authenticated cluster and create the first admin token before exposing the API
 on a non-loopback address.
 
+### Secure cluster initialisation
+
+`relish init` generates the cluster PKI, the first node's identity and a
+`reliaburger.toml` that requires mTLS. Start the cluster with that generated
+configuration; no security switch needs hand-editing:
+
+```sh
+mkdir cluster
+cargo run --bin relish -- init cluster --cluster-name prod --node-id node-01
+cargo run --bin bun -- --cluster --config cluster/reliaburger.toml
+```
+
+The generated security section contains the material paths and the secure
+mode:
+
+```toml
+[security]
+master_key_path = "cluster/prod-master.key"
+bootstrap_path = "cluster/prod-security-bootstrap.json"
+identity_dir = "cluster/identity"
+require_mtls = true
+```
+
+With this mode, Raft and reporting require mutually authenticated node
+certificates. Peer API calls also present their node certificate and check the
+live revocation list; Relish and browsers may omit a client certificate and
+authenticate with a bearer token or session cookie over TLS.
+
+If you specifically need plaintext transports for an isolated local test,
+make that exception explicit:
+
+```sh
+cargo run --bin relish -- init cluster --development-plaintext
+```
+
+That command writes `require_mtls = false`, embeds a warning in the generated
+file and prints a warning. Bun repeats the warning whenever that config starts
+in cluster mode. `relish dev create` does the same for its deliberately local
+Lima-VM configuration. Do not reuse either config on a shared network.
+
 ### CLI (relish)
 
 Relish is the command-line interface for interacting with a running bun agent.
@@ -260,7 +300,7 @@ Commands:
 | `inspect <name>` | Detailed info about an app |
 | `exec <app> <cmd...>` | Execute a command inside a running instance |
 | `stop <app>` | Stop all instances of an app |
-| `init [dir]` | Scaffold starter config files in a directory |
+| `init [dir]` | Generate PKI and an mTLS-required starter config (`--development-plaintext` is an explicit local-only exception) |
 | `nodes` | List cluster nodes and their gossip state |
 | `council` | Show council (Raft) composition and status |
 | `join --token <token> <addr>` | Join an existing cluster |

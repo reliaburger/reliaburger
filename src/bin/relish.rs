@@ -113,6 +113,10 @@ enum Command {
         /// Node ID for this node.
         #[arg(long, default_value = "node-01")]
         node_id: String,
+        /// Generate a development-only config whose internal cluster
+        /// transports are plaintext. Never use this on a shared network.
+        #[arg(long)]
+        development_plaintext: bool,
     },
     /// List cluster nodes and their gossip state.
     Nodes,
@@ -767,7 +771,17 @@ async fn main() -> ExitCode {
             ref dir,
             ref cluster_name,
             ref node_id,
-        } => commands::init(dir, cluster_name, node_id),
+            development_plaintext,
+        } => commands::init_with_security(
+            dir,
+            cluster_name,
+            node_id,
+            if development_plaintext {
+                commands::InitSecurityMode::DevelopmentPlaintext
+            } else {
+                commands::InitSecurityMode::MutualTls
+            },
+        ),
         Command::Nodes => commands::nodes(cli.output).await,
         Command::Council { ref action } => match action {
             None => commands::council(cli.output).await,
@@ -1166,10 +1180,12 @@ mod tests {
                 ref dir,
                 ref cluster_name,
                 ref node_id,
+                development_plaintext,
             } => {
                 assert_eq!(dir.to_str(), Some("."));
                 assert_eq!(cluster_name, "default");
                 assert_eq!(node_id, "node-01");
+                assert!(!development_plaintext);
             }
             _ => panic!("expected Init command"),
         }
@@ -1192,6 +1208,18 @@ mod tests {
             } => assert_eq!(cluster_name, "prod"),
             _ => panic!("expected Init command"),
         }
+    }
+
+    #[test]
+    fn parse_init_requires_an_explicit_development_plaintext_flag() {
+        let cli = parse(&["relish", "init", "--development-plaintext"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Init {
+                development_plaintext: true,
+                ..
+            }
+        ));
     }
 
     #[test]

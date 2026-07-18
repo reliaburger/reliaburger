@@ -229,17 +229,30 @@ skipped), and `make test-no-default` runs 2,643 (all pass; 39 skipped).
 `require_mtls = false`, so the supported cluster bootstrap path uses plaintext
 transports unless an operator discovers and changes the switch.
 
-- [ ] Write init/config tests first which prove generated clustered configs
+- [x] Write init/config tests first which prove generated clustered configs
   require mTLS and deliberately generated development configs don't.
-- [ ] Set `require_mtls = true` in normal generated cluster configuration.
-- [ ] Replace the quiet false path with an explicit, conspicuous
+- [x] Set `require_mtls = true` in normal generated cluster configuration.
+- [x] Replace the quiet false path with an explicit, conspicuous
   development-only plaintext choice and warning.
-- [ ] Add a real multi-node acceptance test that verifies Raft, reporting and
+- [x] Add a real multi-node acceptance test that verifies Raft, reporting and
   cross-node calls use the configured identities.
-- [ ] Update the quick start, configuration reference, security design and book.
+- [x] Update the quick start, configuration reference, security design and book.
 
 **Acceptance:** following the normal initialisation path produces encrypted,
 mutually authenticated cluster transports without hand-editing configuration.
+
+**Delivered:** normal `relish init` writes `require_mtls = true`; the explicit
+`--development-plaintext` path, Lima dev generator and Bun startup all warn on
+the local-only exception. Peer API clients now present their node certificate
+and use the live CRL instead of server-authenticated TLS with a fresh empty
+revocation view. The cluster-gated acceptance starts three real runtimes and
+proves council convergence, all-node reporting and a certificate-bearing peer
+API request. An end-to-end init-to-Bun test also caught and fixed the generated
+security bootstrap's `0644`/required-`0600` permission mismatch, which had made
+the supported bootstrap path reject its own output. Rebased on merged H3, the
+H4 worktree passed 2,666 portable tests (40 skipped), 2,648
+no-default tests (40 skipped), all 21 cluster acceptances, all-target Clippy
+with warnings denied and doc tests.
 
 ### H6. Isolate writable runc root filesystems per workload
 
