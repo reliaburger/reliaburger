@@ -133,12 +133,15 @@ Criterion targets and the 10k-member scale acceptance run separately. See the
 [test harness design](docs/design/test-harness.md) for commands, gates, timings and CI
 ownership.
 
-Phase 15a hardening has since closed H0-H3: dependency advisories are gated,
+Phase 15a hardening has since closed H0-H3 and H6: dependency advisories are gated,
 administrative API bootstrap is loopback-only without credentials, declared
 egress policy fails closed, and rootful-runc workloads now use a pre-bound,
 supervised, capability-gated `.internal` resolver on their veth gateway. The
 DNS path has a checked-in real runc/netns acceptance test; unsupported runtime
-and address combinations fail before workload creation. The H3 portable gates
+and address combinations fail before workload creation. Writable rootful-runc
+image roots now use private per-instance OverlayFS uppers instead of exposing
+one shared writable image generation; restart and Bun adoption preserve the
+right upper, and every cleanup path releases the mount. The H3 portable gates
 run 2,661 default-feature and 2,643 no-default-feature tests successfully, with
 39 named tests reported separately in each profile.
 

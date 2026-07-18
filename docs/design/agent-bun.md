@@ -33,7 +33,7 @@ Bun's responsibilities on every node:
 
 Grill is Bun's container runtime interface -- the abstraction layer between Bun's workload management logic and the underlying runtime. Grill handles OCI image unpacking, container creation, network namespace setup, cgroup configuration, port mapping, and stdio stream attachment. The name follows the Reliaburger convention: Grill is where containers get cooked.
 
-> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and calls `runc create`/`start`/`state` itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
+> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
 
 **Key design decisions:**
 
@@ -46,6 +46,41 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 4. **Sub-millisecond per-app overhead.** At the design goal of 500 apps per node, Bun must have sub-millisecond per-app overhead. This drives the choice of Rust (no GC pauses), eBPF (kernel-space interception, not userspace proxying), and direct cgroup/namespace manipulation (no shim processes per container).
 
 5. **Deny-by-default security.** Process workloads require an explicit binary allowlist in `node.toml`. Capabilities are restricted. Seccomp profiles block dangerous syscalls. The `burger` unprivileged user is used for all workloads.
+
+### 1.1 runc rootfs ownership
+
+One unpacked OCI image generation can back many workloads, but it is never a
+shared writable root. `ImageStore` owns the content-addressed `gen-*` directory.
+For a rootful workload whose OCI root is writable, Grill mounts this layout:
+
+```text
+bundles/{instance}/rootfs         OverlayFS mountpoint passed to runc
+bundles/{instance}/rootfs-upper   this instance's persisted writes
+bundles/{instance}/rootfs-work    OverlayFS work directory
+bundles/{instance}/rootfs-lower   canonical generation marker
+images/.../gen-{hash}             shared lower layer owned by ImageStore
+```
+
+Read-only OCI roots can point directly at the generation. Writable roots can't.
+The private upper remains across a restart of the same instance and across Bun
+replacement, so adoption sees the running workload's files. If the image
+generation changes, Grill clears that instance's old upper before mounting the
+new lower. It never carries modifications from one image into another.
+
+Mount ownership follows the workload lifecycle. A guard unmounts if preparation
+returns an error or unwinds before the bundle becomes live. Natural exit, stop
+timeout escalation, explicit kill and rejected adoption all converge on the
+same cleanup path. Cleanup deletes stale runc state and releases the overlay,
+port map and network namespace, but does not delete the shared lower. A real
+rootful-runc suite covers two-replica isolation, restart persistence, failed
+create rollback, process-death adoption and absence of leaked mountpoints.
+
+Rootless runc has no host privilege with which to mount OverlayFS, and the
+project does not yet own a FUSE snapshotter. It therefore accepts a shared image
+generation only when `root.readonly = true`. A writable rootless image fails
+before pull. Quietly pointing it at the shared writable tree would turn a
+missing capability into cross-workload filesystem access, which is worse than
+an honest refusal.
 
 ---
 

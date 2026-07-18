@@ -46,7 +46,7 @@ On Fedora:
 sudo dnf groupinstall "Development Tools"
 ```
 
-For rootless containers (running without sudo), you need kernel 5.11 or later. That's where unprivileged user namespaces became stable enough for general use. Ubuntu 22.04+, Fedora 31+, and Debian 11+ all ship kernels that qualify. Check yours with `uname -r`. If you're on an older kernel, runc still works — you'll just need root.
+The rootless spec path (running without sudo) needs kernel 5.11 or later. That's where unprivileged user namespaces became stable enough for general use. Ubuntu 22.04+, Fedora 31+, and Debian 11+ all ship kernels that qualify. Check yours with `uname -r`. Reliaburger's declarative app specs currently request writable image roots, so those workloads still need root mode until Chapter 5's private-rootfs ownership has an unprivileged snapshotter.
 
 You also need `runc` installed. Your package manager probably has it (`sudo apt install runc` on Debian/Ubuntu), or grab a binary from the [GitHub releases](https://github.com/opencontainers/runc/releases). Rootless mode requires cgroups v2 with systemd delegation, which is the default on any modern systemd-based distro. You can verify with:
 
@@ -2704,7 +2704,7 @@ Every blob is stored by its SHA-256 digest under `{store_root}/blobs/sha256/{has
 
 ### Going rootless
 
-On Linux, runc normally requires root to create namespaces and set up cgroups. Rootless mode uses user namespaces instead: the kernel maps your unprivileged UID to UID 0 *inside* the container, giving the container process the illusion of being root without any actual privileges on the host.
+On Linux, runc normally requires root to create namespaces and set up cgroups. Rootless mode uses user namespaces instead: the kernel maps your unprivileged UID to UID 0 *inside* the container, giving the container process the illusion of being root without any actual privileges on the host. Reliaburger currently permits shared image generations in this mode only for read-only OCI roots. Writable image roots need the private OverlayFS lifecycle described in Chapter 5, which needs host mount privilege; rootless deployment therefore refuses them until we own an unprivileged snapshotter.
 
 The `rootless::make_rootless` function adjusts an OCI spec for this:
 
@@ -2786,7 +2786,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
 - `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
 - RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
-- Rootless runc runs containers without sudo using user namespaces and UID/GID mapping
+- The rootless runc spec path supports read-only image roots without sudo using user namespaces and UID/GID mapping; declarative apps request writable roots and therefore fail closed until an unprivileged snapshotter exists
 - Jobs run to completion with exit code tracking and retry on failure
 - Init containers run sequentially before the main app, with failure halting the deploy
 - Unhealthy apps get restarted automatically with exponential backoff

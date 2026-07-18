@@ -262,15 +262,15 @@ H3 prevents a repeated pull from deleting that live generation, but it doesn't
 make writes private: one compromised or merely untidy workload can still alter
 files seen by another workload on the node.
 
-- [ ] Write a rootful-runc test in which two concurrent containers use the same
+- [x] Write a rootful-runc test in which two concurrent containers use the same
   image, mutate the same path and prove that neither observes the other's write.
-- [ ] Keep the content-addressed generation immutable and give every instance a
+- [x] Keep the content-addressed generation immutable and give every instance a
   writable overlay/snapshot (or an equivalently isolated upper layer).
-- [ ] Make create failure, normal stop, timeout, panic and Bun adoption clean up
+- [x] Make create failure, normal stop, timeout, panic and Bun adoption clean up
   or recover the per-instance mount without deleting a live lower generation.
-- [ ] Define and test the rootless-runc behaviour separately; don't silently
+- [x] Define and test the rootless-runc behaviour separately; don't silently
   fall back to a shared writable tree when overlay support is unavailable.
-- [ ] Update the Grill design and Chapter 5 with the mount ownership/lifecycle.
+- [x] Update the Grill design and Chapter 5 with the mount ownership/lifecycle.
 
 **Acceptance:** two workloads using one image can't read or corrupt each
 other's rootfs changes, while restart/adoption keeps each workload's own files

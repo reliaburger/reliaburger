@@ -70,9 +70,10 @@ sudo apt install runc
 Download the latest binary from [github.com/opencontainers/runc/releases](https://github.com/opencontainers/runc/releases) and place it in your `PATH`.
 
 Notes:
-- **Rootless mode** is supported — runs containers without sudo using user namespaces
+- Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
 - Rootless stores bundles/images in `~/.local/share/reliaburger/`; root mode uses `/var/lib/reliaburger/`
 - OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
+- Root-mode writable images use one private OverlayFS upper per workload over the shared content-addressed image generation. A restart or Bun adoption reuses that workload's upper; exit and kill unmount it.
 - To run provisioned Linux runtime tests: `sudo make test-linux`
 - OCI protocol tests use a local digest-pinned registry fixture; they need no public registry
 
