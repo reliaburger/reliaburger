@@ -26,8 +26,18 @@ struct Cli {
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
+    /// Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default
+    /// local address (`http[s]://127.0.0.1:9117`).
+    #[arg(long, global = true, value_parser = parse_endpoint)]
+    endpoint: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn parse_endpoint(value: &str) -> Result<String, String> {
+    reliaburger::relish::client::validate_endpoint(value).map_err(|error| error.to_string())?;
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 #[derive(Subcommand)]
@@ -721,9 +731,13 @@ enum FaultAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Record the --token and --ca-cert overrides before any client is built.
+    // Record the global connection overrides before any client is built.
     reliaburger::relish::client::set_cli_token(cli.token.clone());
     reliaburger::relish::client::set_cli_ca_cert(cli.ca_cert.clone());
+    if let Err(reason) = reliaburger::relish::client::set_cli_endpoint(cli.endpoint.clone()) {
+        eprintln!("error: {reason}");
+        return ExitCode::FAILURE;
+    }
 
     let command = match cli.command {
         Some(command) => command,
@@ -1797,5 +1811,35 @@ mod tests {
         // Absent by default.
         let cli = parse(&["relish", "status"]).unwrap();
         assert!(cli.token.is_none());
+    }
+
+    #[test]
+    fn endpoint_flag_parses_globally() {
+        let cli = Cli::try_parse_from([
+            "relish",
+            "status",
+            "--endpoint",
+            "https://node-01.example:9117",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.endpoint.as_deref(),
+            Some("https://node-01.example:9117")
+        );
+    }
+
+    #[test]
+    fn endpoint_flag_rejects_remote_plaintext() {
+        let result = Cli::try_parse_from([
+            "relish",
+            "status",
+            "--endpoint",
+            "http://node-01.example:9117",
+        ]);
+        let error = match result {
+            Ok(_) => panic!("remote plaintext endpoint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("HTTPS"));
     }
 }

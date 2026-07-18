@@ -1,0 +1,406 @@
+//! Executable contracts for the two first-run paths published in the docs.
+//!
+//! These are black-box tests on purpose. A parser unit test can prove that a
+//! flag exists, but it cannot prove that the documented Bun and Relish
+//! processes can actually talk to each other.
+
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+const WAIT: Duration = Duration::from_secs(30);
+
+struct BunProcess {
+    child: Child,
+    log_path: PathBuf,
+}
+
+impl BunProcess {
+    fn spawn(config: &Path, address: SocketAddr, clustered: bool, log_path: PathBuf) -> Self {
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
+        command
+            .arg("--config")
+            .arg(config)
+            .arg("--listen")
+            .arg(address.to_string())
+            .arg("--runtime")
+            .arg("process")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        if clustered {
+            command.arg("--cluster");
+        }
+        Self {
+            child: command.spawn().unwrap(),
+            log_path,
+        }
+    }
+
+    fn assert_running(&mut self) {
+        if let Some(status) = self.child.try_wait().unwrap() {
+            let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            panic!("bun exited before the first-run command ({status}):\n{log}");
+        }
+    }
+}
+
+impl Drop for BunProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn reserve_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+fn reserve_ports() -> [u16; 3] {
+    [
+        reserve_address().port(),
+        reserve_address().port(),
+        reserve_address().port(),
+    ]
+}
+
+fn write_portable_node_config(root: &Path) -> PathBuf {
+    let config = root.join("node.toml");
+    let [gossip_port, raft_port, reporting_port] = reserve_ports();
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+[node]
+name = "first-run-{gossip_port}"
+
+[cluster]
+gossip_port = {gossip_port}
+raft_port = {raft_port}
+reporting_port = {reporting_port}
+
+[network]
+advertise_address = "127.0.0.1"
+
+[storage]
+data = "{root}/data"
+images = "{root}/images"
+logs = "{root}/logs"
+metrics = "{root}/metrics"
+volumes = "{root}/volumes"
+
+[images]
+registry_bind = "127.0.0.1"
+registry_port = 0
+"#,
+            root = root.display(),
+        ),
+    )
+    .unwrap();
+    config
+}
+
+fn run_relish(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .env_remove("RELIABURGER_ENDPOINT")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap()
+}
+
+fn assert_success(output: &Output, context: &str) {
+    assert!(
+        output.status.success(),
+        "{context} failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        bun.assert_running();
+        let output = run_relish(args);
+        if output.status.success() {
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            panic!(
+                "relish never reached bun\nstdout={}\nstderr={}\nbun log={log}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_relish_output(bun: &mut BunProcess, args: &[&str], expected: &str) -> Output {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        bun.assert_running();
+        let output = run_relish(args);
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(expected) {
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            panic!(
+                "relish output never contained {expected:?}\nstdout={}\nstderr={}\nbun log={log}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_tcp(bun: &mut BunProcess, address: SocketAddr) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        bun.assert_running();
+        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "bun never listened on {address}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn standalone_first_run_reaches_a_running_workload() {
+    let root = tempfile::tempdir().unwrap();
+    let address = reserve_address();
+    let config = write_portable_node_config(root.path());
+    let mut bun = BunProcess::spawn(&config, address, false, root.path().join("bun.log"));
+    let endpoint = format!("http://{address}");
+
+    wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
+
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/phase-1/proc-first-run.toml");
+    let apply = run_relish(&["--endpoint", &endpoint, "apply", example.to_str().unwrap()]);
+    assert_success(&apply, "documented standalone apply");
+
+    let status = run_relish(&["--endpoint", &endpoint, "status"]);
+    assert_success(&status, "documented standalone status");
+    assert!(String::from_utf8_lossy(&status.stdout).contains("hello"));
+
+    let top = run_relish(&["--endpoint", &endpoint, "top"]);
+    assert_success(&top, "documented standalone top");
+    assert!(String::from_utf8_lossy(&top.stdout).contains("hello"));
+}
+
+#[test]
+fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    let init = run_relish(&[
+        "init",
+        cluster_dir.to_str().unwrap(),
+        "--cluster-name",
+        "first-run",
+        "--node-id",
+        "node-01",
+    ]);
+    assert_success(&init, "documented cluster init");
+
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    let [gossip_port, raft_port, reporting_port] = reserve_ports();
+    node.node.name = Some("node-01".to_string());
+    node.cluster.gossip_port = gossip_port;
+    node.cluster.raft_port = raft_port;
+    node.cluster.reporting_port = reporting_port;
+    node.network.advertise_address = Some("127.0.0.1".to_string());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+
+    let address = reserve_address();
+    let mut bun = BunProcess::spawn(
+        &node_path,
+        address,
+        true,
+        root.path().join("cluster-bun.log"),
+    );
+    wait_for_tcp(&mut bun, address);
+
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "first-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "documented first-admin token creation");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let token = token.trim();
+    assert!(
+        token.starts_with("rbrg_"),
+        "unexpected token output: {token}"
+    );
+
+    let generated_app = cluster_dir.join("app.toml");
+    let dry_run = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token,
+        "apply",
+        generated_app.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_success(&dry_run, "generated container app dry-run");
+
+    let process_app = root.path().join("cluster-process-app.toml");
+    std::fs::write(
+        &process_app,
+        format!(
+            r#"
+[app.cluster-hello]
+image = "proc-grill:image-ignored"
+command = [{testapp:?}, "--port", "0"]
+"#,
+            testapp = env!("CARGO_BIN_EXE_testapp"),
+        ),
+    )
+    .unwrap();
+    let apply = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token,
+        "apply",
+        process_app.to_str().unwrap(),
+    ]);
+    assert_success(&apply, "authenticated clustered apply");
+
+    wait_for_relish_output(
+        &mut bun,
+        &[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca,
+            "--token",
+            token,
+            "status",
+        ],
+        "cluster-hello",
+    );
+}
+
+#[test]
+fn published_first_run_snippets_do_not_drift() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let documents = [
+        root.join("README.md"),
+        root.join("docs/README.md"),
+        root.join("docs/whitepaper.md"),
+        root.join("docs/design/cli-relish.md"),
+        root.join("docs/book/02-finding-friends.md"),
+    ];
+    for document in documents {
+        let text = std::fs::read_to_string(&document).unwrap();
+        assert!(
+            text.contains("relish apply") && !text.contains("relish apply -f"),
+            "{} publishes the wrong apply syntax",
+            document.display()
+        );
+        assert!(
+            text.contains("--node-id"),
+            "{} omits the required join/init node id",
+            document.display()
+        );
+    }
+
+    let whitepaper = std::fs::read_to_string(root.join("docs/whitepaper.md")).unwrap();
+    assert!(!whitepaper.contains("✓ Started Bun agent"));
+    assert!(!whitepaper.contains("Dashboard: https://10.0.1.5:9443"));
+    assert!(whitepaper.contains("127.0.0.1:9117"));
+
+    let security_book = std::fs::read_to_string(root.join("docs/book/04-trust-no-one.md")).unwrap();
+    assert!(security_book.contains("--node-id node-02"));
+    assert!(security_book.contains("https://10.0.1.5:9117"));
+    assert!(!security_book.contains("relish join --token rbrg_join_1_a7f3b9c2... 10.0.1.5:9443"));
+}
+
+#[test]
+fn published_apply_and_join_shapes_reach_their_handlers() {
+    let root = tempfile::tempdir().unwrap();
+    let app = root.path().join("app.toml");
+    std::fs::write(
+        &app,
+        r#"
+[app.hello]
+image = "proc-grill:image-ignored"
+command = ["true"]
+"#,
+    )
+    .unwrap();
+
+    let apply = run_relish(&["apply", app.to_str().unwrap(), "--dry-run"]);
+    assert_success(&apply, "positional apply path");
+    let stale_apply = run_relish(&["apply", "-f", app.to_str().unwrap()]);
+    assert_eq!(
+        stale_apply.status.code(),
+        Some(2),
+        "the old -f shape should remain a visible clap error"
+    );
+
+    // Port 1 refuses immediately. Exit 1 proves clap accepted the complete
+    // documented shape and dispatched the join handler; a syntax error is 2.
+    let join = run_relish(&[
+        "join",
+        "--token",
+        "documentation-only-token",
+        "--node-id",
+        "node-02",
+        "https://127.0.0.1:1",
+    ]);
+    assert_eq!(join.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&join.stderr).contains("join failed"));
+}

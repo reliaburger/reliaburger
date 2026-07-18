@@ -1330,7 +1330,17 @@ convergence and adoption" theme under 12b.6).
 - [x] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3) — merged in #122: declared policies require live four-hook eBPF and pre-start rootful-runc enforcement at scheduling and local admission, with continuous repair-or-stop supervision.
 - [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1) — implementation and Linux proof are in #123, pending merge.
 - [x] Make generated clusters use mTLS by default (H4 / SEC-2) — normal `relish init` enables mTLS and writes its security bootstrap with the `0600` mode Bun requires (the init-to-Bun acceptance caught the old self-rejecting `0644` output); explicit init/Lima development plaintext configs and Bun startup warn. Peer API calls now present the node certificate and check the live CRL. A three-node real-runtime acceptance proves mTLS Raft, reporting and peer API traffic; 2,651 portable, 2,633 no-default and all 21 cluster tests pass.
-- [ ] Replace the broken published first-run sequence with an executable one (H5 / DOC-1)
+- [x] Replace the broken published first-run sequence with an executable one
+  (H5 / DOC-1) — portable ProcessGrill and secure one-voter mTLS sequences now
+  execute as real Bun/Relish black-box tests on ephemeral endpoints. Init
+  creates its output directory, the generated BusyBox app has an explicit
+  working command/port, remote endpoints require HTTPS, and clap/doc guards
+  reject the old `apply -f`, port-9443 join and missing-`--node-id` shapes.
+  Portable 2,662/2,662, no-default 2,644/2,644 and cluster 21/21 pass.
+- [ ] Add authenticated post-bootstrap join-token issuance (H6) — the one
+  bootstrap token can enrol only one additional node; no reachable API/CLI
+  currently drives the existing Raft `CreateJoinToken` operation, so a fresh
+  cluster cannot form a three-node council through supported commands.
 - [ ] Rerun the complete review matrix and close the high-value gate
 
 ### Medium-value

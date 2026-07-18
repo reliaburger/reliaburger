@@ -376,6 +376,7 @@ pub fn init_with_security(
     node_id: &str,
     security_mode: InitSecurityMode,
 ) -> Result<(), RelishError> {
+    fs::create_dir_all(dir)?;
     let node_path = dir.join("reliaburger.toml");
     let app_path = dir.join("app.toml");
 
@@ -451,17 +452,17 @@ pub fn init_with_security(
         toml::to_string_pretty(&node_config).expect("failed to serialise default node config")
     );
 
-    let app_toml = "\
-# Sample Reliaburger app configuration.
+    let app_toml = r#"# Sample Reliaburger app configuration.
 # Deploy with: relish apply app.toml
 
 [app.web]
-image = \"nginx:latest\"
+image = "busybox:1.36"
+command = ["/bin/sh", "-c", "mkdir -p /tmp/reliaburger-www && printf 'Reliaburger is running\\n' > /tmp/reliaburger-www/index.html && exec /bin/httpd -f -p 8080 -h /tmp/reliaburger-www"]
 port = 8080
 
 [app.web.health]
-path = \"/\"
-";
+path = "/"
+"#;
 
     fs::write(&node_path, node_toml)?;
     fs::write(&app_path, app_toml)?;
@@ -1815,6 +1816,17 @@ mod tests {
     }
 
     #[test]
+    fn init_creates_a_missing_output_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cluster");
+
+        init(&dir, "test-cluster", "node-01").unwrap();
+
+        assert!(dir.join("reliaburger.toml").exists());
+        assert!(dir.join("app.toml").exists());
+    }
+
+    #[test]
     fn init_refuses_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path(), "test-cluster", "node-01").unwrap();
@@ -1833,6 +1845,26 @@ mod tests {
         let app_content = std::fs::read_to_string(dir.path().join("app.toml")).unwrap();
         let config = Config::parse(&app_content).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn init_generated_app_has_an_executable_container_command() {
+        let dir = tempfile::tempdir().unwrap();
+        init(dir.path(), "test-cluster", "node-01").unwrap();
+
+        let app_content = std::fs::read_to_string(dir.path().join("app.toml")).unwrap();
+        let config = Config::parse(&app_content).unwrap();
+        let web = config.app.get("web").unwrap();
+
+        assert_eq!(web.image.as_deref(), Some("busybox:1.36"));
+        assert_eq!(web.port, Some(8080));
+        assert_eq!(web.command.first().map(String::as_str), Some("/bin/sh"));
+        assert!(
+            web.command
+                .iter()
+                .any(|argument| argument.contains("httpd")),
+            "the generated app must not depend on an image entrypoint that runc never loads"
+        );
     }
 
     #[test]

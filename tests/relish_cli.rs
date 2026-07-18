@@ -71,3 +71,18 @@ fn missing_apply_file_exits_nonzero_and_uses_stderr() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
 }
+
+#[test]
+fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .arg("status")
+        .env("RELIABURGER_ENDPOINT", "http://192.0.2.10:9117")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must use HTTPS"));
+}

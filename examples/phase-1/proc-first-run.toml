@@ -1,0 +1,17 @@
+# Portable first-run workload.
+#
+# Build every binary before applying this file:
+#   cargo build --bins
+#
+# Start Bun explicitly with ProcessGrill:
+#   target/debug/bun --runtime process
+#
+# Then deploy:
+#   target/debug/relish apply examples/phase-1/proc-first-run.toml
+
+[app.hello]
+image = "proc-grill:image-ignored"
+# Port 0 asks the operating system for a free port. The first-run example has
+# no service or health probe, so parallel smoke tests cannot collide on a
+# fixed host port. The phase-1 proc-minimal example demonstrates those pieces.
+command = ["target/debug/testapp", "--mode", "healthy", "--port", "0"]

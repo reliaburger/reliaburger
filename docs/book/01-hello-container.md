@@ -2514,30 +2514,43 @@ impl BunClient {
 }
 ```
 
-Each CLI command now tries the agent first. `apply` has a clever fallback: if the agent is unreachable, it still parses and validates the config and shows the dry-run plan. You can review what *would* happen before starting the agent.
+Each CLI command now tries the agent first. Planning without an agent is still
+useful, but it must be explicit: `apply --dry-run` parses, validates and prints
+the plan without making a request. An ordinary `apply` against a dead agent
+prints the same plan for context and exits non-zero. The first implementation
+silently fell back and exited zero, which made automation report a successful
+deployment when nothing had run. Clever, but wrong.
 
 ```rust
-pub async fn apply(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
 
-    let client = BunClient::default_local();
-    match client.health().await {
-        Ok(()) => {
-            let result = client.apply(&config).await?;
-            println!("deployed {} instance(s): {}", result.created, result.instances.join(", "));
-            Ok(())
-        }
-        Err(_) => {
-            let plan = generate_plan(&config);
-            let formatted = format_output(&plan, output)?;
-            println!("{formatted}");
-            println!("\n(dry run — bun agent not reachable, showing plan only)");
-            Ok(())
-        }
+    if dry_run {
+        println!("{}", format_output(&generate_plan(&config, None), output)?);
+        println!("\n(dry run — nothing deployed)");
+        return Ok(());
     }
+
+    let client = BunClient::default_local();
+    if client.health().await.is_err() {
+        println!("{}", format_output(&generate_plan(&config, None), output)?);
+        eprintln!("error: bun agent not reachable — nothing was deployed");
+        return Err(RelishError::AgentUnreachable);
+    }
+    let result = client.apply(&config).await?;
+    println!("deployed {} instance(s): {}", result.created, result.instances.join(", "));
+    Ok(())
 }
 ```
+
+`default_local()` still means port 9117, but it no longer means "hard-coded
+forever". `--endpoint` (or `RELIABURGER_ENDPOINT`) selects another Bun API for
+real clusters and lets tests allocate an ephemeral listener. HTTP is accepted
+only for loopback; a remote URL must use HTTPS. The `url` crate parses the host
+as a domain, IPv4 or IPv6 value, so we don't need home-grown string checks for
+`127.0.0.1` and `::1`. Clap runs the same validator while parsing the flag,
+before a bearer token can leave the process.
 
 The two new `RelishError` variants we saw earlier handle the failure modes: `AgentUnreachable` (can't connect at all) and `ApiError { status, body }` (connected but got an error response). The error enum grows with each phase, but every variant carries enough context to display a useful error message.
 
@@ -2783,7 +2796,7 @@ Phase 1 started with parsing TOML and ended with a working container lifecycle t
 - `cargo run --bin relish -- status` shows what's running
 - `cargo run --bin relish -- logs web` shows captured output, with `--tail N` for the last N lines and `--follow` to stream new output
 - `cargo run --bin relish -- exec web echo hello` runs a command inside a running instance
-- `cargo run --bin relish -- apply app.toml` without an agent falls back to a dry-run plan
+- `cargo run --bin relish -- apply app.toml --dry-run` previews without an agent; an ordinary apply to a dead agent fails
 - `cargo run --bin testapp -- --mode healthy --port 8080` runs the test server for demos
 - RuncGrill pulls real OCI images from Docker Hub (e.g. `alpine:latest`) and unpacks them into a rootfs
 - Rootless runc runs containers without sudo using user namespaces and UID/GID mapping
