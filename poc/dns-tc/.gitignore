@@ -1,0 +1,3 @@
+*.bpf.o
+artifacts/
+__pycache__/

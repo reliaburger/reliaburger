@@ -1,0 +1,109 @@
+TC DNS synthesis proof: verified 2026-07-18
+================================================
+
+Reviewed source SHA: 8ba727f9332c35a1f6603a0f78f76a424513485c
+Runner:              poc/dns-tc/run.sh
+Environment:         isolated Lima Ubuntu arm64 VM
+Command:
+
+  sudo env EVIDENCE_DIR=/tmp/reliaburger-dns-tc-evidence-2026-07-18-v5 \
+    ./poc/dns-tc/run.sh
+
+Result: exit 0, PASS
+
+Environment reported by the runner
+----------------------------------
+
+Linux lima-reliaburger-test 6.8.0-124-generic aarch64
+Ubuntu clang 18.1.3
+bpftool 7.4.0, libbpf 1.4
+tc/iproute2 6.1.0, libbpf 1.3.0
+
+Clang emitted one optimisation warning because it couldn't fully unroll the
+bounded UDP checksum loop. The kernel verifier accepted the resulting programme
+and the kernel JIT compiled it:
+
+  type sched_cls, name dns_tc_ingress, id 479, tag 9ad7e3eb759da25f
+  translated 24,472 bytes, JITed 15,176 bytes
+  map service_v4, id 660, hash, key 4 bytes, value 4 bytes, max 1,024
+
+Functional assertions
+---------------------
+
+mapped:
+  {"additional": 0, "address": "127.128.1.10", "answers": 1,
+   "bytes": 48, "id": 16384, "qr": true, "questions": 1}
+
+EDNS:
+  {"additional": 0, "address": "127.128.1.10", "answers": 1,
+   "bytes": 48, "id": 16384, "qr": true, "questions": 1}
+
+missing internal (upstream NXDOMAIN):
+  {"additional": 0, "answers": 0, "bytes": 34, "id": 16384,
+   "qr": true, "questions": 1}
+
+external (upstream NXDOMAIN):
+  {"additional": 0, "answers": 0, "bytes": 29, "id": 16384,
+   "qr": true, "questions": 1}
+
+malformed three-byte payload:
+  {"timeout": true}
+
+64 simultaneous mapped queries:
+  {"addresses": ["127.128.1.10"], "answered": 64, "count": 64,
+   "timeouts": 0}
+
+Packet evidence
+---------------
+
+The client capture contained 137 packets, with none dropped by tcpdump. A
+synthesised normal response and the EDNS response both decoded as:
+
+  10.203.176.53.53 > 10.203.176.2.<ephemeral>: [udp sum ok]
+    redis.internal. A 127.128.1.10 (48)
+
+The upstream capture covered the functional and concurrency cases before the
+filter-detach test. It contained exactly five packets, with none dropped:
+
+  missing.internal query
+  missing.internal NXDOMAIN response
+  example.com query
+  example.com NXDOMAIN response
+  malformed three-byte DNS payload
+
+It contained no redis.internal query or response. The upstream server log at
+that point likewise contained only missing.internal and example.com (plus an
+empty line for the malformed payload). This proves the normal, EDNS and 64
+concurrent mapped queries didn't reach the upstream namespace.
+
+Capture SHA-256 digests:
+
+  188be38bd6759fd90724c0b773eb12746510735afe8024cd1324fbfe9d53bed0  client.pcap
+  a146da2aafdebd70101409553e58e2fcedc90ca23e069abdadda0078186936af  upstream.pcap
+
+The binary captures remain in the disposable VM evidence directory rather than
+Git. The runner recreates them for independent inspection.
+
+Lifecycle and cleanup
+---------------------
+
+After deleting the TC filter, redis.internal reached the upstream server and
+returned no answer:
+
+  {"additional": 0, "answers": 0, "bytes": 32, "id": 16384,
+   "qr": true, "questions": 1}
+
+The upstream server log then gained redis.internal. Reattaching the programme
+created map id 661, and the same query immediately returned 127.128.1.10 again.
+
+After runner exit, all four checks returned no entries:
+
+  ip netns list | grep '^rbd[cu]'
+  ip -o link show | grep 'rb(br|hc|hu|cp|up)'
+  bpftool prog show name dns_tc_ingress
+  bpftool map show name service_v4
+
+Final runner line:
+
+  PASS: TC DNS proof completed; evidence retained in
+  /tmp/reliaburger-dns-tc-evidence-2026-07-18-v5
