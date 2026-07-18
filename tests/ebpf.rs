@@ -92,6 +92,9 @@ async fn ebpf_load_and_attach() {
         OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
 
     assert!(ebpf.is_attached());
+    assert!(ebpf.connect6_attached());
+    assert!(ebpf.sendmsg4_attached());
+    assert!(ebpf.sendmsg6_attached());
     ebpf.detach();
 }
 
@@ -431,7 +434,7 @@ async fn agent_deploy_populates_backend_map() {
         cmd_rx,
         shutdown.clone(),
     );
-    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
     let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
 
@@ -520,7 +523,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
         cmd_rx,
         shutdown.clone(),
     );
-    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     let agent_task = tokio::spawn(async move { agent.run().await });
     let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
 
@@ -686,6 +689,42 @@ async fn egress_denied_by_default_allowed_when_listed() {
             Err(std::io::ErrorKind::PermissionDenied)
         ),
         "unlisted egress destination should be denied with EPERM, got {blocked:?}"
+    );
+
+    // Unconnected UDP uses sendmsg()/sendto(), not connect(). The matching
+    // cgroup hooks must enforce the same policy or UDP walks around it.
+    let udp_allowed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_allowed_port = udp_allowed.local_addr().unwrap().port();
+    let udp_denied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let udp_denied_port = udp_denied.local_addr().unwrap().port();
+    let udp_key = EgressKey {
+        src_cgroup_id: cgroup_id,
+        dst_ip: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+        dst_port: udp_allowed_port.to_be(),
+        _pad: 0,
+    };
+    egress::write_egress_entry(
+        &mut ebpf.bpf,
+        udp_key,
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    assert_eq!(
+        sender
+            .send_to(&[1], (Ipv4Addr::LOCALHOST, udp_allowed_port))
+            .unwrap(),
+        1
+    );
+    let udp_blocked = sender.send_to(&[1], (Ipv4Addr::LOCALHOST, udp_denied_port));
+    assert!(
+        matches!(
+            udp_blocked.as_ref().map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "unlisted UDP destination should be denied with EPERM, got {udp_blocked:?}"
     );
 
     // Lift enforcement so the harness's own connections are unaffected.
@@ -1029,6 +1068,21 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
         &SocketAddr::new(Ipv6Addr::LOCALHOST.into(), denied_port),
         Duration::from_secs(2),
     );
+    let udp_allowed = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let udp_allowed_port = udp_allowed.local_addr().unwrap().port();
+    let udp_denied = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let udp_denied_port = udp_denied.local_addr().unwrap().port();
+    egress::write_egress6_entry(
+        &mut ebpf.bpf,
+        exact_v6_key(cgroup_id, Ipv6Addr::LOCALHOST, udp_allowed_port),
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .unwrap();
+    let udp_sender = std::net::UdpSocket::bind("[::1]:0").unwrap();
+    let udp_ok = udp_sender.send_to(&[1], (Ipv6Addr::LOCALHOST, udp_allowed_port));
+    let udp_blocked = udp_sender.send_to(&[1], (Ipv6Addr::LOCALHOST, udp_denied_port));
 
     // Lift enforcement before asserting, so a failure never leaves the
     // harness cgroup restricted.
@@ -1036,12 +1090,24 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     ebpf.detach();
 
     assert!(ok.is_ok(), "listed IPv6 destination should connect: {ok:?}");
+    assert_eq!(
+        udp_ok.unwrap(),
+        1,
+        "listed IPv6 UDP destination should send"
+    );
     assert!(
         matches!(
             blocked.as_ref().map_err(|e| e.kind()),
             Err(std::io::ErrorKind::PermissionDenied)
         ),
         "unlisted IPv6 destination should be denied with EPERM, got {blocked:?}"
+    );
+    assert!(
+        matches!(
+            udp_blocked.as_ref().map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        ),
+        "unlisted IPv6 UDP destination should be denied, got {udp_blocked:?}"
     );
 }
 
@@ -1306,7 +1372,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
         cmd_rx,
         shutdown.clone(),
     );
-    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     tokio::spawn(async move { agent.run().await });
 
     let config = Config::parse(
@@ -1366,6 +1432,160 @@ async fn egress_programmed_before_start_via_cgroup_path() {
     shutdown.cancel();
 }
 
+/// A newly prepared cgroup may reuse an inode whose old map entries survived
+/// an unclean exit. Pre-start programming must scrub that whole cgroup policy
+/// before opening the destinations requested by the new workload.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn pre_start_programming_scrubs_recycled_cgroup_allows() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressValue, exact_v4_key};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    assert!(ebpf_tests_enabled());
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap(),
+    ));
+
+    let cgroup_dir = std::path::Path::new("/sys/fs/cgroup/reliaburger/default/recycled/0");
+    std::fs::create_dir_all(cgroup_dir).unwrap();
+    let cgroup_id = egress::cgroup_id_of_path(cgroup_dir).unwrap();
+    let stale_key = exact_v4_key(cgroup_id, Ipv4Addr::new(198, 51, 100, 77), 8443);
+    {
+        let mut e = ebpf.lock().await;
+        egress::delete_cgroup_egress_state(&mut e.bpf, cgroup_id).unwrap();
+        egress::write_egress_entry(
+            &mut e.bpf,
+            stale_key,
+            EgressValue {
+                action: EGRESS_ALLOW,
+            },
+        )
+        .unwrap();
+    }
+
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill,
+        PortAllocator::new(42400, 42500),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.recycled]
+        image = "mock:image"
+        command = ["sleep", "600"]
+
+        [app.recycled.egress]
+        allow = ["203.0.113.9:443"]
+    "#,
+    )
+    .unwrap();
+    let (events, mut event_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while event_rx.recv().await.is_some() {}
+
+    {
+        let mut e = ebpf.lock().await;
+        assert!(
+            !egress::egress_allowed(&mut e.bpf, stale_key).unwrap(),
+            "a recycled cgroup retained an allow from its previous owner"
+        );
+        assert!(
+            egress::egress_allowed(
+                &mut e.bpf,
+                exact_v4_key(cgroup_id, Ipv4Addr::new(203, 0, 113, 9), 443)
+            )
+            .unwrap()
+        );
+        egress::delete_cgroup_egress_state(&mut e.bpf, cgroup_id).unwrap();
+    }
+    shutdown.cancel();
+}
+
+/// A live hook is part of the security boundary. If it disappears after
+/// deploy, the agent must stop the protected workload rather than leave it
+/// running with a decorative allowlist.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn live_egress_hook_loss_stops_protected_workload() {
+    use reliaburger::bun::agent::{AgentCommand, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    assert!(ebpf_tests_enabled());
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(42800, 43100),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    tokio::spawn(async move { agent.run().await });
+
+    let config = Config::parse(
+        r#"
+        [app.guarded]
+        image = "mock:image"
+        command = ["sleep", "600"]
+
+        [app.guarded.egress]
+        allow = ["203.0.113.9:443"]
+    "#,
+    )
+    .unwrap();
+    let (events, mut event_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while event_rx.recv().await.is_some() {}
+
+    ebpf.lock().await.detach();
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            if grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "stop")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("agent did not stop the workload after hook loss");
+
+    shutdown.cancel();
+}
+
 /// Fail closed: a pre-start programming error (here: an allowlist that
 /// cannot be represented in the kernel CIDR value) fails the deploy and
 /// leaves no running process — the mock grill records a create and a
@@ -1401,7 +1621,7 @@ async fn pre_start_programming_error_fails_deploy_with_no_running_process() {
         cmd_rx,
         shutdown.clone(),
     );
-    agent.set_onion_ebpf(Arc::clone(&ebpf));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
     tokio::spawn(async move { agent.run().await });
 
     // Nine ports on one CIDR overflows the kernel value (MAX_CIDR_PORTS

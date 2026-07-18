@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::app::AppSpec;
 use crate::mayo::rollup::NodeRollup;
 use crate::meat::NodeId;
+use crate::meat::cluster_state::NodeCapabilities;
 
 /// Sent by each worker node to its assigned council member at the
 /// reporting interval. Also sent as a full report during the leader
@@ -55,6 +56,63 @@ pub struct RunningApp {
     pub uptime: Duration,
     /// Per-instance resource usage.
     pub resource_usage: AppResourceUsage,
+}
+
+/// Typed capability and enforcement evidence sent beside the legacy state
+/// report. This is a separate message so mixed-version clusters keep the
+/// existing positional bincode `StateReport` wire shape intact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCapabilityReport {
+    /// Node that observed this evidence.
+    pub node_id: NodeId,
+    /// Live node capabilities used for placement.
+    #[serde(default)]
+    pub capabilities: NodeCapabilities,
+    /// Per-workload egress enforcement evidence.
+    #[serde(default)]
+    pub egress_enforcement: Vec<EgressEnforcementEvidence>,
+    /// A live enforcement incident has fenced at least one workload and has
+    /// not yet recovered. The scheduler treats the node as unready meanwhile.
+    #[serde(default)]
+    pub egress_degraded: bool,
+    /// Workloads fenced by the current incident. This remains present after
+    /// they stop so operators don't lose the evidence before the next report.
+    #[serde(default)]
+    pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
+}
+
+/// A workload fenced after its live egress security boundary disappeared.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EgressAffectedWorkload {
+    /// App name from the deployed specification.
+    pub app_name: String,
+    /// Namespace containing the app.
+    pub namespace: String,
+}
+
+/// Identifies a workload whose requested egress policy was evaluated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressEnforcementEvidence {
+    /// App name from the deployed specification.
+    pub app_name: String,
+    /// Namespace containing the app.
+    pub namespace: String,
+    /// Replica ordinal within the app.
+    pub instance_id: u32,
+    /// Kernel-truth enforcement state observed for the instance.
+    pub status: EgressEnforcementStatus,
+}
+
+/// Per-instance egress enforcement evidence reported by the node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EgressEnforcementStatus {
+    /// The workload did not request an egress allowlist.
+    #[default]
+    NotRequested,
+    /// All four hooks are live and the instance cgroup has its enforcement flag.
+    Enforced,
+    /// An allowlist was requested but the live kernel state cannot prove it.
+    Unenforced,
 }
 
 /// Health status as reported in a StateReport.
@@ -149,6 +207,9 @@ pub enum ReportingMessage {
     },
     /// Pre-aggregated metrics rollup from worker to council aggregator.
     MetricsRollup(NodeRollup),
+    /// Live scheduling capabilities and per-workload security evidence.
+    /// Added at the end so existing bincode variant discriminants stay put.
+    CapabilityReport(NodeCapabilityReport),
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +219,32 @@ pub enum ReportingMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wire shape before report extensions were added. Rolling upgrades need
+    /// old and new reporters to share the existing bincode envelope.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct LegacyStateReport {
+        node_id: NodeId,
+        timestamp: SystemTime,
+        running_apps: Vec<RunningApp>,
+        cached_specs: Vec<CachedSpec>,
+        resource_usage: ResourceUsage,
+        event_log: Vec<NodeEvent>,
+        has_buildah: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    enum LegacyReportingMessage {
+        Report(LegacyStateReport),
+        Ack {
+            node_id: NodeId,
+        },
+        AggregatedReport {
+            reports: HashMap<NodeId, LegacyStateReport>,
+        },
+        MetricsRollup(NodeRollup),
+    }
 
     fn sample_report(name: &str) -> StateReport {
         StateReport {
@@ -211,6 +298,76 @@ mod tests {
         assert_eq!(decoded.resource_usage.cpu_used_millicores, 500);
         assert_eq!(decoded.event_log.len(), 1);
         assert_eq!(decoded.event_log[0].kind, EventKind::ContainerStart);
+    }
+
+    #[test]
+    fn capability_message_preserves_legacy_state_report_envelope() {
+        let report = sample_report("node-1");
+        let legacy = LegacyStateReport {
+            node_id: report.node_id.clone(),
+            timestamp: report.timestamp,
+            running_apps: report.running_apps.clone(),
+            cached_specs: report.cached_specs.clone(),
+            resource_usage: report.resource_usage.clone(),
+            event_log: report.event_log.clone(),
+            has_buildah: report.has_buildah,
+        };
+
+        let old_bytes = bincode::serialize(&legacy).unwrap();
+        let decoded_new: StateReport = bincode::deserialize(&old_bytes).unwrap();
+        assert_eq!(decoded_new.node_id, report.node_id);
+
+        let new_bytes = bincode::serialize(&report).unwrap();
+        let decoded_old: LegacyStateReport = bincode::deserialize(&new_bytes).unwrap();
+        assert_eq!(decoded_old.node_id, report.node_id);
+        assert_eq!(decoded_old.running_apps.len(), 1);
+
+        let new_report_message = ReportingMessage::Report(report);
+        let message_bytes = bincode::serialize(&new_report_message).unwrap();
+        let decoded_old_message: LegacyReportingMessage =
+            bincode::deserialize(&message_bytes).unwrap();
+        assert!(matches!(
+            decoded_old_message,
+            LegacyReportingMessage::Report(_)
+        ));
+    }
+
+    #[test]
+    fn capability_report_message_round_trip() {
+        let capability = NodeCapabilityReport {
+            node_id: NodeId::new("node-1"),
+            capabilities: NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+            },
+            egress_enforcement: vec![EgressEnforcementEvidence {
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+                instance_id: 0,
+                status: EgressEnforcementStatus::Enforced,
+            }],
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
+        };
+        let encoded = bincode::serialize(&ReportingMessage::CapabilityReport(capability)).unwrap();
+        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let ReportingMessage::CapabilityReport(decoded) = decoded else {
+            panic!("expected capability report");
+        };
+        assert!(decoded.capabilities.egress.can_enforce_allowlist());
+        assert_eq!(
+            decoded.egress_enforcement[0].status,
+            EgressEnforcementStatus::Enforced
+        );
+        assert!(
+            bincode::deserialize::<LegacyReportingMessage>(&encoded).is_err(),
+            "an old peer may reject the separate extension frame, but its report frame stays valid"
+        );
     }
 
     #[test]

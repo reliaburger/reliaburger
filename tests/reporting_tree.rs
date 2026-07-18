@@ -41,6 +41,9 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                 req = rx.recv() => {
                     if let Some(req) = req {
                         let snapshot = AgentSnapshot {
+                            capabilities: Default::default(),
+                            egress_degraded: false,
+                            egress_affected_workloads: Vec::new(),
                             instances: vec![InstanceSnapshot {
                                 app_name: "web".to_string(),
                                 namespace: "default".to_string(),
@@ -52,6 +55,7 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                                 uptime: Duration::from_secs(60),
                                 cpu_request_millicores: 250,
                                 memory_request_mb: 128,
+                                egress_enforcement: Default::default(),
                             }],
                             allocated_ports: vec![8080],
                             capacity_cpu_millicores: 4000,

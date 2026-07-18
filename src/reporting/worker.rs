@@ -16,7 +16,9 @@ use crate::meat::NodeId;
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
-    AppResourceUsage, ReportHealthStatus, ReportingMessage, ResourceUsage, RunningApp, StateReport,
+    AppResourceUsage, EgressAffectedWorkload, EgressEnforcementEvidence, EgressEnforcementStatus,
+    NodeCapabilityReport, ReportHealthStatus, ReportingMessage, ResourceUsage, RunningApp,
+    StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -46,6 +48,8 @@ pub struct InstanceSnapshot {
     pub cpu_request_millicores: u32,
     /// Memory requested by the instance's spec (MB).
     pub memory_request_mb: u32,
+    /// Live egress policy evidence for this instance.
+    pub egress_enforcement: EgressEnforcementStatus,
 }
 
 /// Full snapshot of the agent's state for building a StateReport.
@@ -59,6 +63,12 @@ pub struct AgentSnapshot {
     pub capacity_cpu_millicores: u32,
     /// Schedulable memory capacity (system total minus reserved).
     pub capacity_memory_mb: u32,
+    /// Live capabilities used by the scheduler for placement.
+    pub capabilities: crate::meat::cluster_state::NodeCapabilities,
+    /// Whether a live egress enforcement incident is still active.
+    pub egress_degraded: bool,
+    /// Workloads fenced during the active incident.
+    pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
 }
 
 /// Request sent to the agent to collect a state snapshot.
@@ -194,10 +204,18 @@ impl<T: ReportingTransport> ReportWorker<T> {
             None => return, // agent didn't respond
         };
 
+        let capability_report = self.build_capability_report(&snapshot);
         let report = self.build_report(snapshot);
         let _ = self
             .transport
             .send(parent, &ReportingMessage::Report(report))
+            .await;
+        let _ = self
+            .transport
+            .send(
+                parent,
+                &ReportingMessage::CapabilityReport(capability_report),
+            )
             .await;
     }
 
@@ -282,6 +300,31 @@ impl<T: ReportingTransport> ReportWorker<T> {
             has_buildah: self.has_buildah,
         }
     }
+
+    /// Build the additive capability message. An old peer may reject this
+    /// separate extension frame, but it still accepts the preceding legacy
+    /// `StateReport` frame.
+    fn build_capability_report(&self, snapshot: &AgentSnapshot) -> NodeCapabilityReport {
+        NodeCapabilityReport {
+            node_id: self.node_id.clone(),
+            capabilities: snapshot.capabilities,
+            egress_enforcement: snapshot
+                .instances
+                .iter()
+                .filter(|instance| {
+                    instance.egress_enforcement != EgressEnforcementStatus::NotRequested
+                })
+                .map(|instance| EgressEnforcementEvidence {
+                    app_name: instance.app_name.clone(),
+                    namespace: instance.namespace.clone(),
+                    instance_id: instance.instance_id,
+                    status: instance.egress_enforcement,
+                })
+                .collect(),
+            egress_degraded: snapshot.egress_degraded,
+            egress_affected_workloads: snapshot.egress_affected_workloads.clone(),
+        }
+    }
 }
 
 /// Whether an instance state is terminal — no process, no held resources.
@@ -325,6 +368,12 @@ mod tests {
                     req = rx.recv() => {
                         if let Some(req) = req {
                             let snapshot = AgentSnapshot {
+                                capabilities: Default::default(),
+                                egress_degraded: true,
+                                egress_affected_workloads: vec![EgressAffectedWorkload {
+                                    app_name: "web".to_string(),
+                                    namespace: "default".to_string(),
+                                }],
                                 instances: vec![InstanceSnapshot {
                                     app_name: "web".to_string(),
                                     namespace: "default".to_string(),
@@ -336,6 +385,7 @@ mod tests {
                                     uptime: Duration::from_secs(120),
                                     cpu_request_millicores: 250,
                                     memory_request_mb: 128,
+                                    egress_enforcement: Default::default(),
                                 }],
                                 allocated_ports: vec![8080],
                                 capacity_cpu_millicores: 7500,
@@ -398,6 +448,23 @@ mod tests {
             _ => panic!("expected Report"),
         }
 
+        let (_, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
+            .await
+            .expect("should receive capability evidence after the state report")
+            .unwrap();
+        let ReportingMessage::CapabilityReport(capability) = msg else {
+            panic!("expected CapabilityReport");
+        };
+        assert_eq!(capability.node_id, NodeId::new("w1"));
+        assert!(capability.egress_degraded);
+        assert_eq!(
+            capability.egress_affected_workloads,
+            vec![EgressAffectedWorkload {
+                app_name: "web".to_string(),
+                namespace: "default".to_string(),
+            }]
+        );
+
         shutdown.cancel();
         let _ = handle.await;
     }
@@ -414,6 +481,7 @@ mod tests {
             uptime: Duration::from_secs(10),
             cpu_request_millicores: cpu,
             memory_request_mb: memory,
+            egress_enforcement: Default::default(),
         }
     }
 
@@ -437,6 +505,9 @@ mod tests {
         );
 
         let snapshot = AgentSnapshot {
+            capabilities: Default::default(),
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
             instances: vec![
                 instance("web", ContainerState::Running, 250, 128),
                 instance("api", ContainerState::Running, 300, 256),
@@ -479,6 +550,9 @@ mod tests {
         );
 
         let snapshot = AgentSnapshot {
+            capabilities: Default::default(),
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
             instances: vec![instance("web", ContainerState::Stopping, 250, 128)],
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,

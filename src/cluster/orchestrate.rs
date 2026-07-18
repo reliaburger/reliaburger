@@ -256,13 +256,23 @@ fn plan_scheduling_pass(
         let want = effective_replicas(spec, override_replicas, alive.len());
 
         // Already converged? A placement is only OK if it targets a node
-        // that is still alive (a departed/cordoned node's placement is
-        // stale and forces a re-plan — daemon convergence and node loss).
+        // that is still alive, ready and capable of enforcing the spec.
+        // Capability loss is a state change, not a warning: it must force
+        // the same re-plan as node loss or a cordon.
+        let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
         let placements_ok = desired
             .scheduling
             .get(app_id)
             .map(|placements| {
-                placements.len() == want && placements.iter().all(|p| alive.contains(&p.node_id))
+                placements.len() == want
+                    && placements.iter().all(|p| {
+                        alive.contains(&p.node_id)
+                            && cache.get_node(&p.node_id).is_some_and(|node| {
+                                node.ready
+                                    && (!requires_egress
+                                        || node.capabilities.egress.can_enforce_allowlist())
+                            })
+                    })
             })
             .unwrap_or(false);
         if placements_ok {
@@ -549,6 +559,7 @@ fn build_cluster_cache(
             continue;
         };
         let usage = &report.resource_usage;
+        let capability_report = reports.capabilities.get(&member.node_id);
         if usage.cpu_total_millicores == 0 {
             continue; // pre-capacity node (or capacity unset)
         }
@@ -572,7 +583,10 @@ fn build_cluster_cache(
                 gpus: 0,
             },
             labels: member.labels.clone(),
-            ready: true,
+            ready: capability_report.is_none_or(|capability| !capability.egress_degraded),
+            capabilities: capability_report
+                .map(|capability| capability.capabilities)
+                .unwrap_or_default(),
             running_apps,
             uptime_secs: member.first_seen.elapsed().as_secs(),
             // Nothing reports cached images yet; locality scoring is
@@ -805,6 +819,7 @@ mod tests {
         let mut reports = AggregatedState {
             reports: HashMap::new(),
             stale_nodes: vec![],
+            capabilities: HashMap::new(),
         };
         reports.reports.insert(NodeId::new("a"), report(4000, 250));
         // "dead" has a report but isn't alive; "unreported" is alive
@@ -819,11 +834,82 @@ mod tests {
     }
 
     #[test]
+    fn cache_preserves_live_egress_capability() {
+        let members = vec![member("guarded", 1)];
+        let guarded = report(4000, 0);
+        let capability = crate::reporting::types::NodeCapabilityReport {
+            node_id: NodeId::new("guarded"),
+            capabilities: crate::meat::cluster_state::NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+            },
+            egress_enforcement: Vec::new(),
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
+        };
+        let reports = AggregatedState {
+            reports: HashMap::from([(NodeId::new("guarded"), guarded)]),
+            stale_nodes: vec![],
+            capabilities: HashMap::from([(NodeId::new("guarded"), capability)]),
+        };
+
+        let cache = build_cluster_cache(&members, &reports);
+
+        assert!(
+            cache
+                .get_node(&NodeId::new("guarded"))
+                .unwrap()
+                .capabilities
+                .egress
+                .can_enforce_allowlist()
+        );
+    }
+
+    #[test]
+    fn unenforced_running_workload_degrades_node_readiness() {
+        let members = vec![member("unsafe", 1)];
+        let mut unsafe_report = report(4000, 0);
+        unsafe_report
+            .running_apps
+            .push(running_app("prod", "payer", 8080, true));
+        let capability = crate::reporting::types::NodeCapabilityReport {
+            node_id: NodeId::new("unsafe"),
+            capabilities: Default::default(),
+            egress_enforcement: vec![crate::reporting::types::EgressEnforcementEvidence {
+                app_name: "payer".to_string(),
+                namespace: "prod".to_string(),
+                instance_id: 0,
+                status: crate::reporting::types::EgressEnforcementStatus::Unenforced,
+            }],
+            egress_degraded: true,
+            egress_affected_workloads: vec![crate::reporting::types::EgressAffectedWorkload {
+                app_name: "payer".to_string(),
+                namespace: "prod".to_string(),
+            }],
+        };
+        let reports = AggregatedState {
+            reports: HashMap::from([(NodeId::new("unsafe"), unsafe_report)]),
+            stale_nodes: vec![],
+            capabilities: HashMap::from([(NodeId::new("unsafe"), capability)]),
+        };
+
+        let cache = build_cluster_cache(&members, &reports);
+
+        assert!(!cache.get_node(&NodeId::new("unsafe")).unwrap().ready);
+    }
+
+    #[test]
     fn cache_skips_zero_capacity_reports() {
         let members = vec![member("zero", 1)];
         let mut reports = AggregatedState {
             reports: HashMap::new(),
             stale_nodes: vec![],
+            capabilities: HashMap::new(),
         };
         reports.reports.insert(NodeId::new("zero"), report(0, 0));
 
@@ -869,6 +955,7 @@ mod tests {
         let mut reports = AggregatedState {
             reports: HashMap::new(),
             stale_nodes: vec![],
+            capabilities: HashMap::new(),
         };
         let mut ra = report(4000, 100);
         ra.running_apps = vec![running_app("default", "api", 30001, true)];
@@ -908,6 +995,7 @@ mod tests {
         let mut reports = AggregatedState {
             reports: HashMap::new(),
             stale_nodes: vec![],
+            capabilities: HashMap::new(),
         };
         let mut ra = report(4000, 100);
         let mut portless = running_app("default", "batch", 0, true);
@@ -1005,6 +1093,7 @@ mod tests {
             allocated: Resources::default(),
             labels,
             ready: true,
+            capabilities: Default::default(),
             running_apps: Default::default(),
             uptime_secs: 86400,
             cached_images: Default::default(),
@@ -1131,6 +1220,44 @@ mod tests {
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
         assert_eq!(decisions.len(), 1, "departed placement must be re-planned");
         assert_eq!(decisions[0].placements[0].node_id, NodeId::new("live"));
+    }
+
+    #[test]
+    fn egress_placement_is_replanned_when_node_loses_enforcement() {
+        let mut desired = DesiredState::default();
+        let app = AppId::new("payer", "prod");
+        let mut spec = app_spec(100, 1);
+        spec.egress = Some(crate::config::app::EgressSpec {
+            allow: vec!["192.0.2.10:443".to_string()],
+            allow_franchise: Vec::new(),
+        });
+        desired.apps.insert(app.clone(), spec);
+        desired.scheduling.insert(
+            app.clone(),
+            vec![crate::meat::types::Placement {
+                node_id: NodeId::new("lost-hooks"),
+                resources: Resources::new(100, 0, 0),
+            }],
+        );
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("lost-hooks", 4000, BTreeMap::new()));
+        let mut capable = sched_node("guarded", 4000, BTreeMap::new());
+        capable.capabilities.egress = crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        };
+        cache.set_node(capable);
+        let alive = HashSet::from([NodeId::new("lost-hooks"), NodeId::new("guarded")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "capability loss must force a re-plan");
+        assert_eq!(decisions[0].placements[0].node_id, NodeId::new("guarded"));
     }
 
     /// Quota rejection: a namespace over its CPU budget gets its app refused.

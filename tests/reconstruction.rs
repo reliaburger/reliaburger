@@ -123,6 +123,7 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
     AggregatedState {
         reports,
         stale_nodes: vec![],
+        capabilities: HashMap::new(),
     }
 }
 

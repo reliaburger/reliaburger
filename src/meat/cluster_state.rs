@@ -6,7 +6,16 @@
 /// it after each placement to reflect reserved resources.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{AppId, NodeId, Resources};
+
+/// Live node capabilities that affect placement correctness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCapabilities {
+    /// Kernel hooks and runtime support for pre-start egress allowlists.
+    pub egress: crate::sesame::egress::EgressEnforcementCapability,
+}
 
 /// Per-node state as seen by the scheduler.
 #[derive(Debug, Clone)]
@@ -21,6 +30,8 @@ pub struct SchedulerNodeState {
     pub labels: BTreeMap<String, String>,
     /// Whether the node is ready to accept new workloads.
     pub ready: bool,
+    /// Live enforcement capabilities reported by the node.
+    pub capabilities: NodeCapabilities,
     /// Apps currently running on this node (for spread scoring).
     pub running_apps: HashSet<AppId>,
     /// How long this node has been alive, in seconds. Used for stability
@@ -138,6 +149,7 @@ mod tests {
             allocated: Resources::default(),
             labels: BTreeMap::new(),
             ready: true,
+            capabilities: NodeCapabilities::default(),
             running_apps: HashSet::new(),
             uptime_secs: 3600,
             cached_images: HashSet::new(),
