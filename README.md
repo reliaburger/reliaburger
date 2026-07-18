@@ -4,251 +4,80 @@
 
 # Reliaburger
 
-A batteries-included container orchestrator written in Rust. One binary that replaces Kubernetes and its ecosystem of add-ons with something dramatically simpler. Targeted at teams running 2-5000 nodes who want containers in production without the PhD.
+One binary. A whole container platform.
 
-This repo produces two things simultaneously:
+Reliaburger is a batteries-included container orchestrator written in Rust,
+for teams running 2-5,000 nodes who want containers in production without
+the PhD. The things you normally assemble from a dozen projects — scheduling,
+gossip clustering, Raft consensus, service discovery, ingress, mTLS PKI, an
+OCI image registry, metrics, logs, dashboards, GitOps, chaos testing, even
+rolling self-upgrade of the orchestrator itself — ship compiled into one
+`bun` agent and one `relish` CLI.
 
-1. **A working implementation** — complete, testable, simple.
-2. **A book** — *Building Reliaburger* — that walks through how we built all of it, teaching Rust and distributed systems along the way.
+No sidecars. No add-on shopping list. No YAML archaeology. You get:
 
-The full architectural vision lives in the [whitepaper](docs/whitepaper.md). For installation and usage instructions, see the [documentation](docs/README.md).
+- **A five-minute start.** `relish setup` takes a fresh machine to a
+  configured node: it detects or installs `bun` (signature-verified through
+  the same dual-signed pipeline the cluster uses to upgrade itself) and asks
+  a handful of questions.
+- **A cluster that heals itself.** SWIM gossip membership, a self-healing
+  Raft council, automatic rescheduling, council disaster recovery, and
+  rolling binary upgrades where workloads survive the swap.
+- **Security that's on by default.** Generated clusters require mTLS;
+  joins are single-use-token, CSR-based; images can be signature-gated;
+  secrets are encrypted at rest.
+- **Batteries you'd otherwise deploy separately.** Built-in registry with
+  P2P image distribution, time-series metrics with SQL, indexed logs,
+  ingress with TLS and draining, web + terminal dashboards, and a fault
+  injector for breaking things on purpose.
 
-## What's included
-
-Everything runs inside a single `bun` binary. No sidecars, no separate databases, no external dependencies.
-
-| Component | What it does |
-|-----------|-------------|
-| **Grill** | Container runtime (runc, Apple Container, process fallback) |
-| **Mustard** | SWIM gossip protocol for cluster membership |
-| **Council** | Raft consensus for leader election and state |
-| **Meat** | Bin-packing scheduler with labels, quotas, daemon mode |
-| **Onion** | Userspace `.internal` DNS + eBPF connection steering |
-| **Wrapper** | Ingress proxy (host/path routing, rate limiting, TLS) |
-| **Sesame** | PKI, mTLS, API auth, secret encryption, Raft encryption |
-| **Pickle** | Built-in OCI image registry (push/pull, replication, GC) |
-| **Mayo** | Time-series metrics (Arrow + DataFusion + Parquet) |
-| **Ketchup** | Log collection (append-only, indexed, JSON-aware) |
-| **Smoker** | Built-in fault injection (safety rails, eBPF network faults, scenarios) |
-| **Brioche** | Web dashboard (HTMX auto-refresh, uPlot charts, app/node detail pages) |
+The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
+Install and usage details are in the [documentation](docs/README.md), and
+implementation status in [progress.md](docs/progress.md).
 
 ## Quick start
 
 ```sh
-# Build all three binaries (including the example workload)
 cargo build --bins
 
-# Run the node agent without an external container runtime
+# Run the node agent — no container runtime needed for the first taste
 target/debug/bun --runtime process
 
-# In another terminal — deploy the example app
+# In another terminal: deploy, inspect, explore
 target/debug/relish apply examples/phase-1/proc-first-run.toml
-
-# Check what's running
 target/debug/relish status
-
-# Or explore the cluster interactively
-target/debug/relish
-
-# View the dashboard
-open http://localhost:9117/
-
-# Show live resource usage
-target/debug/relish top
+target/debug/relish            # interactive terminal dashboard
+open http://localhost:9117/    # web dashboard
 ```
 
-That sequence is intentionally ProcessGrill-only: it runs a real supervised
-process, but doesn't provide container isolation. The
-`examples/phase-1/proc-minimal-app.toml` example adds fixed-port service and
-health-check behaviour once you want to explore further.
+With runc (Linux) or Apple Container (macOS) installed, the same flow runs
+real OCI images — and `relish init cluster` generates the PKI and mTLS
+config for a secure multi-node cluster. The [documentation](docs/README.md)
+has the full secure-cluster walkthrough.
 
-For a minimal secure clustered-mode first run on Linux, install runc, then use
-the generated PKI, node config and container app:
+## The manual is in the binary
+
+Reliaburger documents itself. `relish manual` opens the reference as a
+searchable terminal reader — chapters, runnable examples, fuzzy search —
+with no repo checkout and no internet:
 
 ```sh
-target/debug/relish init cluster --cluster-name prod --node-id node-01
-sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
-
-# In another terminal, create the first administrator while the API is still
-# in its loopback-only bootstrap window, then deploy the generated app.
-export RELIABURGER_TOKEN="$(target/debug/relish \
-  --ca-cert cluster/identity/root-ca.crt \
-  token create --name first-admin --role admin)"
-target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.toml
-target/debug/relish --ca-cert cluster/identity/root-ca.crt status
-
-# Mint one short-lived, single-use token for each additional node.
-JOIN_NODE_02="$(target/debug/relish --ca-cert cluster/identity/root-ca.crt \
-  join-token create --ttl 15m)"
-JOIN_NODE_03="$(target/debug/relish --ca-cert cluster/identity/root-ca.crt \
-  join-token create --ttl 15m)"
+relish manual              # read it in the terminal (/ to search)
+relish manual --web        # the same manual as one page in your browser
+relish manual examples     # drop the runnable example configs right here
 ```
 
-The generated config sets `[security] require_mtls = true`. Raft, reporting
-and peer API calls therefore use the generated node identity without a manual
-edit. The API is HTTPS on `127.0.0.1:9117`; Relish trusts it through the
-generated root CA and authenticates with `RELIABURGER_TOKEN`. Apple Container
-uses `--runtime apple` without `sudo`. For an isolated local experiment only, `relish init
---development-plaintext` writes a conspicuously warned plaintext config.
+<!-- asciinema: `relish manual` demo cast goes here -->
 
-Run `relish join` once on each additional machine with its own token and node
-id. The command writes that node's CSR-signed identity; it doesn't copy the
-cluster master key or create its node config. Provision those separately, set
-`[cluster].join` to an existing node's gossip address, then start Bun. Point
-join-token creation and enrolment at the current leader during an election;
-a follower refuses the mutation without returning a usable token.
-
-See [docs/README.md](docs/README.md) for prerequisites, container runtime setup, and full CLI reference.
-
-## Try it
-
-```sh
-make test                    # run the portable nextest suite
-make audit                   # reject new RustSec dependency findings
-make observability-demo      # start bun, collect metrics, query APIs, show dashboard
-make pickle-test-macos       # push/pull a Docker image through the Pickle registry
-```
-
-## Repo layout
-
-```
-src/
-  lib.rs               # Core library
-  bin/bun.rs           # Node agent (daemon)
-  bin/relish.rs        # CLI entry point
-  bin/testapp.rs       # Configurable test HTTP server
-  config/              # TOML configuration parsing
-  grill/               # Container runtime (runc, Apple Container, process)
-  bun/                 # Node agent (event loop, API, health, supervisor)
-  relish/              # CLI (commands, client, output, plan, chaos, fault, dev)
-  smoker/              # Built-in fault injection (safety, registry, eBPF, scenarios)
-  mustard/             # SWIM gossip protocol
-  council/             # Raft consensus
-  meat/                # Scheduler (filter, score, select, commit)
-  reconstruction/      # State reconstruction after leader election
-  reporting/           # Hierarchical reporting tree
-  onion/               # eBPF service discovery
-  wrapper/             # Ingress proxy
-  firewall/            # nftables perimeter firewall
-  sesame/              # PKI, mTLS, secrets, API auth, Raft encryption
-  pickle/              # OCI image registry (blob store, API, replication, GC)
-  mayo/                # Time-series metrics (Arrow, DataFusion, Parquet, hierarchical rollups)
-  ketchup/             # Log collection (append-only, indexed, queries)
-  brioche/             # Web dashboard
-  upgrade/             # Self-upgrade (dual-signed binaries, exec-in-place, rolling orchestration)
-docs/
-  README.md            # User documentation (install, build, run)
-  whitepaper.md        # Full architectural vision
-  roadmap.md           # 9 implementation phases
-  progress.md          # What's done, what's next
-  design/              # Detailed design docs per component (14 files)
-  book/                # "Building Reliaburger" chapters (preface, 1-11, 14, Rust appendix)
-  _quarto/             # PDF build configuration
-examples/              # Example app and job configs
-scripts/               # Test and demo scripts
-assets/                # Logo and project media
-Makefile               # Build, test, lint, format, demo targets
-CLAUDE.md              # Project guide, conventions, writing style
-```
-
-## Current status
-
-The harness reports what actually ran instead of maintaining one headline total. On the
-audited macOS worktree, the portable profile executes 2,651 tests and identifies 40 ignored
-tests belonging to named slow, cluster, upgrade and manual suites. Linux compiles additional
-kernel/runtime tests, so its platform-specific inventory is reported by that job. Two
-Criterion targets and the 10k-member scale acceptance run separately. See the
-[test harness design](docs/design/test-harness.md) for commands, gates, timings and CI
-ownership.
-
-Phase 15a hardening has since closed H0-H3 and H6: dependency advisories are gated,
-administrative API bootstrap is loopback-only without credentials, declared
-egress policy fails closed, and rootful-runc workloads now use a pre-bound,
-supervised, capability-gated `.internal` resolver on their veth gateway. The
-DNS path has a checked-in real runc/netns acceptance test; unsupported runtime
-and address combinations fail before workload creation. Writable rootful-runc
-image roots now use private per-instance OverlayFS uppers instead of exposing
-one shared writable image generation; restart and Bun adoption preserve the
-right upper, and every cleanup path releases the mount. The H3 portable gates
-run 2,661 default-feature and 2,643 no-default-feature tests successfully, with
-39 named tests reported separately in each profile.
-
-The phase table below records historical cumulative checkpoints. It is not the current
-portable execution count.
-
-**The portable, provisioned, cluster, upgrade and benchmark suites now report separately.** Phase 12 (Optimisations) closed the loop on the whole image pipeline — O(1) nftables port maps, rarest-first P2P image downloads, a pull-through cache for external registries, Btrfs-quota'd volumes with CoW snapshots and scheduled object-store backups, and cluster-wide batch and build execution — and, in the process, wired several long-dead paths (managed volumes, port-mapping DNAT, cluster-image deploys). Phase 13 adds the interactive Relish terminal UI, backed by live event and log WebSockets. A follow-on security hardening pass (Phase 11b Stage 5) is underway; see below. The Phase 12b control-plane pass (12b.2) gave every node a gossip-published directory of leader endpoints, so clusters now reconcile and report past the seven-voter council and through leader failover; the same pass carried node labels over authenticated gossip, gave the scheduler one reservation cache per planning pass (so co-scheduled apps can't double-book a node), converged daemon sets against eligible nodes, fixed the autoscale lifecycle (validated bounds, commit-before-cooldown, stale-override clearing), and added **council disaster recovery** — encrypted external state backups, an operator `relish council recover` path for full-council loss, and disk-pressure voter resignation now driven by a `disk_pressured` bit carried over the authenticated gossip directory so the leader actually learns which voters to replace (all proven by gated acceptance suites, `RELIABURGER_CLUSTER_TESTS=1`). The transactional-deploy strand of the same pass gave instances namespace-scoped identity, routed cluster `stop` through Raft (so no reconciler resurrects a deleted app), made applied-state durable across a Bun restart, **moved deploy work off Bun's command loop** — image pulls, init polling, runtime create/start and rolling health waits now run on a per-deploy task, so one slow deploy no longer stalls health checks, restarts or other commands while the supervisor state machine stays authoritative — and gave rolling deploys real surge, drain and rollback semantics (in-flight requests drain through the ingress proxy before an old instance is retired) with an exit-aware `stop` that escalates SIGTERM to SIGKILL and only reports `Stopped` once the process is gone. The final 12b.2 theme made **namespaces, permissions and builds first-class declarative resources**: manual `relish apply` and Lettuce GitOps now share one desired-state write path (`config_to_desired_writes`), so an every-kind config converges byte-identically whichever door you use; namespace quotas built from desired state reject over-budget placements at deploy time; and a GitOps sync advances its `last_applied_commit` only when every write in the batch succeeds, so a partial failure re-applies next tick instead of silently dropping a resource. The 12b.3 security pass then hardened the node PKI: joins are now **CSR-based** (the joiner keeps its private key and sends only a signing request), the token consume and serial allocation are one atomic Raft entry (so racing joiners with one token issue exactly one certificate), node certificates carry a `spiffe://reliaburger/node/<id>` URI SAN that the Raft mTLS connector binds each peer connection against (so a valid cert for the wrong node is refused), the on-disk identity bundle installs transactionally behind a commit marker and is chain-validated on load, the Raft and reporting accept paths enforce per-connection handshake/read deadlines, and the join-token comparison is constant-time. The final 12b.3 theme completed the tier by hardening **image trust**: a node with `require_signatures` set that can't reach the cluster trust state (a standalone node) now *refuses* an image deploy rather than skipping the check (fail-closed, IMG2); keyless verification validates every link in the certificate chain plus validity, the code-signing EKU, issuer-DN binding and SPIFFE-identity binding (IMG3); OIDC verification enforces issuer, audience, algorithm/kid and issued-at bounds (PKI10); and build signing reuses one persistent per-namespace code-signing identity instead of minting a fresh ephemeral key per build, with a build-sign → deploy-verify round-trip proving the two halves agree — which **completes the 12b.3 "Secure every boundary" tier**. The 12b.4 "Finish the data plane" tier then closed the last three data-plane gaps: a global namespaced service catalogue with cluster-wide replicated endpoints (so DNS and ingress resolve services on any node), Pickle storage and replication durability, and finally **ingress transport and draining** — each route now carries its own TLS mode (a TLS-marked route reached over plain HTTP gets a 308, an unsupported mode is a config error not a silent plaintext downgrade, and the cluster-CA path issues the ingress cert from Sesame's Ingress CA), request/response bodies stream with a configurable request cap instead of buffering whole, TLS handshakes are bounded by a semaphore and a deadline, a WebSocket holds its connection permit and drain slot through the live splice (not the 101) so a rolling retire waits for in-flight WebSockets, and the proxy strips client `X-Forwarded-*`, matches routes on segment boundaries (`/api` no longer captures `/apievil`) and keys rate limits per `(route, client)` — which **completes the 12b.4 tier and finishes the data plane**. The 12b.5 "Make automation and observability truthful" tier then hardened metrics, logs and object storage: every DataFusion query is parameterised and the raw-log `/v1/logs/sql` endpoint is bounded (read-only, `logs`-table-only, row- and memory-capped); rollups are epoch-aligned, idempotent per `(node, window)` and durable across restart; per-app metrics are collected so autoscaling has a signal; a firing alert no longer resolves itself when telemetry goes stale, and Slack/PagerDuty get provider-shaped payloads; cross-node log fan-out URL-encodes its values, reports **which** nodes failed instead of a silent empty, and deduplicates on stable `(node, timestamp, stream, line)` identity; and **log/metric export now writes real `s3://`/`gs://` object stores** through `object_store` with one Bun-owned checkpoint keyed on durable content-hash ids (a filename reused after retention isn't skipped), a final flush on shutdown, and the dead legacy `KetchupStore` removed — which **completes the 12b.5 tier**. The final 12b.6 "Platform, upgrades and documentation" tier then made the last workload and chaos surfaces honest: `[process_workloads]` reaches the supervisor with **default-deny** host exec and a real NVIDIA detector that makes `gpu_enabled` effective (a GPU request on an unbacked node is refused, not silently scheduled); every Smoker fault now has a **real, reversible effect** (CPU/memory/IO cgroup limits, auto-resumed pause, honest rejection of node-level faults, and — caught by the acceptance gate — a DnsNxdomain fault that actually returns NXDOMAIN in the userspace resolver instead of writing to a dead kernel map); self-upgrade computes quorum from **live** voters, derives node roles/addresses server-side, proves gossip rejoin and adopts Apple workloads across an `exec()`; and a documentation truth pass reconciled the whitepaper, design docs and book to the shipped reality. The **Phase 12b acceptance gate** then ran the whole programme end-to-end — portable, no-default, in-process cluster (8+ node failover, council recovery) and upgrade suites in the sandbox, the full CI matrix (coverage floor held) on the merge commit, `make test-linux` via CI's privileged-Linux job, and `make test-apple` on **real Apple silicon** — the last of which caught and fixed an inspect-schema adoption bug a green unit test had hidden. That **completes the entire Phase 12b review-remediation programme (12b.1–12b.6)**. See [progress.md](docs/progress.md) for the full checklist.
-
-| Phase | Status | Tests |
-|-------|--------|-------|
-| 1. Foundation | Done | 321 |
-| 2. Cluster Formation | Done | 588 |
-| 3. Networking | Done | 702 |
-| 4. Security | Done | 795 |
-| 5. Storage & Registry | Done | 867 |
-| 6. Observability | Done | 991 |
-| 7. Deployments | Done | 1,050 |
-| 8. Advanced | Done | 1,263 |
-| 9. User Experience | Done | 1,271 |
-| 10. Advanced Security | Done | 1,448 |
-| 11. Advanced Observability | Done | 1,595 |
-| 11b. Review & wiring | Done | 1,703 |
-| 14. Self-Upgrade | Done | 1,880 |
-| 12. Optimisations | Done | 1,981 |
-| 13. Relish TUI | Done | 2,268 |
-| 12b.2 Cluster convergence | Done | 2,431 |
-| 12b.3 API authorisation & Brioche | Done | 2,456 |
-| 12b.3 Node PKI, join & mTLS | Done | 2,473 |
-| 12b.3 Image trust policy (tier complete) | Done | 2,499 |
-| 12b.4 Pickle storage & replication durability | Done | 2,532 |
-| 12b.4 Global namespaced service catalogue + replicated endpoints | Done | 2,570 |
-| 12b.4 Ingress transport & draining (tier complete) | Done | 2,593 |
-| 12b.5–12b.6 Observability, platform, upgrades, docs + acceptance gate (**Phase 12b complete**) | Done | 2,628 portable |
-
-Phase 14 (rolling binary upgrades) landed ahead of 12 and 13: `relish
-upgrade start v0.2.0` rolls a live cluster onto a new dual-signed binary —
-workloads survive the swap (same pids, adopted across `exec()`), a
-crash-looping release reverts itself, and the leader upgrades itself last
-(in place, quorum preserved through the sub-second exec bounce).
-
-Phase 12 (optimisations) followed: port mapping via O(1) nftables named
-maps, parallel rarest-first P2P image pulls between nodes, a pull-through
-cache so external images are fetched from upstream once, Btrfs subvolume
-quotas and instant CoW snapshots (`relish snapshot`, scheduled S3/GCS
-backups), and cluster-wide batch (`relish batch`) and image-build
-(`relish build`) execution with capability-based placement.
-
-Phase 11b Stage 5 (security hardening, in progress) turns the PKI from a
-tested library into a live boundary. Each node persists its own certificate
-(written by `relish init`, delivered to joiners in the join response with a
-trust-on-first-use fingerprint check). Normal `relish init` output now sets
-`[security] require_mtls = true`: Raft and reporting require mutually
-authenticated TLS, while peer API clients present their node certificate over
-the API's token-authorised TLS listener. All three use the shared,
-Raft-replicated revocation list; a revoked node is refused on its next
-handshake. Image-signature verification checks that revocation list too.
-The Brioche dashboard now authenticates: a token is exchanged once for a
-read-only, `HttpOnly` session cookie, and the UI routes sit behind it.
-Network policy enforcement is now complete too: egress allowlists cover
-IPv6 (a new `connect6` hook — a v4-only allowlist was bypassable over v6)
-and CIDR ranges (kernel LPM tries), egress is programmed *before* the
-process starts on root-mode runc (create → program → start, failing the
-deploy closed if policy can't be installed), a periodic sweep reconciles
-the kernel maps against live instances, and the nftables perimeter is
-dual-stack with parsed-and-validated admin CIDRs and bounded `nft` calls.
-Secret and workload-identity safety rounds out the 12b.1 "stop the
-bleeding" themes: workload certificates get exact one-hour validity
-windows and server-rebuilt SANs (a CSR can't smuggle extra names), each
-instance's identity lives in its own tmpfs-backed directory that follows
-the instance from creation to stop and survives agent restarts with its
-rotation schedule intact, and secret-key rotation refuses to retire an
-old key while any stored secret is still sealed under it.
-Still open in this stage: the Pickle registry's own auth/TLS, and the
-broader correctness/observability items tracked in
-[progress.md](docs/progress.md).
+The source ships too. `relish source ebpf` opens a fuzzy search over the
+exact `src/` tree the binary was compiled from. The platform carries its own
+reference, examples and implementation wherever the binary goes.
 
 ## The book
 
-Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rust and distributed systems through the implementation:
+This repository is also a book. *Building Reliaburger* walks through how
+every subsystem was designed and built — teaching Rust and distributed
+systems along the way, aimed at programmers coming from C, Python or Go:
 
 0. [Preface](docs/book/00-preface.md)
 1. [Hello, Container](docs/book/01-hello-container.md)
@@ -266,6 +95,24 @@ Each phase produces a chapter of *Building Reliaburger*, a book that teaches Rus
 13. [A Room with a View](docs/book/13-a-room-with-a-view.md)
 14. [Changing the Tyres at Full Speed](docs/book/14-changing-the-tyres.md)
 - [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
+
+## What's inside
+
+Twelve burger-named subsystems in one binary — Grill (runtimes), Mustard
+(gossip), Council (Raft), Meat (scheduler), Onion (discovery/DNS/eBPF),
+Wrapper (ingress), Sesame (security), Pickle (registry), Mayo (metrics),
+Ketchup (logs), Smoker (chaos), Brioche (dashboard). The component tour and
+repo layout live in the manual (`relish manual`, "Under the hood") and the
+[design docs](docs/design/).
+
+## Try it
+
+```sh
+make test                    # run the portable nextest suite
+make audit                   # reject new RustSec dependency findings
+make observability-demo      # start bun, collect metrics, query APIs, show dashboard
+make pickle-test-macos       # push/pull a Docker image through the Pickle registry
+```
 
 ## Licence
 
