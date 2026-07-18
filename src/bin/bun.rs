@@ -261,27 +261,28 @@ async fn refresh_token_store(
     *store.write().await = tokens;
 }
 
-/// Refuse to bind a token-less (wide-open) API to a routable address (AUTH3).
+/// Refuse to bind a token-less (wide-open) API beyond literal loopback (AUTH3).
 ///
-/// Returns an error when `listen` resolves to a non-loopback IP, so the caller
-/// aborts startup. A loopback address, an unparseable one (a hostname we leave
-/// to the resolver), or a `0.0.0.0`/`::`-free routable IP all take the safe
-/// path: only a clearly non-loopback bind is refused. The message names the
-/// two recovery routes so the operator isn't left guessing.
+/// During bootstrap, only an IP-literal loopback address is unambiguously safe.
+/// Hostnames are rejected too: resolving one here and binding it later creates
+/// a time-of-check/time-of-use gap, and accepting an unresolved name was the
+/// standalone-mode authentication bypass this guard exists to prevent.
 fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
-    let Ok(address) = listen.parse::<std::net::SocketAddr>() else {
-        // A hostname, not a literal address: we can't tell if it's loopback
-        // here, so don't block. The operator opted into a name deliberately.
-        return Ok(());
-    };
+    let address = listen.parse::<std::net::SocketAddr>().map_err(|_| {
+        anyhow::anyhow!(
+            "refusing API listener {listen:?} while the API has an empty token store: \
+             bootstrap requires an IP-literal loopback address such as 127.0.0.1:9117 \
+             or [::1]:9117; hostnames aren't accepted because their resolution can change"
+        )
+    })?;
     if address.ip().is_loopback() {
         return Ok(());
     }
     anyhow::bail!(
-        "refusing to bind the API to non-loopback address {address} while no user tokens exist: \
-         the API would be open to anyone who can reach it. bind a loopback address \
-         (e.g. 127.0.0.1:9117) and run `relish token create` to mint the first admin token, \
-         then restart with your intended --listen address"
+        "refusing API listener {address} while the API has an empty token store: \
+         bootstrap requires an IP-literal loopback address such as 127.0.0.1:9117 \
+         or [::1]:9117; initialise an authenticated cluster and create the first \
+         admin token before using a non-loopback --listen address"
     )
 }
 
@@ -303,6 +304,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         NodeConfig::default()
     };
+
+    // Create the store before any subsystem side effects. Standalone mode has
+    // no council from which it could load an existing token, so its bootstrap
+    // listener policy is already known and can fail immediately. Cluster mode
+    // checks the same store after Raft security state has populated it below.
+    let api_token_store = reliaburger::sesame::auth::new_token_store();
+    if !cli.cluster {
+        refuse_open_non_loopback_bind(&cli.listen)?;
+    }
 
     // Validate the reconstruction thresholds and backup settings before we
     // build anything on top of them (12b.2 D21/CP12): a nonsensical coverage
@@ -796,14 +806,17 @@ async fn main() -> anyhow::Result<()> {
     // refreshed. The middleware reads this store; without the refresh, a token
     // created after startup would never engage enforcement (the ≤5 s lag is
     // deliberate).
-    let api_token_store = if let Some(council) = &api_council {
-        let store = reliaburger::sesame::auth::new_token_store();
-        refresh_token_store(&store, council).await;
+    // Every mode owns the explicit store created before subsystem startup.
+    // Previously standalone mode used `None`, while router construction
+    // silently replaced it with a fresh empty store. The listener guard then
+    // saw `None` and skipped the check needed to contain that open router.
+    if let Some(council) = &api_council {
+        refresh_token_store(&api_token_store, council).await;
         if let Some(crl) = &crl_refresh {
             crl.update(council.security_state().await.crl);
         }
 
-        let refresh_store = Arc::clone(&store);
+        let refresh_store = Arc::clone(&api_token_store);
         let refresh_council = Arc::clone(council);
         let refresh_shutdown = shutdown.clone();
         let refresh_crl = crl_refresh.clone();
@@ -823,10 +836,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
-        Some(store)
-    } else {
-        None
-    };
+    }
     agent.set_log_sink(log_tx);
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
@@ -1173,16 +1183,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the API server.
     //
-    // AUTH3 fail-closed: a fresh cluster with no user tokens leaves the API
-    // wide open (the middleware's bootstrap window). That's fine on loopback
-    // — the operator creates the first token locally — but binding a wide-open
-    // API to a routable address exposes the whole cluster to anyone who can
-    // reach it. Refuse that combination and tell the operator how to recover.
-    if let Some(store) = &api_token_store {
-        let no_tokens = store.read().await.is_empty();
-        if no_tokens {
-            refuse_open_non_loopback_bind(&cli.listen)?;
-        }
+    // AUTH3 fail-closed: an empty user-token store leaves the API wide open
+    // (the middleware's bootstrap window). That's fine on loopback, but a
+    // routable listener would expose every administrative route. Standalone
+    // has already checked this before subsystem startup; this second boundary
+    // covers the token state loaded from Raft in cluster mode.
+    let no_tokens = api_token_store.read().await.is_empty();
+    if no_tokens {
+        refuse_open_non_loopback_bind(&cli.listen)?;
     }
     let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
     println!("bun: API server listening on {}", cli.listen);
@@ -1276,7 +1284,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::clone(&pickle_catalog)),
         alerts.clone(),
         api_council.clone(),
-        api_token_store.clone(),
+        Some(api_token_store.clone()),
         service_token.clone(),
         api_rollup_store,
         api_membership.clone(),
@@ -1407,10 +1415,12 @@ async fn main() -> anyhow::Result<()> {
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     // Registry writes reuse the cluster's existing auth material (REG4):
     // the same token store and service token that guard the agent API. In
-    // single-node/tokenless mode this stays `None` and writes are open.
-    let registry_auth = api_token_store.as_ref().map(|store| {
-        reliaburger::sesame::auth::AuthState::new(Arc::clone(store), service_token.clone())
-    });
+    // single-node/tokenless mode the empty-store bootstrap rule keeps writes
+    // open, but the API listener above is restricted to literal loopback.
+    let registry_auth = Some(reliaburger::sesame::auth::AuthState::new(
+        Arc::clone(&api_token_store),
+        service_token.clone(),
+    ));
     // Storage quotas (REG4): a per-repository ceiling derived from
     // `[images] max_storage` divided across repositories is more than an
     // operator asked for; we apply `max_storage` as the registry-wide cap
@@ -1876,8 +1886,8 @@ mod tests {
         // A wide-open API on a routable address must be refused (AUTH3).
         let err = refuse_open_non_loopback_bind("10.0.0.5:9117").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("non-loopback"), "message was: {msg}");
-        assert!(msg.contains("relish token create"), "message was: {msg}");
+        assert!(msg.contains("empty token store"), "message was: {msg}");
+        assert!(msg.contains("IP-literal loopback"), "message was: {msg}");
     }
 
     #[test]
@@ -1889,10 +1899,11 @@ mod tests {
     }
 
     #[test]
-    fn bind_check_allows_hostnames() {
-        // A hostname isn't a literal address; we can't classify it here, so
-        // we don't block — the resolver decides.
-        refuse_open_non_loopback_bind("localhost:9117").unwrap();
+    fn bind_check_refuses_hostnames() {
+        // Even localhost is rejected during the empty-token window: resolving
+        // and checking it separately from bind would introduce a TOCTOU gap.
+        let err = refuse_open_non_loopback_bind("localhost:9117").unwrap_err();
+        assert!(err.to_string().contains("hostnames aren't accepted"));
     }
 
     #[tokio::test]

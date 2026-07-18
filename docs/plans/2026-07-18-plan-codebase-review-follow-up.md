@@ -48,26 +48,32 @@ the uncertainty.
 remaining alert has a written reachability decision, compensating control,
 owner and expiry/recheck date, and CI fails on new unacknowledged advisories.
 
-### H1. Enforce authentication on every non-loopback control-plane listener
+### H1. Contain the API authentication bootstrap window
 
 **Finding:** SEC-1. Standalone Bun skips the empty-token bind guard while its
 router still creates an empty token store, exposing administrative routes when
 the operator binds it beyond loopback.
 
-- [ ] Write black-box startup tests for standalone and clustered modes with a
-  loopback literal, `0.0.0.0`, a routable literal and a hostname.
-- [ ] Construct one explicit API authentication mode before router and listener
+- [x] Write black-box startup tests covering standalone loopback, wildcard,
+  non-loopback and hostname listeners, plus clustered empty-token startup.
+- [x] Construct one explicit API authentication mode before router and listener
   creation. Don't let `Option<TokenStore>` decide security policy implicitly.
-- [ ] Permit an empty token store only on an IP-literal loopback listener (or a
+- [x] Permit an empty token store only on an IP-literal loopback listener (or a
   future Unix socket). Reject unresolved hostnames rather than assuming safety.
-- [ ] Make the startup error name both remedies: bind to loopback or configure a
+- [x] Make the startup error name both remedies: bind to loopback or configure a
   token/authenticated cluster identity.
-- [ ] Update the security design and book where they describe first-start API
+- [x] Update the security design and book where they describe first-start API
   access.
 
 **Acceptance:** remote administrative routes are never served with empty-token
 authentication; loopback bootstrap remains usable; portable startup tests cover
 both standalone and clustered construction.
+
+**Delivered on the hardening branch:** Production Bun now constructs one token
+store in every mode. Standalone validates the listener immediately after config
+parsing; clustered Bun validates the Raft-populated store before bind. Five real
+binary tests and three policy unit tests cover the boundary. Portable clippy,
+2,633 default tests and the no-default H1 suite pass.
 
 ### H2. Fail closed when a declared egress policy can't be enforced
 

@@ -798,6 +798,15 @@ $ relish token create --name ci-deploy --role deployer \
 3. Store the hash, salt, role, scope, TTL, and rate limit in Raft.
 4. Return the plaintext token to the user. It is never stored in plaintext.
 
+**Bootstrap boundary (shipped):** An empty user-token store leaves protected
+API routes open long enough to create the first cluster token. Bun contains
+that window to an IP-literal loopback listener (`127.0.0.0/8` or `::1`). It
+rejects wildcard and routable addresses, and also rejects hostnames rather than
+resolving and checking one address before a later bind. Production Bun creates
+the same explicit token store in standalone and clustered modes, so standalone
+can't bypass the listener check by omitting council state. The check runs before
+runtime, storage or observability startup in standalone mode.
+
 **Rotation:**
 
 ```bash

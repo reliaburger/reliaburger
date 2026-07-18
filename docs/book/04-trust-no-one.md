@@ -267,7 +267,7 @@ let argon2 = Argon2::default();
 let hash = argon2.hash_password(token.as_bytes(), &salt)?;
 ```
 
-The middleware skips authentication for `/v1/health` (so liveness probes still work) and when no tokens exist yet (pre-init single-node mode).
+The middleware skips authentication for `/v1/health` (so liveness probes still work) and when no user tokens exist yet. That second case is a bootstrap window, not permission to publish an open control plane: Bun only permits it on an IP-literal loopback listener. Wildcard, routable and hostname listeners are refused until the cluster has a real user token.
 
 ## Secret encryption
 

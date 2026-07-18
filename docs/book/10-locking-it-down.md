@@ -472,28 +472,29 @@ Snapshot mutation used to ride on "any authenticated caller". So did app rollbac
 
 ### Fail closed, not open
 
-A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine — you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.
+A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine: you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.
 
-So we refuse that combination at bind time:
+So we refuse that combination before building any subsystems:
 
 ```rust
 fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
-    let Ok(address) = listen.parse::<std::net::SocketAddr>() else {
-        return Ok(()); // a hostname; leave classification to the resolver
-    };
+    let address = listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| anyhow::anyhow!(
+            "bootstrap requires an IP-literal loopback address"
+        ))?;
     if address.ip().is_loopback() {
         return Ok(());
     }
-    anyhow::bail!(
-        "refusing to bind the API to non-loopback address {address} while no user tokens exist: \
-         the API would be open to anyone who can reach it. bind a loopback address \
-         (e.g. 127.0.0.1:9117) and run `relish token create` to mint the first admin token, \
-         then restart with your intended --listen address"
-    )
+    anyhow::bail!("bootstrap requires an IP-literal loopback address")
 }
 ```
 
-The recovery path is in the error itself, because a fail-closed check that leaves the operator guessing is a support ticket waiting to happen. Bind loopback, mint a token, restart wherever you meant to. Once a token exists the bootstrap window is closed and normal auth applies, so the non-loopback bind sails through.
+Why reject `localhost` too? We could resolve it, check that the answer is loopback, then ask Tokio to resolve it again during bind. Those are two separate lookups. If the answer changes between them, we checked one address and listened on another (a time-of-check/time-of-use bug). Requiring `127.0.0.1:9117` or `[::1]:9117` is less magical and actually proves what we need.
+
+The first implementation still had a hole. Cluster mode created a token store, so this check ran. Standalone mode passed `None`; the router quietly replaced that with a new empty store, while the listener code interpreted `None` as “nothing to check”. In other words, the router was wide open precisely when the guard looked away. Bun now constructs one token store in every mode. Standalone mode has no council state to load, so it checks the literal-loopback rule immediately after parsing configuration, before runtime, storage or observability startup. Cluster mode fills the same store from Raft, then checks it before bind.
+
+The recovery path is in the error itself, because a fail-closed check that leaves the operator guessing is a support ticket waiting to happen. Bootstrap an authenticated cluster on loopback, mint the first admin token, then restart wherever you meant to listen. Once a token exists the bootstrap window is closed and normal auth applies, so a non-loopback cluster bind can proceed.
 
 ### A shared Admin token is a lateral-movement risk
 

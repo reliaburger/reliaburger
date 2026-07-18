@@ -209,8 +209,8 @@ cargo run --bin bun
 # Force process runtime (no container tools needed)
 cargo run --bin bun -- --runtime process
 
-# Use a custom listen address
-cargo run --bin bun -- --listen 0.0.0.0:9117
+# Use a custom loopback address
+cargo run --bin bun -- --listen 127.0.0.1:9217
 
 # Load node configuration from file
 cargo run --bin bun -- --config node.toml
@@ -225,6 +225,13 @@ bun: API server listening on 127.0.0.1:9117
 ```
 
 Stop with `Ctrl-C` — the agent shuts down gracefully.
+
+An empty token store is a local bootstrap window: administrative routes are
+open so the first cluster token can be created. Bun therefore accepts only an
+IP-literal loopback `--listen` address in that state. Wildcard, routable and
+hostname listeners are rejected before subsystem startup. Initialise an
+authenticated cluster and create the first admin token before exposing the API
+on a non-loopback address.
 
 ### CLI (relish)
 
