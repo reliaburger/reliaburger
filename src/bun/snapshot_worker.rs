@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use object_store::ObjectStoreExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::node::SnapshotsSection;
@@ -38,10 +39,11 @@ impl SnapshotUploader {
     /// Object key for one snapshot archive.
     fn key_for(&self, meta: &SnapshotMeta) -> object_store::path::Path {
         self.prefix
-            .child(meta.namespace.as_str())
-            .child(meta.app.as_str())
-            .child(crate::grill::snapshot::volume_slug(&meta.volume_path))
-            .child(format!("{}.tar.gz", meta.name))
+            .clone()
+            .join(meta.namespace.as_str())
+            .join(meta.app.as_str())
+            .join(crate::grill::snapshot::volume_slug(&meta.volume_path))
+            .join(format!("{}.tar.gz", meta.name))
     }
 }
 

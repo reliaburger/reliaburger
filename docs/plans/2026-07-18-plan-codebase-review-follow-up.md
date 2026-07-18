@@ -25,28 +25,67 @@ The labels describe scheduling value:
 ### H0. Patch and continuously detect known dependency advisories
 
 **Finding:** GitHub reported 12 open Dependabot alerts on the reviewed default
-branch after the review was pushed: 2 high, 5 medium and 5 low. The high alerts
-affect `rustls-webpki` (malformed-CRL panic) and `quinn-proto` (unauthenticated
-QUIC transport-parameter panic). Reliaburger also uses vulnerable `tar` versions
-on extraction paths. Upstream severity doesn't prove every transitive path is
-reachable here, but known fixes are available and cheap compared with carrying
-the uncertainty.
+branch after the review was pushed: 2 high, 5 medium and 5 low. A fresh RustSec
+scan then found newer `crossbeam-epoch`, `quick-xml` and `quinn-proto`
+advisories that GitHub hadn't reported yet. The affected graph includes TLS,
+archive extraction, cloud object-store parsing, system inspection and
+development benchmarks. Upstream severity doesn't prove every transitive path
+is reachable here, but known fixes are available and cheap compared with
+carrying the uncertainty.
 
-- [ ] Upgrade `rustls-webpki` to at least 0.103.13, `quinn-proto` to at least
-  0.11.14 and `tar` to at least 0.4.46; take compatible patched `rand` releases.
-- [ ] Use `cargo tree -i` plus call-path review to record whether each advisory
+- [x] Upgrade `rustls-webpki` to 0.103.13, `quinn-proto` to 0.11.15, `tar` to
+  0.4.46, `crossbeam-epoch` to 0.9.20 and `object_store`/`quick-xml` to
+  0.14.1/0.41.0; take compatible patched `rand` releases.
+- [x] Use `cargo tree -i` plus call-path review to record whether each advisory
   is direct, reachable transitive code, or compiled but unused.
-- [ ] Document compensating controls for the currently unpatched `thrift`
+- [x] Document compensating controls for the currently unpatched `thrift`
   excessive-allocation advisory and the `lru::IterMut` soundness advisory; pin
   follow-up owners rather than silently accepting them.
-- [ ] Add `cargo-deny` or `cargo-audit` to an owned CI/release gate with explicit,
+- [x] Add `cargo-deny` or `cargo-audit` to an owned CI/release gate with explicit,
   expiring exceptions for advisories that have no compatible fix.
-- [ ] Re-run portable, no-default, documentation and relevant extraction/TLS
+- [x] Re-run portable, no-default, documentation and relevant extraction/TLS
   suites after lockfile changes.
 
 **Acceptance:** every alert with a compatible patched release is gone. Every
 remaining alert has a written reachability decision, compensating control,
 owner and expiry/recheck date, and CI fails on new unacknowledged advisories.
+
+#### H0 implementation audit record (18 July 2026)
+
+`cargo audit` loaded 1,166 RustSec advisories and scanned 637 locked packages.
+The first scan failed with four vulnerabilities. After the upgrades below it
+passes with `warnings` denied and only the named exceptions in
+`.cargo/audit.toml`. `make audit` makes those exceptions fail closed after 18
+August 2026. The normal reusable CI workflow runs the gate on changes and
+before release; a small scheduled workflow refreshes the advisory database each
+Monday even when the repository is quiet.
+
+| Package/advisory | Dependency and call-path decision | Disposition |
+|---|---|---|
+| `rustls-webpki` GHSA-82j2-j2ch-gfr8 and related findings | Runtime transitive dependency of `rustls`; Reliaburger constructs TLS and CRL verification paths. | Patched to 0.103.13. |
+| `tar` GHSA-3pv8-6f4r-ffg2, GHSA-j4xf-2g29-59ph and GHSA-gchp-q4r4-x4ff | Direct and runtime reachable from image/build archive extraction in `grill::image` and `pickle::build`. | Patched to 0.4.46. |
+| `quick-xml` RUSTSEC-2026-0194 and RUSTSEC-2026-0195 | Runtime transitive dependency of the directly used `object_store` cloud features. A malicious or compromised configured S3/GCS endpoint can reach response parsing. | Upgraded `object_store` 0.12.5 to 0.14.1 and `quick-xml` to 0.41.0; migrated the extension-trait and path APIs. |
+| `crossbeam-epoch` RUSTSEC-2026-0204 | Runtime reachable through `sysinfo`; also present through Criterion in development. | Patched to 0.9.20. |
+| `quinn-proto` GHSA-6xvm-j4wr-6v98 and RUSTSEC-2026-0185 | Present only in the lockfile as reqwest's optional HTTP/3 graph. `cargo tree --target all` prints no active path because Reliaburger doesn't enable HTTP/3. | Patched anyway, to 0.11.15. |
+| `rand` GHSA-cq8v-f236-94qc | Direct and transitive versions are compiled; the advisory affects the old range. | Patched the 0.8 and 0.9 lines to 0.8.6 and 0.9.3. |
+| `thrift` GHSA-2f9f-gq7v-9h6m | Runtime reachable through Parquet/DataFusion when the operator runs `relish logs-query remote` against a local or remote archive. There is no fixed `thrift` release. | **Temporary risk acceptance.** Query only Bun-produced Parquet in operator-controlled object stores; don't point the command at untrusted archives. A crafted trusted-store object can still cause process memory exhaustion, so this isn't a complete defence. Phase 15a/M2 owns replacement or upstream upgrade; recheck by 18 August 2026. GitHub Dependabot remains the detection source because RustSec doesn't currently carry this GHSA. |
+| `lru` RUSTSEC-2026-0002 | Transitive through ratatui 0.29. Its layout cache uses `LruCache`, but source review finds no call to the affected `LruCache::iter_mut` API. | **Temporary exception.** No reachable affected call. Phase 15a/M2 owns the ratatui/lru upgrade; CI exception expires 18 August 2026. |
+| `anyhow` RUSTSEC-2026-0190 | Direct error type. Repository call-path review finds no `Error::downcast_mut`, the affected API. No fixed release exists. | **Temporary exception.** Avoid `downcast_mut`; Phase 15a/M2 owns upstream recheck; CI exception expires 18 August 2026. |
+| `bincode`, `rustls-pemfile`, `paste`, `proc-macro-error` informational advisories | `bincode` persists Raft vote/log-id metadata and needs a format migration. `rustls-pemfile` parses configured TLS material. `paste` and `proc-macro-error` are build-time transitive macros. These are maintenance notices rather than published vulnerabilities. | **Temporary exceptions.** Phase 15a/M2 owns migration/upgrade; CI exceptions expire 18 August 2026. |
+
+The remaining `lru` and `thrift` GitHub alerts therefore stay visible. They are
+not being called fixed. The acceptance decision is narrowly about known API
+reachability and trusted input, with a forced re-review date.
+
+**Verification:** `make audit`, `cargo fmt --all -- --check` and portable
+all-target clippy pass. `make test` runs 2,633 tests (all pass; 39 separately
+skipped), while `make test-no-default` runs 2,615 (all pass; 39 skipped).
+`make test-doc` also passes and still discovers zero doctests, as tracked in
+O3. Those portable suites include the image/build archive extraction, TLS/CRL,
+snapshot upload, council backup, object-store export and remote log-query
+tests. The macOS `make lint` all-feature target still fails at the known
+Linux/Aya module boundary recorded in M2; the portable all-target clippy gate
+passes, so that platform limitation isn't misreported as an H0 regression.
 
 ### H1. Contain the API authentication bootstrap window
 

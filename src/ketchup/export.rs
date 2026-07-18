@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -151,7 +152,7 @@ pub async fn export_logs(
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<ExportResult, KetchupError> {
     let (store, prefix) = parse_destination(destination)?;
-    let node_prefix = prefix.child(node_id);
+    let node_prefix = prefix.join(node_id);
 
     let entries = match std::fs::read_dir(source_dir) {
         Ok(entries) => entries,
@@ -184,7 +185,7 @@ pub async fn export_logs(
             continue;
         }
 
-        let key = node_prefix.child(filename.as_str());
+        let key = node_prefix.clone().join(filename.as_str());
         let len = contents.len() as u64;
         store
             .put(&key, object_store::PutPayload::from(contents))

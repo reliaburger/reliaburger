@@ -118,6 +118,7 @@ make test        # portable nextest suite
 make test-doc    # Rust documentation examples
 make test-linux  # provisioned Linux runtime/kernel suite
 make lint        # clippy with warnings as errors
+make audit       # RustSec advisory and dependency-maintenance gate
 make fmt         # format with rustfmt
 make ci          # portable format, lint and test checks
 make clean       # remove build artefacts
@@ -144,6 +145,7 @@ make test-cluster          # failover, healing, recovery, placement and chaos
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # combined HTML and LCOV coverage
+make audit                 # fail on new RustSec dependency findings
 ```
 
 `make test` runs only tests that can execute truthfully on an ordinary developer machine.

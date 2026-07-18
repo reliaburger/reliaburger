@@ -1325,7 +1325,7 @@ convergence and adoption" theme under 12b.6).
 
 ### High-value / must fix
 
-- [ ] Patch, assess and continuously detect known dependency advisories (H0)
+- [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. Named temporary exceptions fail closed after 18 August 2026; `thrift` and `lru` remain tracked risk, not claimed fixes.
 - [x] Contain the API authentication bootstrap window (H1 / SEC-1) — Bun now owns one token store in standalone and cluster modes; an empty store permits only IP-literal loopback. Five real-binary startup tests cover standalone/clustered bootstrap, and the 2,633-test portable suite passes.
 - [ ] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3)
 - [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1)
