@@ -81,6 +81,19 @@ pub struct NodeCapabilityReport {
     pub egress_affected_workloads: Vec<EgressAffectedWorkload>,
 }
 
+/// Additive DNS readiness message.
+///
+/// DNS is deliberately separate from [`NodeCapabilityReport`]. That report
+/// shipped with H2 as positional bincode, so appending a field would make H2
+/// and H3 nodes reject each other's capability frame during a rolling update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsCapabilityReport {
+    /// Node that bound and tested this resolver path.
+    pub node_id: NodeId,
+    /// Live resolver transports and workload reachability.
+    pub capability: crate::onion::dns::DnsCapability,
+}
+
 /// A workload fenced after its live egress security boundary disappeared.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EgressAffectedWorkload {
@@ -210,6 +223,9 @@ pub enum ReportingMessage {
     /// Live scheduling capabilities and per-workload security evidence.
     /// Added at the end so existing bincode variant discriminants stay put.
     CapabilityReport(NodeCapabilityReport),
+    /// Live DNS readiness in its own rolling-upgrade-safe extension frame.
+    /// Added at the end so every earlier discriminant stays unchanged.
+    DnsCapabilityReport(DnsCapabilityReport),
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +260,35 @@ mod tests {
             reports: HashMap<NodeId, LegacyStateReport>,
         },
         MetricsRollup(NodeRollup),
+    }
+
+    /// Exact H2 capability wire shape, before DNS readiness was added as its
+    /// own extension frame.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct H2NodeCapabilities {
+        egress: crate::sesame::egress::EgressEnforcementCapability,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct H2NodeCapabilityReport {
+        node_id: NodeId,
+        capabilities: H2NodeCapabilities,
+        egress_enforcement: Vec<EgressEnforcementEvidence>,
+        egress_degraded: bool,
+        egress_affected_workloads: Vec<EgressAffectedWorkload>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    enum H2ReportingMessage {
+        Report(StateReport),
+        Ack {
+            node_id: NodeId,
+        },
+        AggregatedReport {
+            reports: HashMap<NodeId, StateReport>,
+        },
+        MetricsRollup(NodeRollup),
+        CapabilityReport(H2NodeCapabilityReport),
     }
 
     fn sample_report(name: &str) -> StateReport {
@@ -344,6 +389,13 @@ mod tests {
                     udp_ipv6: true,
                     pre_start: true,
                 },
+                dns: crate::onion::dns::DnsCapability {
+                    enabled: true,
+                    ready: true,
+                    ipv4: true,
+                    ipv6: false,
+                    workload_reachable: true,
+                },
             },
             egress_enforcement: vec![EgressEnforcementEvidence {
                 app_name: "web".to_string(),
@@ -360,6 +412,7 @@ mod tests {
             panic!("expected capability report");
         };
         assert!(decoded.capabilities.egress.can_enforce_allowlist());
+        assert_eq!(decoded.capabilities.dns, Default::default());
         assert_eq!(
             decoded.egress_enforcement[0].status,
             EgressEnforcementStatus::Enforced
@@ -368,6 +421,61 @@ mod tests {
             bincode::deserialize::<LegacyReportingMessage>(&encoded).is_err(),
             "an old peer may reject the separate extension frame, but its report frame stays valid"
         );
+
+        let decoded_h2: H2ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let H2ReportingMessage::CapabilityReport(decoded_h2) = decoded_h2 else {
+            panic!("expected the unchanged H2 capability discriminant");
+        };
+        assert!(decoded_h2.capabilities.egress.can_enforce_allowlist());
+    }
+
+    #[test]
+    fn dns_capability_extension_round_trip() {
+        let message = ReportingMessage::DnsCapabilityReport(DnsCapabilityReport {
+            node_id: NodeId::new("node-1"),
+            capability: crate::onion::dns::DnsCapability {
+                enabled: true,
+                ready: true,
+                ipv4: true,
+                ipv6: false,
+                workload_reachable: true,
+            },
+        });
+        let encoded = bincode::serialize(&message).unwrap();
+        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let ReportingMessage::DnsCapabilityReport(decoded) = decoded else {
+            panic!("expected DNS capability report");
+        };
+        assert_eq!(decoded.node_id, NodeId::new("node-1"));
+        assert!(decoded.capability.can_resolve_internal());
+        assert!(bincode::deserialize::<H2ReportingMessage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn h2_capability_frame_decodes_with_dns_default() {
+        let h2 = H2ReportingMessage::CapabilityReport(H2NodeCapabilityReport {
+            node_id: NodeId::new("node-1"),
+            capabilities: H2NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+            },
+            egress_enforcement: Vec::new(),
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
+        });
+
+        let encoded = bincode::serialize(&h2).unwrap();
+        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let ReportingMessage::CapabilityReport(decoded) = decoded else {
+            panic!("expected CapabilityReport");
+        };
+        assert!(decoded.capabilities.egress.can_enforce_allowlist());
+        assert_eq!(decoded.capabilities.dns, Default::default());
     }
 
     #[test]

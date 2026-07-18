@@ -149,6 +149,7 @@ async fn start_node(
             Arc::clone(council),
             membership_rx.clone(),
             aggregated_rx,
+            false,
             // Fast learning period so the test doesn't wait long.
             reliaburger::config::node::ReconstructionSection {
                 report_threshold_percent: 95,

@@ -16,9 +16,9 @@ use crate::meat::NodeId;
 use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
-    AppResourceUsage, EgressAffectedWorkload, EgressEnforcementEvidence, EgressEnforcementStatus,
-    NodeCapabilityReport, ReportHealthStatus, ReportingMessage, ResourceUsage, RunningApp,
-    StateReport,
+    AppResourceUsage, DnsCapabilityReport, EgressAffectedWorkload, EgressEnforcementEvidence,
+    EgressEnforcementStatus, NodeCapabilityReport, ReportHealthStatus, ReportingMessage,
+    ResourceUsage, RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -205,6 +205,10 @@ impl<T: ReportingTransport> ReportWorker<T> {
         };
 
         let capability_report = self.build_capability_report(&snapshot);
+        let dns_report = DnsCapabilityReport {
+            node_id: self.node_id.clone(),
+            capability: snapshot.capabilities.dns,
+        };
         let report = self.build_report(snapshot);
         let _ = self
             .transport
@@ -216,6 +220,10 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 parent,
                 &ReportingMessage::CapabilityReport(capability_report),
             )
+            .await;
+        let _ = self
+            .transport
+            .send(parent, &ReportingMessage::DnsCapabilityReport(dns_report))
             .await;
     }
 
@@ -368,7 +376,16 @@ mod tests {
                     req = rx.recv() => {
                         if let Some(req) = req {
                             let snapshot = AgentSnapshot {
-                                capabilities: Default::default(),
+                                capabilities: crate::meat::cluster_state::NodeCapabilities {
+                                    dns: crate::onion::dns::DnsCapability {
+                                        enabled: true,
+                                        ready: true,
+                                        ipv4: true,
+                                        ipv6: false,
+                                        workload_reachable: true,
+                                    },
+                                    ..Default::default()
+                                },
                                 egress_degraded: true,
                                 egress_affected_workloads: vec![EgressAffectedWorkload {
                                     app_name: "web".to_string(),
@@ -464,6 +481,16 @@ mod tests {
                 namespace: "default".to_string(),
             }]
         );
+
+        let (_, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
+            .await
+            .expect("should receive DNS capability after egress capability")
+            .unwrap();
+        let ReportingMessage::DnsCapabilityReport(dns) = msg else {
+            panic!("expected DnsCapabilityReport");
+        };
+        assert_eq!(dns.node_id, NodeId::new("w1"));
+        assert!(dns.capability.can_resolve_internal());
 
         shutdown.cancel();
         let _ = handle.await;

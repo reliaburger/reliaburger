@@ -186,6 +186,11 @@ pub struct ImageStore {
     /// clones (the runc grill holds one). A lock-free `OnceLock` read
     /// sits on every pull, a set happens at most once.
     cluster_source: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn ClusterImageSource>>>,
+    /// Serialises generation publication across clones. Re-unpacking the same
+    /// generation clears its directory, which can destroy a running
+    /// container's rootfs; the completion marker makes subsequent pulls reuse
+    /// the published tree instead.
+    unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ImageStore {
@@ -194,6 +199,7 @@ impl ImageStore {
         Self {
             store_root,
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
+            unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -211,9 +217,9 @@ impl ImageStore {
     /// point at different content) never share a rootfs. A tag move
     /// therefore extracts into a *fresh* directory and cannot delete or
     /// re-extract another generation while a container is running out of it
-    /// — the container keeps the path it was started with. Re-extracting the
-    /// same content is idempotent: the target is unique to that content, so
-    /// `unpack_layers`'s clear-and-recreate rebuilds an identical tree.
+    /// — the container keeps the path it was started with. The same content is
+    /// published once and then reused; clearing and rebuilding an already-live
+    /// generation would briefly remove files from running containers.
     ///
     /// Tar extraction is CPU-bound, so it runs on a blocking task.
     async fn unpack_to(
@@ -221,7 +227,12 @@ impl ImageStore {
         layer_paths: Vec<PathBuf>,
         rootfs: PathBuf,
     ) -> Result<PathBuf, ImageError> {
+        let _guard = self.unpack_lock.lock().await;
         let generation = self.rootfs_generation_path(&rootfs, &layer_paths);
+        let complete = generation.with_extension("complete");
+        if complete.is_file() {
+            return Ok(generation);
+        }
         let target = generation.clone();
         tokio::task::spawn_blocking(move || unpack_layers(&layer_paths, &target))
             .await
@@ -229,6 +240,7 @@ impl ImageStore {
                 digest: "join".to_string(),
                 reason: e.to_string(),
             })??;
+        tokio::fs::write(&complete, b"complete\n").await?;
         Ok(generation)
     }
 
@@ -747,7 +759,7 @@ mod tests {
     /// REG5: two different layer sets for the same tag land in *different*
     /// content-addressed generation directories, so a tag move or a
     /// concurrent push can't clobber a running container's rootfs. The same
-    /// layer set is stable across calls (idempotent re-extract target).
+    /// layer set is stable across calls and reused after publication.
     #[test]
     fn rootfs_generations_are_content_addressed_and_isolated() {
         let store = ImageStore::new(PathBuf::from("/tmp/images"));
@@ -779,6 +791,28 @@ mod tests {
         assert_ne!(gen_a, gen_b, "different content must not share a rootfs");
         assert!(gen_a.starts_with(&tag_rootfs));
         assert!(gen_b.starts_with(&tag_rootfs));
+    }
+
+    #[tokio::test]
+    async fn repeated_unpack_reuses_live_generation_without_clearing_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.gz");
+        create_test_layer(&layer, &[("bin/tool", b"original")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("rootfs/tag");
+
+        let generation = store
+            .unpack_to(vec![layer.clone()], tag_root.clone())
+            .await
+            .unwrap();
+        std::fs::write(generation.join("live-sentinel"), b"still mounted").unwrap();
+
+        let same = store.unpack_to(vec![layer], tag_root).await.unwrap();
+        assert_eq!(same, generation);
+        assert!(
+            generation.join("live-sentinel").exists(),
+            "a repeated pull must not clear a generation used by a running container"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ Everything runs inside a single `bun` binary. No sidecars, no separate databases
 | **Mustard** | SWIM gossip protocol for cluster membership |
 | **Council** | Raft consensus for leader election and state |
 | **Meat** | Bin-packing scheduler with labels, quotas, daemon mode |
-| **Onion** | eBPF service discovery (DNS + connect rewrite) |
+| **Onion** | Userspace `.internal` DNS + eBPF connection steering |
 | **Wrapper** | Ingress proxy (host/path routing, rate limiting, TLS) |
 | **Sesame** | PKI, mTLS, API auth, secret encryption, Raft encryption |
 | **Pickle** | Built-in OCI image registry (push/pull, replication, GC) |
@@ -119,6 +119,15 @@ kernel/runtime tests, so its platform-specific inventory is reported by that job
 Criterion targets and the 10k-member scale acceptance run separately. See the
 [test harness design](docs/design/test-harness.md) for commands, gates, timings and CI
 ownership.
+
+Phase 15a hardening has since closed H0-H3: dependency advisories are gated,
+administrative API bootstrap is loopback-only without credentials, declared
+egress policy fails closed, and rootful-runc workloads now use a pre-bound,
+supervised, capability-gated `.internal` resolver on their veth gateway. The
+DNS path has a checked-in real runc/netns acceptance test; unsupported runtime
+and address combinations fail before workload creation. The H3 portable gates
+run 2,661 default-feature and 2,643 no-default-feature tests successfully, with
+39 named tests reported separately in each profile.
 
 The phase table below records historical cumulative checkpoints. It is not the current
 portable execution count.

@@ -2150,7 +2150,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         std::collections::HashSet<InstanceId>,
     ) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
-            return (Default::default(), Default::default());
+            return (
+                crate::meat::cluster_state::NodeCapabilities {
+                    dns: self.supervisor.dns_capability(),
+                    ..Default::default()
+                },
+                Default::default(),
+            );
         };
         let mut ebpf = handle.lock().await;
         let capabilities = crate::meat::cluster_state::NodeCapabilities {
@@ -2161,6 +2167,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 udp_ipv6: ebpf.sendmsg6_attached(),
                 pre_start: self.supervisor.grill().honours_cgroup_path(),
             },
+            dns: self.supervisor.dns_capability(),
         };
         let enforced_cgroups =
             crate::sesame::egress::list_enforced_cgroups(&mut ebpf.bpf).unwrap_or_default();
@@ -2181,7 +2188,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
-        (Default::default(), Default::default())
+        (
+            crate::meat::cluster_state::NodeCapabilities {
+                dns: self.supervisor.dns_capability(),
+                ..Default::default()
+            },
+            Default::default(),
+        )
     }
 
     /// Get cluster node membership from gossip, or empty if single-node.

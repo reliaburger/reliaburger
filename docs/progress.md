@@ -1327,9 +1327,10 @@ convergence and adoption" theme under 12b.6).
 
 - [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. Named temporary exceptions fail closed after 18 August 2026; `thrift` and `lru` remain tracked risk, not claimed fixes.
 - [x] Contain the API authentication bootstrap window (H1 / SEC-1) — Bun now owns one token store in standalone and cluster modes; an empty store permits only IP-literal loopback. Five real-binary startup tests cover standalone/clustered bootstrap, and the 2,633-test portable suite passes.
-- [ ] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3)
-- [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1)
+- [x] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3) — four cgroup hooks plus per-workload enforcement are proven before start, live loss fences affected workloads, and independent expiring capability evidence keeps placement fail closed. Merged in PR #122.
+- [x] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1) — rootful runc derives and mounts a veth-gateway resolver, Bun pre-binds supervised UDP/TCP with `IP_FREEBIND`, and independent rolling-safe readiness leases gate placement. A checked-in two-workload rootful-runc/netns acceptance test resolves `redis.internal`; it also forced fixes for colliding long veth names and destructive repeated rootfs extraction. Unsupported runtimes and addresses fail before creation. Portable default/no-default suites pass 2,661/2,643 tests (39 named skips in each).
 - [ ] Make generated clusters use mTLS by default (H4 / SEC-2)
+- [ ] Isolate writable runc root filesystems per workload (H6) — H3 stopped repeated pulls from clearing a live generation, but replicas still need private writable upper layers.
 - [ ] Replace the broken published first-run sequence with an executable one (H5 / DOC-1)
 - [ ] Rerun the complete review matrix and close the high-value gate
 

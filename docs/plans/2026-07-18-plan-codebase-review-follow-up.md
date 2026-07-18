@@ -162,24 +162,66 @@ process, recycled-cgroup scrubbing and live hook-loss fencing.
 address writes an unreachable nameserver into runc containers. Bind failure also
 happens in a detached task and doesn't fail Bun startup.
 
-- [ ] Write a real runc/netns test that resolves a mapped `.internal` service
+- [x] Write a real runc/netns test that resolves a mapped `.internal` service
   through the address written to the workload's `resolv.conf`.
-- [ ] Derive or configure a container-reachable responder address for runc; keep
+- [x] Derive or configure a container-reachable responder address for runc; keep
   host loopback only for runtimes whose network model can reach it.
-- [ ] Bind the responder before Bun reports readiness and propagate bind/startup
+- [x] Bind the responder before Bun reports readiness and propagate bind/startup
   errors to the supervisor.
-- [ ] Publish DNS readiness and supported address families as live capabilities.
-- [ ] Refuse a deployment that requires `.internal` discovery when its selected
+- [x] Publish DNS readiness and supported address families as live capabilities.
+- [x] Refuse a deployment that requires `.internal` discovery when its selected
   runtime/node can't reach a ready responder.
-- [ ] Keep the TC implementation in `poc/dns-tc/` as evidence and a possible
+- [x] Keep the TC implementation in `poc/dns-tc/` as evidence and a possible
   future fast path. Don't move it into production until it beats the corrected
   userspace design on simplicity or material performance.
-- [ ] Reconcile the DNS design, configuration reference and book with the runtime
+- [x] Reconcile the DNS design, configuration reference and book with the runtime
   address rules and failure behaviour.
 
 **Acceptance:** a default supported runc deployment can resolve `.internal`
 names, a bind conflict prevents ready startup, and unsupported runtime/address
 combinations fail before workload creation.
+
+#### H3 implementation audit record (18 July 2026)
+
+Rootful runc now derives the node side of its workload veth as the resolver
+address. Bun binds UDP and TCP port 53 on that precise address before it starts
+the agent or adopts a workload; Linux `IP_FREEBIND` closes the first-workload
+ordering gap without opening wildcard port 53 or fighting the host resolver.
+Each OCI bundle gets its own read-only `/etc/resolv.conf` bind mount, so nodes no
+longer mutate a shared unpacked image rootfs.
+
+DNS readiness (enabled, ready, IPv4/IPv6 and workload reachability) travels in
+an additive reporting frame. The H2 positional bincode frame remains byte
+compatible in both directions during a rolling update. DNS and egress evidence
+have independent receive-time leases and leadership epochs, so one heartbeat
+can't keep the other capability alive. The leader takes DNS-required mode from
+its configuration rather than inferring it from currently fresh leases; losing
+every DNS report therefore leaves zero eligible nodes instead of disabling the
+placement constraint. The local supervisor repeats the admission check before
+runtime creation.
+
+The responder refuses every query from a source outside its private/loopback
+ACL, bounds both upstream UDP work and DNS-over-TCP clients, and gives each TCP
+client a deadline. Either serving loop ending makes the combined task end; Bun
+then cancels the node so reporting leases expire. Rootless runc, ProcessGrill,
+Apple Container, non-port-53 and IPv6-only/host-loopback runc configurations
+fail before workload creation. They aren't described as working fallbacks.
+
+Linux acceptance evidence: the checked-in ignored test
+`runc_netns_resolves_internal_name_through_mounted_resolv_conf` ran as root in
+the `reliaburger-test` VM. It created two real network namespaces and veths,
+started concurrent Alpine runc workloads, printed both generated resolver files
+and resolved `redis.internal` to its mapped VIP through the gateway; both
+workloads exited 0. Strengthening the test from one workload to two exposed two
+existing prerequisites: prefix-truncated veth names collided for long replica
+IDs, and a second pull cleared the same content-addressed rootfs generation
+under the first workload. Long interface names now use a stable whole-ID hash,
+and image generations are serialised, completion-marked and reused without
+destructive re-extraction.
+The all-target Linux/eBPF Clippy gate also passes. Portable evidence: all-target
+warnings-as-errors Clippy, 13 DNS wire tests, reporting wire/lease tests and the
+documentation suite pass. `make test` runs 2,661 tests (all pass; 39 separately
+skipped), and `make test-no-default` runs 2,643 (all pass; 39 skipped).
 
 ### H4. Make generated clusters use mTLS by default
 
@@ -198,6 +240,28 @@ transports unless an operator discovers and changes the switch.
 
 **Acceptance:** following the normal initialisation path produces encrypted,
 mutually authenticated cluster transports without hand-editing configuration.
+
+### H6. Isolate writable runc root filesystems per workload
+
+**Finding:** the strengthened H3 acceptance test found that replicas using the
+same image also use the same unpacked rootfs generation with `readonly = false`.
+H3 prevents a repeated pull from deleting that live generation, but it doesn't
+make writes private: one compromised or merely untidy workload can still alter
+files seen by another workload on the node.
+
+- [ ] Write a rootful-runc test in which two concurrent containers use the same
+  image, mutate the same path and prove that neither observes the other's write.
+- [ ] Keep the content-addressed generation immutable and give every instance a
+  writable overlay/snapshot (or an equivalently isolated upper layer).
+- [ ] Make create failure, normal stop, timeout, panic and Bun adoption clean up
+  or recover the per-instance mount without deleting a live lower generation.
+- [ ] Define and test the rootless-runc behaviour separately; don't silently
+  fall back to a shared writable tree when overlay support is unavailable.
+- [ ] Update the Grill design and Chapter 5 with the mount ownership/lifecycle.
+
+**Acceptance:** two workloads using one image can't read or corrupt each
+other's rootfs changes, while restart/adoption keeps each workload's own files
+and cleanup leaves no mounts behind.
 
 ### H5. Replace the broken published first-run sequence with an executable one
 
@@ -313,8 +377,9 @@ runtime, and CI rejects future command drift.
 Prefer one reviewable commit/PR per high-value item. H0 and H1 have no
 architectural prerequisite and start first. H2 and H3 may introduce the minimum common live
 capability type needed for their own fail-closed decisions; M1 generalises it
-after those contracts are proven. H4 follows without waiting for M1. H5 closes
-the gate using the corrected defaults and commands.
+after those contracts are proven. H4 follows without waiting for M1. H6 closes
+the newly proven rootfs isolation boundary, then H5 publishes a first-run path
+against the settled secure defaults and commands.
 
 For every production change:
 
@@ -325,5 +390,5 @@ For every production change:
 5. run privileged Linux/cluster/runtime gates when the boundary needs them; and
 6. record exact acceptance evidence before checking the progress item.
 
-When H0-H5 are green together, rerun the complete review matrix. Only then mark
+When H0-H6 are green together, rerun the complete review matrix. Only then mark
 the high-value gate complete and resume the remaining Phase 15 feature order.

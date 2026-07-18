@@ -71,6 +71,7 @@ pub fn spawn_leader_scheduler(
     council: Arc<CouncilNode>,
     membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
     aggregated_rx: watch::Receiver<AggregatedState>,
+    dns_required: bool,
     reconstruction_config: crate::config::node::ReconstructionSection,
     shutdown: CancellationToken,
 ) {
@@ -177,7 +178,13 @@ pub fn spawn_leader_scheduler(
             // deploy time, with the reason surfaced through the log.
             let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
-            let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+            let decisions = plan_scheduling_pass_with_dns(
+                &mut cache,
+                &desired,
+                &alive,
+                &mut quotas,
+                dns_required,
+            );
 
             for decision in decisions {
                 // Revalidate against the LATEST membership before the async
@@ -231,11 +238,27 @@ pub fn spawn_leader_scheduler(
 ///
 /// `quotas` gates admission cumulatively per namespace (empty in
 /// production until T6 feeds it).
+#[cfg(test)]
 fn plan_scheduling_pass(
     cache: &mut ClusterStateCache,
     desired: &crate::council::types::DesiredState,
     alive: &HashSet<NodeId>,
     quotas: &mut crate::meat::quota::QuotaLedger,
+) -> Vec<crate::meat::types::SchedulingDecision> {
+    plan_scheduling_pass_with_dns(cache, desired, alive, quotas, false)
+}
+
+/// Plan a pass with the cluster's configured DNS requirement.
+///
+/// The requirement is an explicit configuration input. Deriving it from live
+/// capability reports creates a fail-open edge: if every DNS lease expires,
+/// absence would look exactly like an intentionally disabled resolver.
+fn plan_scheduling_pass_with_dns(
+    cache: &mut ClusterStateCache,
+    desired: &crate::council::types::DesiredState,
+    alive: &HashSet<NodeId>,
+    quotas: &mut crate::meat::quota::QuotaLedger,
+    dns_required: bool,
 ) -> Vec<crate::meat::types::SchedulingDecision> {
     use crate::meat::scheduler::Scheduler;
 
@@ -271,6 +294,8 @@ fn plan_scheduling_pass(
                                 node.ready
                                     && (!requires_egress
                                         || node.capabilities.egress.can_enforce_allowlist())
+                                    && (!dns_required
+                                        || node.capabilities.dns.can_resolve_internal())
                             })
                     })
             })
@@ -301,7 +326,7 @@ fn plan_scheduling_pass(
         }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
-        let mut scheduler = Scheduler::new(std::mem::take(cache));
+        let mut scheduler = Scheduler::new(std::mem::take(cache)).with_dns_required(dns_required);
         let result = scheduler.schedule_app(app_id, &effective_spec);
         *cache = scheduler.cluster;
         match result {
@@ -847,6 +872,7 @@ mod tests {
                     udp_ipv6: true,
                     pre_start: true,
                 },
+                dns: Default::default(),
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,
@@ -1258,6 +1284,72 @@ mod tests {
 
         assert_eq!(decisions.len(), 1, "capability loss must force a re-plan");
         assert_eq!(decisions[0].placements[0].node_id, NodeId::new("guarded"));
+    }
+
+    #[test]
+    fn dns_placement_is_replanned_when_node_loses_resolver_capability() {
+        let mut desired = DesiredState::default();
+        let app = AppId::new("client", "prod");
+        desired.apps.insert(app.clone(), app_spec(100, 1));
+        desired.scheduling.insert(
+            app.clone(),
+            vec![crate::meat::types::Placement {
+                node_id: NodeId::new("dns-lost"),
+                resources: Resources::new(100, 0, 0),
+            }],
+        );
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("dns-lost", 4000, BTreeMap::new()));
+        let mut capable = sched_node("dns-ready", 4000, BTreeMap::new());
+        capable.capabilities.dns = crate::onion::dns::DnsCapability {
+            enabled: true,
+            ready: true,
+            ipv4: true,
+            ipv6: false,
+            workload_reachable: true,
+        };
+        cache.set_node(capable);
+        let alive = HashSet::from([NodeId::new("dns-lost"), NodeId::new("dns-ready")]);
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+            true,
+        );
+
+        assert_eq!(decisions.len(), 1, "DNS capability loss must re-plan");
+        assert_eq!(decisions[0].placements[0].node_id, NodeId::new("dns-ready"));
+    }
+
+    #[test]
+    fn dns_requirement_stays_fail_closed_when_all_capability_leases_are_absent() {
+        let mut desired = DesiredState::default();
+        desired
+            .apps
+            .insert(AppId::new("client", "prod"), app_spec(100, 1));
+
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node(
+            "reported-but-no-dns-lease",
+            4000,
+            BTreeMap::new(),
+        ));
+        let alive = HashSet::from([NodeId::new("reported-but-no-dns-lease")]);
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &mut QuotaLedger::default(),
+            true,
+        );
+        assert!(
+            decisions.is_empty(),
+            "losing every DNS lease must not be interpreted as DNS being disabled"
+        );
     }
 
     /// Quota rejection: a namespace over its CPU budget gets its app refused.

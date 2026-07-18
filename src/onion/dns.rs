@@ -1,9 +1,11 @@
 /// Userspace DNS responder for `.internal` service names.
 ///
-/// A lightweight UDP server that Bun runs on `127.0.0.53:53` (or a
-/// configured address). Containers' `/etc/resolv.conf` points at this
-/// address. When a query arrives for `*.internal`, we answer from the
-/// service map; everything else is forwarded to the upstream resolver.
+/// A lightweight UDP/TCP server that Bun binds before reporting node
+/// readiness. Runc containers use the node-side veth gateway as their
+/// nameserver; on Linux, Bun uses `IP_FREEBIND` so it can bind that precise
+/// address before the first veth creates it.
+/// When a query arrives for `*.internal`, we answer from the service map;
+/// everything else is forwarded to the upstream resolver.
 ///
 /// The responder is authoritative for `.internal`: names that don't
 /// resolve get NXDOMAIN locally and are never forwarded, so internal
@@ -18,6 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, watch};
@@ -82,6 +85,13 @@ const UPSTREAM_BUFFER: usize = 4096;
 /// forwarding tasks so a query flood cannot exhaust memory.
 const MAX_INFLIGHT_FORWARDS: usize = 64;
 
+/// Maximum clients allowed to hold a DNS-over-TCP task at once.
+const MAX_INFLIGHT_TCP: usize = 64;
+
+/// A client that never finishes its length-prefixed query must release its
+/// TCP slot promptly instead of pinning one forever.
+const TCP_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// DNS RCODEs we produce.
 const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
@@ -92,9 +102,37 @@ const RCODE_REFUSED: u8 = 5;
 const QTYPE_A: u16 = 1;
 const QTYPE_AAAA: u16 = 28;
 
+/// Live DNS capability published by a node.
+///
+/// `ready` only becomes true after both UDP and TCP sockets have bound.
+/// `workload_reachable` additionally means the selected runtime can install
+/// and reach the advertised resolver address; a host-side socket alone isn't
+/// enough.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsCapability {
+    /// The operator enabled the `.internal` resolver on this node.
+    pub enabled: bool,
+    /// Both DNS transports bound before Bun entered its ready state.
+    pub ready: bool,
+    /// The workload resolver path supports DNS over IPv4.
+    pub ipv4: bool,
+    /// The workload resolver path supports DNS over IPv6.
+    pub ipv6: bool,
+    /// The selected runtime can reach the address installed in workloads.
+    pub workload_reachable: bool,
+}
+
+impl DnsCapability {
+    /// Whether this node can safely host a workload in a DNS-enabled cluster.
+    pub fn can_resolve_internal(self) -> bool {
+        self.enabled && self.ready && self.workload_reachable && (self.ipv4 || self.ipv6)
+    }
+}
+
 /// Configuration for the DNS responder.
+#[derive(Debug, Clone)]
 pub struct DnsConfig {
-    /// Address to listen on (e.g. `127.0.0.53:53`).
+    /// Address to listen on (e.g. `0.0.0.0:53` for runc workloads).
     pub listen_addr: SocketAddr,
     /// Upstream DNS server for non-`.internal` queries.
     pub upstream: SocketAddr,
@@ -116,11 +154,155 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            listen_addr: SocketAddr::new(Ipv4Addr::new(127, 0, 0, 53).into(), 53),
+            listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53),
             upstream: SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53),
             upstream_timeout: Duration::from_secs(2),
             default_namespace: "default".to_string(),
             source_acl: SourceAcl::default(),
+        }
+    }
+}
+
+/// DNS sockets bound during Bun startup.
+///
+/// Keeping binding separate from serving closes the readiness race: callers
+/// can fail startup before they publish a capability or create a workload.
+pub struct BoundDnsResponder {
+    config: Arc<DnsConfig>,
+    udp: Arc<UdpSocket>,
+    tcp: TcpListener,
+}
+
+impl BoundDnsResponder {
+    /// Bind both UDP and TCP on the configured address.
+    pub async fn bind(mut config: DnsConfig) -> Result<Self, std::io::Error> {
+        let udp = Arc::new(UdpSocket::bind(config.listen_addr).await?);
+        // Port zero is useful for tests and embedded callers. Bind UDP first,
+        // then make TCP use the same kernel-selected port rather than letting
+        // each transport receive a different ephemeral port.
+        if config.listen_addr.port() == 0 {
+            config.listen_addr.set_port(udp.local_addr()?.port());
+        }
+        let tcp = TcpListener::bind(config.listen_addr).await?;
+        Ok(Self {
+            config: Arc::new(config),
+            udp,
+            tcp,
+        })
+    }
+
+    /// Bind an IPv4 address that the kernel will add after startup.
+    ///
+    /// Rootful runc creates its gateway address with the first workload veth,
+    /// but readiness must be established before any workload exists. Linux's
+    /// `IP_FREEBIND` provides exactly that ordering without binding wildcard
+    /// port 53 (which commonly conflicts with the host resolver).
+    #[cfg(target_os = "linux")]
+    pub fn bind_freebind(config: DnsConfig) -> Result<Self, std::io::Error> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        fn socket(config: &DnsConfig, socket_type: libc::c_int) -> std::io::Result<OwnedFd> {
+            let IpAddr::V4(ip) = config.listen_addr.ip() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "IP_FREEBIND DNS requires an IPv4 listen address",
+                ));
+            };
+            // SAFETY: `socket` receives valid AF_INET/type/protocol constants.
+            // On success the returned descriptor is immediately owned by
+            // `OwnedFd`, so every later error closes it exactly once.
+            let raw = unsafe {
+                libc::socket(
+                    libc::AF_INET,
+                    socket_type | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                )
+            };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: `raw` is a fresh successful socket descriptor and
+            // ownership has not been transferred anywhere else.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let enabled: libc::c_int = 1;
+            // SAFETY: the descriptor is live, and the pointer/length describe
+            // one initialised `c_int`, as IP_FREEBIND requires.
+            let result = unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_FREEBIND,
+                    std::ptr::from_ref(&enabled).cast(),
+                    std::mem::size_of_val(&enabled) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let address = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: config.listen_addr.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(ip.octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: `address` is a fully initialised IPv4 sockaddr and its
+            // pointer remains valid for the duration of this call.
+            let result = unsafe {
+                libc::bind(
+                    fd.as_raw_fd(),
+                    std::ptr::from_ref(&address).cast(),
+                    std::mem::size_of_val(&address) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(fd)
+        }
+
+        let udp = std::net::UdpSocket::from(socket(&config, libc::SOCK_DGRAM)?);
+        let tcp = std::net::TcpListener::from(socket(&config, libc::SOCK_STREAM)?);
+        // SAFETY: `tcp` is a bound stream socket and backlog is a valid
+        // non-negative listen queue length.
+        if unsafe { libc::listen(tcp.as_raw_fd(), 128) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            config: Arc::new(config),
+            udp: Arc::new(UdpSocket::from_std(udp)?),
+            tcp: TcpListener::from_std(tcp)?,
+        })
+    }
+
+    /// Return the address on which the UDP responder is listening.
+    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.udp.local_addr()
+    }
+
+    /// Serve the already-bound sockets until shutdown.
+    pub async fn run(
+        self,
+        service_map: watch::Receiver<ServiceMap>,
+        dns_faults: watch::Receiver<DnsFaultState>,
+        shutdown: CancellationToken,
+    ) {
+        let udp = serve(
+            Arc::clone(&self.config),
+            self.udp,
+            service_map.clone(),
+            dns_faults.clone(),
+            shutdown.clone(),
+        );
+        let tcp = serve_tcp(self.config, self.tcp, service_map, dns_faults, shutdown);
+        // Both loops normally finish only on shutdown. If either returns or
+        // panics first, this combined future also ends, and Bun's outer task
+        // monitor withdraws readiness by shutting the node down.
+        tokio::select! {
+            _ = udp => {}
+            _ = tcp => {}
         }
     }
 }
@@ -185,24 +367,10 @@ pub async fn run_dns_responder(
     dns_faults: watch::Receiver<DnsFaultState>,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    // Bind UDP *and* TCP up front. Both must bind or the responder is only
-    // half up — a caller retrying a truncated answer over TCP would hang.
-    // Binding fails the whole startup (the caller fails the deploy closed)
-    // rather than silently serving UDP-only.
-    let udp = Arc::new(UdpSocket::bind(config.listen_addr).await?);
-    let tcp = TcpListener::bind(config.listen_addr).await?;
-    let config = Arc::new(config);
-
-    let tcp_task = {
-        let config = Arc::clone(&config);
-        let service_map = service_map.clone();
-        let dns_faults = dns_faults.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move { serve_tcp(config, tcp, service_map, dns_faults, shutdown).await })
-    };
-
-    serve(config, udp, service_map, dns_faults, shutdown).await;
-    tcp_task.abort();
+    BoundDnsResponder::bind(config)
+        .await?
+        .run(service_map, dns_faults, shutdown)
+        .await;
     Ok(())
 }
 
@@ -250,6 +418,16 @@ pub async fn serve(
                     // won't relay bytes we can't parse to the upstream.
                     continue;
                 };
+
+                // Bun binds only the runc gateway in production, but the
+                // responder also supports explicit/wildcard test listeners.
+                // Never let one become an open recursive resolver: public
+                // sources are refused for internal and external names.
+                if !config.source_acl.allows(src.ip()) {
+                    let response = build_status_response(&query, RCODE_REFUSED);
+                    let _ = socket.send_to(&response, src).await;
+                    continue;
+                }
 
                 if let Some(stripped) = name.strip_suffix(".internal") {
                     let response = answer_internal(
@@ -301,50 +479,74 @@ async fn serve_tcp(
     dns_faults: watch::Receiver<DnsFaultState>,
     shutdown: CancellationToken,
 ) {
+    let clients = Arc::new(Semaphore::new(MAX_INFLIGHT_TCP));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
-                let Ok((mut stream, peer)) = accepted else { continue };
+                let Ok((stream, peer)) = accepted else { continue };
+                let Ok(permit) = Arc::clone(&clients).try_acquire_owned() else {
+                    continue;
+                };
                 let config = Arc::clone(&config);
                 let service_map = service_map.clone();
                 let dns_faults = dns_faults.clone();
                 tokio::spawn(async move {
-                    // One query-response per accepted connection is enough for
-                    // the resolver retry case; keep it simple and bounded.
-                    let mut len_buf = [0u8; 2];
-                    if stream.read_exact(&mut len_buf).await.is_err() {
-                        return;
-                    }
-                    let qlen = u16::from_be_bytes(len_buf) as usize;
-                    if qlen == 0 || qlen > UPSTREAM_BUFFER {
-                        return;
-                    }
-                    let mut query = vec![0u8; qlen];
-                    if stream.read_exact(&mut query).await.is_err() {
-                        return;
-                    }
-                    let Some((name, qtype)) = parse_query(&query) else { return };
-                    let response = match name.strip_suffix(".internal") {
-                        Some(stripped) => answer_internal(
-                            &config,
-                            &service_map,
-                            &dns_faults,
-                            &query,
-                            stripped,
-                            qtype,
-                            peer.ip(),
-                        ),
-                        None => build_status_response(&query, RCODE_SERVFAIL),
-                    };
-                    let mut framed = Vec::with_capacity(response.len() + 2);
-                    framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
-                    framed.extend_from_slice(&response);
-                    let _ = stream.write_all(&framed).await;
+                    let _permit = permit;
+                    let _ = tokio::time::timeout(
+                        TCP_QUERY_TIMEOUT,
+                        answer_tcp_query(stream, peer, config, service_map, dns_faults),
+                    )
+                    .await;
                 });
             }
         }
     }
+}
+
+/// Read and answer one bounded DNS-over-TCP query.
+async fn answer_tcp_query(
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    config: Arc<DnsConfig>,
+    service_map: watch::Receiver<ServiceMap>,
+    dns_faults: watch::Receiver<DnsFaultState>,
+) {
+    let mut len_buf = [0u8; 2];
+    if stream.read_exact(&mut len_buf).await.is_err() {
+        return;
+    }
+    let qlen = u16::from_be_bytes(len_buf) as usize;
+    if qlen == 0 || qlen > UPSTREAM_BUFFER {
+        return;
+    }
+    let mut query = vec![0u8; qlen];
+    if stream.read_exact(&mut query).await.is_err() {
+        return;
+    }
+    let Some((name, qtype)) = parse_query(&query) else {
+        return;
+    };
+    let response = if !config.source_acl.allows(peer.ip()) {
+        build_status_response(&query, RCODE_REFUSED)
+    } else {
+        match name.strip_suffix(".internal") {
+            Some(stripped) => answer_internal(
+                &config,
+                &service_map,
+                &dns_faults,
+                &query,
+                stripped,
+                qtype,
+                peer.ip(),
+            ),
+            None => build_status_response(&query, RCODE_SERVFAIL),
+        }
+    };
+    let mut framed = Vec::with_capacity(response.len() + 2);
+    framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&response);
+    let _ = stream.write_all(&framed).await;
 }
 
 /// Answer a query for a name under `.internal`.

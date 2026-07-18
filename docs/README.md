@@ -455,6 +455,38 @@ The first deploy will pull the image from Docker Hub, which takes a few seconds.
 
 The `proc-*` examples use `command` to run local binaries and work without any container runtime. The `container-*` examples use `image` to pull and run real OCI containers.
 
+### Internal DNS on rootful runc
+
+The `.internal` responder is opt-in and currently supports rootful runc on
+Linux. It also requires the eBPF service data path: DNS returns a virtual IP,
+and the connect hook turns that VIP into a healthy backend. Bun refuses any
+other combination before it adopts or creates a workload.
+
+```toml
+[dns]
+enabled = true
+listen = "0.0.0.0:53"       # derive and bind this node's runc gateway
+upstream = "8.8.8.8:53"
+default_namespace = "default"
+restrict_sources = true
+
+[ebpf]
+enabled = true
+```
+
+`0.0.0.0:53` is a derivation setting, not the socket Bun ultimately exposes.
+Bun calculates the node-side veth gateway and binds that precise address with
+Linux `IP_FREEBIND` before the first workload creates the interface. This avoids
+host loopback, which a container namespace can't reach, and avoids claiming
+wildcard port 53 from `systemd-resolved`. `/etc/resolv.conf` has no port syntax,
+so other ports are rejected.
+
+Runc receives a per-instance, read-only resolver file. Bun doesn't modify the
+shared unpacked image. Both UDP and TCP must bind before the node reports DNS
+ready; a later responder-task failure stops Bun so its capability expires.
+Rootless runc, ProcessGrill, Apple Container and IPv6-only listeners remain
+unsupported rather than silently falling back to broken host DNS.
+
 ## Configuration
 
 Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-apply configs:

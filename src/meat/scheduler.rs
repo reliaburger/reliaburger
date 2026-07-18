@@ -37,6 +37,11 @@ pub enum ScheduleError {
 pub struct Scheduler {
     /// Mutable cluster state, updated after each placement.
     pub cluster: ClusterStateCache,
+    /// Whether this cluster requires every placement to have live internal
+    /// DNS. This comes from the leader's node configuration, not from the
+    /// presence of a fresh capability lease: losing every lease must fail
+    /// closed rather than silently switching DNS mode off.
+    require_dns: bool,
 }
 
 /// Hard constraints shared by fixed-replica and daemon placement.
@@ -44,12 +49,22 @@ struct WorkloadRequirements<'a> {
     resources: &'a Resources,
     labels: &'a BTreeMap<String, String>,
     requires_egress: bool,
+    requires_dns: bool,
 }
 
 impl Scheduler {
     /// Create a new scheduler with the given cluster state.
     pub fn new(cluster: ClusterStateCache) -> Self {
-        Self { cluster }
+        Self {
+            cluster,
+            require_dns: false,
+        }
+    }
+
+    /// Require live, workload-reachable internal DNS for every placement.
+    pub fn with_dns_required(mut self, required: bool) -> Self {
+        self.require_dns = required;
+        self
     }
 
     /// Schedule an app according to its spec.
@@ -69,6 +84,7 @@ impl Scheduler {
             resources: &resources,
             labels: &required,
             requires_egress,
+            requires_dns: self.require_dns,
         };
 
         match spec.replicas {
@@ -94,6 +110,7 @@ impl Scheduler {
                 requirements.resources,
                 requirements.labels,
                 requirements.requires_egress,
+                requirements.requires_dns,
                 &self.cluster,
             );
             if candidates.is_empty() {
@@ -146,6 +163,7 @@ impl Scheduler {
             requirements.resources,
             requirements.labels,
             requirements.requires_egress,
+            requirements.requires_dns,
             &self.cluster,
         );
         if candidates.is_empty() {
@@ -484,6 +502,28 @@ mod tests {
             .expect("the capable node should remain eligible");
 
         assert_eq!(decision.placements[0].node_id, NodeId::new("guarded"));
+    }
+
+    #[test]
+    fn dns_enabled_cluster_only_uses_nodes_with_reachable_ready_resolver() {
+        let mut cluster = ClusterStateCache::new();
+        cluster.set_node(node_state("plain", 2000, 4096, BTreeMap::new()));
+        let mut capable = node_state("dns-ready", 2000, 4096, BTreeMap::new());
+        capable.capabilities.dns = crate::onion::dns::DnsCapability {
+            enabled: true,
+            ready: true,
+            ipv4: true,
+            ipv6: false,
+            workload_reachable: true,
+        };
+        cluster.set_node(capable);
+
+        let decision = Scheduler::new(cluster)
+            .with_dns_required(true)
+            .schedule_app(&AppId::new("client", "prod"), &default_spec())
+            .expect("the DNS-ready node should remain eligible");
+
+        assert_eq!(decision.placements[0].node_id, NodeId::new("dns-ready"));
     }
 
     /// H8: three equal nodes, three replicas — one replica per node.

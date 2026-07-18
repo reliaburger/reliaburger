@@ -18,6 +18,7 @@ pub fn filter_nodes(
     resources: &Resources,
     required_labels: &BTreeMap<String, String>,
     requires_egress: bool,
+    requires_dns: bool,
     cluster: &ClusterStateCache,
 ) -> Vec<NodeId> {
     cluster
@@ -27,6 +28,7 @@ pub fn filter_nodes(
                 && node.can_fit(resources)
                 && node.matches_labels(required_labels)
                 && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
+                && (!requires_dns || node.capabilities.dns.can_resolve_internal())
         })
         .map(|node| node.node_id.clone())
         .collect()
@@ -102,6 +104,7 @@ mod tests {
             &Resources::new(500, 1024, 0),
             &BTreeMap::new(),
             false,
+            false,
             &cluster,
         );
 
@@ -128,7 +131,13 @@ mod tests {
         ));
 
         let required = labels(&[("zone", "us-east")]);
-        let result = filter_nodes(&Resources::new(100, 100, 0), &required, false, &cluster);
+        let result = filter_nodes(
+            &Resources::new(100, 100, 0),
+            &required,
+            false,
+            false,
+            &cluster,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], NodeId::new("east"));
@@ -143,6 +152,7 @@ mod tests {
         let result = filter_nodes(
             &Resources::new(100, 100, 0),
             &BTreeMap::new(),
+            false,
             false,
             &cluster,
         );
@@ -168,9 +178,43 @@ mod tests {
             &Resources::new(100, 100, 0),
             &BTreeMap::new(),
             false,
+            false,
             &cluster,
         );
         assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn dns_enabled_placement_requires_ready_workload_reachable_resolver() {
+        let mut cluster = ClusterStateCache::new();
+        let mut capable = node_state("dns-ready", 2000, 4096, BTreeMap::new(), true);
+        capable.capabilities.dns = crate::onion::dns::DnsCapability {
+            enabled: true,
+            ready: true,
+            ipv4: true,
+            ipv6: false,
+            workload_reachable: true,
+        };
+        cluster.set_node(capable);
+
+        let mut unready = node_state("dns-unready", 2000, 4096, BTreeMap::new(), true);
+        unready.capabilities.dns = crate::onion::dns::DnsCapability {
+            enabled: true,
+            ready: false,
+            ipv4: true,
+            ipv6: false,
+            workload_reachable: true,
+        };
+        cluster.set_node(unready);
+
+        let result = filter_nodes(
+            &Resources::new(100, 100, 0),
+            &BTreeMap::new(),
+            false,
+            true,
+            &cluster,
+        );
+        assert_eq!(result, vec![NodeId::new("dns-ready")]);
     }
 
     #[test]
@@ -213,6 +257,7 @@ mod tests {
         let result = filter_nodes(
             &Resources::new(100, 100, 0),
             &BTreeMap::new(),
+            false,
             false,
             &cluster,
         );
