@@ -720,6 +720,7 @@ relish secret encrypt --pubkey <key> --file <path> # Encrypt a file
 relish secret rotate                # Generate new keypair, re-encrypt all secrets
 
 # Tokens
+relish join-token create --ttl 15m # Create one node-enrolment token
 relish token create --name <name>   # Create new API token
 relish token create --name <name> --role <role> # admin, deployer, read-only
 relish token create --name <name> --ttl-days <days>
@@ -1124,13 +1125,35 @@ config requires mTLS unless `--development-plaintext` was explicitly used.
 
 **`relish join --token <token> --node-id <id> <api-address>`**
 
-Contacts an existing member's agent API (normally HTTPS on port 9117), sends a
+Contacts the current leader's agent API (normally HTTPS on port 9117), sends a
 CSR, validates and consumes the join token, and writes the returned certificate
 bundle to `--identity-dir` (default `identity`). `--ca-fingerprint sha256:...`
 pins the first exchange. The command doesn't add `[cluster].join`, copy the
 cluster master key, start Bun or claim that gossip membership has converged;
 those are explicit provisioning and startup steps. Port 9443 is a gossip seed,
 not a valid API address for this command.
+
+**`relish join-token create [--ttl <duration>]`**
+
+Calls `POST /v1/join-token/create` with `ttl_seconds`. The command accepts a
+whole number followed by `s`, `m` or `h`, defaults to `15m`, and rejects values
+outside `1s..=1h` before dispatch. The API requires a user Admin principal
+(the internal service principal is not enough), creates the token server-side,
+commits only `JoinToken { token_hash, expires_at, consumed: false,
+attestation_mode }` to Raft, then returns the plaintext once:
+
+```json
+{
+  "token": "rbrg_join_1_...",
+  "ttl_seconds": 900,
+  "expires_at": 1784310900
+}
+```
+
+The endpoint is leader-only. A follower or election window returns `503`
+without the plaintext, so the operator can retry safely against the current
+leader. This is intentionally not a subcommand of `relish token`: those
+commands manage long-lived API bearer credentials, not node enrolment.
 
 #### Testing & Benchmarking Commands
 

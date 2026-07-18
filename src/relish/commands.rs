@@ -1540,6 +1540,29 @@ pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// Mint a short-lived, single-use node join token through the council.
+pub async fn join_token_create(ttl_seconds: u64) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let plaintext = client.join_token_create(ttl_seconds).await?;
+    eprintln!(
+        "Join token created (expires in {}).",
+        format_ttl(ttl_seconds)
+    );
+    eprintln!("The plaintext is shown once:");
+    println!("{plaintext}");
+    Ok(())
+}
+
+fn format_ttl(seconds: u64) -> String {
+    if seconds.is_multiple_of(3600) {
+        format!("{}h", seconds / 3600)
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 /// Snapshot an app's managed volumes.
 pub async fn snapshot_create(
     app: &str,

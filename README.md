@@ -76,6 +76,12 @@ export RELIABURGER_TOKEN="$(target/debug/relish \
   token create --name first-admin --role admin)"
 target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.toml
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
+
+# Mint one short-lived, single-use token for each additional node.
+JOIN_NODE_02="$(target/debug/relish --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
+JOIN_NODE_03="$(target/debug/relish --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
 ```
 
 The generated config sets `[security] require_mtls = true`. Raft, reporting
@@ -84,6 +90,13 @@ edit. The API is HTTPS on `127.0.0.1:9117`; Relish trusts it through the
 generated root CA and authenticates with `RELIABURGER_TOKEN`. Apple Container
 uses `--runtime apple` without `sudo`. For an isolated local experiment only, `relish init
 --development-plaintext` writes a conspicuously warned plaintext config.
+
+Run `relish join` once on each additional machine with its own token and node
+id. The command writes that node's CSR-signed identity; it doesn't copy the
+cluster master key or create its node config. Provision those separately, set
+`[cluster].join` to an existing node's gossip address, then start Bun. Point
+join-token creation and enrolment at the current leader during an election;
+a follower refuses the mutation without returning a usable token.
 
 See [docs/README.md](docs/README.md) for prerequisites, container runtime setup, and full CLI reference.
 

@@ -137,7 +137,7 @@ enum Command {
     },
     /// Join an existing cluster.
     Join {
-        /// Join token issued by `relish init` or `relish token create`.
+        /// Join token issued by `relish init` or `relish join-token create`.
         #[arg(long)]
         token: String,
         /// API address of an existing cluster member, e.g.
@@ -283,6 +283,11 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Manage short-lived node-enrolment tokens.
+    JoinToken {
+        #[command(subcommand)]
+        action: JoinTokenAction,
+    },
     /// Sign an image in the Pickle registry and attach the signature.
     Sign {
         /// Image reference or manifest digest (e.g. "myapp:v1" or "sha256:abc...").
@@ -415,6 +420,37 @@ enum TokenAction {
         /// Token name to revoke.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum JoinTokenAction {
+    /// Create a single-use token for enrolling one node.
+    Create {
+        /// Lifetime: an integer followed by s, m or h (1s to 1h).
+        #[arg(long, default_value = "15m", value_parser = parse_join_token_ttl)]
+        ttl: u64,
+    },
+}
+
+fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 3_600_u64),
+        _ => return Err("TTL must end in s, m or h (for example 15m)".to_string()),
+    };
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| "TTL must start with a whole number".to_string())?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "TTL is too large".to_string())?;
+    let min = reliaburger::sesame::join::MIN_JOIN_TOKEN_TTL.as_secs();
+    let max = reliaburger::sesame::join::MAX_JOIN_TOKEN_TTL.as_secs();
+    if !(min..=max).contains(&seconds) {
+        return Err("TTL must be between 1s and 1h".to_string());
+    }
+    Ok(seconds)
 }
 
 #[derive(Subcommand)]
@@ -978,6 +1014,9 @@ async fn main() -> ExitCode {
             }
             TokenAction::List => commands::token_list().await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
+        },
+        Command::JoinToken { action } => match &action {
+            JoinTokenAction::Create { ttl } => commands::join_token_create(*ttl).await,
         },
         Command::Sign { ref image } => commands::sign(image).await,
         Command::Dev { action } => match &action {
@@ -1841,5 +1880,25 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn parse_join_token_create_with_a_bounded_ttl() {
+        let cli = Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "30m"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::JoinToken {
+                action: JoinTokenAction::Create { ttl: 1_800 }
+            })
+        ));
+        let cli = Cli::try_parse_from(["relish", "join-token", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::JoinToken {
+                action: JoinTokenAction::Create { ttl: 900 }
+            })
+        ));
+        assert!(Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "0s"]).is_err());
+        assert!(Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "61m"]).is_err());
     }
 }
