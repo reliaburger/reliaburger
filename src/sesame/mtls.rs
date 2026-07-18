@@ -379,10 +379,10 @@ pub fn build_mtls_server_config(
 ///
 /// The API is reached by the `relish` CLI and browsers, which have no node
 /// certificate — they authenticate with a bearer token or a session cookie
-/// over TLS. Node-to-node API calls that do present a node cert are verified
-/// (and CRL-checked) exactly as on the Raft transport; a client with no cert
-/// simply gets an unauthenticated TLS connection, which the bearer/cookie
-/// layer then handles.
+/// over TLS. Node-to-node API calls present a node cert and are verified (and
+/// CRL-checked) exactly as on the Raft transport; a client with no cert simply
+/// gets an unauthenticated TLS connection, which the bearer/cookie layer then
+/// handles.
 pub fn build_api_server_config(
     identity: &NodeIdentity,
     crl: CrlHandle,
@@ -400,31 +400,39 @@ pub fn build_api_server_config(
     let client_verifier = Arc::new(RevocationCheckingClientVerifier { inner: webpki, crl });
 
     let (chain, key) = identity_chain_and_key(identity)?;
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
+    // A resumed session can skip certificate verification. Peer API clients
+    // present node identities, so force a fresh check against the live CRL on
+    // every connection just as the Raft/reporting listeners do.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     Ok(Arc::new(config))
 }
 
-/// Build a reqwest client that trusts the cluster root CA for verifying the
-/// server it connects to, using the same pinned verifier as the internal
-/// transports (no hostname check). Used for node-to-node API calls when the
-/// cluster runs mTLS. The client presents no certificate: node-to-node calls
-/// still authenticate with the service token, now inside TLS.
-pub fn build_cluster_http_client(identity: &NodeIdentity) -> Result<reqwest::Client, MtlsError> {
+/// Build a reqwest client for mutually authenticated node-to-node API calls.
+///
+/// The client verifies the peer against the pinned cluster CAs, checks the
+/// live CRL and presents this node's certificate. API authorisation still uses
+/// the service token; the certificate authenticates the transport peer.
+pub fn build_cluster_http_client(
+    identity: &NodeIdentity,
+    crl: CrlHandle,
+) -> Result<reqwest::Client, MtlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let verifier = Arc::new(PinnedChainServerVerifier::new(
         identity.node_ca_der.clone(),
         identity.root_ca_der.clone(),
-        // Peer API certs are node certs; revocation is enforced on the Raft
-        // and reporting transports. A fresh handle keeps this client simple.
-        CrlHandle::default(),
+        crl,
     ));
+    let (chain, key) = identity_chain_and_key(identity)?;
     let tls = ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(chain, key)
+        .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .build()
@@ -724,6 +732,30 @@ mod tests {
             err.to_lowercase().contains("certificate"),
             "expected a certificate-required failure, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn api_tls_accepts_a_trusted_client_without_a_node_certificate() {
+        let hierarchy = test_hierarchy("test");
+        let server_id = identity_from(&hierarchy, "node-01", 10);
+        let server = build_api_server_config(&server_id, CrlHandle::default()).unwrap();
+
+        // Relish and browsers authenticate above TLS with a bearer token or
+        // cookie, so the API listener deliberately accepts an anonymous TLS
+        // client that still pins the cluster CAs.
+        let verifier = Arc::new(PinnedChainServerVerifier::new(
+            server_id.node_ca_der.clone(),
+            server_id.root_ca_der.clone(),
+            CrlHandle::default(),
+        ));
+        let client = Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+        );
+
+        try_handshake(server, client).await.unwrap();
     }
 
     #[tokio::test]

@@ -527,14 +527,11 @@ async fn main() -> anyhow::Result<()> {
             println!("bun: mTLS enabled on the Raft RPC, reporting and API transports");
         } else if config.security.require_mtls {
             unreachable!("enforce_mtls_mode rejects require_mtls without an identity");
-        } else if reliaburger::sesame::identity_store::load(&node_identity_dir(&config))
-            .ok()
-            .flatten()
-            .is_some()
-        {
+        } else {
             eprintln!(
-                "bun: warning — a node identity is present but [security] require_mtls is false; \
-                 internal transports stay plaintext. Set require_mtls = true to enable mTLS."
+                "bun: WARNING — DEVELOPMENT-ONLY plaintext cluster transports are enabled because \
+                 [security] require_mtls is false. Do not use this configuration on a shared or \
+                 production network."
             );
         }
 
@@ -572,8 +569,11 @@ async fn main() -> anyhow::Result<()> {
     // placement reconciler and upgrade orchestrator.
     let cluster_http = match &api_identity {
         Some(identity) => reliaburger::cluster::ClusterHttp::secure(
-            reliaburger::sesame::mtls::build_cluster_http_client(identity)
-                .map_err(|e| anyhow::anyhow!("failed to build cluster HTTP client: {e}"))?,
+            reliaburger::sesame::mtls::build_cluster_http_client(
+                identity,
+                crl_refresh.clone().unwrap_or_default(),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to build cluster HTTP client: {e}"))?,
         ),
         None => reliaburger::cluster::ClusterHttp::plaintext(),
     };
@@ -1454,8 +1454,11 @@ async fn main() -> anyhow::Result<()> {
     let registry_over_tls = api_identity.is_some();
     let registry_scheme = if registry_over_tls { "https" } else { "http" };
     let registry_client = match &api_identity {
-        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client(identity)
-            .unwrap_or_else(|_| reqwest::Client::new()),
+        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client(
+            identity,
+            crl_refresh.clone().unwrap_or_default(),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to build registry mTLS client: {e}"))?,
         None => reqwest::Client::new(),
     };
 
@@ -1989,6 +1992,22 @@ mod tests {
             err.to_string().contains("relish join"),
             "joiner error should point at `relish join`, got: {err}"
         );
+    }
+
+    #[test]
+    fn normal_init_config_loads_the_generated_identity_for_mtls() {
+        let dir = tempfile::tempdir().unwrap();
+        reliaburger::relish::commands::init(dir.path(), "secure-test", "node-secure").unwrap();
+        let config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
+
+        assert!(config.security.require_mtls);
+        let params = cluster_params_from_config(&config).unwrap();
+        let identity = params
+            .identity
+            .as_ref()
+            .expect("normal init should produce loadable mTLS identity parameters");
+        assert_eq!(identity.node_id, "node-secure");
+        enforce_mtls_mode(&config, &params).unwrap();
     }
 
     #[test]

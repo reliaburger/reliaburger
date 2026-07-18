@@ -1327,9 +1327,9 @@ convergence and adoption" theme under 12b.6).
 
 - [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. Named temporary exceptions fail closed after 18 August 2026; `thrift` and `lru` remain tracked risk, not claimed fixes.
 - [x] Contain the API authentication bootstrap window (H1 / SEC-1) — Bun now owns one token store in standalone and cluster modes; an empty store permits only IP-literal loopback. Five real-binary startup tests cover standalone/clustered bootstrap, and the 2,633-test portable suite passes.
-- [ ] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3)
-- [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1)
-- [ ] Make generated clusters use mTLS by default (H4 / SEC-2)
+- [x] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3) — merged in #122: declared policies require live four-hook eBPF and pre-start rootful-runc enforcement at scheduling and local admission, with continuous repair-or-stop supervision.
+- [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1) — implementation and Linux proof are in #123, pending merge.
+- [x] Make generated clusters use mTLS by default (H4 / SEC-2) — normal `relish init` enables mTLS and writes its security bootstrap with the `0600` mode Bun requires (the init-to-Bun acceptance caught the old self-rejecting `0644` output); explicit init/Lima development plaintext configs and Bun startup warn. Peer API calls now present the node certificate and check the live CRL. A three-node real-runtime acceptance proves mTLS Raft, reporting and peer API traffic; 2,651 portable, 2,633 no-default and all 21 cluster tests pass.
 - [ ] Replace the broken published first-run sequence with an executable one (H5 / DOC-1)
 - [ ] Rerun the complete review matrix and close the high-value gate
 

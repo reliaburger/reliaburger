@@ -75,6 +75,21 @@ The `hkdf_info` field binds the derived key to a specific purpose. A key derived
 $ relish init --cluster-name prod --node-id node-01
 ```
 
+That normal command now writes `require_mtls = true` into the generated
+`reliaburger.toml`. The first Bun therefore loads the identity and refuses to
+start cluster mode without it. You don't generate keys and then quietly run
+plaintext because you missed one Boolean. If you really need plaintext for an
+isolated experiment, you must say `--development-plaintext`; the generated
+file and both commands warn you. `relish dev create` makes the same explicit
+trade for its local Lima network because that provisioner doesn't enrol a
+separate identity in every VM yet. Subtle, it isn't.
+
+The generated master key and security-bootstrap JSON both land as `0600`.
+That second file used to land as `0644`, while Bun's loader quite reasonably
+refused to read it. The result was security with a certain slapstick quality:
+the bootstrap command generated a file the agent rejected. The end-to-end
+config test now guards both halves of the contract.
+
 Under the hood:
 
 1. Generate a 256-bit master secret (for HKDF key wrapping)
@@ -137,7 +152,7 @@ The council writes a new join token to Raft via `generate_new_join_token()`, whi
 
 Phase 4 builds the token machinery: generation, hashing, and storage in Raft. The full lifecycle around it — enforcing single-use and expiry inside the agent, plus `relish token list` and `relish token revoke` — needs `SecurityState` to live in the Raft state machine, which doesn't arrive until Chapter 10. So treat this section as the foundation; we close the loop on token validation and revocation there.
 
-After that, every connection between cluster nodes uses mutual TLS. Both sides present their certificates, both sides verify against the Root CA trust anchor. A plain TCP connection to a cluster port gets rejected immediately.
+After that, every internal TCP connection between cluster nodes uses mutual TLS. Raft and reporting require node certificates. Peer API clients present the same identity too, although the API listener also accepts certificate-less Relish and browser connections because those authenticate with a bearer token or session cookie. Both peer sides verify the Node CA chain and the live revocation list. A plain TCP connection to one of these TLS ports gets rejected immediately.
 
 ### Where the node's certificate actually lives
 
@@ -154,7 +169,7 @@ The fix is `sesame::identity_store`, a small module that owns one directory:
   meta.json     # node_id, serial, CA generation, validity window
 ```
 
-`relish init` now writes this for the bootstrap node, and fills the `[security]` section of the generated `reliaburger.toml` so `bun` knows where to look. Two details are worth stealing for your own projects. First, the private key is written with `atomic_write_mode(path, data, Some(0o600))` — the permission is set on the temp file *before* the rename, so there is never a moment when the key sits at its final path world-readable. Second, `load()` returns `Result<Option<NodeIdentity>, _>`, not a bare `Result`. A missing identity isn't an error; it's a state ("this node hasn't enrolled yet") that the caller matches on explicitly. Rust makes the three outcomes — loaded, absent, corrupt — impossible to conflate, which is exactly what you want for a file that decides whether your listeners speak TLS.
+`relish init` now writes this for the bootstrap node, fills the `[security]` section of the generated `reliaburger.toml` so `bun` knows where to look, and enables the mTLS requirement in that same file. Two details are worth stealing for your own projects. First, the private key is written with `atomic_write_mode(path, data, Some(0o600))` — the permission is set on the temp file *before* the rename, so there is never a moment when the key sits at its final path world-readable. Second, `load()` returns `Result<Option<NodeIdentity>, _>`, not a bare `Result`. A missing identity isn't an error; it's a state ("this node hasn't enrolled yet") that the caller matches on explicitly. Rust makes the three outcomes — loaded, absent, corrupt — impossible to conflate, which is exactly what you want for a file that decides whether your listeners speak TLS.
 
 `init` also prints the root CA fingerprint (`sha256:...`). Keep it. When a joiner enrols later, `relish join` prints the fingerprint of the root CA it received, and those two strings matching is your defence against handing a node's trust to the wrong cluster.
 
@@ -237,12 +252,12 @@ A peer that stalls is dropped when the deadline fires, and the task is freed. `t
 
 ## Gossip HMAC
 
-Gossip uses UDP, which can't do TLS. Instead, we authenticate gossip messages with HMAC-SHA256. The HMAC key is derived from the Root CA certificate (which all cluster members share). This proves the sender is a cluster member without the overhead of TLS on every UDP datagram.
+Gossip uses UDP, which can't do TLS. Instead, we authenticate gossip messages with HMAC-SHA256. The HMAC key is derived from the cluster master secret (which members hold, but outsiders don't). Deriving it from the public Root CA certificate would prove nothing. This proves the sender holds cluster key material without the overhead of TLS on every UDP datagram.
 
 ```rust
-pub fn derive_gossip_key(root_ca_der: &[u8]) -> hmac::Key {
+pub fn derive_gossip_key(master_secret: &[u8; 32]) -> hmac::Key {
     let salt = Salt::new(HKDF_SHA256, b"reliaburger-gossip-hmac-v1");
-    let prk = salt.extract(root_ca_der);
+    let prk = salt.extract(master_secret);
     // ... derive 256-bit HMAC key
 }
 ```
