@@ -39,6 +39,13 @@ pub struct Scheduler {
     pub cluster: ClusterStateCache,
 }
 
+/// Hard constraints shared by fixed-replica and daemon placement.
+struct WorkloadRequirements<'a> {
+    resources: &'a Resources,
+    labels: &'a BTreeMap<String, String>,
+    requires_egress: bool,
+}
+
 impl Scheduler {
     /// Create a new scheduler with the given cluster state.
     pub fn new(cluster: ClusterStateCache) -> Self {
@@ -57,12 +64,16 @@ impl Scheduler {
         let resources = self.extract_resources(spec);
         let (required, preferred) = self.parse_labels(spec);
         let image = spec.image.as_deref();
+        let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+        let requirements = WorkloadRequirements {
+            resources: &resources,
+            labels: &required,
+            requires_egress,
+        };
 
         match spec.replicas {
-            Replicas::Fixed(n) => {
-                self.schedule_fixed(app_id, n, &resources, &required, &preferred, image)
-            }
-            Replicas::DaemonSet => self.schedule_daemon(app_id, &resources, &required),
+            Replicas::Fixed(n) => self.schedule_fixed(app_id, n, &requirements, &preferred, image),
+            Replicas::DaemonSet => self.schedule_daemon(app_id, &requirements),
         }
     }
 
@@ -71,8 +82,7 @@ impl Scheduler {
         &mut self,
         app_id: &AppId,
         replica_count: u32,
-        resources: &Resources,
-        required_labels: &BTreeMap<String, String>,
+        requirements: &WorkloadRequirements<'_>,
         preferred_labels: &BTreeMap<String, String>,
         image: Option<&str>,
     ) -> Result<SchedulingDecision, ScheduleError> {
@@ -80,7 +90,12 @@ impl Scheduler {
 
         for _ in 0..replica_count {
             // Phase 1: Filter
-            let candidates = filter_nodes(resources, required_labels, &self.cluster);
+            let candidates = filter_nodes(
+                requirements.resources,
+                requirements.labels,
+                requirements.requires_egress,
+                &self.cluster,
+            );
             if candidates.is_empty() {
                 return Err(ScheduleError::NoEligibleNodes {
                     app_id: app_id.clone(),
@@ -91,7 +106,7 @@ impl Scheduler {
             let scored = score_nodes(
                 &candidates,
                 app_id,
-                resources,
+                requirements.resources,
                 preferred_labels,
                 &self.cluster,
                 image,
@@ -106,11 +121,12 @@ impl Scheduler {
                     })?;
 
             // Phase 4: Commit (reserve in the cluster state cache)
-            self.cluster.reserve(selected_node, app_id, resources);
+            self.cluster
+                .reserve(selected_node, app_id, requirements.resources);
 
             placements.push(Placement {
                 node_id: selected_node.clone(),
-                resources: *resources,
+                resources: *requirements.resources,
             });
         }
 
@@ -124,10 +140,14 @@ impl Scheduler {
     fn schedule_daemon(
         &mut self,
         app_id: &AppId,
-        resources: &Resources,
-        required_labels: &BTreeMap<String, String>,
+        requirements: &WorkloadRequirements<'_>,
     ) -> Result<SchedulingDecision, ScheduleError> {
-        let candidates = filter_nodes(resources, required_labels, &self.cluster);
+        let candidates = filter_nodes(
+            requirements.resources,
+            requirements.labels,
+            requirements.requires_egress,
+            &self.cluster,
+        );
         if candidates.is_empty() {
             return Err(ScheduleError::NoEligibleNodes {
                 app_id: app_id.clone(),
@@ -136,10 +156,11 @@ impl Scheduler {
 
         let mut placements = Vec::with_capacity(candidates.len());
         for node_id in &candidates {
-            self.cluster.reserve(node_id, app_id, resources);
+            self.cluster
+                .reserve(node_id, app_id, requirements.resources);
             placements.push(Placement {
                 node_id: node_id.clone(),
-                resources: *resources,
+                resources: *requirements.resources,
             });
         }
 
@@ -378,6 +399,7 @@ mod tests {
             allocated: Resources::default(),
             labels,
             ready: true,
+            capabilities: Default::default(),
             running_apps: HashSet::new(),
             uptime_secs: 86400,
             cached_images: HashSet::new(),
@@ -434,6 +456,34 @@ mod tests {
             "replicas must spread across distinct nodes; got {:?}",
             decision.placements
         );
+    }
+
+    #[test]
+    fn egress_allowlist_only_uses_nodes_with_live_dual_stack_pre_start_hooks() {
+        let mut cluster = ClusterStateCache::new();
+        let incapable = node_state("plain", 2000, 4096, BTreeMap::new());
+        let mut capable = node_state("guarded", 2000, 4096, BTreeMap::new());
+        capable.capabilities.egress = crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        };
+        cluster.set_node(incapable);
+        cluster.set_node(capable);
+
+        let mut spec = default_spec();
+        spec.egress = Some(crate::config::app::EgressSpec {
+            allow: vec!["192.0.2.10:443".to_string()],
+            allow_franchise: Vec::new(),
+        });
+
+        let decision = Scheduler::new(cluster)
+            .schedule_app(&AppId::new("payer", "prod"), &spec)
+            .expect("the capable node should remain eligible");
+
+        assert_eq!(decision.placements[0].node_id, NodeId::new("guarded"));
     }
 
     /// H8: three equal nodes, three replicas — one replica per node.

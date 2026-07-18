@@ -143,6 +143,7 @@ mod tests {
             allocated: Resources::new(cpu_used, 0, 0),
             labels,
             ready: true,
+            capabilities: Default::default(),
             running_apps: HashSet::new(),
             uptime_secs: 86400, // 24h — full stability score
             cached_images: HashSet::new(),

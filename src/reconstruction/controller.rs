@@ -273,6 +273,7 @@ mod tests {
         AggregatedState {
             reports,
             stale_nodes: vec![],
+            capabilities: HashMap::new(),
         }
     }
 

@@ -19,7 +19,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 
 **Design principles:**
 
-1. **Zero-configuration security.** A fresh cluster has mTLS between all nodes, workload identity for all apps, namespace isolation, deny-by-default egress, and encrypted Raft logs -- with no operator configuration.
+1. **Zero-configuration security (target).** A fresh cluster should have mTLS between all nodes, workload identity for all apps, namespace isolation, deny-by-default egress, and encrypted Raft logs. The current egress implementation is narrower: a declared `[app.NAME.egress]` allowlist is deny-by-default and fail-closed, but an app with no block still has unrestricted egress. A cluster-wide default policy remains planned.
 2. **Separation of privilege.** Worker nodes never hold CA private keys. They can only obtain certificates for workloads they are scheduled to run.
 3. **Data plane survives control plane failures.** Existing certificates, firewall rules, and secrets continue working during council outages. Grace period extensions prevent hard cliffs.
 4. **Short-lived credentials by default.** Workload certificates live 1 hour, rotated every 30 minutes. API tokens default to 90-day TTL. Short lifetimes reduce the blast radius of credential theft.
@@ -901,14 +901,20 @@ On each council node:
 
 ### 5.9 Egress Allowlist Processing
 
+Current status: egress enforcement is opt-in per app. With no `[app.NAME.egress]`
+block, Bun allows external egress. Once an app declares a non-empty allowlist,
+the following contract applies and there is no warning-only fallback.
+
 When Bun processes an app's `[app.NAME.egress]` block:
 
 1. Each entry is parsed: exact IPv4/IPv6 destinations (`1.2.3.4:443`, `[2001:db8::1]:443`), CIDRs (`10.0.0.0/8:443`, `[2001:db8::/32]:443` — host bits rejected), or hostnames resolved via DNS keeping both A and AAAA records.
-2. On runtimes that honour the OCI `cgroupsPath` (root-mode runc), Bun creates the instance's cgroup directory itself and programs the eBPF maps against its inode *before* the workload starts (create → program → start). There is no window in which the process runs ahead of its policy; if programming fails, the created container is removed and the deploy fails closed. Runtimes that do not place workloads into the cgroup path (ProcessGrill, Apple Container) are programmed post-start from the pid — a documented ordering gap on those runtimes.
+2. On runtimes that honour the OCI `cgroupsPath` (currently root-mode runc), Bun creates the instance's cgroup directory itself and programs the eBPF maps against its inode *before* the workload starts (create → program → start). There is no window in which the process runs ahead of its policy. A node without this runtime contract refuses the workload; ProcessGrill, Apple Container, non-eBPF builds and rootless runc don't quietly fall back to post-start programming.
 3. Exact destinations go into per-family hash maps (`egress_map`, `egress6_map`); CIDRs into per-family LPM tries with the ports of enclosing prefixes folded into more specific entries.
-4. Enforcement requires both connect hooks: if `cgroup/connect6` is unavailable, deploys with an allowlist are refused — a v4-only policy is bypassable over IPv6.
+4. Enforcement requires four live hooks: `connect4` and `connect6` cover connected TCP/UDP sockets, while `sendmsg4` and `sendmsg6` cover unconnected UDP (`sendto()` doesn't invoke a connect hook). If any hook is unavailable, deploys with an allowlist are refused.
 5. Bun re-resolves DNS-based entries periodically (about every 5 minutes) and reprograms the maps when a hostname's addresses change.
-6. A kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) deletes map state whose cgroup no longer maps to a live instance and reinstalls entries a live instance lost (e.g. after a Bun restart with adopted workloads).
+6. Bun reports the four hooks and pre-start runtime support as a typed live node capability. The scheduler filters policy-bearing workloads using it, and the agent repeats the check immediately before start so a stale report can't open a gap.
+7. Every one-second agent tick verifies the live hooks and each protected cgroup's enforcement flag. It repairs a missing flag once and verifies the result. Hook loss, an unreadable map or failed repair stops the affected workload, records the affected app and makes the node unready until all four hooks recover. The slower kernel-truth sweep (`[ebpf] sweep_interval_secs`, default 60) still scrubs stale state and rebuilds all entries.
+8. `allow_franchise` remains unimplemented. Bun refuses it explicitly rather than starting a workload with unrestricted cross-cluster egress.
 
 ---
 
@@ -988,7 +994,8 @@ secret_key = true    # generate a separate age keypair for this namespace
 
 ```toml
 [cluster]
-# Default egress policy for apps without an [egress] block.
+# Planned, not currently parsed or enforced: default policy for apps without
+# an [egress] block.
 # Options: "deny" (default, recommended), "allow" (escape hatch for migration).
 default_egress = "deny"
 
@@ -1129,7 +1136,7 @@ The threat model assumes:
 - **Semi-trusted:** Council nodes. They hold sensitive key material but are hardened (minimal attack surface, TPM sealing, encrypted Raft logs).
 - **Untrusted:** Worker nodes. They may be compromised. The system is designed so that a compromised worker node has limited blast radius.
 - **Untrusted:** Network between nodes. All inter-node communication is mTLS-authenticated and encrypted.
-- **Untrusted:** External network. Default-deny egress, nftables perimeter rules, Wrapper-only ingress.
+- **Untrusted:** External network. Declared app allowlists are default-deny; apps without an egress block remain unrestricted until the planned cluster default lands. nftables perimeter rules and Wrapper-only ingress cover inbound traffic.
 
 ### 8.2 Compromised Worker Node
 
@@ -1193,7 +1200,7 @@ See Section 7.3. The short TTL (15 minutes), single-use property, and optional T
 
 ### 8.5 DNS Poisoning of Egress Allowlists
 
-**Scenario:** An attacker poisons DNS responses for a hostname in an app's egress allowlist, causing Bun to add a malicious IP to the nftables set.
+**Scenario:** An attacker poisons DNS responses for a hostname in an app's egress allowlist, causing Bun to add a malicious IP to the eBPF maps.
 
 **Impact:** The app could connect to an attacker-controlled server instead of the legitimate service.
 
@@ -1213,7 +1220,7 @@ See Section 7.3. The short TTL (15 minutes), single-use property, and optional T
 
 - Workloads run in unprivileged containers without `CAP_NET_RAW`, `CAP_NET_ADMIN`, or `CAP_SYS_ADMIN`.
 - Cgroup IDs are assigned by the kernel at container creation and cannot be changed by unprivileged processes.
-- The eBPF programs are attached at the cgroup level (`BPF_CGROUP_INET4_CONNECT`, `BPF_CGROUP_UDP4_SENDMSG`), which intercepts all socket operations regardless of application behaviour.
+- The eBPF programs are attached at the cgroup level for IPv4 and IPv6 connect and UDP sendmsg operations (`BPF_CGROUP_INET4_CONNECT`, `BPF_CGROUP_INET6_CONNECT`, `BPF_CGROUP_UDP4_SENDMSG`, `BPF_CGROUP_UDP6_SENDMSG`).
 - Raw socket creation requires `CAP_NET_RAW`, which is dropped from the container's capability set.
 - The nftables perimeter layer provides defense-in-depth: even if a workload bypasses eBPF, the nftables rules on the destination node enforce cluster perimeter policy.
 
@@ -1310,7 +1317,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 - **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from `admin_cidrs` or cluster nodes.
 - **eBPF firewall test:** Deploy two apps in the same namespace with `allow_from` restrictions. Verify that unauthorized apps receive `ECONNREFUSED`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
-- **Egress allowlist test:** Deploy an app with an `egress` block. Verify that connections to allowed destinations succeed and connections to disallowed destinations are dropped. Verify DNS resolution refresh by changing the DNS record and confirming the nftables set updates within 10 seconds.
+- **Egress allowlist test:** Deploy an app with an `egress` block. Verify that TCP and UDP connections to allowed IPv4/IPv6 destinations succeed and connections to disallowed destinations are dropped. Verify DNS resolution refresh by changing the DNS record and confirming the eBPF maps update.
 - **`relish firewall test` integration:** Verify that the `--from` / `--to` diagnostic command accurately reports whether a connection would be permitted.
 
 ### 10.4 Join Token Security
@@ -1335,7 +1342,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 - **Token audit test:** Use an API token to perform operations. Verify that `relish token list` shows the correct `last_used` timestamp.
 - **Secret decryption audit test:** Deploy an app with encrypted secrets. Verify that `relish events --type secret` shows the decryption events with correct app, node, and timestamp.
-- **Egress DNS change audit test:** Change the DNS record for a hostname in an egress allowlist. Verify that an audit event is logged when Bun updates the nftables set.
+- **Egress DNS change audit test:** Change the DNS record for a hostname in an egress allowlist. Verify that an audit event is logged when Bun updates the eBPF maps.
 
 ---
 
@@ -1347,7 +1354,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 **PKI:** Kubernetes uses a single CA by default (though kubeadm supports front-proxy CA and etcd CA separately). The kubelet certificate rotation was added later and requires explicit opt-in. Reliaburger's three-intermediate-CA hierarchy is stricter from day one, and workload certificate rotation is automatic and mandatory.
 
-**NetworkPolicy:** Kubernetes NetworkPolicy requires a CNI plugin that supports it (Calico, Cilium, etc.). Many clusters run without any NetworkPolicy enforcement. The policy model is namespace-scoped and uses label selectors. Reliaburger's approach is fundamentally different: namespace isolation is enforced by default (no configuration required), per-app rules use eBPF at the socket level (not packet filtering), and egress is deny-by-default. There is no separate "policy controller" -- the enforcement is built into Bun and Onion.
+**NetworkPolicy:** Kubernetes NetworkPolicy requires a CNI plugin that supports it (Calico, Cilium, etc.). Many clusters run without any NetworkPolicy enforcement. The policy model is namespace-scoped and uses label selectors. Reliaburger's approach is fundamentally different: namespace isolation is enforced by default (no configuration required), and declared per-app egress rules use eBPF at the socket level (not packet filtering). Those declared rules are deny-by-default. The cluster-wide default for apps with no rule is still planned, so we must not describe the current system as globally default-deny. There is no separate "policy controller" -- the enforcement is built into Bun and Onion.
 
 **References:**
 

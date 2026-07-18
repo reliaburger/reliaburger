@@ -83,6 +83,9 @@ pub struct PlatformCapabilities {
     /// wire, so a limit-requiring workload is refused rather than run
     /// silently unlimited.
     pub rootless: bool,
+    /// Live hooks and runtime behaviour needed for pre-start, dual-stack
+    /// egress enforcement.
+    pub egress: crate::sesame::egress::EgressEnforcementCapability,
 }
 
 /// Manages all workload instances on this node.
@@ -146,6 +149,15 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.capabilities = capabilities;
     }
 
+    /// Refresh the live egress enforcement capability without disturbing
+    /// the independently detected GPU and rootless values.
+    pub fn set_egress_capability(
+        &mut self,
+        capability: crate::sesame::egress::EgressEnforcementCapability,
+    ) {
+        self.capabilities.egress = capability;
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist
@@ -158,12 +170,41 @@ impl<G: Grill> WorkloadSupervisor<G> {
     }
 
     /// Full admission check for an app: host-exec/script allowlist, GPU
-    /// availability and rootless resource limits. Returns the first refusal.
+    /// availability, rootless resource limits and egress enforcement.
+    /// Returns the first refusal.
     fn admit_app(&self, app_name: &str, spec: &AppSpec) -> Result<(), BunError> {
         self.admit_process_workload(app_name, spec.exec.as_deref(), spec.script.as_deref())?;
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(app_name, spec.memory.is_some() || spec.cpu.is_some())?;
+        self.admit_egress(app_name, spec.egress.as_ref())?;
         Ok(())
+    }
+
+    /// Refuse an allowlist unless the node can install it before start on
+    /// both address families. A warning is not a security boundary.
+    fn admit_egress(
+        &self,
+        app_name: &str,
+        policy: Option<&crate::config::app::EgressSpec>,
+    ) -> Result<(), BunError> {
+        let Some(policy) = policy else {
+            return Ok(());
+        };
+        if !policy.allow_franchise.is_empty() {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: "cross-cluster egress is not implemented; refusing allow_franchise rather than running it unenforced"
+                    .to_string(),
+            });
+        }
+        if policy.allow.is_empty() || self.capabilities.egress.can_enforce_allowlist() {
+            return Ok(());
+        }
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: "egress allowlist requires live connect4/connect6/sendmsg4/sendmsg6 hooks and a runtime that supports pre-start cgroup programming"
+                .to_string(),
+        })
     }
 
     /// Refuse an un-allowlisted host binary or script (D17/H8). Also enforces
@@ -1164,6 +1205,75 @@ mod tests {
         assert_eq!(ids.len(), 1);
     }
 
+    // -- egress admission -----------------------------------------------------
+
+    #[tokio::test]
+    async fn egress_allowlist_refused_without_kernel_enforcement() {
+        let mut sup = test_supervisor();
+        let mut spec = basic_app_spec(None);
+        spec.egress = Some(crate::config::app::EgressSpec {
+            allow: vec!["192.0.2.10:443".to_string()],
+            allow_franchise: Vec::new(),
+        });
+
+        let err = sup
+            .deploy_app("payer", "default", &spec, Instant::now())
+            .await
+            .expect_err("a default node has no live egress hooks");
+
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+        assert!(sup.list_instances().is_empty());
+    }
+
+    #[tokio::test]
+    async fn egress_allowlist_admitted_with_complete_live_capability() {
+        let mut sup = test_supervisor();
+        sup.set_egress_capability(crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        });
+        let mut spec = basic_app_spec(None);
+        spec.egress = Some(crate::config::app::EgressSpec {
+            allow: vec!["192.0.2.10:443".to_string()],
+            allow_franchise: Vec::new(),
+        });
+
+        let ids = sup
+            .deploy_app("payer", "default", &spec, Instant::now())
+            .await
+            .expect("all required hooks are live");
+
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unimplemented_franchise_egress_is_refused_not_run_unrestricted() {
+        let mut sup = test_supervisor();
+        sup.set_egress_capability(crate::sesame::egress::EgressEnforcementCapability {
+            connect_ipv4: true,
+            connect_ipv6: true,
+            udp_ipv4: true,
+            udp_ipv6: true,
+            pre_start: true,
+        });
+        let mut spec = basic_app_spec(None);
+        spec.egress = Some(crate::config::app::EgressSpec {
+            allow: Vec::new(),
+            allow_franchise: vec!["redis.prod-west".to_string()],
+        });
+
+        let err = sup
+            .deploy_app("payer", "default", &spec, Instant::now())
+            .await
+            .expect_err("franchise egress has no implementation yet");
+
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+        assert!(sup.list_instances().is_empty());
+    }
+
     // -- GPU admission (D15) --------------------------------------------------
 
     #[tokio::test]
@@ -1173,6 +1283,7 @@ mod tests {
             gpu_count: 0,
             gpu_enabled: true,
             rootless: false,
+            egress: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
@@ -1190,6 +1301,7 @@ mod tests {
             gpu_count: 4, // hardware present but disabled by config
             gpu_enabled: false,
             rootless: false,
+            egress: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
@@ -1207,6 +1319,7 @@ mod tests {
             gpu_count: 2,
             gpu_enabled: true,
             rootless: false,
+            egress: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
@@ -1224,6 +1337,7 @@ mod tests {
             gpu_count: 0,
             gpu_enabled: false,
             rootless: false,
+            egress: Default::default(),
         });
         let spec = basic_app_spec(None); // no gpu request
         let ids = sup
@@ -1242,6 +1356,7 @@ mod tests {
             gpu_count: 0,
             gpu_enabled: false,
             rootless: true,
+            egress: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.memory =
@@ -1263,6 +1378,7 @@ mod tests {
             gpu_count: 0,
             gpu_enabled: false,
             rootless: true,
+            egress: Default::default(),
         });
         let spec = basic_app_spec(None); // no cpu/memory limits
         let ids = sup

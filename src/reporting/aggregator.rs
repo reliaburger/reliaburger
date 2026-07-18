@@ -26,7 +26,7 @@ use crate::meat::NodeId;
 use crate::mustard::membership::MembershipSnapshot;
 
 use super::transport::ReportingTransport;
-use super::types::{ReportingMessage, StateReport};
+use super::types::{NodeCapabilityReport, ReportingMessage, StateReport};
 
 /// How many stale windows an entry may age before it is evicted outright
 /// (as opposed to merely listed in `stale_nodes`).
@@ -45,6 +45,9 @@ pub struct AggregatedState {
     /// Nodes whose last report was *received* longer ago than
     /// `stale_report_timeout` (receive time, not sender wall clock).
     pub stale_nodes: Vec<NodeId>,
+    /// Latest additive capability evidence from new-enough nodes. Absence
+    /// means no schedulable security capabilities, never an optimistic guess.
+    pub capabilities: HashMap<NodeId, NodeCapabilityReport>,
 }
 
 /// A stored report plus the aggregator-side metadata that decides its fate.
@@ -56,10 +59,19 @@ struct ReportEntry {
     epoch: u64,
 }
 
+/// Capability evidence uses the same receive-time and leadership-epoch rules
+/// as state reports, but travels in a separate backwards-compatible message.
+struct CapabilityEntry {
+    report: NodeCapabilityReport,
+    received_at: Instant,
+    epoch: u64,
+}
+
 /// Aggregates state reports from assigned worker nodes.
 pub struct ReportAggregator<T: ReportingTransport> {
     transport: T,
     entries: HashMap<NodeId, ReportEntry>,
+    capability_entries: HashMap<NodeId, CapabilityEntry>,
     watch_tx: watch::Sender<AggregatedState>,
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
     config: ReportingTreeSection,
@@ -89,6 +101,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         let aggregator = Self {
             transport,
             entries: HashMap::new(),
+            capability_entries: HashMap::new(),
             watch_tx,
             rollup_store,
             config,
@@ -131,6 +144,10 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                             if let Some(ref store) = self.rollup_store {
                                 store.write().await.ingest(&rollup);
                             }
+                        }
+                        Some((_, ReportingMessage::CapabilityReport(report))) => {
+                            self.store_capability(report);
+                            self.publish();
                         }
                         None => {
                             // The transport only closes at shutdown; anything
@@ -197,11 +214,24 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         );
     }
 
+    fn store_capability(&mut self, report: NodeCapabilityReport) {
+        self.capability_entries.insert(
+            report.node_id.clone(),
+            CapabilityEntry {
+                report,
+                received_at: Instant::now(),
+                epoch: self.current_epoch(),
+            },
+        );
+    }
+
     /// Remove entries whose receive age exceeds the eviction bound.
     fn evict_expired(&mut self, stale_timeout: Duration) {
         let bound = stale_timeout * EVICTION_MULTIPLIER;
         let now = Instant::now();
         self.entries
+            .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
+        self.capability_entries
             .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
     }
 
@@ -221,7 +251,10 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             members.iter().map(|m| &m.node_id).collect();
         let before = self.entries.len();
         self.entries.retain(|node_id, _| active.contains(node_id));
-        self.entries.len() != before
+        let capability_before = self.capability_entries.len();
+        self.capability_entries
+            .retain(|node_id, _| active.contains(node_id));
+        self.entries.len() != before || self.capability_entries.len() != capability_before
     }
 
     fn publish(&self) {
@@ -247,9 +280,19 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             }
         }
 
+        let capabilities = self
+            .capability_entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.epoch == epoch && now.duration_since(entry.received_at) <= stale_timeout
+            })
+            .map(|(node_id, entry)| (node_id.clone(), entry.report.clone()))
+            .collect();
+
         AggregatedState {
             reports,
             stale_nodes,
+            capabilities,
         }
     }
 
@@ -289,6 +332,24 @@ mod tests {
             cached_specs: vec![],
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
+        }
+    }
+
+    fn capability(name: &str) -> NodeCapabilityReport {
+        NodeCapabilityReport {
+            node_id: NodeId::new(name),
+            capabilities: crate::meat::cluster_state::NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+            },
+            egress_enforcement: Vec::new(),
+            egress_degraded: false,
+            egress_affected_workloads: Vec::new(),
         }
     }
 
@@ -416,6 +477,29 @@ mod tests {
         tokio::time::advance(Duration::from_secs(31)).await;
         let state = aggregator.build_aggregated_state();
         assert!(state.stale_nodes.contains(&NodeId::new("old-node")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_capability_is_withdrawn_fail_closed() {
+        let net = InMemoryReportingNetwork::new();
+        let council_transport = net.register(addr(1)).await;
+        let shutdown = CancellationToken::new();
+
+        let (mut aggregator, _watch_rx) =
+            ReportAggregator::new(council_transport, test_config(), shutdown, None, None, None);
+        aggregator.store_capability(capability("guarded"));
+        assert!(
+            aggregator
+                .build_aggregated_state()
+                .capabilities
+                .contains_key(&NodeId::new("guarded"))
+        );
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(
+            aggregator.build_aggregated_state().capabilities.is_empty(),
+            "a stale hook report must never keep admitting protected workloads"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -13,15 +13,20 @@ use super::types::{NodeId, Resources};
 /// 1. It is ready (not unknown, draining, or cordoned).
 /// 2. It has sufficient allocatable resources after current allocations.
 /// 3. It matches all required placement labels.
+/// 4. It can enforce any security capability the workload requires.
 pub fn filter_nodes(
     resources: &Resources,
     required_labels: &BTreeMap<String, String>,
+    requires_egress: bool,
     cluster: &ClusterStateCache,
 ) -> Vec<NodeId> {
     cluster
         .nodes()
         .filter(|node| {
-            node.ready && node.can_fit(resources) && node.matches_labels(required_labels)
+            node.ready
+                && node.can_fit(resources)
+                && node.matches_labels(required_labels)
+                && (!requires_egress || node.capabilities.egress.can_enforce_allowlist())
         })
         .map(|node| node.node_id.clone())
         .collect()
@@ -73,6 +78,7 @@ mod tests {
             allocated: Resources::default(),
             labels,
             ready,
+            capabilities: Default::default(),
             running_apps: HashSet::new(),
             uptime_secs: 86400,
             cached_images: HashSet::new(),
@@ -92,7 +98,12 @@ mod tests {
         cluster.set_node(node_state("big", 2000, 4096, BTreeMap::new(), true));
         cluster.set_node(node_state("small", 100, 256, BTreeMap::new(), true));
 
-        let result = filter_nodes(&Resources::new(500, 1024, 0), &BTreeMap::new(), &cluster);
+        let result = filter_nodes(
+            &Resources::new(500, 1024, 0),
+            &BTreeMap::new(),
+            false,
+            &cluster,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], NodeId::new("big"));
@@ -117,7 +128,7 @@ mod tests {
         ));
 
         let required = labels(&[("zone", "us-east")]);
-        let result = filter_nodes(&Resources::new(100, 100, 0), &required, &cluster);
+        let result = filter_nodes(&Resources::new(100, 100, 0), &required, false, &cluster);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], NodeId::new("east"));
@@ -129,7 +140,12 @@ mod tests {
         cluster.set_node(node_state("ready", 2000, 4096, BTreeMap::new(), true));
         cluster.set_node(node_state("not-ready", 2000, 4096, BTreeMap::new(), false));
 
-        let result = filter_nodes(&Resources::new(100, 100, 0), &BTreeMap::new(), &cluster);
+        let result = filter_nodes(
+            &Resources::new(100, 100, 0),
+            &BTreeMap::new(),
+            false,
+            &cluster,
+        );
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], NodeId::new("ready"));
@@ -148,7 +164,12 @@ mod tests {
             ));
         }
 
-        let result = filter_nodes(&Resources::new(100, 100, 0), &BTreeMap::new(), &cluster);
+        let result = filter_nodes(
+            &Resources::new(100, 100, 0),
+            &BTreeMap::new(),
+            false,
+            &cluster,
+        );
         assert_eq!(result.len(), 5);
     }
 
@@ -189,7 +210,12 @@ mod tests {
 
         apply_upgrade_cordon(&mut cluster, Some(&upgrade));
 
-        let result = filter_nodes(&Resources::new(100, 100, 0), &BTreeMap::new(), &cluster);
+        let result = filter_nodes(
+            &Resources::new(100, 100, 0),
+            &BTreeMap::new(),
+            false,
+            &cluster,
+        );
         // n1 is mid-upgrade (Directed) and cordoned; n2 is merely Pending
         // and keeps taking work until its turn actually comes.
         assert_eq!(result, vec![NodeId::new("n2")]);

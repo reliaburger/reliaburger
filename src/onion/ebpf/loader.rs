@@ -24,7 +24,12 @@ pub const REQUIRED_MAPS: [&str; 9] = [
 ];
 
 /// Every program the object must define.
-pub const REQUIRED_PROGRAMS: [&str; 2] = ["onion_connect", "onion_connect6"];
+pub const REQUIRED_PROGRAMS: [&str; 4] = [
+    "onion_connect",
+    "onion_connect6",
+    "onion_sendmsg4",
+    "onion_sendmsg6",
+];
 
 /// Which required names are absent from the loaded object? Pure, so the
 /// validation logic is testable without a kernel.
@@ -40,13 +45,19 @@ pub fn missing_names(required: &[&'static str], present: &[String]) -> Vec<&'sta
 pub struct OnionEbpf {
     _cgroup_path: PathBuf,
     #[cfg(feature = "ebpf")]
-    _connect_link_id: aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId,
+    _connect_link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
     #[cfg(feature = "ebpf")]
     _connect6_link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
+    #[cfg(feature = "ebpf")]
+    _sendmsg4_link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
+    #[cfg(feature = "ebpf")]
+    _sendmsg6_link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
     #[cfg(feature = "ebpf")]
     pub bpf: aya::Ebpf,
     attached: bool,
     connect6_attached: bool,
+    sendmsg4_attached: bool,
+    sendmsg6_attached: bool,
 }
 
 impl OnionEbpf {
@@ -54,11 +65,10 @@ impl OnionEbpf {
     ///
     /// Loads `onion_connect.bpf.o` from `program_dir`, validates that
     /// every required map and program exists in the object, and attaches
-    /// the `onion_connect` (IPv4) and `onion_connect6` (IPv6) programs
-    /// to the root cgroup v2. A kernel that refuses the connect6 attach
-    /// is logged and reported via `connect6_attached()` — deploys with
-    /// an egress allowlist then fail closed rather than run a policy
-    /// that IPv6 walks straight past.
+    /// the TCP connect and unconnected UDP sendmsg programs for both
+    /// address families to the root cgroup v2. A missing optional attach
+    /// is reported as a false capability, so allowlisted workloads fail
+    /// closed while workloads without a policy can still run.
     #[cfg(feature = "ebpf")]
     pub fn load(program_dir: &Path, cgroup_path: &Path) -> Result<Self, OnionError> {
         check_prerequisites()?;
@@ -112,14 +122,36 @@ impl OnionEbpf {
                     (None, false)
                 }
             };
+        let (sendmsg4_link_id, sendmsg4_attached) =
+            match Self::attach_connect_program(&mut bpf, "onion_sendmsg4", &cgroup_fd) {
+                Ok(id) => (Some(id), true),
+                Err(e) => {
+                    eprintln!("onion: sendmsg4 attach failed ({e}); UDP egress policy unavailable");
+                    (None, false)
+                }
+            };
+        let (sendmsg6_link_id, sendmsg6_attached) =
+            match Self::attach_connect_program(&mut bpf, "onion_sendmsg6", &cgroup_fd) {
+                Ok(id) => (Some(id), true),
+                Err(e) => {
+                    eprintln!(
+                        "onion: sendmsg6 attach failed ({e}); IPv6 UDP egress policy unavailable"
+                    );
+                    (None, false)
+                }
+            };
 
         Ok(Self {
             _cgroup_path: cgroup_path.to_path_buf(),
-            _connect_link_id: link_id,
+            _connect_link_id: Some(link_id),
             _connect6_link_id: connect6_link_id,
+            _sendmsg4_link_id: sendmsg4_link_id,
+            _sendmsg6_link_id: sendmsg6_link_id,
             bpf,
             attached: true,
             connect6_attached,
+            sendmsg4_attached,
+            sendmsg6_attached,
         })
     }
 
@@ -167,6 +199,8 @@ impl OnionEbpf {
             _cgroup_path: cgroup_path.to_path_buf(),
             attached: false,
             connect6_attached: false,
+            sendmsg4_attached: false,
+            sendmsg6_attached: false,
         })
     }
 
@@ -181,11 +215,61 @@ impl OnionEbpf {
         self.connect6_attached
     }
 
+    /// Whether unconnected IPv4 UDP sends are covered by policy.
+    pub fn sendmsg4_attached(&self) -> bool {
+        self.sendmsg4_attached
+    }
+
+    /// Whether unconnected IPv6 UDP sends are covered by policy.
+    pub fn sendmsg6_attached(&self) -> bool {
+        self.sendmsg6_attached
+    }
+
     /// Detach eBPF programs from the cgroup.
     pub fn detach(&mut self) {
+        #[cfg(feature = "ebpf")]
+        {
+            Self::detach_program(&mut self.bpf, "onion_connect", self._connect_link_id.take());
+            Self::detach_program(
+                &mut self.bpf,
+                "onion_connect6",
+                self._connect6_link_id.take(),
+            );
+            Self::detach_program(
+                &mut self.bpf,
+                "onion_sendmsg4",
+                self._sendmsg4_link_id.take(),
+            );
+            Self::detach_program(
+                &mut self.bpf,
+                "onion_sendmsg6",
+                self._sendmsg6_link_id.take(),
+            );
+        }
         self.attached = false;
         self.connect6_attached = false;
-        // Links are dropped when self is dropped, which detaches the program
+        self.sendmsg4_attached = false;
+        self.sendmsg6_attached = false;
+    }
+
+    #[cfg(feature = "ebpf")]
+    fn detach_program(
+        bpf: &mut aya::Ebpf,
+        name: &str,
+        link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
+    ) {
+        use aya::programs::CgroupSockAddr;
+
+        let Some(link_id) = link_id else { return };
+        let Some(program) = bpf.program_mut(name) else {
+            return;
+        };
+        let Ok(program) = <&mut CgroupSockAddr>::try_from(program) else {
+            return;
+        };
+        if let Ok(link) = program.take_link(link_id) {
+            drop(link);
+        }
     }
 }
 
@@ -266,9 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn required_programs_include_both_connect_hooks() {
+    fn required_programs_cover_tcp_and_unconnected_udp_in_both_families() {
         assert!(REQUIRED_PROGRAMS.contains(&"onion_connect"));
         assert!(REQUIRED_PROGRAMS.contains(&"onion_connect6"));
+        assert!(REQUIRED_PROGRAMS.contains(&"onion_sendmsg4"));
+        assert!(REQUIRED_PROGRAMS.contains(&"onion_sendmsg6"));
     }
 
     #[test]

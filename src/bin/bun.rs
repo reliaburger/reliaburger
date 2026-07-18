@@ -613,6 +613,7 @@ async fn main() -> anyhow::Result<()> {
         gpu_count,
         gpu_enabled: config.resources.gpu_enabled,
         rootless,
+        egress: Default::default(),
     });
     // Wire [storage] volumes — the agent constructors default it, which
     // left the config key dead (review M21's second half).
@@ -646,7 +647,9 @@ async fn main() -> anyhow::Result<()> {
                             program_dir.display(),
                             ebpf.is_attached()
                         );
-                        agent.set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)));
+                        agent
+                            .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
+                            .await;
                     }
                     Err(e) => {
                         eprintln!(

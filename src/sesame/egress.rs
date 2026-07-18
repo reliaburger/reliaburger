@@ -17,6 +17,8 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
+use serde::{Deserialize, Serialize};
+
 /// A single resolved egress destination, ready to program into the
 /// kernel maps. Addresses and ports are in host byte order; the map
 /// entry builders below convert to network byte order.
@@ -544,33 +546,52 @@ pub fn cgroup_id_of_path(_path: &std::path::Path) -> Option<u64> {
 pub enum PreStartEgress {
     /// No allowlist configured: nothing to program.
     NoPolicy,
-    /// eBPF is not loaded: egress is documented-unenforced (D5), warn.
-    Unenforced,
-    /// The runtime does not place workloads into the computed cgroup
-    /// path; defer to the post-start (pid-based) programming path.
-    Deferred,
     /// Program the maps against this cgroup id, then start.
     Program { cgroup_id: u64 },
     /// Enforcement is required but impossible: fail the deploy closed.
     Refuse { reason: String },
 }
 
+/// Live kernel and runtime capabilities required to enforce an egress
+/// allowlist before a workload gets a chance to connect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressEnforcementCapability {
+    /// The cgroup `connect4` hook is attached.
+    pub connect_ipv4: bool,
+    /// The cgroup `connect6` hook is attached.
+    pub connect_ipv6: bool,
+    /// The cgroup IPv4 `sendmsg` hook covers unconnected UDP.
+    pub udp_ipv4: bool,
+    /// The cgroup IPv6 `sendmsg` hook covers unconnected UDP.
+    pub udp_ipv6: bool,
+    /// The runtime honours the prepared cgroup path before process start.
+    pub pre_start: bool,
+}
+
+impl EgressEnforcementCapability {
+    /// Whether this node can enforce a dual-stack allowlist before start.
+    pub fn can_enforce_allowlist(self) -> bool {
+        self.connect_ipv4 && self.connect_ipv6 && self.udp_ipv4 && self.udp_ipv6 && self.pre_start
+    }
+}
+
 /// Decide the pre-start egress step for an instance (pure logic, so the
 /// fail-closed branches are testable without a kernel).
 pub fn plan_pre_start_egress(
     has_allowlist: bool,
-    ebpf_loaded: bool,
-    connect6_attached: bool,
-    runtime_honours_cgroup_path: bool,
+    capability: EgressEnforcementCapability,
     cgroup_id: Option<u64>,
 ) -> PreStartEgress {
     if !has_allowlist {
         return PreStartEgress::NoPolicy;
     }
-    if !ebpf_loaded {
-        return PreStartEgress::Unenforced;
+    if !capability.connect_ipv4 {
+        return PreStartEgress::Refuse {
+            reason: "egress allowlist requires the cgroup connect4 hook, but it is not attached"
+                .to_string(),
+        };
     }
-    if !connect6_attached {
+    if !capability.connect_ipv6 {
         // A v4-only allowlist is trivially bypassable over IPv6 — refusing
         // the deploy is the only honest answer (NET7).
         return PreStartEgress::Refuse {
@@ -579,8 +600,16 @@ pub fn plan_pre_start_egress(
                 .to_string(),
         };
     }
-    if !runtime_honours_cgroup_path {
-        return PreStartEgress::Deferred;
+    if !capability.udp_ipv4 || !capability.udp_ipv6 {
+        return PreStartEgress::Refuse {
+            reason: "egress allowlist requires IPv4 and IPv6 sendmsg hooks; unconnected UDP would bypass connect-only policy"
+                .to_string(),
+        };
+    }
+    if !capability.pre_start {
+        return PreStartEgress::Refuse {
+            reason: "runtime cannot install the egress policy before process start".to_string(),
+        };
     }
     match cgroup_id {
         Some(cgroup_id) => PreStartEgress::Program { cgroup_id },
@@ -626,6 +655,40 @@ pub fn plan_egress_sweep(
     stale.sort_unstable();
     repair.sort_unstable();
     EgressSweepPlan { stale, repair }
+}
+
+/// Immediate response to live enforcement loss. Hook loss can't be repaired
+/// by rewriting maps, so every protected cgroup must be fenced. A missing
+/// per-cgroup flag is repaired first; the caller fences it if verification
+/// still fails after that write.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LiveEgressHealthPlan {
+    /// Cgroups whose enforcement map state should be rewritten now.
+    pub repair: Vec<u64>,
+    /// Cgroups whose workloads must be stopped because no hook is live.
+    pub fence: Vec<u64>,
+}
+
+/// Compare the live hooks and enforcement flags with protected cgroups.
+pub fn plan_live_egress_health(
+    capability: EgressEnforcementCapability,
+    expected: &HashSet<u64>,
+    kernel_enforced: &HashSet<u64>,
+) -> LiveEgressHealthPlan {
+    if !capability.can_enforce_allowlist() {
+        let mut fence: Vec<u64> = expected.iter().copied().collect();
+        fence.sort_unstable();
+        return LiveEgressHealthPlan {
+            repair: Vec::new(),
+            fence,
+        };
+    }
+    let mut repair: Vec<u64> = expected.difference(kernel_enforced).copied().collect();
+    repair.sort_unstable();
+    LiveEgressHealthPlan {
+        repair,
+        fence: Vec::new(),
+    }
 }
 
 /// Value written to `egress_enabled_map` to turn on enforcement.
@@ -1241,23 +1304,31 @@ mod tests {
     #[test]
     fn pre_start_no_allowlist_means_no_policy() {
         assert_eq!(
-            plan_pre_start_egress(false, true, true, true, Some(1)),
+            plan_pre_start_egress(false, Default::default(), Some(1)),
             PreStartEgress::NoPolicy
         );
     }
 
     #[test]
-    fn pre_start_without_ebpf_is_unenforced() {
-        assert_eq!(
-            plan_pre_start_egress(true, false, false, true, None),
-            PreStartEgress::Unenforced
+    fn pre_start_refuses_allowlist_without_ebpf() {
+        let plan = plan_pre_start_egress(true, Default::default(), None);
+        assert!(
+            matches!(plan, PreStartEgress::Refuse { .. }),
+            "an allowlist must not become a warning-only policy: {plan:?}"
         );
     }
 
     #[test]
     fn pre_start_refuses_deploy_without_connect6() {
         // A v4-only allowlist is bypassable over IPv6: fail the deploy closed.
-        let plan = plan_pre_start_egress(true, true, false, true, Some(1));
+        let plan = plan_pre_start_egress(
+            true,
+            EgressEnforcementCapability {
+                connect_ipv4: true,
+                ..Default::default()
+            },
+            Some(1),
+        );
         assert!(
             matches!(plan, PreStartEgress::Refuse { .. }),
             "got {plan:?}"
@@ -1265,24 +1336,74 @@ mod tests {
     }
 
     #[test]
-    fn pre_start_defers_when_runtime_ignores_cgroup_path() {
-        assert_eq!(
-            plan_pre_start_egress(true, true, true, false, None),
-            PreStartEgress::Deferred
+    fn pre_start_refuses_runtime_without_pre_start_cgroup() {
+        let plan = plan_pre_start_egress(
+            true,
+            EgressEnforcementCapability {
+                connect_ipv4: true,
+                connect_ipv6: true,
+                udp_ipv4: true,
+                udp_ipv6: true,
+                pre_start: false,
+            },
+            None,
+        );
+        assert!(
+            matches!(plan, PreStartEgress::Refuse { .. }),
+            "post-start programming leaves an unrestricted startup window: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn pre_start_refuses_connect_only_policy_without_udp_hooks() {
+        let plan = plan_pre_start_egress(
+            true,
+            EgressEnforcementCapability {
+                connect_ipv4: true,
+                connect_ipv6: true,
+                udp_ipv4: false,
+                udp_ipv6: false,
+                pre_start: true,
+            },
+            Some(1),
+        );
+        assert!(
+            matches!(plan, PreStartEgress::Refuse { .. }),
+            "unconnected UDP would bypass this node: {plan:?}"
         );
     }
 
     #[test]
     fn pre_start_programs_with_resolved_cgroup() {
         assert_eq!(
-            plan_pre_start_egress(true, true, true, true, Some(99)),
+            plan_pre_start_egress(
+                true,
+                EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+                Some(99)
+            ),
             PreStartEgress::Program { cgroup_id: 99 }
         );
     }
 
     #[test]
     fn pre_start_refuses_when_cgroup_unresolvable() {
-        let plan = plan_pre_start_egress(true, true, true, true, None);
+        let plan = plan_pre_start_egress(
+            true,
+            EgressEnforcementCapability {
+                connect_ipv4: true,
+                connect_ipv6: true,
+                udp_ipv4: true,
+                udp_ipv6: true,
+                pre_start: true,
+            },
+            None,
+        );
         assert!(
             matches!(plan, PreStartEgress::Refuse { .. }),
             "got {plan:?}"
@@ -1302,6 +1423,44 @@ mod tests {
         // 10 and 30 lost their enforcement flag: reinstall.
         assert_eq!(plan.repair, vec![10, 30]);
         assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn live_hook_loss_fences_every_protected_cgroup() {
+        let expected: HashSet<u64> = [10, 20].into_iter().collect();
+        let enforced = expected.clone();
+        let plan = plan_live_egress_health(
+            EgressEnforcementCapability {
+                connect_ipv4: false,
+                connect_ipv6: false,
+                udp_ipv4: false,
+                udp_ipv6: false,
+                pre_start: true,
+            },
+            &expected,
+            &enforced,
+        );
+        assert_eq!(plan.fence, vec![10, 20]);
+        assert!(plan.repair.is_empty());
+    }
+
+    #[test]
+    fn missing_enforcement_flag_is_repaired_before_fencing() {
+        let expected: HashSet<u64> = [10, 20].into_iter().collect();
+        let enforced: HashSet<u64> = [10].into_iter().collect();
+        let plan = plan_live_egress_health(
+            EgressEnforcementCapability {
+                connect_ipv4: true,
+                connect_ipv6: true,
+                udp_ipv4: true,
+                udp_ipv6: true,
+                pre_start: true,
+            },
+            &expected,
+            &enforced,
+        );
+        assert_eq!(plan.repair, vec![20]);
+        assert!(plan.fence.is_empty());
     }
 
     #[test]

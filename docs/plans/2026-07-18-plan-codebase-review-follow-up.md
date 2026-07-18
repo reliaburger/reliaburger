@@ -117,24 +117,44 @@ binary tests and three policy unit tests cover the boundary. Portable clippy,
 ### H2. Fail closed when a declared egress policy can't be enforced
 
 **Finding:** SEC-3. Workloads with an egress allowlist currently deploy after a
-warning when eBPF or the required connect hooks are absent.
+warning when eBPF or the required socket-address hooks are absent.
 
-- [ ] Write tests first for no eBPF handle, IPv4-only attachment, dual-stack
+- [x] Write tests first for no eBPF handle, incomplete attachment, complete
   attachment, map update failure and enforcement loss after deployment.
-- [ ] Represent live IPv4/IPv6 connect-hook state as a typed node capability.
-- [ ] Reject placement/deployment of a policy-bearing workload unless the
+- [x] Represent live IPv4/IPv6 TCP/connected-UDP and unconnected-UDP hook state
+  plus the pre-start runtime contract as a typed node capability.
+- [x] Reject placement/deployment of a policy-bearing workload unless the
   selected node reports every hook its policy needs.
-- [ ] Keep the agent-side pre-start check as a second fail-closed boundary so a
+- [x] Keep the agent-side pre-start check as a second fail-closed boundary so a
   stale scheduler capability can't create an enforcement gap.
-- [ ] Make later hook loss degrade readiness and expose the affected workloads;
+- [x] Make later hook loss degrade readiness and expose the affected workloads;
   define whether Bun fences or stops them before implementing recovery.
-- [ ] Reconcile the security design's deny-by-default claim with the exact
+- [x] Reconcile the security design's deny-by-default claim with the exact
   capability and failure contract.
 
 **Acceptance:** a declared allowlist is either live on every required address
 family or the workload isn't started. There is no warning-only success path.
 Privileged Linux tests prove the hooks and map updates, while portable tests
 prove capability/placement decisions.
+
+**Delivered on the H2 branch:** Bun now requires `connect4`, `connect6`,
+`sendmsg4` and `sendmsg6` plus a runtime that honours the prepared cgroup path.
+This closes the previously undocumented unconnected-UDP `sendto()` bypass as
+well as the startup window. Placement and agent admission both fail closed;
+`allow_franchise` is refused explicitly while it remains unimplemented. A
+one-second live check repairs a missing enforcement flag once, then stops the
+affected app when a hook, map read or repair is lost. The incident remains in a
+separate, rolling-upgrade-safe capability report and keeps the node unready
+until all hooks recover. Stale capability reports are withdrawn rather than
+trusted. Post-start policy installation has been removed, and pre-start writes
+scrub recycled cgroup IDs before enabling their new policy.
+
+Portable evidence: all-target compilation, warnings-as-errors clippy, 51 focused
+egress tests, 36 focused reporting tests, 2,646 default tests and 2,628
+no-default tests pass. Linux evidence: all targets compile with `--features
+ebpf`; root-only tests pass for four-hook load, IPv4 and IPv6 TCP/UDP
+allow/deny, create-program-start ordering, programming failure with no running
+process, recycled-cgroup scrubbing and live hook-loss fencing.
 
 ### H3. Make `.internal` DNS reachable, supervised and schedulable
 
