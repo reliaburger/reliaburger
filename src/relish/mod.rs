@@ -30,6 +30,7 @@ pub mod output;
 pub mod plan;
 pub mod reader;
 pub mod setup;
+pub mod source;
 pub mod tui;
 pub mod upgrade;
 

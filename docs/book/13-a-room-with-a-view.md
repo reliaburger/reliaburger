@@ -197,6 +197,14 @@ The terminal face is a new, deliberately generic reader: a list pane, a content 
 
 Search here is fuzzy (the `nucleo` matcher, the engine behind the Helix editor's pickers), which looks like a contradiction: a few pages ago we declined a fuzzy-matching crate for the cluster search. Both decisions stand. Cluster search matches short, known names — apps called `web`, nodes called `node-03` — where substring matching is predictable and honest. The manual searches prose and file paths, where "clstr" should still find the cluster chapter. Same tool question, different data, different answer.
 
+## Shipping the source
+
+Once documents-in-the-binary machinery exists, a stranger idea becomes a small diff: `relish source` embeds the entire `src/` tree the binary was compiled from. Run it on any machine and you can browse and fuzzy-search the orchestrator's own implementation — `relish source ebpf` opens the reader with the query already typed. It's the logical end of the batteries-included argument: the code is a battery too.
+
+The whole feature is one new module because the reader from the previous section doesn't care what it's showing. Each file becomes a document whose first line is its styled path, so one fuzzy query matches paths and contents alike. No new key bindings, no new search code, no markdown involved.
+
+The cost is binary size, and rust-embed softens it twice. Its `compression` feature compresses each embedded file in release builds (source code deflates well), and in debug builds it doesn't embed at all — assets load from disk at runtime, so `cargo test` iterations don't pay for a 5 MB copy of `src/` on every link. That split, incidentally, is why an embed-backed test can pass in debug and still deserve a release-build check in CI.
+
 ## What we learned
 
 The TUI is mostly a lesson in boundaries. One task owns mutable state. Renderers borrow it. Providers own I/O. Effects cross the line between the two. Once those boundaries were explicit, keyboard tests, HTTP tests and screen tests stopped needing special cases.

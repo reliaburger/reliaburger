@@ -1384,7 +1384,9 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   content + nucleo fuzzy search, pure keyboard-tested reducer) that
   `relish source` will reuse; `relish manual examples` extracts the embedded
   example configs without clobbering local edits.
-- [ ] `relish source` — embedded source snapshot with fuzzy search
-  (`relish source ebpf` pre-seeds the query).
+- [x] `relish source` — the whole `src/` tree embedded (rust-embed,
+  compressed in release builds) and browsed through the shared reader; each
+  file's first line is its styled path so fuzzy search covers paths and
+  content; `relish source ebpf` opens with the query pre-seeded.
 - [ ] README revamp — pitch-first top-level README; reference material moves
   into the manual.
