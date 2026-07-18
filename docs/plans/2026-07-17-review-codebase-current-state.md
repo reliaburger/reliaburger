@@ -33,6 +33,7 @@ The DNS reassessment changes one sentence, not the production recommendation. DN
 
 | Priority | Finding | Recommended action |
 |---|---|---|
+| P1 | GitHub reports 12 open dependency advisories, including high-severity `rustls-webpki` and `quinn-proto` issues | Upgrade the five dependencies with fixed releases immediately; assess actual call-path exposure for unpatched `thrift` and `lru`; add owned advisory scanning so this can't disappear between reviews. |
 | P1 | Standalone non-loopback API can be unauthenticated | Apply the empty-token bind guard in every mode; reject unresolved bind hostnames unless explicitly marked safe; make authenticated TLS the normal clustered path. |
 | P1 | mTLS is opt-in and `relish init` doesn't enable it | Make generated clusters set `require_mtls = true`; preserve an explicit development-only plaintext mode; add a real multi-node encrypted-transport acceptance test. |
 | P1 | Egress allowlists fail open when eBPF is absent | Refuse a deployment that declares egress policy unless the selected node reports both connect hooks live. Never turn a declared policy into a warning. |
@@ -51,7 +52,7 @@ The DNS reassessment changes one sentence, not the production recommendation. DN
 | P3 | DNS, duration and percentage parsing are hand-written repeatedly | Evaluate `hickory-proto` for DNS and `humantime`/typed shared parsers for durations; remove duplicate parsers after compatibility tests. |
 | P3 | Public docs have no executable Rust examples | Add small doctests for the public configuration and client APIs; `cargo test --doc` currently runs zero tests. |
 
-No P0 finding was established in this review. That statement is deliberately narrower than “there are no P0 bugs”. Dependency advisory scanning wasn't available because neither `cargo-audit` nor `cargo-deny` is installed.
+No P0 finding was established in this review. That statement is deliberately narrower than “there are no P0 bugs”. Local dependency advisory scanning wasn't available because neither `cargo-audit` nor `cargo-deny` is installed. When the review branch was pushed, GitHub reported 12 open Dependabot alerts on the default branch: 2 high, 5 medium and 5 low. The high alerts are a malformed-CRL panic in `rustls-webpki` (fixed in 0.103.13) and unauthenticated QUIC transport-parameter panic in `quinn-proto` (fixed in 0.11.14). The medium set includes three `tar` extraction/header advisories (fixed by 0.4.46) and an unpatched excessive-allocation issue in `thrift`. This post-run evidence moves advisory remediation into the high-value gate; upstream severity is not, by itself, a claim that every path is remotely reachable in Reliaburger.
 
 ## Review method and evidence
 

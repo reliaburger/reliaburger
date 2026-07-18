@@ -22,6 +22,32 @@ The labels describe scheduling value:
 
 ## High-value / must fix
 
+### H0. Patch and continuously detect known dependency advisories
+
+**Finding:** GitHub reported 12 open Dependabot alerts on the reviewed default
+branch after the review was pushed: 2 high, 5 medium and 5 low. The high alerts
+affect `rustls-webpki` (malformed-CRL panic) and `quinn-proto` (unauthenticated
+QUIC transport-parameter panic). Reliaburger also uses vulnerable `tar` versions
+on extraction paths. Upstream severity doesn't prove every transitive path is
+reachable here, but known fixes are available and cheap compared with carrying
+the uncertainty.
+
+- [ ] Upgrade `rustls-webpki` to at least 0.103.13, `quinn-proto` to at least
+  0.11.14 and `tar` to at least 0.4.46; take compatible patched `rand` releases.
+- [ ] Use `cargo tree -i` plus call-path review to record whether each advisory
+  is direct, reachable transitive code, or compiled but unused.
+- [ ] Document compensating controls for the currently unpatched `thrift`
+  excessive-allocation advisory and the `lru::IterMut` soundness advisory; pin
+  follow-up owners rather than silently accepting them.
+- [ ] Add `cargo-deny` or `cargo-audit` to an owned CI/release gate with explicit,
+  expiring exceptions for advisories that have no compatible fix.
+- [ ] Re-run portable, no-default, documentation and relevant extraction/TLS
+  suites after lockfile changes.
+
+**Acceptance:** every alert with a compatible patched release is gone. Every
+remaining alert has a written reachability decision, compensating control,
+owner and expiry/recheck date, and CI fails on new unacknowledged advisories.
+
 ### H1. Enforce authentication on every non-loopback control-plane listener
 
 **Finding:** SEC-1. Standalone Bun skips the empty-token bind guard while its
@@ -219,8 +245,8 @@ runtime, and CI rejects future command drift.
 
 ## Delivery order and gates
 
-Prefer one reviewable commit/PR per high-value item. H1 has no architectural
-prerequisite and starts first. H2 and H3 may introduce the minimum common live
+Prefer one reviewable commit/PR per high-value item. H0 and H1 have no
+architectural prerequisite and start first. H2 and H3 may introduce the minimum common live
 capability type needed for their own fail-closed decisions; M1 generalises it
 after those contracts are proven. H4 follows without waiting for M1. H5 closes
 the gate using the corrected defaults and commands.
@@ -234,5 +260,5 @@ For every production change:
 5. run privileged Linux/cluster/runtime gates when the boundary needs them; and
 6. record exact acceptance evidence before checking the progress item.
 
-When H1-H5 are green together, rerun the complete review matrix. Only then mark
+When H0-H5 are green together, rerun the complete review matrix. Only then mark
 the high-value gate complete and resume the remaining Phase 15 feature order.

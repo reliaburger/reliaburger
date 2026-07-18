@@ -1325,6 +1325,7 @@ convergence and adoption" theme under 12b.6).
 
 ### High-value / must fix
 
+- [ ] Patch, assess and continuously detect known dependency advisories (H0)
 - [ ] Enforce authentication on every non-loopback control-plane listener (H1 / SEC-1)
 - [ ] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3)
 - [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1)
