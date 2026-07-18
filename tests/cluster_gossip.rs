@@ -8,7 +8,9 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -20,9 +22,21 @@ use reliaburger::config::node::ReportingTreeSection;
 use reliaburger::grill::state::ContainerState;
 use reliaburger::mustard::state::NodeState;
 use reliaburger::reporting::worker::{AgentSnapshot, CollectSnapshotRequest, InstanceSnapshot};
+use reliaburger::sesame::ca::{self, CaHierarchy};
+use reliaburger::sesame::identity_store::NodeIdentity;
+use reliaburger::sesame::mtls::CrlHandle;
+use reliaburger::sesame::types::SerialNumber;
 
 fn local(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// Stand in for the BunAgent: answer the reporting worker's snapshot requests
@@ -122,6 +136,118 @@ async fn start_node_with_mayo(
     spawn_fake_agent(snapshot_rx, shutdown.clone());
 
     (handle, runtime)
+}
+
+fn issued_node_identity(hierarchy: &CaHierarchy, node_id: &str, serial: u64) -> NodeIdentity {
+    let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+        node_id,
+        SerialNumber(serial),
+        &hierarchy.node.signing_keypair,
+        &hierarchy.node.certificate_params,
+    )
+    .unwrap();
+    let now = SystemTime::now();
+    NodeIdentity {
+        node_id: node_id.to_string(),
+        certificate_der,
+        private_key_der,
+        serial,
+        ca_generation: 0,
+        node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+        root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+        not_before: now,
+        not_after: now + Duration::from_secs(365 * 24 * 60 * 60),
+    }
+}
+
+async fn start_mtls_node(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    identity: NodeIdentity,
+    shutdown: &CancellationToken,
+) -> (ClusterHandle, ClusterRuntime) {
+    let data_dir = std::env::temp_dir().join(format!("rb-cluster-mtls-{name}-{gossip_port}"));
+    let _ = std::fs::remove_dir_all(&data_dir);
+
+    let (mut handle, runtime) = runtime::start(
+        ClusterParams {
+            node_name: name.into(),
+            gossip_addr: local(gossip_port),
+            raft_port: gossip_port + 1,
+            reporting_port: gossip_port + 2,
+            api_port: gossip_port + 3,
+            reporting_config: ReportingTreeSection {
+                report_interval_secs: 1,
+                max_events_per_report: 100,
+                stale_report_timeout_secs: 30,
+            },
+            seeds,
+            wrapping_ikm: Some([42; 32]),
+            bootstrap_security_state: None,
+            data_dir,
+            mayo: None,
+            rollup_interval: Duration::from_millis(300),
+            identity: Some(Arc::new(identity)),
+            backup: Default::default(),
+            labels: std::collections::BTreeMap::new(),
+            self_disk_pressured_rx: None,
+        },
+        shutdown.clone(),
+    )
+    .await
+    .unwrap();
+
+    let (_dummy_tx, dummy_rx) = mpsc::channel(1);
+    let snapshot_rx = std::mem::replace(&mut handle.snapshot_rx, dummy_rx);
+    spawn_fake_agent(snapshot_rx, shutdown.clone());
+    (handle, runtime)
+}
+
+async fn spawn_identity_observing_api(
+    identity: &NodeIdentity,
+    saw_client_certificate: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+) -> SocketAddr {
+    use tower::Service;
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        reliaburger::sesame::mtls::build_api_server_config(identity, CrlHandle::default()).unwrap(),
+    );
+    let router = axum::Router::new().route("/probe", axum::routing::get(|| async { "ok" }));
+    let listener = tokio::net::TcpListener::bind(local(0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut make_service = router.into_make_service();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                accepted = listener.accept() => {
+                    let Ok((tcp, _)) = accepted else { continue };
+                    let acceptor = acceptor.clone();
+                    let saw_client_certificate = saw_client_certificate.clone();
+                    let service = match make_service.call(()).await {
+                        Ok(service) => service,
+                        Err(infallible) => match infallible {},
+                    };
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(tcp).await else { return };
+                        saw_client_certificate.store(
+                            tls.get_ref().1.peer_certificates().is_some_and(|c| !c.is_empty()),
+                            Ordering::SeqCst,
+                        );
+                        let service = hyper_util::service::TowerToHyperService::new(service);
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                    });
+                }
+            }
+        }
+    });
+    address
 }
 
 /// Distinct alive node names in a membership snapshot.
@@ -271,6 +397,104 @@ async fn three_node_council_elects_leader_and_grows() {
     for h in handles {
         if let Some(c) = &h.council {
             c.shutdown().await.ok();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node mTLS acceptance; run with make test-cluster"]
+async fn generated_security_model_protects_all_live_cluster_transports() {
+    let shutdown = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(shutdown.clone());
+    let hierarchy = ca::generate_ca_hierarchy("cluster-mtls-test", b"cluster-mtls-ikm").unwrap();
+    let identity_1 = issued_node_identity(&hierarchy, "tls-1", 10);
+    let identity_2 = issued_node_identity(&hierarchy, "tls-2", 11);
+    let identity_3 = issued_node_identity(&hierarchy, "tls-3", 12);
+
+    let node_1 = start_mtls_node("tls-1", 17841, vec![], identity_1.clone(), &shutdown).await;
+    let node_2 = start_mtls_node(
+        "tls-2",
+        17843,
+        vec![local(17841)],
+        identity_2.clone(),
+        &shutdown,
+    )
+    .await;
+    let node_3 = start_mtls_node("tls-3", 17845, vec![local(17841)], identity_3, &shutdown).await;
+    let nodes = [&node_1, &node_2, &node_3];
+
+    let expected_voters: BTreeSet<u64> = ["tls-1", "tls-2", "tls-3"]
+        .iter()
+        .map(|name| raft_id_from_name(name))
+        .collect();
+    assert!(
+        wait_until(Duration::from_secs(25), || {
+            nodes
+                .iter()
+                .all(|node| voter_ids(&node.0) == expected_voters)
+                && nodes
+                    .iter()
+                    .filter(|node| thinks_it_is_leader(&node.0))
+                    .count()
+                    == 1
+        })
+        .await,
+        "the mTLS Raft council did not converge on three voters"
+    );
+
+    let expected_reporters: BTreeSet<String> = ["tls-1", "tls-2", "tls-3"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            nodes
+                .iter()
+                .find(|node| thinks_it_is_leader(&node.0))
+                .map(|leader| {
+                    leader
+                        .1
+                        .aggregated_rx
+                        .borrow()
+                        .reports
+                        .keys()
+                        .map(|node_id| node_id.0.clone())
+                        .collect::<BTreeSet<_>>()
+                        == expected_reporters
+                })
+                .unwrap_or(false)
+        })
+        .await,
+        "the mTLS reporting tree did not deliver all three node reports"
+    );
+
+    let saw_client_certificate = Arc::new(AtomicBool::new(false));
+    let api_address = spawn_identity_observing_api(
+        &identity_2,
+        saw_client_certificate.clone(),
+        shutdown.clone(),
+    )
+    .await;
+    let peer_http = reliaburger::cluster::ClusterHttp::secure(
+        reliaburger::sesame::mtls::build_cluster_http_client(&identity_1, CrlHandle::default())
+            .unwrap(),
+    );
+    let response = peer_http
+        .client()
+        .get(peer_http.url(&api_address.to_string(), "/probe"))
+        .send()
+        .await
+        .expect("the mTLS peer API call should succeed");
+    assert_eq!(response.text().await.unwrap(), "ok");
+    assert!(
+        saw_client_certificate.load(Ordering::SeqCst),
+        "the cross-node API call did not present the source node identity"
+    );
+
+    shutdown.cancel();
+    for node in nodes {
+        if let Some(council) = &node.0.council {
+            council.shutdown().await.ok();
         }
     }
 }

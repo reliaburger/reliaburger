@@ -57,6 +57,19 @@ open http://localhost:9117/
 cargo run --bin relish -- top
 ```
 
+To initialise a cluster, generate its PKI and secure node configuration first:
+
+```sh
+mkdir cluster
+cargo run --bin relish -- init cluster --cluster-name prod --node-id node-01
+cargo run --bin bun -- --cluster --config cluster/reliaburger.toml
+```
+
+The generated config sets `[security] require_mtls = true`. Raft, reporting
+and peer API calls therefore use the generated node identity without a manual
+edit. For an isolated local experiment only, `relish init
+--development-plaintext` writes a conspicuously warned plaintext config.
+
 See [docs/README.md](docs/README.md) for prerequisites, container runtime setup, and full CLI reference.
 
 ## Try it
@@ -113,7 +126,7 @@ CLAUDE.md              # Project guide, conventions, writing style
 ## Current status
 
 The harness reports what actually ran instead of maintaining one headline total. On the
-audited macOS worktree, the portable profile executes 2,628 tests and identifies 39 ignored
+audited macOS worktree, the portable profile executes 2,651 tests and identifies 40 ignored
 tests belonging to named slow, cluster, upgrade and manual suites. Linux compiles additional
 kernel/runtime tests, so its platform-specific inventory is reported by that job. Two
 Criterion targets and the 10k-member scale acceptance run separately. See the
@@ -179,10 +192,12 @@ backups), and cluster-wide batch (`relish batch`) and image-build
 Phase 11b Stage 5 (security hardening, in progress) turns the PKI from a
 tested library into a live boundary. Each node persists its own certificate
 (written by `relish init`, delivered to joiners in the join response with a
-trust-on-first-use fingerprint check), and — when `[security] require_mtls`
-is set — the Raft, reporting and agent-API listeners all run mutual TLS with
-a shared, Raft-replicated revocation list; a revoked node is refused on its
-next handshake. Image-signature verification checks that revocation list too.
+trust-on-first-use fingerprint check). Normal `relish init` output now sets
+`[security] require_mtls = true`: Raft and reporting require mutually
+authenticated TLS, while peer API clients present their node certificate over
+the API's token-authorised TLS listener. All three use the shared,
+Raft-replicated revocation list; a revoked node is refused on its next
+handshake. Image-signature verification checks that revocation list too.
 The Brioche dashboard now authenticates: a token is exchanged once for a
 read-only, `HttpOnly` session cookie, and the UI routes sit behind it.
 Network policy enforcement is now complete too: egress allowlists cover
