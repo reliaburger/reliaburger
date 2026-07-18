@@ -1378,8 +1378,12 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   deferred to `relish upgrade start`), and writes a minimal `reliaburger.toml`
   from stdin answers that round-trips through `NodeConfig::parse`. `--yes`
   takes every default non-interactively.
-- [ ] `relish manual` — embedded, searchable in-terminal reference with
-  runnable examples and a `--web` single-page HTML view.
+- [x] `relish manual` — six starter chapters (`docs/manual/*.md`) embedded
+  with rust-embed; one pulldown-cmark parse renders both the terminal reader
+  and the `--web` single-page HTML view; a new shared reader TUI (list +
+  content + nucleo fuzzy search, pure keyboard-tested reducer) that
+  `relish source` will reuse; `relish manual examples` extracts the embedded
+  example configs without clobbering local edits.
 - [ ] `relish source` — embedded source snapshot with fuzzy search
   (`relish source ebpf` pre-seeds the query).
 - [ ] README revamp — pitch-first top-level README; reference material moves

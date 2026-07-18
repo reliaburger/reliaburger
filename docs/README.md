@@ -361,6 +361,10 @@ Commands:
 | Command | Description |
 |---------|-------------|
 | `tui` (or no command) | Interactive dashboard for apps, nodes, jobs, events, logs, metrics and routes |
+| `setup` | Guided install: detect/install bun (signature-verified) and write a starter config (`--yes` for defaults) |
+| `manual` | Read the built-in manual in a searchable terminal reader |
+| `manual --web` | Serve the manual as one HTML page and open the browser |
+| `manual examples` | Write the embedded example configs into the current directory |
 | `apply <path>` | Deploy workloads from a TOML config file |
 | `status` | List all running workloads |
 | `logs <name>` | Show captured stdout/stderr for an app |

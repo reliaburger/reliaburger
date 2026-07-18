@@ -25,8 +25,10 @@ pub mod k8s_export;
     clippy::single_match
 )]
 pub mod k8s_import;
+pub mod manual;
 pub mod output;
 pub mod plan;
+pub mod reader;
 pub mod setup;
 pub mod tui;
 pub mod upgrade;
