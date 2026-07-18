@@ -187,6 +187,16 @@ The questions follow the pattern this whole chapter has been preaching: I/O at t
 
 There's no new Rust in any of this, which is rather the point. Struct update syntax (`IngressSection { enabled: true, ..IngressSection::default() }`) carries the whole "mostly defaults, with these overrides" story, and `bool::then_some` turns "the join answer was empty" into an `Option<String>` without an `if`/`else` in sight. By chapter thirteen, the language has stopped being the hard part.
 
+## The manual is in the binary
+
+The next thing a newcomer needs after a working node is somewhere to learn what it can do. Sending them back to the repository defeats the single-binary story, so `relish manual` embeds the reference: chapters live in `docs/manual/*.md`, and `rust-embed` compiles them into the executable the same way Brioche ships its dashboard assets. The example configs embed too — `relish manual examples` writes them into the current directory (skipping files you've edited), so every command the chapters print is runnable as printed.
+
+One markdown parse, two faces. pulldown-cmark turns each chapter into an event stream; a small builder folds those events into styled ratatui `Line`s for the terminal, and the same crate's `push_html` produces the single self-contained page behind `relish manual --web`. There is no second markdown dialect to drift out of sync.
+
+The terminal face is a new, deliberately generic reader: a list pane, a content pane, and fuzzy search, over nothing more than "documents with titles and lines". It follows the reducer discipline from earlier in this chapter — `ReaderState::handle_key` is a pure function the tests drive with synthetic key events; the async loop just owns the terminal and the tick.
+
+Search here is fuzzy (the `nucleo` matcher, the engine behind the Helix editor's pickers), which looks like a contradiction: a few pages ago we declined a fuzzy-matching crate for the cluster search. Both decisions stand. Cluster search matches short, known names — apps called `web`, nodes called `node-03` — where substring matching is predictable and honest. The manual searches prose and file paths, where "clstr" should still find the cluster chapter. Same tool question, different data, different answer.
+
 ## What we learned
 
 The TUI is mostly a lesson in boundaries. One task owns mutable state. Renderers borrow it. Providers own I/O. Effects cross the line between the two. Once those boundaries were explicit, keyboard tests, HTTP tests and screen tests stopped needing special cases.
