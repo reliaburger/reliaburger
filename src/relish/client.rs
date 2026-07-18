@@ -102,6 +102,32 @@ static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new
 /// this CA.
 static CLI_CA_CERT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
 
+/// The `--endpoint` CLI override, set once from `main` before dispatch.
+static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// An invalid Bun API base URL supplied through Relish's connection options.
+#[derive(Debug, thiserror::Error)]
+pub enum EndpointError {
+    /// The value isn't an absolute URL.
+    #[error("invalid endpoint URL: {0}")]
+    InvalidUrl(#[from] url::ParseError),
+    /// The URL has no host component.
+    #[error("endpoint URL is missing a host")]
+    MissingHost,
+    /// The URL embeds user-info.
+    #[error("endpoint URL must not contain credentials")]
+    Credentials,
+    /// The URL includes components that can't be part of an API base URL.
+    #[error("endpoint URL must not contain a query or fragment")]
+    QueryOrFragment,
+    /// A non-loopback endpoint selected plaintext HTTP.
+    #[error("remote Bun endpoints must use HTTPS")]
+    RemotePlaintext,
+    /// The scheme isn't supported by the HTTP client.
+    #[error("endpoint URL must use HTTP or HTTPS")]
+    UnsupportedScheme,
+}
+
 /// Record the `--token` CLI flag. Call once, in `main`, before dispatch.
 pub fn set_cli_token(token: Option<String>) {
     let _ = CLI_TOKEN.set(token);
@@ -110,6 +136,18 @@ pub fn set_cli_token(token: Option<String>) {
 /// Record the `--ca-cert` CLI flag. Call once, in `main`, before dispatch.
 pub fn set_cli_ca_cert(path: Option<std::path::PathBuf>) {
     let _ = CLI_CA_CERT.set(path);
+}
+
+/// Record the API endpoint before dispatch, falling back to
+/// `RELIABURGER_ENDPOINT` when the flag is absent. Remote plaintext and
+/// credential-bearing URLs are rejected before a bearer token can be sent.
+pub fn set_cli_endpoint(endpoint: Option<String>) -> Result<(), EndpointError> {
+    let endpoint = pick_endpoint(Some(&endpoint), std::env::var("RELIABURGER_ENDPOINT").ok());
+    if let Some(ref value) = endpoint {
+        validate_endpoint(value)?;
+    }
+    let _ = CLI_ENDPOINT.set(endpoint);
+    Ok(())
 }
 
 /// Resolve the CA cert path: `--ca-cert` flag, else `RELIABURGER_CA_CERT`.
@@ -126,6 +164,12 @@ fn resolve_token() -> Option<String> {
     pick_token(CLI_TOKEN.get(), std::env::var("RELIABURGER_TOKEN").ok())
 }
 
+/// Resolve the Bun API endpoint: `--endpoint`, then
+/// `RELIABURGER_ENDPOINT`, then the ordinary local default.
+fn resolve_endpoint() -> Option<String> {
+    CLI_ENDPOINT.get().cloned().flatten()
+}
+
 /// Precedence rule for [`resolve_token`], split out to be testable without the
 /// process-global flag and environment. A present `--token` flag wins;
 /// otherwise fall back to the environment value.
@@ -133,6 +177,50 @@ fn pick_token(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<
     match cli_flag {
         Some(Some(t)) => Some(t.clone()),
         _ => env,
+    }
+}
+
+/// Precedence rule for [`resolve_endpoint`], kept pure for unit tests.
+fn pick_endpoint(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<String> {
+    match cli_flag {
+        Some(Some(endpoint)) => Some(endpoint.clone()),
+        _ => env,
+    }
+}
+
+/// Validate an operator-supplied Bun API base URL.
+///
+/// HTTPS is required off-host so bearer tokens and API responses never cross
+/// a network in plaintext. IP-literal loopback HTTP remains available for
+/// standalone development. User-info is rejected because embedding
+/// credentials in URLs leaks them through shell history, process listings and
+/// logs.
+pub fn validate_endpoint(value: &str) -> Result<(), EndpointError> {
+    let parsed = url::Url::parse(value)?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(EndpointError::Credentials);
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(EndpointError::QueryOrFragment);
+    }
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = parsed.host().ok_or(EndpointError::MissingHost)?;
+            let loopback = match host {
+                // Keep the bootstrap boundary free of DNS/hosts-file TOCTOU:
+                // plaintext is for IP-literal loopback only.
+                url::Host::Domain(_) => false,
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+            };
+            if loopback {
+                Ok(())
+            } else {
+                Err(EndpointError::RemotePlaintext)
+            }
+        }
+        _ => Err(EndpointError::UnsupportedScheme),
     }
 }
 
@@ -189,8 +277,12 @@ impl BunClient {
     }
 
     /// Create a client pointing at the default local agent. Uses HTTPS when a
-    /// cluster CA cert is configured (`--ca-cert` / `RELIABURGER_CA_CERT`).
+    /// cluster CA cert is configured (`--ca-cert` / `RELIABURGER_CA_CERT`). An
+    /// explicit `--endpoint` / `RELIABURGER_ENDPOINT` replaces the whole URL.
     pub fn default_local() -> Self {
+        if let Some(endpoint) = resolve_endpoint() {
+            return Self::new(&endpoint);
+        }
         let scheme = if resolve_ca_cert().is_some() {
             "https"
         } else {
@@ -1499,5 +1591,30 @@ mod tests {
         );
         // Neither -> none.
         assert_eq!(pick_token(None, None), None);
+    }
+
+    #[test]
+    fn resolve_endpoint_prefers_flag_over_env() {
+        let flag = Some("https://flag.example:9117".to_string());
+        assert_eq!(
+            pick_endpoint(Some(&flag), Some("https://env.example:9117".to_string())),
+            Some("https://flag.example:9117".to_string())
+        );
+        assert_eq!(
+            pick_endpoint(Some(&None), Some("https://env.example:9117".to_string())),
+            Some("https://env.example:9117".to_string())
+        );
+        assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    #[test]
+    fn endpoint_validation_allows_loopback_http_and_requires_remote_https() {
+        assert!(validate_endpoint("http://127.0.0.1:9117").is_ok());
+        assert!(validate_endpoint("http://[::1]:9117").is_ok());
+        assert!(validate_endpoint("http://localhost:9117").is_err());
+        assert!(validate_endpoint("https://node-01.example:9117").is_ok());
+        assert!(validate_endpoint("http://node-01.example:9117").is_err());
+        assert!(validate_endpoint("ftp://node-01.example:9117").is_err());
+        assert!(validate_endpoint("https://user:secret@node-01.example:9117").is_err());
     }
 }

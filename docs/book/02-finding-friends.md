@@ -1711,14 +1711,32 @@ The `join` addresses point to existing nodes' gossip ports. Raft and reporting p
 
 ### The `relish join` command
 
-You can also tell a running node to join a cluster at runtime:
+There are two different addresses in this story, and mixing them up makes for
+a wonderfully unhelpful TLS error. `[cluster].join` contains **gossip** seeds
+on port 9443. `relish join` performs identity enrolment against an existing
+member's **agent API**, normally HTTPS on port 9117:
 
 ```
-$ relish join --token abc123 10.0.1.5:9443
-join request accepted for seed 10.0.1.5:9443
+$ relish join --token abc123 --node-id node-02 \
+    --identity-dir node-02/identity \
+    --ca-fingerprint sha256:0123... \
+    https://10.0.1.5:9117
+joined as node-02: identity written to node-02/identity
 ```
 
-This follows the same pipeline as every other `relish` command: the CLI sends a POST to `/v1/cluster/join` on the local Bun agent, which processes the request and returns a confirmation. The `--token` flag is accepted but not validated yet — that's Phase 4's job (Sesame handles authentication). For now, the command is unauthenticated, which is fine for development and testing clusters.
+The joining machine creates its private key and sends a certificate-signing
+request (CSR). The member atomically consumes the one-use token, allocates a
+serial and signs the CSR. The private key never crosses the network. The CLI
+checks the returned root fingerprint before it commits the identity bundle to
+disk.
+
+Now, notice what the command doesn't do. It doesn't write node configuration,
+copy the cluster master key, start Bun or wait for gossip convergence. The
+operator (or provisioning system) prepares those node-specific files first,
+including `join = ["10.0.1.5:9443"]` and an `identity_dir` matching the command
+above. Enrolment grants an identity. Starting `bun --cluster` makes it a live
+node. Those are separate state transitions, which is rather easier to reason
+about than a CLI printing "joined" before the process exists.
 
 ## Bootstrapping a cluster
 
@@ -1727,10 +1745,15 @@ Let's walk through what actually happens when you start three nodes from nothing
 ### The first node
 
 ```
-$ bun --config node.toml
+$ relish init cluster --cluster-name prod --node-id node-01
+$ bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
-Node 1 starts. Its `[cluster]` section has an empty `join` list and `gossip_port = 9443`. Because `join` is empty, Bun knows this is the first node in a new cluster.
+`relish init` only writes the secure bootstrap files; the second command starts
+Bun. Node 1's generated `[cluster]` section has an empty `join` list and
+`gossip_port = 9443`. Because `join` is empty, Bun knows this is the first node
+in a new cluster. Its operator API is a separate HTTPS listener on
+`127.0.0.1:9117`.
 
 Here's the sequence:
 
@@ -1746,10 +1769,12 @@ At this point you have a fully functional cluster of one. You can deploy apps, a
 ### The second node joins
 
 ```
-$ bun --config node.toml
+$ bun --cluster --runtime runc --config node-02/reliaburger.toml
 ```
 
-Node 2's config has `join = ["10.0.1.5:9443"]` — the first node's gossip address.
+This happens after the `relish join --token ... --node-id node-02` enrolment
+above. Node 2's config has `join = ["10.0.1.5:9443"]` — the first node's gossip
+address — plus the provisioned master-key and identity paths.
 
 1. **Bind ports.** Same as before, different host or different port numbers.
 2. **Create MustardNode with seed.** Node 2 adds the seed address to its membership table and starts the gossip protocol. On its first cycle, it pings `10.0.1.5:9443`.
