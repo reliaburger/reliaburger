@@ -1366,3 +1366,21 @@ convergence and adoption" theme under 12b.6).
 - [ ] Public API doctests (O3)
 - [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4)
 - [ ] Mechanical shipped/planned/experimental/historical documentation markers (O5)
+
+## UX Track: Learning Curve & Demonstrability
+
+Post-12b user-experience work (not a roadmap phase). Plan:
+`docs/plans/2026-07-17-plan-ux-improvements.md`.
+
+- [x] `relish setup` — guided install and first configuration: detects bun on
+  PATH / in `~/.reliaburger/bin` / running, installs or upgrades through the
+  dual-signed Phase 14 pipeline (embedded release signature; a running node is
+  deferred to `relish upgrade start`), and writes a minimal `reliaburger.toml`
+  from stdin answers that round-trips through `NodeConfig::parse`. `--yes`
+  takes every default non-interactively.
+- [ ] `relish manual` — embedded, searchable in-terminal reference with
+  runnable examples and a `--web` single-page HTML view.
+- [ ] `relish source` — embedded source snapshot with fuzzy search
+  (`relish source ebpf` pre-seeds the query).
+- [ ] README revamp — pitch-first top-level README; reference material moves
+  into the manual.

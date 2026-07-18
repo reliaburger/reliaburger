@@ -177,6 +177,16 @@ Reducer tests press synthetic `KeyEvent` values and inspect the view stack or pe
 
 Snapshots are useful only when somebody reads them. A changed snapshot is a review artefact, not a rubber stamp.
 
+## Setting the table
+
+Everything so far assumed a running node. A newcomer doesn't have one. Until now the honest install instructions were "clone the repository, build it, read the docs until the config makes sense". That's a poor first five minutes, so Relish also grew `relish setup`: one guided command that finds or installs `bun`, asks a handful of questions and writes a starter `reliaburger.toml`.
+
+The interesting part is how little new machinery it needed. Phase 14 built a complete pipeline for getting trustworthy binaries onto a machine: release metadata fetching, dual Ed25519 signature verification, and the `BinaryStore` with its atomic symlink swap. Setup reuses all of it. A fresh install is just an upgrade with no previous version, staged into `~/.reliaburger/bin` through exactly the code path a live node uses to replace itself. One deliberate difference: there is no node.toml yet, so no operator signing key exists, and setup verifies the embedded release signature only. That's the same trust an air-gapped upgrade gets. And if a node is already running, setup refuses to swap the binary underneath it and points you at `relish upgrade start` instead, where the markers and automatic revert live.
+
+The questions follow the pattern this whole chapter has been preaching: I/O at the edge, logic pure. `run` reads stdin and prints. Everything it decides is a pure function. `decide_install` compares versions and returns an enum (`NotInstalled`, `UpToDate`, `Upgradable`); `build_node_config` maps a `SetupAnswers` struct onto a full `NodeConfig`; `render_config` emits a minimal TOML file containing only the sections the user actually answered, because a newcomer's first config file should not be a wall of defaults. The test for that pair is one line of intent: parse the rendered file and assert it equals the built config. If the generated file and the node's parser ever disagree, the round-trip test fails before a user ever sees it.
+
+There's no new Rust in any of this, which is rather the point. Struct update syntax (`IngressSection { enabled: true, ..IngressSection::default() }`) carries the whole "mostly defaults, with these overrides" story, and `bool::then_some` turns "the join answer was empty" into an `Option<String>` without an `if`/`else` in sight. By chapter thirteen, the language has stopped being the hard part.
+
 ## What we learned
 
 The TUI is mostly a lesson in boundaries. One task owns mutable state. Renderers borrow it. Providers own I/O. Effects cross the line between the two. Once those boundaries were explicit, keyboard tests, HTTP tests and screen tests stopped needing special cases.
