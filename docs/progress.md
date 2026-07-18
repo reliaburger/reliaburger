@@ -1313,3 +1313,41 @@ convergence and adoption" theme under 12b.6).
 - [ ] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
   `trace`) when those commands land
 - [ ] All Phase 15 tests green
+
+## Phase 15a: Current-State Hardening
+
+> Prioritised follow-up plan:
+> [2026-07-18-plan-codebase-review-follow-up.md](plans/2026-07-18-plan-codebase-review-follow-up.md)
+>
+> This is a hardening gate before the unfinished Phase 15 diagnostic commands,
+> not a declaration that Phase 15 is complete. The source review is
+> [2026-07-17-review-codebase-current-state.md](plans/2026-07-17-review-codebase-current-state.md).
+
+### High-value / must fix
+
+- [ ] Patch, assess and continuously detect known dependency advisories (H0)
+- [ ] Enforce authentication on every non-loopback control-plane listener (H1 / SEC-1)
+- [ ] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3)
+- [ ] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1)
+- [ ] Make generated clusters use mTLS by default (H4 / SEC-2)
+- [ ] Replace the broken published first-run sequence with an executable one (H5 / DOC-1)
+- [ ] Rerun the complete review matrix and close the high-value gate
+
+### Medium-value
+
+- [ ] Live subsystem readiness/capability evidence and supervised failure (M1)
+- [ ] Executable examples, coherent cross-platform lint and advisory scanning (M2)
+- [ ] Peer-reachable clustered registry defaults (M3)
+- [ ] Configured workload trust domain (M4)
+- [ ] Rootless proxy adoption across Bun replacement (M5)
+- [ ] Real deployment operation state (M6)
+- [ ] Explicit v1 ingress/TLS contract (M7)
+- [ ] Corrected Phase 15 prerequisites and catalogue (M8)
+
+### Optional
+
+- [ ] Ownership-based module splits (O1)
+- [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2)
+- [ ] Public API doctests (O3)
+- [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4)
+- [ ] Mechanical shipped/planned/experimental/historical documentation markers (O5)
