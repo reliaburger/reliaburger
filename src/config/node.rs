@@ -54,14 +54,14 @@ impl NodeConfig {
 
 /// DNS responder configuration.
 ///
-/// Disabled by default: the standard listen address is `127.0.0.53:53`
+/// Disabled by default: the standard runc listen address is `0.0.0.0:53`
 /// and binding port 53 needs root, so it must be an explicit choice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DnsSection {
     /// Start the `.internal` DNS responder on this node.
     pub enabled: bool,
-    /// Listen address, e.g. "127.0.0.53:53".
+    /// Listen address, e.g. "0.0.0.0:53" for rootful runc.
     pub listen: String,
     /// Upstream resolver for non-`.internal` names.
     pub upstream: String,
@@ -78,7 +78,7 @@ impl Default for DnsSection {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen: "127.0.0.53:53".to_string(),
+            listen: "0.0.0.0:53".to_string(),
             upstream: "8.8.8.8:53".to_string(),
             default_namespace: "default".to_string(),
             restrict_sources: true,

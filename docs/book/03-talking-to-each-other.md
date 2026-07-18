@@ -34,7 +34,7 @@ Each node gets a `/23` subnet from the `10.0.0.0/8` private range. A /23 gives 5
 
 Why /23 and not /24? A /24 only has 254 usable addresses. In a busy cluster, 500 pods on a single node isn't unusual. A /23 doubles that to 510, which covers the target with a bit of headroom.
 
-The gateway sits at the first usable address in the block, and containers start at gateway + 1. A veth pair — think of it as a virtual cable with a plug on each end — connects the container to the host. One end (`eth0`) lives inside the container's namespace, the other (`veth-{id}-h`) lives on the host.
+The gateway sits at the first usable address in the block, and containers start at gateway + 1. A veth pair — think of it as a virtual cable with a plug on each end — connects the container to the host. One end (`eth0`) lives inside the container's namespace, the other (`veth-{id}-h`) lives on the host. Linux limits interface names to 15 bytes. Short IDs keep that readable form; long IDs use `veth-` plus a stable hash of the *whole* instance ID. Simply cutting off byte 16 looks harmless until `very-long-app-0` and `very-long-app-1` both become the same interface. The two-workload DNS acceptance test found that one.
 
 ### Three strategies for three runtimes
 
@@ -276,11 +276,11 @@ We're going to do something different. DNS resolution goes through a tiny UDP re
 
 Two steps, one in userspace, one in the kernel:
 
-1. Your app calls `getaddrinfo("redis.internal")`. The C library sends a DNS query to `127.0.0.53:53` — a tiny UDP server built into Bun. Bun looks up "redis" in the service map and responds with a virtual IP: `127.128.0.3`. The query never leaves localhost. Takes about 50 microseconds.
+1. Your app calls `getaddrinfo("redis.internal")`. The C library sends a DNS query to the node-side address of its runc veth (for example `10.0.2.1:53`), where a tiny UDP/TCP server built into Bun is listening. Bun looks up "redis" in the service map and responds with a virtual IP: `127.128.0.3`. The query never leaves the node. Takes about 50 microseconds.
 
 2. Your app calls `connect(127.128.0.3, 6379)`. An eBPF program intercepts the `connect()` syscall *before the kernel sends any packets*, looks up the VIP in a hash map, picks a healthy backend via round-robin, and rewrites the destination to `10.0.2.5:30891`. Your app's TCP connection goes directly to the backend. No proxy.
 
-The DNS lookup adds ~50 microseconds (one localhost UDP round trip). The connect rewrite adds zero — it happens before the TCP handshake. Compare that to CoreDNS over the pod network (~500 microseconds) plus kube-proxy iptables traversal. Your app sees a normal TCP connection that just happens to land on the right backend.
+The DNS lookup adds ~50 microseconds (one node-local UDP round trip). The connect rewrite adds zero — it happens before the TCP handshake. Compare that to CoreDNS over the pod network (~500 microseconds) plus kube-proxy iptables traversal. Your app sees a normal TCP connection that just happens to land on the right backend.
 
 ### Virtual IPs
 
@@ -496,9 +496,11 @@ There's a subtlety worth noting. During a network partition, a node might be mar
 
 ### Why userspace DNS, not eBPF?
 
-The original design called for fully in-kernel DNS interception using `cgroup/sendmsg4` and `cgroup/recvmsg4` eBPF hooks. We tried it. It doesn't work.
+The original design called for fully in-kernel DNS interception using `cgroup/sendmsg4` and `cgroup/recvmsg4` eBPF hooks. We tried it. It doesn't work *at those hooks*.
 
 The problem is that these hooks let you modify the *destination address* of a UDP sendmsg, but they can't read the *packet payload*. You can redirect where a DNS query goes, but you can't parse the query name or synthesise a response. The BPF helper you'd need (`bpf_msg_pull_data`) only works with `SK_MSG` programs (stream parsers for TCP), not cgroup socket address hooks.
+
+That isn't the same as saying eBPF can never answer DNS. TC and XDP packet hooks can read and rewrite packet bytes. The review proof in `poc/dns-tc/` did exactly that: a bounded TC-ingress parser answered mapped `.internal` A queries, repaired checksums and redirected replies into a container namespace without sending matched queries upstream. It also showed the bill. IPv6, TCP fallback, fragments, EDNS, lifecycle, map ownership and observability all become a second DNS implementation we would still need to back with userspace for other runtimes. So TC is feasible, but it isn't the simpler production design today.
 
 So we run a userspace DNS responder instead. It lives in `src/onion/dns.rs`: a `tokio::select!` loop reading from a UDP socket, plus a TCP listener for large answers. Bun configures containers' `/etc/resolv.conf` to point at the responder, and it handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
 
@@ -523,7 +525,7 @@ The connect rewrite — the part that actually matters for latency — is still 
 
 The responder answers `.internal` over both UDP and TCP. A resolver retries over TCP when a UDP reply comes back truncated (the TC bit set), so a UDP-only responder would leave that retry hanging with nobody home. Our answers are small — a single A record with a 4-byte VIP — so truncation is rare, but "rare" isn't "never," and a half-bound responder is a subtle way to lose DNS for one query in a thousand. TCP frames each message with a 2-byte length prefix; the listener reads the length, reads that many bytes, answers, and closes.
 
-Not everyone gets to ask, though. The `.internal` zone is a map of the cluster's internal topology, and that shouldn't be readable from the public internet. Every internal answer is gated by a source ACL: loopback and the private ranges containers live in (RFC 1918, plus the `100.64.0.0/10` CGNAT block Lima and runc bridges hand out) are served; a query from a public address gets REFUSED — not answered, not forwarded, refused. The check is a small method on the config:
+Not everyone gets to ask, though. The `.internal` zone is a map of the cluster's internal topology, and the responder also forwards ordinary public names. Neither service should be exposed as an open resolver. Every query is gated by a source ACL: loopback and the private ranges containers live in (RFC 1918, plus the `100.64.0.0/10` CGNAT block Lima and runc bridges hand out) are served; a query from a public address gets REFUSED — not answered, not forwarded, refused. The check is a small method on the config:
 
 ```rust
 pub fn allows(&self, src: IpAddr) -> bool {
@@ -538,7 +540,11 @@ pub fn allows(&self, src: IpAddr) -> bool {
 
 ### Fail closed, not open
 
-One more change worth calling out. The original responder was spawned as a detached best-effort task: if it couldn't bind its socket, the error was logged and the node carried on. That's the wrong default. A node that's advertising service discovery but has no resolver is worse than one that refuses to start — the apps deploy, look healthy, and then can't find each other. So `run_dns_responder` binds both UDP and TCP up front and *returns the error* if either bind fails; startup propagates it and the deploy fails closed. Config validation catches the related trap earlier still: a VIP the responder hands out only routes because the eBPF connect hook rewrites it, so enabling `[dns]` with `[ebpf]` turned off is rejected outright rather than deploying an app whose VIP silently goes nowhere.
+One more change worth calling out. The original responder was spawned as a detached best-effort task: if it couldn't bind its socket, the error was logged and the node carried on. That's the wrong default. A node that's advertising service discovery but has no resolver is worse than one that refuses to start — the apps deploy, look healthy, and then can't find each other. Bun now binds both UDP and TCP *before* it starts the agent or publishes readiness. Either bind failing aborts startup. If the serving task later exits, its supervisor cancels Bun so the reporting lease expires and the scheduler withdraws the capability. Config validation catches the related trap earlier still: a VIP the responder hands out only routes because the eBPF connect hook rewrites it, so enabling `[dns]` with `[ebpf]` turned off is rejected outright rather than deploying an app whose VIP silently goes nowhere.
+
+There's an ordering snag. The runc gateway address doesn't exist until we create the first workload veth, but we refuse to create that workload until DNS is bound. Binding `0.0.0.0:53` would dodge the race, then collide with `systemd-resolved` and expose port 53 on unrelated interfaces. Linux gives us a narrower tool: `IP_FREEBIND` lets a socket bind one address before an interface owns it. Bun treats the default `0.0.0.0:53` setting as "derive my runc gateway", then binds that derived address with `IP_FREEBIND`.
+
+Rust's standard networking API doesn't expose `IP_FREEBIND`, so this tiny boundary calls `setsockopt`, `bind` and `listen` through `libc`. That's `unsafe`: we're telling Rust that the raw file descriptor and pointers satisfy contracts the compiler can't prove. Each block has a `// SAFETY:` explanation, and the descriptor moves straight into `OwnedFd` so early returns still close it exactly once. The unsafe part is small. The policy around it remains ordinary safe Rust.
 
 ### A DNS server that doesn't fall over
 
@@ -556,7 +562,9 @@ The responder is now properly authoritative for `.internal`: unknown names get N
 
 The Rust-flavoured part is how the responder reads the service map. The agent *owns* its `ServiceMap` — it mutates it freely inside its event loop, no locks. Sharing it with the DNS task via `Arc<RwLock<…>>` would have meant threading lock acquisitions through dozens of agent call sites. Instead the agent publishes a *snapshot* on a `tokio::sync::watch` channel every time the map changes (the same moment it rebuilds the routing table). A watch channel holds exactly one value — the latest — and the responder reads it with `borrow()`, no await, no contention. The cost is a clone of the map per change; deploys are rare and maps are small, so that's a bargain for keeping the agent lock-free. Go programmers will recognise the shape: don't share memory, communicate — except here the borrow checker enforces it.
 
-Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`, written into the rootfs at create time when `[dns]` is enabled. One catch — `resolv.conf` has no port syntax, so this only works when the responder listens on port 53, and the listen address must be reachable from inside the container's network namespace (the node's bridge IP, not `127.0.0.53`). ProcessGrill and Apple Container workloads keep host DNS; they were never namespaced away from it in the first place.
+Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`. Runc writes a per-instance file in the OCI bundle and bind-mounts it read-only at `/etc/resolv.conf`; it never edits the shared unpacked image rootfs. The file names the node-side veth gateway, not host loopback. `resolv.conf` has no port syntax, so only port 53 is valid.
+
+Rootful runc is the supported transparent path today. Rootless runc's promised slirp wiring isn't complete, ProcessGrill doesn't install a resolver into the host, and Apple Container has no DNS injection in its adapter. Enabling `[dns]` with any of those runtimes fails before adoption or workload creation. The live node capability records readiness, IPv4/IPv6 support and workload reachability; a DNS-enabled scheduling pass excludes nodes that can't prove all three.
 
 ### Testing service discovery
 
@@ -688,11 +696,11 @@ Why not Docker? Two reasons. First, building Rust inside a Docker container on m
 
 Let's step back and see what Onion gives us.
 
-A container calls `getaddrinfo("redis.internal")`. Bun's built-in DNS responder looks up the service map and responds with a virtual IP — one localhost UDP round trip, about 50 microseconds. The container calls `connect()` with that VIP. An eBPF program intercepts the syscall, picks a healthy backend via round-robin from a kernel hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No proxy in the data path, no iptables rules.
+A container calls `getaddrinfo("redis.internal")`. Bun's built-in DNS responder looks up the service map and responds with a virtual IP — one node-local UDP round trip, about 50 microseconds. The container calls `connect()` with that VIP. An eBPF program intercepts the syscall, picks a healthy backend via round-robin from a kernel hash map, and rewrites the destination. The TCP handshake goes directly to the backend. No proxy in the data path, no iptables rules.
 
 Kubernetes needs CoreDNS (a separate Go binary consuming 170MB of RAM), kube-proxy (thousands of iptables rules, O(n) per packet), and often a service mesh sidecar (Envoy, consuming 50-100MB per pod). We need a single binary with a built-in DNS responder, one eBPF program, and a hash map. The eBPF connect hook persists in the kernel — if Bun crashes, running connections keep working. DNS resolution pauses (since Bun runs the responder), but that only affects new connections. Existing TCP sessions are fine.
 
-We originally planned to do DNS entirely in-kernel too. It turned out the BPF hooks we needed can't read DNS packet payloads. So we went with the pragmatic approach: userspace DNS at 50 microseconds, in-kernel connect rewrite at zero. Pragmatism over purity. The 50 microsecond DNS hit is invisible to any real application, and it saved us from fighting kernel limitations that would have taken weeks to work around (if they're even solvable with current BPF).
+We originally planned to do DNS entirely in-kernel too. It turned out the cgroup socket-address hooks we chose can't read DNS packet payloads. A TC proof shows packet hooks can do it, but only by adding a second, deliberately narrower parser and lifecycle. So we went with the pragmatic approach: userspace DNS at 50 microseconds, in-kernel connect rewrite at zero. Pragmatism over purity. We'll revisit TC only if measurements show a material reason.
 
 ## Wrapper: The Front Door
 

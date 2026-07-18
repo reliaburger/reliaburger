@@ -86,6 +86,8 @@ pub struct PlatformCapabilities {
     /// Live hooks and runtime behaviour needed for pre-start, dual-stack
     /// egress enforcement.
     pub egress: crate::sesame::egress::EgressEnforcementCapability,
+    /// Live `.internal` resolver readiness for this runtime's workload path.
+    pub dns: crate::onion::dns::DnsCapability,
 }
 
 /// Manages all workload instances on this node.
@@ -158,6 +160,11 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.capabilities.egress = capability;
     }
 
+    /// Return the DNS capability bound to this runtime.
+    pub fn dns_capability(&self) -> crate::onion::dns::DnsCapability {
+        self.capabilities.dns
+    }
+
     /// Replace the process-workloads policy (host-exec/script allowlist,
     /// mount isolation, script dir). The binary feeds the parsed
     /// `[process_workloads]` config here so the deny-by-default allowlist
@@ -177,7 +184,25 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_gpu(app_name, spec.gpu.unwrap_or(0))?;
         self.admit_rootless_limits(app_name, spec.memory.is_some() || spec.cpu.is_some())?;
         self.admit_egress(app_name, spec.egress.as_ref())?;
+        self.admit_dns(app_name)?;
         Ok(())
+    }
+
+    /// A DNS-enabled node may not create workloads until the resolver is both
+    /// bound and reachable through the selected runtime. Bun normally proves
+    /// this before constructing the supervisor; this check is the admission
+    /// backstop for live tests and future runtime reconfiguration.
+    fn admit_dns(&self, app_name: &str) -> Result<(), BunError> {
+        let dns = self.capabilities.dns;
+        if !dns.enabled || dns.can_resolve_internal() {
+            return Ok(());
+        }
+        Err(BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason:
+                "internal DNS requires a ready responder and a workload-reachable resolver address"
+                    .to_string(),
+        })
     }
 
     /// Refuse an allowlist unless the node can install it before start on
@@ -1284,6 +1309,7 @@ mod tests {
             gpu_enabled: true,
             rootless: false,
             egress: Default::default(),
+            dns: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
@@ -1302,6 +1328,7 @@ mod tests {
             gpu_enabled: false,
             rootless: false,
             egress: Default::default(),
+            dns: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
@@ -1320,6 +1347,7 @@ mod tests {
             gpu_enabled: true,
             rootless: false,
             egress: Default::default(),
+            dns: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.gpu = Some(1);
@@ -1338,6 +1366,7 @@ mod tests {
             gpu_enabled: false,
             rootless: false,
             egress: Default::default(),
+            dns: Default::default(),
         });
         let spec = basic_app_spec(None); // no gpu request
         let ids = sup
@@ -1357,6 +1386,7 @@ mod tests {
             gpu_enabled: false,
             rootless: true,
             egress: Default::default(),
+            dns: Default::default(),
         });
         let mut spec = basic_app_spec(None);
         spec.memory =
@@ -1379,6 +1409,7 @@ mod tests {
             gpu_enabled: false,
             rootless: true,
             egress: Default::default(),
+            dns: Default::default(),
         });
         let spec = basic_app_spec(None); // no cpu/memory limits
         let ids = sup
@@ -1386,5 +1417,28 @@ mod tests {
             .await
             .expect("a workload with no limits is fine on a rootless node");
         assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_enabled_but_unready_node_refuses_before_workload_creation() {
+        let mut sup = test_supervisor();
+        sup.set_capabilities(PlatformCapabilities {
+            dns: crate::onion::dns::DnsCapability {
+                enabled: true,
+                ready: false,
+                ipv4: true,
+                ipv6: false,
+                workload_reachable: true,
+            },
+            ..Default::default()
+        });
+
+        let err = sup
+            .deploy_app("client", "default", &basic_app_spec(None), Instant::now())
+            .await
+            .expect_err("an unready resolver must fail admission");
+
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+        assert!(sup.list_instances().is_empty());
     }
 }

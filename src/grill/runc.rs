@@ -110,6 +110,17 @@ impl RuncGrill {
         self
     }
 
+    /// Node-side address that rootful container namespaces use as their
+    /// default gateway and DNS resolver endpoint.
+    pub fn dns_gateway_address(&self) -> Option<std::net::Ipv4Addr> {
+        (!self.rootless).then(|| netns::gateway_ip(self.node_index))
+    }
+
+    /// Whether this grill uses rootless runc.
+    pub fn is_rootless(&self) -> bool {
+        self.rootless
+    }
+
     /// The image store this runtime pulls through. Clones share the
     /// cluster-source slot, so installing a source on the returned
     /// handle affects this grill's pulls.
@@ -194,6 +205,13 @@ impl super::Grill for RuncGrill {
 
         let mut spec = spec.clone();
 
+        if self.rootless && self.dns_nameserver.is_some() {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "rootless runc has no supervised workload DNS path".to_string(),
+            });
+        }
+
         // Set up per-container networking (root mode only, non-rootless).
         // For rootless, slirp4netns is set up after runc create (needs PID).
         if !self.rootless {
@@ -237,8 +255,17 @@ impl super::Grill for RuncGrill {
                     self.networks.lock().await.insert(instance.clone(), network);
                 }
                 Err(e) => {
-                    // Network setup failed. Log and continue without isolation —
-                    // the container will use an empty new network namespace.
+                    // A configured resolver is only reachable through this
+                    // namespace. Continuing would create a workload whose
+                    // resolv.conf is guaranteed to be broken.
+                    if self.dns_nameserver.is_some() {
+                        return Err(GrillError::StartFailed {
+                            instance: instance.clone(),
+                            reason: format!("failed to create DNS-capable container network: {e}"),
+                        });
+                    }
+                    // DNS-disabled workloads retain the historical best-effort
+                    // networking behaviour.
                     eprintln!("warning: container network setup failed for {instance}: {e}");
                 }
             }
@@ -276,20 +303,29 @@ impl super::Grill for RuncGrill {
                 .to_string();
         }
 
-        // Point the container at the node's DNS responder. The rootfs
-        // may be shared between containers of the same image; the
-        // content is node-constant, so repeated writes are idempotent.
+        // Point the container at the node's DNS responder with a per-instance
+        // read-only bind mount. Image rootfs directories are shared by every
+        // instance of an image, so mutating rootfs/etc/resolv.conf here races
+        // concurrent creates and leaks node-local configuration into the
+        // unpacked image cache.
         if let Some(nameserver) = self.dns_nameserver {
-            let resolv_path = std::path::Path::new(&spec.root.path)
-                .join("etc")
+            let resolv_path = std::fs::canonicalize(&bundle_dir)
+                .unwrap_or_else(|_| bundle_dir.clone())
                 .join("resolv.conf");
-            if let Some(parent) = resolv_path.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            let content = resolv_conf_content(nameserver);
-            if let Err(e) = tokio::fs::write(&resolv_path, content).await {
-                eprintln!("warning: failed to write resolv.conf for {instance}: {e}");
-            }
+            tokio::fs::write(&resolv_path, resolv_conf_content(nameserver))
+                .await
+                .map_err(|e| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to write per-instance resolv.conf: {e}"),
+                })?;
+            spec.mounts
+                .retain(|mount| mount.destination != std::path::Path::new("/etc/resolv.conf"));
+            spec.mounts.push(crate::grill::oci::OciMount {
+                destination: std::path::PathBuf::from("/etc/resolv.conf"),
+                source: Some(resolv_path),
+                mount_type: Some("bind".to_string()),
+                options: vec!["bind".to_string(), "ro".to_string()],
+            });
         }
 
         // Apply rootless modifications if running as non-root
@@ -709,6 +745,29 @@ mod tests {
         std::env::var("RELIABURGER_RUNC_TESTS").is_ok()
     }
 
+    fn remove_test_network(instance: &InstanceId) {
+        let _ = std::process::Command::new("ip")
+            .args(["link", "delete", &netns::host_veth_name(instance)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "delete", &format!("rb-{}", instance.0)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    struct TestNetworkCleanup(Vec<InstanceId>);
+
+    impl Drop for TestNetworkCleanup {
+        fn drop(&mut self) {
+            for instance in &self.0 {
+                remove_test_network(instance);
+            }
+        }
+    }
+
     // Runtime-agnostic: exercises the log-tailing primitive used by
     // `logs`/`follow_logs` without needing runc.
     #[tokio::test]
@@ -790,6 +849,145 @@ mod tests {
 
     // Validates the run-and-capture model end-to-end: the container's exit code
     // is captured (so jobs don't get retried) and its stdout is readable.
+    #[tokio::test]
+    #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_netns_resolves_internal_name_through_mounted_resolv_conf() {
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after provisioning runc"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            false,
+            tmp.path().join("state"),
+        );
+        let nameserver = grill.dns_gateway_address().unwrap();
+        let grill = grill.with_dns_nameserver(nameserver);
+
+        let mut map = crate::onion::service_map::ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let vip = map
+            .resolve(&crate::onion::service_id::ServiceId::new(
+                "default", "redis",
+            ))
+            .unwrap()
+            .vip;
+        let (_map_tx, map_rx) = tokio::sync::watch::channel(map);
+        let (_fault_tx, fault_rx) =
+            tokio::sync::watch::channel(crate::onion::dns::DnsFaultState::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let responder =
+            crate::onion::dns::BoundDnsResponder::bind_freebind(crate::onion::dns::DnsConfig {
+                listen_addr: std::net::SocketAddr::new(nameserver.into(), 53),
+                upstream: "192.0.2.1:53".parse().unwrap(),
+                ..Default::default()
+            })
+            .expect("bind the future runc gateway before its veth exists");
+        let responder_shutdown = shutdown.clone();
+        let responder_task = tokio::spawn(responder.run(map_rx, fault_rx, responder_shutdown));
+
+        let ids = [
+            InstanceId("runc-dns-netns-0".to_string()),
+            InstanceId("runc-dns-netns-1".to_string()),
+        ];
+        for id in &ids {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(ids.to_vec());
+        let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
+            root: crate::grill::oci::OciRoot {
+                path: "alpine:latest".to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                args: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    // Keep both namespaces alive while they query. This catches
+                    // duplicate-gateway routing bugs that a single-container
+                    // proof cannot see.
+                    "sleep 1; cat /etc/resolv.conf; nslookup redis.internal; sleep 2".to_string(),
+                ],
+                env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: crate::grill::oci::standard_mounts(),
+            linux: crate::grill::oci::OciLinux {
+                namespaces: crate::grill::oci::standard_namespaces(None),
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+
+        for id in &ids {
+            grill
+                .create(id, &spec)
+                .await
+                .expect("create a rootful runc workload and netns");
+            grill.start(id).await.expect("start a DNS client");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut all_stopped = true;
+            for id in &ids {
+                all_stopped &= matches!(grill.state(id).await, Ok(ContainerState::Stopped));
+            }
+            if all_stopped {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DNS client did not exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        for id in &ids {
+            let logs = grill.logs(id).await.unwrap();
+            assert!(
+                logs.contains(&format!("nameserver {nameserver}")),
+                "{id} did not receive the derived resolver: {logs}"
+            );
+            assert!(
+                logs.contains(&vip.0.to_string()),
+                "{id} did not resolve redis.internal to {vip:?}: {logs}"
+            );
+            assert_eq!(grill.exit_code(id).await, Some(0), "{id} logs: {logs}");
+        }
+
+        let config: crate::grill::oci::OciSpec = serde_json::from_slice(
+            &std::fs::read(tmp.path().join("bundles/runc-dns-netns-0/config.json")).unwrap(),
+        )
+        .unwrap();
+        let resolver_mount = config
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == std::path::Path::new("/etc/resolv.conf"))
+            .expect("per-instance resolver bind mount");
+        assert_eq!(
+            resolver_mount.source.as_deref(),
+            Some(
+                tmp.path()
+                    .join("bundles/runc-dns-netns-0/resolv.conf")
+                    .as_path()
+            )
+        );
+
+        for id in &ids {
+            grill.kill(id).await.ok();
+        }
+        shutdown.cancel();
+        responder_task.await.ok();
+    }
+
     #[tokio::test]
     #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_captures_exit_code_and_logs() {

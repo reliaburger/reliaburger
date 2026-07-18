@@ -340,27 +340,6 @@ async fn main() -> anyhow::Result<()> {
         config.network.port_range.end,
     );
 
-    // Containers can only be pointed at the DNS responder when it
-    // listens on port 53 (resolv.conf has no port syntax) on an IPv4
-    // address; otherwise host DNS applies and we say so.
-    let container_nameserver = if config.dns.enabled {
-        match config.dns.to_dns_config()? {
-            c if c.listen_addr.port() == 53 => match c.listen_addr.ip() {
-                std::net::IpAddr::V4(ip) => Some(ip),
-                std::net::IpAddr::V6(_) => None,
-            },
-            c => {
-                println!(
-                    "bun: dns listen {} is not port 53 — containers keep host DNS",
-                    c.listen_addr
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Writable base for node-local runtime state (instance records,
     // upgrade markers). Prefers the configured data dir, falls back to the
     // user data dir like the metrics/logs stores below.
@@ -434,7 +413,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Select runtime
-    let runtime = select_runtime(&cli.runtime, container_nameserver, &instances_dir).await?;
+    let runtime = select_runtime(&cli.runtime, &instances_dir).await?;
+    // DNS is a workload capability, not a best-effort side task. Select the
+    // runtime first so we can derive its reachable resolver address, then bind
+    // both sockets before starting the agent, reporting readiness or adopting
+    // any surviving workloads.
+    let (runtime, bound_dns, dns_capability) = prepare_dns_runtime(runtime, &config.dns).await?;
     // Image-store handle for installing the cluster P2P image source
     // once the registry and catalog exist — the runtime is selected
     // long before them, so the source is injected late via a OnceLock
@@ -614,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
         gpu_enabled: config.resources.gpu_enabled,
         rootless,
         egress: Default::default(),
+        dns: dns_capability,
     });
     // Wire [storage] volumes — the agent constructors default it, which
     // left the config key dead (review M21's second half).
@@ -699,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(council),
                 membership_rx.clone(),
                 aggregated_rx,
+                config.dns.enabled,
                 config.reconstruction.clone(),
                 shutdown.clone(),
             );
@@ -853,22 +839,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Onion DNS: start the .internal responder when [dns] enables it,
     // resolving from the agent's service-map snapshots.
-    if config.dns.enabled {
-        let dns_config = config.dns.to_dns_config()?;
+    if let Some(bound_dns) = bound_dns {
         let service_map_rx = agent.service_map_watch();
         let dns_faults_rx = agent.dns_faults_watch();
         let dns_shutdown = shutdown.clone();
-        println!("bun: dns responder on {}", dns_config.listen_addr);
+        let dns_addr = bound_dns.local_addr()?;
+        println!("bun: dns responder ready on {dns_addr}");
+        let server =
+            tokio::spawn(bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()));
         tokio::spawn(async move {
-            if let Err(e) = reliaburger::onion::dns::run_dns_responder(
-                dns_config,
-                service_map_rx,
-                dns_faults_rx,
-                dns_shutdown,
-            )
-            .await
-            {
-                eprintln!("bun: dns responder failed to bind: {e}");
+            let outcome = server.await;
+            if !dns_shutdown.is_cancelled() {
+                match outcome {
+                    Ok(()) => eprintln!("bun: dns responder stopped unexpectedly"),
+                    Err(error) => eprintln!("bun: dns responder task failed: {error}"),
+                }
+                // Readiness cannot remain true after a critical resolver task
+                // exits. Stop the node so gossip/report staleness withdraws
+                // the capability instead of scheduling more workloads here.
+                dns_shutdown.cancel();
             }
         });
     }
@@ -1787,13 +1776,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn select_runtime(
-    name: &str,
-    dns_nameserver: Option<std::net::Ipv4Addr>,
-    instances_dir: &std::path::Path,
-) -> anyhow::Result<AnyGrill> {
-    // Silence the unused warning on platforms without runc.
-    let _ = dns_nameserver;
+async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::Result<AnyGrill> {
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
@@ -1846,18 +1829,12 @@ async fn select_runtime(
                 )
             };
 
-            let mut grill = reliaburger::grill::runc::RuncGrill::new(
+            let grill = reliaburger::grill::runc::RuncGrill::new(
                 bundle_base,
                 image_store,
                 is_rootless,
                 state_dir,
             );
-            // Containers resolve .internal via the node's DNS responder;
-            // resolv.conf has no port syntax, so this only applies to
-            // port-53 listeners (checked by the caller).
-            if let Some(nameserver) = dns_nameserver {
-                grill = grill.with_dns_nameserver(nameserver);
-            }
             Ok(AnyGrill::Runc(grill))
         }
         #[cfg(target_os = "macos")]
@@ -1871,10 +1848,178 @@ async fn select_runtime(
     }
 }
 
+/// Bind and wire the `.internal` resolver for the selected runtime.
+///
+/// Rootful runc is the only runtime whose transparent resolver path is
+/// implemented today. Its workload address is the node-side veth gateway;
+/// `IP_FREEBIND` lets Bun bind that exact address before the first container
+/// network creates it. Other runtime/address combinations fail before the
+/// agent can create or adopt a workload.
+async fn prepare_dns_runtime(
+    runtime: AnyGrill,
+    section: &reliaburger::config::node::DnsSection,
+) -> anyhow::Result<(
+    AnyGrill,
+    Option<reliaburger::onion::dns::BoundDnsResponder>,
+    reliaburger::onion::dns::DnsCapability,
+)> {
+    if !section.enabled {
+        return Ok((runtime, None, Default::default()));
+    }
+
+    let mut config = section.to_dns_config()?;
+    if config.listen_addr.port() != 53 {
+        anyhow::bail!(
+            "dns.listen {} is unsupported for workloads: resolv.conf cannot express a port other than 53",
+            config.listen_addr
+        );
+    }
+
+    let (runtime, nameserver, freebind) = configure_workload_dns(runtime, config.listen_addr)?;
+    if config.listen_addr.ip().is_unspecified() {
+        config.listen_addr.set_ip(nameserver.into());
+    }
+
+    #[cfg(target_os = "linux")]
+    let bound = if freebind {
+        reliaburger::onion::dns::BoundDnsResponder::bind_freebind(config)
+    } else {
+        reliaburger::onion::dns::BoundDnsResponder::bind(config).await
+    };
+    #[cfg(not(target_os = "linux"))]
+    let bound = {
+        let _ = freebind;
+        reliaburger::onion::dns::BoundDnsResponder::bind(config).await
+    };
+    let bound = bound.map_err(|error| {
+        anyhow::anyhow!("failed to bind DNS responder before readiness: {error}")
+    })?;
+    println!("bun: workloads use DNS nameserver {nameserver}");
+    let capability = reliaburger::onion::dns::DnsCapability {
+        enabled: true,
+        ready: true,
+        ipv4: true,
+        ipv6: false,
+        workload_reachable: true,
+    };
+    Ok((runtime, Some(bound), capability))
+}
+
+#[cfg(target_os = "linux")]
+fn configure_workload_dns(
+    runtime: AnyGrill,
+    listen_addr: std::net::SocketAddr,
+) -> anyhow::Result<(AnyGrill, std::net::Ipv4Addr, bool)> {
+    use std::net::IpAddr;
+
+    match runtime {
+        AnyGrill::Runc(grill) => {
+            let Some(gateway) = grill.dns_gateway_address() else {
+                anyhow::bail!(
+                    "dns is enabled but rootless runc has no supervised workload-reachable resolver path"
+                );
+            };
+            let nameserver = match listen_addr.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => gateway,
+                IpAddr::V4(ip) if ip.is_loopback() => anyhow::bail!(
+                    "dns.listen {} is host loopback and cannot be reached from a runc network namespace; use 0.0.0.0:53 or a reachable host IPv4 address",
+                    listen_addr
+                ),
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => anyhow::bail!(
+                    "dns.listen {} is IPv6-only but runc workload DNS is IPv4-only",
+                    listen_addr
+                ),
+            };
+            let freebind = listen_addr.ip().is_unspecified() || listen_addr.ip() == gateway;
+            Ok((
+                AnyGrill::Runc(grill.with_dns_nameserver(nameserver)),
+                nameserver,
+                freebind,
+            ))
+        }
+        AnyGrill::Process(_) => anyhow::bail!(
+            "dns is enabled but ProcessGrill does not install a supervised resolver into workloads"
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn configure_workload_dns(
+    runtime: AnyGrill,
+    _listen_addr: std::net::SocketAddr,
+) -> anyhow::Result<(AnyGrill, std::net::Ipv4Addr, bool)> {
+    match runtime {
+        AnyGrill::Apple(_) => anyhow::bail!(
+            "dns is enabled but Apple Container resolver injection is not implemented"
+        ),
+        AnyGrill::Process(_) => anyhow::bail!(
+            "dns is enabled but ProcessGrill does not install a supervised resolver into workloads"
+        ),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn configure_workload_dns(
+    runtime: AnyGrill,
+    _listen_addr: std::net::SocketAddr,
+) -> anyhow::Result<(AnyGrill, std::net::Ipv4Addr, bool)> {
+    match runtime {
+        AnyGrill::Process(_) => anyhow::bail!(
+            "dns is enabled but ProcessGrill does not install a supervised resolver into workloads"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn process_runtime_refuses_dns_before_workload_creation() {
+        let runtime = AnyGrill::Process(ProcessGrill::new());
+        let error = configure_workload_dns(runtime, "127.0.0.53:53".parse().unwrap())
+            .err()
+            .expect("ProcessGrill has no resolver injection path");
+        assert!(error.to_string().contains("ProcessGrill"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rootful_runc_derives_gateway_nameserver_for_wildcard_listener() {
+        let temp = tempfile::tempdir().unwrap();
+        let grill = reliaburger::grill::runc::RuncGrill::new(
+            temp.path().join("bundles"),
+            reliaburger::grill::ImageStore::new(temp.path().join("images")),
+            false,
+            temp.path().join("state"),
+        );
+        let expected = grill.dns_gateway_address().unwrap();
+
+        let (_, nameserver, freebind) =
+            configure_workload_dns(AnyGrill::Runc(grill), "0.0.0.0:53".parse().unwrap())
+                .expect("rootful runc wildcard listener should be reachable");
+        assert_eq!(nameserver, expected);
+        assert!(freebind);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rootful_runc_refuses_host_loopback_nameserver() {
+        let temp = tempfile::tempdir().unwrap();
+        let grill = reliaburger::grill::runc::RuncGrill::new(
+            temp.path().join("bundles"),
+            reliaburger::grill::ImageStore::new(temp.path().join("images")),
+            false,
+            temp.path().join("state"),
+        );
+
+        let error = configure_workload_dns(AnyGrill::Runc(grill), "127.0.0.53:53".parse().unwrap())
+            .err()
+            .expect("host loopback is isolated from the workload namespace");
+        assert!(error.to_string().contains("host loopback"));
+    }
 
     use reliaburger::council::CouncilNode;
     use reliaburger::council::log_store::MemLogStore;

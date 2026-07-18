@@ -11,9 +11,9 @@
 
 Onion is Reliaburger's service discovery layer. It replaces DNS servers (CoreDNS, Consul DNS) and proxy processes (Envoy, kube-proxy, linkerd-proxy). Name resolution runs in a small userspace responder that Bun hosts; connection steering runs in an eBPF program loaded into the kernel by the Bun agent on each node.
 
-Service discovery happens in two steps. When an application calls `getaddrinfo("redis.internal")`, Bun's userspace UDP responder answers from the service map with a virtual IP; the container's `/etc/resolv.conf` points `.internal` lookups at that responder, so `.internal` names never leak to a public resolver. When the application subsequently calls `connect()` with that virtual IP, an eBPF program intercepts the syscall, selects a healthy backend from the service map, and rewrites the destination to the real `host:port` of a running instance. The application's `connect()` completes with a direct TCP connection to the backend. No proxy sits in the data path.
+Service discovery happens in two steps. When an application calls `getaddrinfo("redis.internal")`, Bun's userspace UDP/TCP responder answers from the service map with a virtual IP; rootful runc bind-mounts a per-instance `/etc/resolv.conf` naming the node-side veth gateway, so `.internal` names never leak to a public resolver. When the application subsequently calls `connect()` with that virtual IP, an eBPF program intercepts the syscall, selects a healthy backend from the service map, and rewrites the destination to the real `host:port` of a running instance. The application's `connect()` completes with a direct TCP connection to the backend. No proxy sits in the data path.
 
-Why answer DNS in userspace when the rest of Onion lives in the kernel? We tried the in-kernel route first, and it doesn't work: the cgroup `sendmsg4`/`recvmsg4` eBPF hooks can rewrite a socket's destination address, but they can't read or synthesise the DNS *packet payload*, so an eBPF program can't tell which name was queried or build a reply. So DNS is the one piece that stays in userspace. The trade-off is tiny (a ~50µs resolver hop that any real application never notices) and the latency-critical part, the `connect()` rewrite, is still zero-cost in the kernel. That split is deliberate: pragmatism over purity.
+Why answer DNS in userspace when the rest of Onion lives in the kernel? The current cgroup `sendmsg4`/`recvmsg4` eBPF hooks can rewrite a socket's destination address, but they can't read or synthesise the DNS *packet payload*, so they can't tell which name was queried or build a reply. Packet hooks can: the proof in `poc/dns-tc/` synthesises a bounded IPv4/UDP A answer at TC ingress. It also needs a second DNS parser, map, veth attachment lifecycle, checksums and fallbacks for TCP, IPv6, fragments and unsupported EDNS cases. Userspace remains the simpler production design. The trade-off is a small node-local resolver hop; the latency-critical `connect()` rewrite stays in the kernel.
 
 This still eliminates an entire category of infrastructure: no separate DNS server to operate, no proxy process in the data path, no iptables/IPVS rules to manage. The connect-rewrite eBPF program persists in the kernel even if the Bun agent crashes, so existing connections keep flowing; only service map updates and new `.internal` resolutions pause until Bun restarts.
 
@@ -28,6 +28,8 @@ Onion also enforces namespace isolation and per-app firewall rules at the `conne
 - **Linux kernel 5.7+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7. (The `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
 - **BPF Type Format (BTF)** enabled in the kernel (`CONFIG_DEBUG_INFO_BTF=y`). Required for CO-RE (Compile Once, Run Everywhere) portability of eBPF programs across kernel versions. Most distribution kernels since Ubuntu 20.10, Fedora 33, and Debian 12 ship with BTF enabled.
 - **cgroup v2** mounted at `/sys/fs/cgroup`. Required for cgroup-scoped eBPF program attachment and for identifying the source application by cgroup ID in the firewall path.
+- **Rootful runc for transparent DNS.** Rootless runc, ProcessGrill and Apple Container don't yet install a supervised workload resolver. Bun refuses `[dns] enabled = true` with those runtimes before adoption or workload creation.
+- **Port 53 on the derived runc gateway.** `/etc/resolv.conf` can't encode another port. Bun uses Linux `IP_FREEBIND` to bind the precise gateway address before the first veth creates it, avoiding a wildcard conflict with the host resolver.
 
 ### Bun Agent
 
@@ -49,7 +51,7 @@ The hierarchical reporting tree is the source of truth for service map updates. 
 
 Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that feed it, plus a userspace DNS responder, all managed by the Bun agent process.
 
-> **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it (the hooks can't read the DNS payload; see §1). The live implementation is a userspace UDP responder (`src/onion/dns.rs`) that Bun answers from directly, with the container's `resolv.conf` rewritten to point `.internal` at it. The kernel listings are preserved here for teaching, not as a description of the running binary; `dns_map` survives in the source as a leftover but is off the resolution path.
+> **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it because those hooks can't read the DNS payload (see §1). The live implementation is a supervised userspace UDP/TCP responder (`src/onion/dns.rs`), with a per-instance resolver file mounted into rootful runc workloads. The kernel listings are preserved for teaching, not as a description of the running binary; `dns_map` survives in the source as a leftover but is off the resolution path. The later TC proof demonstrates that packet-hook synthesis is feasible, but it remains review evidence rather than production code.
 
 ### eBPF Programs
 
@@ -354,7 +356,17 @@ pub struct BackendInstance {
 
 ### 5.1 DNS Interception Flow
 
-When an application calls `getaddrinfo("redis.internal")`, the C library (glibc or musl) constructs a DNS query packet and calls `sendmsg()` targeting the nameserver at port 53 (as configured in `/etc/resolv.conf`).
+The live rootful-runc path is:
+
+1. Bun derives the node-side veth gateway, binds UDP and TCP port 53 there with `IP_FREEBIND`, and only then reports DNS ready.
+2. Runc creates a per-instance `resolv.conf` naming that gateway and bind-mounts it read-only at `/etc/resolv.conf`. It never edits the shared image rootfs.
+3. The C library sends its query to the gateway. Bun answers `.internal` from the latest service-map snapshot and forwards other private-source queries to the configured upstream resolver.
+4. Unknown internal names stay local as NXDOMAIN. Public sources receive REFUSED for every name, so the responder can't become an open recursive resolver.
+5. If either startup bind fails, Bun doesn't start the agent. If the serving task later exits, its supervisor cancels Bun and the reporting lease withdraws readiness.
+
+DNS readiness, IPv4/IPv6 transport support and workload reachability are reported as placement capabilities. Once any node enables cluster DNS, a scheduling pass accepts only nodes that can prove the complete resolver path. Rootless runc, ProcessGrill and Apple Container are explicit unsupported combinations today.
+
+The pseudocode below records the superseded cgroup-hook design. It is not the live flow.
 
 **eBPF pseudocode for `onion_dns` (sendmsg hook):**
 
@@ -974,7 +986,7 @@ Kubernetes uses a two-component approach: CoreDNS resolves service names to Clus
 
 **What Onion borrows:** The concept of virtual IPs (ClusterIPs in Kubernetes) for service-level addressing. The concept of per-node backends lists for load balancing.
 
-**What Onion does differently:** Eliminates the DNS server entirely (kernel map lookup vs. network round trip). Eliminates iptables/IPVS (eBPF connect rewrite vs. packet-level DNAT). Eliminates the proxy process (zero data-path overhead). Service map updates are microseconds (BPF map write) vs. seconds (iptables reprogramming).
+**What Onion does differently:** Integrates a per-node DNS responder into Bun instead of operating a separate clustered DNS deployment. It eliminates iptables/IPVS for service connections (eBPF connect rewrite vs. packet-level DNAT) and eliminates the proxy process from the data path. Service map updates are BPF map writes rather than whole-rule-set reprogramming.
 
 ### Cilium (eBPF)
 
@@ -987,10 +999,10 @@ Cilium ([eBPF documentation](https://docs.cilium.io/en/stable/bpf/)) is the clos
 
 **What Onion does differently:**
 
-- **Socket-level only, not packet-level.** Onion operates exclusively at the socket layer (`connect()`, `sendmsg()`, `recvmsg()`). It never touches TC, XDP, or any packet-processing hook. This is simpler, has zero data-path overhead (no per-packet processing), and avoids the complexity of packet-level NAT state tracking.
+- **Socket-level production data plane.** Onion's shipped connection steering uses cgroup socket hooks, not TC or XDP, so it avoids per-packet NAT state. The TC DNS implementation under `poc/dns-tc/` is feasibility evidence and a possible measured fast path, not a loaded production programme.
 - **No overlay network.** Cilium typically manages a full CNI with VXLAN/Geneve tunneling or native routing. Onion operates on top of Reliaburger's overlay-free architecture (direct host port mapping). This eliminates tunnel encapsulation overhead and MTU issues.
 - **No proxy at all.** Cilium integrates Envoy for L7 policy enforcement. Onion has no proxy component -- all policy enforcement happens in the eBPF connect hook.
-- **DNS interception, not DNS proxying.** Cilium DNS policy uses a DNS proxy that parses queries and can enforce FQDN-based policy. Onion intercepts DNS at the socket level and responds from a kernel map -- no proxy process, no DNS parsing complexity beyond name matching.
+- **Integrated userspace DNS, not a policy proxy.** Bun parses and answers the small authoritative `.internal` zone, and forwards other names. It doesn't use DNS responses to maintain FQDN firewall policy.
 - **Single-purpose, minimal scope.** Cilium is a full networking stack (CNI, network policy, observability, service mesh, gateway API). Onion is only service discovery and namespace-level firewall enforcement. This dramatically reduces complexity and attack surface.
 
 ### Consul Connect
@@ -999,7 +1011,7 @@ HashiCorp Consul Connect provides service discovery via DNS or HTTP API, with op
 
 **What Onion borrows:** The principle that service discovery should be transparent to applications (no SDK required).
 
-**What Onion does differently:** No agent process in the DNS path (eBPF vs. Consul agent). No sidecar proxy (connect rewrite vs. Envoy proxy). No gossip-based service catalog (reporting tree + BPF maps vs. Consul's Serf + agent).
+**What Onion does differently:** The existing Bun node agent owns DNS rather than adding another agent or clustered service. There is no sidecar proxy (connect rewrite vs. Envoy proxy), and the reporting tree plus BPF maps replace Consul's Serf catalogue.
 
 ### Envoy / Istio
 

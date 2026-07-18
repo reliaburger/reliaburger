@@ -184,14 +184,21 @@ pub fn namespace_path(instance_id: &InstanceId) -> PathBuf {
 
 /// Generate the host-side veth name for an instance.
 ///
-/// Truncated to 15 characters (Linux interface name limit).
+/// Short readable IDs stay readable. Longer IDs use a stable hash suffix
+/// rather than truncation: replicas normally differ near the end of their
+/// names, so prefix truncation made `...-0` and `...-1` collide.
 pub fn host_veth_name(instance_id: &InstanceId) -> String {
     let raw = format!("veth-{}-h", instance_id.0);
-    if raw.len() > 15 {
-        raw[..15].to_string()
-    } else {
-        raw
+    if raw.len() <= 15 {
+        return raw;
     }
+    let hash = instance_id
+        .0
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("veth-{:010x}", hash & 0xff_ffff_ffff)
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +803,13 @@ mod tests {
         let id = InstanceId("very-long-instance-name-42".to_string());
         let name = host_veth_name(&id);
         assert!(name.len() <= 15, "veth name too long: {name}");
+    }
+
+    #[test]
+    fn host_veth_name_distinguishes_long_replica_ids() {
+        let first = InstanceId("default__very-long-application-0".to_string());
+        let second = InstanceId("default__very-long-application-1".to_string());
+        assert_ne!(host_veth_name(&first), host_veth_name(&second));
     }
 
     // Argv generation for map elements is unit-tested in

@@ -179,6 +179,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         Arc::clone(&council),
         membership_rx.clone(),
         aggregated_rx.clone(),
+        false,
         reliaburger::config::node::ReconstructionSection {
             report_threshold_percent: 80,
             learning_period_timeout_secs: 5,

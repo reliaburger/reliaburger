@@ -5,10 +5,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reliaburger::onion::dns::{DnsConfig, DnsFaultState, bind_dns_responder, serve};
+use reliaburger::onion::dns::{
+    BoundDnsResponder, DnsCapability, DnsConfig, DnsFaultState, bind_dns_responder, serve,
+};
 use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::service_map::ServiceMap;
 use reliaburger::onion::vip::VirtualIP;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -288,6 +291,82 @@ async fn run_dns_responder_fails_closed_when_it_cannot_bind() {
         result.is_err(),
         "responder must fail closed when the listen address is unavailable"
     );
+}
+
+#[tokio::test]
+async fn startup_binding_requires_both_udp_and_tcp() {
+    // Leave UDP free but occupy TCP. A UDP-only startup would look healthy
+    // until a resolver retried a truncated answer over TCP.
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = tcp.local_addr().unwrap();
+    let config = DnsConfig {
+        listen_addr: taken,
+        ..DnsConfig::default()
+    };
+
+    let result = BoundDnsResponder::bind(config).await;
+    assert!(result.is_err(), "TCP bind conflict must fail readiness");
+}
+
+#[tokio::test]
+async fn bound_responder_answers_internal_query_over_tcp_on_the_same_port() {
+    let (map_tx, map_rx) = watch::channel(map_with("redis"));
+    let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
+    let shutdown = CancellationToken::new();
+    let responder = BoundDnsResponder::bind(DnsConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        upstream: unroutable_upstream(),
+        ..DnsConfig::default()
+    })
+    .await
+    .unwrap();
+    let addr = responder.local_addr().unwrap();
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(responder.run(map_rx, fault_rx, task_shutdown));
+
+    let query = build_query("redis.internal", QTYPE_A);
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(&(query.len() as u16).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&query).await.unwrap();
+    let response_len = stream.read_u16().await.unwrap() as usize;
+    let mut response = vec![0; response_len];
+    stream.read_exact(&mut response).await.unwrap();
+
+    assert_eq!(rcode(&response), 0);
+    assert_eq!(&response[6..8], &[0x00, 0x01]);
+    let vip = map_tx
+        .borrow()
+        .resolve(&ServiceId::new("default", "redis"))
+        .unwrap()
+        .vip;
+    assert_eq!(&response[response.len() - 4..], &vip.0.octets());
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[test]
+fn dns_capability_requires_binding_family_and_workload_reachability() {
+    let mut capability = DnsCapability {
+        enabled: true,
+        ready: true,
+        ipv4: true,
+        ipv6: false,
+        workload_reachable: true,
+    };
+    assert!(capability.can_resolve_internal());
+
+    capability.ready = false;
+    assert!(!capability.can_resolve_internal());
+    capability.ready = true;
+    capability.workload_reachable = false;
+    assert!(!capability.can_resolve_internal());
+    capability.workload_reachable = true;
+    capability.ipv4 = false;
+    assert!(!capability.can_resolve_internal());
 }
 
 #[tokio::test]
