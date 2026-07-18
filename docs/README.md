@@ -365,6 +365,7 @@ Commands:
 | `manual` | Read the built-in manual in a searchable terminal reader |
 | `manual --web` | Serve the manual as one HTML page and open the browser |
 | `manual examples` | Write the embedded example configs into the current directory |
+| `source [query]` | Browse and fuzzy-search the embedded source tree (e.g. `relish source ebpf`) |
 | `apply <path>` | Deploy workloads from a TOML config file |
 | `status` | List all running workloads |
 | `logs <name>` | Show captured stdout/stderr for an app |
