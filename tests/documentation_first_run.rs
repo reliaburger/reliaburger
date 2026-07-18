@@ -198,9 +198,18 @@ fn standalone_first_run_reaches_a_running_workload() {
 
     wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
 
+    // The shipped example hardcodes `target/debug/testapp` for readers following
+    // the documented `cargo build --bins` workflow. Under `cargo llvm-cov` the
+    // binaries live in a different target dir, so apply a copy pointing at the
+    // testapp this test was built against (mirrors the clustered case below).
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/phase-1/proc-first-run.toml");
-    let apply = run_relish(&["--endpoint", &endpoint, "apply", example.to_str().unwrap()]);
+    let manifest = std::fs::read_to_string(&example)
+        .unwrap()
+        .replace("target/debug/testapp", env!("CARGO_BIN_EXE_testapp"));
+    let applied = root.path().join("proc-first-run.toml");
+    std::fs::write(&applied, manifest).unwrap();
+    let apply = run_relish(&["--endpoint", &endpoint, "apply", applied.to_str().unwrap()]);
     assert_success(&apply, "documented standalone apply");
 
     let status = run_relish(&["--endpoint", &endpoint, "status"]);
