@@ -370,6 +370,56 @@ Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{rep
 
 The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises generation publication across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
 
+### One writable rootfs per workload
+
+That fixed image publication, but not workload isolation. Two replicas still
+received the same `gen-*` path with `root.readonly = false`. Replica A could
+write `/etc/example`; replica B would immediately read A's file. No container
+escape required. We had handed both containers the same ordinary directory.
+
+The Linux answer is OverlayFS (a kernel filesystem that combines read-only and
+writable directory layers). The shared generation becomes the lower layer and
+each instance gets its own upper and work directories:
+
+```text
+images/.../gen-57d492d21ee15a2b       shared lower
+bundles/default__web-0/rootfs-upper   replica 0 writes
+bundles/default__web-0/rootfs-work
+bundles/default__web-0/rootfs         mounted view passed to runc
+bundles/default__web-1/rootfs-upper   replica 1 writes
+bundles/default__web-1/rootfs-work
+bundles/default__web-1/rootfs         a different mounted view
+```
+
+The acceptance test makes the race concrete. Two Alpine containers start from
+one generation. One writes `alpha`, the other writes `beta`, and both sleep long
+enough for the writes to overlap. Each later reads its own value. The test also
+asserts that their OCI specs name different rootfs mountpoints. It failed on the
+old code before either process check ran, because both paths were the same.
+
+Now, who owns the upper? The workload instance does. A restart of
+`default__web-0` on the same image remounts its old upper, so files survive the
+restart. Bun can also die and adopt the still-running runc process without
+disturbing its mount. A small marker records the canonical lower generation; if
+the image changes, Grill clears the old upper instead of smuggling changes into
+the new image.
+
+Cleanup needs the same care as creation. `MountedRootfs` starts armed and its
+`Drop` implementation unmounts the overlay if any later preparation step fails
+or unwinds. Only a fully recorded bundle disarms it. Normal exit, timeout/kill
+and failed adoption all use one cleanup function, which releases the mount but
+doesn't touch the shared lower. The privileged tests force a `config.json`
+write failure after mounting and check `/proc/self/mountinfo`; there is no mount
+left behind. They repeat that check after natural exit and after killing an
+adopted workload.
+
+What about rootless runc? Mounting a host OverlayFS needs privilege, and we don't
+yet ship a FUSE snapshotter. Read-only image roots can safely share the lower.
+Writable ones fail before pull with an explicit error. That's less convenient,
+but it doesn't quietly turn “rootless” into “every local workload shares one
+writable filesystem”. We can add an unprivileged snapshotter later and keep the
+same ownership contract.
+
 ### One authoritative catalogue
 
 Pickle has two catalogues: the council's Raft-replicated `manifest_catalog`, and each node's local `PickleState::catalog`. The push path proposes to Raft; the read path — `manifest_get` and `tags_list` — read the *local* one. So a manifest a peer committed to Raft was invisible on a node that hadn't received the original PUT, until a heal tick happened to reconcile it. Push on node A, `docker pull` from node B, get a 404.

@@ -161,6 +161,10 @@ impl RuncGrill {
         let _ = self
             .runc_command(&["delete", "--force", &instance.0], instance)
             .await;
+        if let Err(error) = super::rootfs::unmount_bundle(self.bundle_base.join(&instance.0)).await
+        {
+            eprintln!("warning: rootfs teardown failed for {instance}: {error}");
+        }
         if let Some(handle) = self.port_handles.lock().await.remove(instance)
             && let Err(e) = handle.shutdown().await
         {
@@ -193,8 +197,8 @@ async fn read_from_offset(path: &std::path::Path, offset: u64) -> std::io::Resul
     Ok(buf)
 }
 
-impl super::Grill for RuncGrill {
-    async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+impl RuncGrill {
+    async fn prepare(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         let bundle_dir = self.bundle_base.join(&instance.0);
         tokio::fs::create_dir_all(&bundle_dir)
             .await
@@ -204,6 +208,15 @@ impl super::Grill for RuncGrill {
             })?;
 
         let mut spec = spec.clone();
+        let mut rootfs_mount = None;
+
+        if self.rootless && looks_like_image_ref(&spec.root.path) && !spec.root.readonly {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "rootless runc cannot safely isolate a writable image rootfs; use a read-only rootfs or rootful runc"
+                    .to_string(),
+            });
+        }
 
         if self.rootless && self.dns_nameserver.is_some() {
             return Err(GrillError::StartFailed {
@@ -273,20 +286,31 @@ impl super::Grill for RuncGrill {
 
         // If root.path looks like an image reference, pull and unpack it
         if looks_like_image_ref(&spec.root.path) {
-            let rootfs = self
+            let lower = self
                 .image_store
                 .pull_and_unpack(&spec.root.path)
                 .await
                 .map_err(GrillError::ImagePull)?;
 
-            // Point the spec at the unpacked rootfs by its absolute path.
-            // `runc run` rejects a relative or symlinked rootfs ("invalid
-            // rootfs: not an absolute path, or a symlink"), so we must not
-            // symlink it into the bundle as the old create/start path did.
-            spec.root.path = std::fs::canonicalize(&rootfs)
-                .unwrap_or(rootfs)
-                .to_string_lossy()
-                .to_string();
+            if spec.root.readonly {
+                // A read-only OCI root cannot mutate the shared generation, so
+                // it is safe to point runc at the immutable lower directly.
+                spec.root.path = std::fs::canonicalize(&lower)
+                    .unwrap_or(lower)
+                    .to_string_lossy()
+                    .to_string();
+            } else {
+                // Writable workloads get a private upper layer. The image
+                // generation remains the shared, content-addressed lower.
+                let mounted = super::rootfs::mount_private(lower, bundle_dir.clone())
+                    .await
+                    .map_err(|error| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: format!("failed to isolate writable image rootfs: {error}"),
+                    })?;
+                spec.root.path = mounted.path().to_string_lossy().to_string();
+                rootfs_mount = Some(mounted);
+            }
         } else {
             // No image to pull — create an empty rootfs directory and point the
             // spec at its absolute path (same rationale as above).
@@ -369,60 +393,86 @@ impl super::Grill for RuncGrill {
                 exit_code: None,
             },
         );
+        // Keep rollback armed until every fallible preparation step has
+        // succeeded and the entry is visible. Unwinding before here also
+        // drops the guard and releases the host mount.
+        if let Some(mounted) = rootfs_mount {
+            mounted.commit();
+        }
 
         Ok(())
     }
+}
+
+impl super::Grill for RuncGrill {
+    async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        let result = self.prepare(instance, spec).await;
+        if result.is_err() {
+            self.cleanup(instance).await;
+        }
+        result
+    }
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let mut entries = self.entries.lock().await;
-        let entry = entries
-            .get_mut(instance)
-            .ok_or_else(|| GrillError::NotFound {
-                instance: instance.clone(),
-            })?;
+        let result = {
+            let mut entries = self.entries.lock().await;
+            let entry = entries
+                .get_mut(instance)
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
 
-        if entry.child.is_some() || entry.adopted_pid.is_some() {
-            return Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: "already started".to_string(),
-            });
+            if entry.child.is_some() || entry.adopted_pid.is_some() {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: "already started".to_string(),
+                });
+            }
+
+            (|| {
+                // Redirect stdout and stderr to the per-instance log file.
+                let log_file = std::fs::File::create(&entry.log_path).map_err(|e| {
+                    GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: format!("failed to create log file: {e}"),
+                    }
+                })?;
+                let log_file_err = log_file.try_clone().map_err(|e| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to clone log file handle: {e}"),
+                })?;
+
+                // `runc run` = create + start + wait; its exit status is the
+                // container's exit code.
+                let state_dir_str = self.state_dir.to_string_lossy().to_string();
+                let bundle_str = entry.bundle_dir.to_string_lossy().to_string();
+                let child = tokio::process::Command::new("runc")
+                    .args([
+                        "--root",
+                        &state_dir_str,
+                        "run",
+                        "--bundle",
+                        &bundle_str,
+                        &instance.0,
+                    ])
+                    .stdout(std::process::Stdio::from(log_file))
+                    .stderr(std::process::Stdio::from(log_file_err))
+                    .spawn()
+                    .map_err(|e| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: format!("failed to spawn runc run: {e}"),
+                    })?;
+
+                entry.child = Some(child);
+                entry.state = ContainerState::Running;
+                Ok(())
+            })()
+        };
+
+        if result.is_err() {
+            self.cleanup(instance).await;
         }
-
-        // Redirect the container's stdout+stderr to the per-instance log file.
-        let log_file =
-            std::fs::File::create(&entry.log_path).map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to create log file: {e}"),
-            })?;
-        let log_file_err = log_file.try_clone().map_err(|e| GrillError::StartFailed {
-            instance: instance.clone(),
-            reason: format!("failed to clone log file handle: {e}"),
-        })?;
-
-        // `runc run` = create + start + wait; its exit status is the
-        // container's exit code.
-        let state_dir_str = self.state_dir.to_string_lossy().to_string();
-        let bundle_str = entry.bundle_dir.to_string_lossy().to_string();
-        let child = tokio::process::Command::new("runc")
-            .args([
-                "--root",
-                &state_dir_str,
-                "run",
-                "--bundle",
-                &bundle_str,
-                &instance.0,
-            ])
-            .stdout(std::process::Stdio::from(log_file))
-            .stderr(std::process::Stdio::from(log_file_err))
-            .spawn()
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to spawn runc run: {e}"),
-            })?;
-
-        entry.child = Some(child);
-        entry.state = ContainerState::Running;
-        Ok(())
+        result
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
@@ -495,43 +545,42 @@ impl super::Grill for RuncGrill {
             (entry.state, just_exited)
         };
 
-        // Tear down the port mapping and netns for a naturally-exited
-        // container (lock released).
+        // Release all host resources once `runc run` has exited (lock released).
         if just_exited {
-            if let Some(handle) = self.port_handles.lock().await.remove(instance)
-                && let Err(e) = handle.shutdown().await
-            {
-                eprintln!("warning: port mapping teardown failed for {instance}: {e}");
-            }
-            if let Some(network) = self.networks.lock().await.remove(instance)
-                && let Err(e) = netns::teardown_container_network(&network).await
-            {
-                eprintln!("warning: network teardown failed for {instance}: {e}");
-            }
+            self.cleanup(instance).await;
         }
         Ok(result_state)
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
-        let mut entries = self.entries.lock().await;
-        let entry = entries.get_mut(instance)?;
-        // Reap the child so the exit code is captured even if state() wasn't
-        // polled since exit.
-        if let Some(ref mut child) = entry.child {
-            if let Ok(Some(status)) = child.try_wait() {
-                entry.state = ContainerState::Stopped;
-                entry.exit_code = status.code();
+        let (exit_code, just_exited) = {
+            let mut entries = self.entries.lock().await;
+            let entry = entries.get_mut(instance)?;
+            let mut just_exited = false;
+            // Reap the child so the exit code is captured even if state() wasn't
+            // polled since exit.
+            if let Some(ref mut child) = entry.child {
+                if let Ok(Some(status)) = child.try_wait() {
+                    just_exited = entry.state != ContainerState::Stopped;
+                    entry.state = ContainerState::Stopped;
+                    entry.exit_code = status.code();
+                }
+            } else if let Some(pid) = entry.adopted_pid
+                && entry.state != ContainerState::Stopped
+            {
+                let (running, exit_code) = super::records::poll_adopted_process(pid);
+                if !running {
+                    just_exited = true;
+                    entry.state = ContainerState::Stopped;
+                    entry.exit_code = exit_code;
+                }
             }
-        } else if let Some(pid) = entry.adopted_pid
-            && entry.state != ContainerState::Stopped
-        {
-            let (running, exit_code) = super::records::poll_adopted_process(pid);
-            if !running {
-                entry.state = ContainerState::Stopped;
-                entry.exit_code = exit_code;
-            }
+            (entry.exit_code, just_exited)
+        };
+        if just_exited {
+            self.cleanup(instance).await;
         }
-        entry.exit_code
+        exit_code
     }
 
     async fn pid(&self, instance: &InstanceId) -> Option<u32> {
@@ -570,14 +619,20 @@ impl super::Grill for RuncGrill {
     ) -> Result<bool, GrillError> {
         // The recorded `runc run` process must still be the one we started...
         if !super::records::is_live(record) {
+            self.cleanup(instance).await;
             return Ok(false);
         }
         // ...and runc itself must agree the container is running.
         let container_id = record.runc_container_id.as_deref().unwrap_or(&instance.0);
-        let output = self
-            .runc_command(&["state", container_id], instance)
-            .await?;
+        let output = match self.runc_command(&["state", container_id], instance).await {
+            Ok(output) => output,
+            Err(error) => {
+                self.cleanup(instance).await;
+                return Err(error);
+            }
+        };
         if !output.status.success() {
+            self.cleanup(instance).await;
             return Ok(false);
         }
         let running = serde_json::from_slice::<serde_json::Value>(&output.stdout)
@@ -585,6 +640,7 @@ impl super::Grill for RuncGrill {
             .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
             .is_some_and(|status| status == "running");
         if !running {
+            self.cleanup(instance).await;
             return Ok(false);
         }
 
@@ -644,7 +700,9 @@ impl super::Grill for RuncGrill {
                 reason: "no command specified".to_string(),
             });
         }
-        let mut args = vec!["exec", &instance.0, "--"];
+        // `--` terminates runc's own option parsing. It must precede the
+        // container id; after the id it becomes the command to execute.
+        let mut args = vec!["exec", "--", &instance.0];
         for part in command {
             args.push(part.as_str());
         }
@@ -728,11 +786,10 @@ fn resolv_conf_content(nameserver: std::net::Ipv4Addr) -> String {
 
 impl Drop for RuncGrill {
     fn drop(&mut self) {
-        // Clean up bundle directories. Best-effort, ignore errors.
-        let entries = self.entries.clone();
-        // We can't do async cleanup in Drop, so we just log the intent.
-        // In production the Bun agent handles cleanup before exit.
-        let _ = entries;
+        // Intentionally leave runc and its rootfs mounts alive. Bun records the
+        // foreground runc pid and the replacement process adopts it. Runtime
+        // lifecycle methods own cleanup; doing it here would turn a Bun restart
+        // or self-upgrade into a workload restart.
     }
 }
 
@@ -789,6 +846,52 @@ mod tests {
         std::fs::write(&path, b"line one\nline two\n").unwrap();
         let second = read_from_offset(&path, offset).await.unwrap();
         assert_eq!(second, b"line two\n");
+    }
+
+    #[tokio::test]
+    async fn rootless_writable_image_fails_before_pull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            true,
+            tmp.path().join("state"),
+        );
+        let id = InstanceId("rootless-writable".to_string());
+        let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
+            root: crate::grill::oci::OciRoot {
+                path: "invalid.example/reliaburger/no-pull:latest".to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                args: vec!["/bin/true".to_string()],
+                env: vec![],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: crate::grill::oci::standard_mounts(),
+            linux: crate::grill::oci::OciLinux {
+                namespaces: crate::grill::oci::standard_namespaces(None),
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+
+        let error = grill.create(&id, &spec).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rootless runc cannot safely isolate a writable image rootfs")
+        );
+        assert!(!tmp.path().join("images/rootfs").exists());
+        assert!(
+            !tmp.path()
+                .join("bundles/rootless-writable/rootfs-lower")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -989,6 +1092,321 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_replicas_cannot_observe_each_others_rootfs_writes() {
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after provisioning rootful runc"
+        );
+        assert_eq!(
+            nix::unistd::Uid::effective().as_raw(),
+            0,
+            "the rootfs overlay acceptance must run as root"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            false,
+            tmp.path().join("state"),
+        );
+        let ids = [
+            InstanceId("runc-rootfs-isolation-0".to_string()),
+            InstanceId("runc-rootfs-isolation-1".to_string()),
+        ];
+        for id in &ids {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(ids.to_vec());
+
+        let spec_for =
+            |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
+                port_mapping: None,
+                root: crate::grill::oci::OciRoot {
+                    path: "alpine:latest".to_string(),
+                    readonly: false,
+                },
+                process: crate::grill::oci::OciProcess {
+                    args: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "sleep {initial_delay}; echo {value} > /reliaburger-isolation; \
+                             sleep {final_delay}; test \"$(cat /reliaburger-isolation)\" = {value}"
+                        ),
+                    ],
+                    env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                    cwd: "/".to_string(),
+                    user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+                },
+                mounts: crate::grill::oci::standard_mounts(),
+                linux: crate::grill::oci::OciLinux {
+                    namespaces: crate::grill::oci::standard_namespaces(None),
+                    resources: None,
+                    cgroups_path: None,
+                    uid_mappings: None,
+                    gid_mappings: None,
+                },
+            };
+        let specs = [spec_for("alpha", 0, 3), spec_for("beta", 1, 1)];
+
+        for (id, spec) in ids.iter().zip(&specs) {
+            grill
+                .create(id, spec)
+                .await
+                .expect("prepare isolated rootfs");
+            grill.start(id).await.expect("start rootfs writer");
+        }
+
+        let configs: Vec<crate::grill::oci::OciSpec> = ids
+            .iter()
+            .map(|id| {
+                serde_json::from_slice(
+                    &std::fs::read(tmp.path().join("bundles").join(&id.0).join("config.json"))
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_ne!(
+            configs[0].root.path, configs[1].root.path,
+            "replicas must not point runc at one writable rootfs"
+        );
+        let rootfs_paths: Vec<PathBuf> = configs
+            .iter()
+            .map(|config| PathBuf::from(&config.root.path))
+            .collect();
+        for rootfs in &rootfs_paths {
+            assert!(
+                crate::grill::rootfs::is_mountpoint(rootfs),
+                "private rootfs must remain mounted while runc uses it"
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut all_stopped = true;
+            for id in &ids {
+                all_stopped &= matches!(grill.state(id).await, Ok(ContainerState::Stopped));
+            }
+            if all_stopped {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "writers did not exit");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        for id in &ids {
+            assert_eq!(
+                grill.exit_code(id).await,
+                Some(0),
+                "{id} observed another replica's write: {}",
+                grill.logs(id).await.unwrap()
+            );
+        }
+        for rootfs in &rootfs_paths {
+            assert!(
+                !crate::grill::rootfs::is_mountpoint(rootfs),
+                "natural exit must not leak an overlay mount"
+            );
+        }
+
+        // Recreating the same instance on the same image generation remounts
+        // its private upper. Each replica keeps its own file across restart.
+        for ((id, spec), value) in ids.iter().zip(&specs).zip(["alpha", "beta"]) {
+            let mut restart = spec.clone();
+            restart.process.args = vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!("test \"$(cat /reliaburger-isolation)\" = {value}"),
+            ];
+            grill
+                .create(id, &restart)
+                .await
+                .expect("remount private rootfs");
+            grill.start(id).await.expect("restart rootfs reader");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut all_stopped = true;
+            for id in &ids {
+                all_stopped &= matches!(grill.state(id).await, Ok(ContainerState::Stopped));
+            }
+            if all_stopped {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restarted readers did not exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for (id, rootfs) in ids.iter().zip(&rootfs_paths) {
+            assert_eq!(grill.exit_code(id).await, Some(0));
+            assert!(!crate::grill::rootfs::is_mountpoint(rootfs));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, network access to an OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_create_failure_rolls_back_private_rootfs_mount() {
+        assert!(runc_tests_enabled());
+        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("runc-rootfs-create-failure-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let bundle = tmp.path().join("bundles").join(&id.0);
+        std::fs::create_dir_all(bundle.join("config.json")).unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            false,
+            tmp.path().join("state"),
+        );
+        let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
+            root: crate::grill::oci::OciRoot {
+                path: "alpine:latest".to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                args: vec!["/bin/true".to_string()],
+                env: vec![],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: crate::grill::oci::standard_mounts(),
+            linux: crate::grill::oci::OciLinux {
+                namespaces: crate::grill::oci::standard_namespaces(None),
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+
+        let error = grill.create(&id, &spec).await.unwrap_err();
+        assert!(error.to_string().contains("failed to write config.json"));
+        assert!(
+            !crate::grill::rootfs::is_mountpoint(&bundle.join("rootfs")),
+            "a failed create must release its overlay mount"
+        );
+        assert!(grill.networks.lock().await.get(&id).is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_adoption_keeps_private_rootfs_and_releases_mount() {
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after provisioning rootful runc"
+        );
+        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_base = tmp.path().join("bundles");
+        let image_store = ImageStore::new(tmp.path().join("images"));
+        let state_dir = tmp.path().join("state");
+        let id = InstanceId("runc-rootfs-adoption-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let spec = crate::grill::oci::OciSpec {
+            port_mapping: None,
+            root: crate::grill::oci::OciRoot {
+                path: "alpine:latest".to_string(),
+                readonly: false,
+            },
+            process: crate::grill::oci::OciProcess {
+                args: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo adopted > /reliaburger-isolation; sleep 30".to_string(),
+                ],
+                env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: crate::grill::oci::standard_mounts(),
+            linux: crate::grill::oci::OciLinux {
+                namespaces: crate::grill::oci::standard_namespaces(None),
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+
+        let original = RuncGrill::new(
+            bundle_base.clone(),
+            image_store.clone(),
+            false,
+            state_dir.clone(),
+        );
+        original.create(&id, &spec).await.unwrap();
+        original.start(&id).await.unwrap();
+        let pid = original.pid(&id).await.unwrap();
+        let started_at = crate::grill::records::process_start_time(pid).unwrap();
+        let rootfs = bundle_base.join(&id.0).join("rootfs");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if original
+                .exec(
+                    &id,
+                    &["cat".to_string(), "/reliaburger-isolation".to_string()],
+                )
+                .await
+                .is_ok_and(|output| output.trim() == "adopted")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workload did not write its private file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let record = crate::grill::records::InstanceRecord {
+            schema: 1,
+            instance_id: id.0.clone(),
+            namespace: "default".to_string(),
+            app_name: "rootfs-adoption".to_string(),
+            replica_index: 0,
+            is_job: false,
+            image: "alpine:latest".to_string(),
+            runtime: crate::grill::records::RuntimeKind::Runc,
+            pid,
+            pid_started_at: started_at,
+            runc_container_id: Some(id.0.clone()),
+            log_stem: None,
+            host_port: None,
+            app_spec: None,
+            oci_spec: spec,
+        };
+        drop(original); // A Bun exec/process death drops the child handle only.
+
+        let adopter = RuncGrill::new(bundle_base, image_store, false, state_dir);
+        assert!(adopter.adopt(&id, &record).await.unwrap());
+        assert!(crate::grill::rootfs::is_mountpoint(&rootfs));
+        let contents = adopter
+            .exec(
+                &id,
+                &["cat".to_string(), "/reliaburger-isolation".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(contents.trim(), "adopted");
+
+        adopter.kill(&id).await.unwrap();
+        assert!(!crate::grill::rootfs::is_mountpoint(&rootfs));
+    }
+
+    #[tokio::test]
     #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_captures_exit_code_and_logs() {
         assert!(
@@ -1008,7 +1426,7 @@ mod tests {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
                 path: "alpine:latest".to_string(),
-                readonly: false,
+                readonly: true,
             },
             process: crate::grill::oci::OciProcess {
                 // Absolute path: a bare "sh" needs $PATH, which a hand-built

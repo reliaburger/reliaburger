@@ -22,6 +22,8 @@ pub mod process;
 pub mod process_workload;
 pub mod records;
 #[cfg(target_os = "linux")]
+mod rootfs;
+#[cfg(target_os = "linux")]
 pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
