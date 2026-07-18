@@ -709,9 +709,8 @@ relish exec --debug --privileged <instance> # Debug container with firewall bypa
 relish exec --node <node> -- <cmd>  # Run command on host (admin only)
 
 # Cluster lifecycle
-relish init                         # Initialise a new cluster (first node)
-relish init --import-key <path>     # Init with existing encryption key
-relish join --token <token> <addr>  # Join an existing cluster
+relish init [dir] --cluster-name <name> --node-id <id> # Generate config + PKI
+relish join --token <token> --node-id <id> <api-addr>  # Enrol node identity
 
 # Secrets
 relish secret pubkey                # Print cluster encryption public key
@@ -721,11 +720,12 @@ relish secret encrypt --pubkey <key> --file <path> # Encrypt a file
 relish secret rotate                # Generate new keypair, re-encrypt all secrets
 
 # Tokens
-relish token create                 # Create new API token
-relish token create --role <role>   # Specify role (admin, deployer, read-only)
-relish token create --ttl <dur>     # Set TTL (default 90d)
-relish token create --apps <list>   # Scope to specific apps
-relish token create --namespaces <list> # Scope to specific namespaces
+relish join-token create --ttl 15m # Create one node-enrolment token
+relish token create --name <name>   # Create new API token
+relish token create --name <name> --role <role> # admin, deployer, read-only
+relish token create --name <name> --ttl-days <days>
+relish token create --name <name> --apps <list> # Scope to specific apps
+relish token create --name <name> --namespaces <list> # Scope to namespaces
 relish token list                   # List all tokens with last-used and expiry
 relish token rotate <name>          # Rotate token with grace period
 relish token revoke <name>          # Revoke a token immediately
@@ -809,13 +809,10 @@ relish import -f <path> --strict            # Exit non-zero if any warnings
 relish export --format kubernetes -f <path> # Export to Kubernetes manifests
 
 # Global flags (available on all commands)
-  --cluster <addr>          # Override cluster endpoint
+  --endpoint <url>          # Override Bun API URL / RELIABURGER_ENDPOINT
   --output <format>         # Output format: human, json, yaml
-  --namespace <ns>          # Target namespace
-  --token <token>           # API token (overrides config)
-  --no-colour                # Disable ANSI colours
-  --verbose                 # Enable debug logging
-  --timeout <duration>      # Request timeout
+  --token <token>           # API token / RELIABURGER_TOKEN
+  --ca-cert <path>          # Cluster root CA / RELIABURGER_CA_CERT
 ```
 
 ### Detailed Command Behaviour
@@ -1117,13 +1114,46 @@ Navigation:
 
 #### Cluster Lifecycle Commands
 
-**`relish init`**
+**`relish init [dir] --cluster-name <name> --node-id <id>`**
 
-Initializes a new cluster on the current node. Generates root CA and intermediate CAs (node, workload, ingress), generates OIDC signing key, generates age encryption keypair, starts the Bun agent, and prints the join token and dashboard URL. Prompts to configure an external signing key for upgrades.
+Creates the output directory and writes `reliaburger.toml`, a sample
+`app.toml`, the CA hierarchy, sealed root backup, master key, initial security
+state and the first node's identity. It prints the one-use join token and root
+CA fingerprint. It does **not** start Bun. The operator starts the first node
+explicitly with `bun --cluster --config <dir>/reliaburger.toml`; the generated
+config requires mTLS unless `--development-plaintext` was explicitly used.
 
-**`relish join --token <token> <address>`**
+**`relish join --token <token> --node-id <id> <api-address>`**
 
-Joins an existing cluster. Authenticates via the join token, receives a node certificate signed by the Node CA, and begins accepting workloads.
+Contacts the current leader's agent API (normally HTTPS on port 9117), sends a
+CSR, validates and consumes the join token, and writes the returned certificate
+bundle to `--identity-dir` (default `identity`). `--ca-fingerprint sha256:...`
+pins the first exchange. The command doesn't add `[cluster].join`, copy the
+cluster master key, start Bun or claim that gossip membership has converged;
+those are explicit provisioning and startup steps. Port 9443 is a gossip seed,
+not a valid API address for this command.
+
+**`relish join-token create [--ttl <duration>]`**
+
+Calls `POST /v1/join-token/create` with `ttl_seconds`. The command accepts a
+whole number followed by `s`, `m` or `h`, defaults to `15m`, and rejects values
+outside `1s..=1h` before dispatch. The API requires a user Admin principal
+(the internal service principal is not enough), creates the token server-side,
+commits only `JoinToken { token_hash, expires_at, consumed: false,
+attestation_mode }` to Raft, then returns the plaintext once:
+
+```json
+{
+  "token": "rbrg_join_1_...",
+  "ttl_seconds": 900,
+  "expires_at": 1784310900
+}
+```
+
+The endpoint is leader-only. A follower or election window returns `503`
+without the plaintext, so the operator can retry safely against the current
+leader. This is intentionally not a subcommand of `relish token`: those
+commands manage long-lived API bearer credentials, not node enrolment.
 
 #### Testing & Benchmarking Commands
 

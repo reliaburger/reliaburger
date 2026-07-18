@@ -127,8 +127,13 @@ Cluster initialised.
 New nodes join by presenting a join token:
 
 ```bash
-$ relish join --token rbrg_join_1_a7f3b9c2... 10.0.1.5:9443
+$ relish join --token rbrg_join_1_a7f3b9c2... --node-id node-02 \
+    --ca-fingerprint sha256:0123... https://10.0.1.5:9117
 ```
+
+Port 9117 is the member's agent API. Port 9443 is the gossip seed that belongs
+in the joining node's `[cluster].join` configuration; pointing the HTTPS client
+at it can't work.
 
 The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, and hasn't been consumed, the council marks it as consumed and issues a node certificate.
 
@@ -140,17 +145,27 @@ The issuer takes exactly one thing from the CSR — its public key. Every other 
 
 That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
 
-But that first token is single-use. It expires after 15 minutes, and once one node has used it, it's gone. How do you add a second node? A tenth?
+But that first token is single-use. It expires after 15 minutes, and once one
+node has used it, it's gone. How do you add a second node? Mint another
+credential, explicitly:
 
-Any admin with an existing token can generate more:
-
-```bash
-$ relish token create --name join-batch --role admin
+```sh
+JOIN_TOKEN="$(relish --ca-cert root-ca.crt --token "$ADMIN_TOKEN" \
+  join-token create --ttl 15m)"
 ```
 
-The council writes a new join token to Raft via `generate_new_join_token()`, which takes an explicit TTL. The function is the same one `relish init` uses internally — the only difference is that `init` calls it once automatically, while subsequent tokens are created on demand. Each token is independent: its own 256-bit random value, its own hash, its own expiry. Consume one and the others are unaffected.
+`relish token create` still means an **API bearer token**. `relish join-token
+create` means a short-lived credential that can enrol exactly one node. The
+hyphen is doing useful security work here: operators and scripts can't quietly
+confuse two secrets with very different powers.
 
-Phase 4 builds the token machinery: generation, hashing, and storage in Raft. The full lifecycle around it — enforcing single-use and expiry inside the agent, plus `relish token list` and `relish token revoke` — needs `SecurityState` to live in the Raft state machine, which doesn't arrive until Chapter 10. So treat this section as the foundation; we close the loop on token validation and revocation there.
+The CLI parser turns `15m` into seconds and rejects anything below one second
+or above one hour. The Admin-only handler generates the random plaintext,
+commits a `JoinToken` containing only its SHA-256 hash and expiry to Raft, and
+prints the plaintext after that write succeeds. If the request lands on a
+follower during an election it returns an error without the plaintext. Point
+the retry at the current leader. No orphan token, no optimistic success, no
+creative archaeology in the Raft data directory. Nice and boring.
 
 After that, every internal TCP connection between cluster nodes uses mutual TLS. Raft and reporting require node certificates. Peer API clients present the same identity too, although the API listener also accepts certificate-less Relish and browser connections because those authenticate with a bearer token or session cookie. Both peer sides verify the Node CA chain and the live revocation list. A plain TCP connection to one of these TLS ports gets rejected immediately.
 

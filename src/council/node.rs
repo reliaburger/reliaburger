@@ -840,6 +840,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_token_issuance_fails_closed_on_a_follower_and_survives_failover() {
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader = &nodes[(leader_id - 1) as usize];
+        let (_, before_failover) =
+            crate::sesame::join::create_join_token(crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL)
+                .unwrap();
+        let before_hash = before_failover.token_hash;
+        leader
+            .write(RaftRequest::CreateJoinToken(before_failover))
+            .await
+            .unwrap();
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(3), |state| {
+                state
+                    .security_state
+                    .join_tokens
+                    .iter()
+                    .any(|token| token.token_hash == before_hash)
+            })
+            .await
+        );
+
+        let follower_idx = nodes
+            .iter()
+            .enumerate()
+            .find(|(index, _)| *index as u64 + 1 != leader_id)
+            .map(|(index, _)| index)
+            .unwrap();
+        let (_, refused) =
+            crate::sesame::join::create_join_token(crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL)
+                .unwrap();
+        let refused_hash = refused.token_hash;
+        assert!(matches!(
+            nodes[follower_idx]
+                .write(RaftRequest::CreateJoinToken(refused))
+                .await,
+            Err(CouncilError::ForwardToLeader { .. })
+        ));
+        for node in &nodes {
+            assert!(
+                node.security_state()
+                    .await
+                    .join_tokens
+                    .iter()
+                    .all(|token| token.token_hash != refused_hash),
+                "a follower must not commit the token it refused"
+            );
+        }
+
+        leader.shutdown().await.unwrap();
+        let remaining: Vec<&CouncilNode> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index as u64 + 1 != leader_id)
+            .map(|(_, node)| node)
+            .collect();
+        let new_leader_id =
+            wait_for_leader_refs(&remaining, Duration::from_secs(5), Some(leader_id))
+                .await
+                .expect("no new leader");
+        let new_leader = &nodes[(new_leader_id - 1) as usize];
+
+        let (_, after_failover) =
+            crate::sesame::join::create_join_token(crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL)
+                .unwrap();
+        let after_hash = after_failover.token_hash;
+        new_leader
+            .write(RaftRequest::CreateJoinToken(after_failover))
+            .await
+            .unwrap();
+        let state = new_leader.security_state().await;
+        assert!(
+            state
+                .join_tokens
+                .iter()
+                .any(|token| token.token_hash == before_hash)
+        );
+        assert!(
+            state
+                .join_tokens
+                .iter()
+                .any(|token| token.token_hash == after_hash)
+        );
+        assert!(
+            state
+                .join_tokens
+                .iter()
+                .all(|token| token.token_hash != refused_hash)
+        );
+    }
+
+    #[tokio::test]
     async fn membership_changes_compose_add_then_evict() {
         // The self-healing reconciler's sequence: add a learner, promote it
         // via joint consensus, then evict a voter without leaving it behind

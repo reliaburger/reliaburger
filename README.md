@@ -35,40 +35,68 @@ Everything runs inside a single `bun` binary. No sidecars, no separate databases
 ## Quick start
 
 ```sh
-# Build
-cargo build
+# Build all three binaries (including the example workload)
+cargo build --bins
 
-# Run the node agent
-cargo run --bin bun
+# Run the node agent without an external container runtime
+target/debug/bun --runtime process
 
 # In another terminal — deploy the example app
-cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
+target/debug/relish apply examples/phase-1/proc-first-run.toml
 
 # Check what's running
-cargo run --bin relish -- status
+target/debug/relish status
 
 # Or explore the cluster interactively
-cargo run --bin relish
+target/debug/relish
 
 # View the dashboard
 open http://localhost:9117/
 
 # Show live resource usage
-cargo run --bin relish -- top
+target/debug/relish top
 ```
 
-To initialise a cluster, generate its PKI and secure node configuration first:
+That sequence is intentionally ProcessGrill-only: it runs a real supervised
+process, but doesn't provide container isolation. The
+`examples/phase-1/proc-minimal-app.toml` example adds fixed-port service and
+health-check behaviour once you want to explore further.
+
+For a minimal secure clustered-mode first run on Linux, install runc, then use
+the generated PKI, node config and container app:
 
 ```sh
-mkdir cluster
-cargo run --bin relish -- init cluster --cluster-name prod --node-id node-01
-cargo run --bin bun -- --cluster --config cluster/reliaburger.toml
+target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
+
+# In another terminal, create the first administrator while the API is still
+# in its loopback-only bootstrap window, then deploy the generated app.
+export RELIABURGER_TOKEN="$(target/debug/relish \
+  --ca-cert cluster/identity/root-ca.crt \
+  token create --name first-admin --role admin)"
+target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.toml
+target/debug/relish --ca-cert cluster/identity/root-ca.crt status
+
+# Mint one short-lived, single-use token for each additional node.
+JOIN_NODE_02="$(target/debug/relish --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
+JOIN_NODE_03="$(target/debug/relish --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
 ```
 
 The generated config sets `[security] require_mtls = true`. Raft, reporting
 and peer API calls therefore use the generated node identity without a manual
-edit. For an isolated local experiment only, `relish init
+edit. The API is HTTPS on `127.0.0.1:9117`; Relish trusts it through the
+generated root CA and authenticates with `RELIABURGER_TOKEN`. Apple Container
+uses `--runtime apple` without `sudo`. For an isolated local experiment only, `relish init
 --development-plaintext` writes a conspicuously warned plaintext config.
+
+Run `relish join` once on each additional machine with its own token and node
+id. The command writes that node's CSR-signed identity; it doesn't copy the
+cluster master key or create its node config. Provision those separately, set
+`[cluster].join` to an existing node's gossip address, then start Bun. Point
+join-token creation and enrolment at the current leader during an election;
+a follower refuses the mutation without returning a usable token.
 
 See [docs/README.md](docs/README.md) for prerequisites, container runtime setup, and full CLI reference.
 

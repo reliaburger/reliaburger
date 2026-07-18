@@ -187,6 +187,29 @@ are stable on consistent hardware.
 
 ## Running
 
+### Portable first run
+
+This path needs no container runtime. Build all binaries first because the
+workload itself is the `testapp` binary:
+
+```sh
+cargo build --bins
+target/debug/bun --runtime process
+```
+
+Leave Bun running. In a second terminal:
+
+```sh
+target/debug/relish apply examples/phase-1/proc-first-run.toml
+target/debug/relish status
+target/debug/relish top
+```
+
+You should see the `hello` workload in `Running` state. Open
+<http://127.0.0.1:9117/> for the dashboard. ProcessGrill supervises a real OS
+process, but it doesn't isolate it; use runc or Apple Container for container
+workloads.
+
 ### Node agent (bun)
 
 The bun agent manages container lifecycle, health checks, and the local HTTP API.
@@ -243,10 +266,55 @@ on a non-loopback address.
 configuration; no security switch needs hand-editing:
 
 ```sh
-mkdir cluster
-cargo run --bin relish -- init cluster --cluster-name prod --node-id node-01
-cargo run --bin bun -- --cluster --config cluster/reliaburger.toml
+target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
+
+The output directory is created if it doesn't exist. Leave Bun running and,
+from another terminal, mint the first administrator token over the generated
+cluster CA before doing anything else:
+
+```sh
+export RELIABURGER_TOKEN="$(target/debug/relish \
+  --ca-cert cluster/identity/root-ca.crt \
+  token create --name first-admin --role admin)"
+
+target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.toml
+target/debug/relish --ca-cert cluster/identity/root-ca.crt status
+```
+
+This is a one-node Raft cluster: clustered code paths are live, but it cannot
+survive a node failure. The API listens at `https://127.0.0.1:9117`. On Apple
+Silicon use `--runtime apple` and run Bun as your ordinary user; don't put
+Apple Container behind `sudo`.
+
+To grow this into a resilient three-voter council, mint one token per new
+node. Join tokens are deliberately separate from API bearer tokens:
+
+```sh
+JOIN_NODE_02="$(target/debug/relish \
+  --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
+JOIN_NODE_03="$(target/debug/relish \
+  --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
+
+# Run this on node-02 after provisioning the binary, cluster master key and
+# a node-specific config. Repeat with JOIN_NODE_03 and node-03.
+target/debug/relish join --token "$JOIN_NODE_02" --node-id node-02 \
+  --identity-dir identity \
+  --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> \
+  https://<CURRENT_LEADER>:9117
+```
+
+Set each joiner's `[cluster].join` to an existing member's gossip address
+(port 9443 by default), give it unique storage paths and ports, and then start
+`bun --cluster` with that config. `relish join` enrols identity only; it
+doesn't provision or start the node. Token creation accepts `--ttl` from `1s`
+to `1h` (default `15m`), requires an Admin bearer after bootstrap, commits only
+the token hash and expiry to Raft, and prints the plaintext once. During an
+election, retry against the current leader: a follower returns an error and
+does not commit or disclose a usable token.
 
 The generated security section contains the material paths and the secure
 mode:
@@ -304,7 +372,8 @@ Commands:
 | `init [dir]` | Generate PKI and an mTLS-required starter config (`--development-plaintext` is an explicit local-only exception) |
 | `nodes` | List cluster nodes and their gossip state |
 | `council` | Show council (Raft) composition and status |
-| `join --token <token> <addr>` | Join an existing cluster |
+| `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
+| `join-token create --ttl 15m` | Mint one Admin-authorised, single-use node-enrolment token |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |
@@ -414,6 +483,9 @@ Global flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--output <format>` | `human` | Output format: `human`, `json`, `yaml` |
+| `--endpoint <url>` | local API | Bun API base URL; overrides `RELIABURGER_ENDPOINT` |
+| `--ca-cert <path>` | unset | Cluster root CA PEM; switches the local default to HTTPS |
+| `--token <token>` | environment | API bearer token; overrides `RELIABURGER_TOKEN` |
 
 Examples:
 
@@ -421,8 +493,8 @@ Examples:
 # Deploy the example app (agent must be running)
 cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
 
-# Deploy without agent (shows dry-run plan)
-cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml
+# Preview without contacting an agent
+cargo run --bin relish -- apply examples/phase-1/proc-minimal-app.toml --dry-run
 
 # List running workloads
 cargo run --bin relish -- status
@@ -449,14 +521,14 @@ cargo run --bin relish -- stop web
 cargo run --bin relish -- init myproject
 ```
 
-If no agent is running, `apply` falls back to a dry-run plan showing what *would* happen:
+`apply --dry-run` shows what would happen without contacting an agent:
 
 ```
 app "web" (proc-grill:image-ignored)
   1 replica, port 8080
   health: GET /healthz every 10s
 
-(dry run — bun agent not reachable, showing plan only)
+(dry run — nothing deployed)
 ```
 
 ### TestApp utility
@@ -535,6 +607,7 @@ Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-appl
 | Example | Demonstrates |
 |---------|-------------|
 | **ProcessGrill** (`proc-*`) | **Runs local processes — no container runtime needed** |
+| [`proc-first-run.toml`](../examples/phase-1/proc-first-run.toml) | Collision-free portable first run |
 | [`proc-minimal-app.toml`](../examples/phase-1/proc-minimal-app.toml) | App with health check + worker |
 | [`proc-restarts.toml`](../examples/phase-1/proc-restarts.toml) | App that goes unhealthy and gets restarted |
 | [`proc-job-success.toml`](../examples/phase-1/proc-job-success.toml) | Job that runs to completion |

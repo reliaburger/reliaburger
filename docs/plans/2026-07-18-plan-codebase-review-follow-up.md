@@ -281,17 +281,66 @@ and cleanup leaves no mounts behind.
 **Finding:** DOC-1. The whitepaper quick start uses commands and output that
 don't match current clap definitions or `relish init` behaviour.
 
-- [ ] Define one canonical standalone first run and one minimal clustered first
+- [x] Define one canonical standalone first run and one minimal clustered first
   run using the current binary boundaries and ports.
-- [ ] Add a documentation smoke test that executes or dry-runs every Reliaburger
+- [x] Add a documentation smoke test that executes or dry-runs every Reliaburger
   command in those sequences in temporary directories.
-- [ ] Generate/check command snippets against clap so flags such as positional
+- [x] Generate/check command snippets against clap so flags such as positional
   `apply` paths and required `join --node-id` can't drift silently.
-- [ ] Correct the whitepaper, top-level README, `docs/README.md` and relevant book
+- [x] Correct the whitepaper, top-level README, `docs/README.md` and relevant book
   walkthroughs together.
 
 **Acceptance:** a new operator can copy the published sequence on a supported
 runtime, and CI rejects future command drift.
+
+**Delivered on the H5 branch:** the portable path now builds all binaries,
+forces ProcessGrill and applies a collision-free `proc-first-run.toml`. The
+secure path creates a directory and mTLS cluster, starts Bun explicitly,
+creates the first Admin token over the generated CA and applies an executable
+BusyBox sample whose command and port don't depend on an ignored image
+entrypoint. `--endpoint`/`RELIABURGER_ENDPOINT` make Relish usable against an
+explicit API and keep the tests on ephemeral ports; plaintext endpoints are
+restricted to IP-literal loopback. Four black-box tests run both real Bun
+processes, the HTTPS/token path and the documented clap shapes. Portable
+Clippy, 2,662 default tests, 2,644 no-default tests, all 21 cluster tests,
+doctests and the dependency audit pass. macOS `--all-features` Clippy still
+hits the pre-existing Linux/Aya target-boundary failure owned by M2; the
+supported all-target portable gate passes with warnings denied.
+
+### H7. Make post-bootstrap node enrolment possible
+
+**Finding:** the executable H5 audit found a prerequisite that DOC-1's old
+three-node story hid. `relish init` creates one 15-minute, single-use join
+token. The second node consumes it, and no API or CLI can create another.
+`RaftRequest::CreateJoinToken` and `sesame::join::generate_new_join_token`
+exist, but nothing reachable connects them. `relish token create` creates an
+API bearer token, not a join token. A fresh cluster therefore cannot enrol a
+third node through the supported interface.
+
+- [x] Write an authenticated API contract and CLI command dedicated to join
+  tokens; don't overload API bearer-token commands.
+- [x] Require Admin authorisation, validate a bounded TTL and commit only the
+  hash plus expiry to Raft. Print the plaintext exactly once.
+- [x] Prove two separately minted tokens enrol two distinct CSR-bearing nodes,
+  while reuse, expiry, a non-Admin principal and a follower/leader transition
+  fail safely.
+- [x] Add a three-node executable provisioning walkthrough after the command
+  exists, replacing the temporary one-extra-node limitation with tested
+  issuance, enrolment and startup steps.
+
+**Acceptance:** an authenticated operator can enrol enough nodes to form a
+three-voter council without regenerating PKI or editing Raft state, and the
+full sequence is covered by a real cluster test.
+
+**Delivered:** `relish join-token create --ttl 15m` calls an Admin-only API,
+accepts `1s..=1h`, and returns plaintext only after the hash and expiry commit.
+A real-binary test creates two credentials, enrols two independently generated
+CSRs, proves Deployer/reuse/expiry refusal, starts both Bun joiners and waits
+for all three nodes to converge on the voter set. A separate three-member Raft
+test proves a follower's refused token never appears in state and issuance
+continues after leader replacement. The regression gate passes 2,670 portable,
+2,652 no-default and all 21 gated cluster tests; warnings-as-errors Clippy,
+doctests and the RustSec audit also pass.
 
 ## Medium-value
 
@@ -392,7 +441,8 @@ architectural prerequisite and start first. H2 and H3 may introduce the minimum 
 capability type needed for their own fail-closed decisions; M1 generalises it
 after those contracts are proven. H4 follows without waiting for M1. H6 closes
 the newly proven rootfs isolation boundary, then H5 publishes a first-run path
-against the settled secure defaults and commands.
+against the settled secure defaults and commands. H7 then removes the newly
+proven enrolment prerequisite before we call the high-value gate complete.
 
 For every production change:
 
@@ -403,5 +453,5 @@ For every production change:
 5. run privileged Linux/cluster/runtime gates when the boundary needs them; and
 6. record exact acceptance evidence before checking the progress item.
 
-When H0-H6 are green together, rerun the complete review matrix. Only then mark
+When H0-H7 are green together, rerun the complete review matrix. Only then mark
 the high-value gate complete and resume the remaining Phase 15 feature order.

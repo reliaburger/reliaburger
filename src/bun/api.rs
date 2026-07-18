@@ -391,6 +391,7 @@ pub fn router_with_upgrade(
         .route("/v1/token/create", post(token_create_handler))
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
+        .route("/v1/join-token/create", post(join_token_create_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -3838,6 +3839,101 @@ async fn token_create_handler(
     }
 }
 
+/// Create a short-lived, single-use node join token and persist its hash.
+///
+/// This is deliberately separate from API bearer-token management. The
+/// plaintext exists only in this request and response; Raft receives the
+/// SHA-256 hash, expiry and attestation policy.
+async fn join_token_create_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+
+    fn default_ttl_seconds() -> u64 {
+        crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL.as_secs()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CreateRequest {
+        #[serde(default = "default_ttl_seconds")]
+        ttl_seconds: u64,
+    }
+
+    let req: CreateRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+
+    let ttl = std::time::Duration::from_secs(req.ttl_seconds);
+    let (plaintext, join_token) = match crate::sesame::join::create_join_token(ttl) {
+        Ok(created) => created,
+        Err(crate::sesame::join::JoinError::InvalidTtl { .. }) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "ttl_seconds must be between {} and {}",
+                        crate::sesame::join::MIN_JOIN_TOKEN_TTL.as_secs(),
+                        crate::sesame::join::MAX_JOIN_TOKEN_TTL.as_secs(),
+                    )
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let expires_at = join_token
+        .expires_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    match council
+        .write(crate::council::RaftRequest::CreateJoinToken(join_token))
+        .await
+    {
+        Ok(_) => Json(serde_json::json!({
+            "token": plaintext,
+            "ttl_seconds": req.ttl_seconds,
+            "expires_at": expires_at,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("failed to commit join token (try the cluster leader): {e}")
+            })),
+        )
+            .into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Secret rotation endpoint
 // ---------------------------------------------------------------------------
@@ -4295,6 +4391,83 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn admin_token_may_create_a_join_token() {
+        let (app, shutdown, tok) =
+            setup_with_role("role-admin-join", crate::sesame::types::ApiRole::Admin).await;
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/join-token/create")
+                    .header("authorization", format!("Bearer {tok}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"ttl_seconds":900}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["token"]
+                .as_str()
+                .is_some_and(|token| token.starts_with("rbrg_join_1_"))
+        );
+        assert_eq!(json["ttl_seconds"], 900);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn non_admin_token_cannot_create_a_join_token() {
+        let (app, shutdown, tok) = setup_with_role(
+            "role-deployer-join",
+            crate::sesame::types::ApiRole::Deployer,
+        )
+        .await;
+        let status =
+            post_status(app, "/v1/join-token/create", &tok, r#"{"ttl_seconds":900}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn service_principal_cannot_create_a_join_token() {
+        let (user, _plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (app, shutdown) =
+            setup_with_auth(vec![user], Some("rbrg_service_join_test".to_string())).await;
+        let status = post_status(
+            app,
+            "/v1/join-token/create",
+            "rbrg_service_join_test",
+            r#"{"ttl_seconds":900}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn join_token_ttl_is_bounded() {
+        for (tag, ttl) in [("zero", 0), ("too-long", 3_601)] {
+            let (app, shutdown, tok) = setup_with_role(
+                &format!("join-ttl-{tag}"),
+                crate::sesame::types::ApiRole::Admin,
+            )
+            .await;
+            let status = post_status(
+                app,
+                "/v1/join-token/create",
+                &tok,
+                &serde_json::json!({ "ttl_seconds": ttl }).to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "ttl={ttl}");
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]
@@ -4820,6 +4993,65 @@ mod tests {
         let stored = council.security_state().await.api_tokens;
         let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
         assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn join_token_create_returns_two_distinct_plaintexts_and_stores_only_hashes() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let council = seeded_council("join-token-create").await;
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&council)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+
+        let mut plaintexts = Vec::new();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/join-token/create")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"ttl_seconds":900}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            plaintexts.push(json["token"].as_str().unwrap().to_string());
+        }
+        assert_ne!(plaintexts[0], plaintexts[1]);
+
+        let stored = council.security_state().await.join_tokens;
+        assert_eq!(stored.len(), 3, "bootstrap token plus two new tokens");
+        for plaintext in &plaintexts {
+            assert!(
+                stored
+                    .iter()
+                    .any(|token| crate::sesame::ca::verify_join_token(
+                        plaintext,
+                        &token.token_hash
+                    )),
+                "returned token must match one committed hash"
+            );
+        }
+        let serialised = serde_json::to_string(&stored).unwrap();
+        assert!(plaintexts.iter().all(|token| !serialised.contains(token)));
     }
 
     #[tokio::test]

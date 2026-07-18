@@ -14,7 +14,14 @@ use serde::{Deserialize, Serialize};
 use super::ca;
 use super::crypto;
 use super::identity_store::NodeIdentity;
-use super::types::{CaRole, SecurityState, SerialNumber};
+use super::types::{CaRole, JoinToken, SecurityState, SerialNumber};
+
+/// Default lifetime for an operator-minted join token.
+pub const DEFAULT_JOIN_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+/// Shortest join-token lifetime accepted by the API.
+pub const MIN_JOIN_TOKEN_TTL: Duration = Duration::from_secs(1);
+/// Longest join-token lifetime accepted by the API.
+pub const MAX_JOIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Errors from join operations.
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +32,8 @@ pub enum JoinError {
     TokenExpired,
     #[error("join token has already been consumed")]
     TokenConsumed,
+    #[error("join token TTL must be between 1 second and 1 hour (got {seconds} seconds)")]
+    InvalidTtl { seconds: u64 },
     #[error("no Node CA found in security state")]
     NoNodeCa,
     #[error("Node CA private key is not available")]
@@ -313,15 +322,31 @@ pub fn generate_new_join_token(
     state: &mut SecurityState,
     ttl: Duration,
 ) -> Result<String, JoinError> {
+    let (plaintext, join_token) = create_join_token(ttl)?;
+    state.join_tokens.push(join_token);
+    Ok(plaintext)
+}
+
+/// Create a join token without storing its plaintext.
+///
+/// The caller commits the returned [`JoinToken`] to Raft, then returns the
+/// plaintext to the operator exactly once. Keeping creation separate from
+/// storage prevents a failed Raft write from producing a token that looks
+/// usable but no council member can validate.
+pub fn create_join_token(ttl: Duration) -> Result<(String, JoinToken), JoinError> {
+    if !(MIN_JOIN_TOKEN_TTL..=MAX_JOIN_TOKEN_TTL).contains(&ttl) {
+        return Err(JoinError::InvalidTtl {
+            seconds: ttl.as_secs(),
+        });
+    }
     let (plaintext, hash) = ca::generate_join_token()?;
-    let join_token = super::types::JoinToken {
+    let join_token = JoinToken {
         token_hash: hash,
         expires_at: SystemTime::now() + ttl,
         consumed: false,
         attestation_mode: super::types::AttestationMode::None,
     };
-    state.join_tokens.push(join_token);
-    Ok(plaintext)
+    Ok((plaintext, join_token))
 }
 
 #[cfg(test)]

@@ -26,8 +26,18 @@ struct Cli {
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
+    /// Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default
+    /// local address (`http[s]://127.0.0.1:9117`).
+    #[arg(long, global = true, value_parser = parse_endpoint)]
+    endpoint: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+fn parse_endpoint(value: &str) -> Result<String, String> {
+    reliaburger::relish::client::validate_endpoint(value).map_err(|error| error.to_string())?;
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 #[derive(Subcommand)]
@@ -127,7 +137,7 @@ enum Command {
     },
     /// Join an existing cluster.
     Join {
-        /// Join token issued by `relish init` or `relish token create`.
+        /// Join token issued by `relish init` or `relish join-token create`.
         #[arg(long)]
         token: String,
         /// API address of an existing cluster member, e.g.
@@ -273,6 +283,11 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Manage short-lived node-enrolment tokens.
+    JoinToken {
+        #[command(subcommand)]
+        action: JoinTokenAction,
+    },
     /// Sign an image in the Pickle registry and attach the signature.
     Sign {
         /// Image reference or manifest digest (e.g. "myapp:v1" or "sha256:abc...").
@@ -405,6 +420,37 @@ enum TokenAction {
         /// Token name to revoke.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum JoinTokenAction {
+    /// Create a single-use token for enrolling one node.
+    Create {
+        /// Lifetime: an integer followed by s, m or h (1s to 1h).
+        #[arg(long, default_value = "15m", value_parser = parse_join_token_ttl)]
+        ttl: u64,
+    },
+}
+
+fn parse_join_token_ttl(value: &str) -> Result<u64, String> {
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 3_600_u64),
+        _ => return Err("TTL must end in s, m or h (for example 15m)".to_string()),
+    };
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| "TTL must start with a whole number".to_string())?;
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "TTL is too large".to_string())?;
+    let min = reliaburger::sesame::join::MIN_JOIN_TOKEN_TTL.as_secs();
+    let max = reliaburger::sesame::join::MAX_JOIN_TOKEN_TTL.as_secs();
+    if !(min..=max).contains(&seconds) {
+        return Err("TTL must be between 1s and 1h".to_string());
+    }
+    Ok(seconds)
 }
 
 #[derive(Subcommand)]
@@ -721,9 +767,13 @@ enum FaultAction {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Record the --token and --ca-cert overrides before any client is built.
+    // Record the global connection overrides before any client is built.
     reliaburger::relish::client::set_cli_token(cli.token.clone());
     reliaburger::relish::client::set_cli_ca_cert(cli.ca_cert.clone());
+    if let Err(reason) = reliaburger::relish::client::set_cli_endpoint(cli.endpoint.clone()) {
+        eprintln!("error: {reason}");
+        return ExitCode::FAILURE;
+    }
 
     let command = match cli.command {
         Some(command) => command,
@@ -964,6 +1014,9 @@ async fn main() -> ExitCode {
             }
             TokenAction::List => commands::token_list().await,
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
+        },
+        Command::JoinToken { action } => match &action {
+            JoinTokenAction::Create { ttl } => commands::join_token_create(*ttl).await,
         },
         Command::Sign { ref image } => commands::sign(image).await,
         Command::Dev { action } => match &action {
@@ -1797,5 +1850,55 @@ mod tests {
         // Absent by default.
         let cli = parse(&["relish", "status"]).unwrap();
         assert!(cli.token.is_none());
+    }
+
+    #[test]
+    fn endpoint_flag_parses_globally() {
+        let cli = Cli::try_parse_from([
+            "relish",
+            "status",
+            "--endpoint",
+            "https://node-01.example:9117",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.endpoint.as_deref(),
+            Some("https://node-01.example:9117")
+        );
+    }
+
+    #[test]
+    fn endpoint_flag_rejects_remote_plaintext() {
+        let result = Cli::try_parse_from([
+            "relish",
+            "status",
+            "--endpoint",
+            "http://node-01.example:9117",
+        ]);
+        let error = match result {
+            Ok(_) => panic!("remote plaintext endpoint should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn parse_join_token_create_with_a_bounded_ttl() {
+        let cli = Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "30m"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::JoinToken {
+                action: JoinTokenAction::Create { ttl: 1_800 }
+            })
+        ));
+        let cli = Cli::try_parse_from(["relish", "join-token", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::JoinToken {
+                action: JoinTokenAction::Create { ttl: 900 }
+            })
+        ));
+        assert!(Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "0s"]).is_err());
+        assert!(Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "61m"]).is_err());
     }
 }

@@ -1331,7 +1331,21 @@ convergence and adoption" theme under 12b.6).
 - [x] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1) — rootful runc derives and mounts a veth-gateway resolver, Bun pre-binds supervised UDP/TCP with `IP_FREEBIND`, and independent rolling-safe readiness leases gate placement. A checked-in two-workload rootful-runc/netns acceptance test resolves `redis.internal`; it also forced fixes for colliding long veth names and destructive repeated rootfs extraction. Unsupported runtimes and addresses fail before creation. Portable default/no-default suites pass 2,661/2,643 tests (39 named skips in each).
 - [x] Make generated clusters use mTLS by default (H4 / SEC-2) — normal `relish init` enables mTLS and writes its security bootstrap with the `0600` mode Bun requires (the init-to-Bun acceptance caught the old self-rejecting `0644` output); explicit init/Lima development plaintext configs and Bun startup warn. Peer API calls now present the node certificate and check the live CRL. A three-node real-runtime acceptance proves mTLS Raft, reporting and peer API traffic; rebased on merged H3, 2,666 portable, 2,648 no-default and all 21 cluster tests pass.
 - [x] Isolate writable runc root filesystems per workload (H6) — rootful runc now mounts one private OverlayFS upper/work pair per writable image instance over the shared content-addressed generation. Real privileged tests prove concurrent replicas can't observe each other's writes, same-instance restart and Bun adoption preserve only that instance's files, and natural exit, kill and failed create leave no visible mounts. Writable rootless image workloads fail closed; read-only image roots remain shareable. The adoption proof also fixed `runc exec` placing `--` after the container id, where runc treated it as the command.
-- [ ] Replace the broken published first-run sequence with an executable one (H5 / DOC-1)
+- [x] Replace the broken published first-run sequence with an executable one
+  (H5 / DOC-1) — portable ProcessGrill and secure one-voter mTLS sequences now
+  execute as real Bun/Relish black-box tests on ephemeral endpoints. Init
+  creates its output directory, the generated BusyBox app has an explicit
+  working command/port, remote endpoints require HTTPS, and clap/doc guards
+  reject the old `apply -f`, port-9443 join and missing-`--node-id` shapes.
+  Portable 2,662/2,662, no-default 2,644/2,644 and cluster 21/21 pass.
+- [x] Add authenticated post-bootstrap join-token issuance (H7) — dedicated
+  Admin-only `relish join-token create --ttl 15m`, bounded `1s..=1h`; only the
+  hash and expiry enter Raft and plaintext is returned once after commit. A
+  real Bun/Relish test enrols two CSR-bearing nodes, proves Deployer, reuse and
+  expiry refusal, starts both joiners and observes a three-voter mTLS council;
+  a three-member Raft test proves follower refusal and post-failover issuance.
+  Portable 2,670/2,670, no-default 2,652/2,652, cluster 21/21, Clippy,
+  doctests and the dependency audit pass.
 - [ ] Rerun the complete review matrix and close the high-value gate
 
 ### Medium-value
