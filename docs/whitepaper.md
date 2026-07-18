@@ -358,8 +358,18 @@ This bootstraps a real but non-resilient one-voter cluster.
 
 Adding a node is a separate two-part operation. Put its node-specific config
 and cluster master key on the machine, including the existing node's gossip
-address in `[cluster].join`. Then enrol its identity against an existing
-member's **API** address:
+address in `[cluster].join`. An authenticated administrator mints one
+short-lived token per node against the current leader:
+
+```sh
+$ JOIN_TOKEN="$(relish --endpoint https://10.0.1.5:9117 \
+    --ca-cert cluster/identity/root-ca.crt \
+    join-token create --ttl 15m)"
+```
+
+The council stores only its hash and expiry. Relish prints the plaintext once;
+the token enrols exactly one node. Then enrol that node's identity against the
+leader's **API** address:
 
 ```sh
 $ relish join --token "$JOIN_TOKEN" --node-id node-02 \
@@ -372,7 +382,9 @@ $ relish join --token "$JOIN_TOKEN" --node-id node-02 \
 start Bun or claim that the node has joined gossip. Start that node with
 `bun --cluster --config node-02/reliaburger.toml` after enrolment. The
 fingerprint check turns the initial certificate exchange from blind trust into
-an out-of-band verified hand-off.
+an out-of-band verified hand-off. If leadership changes, retry creation or
+enrolment against the new leader. A follower refuses the write rather than
+returning a token that Raft never committed.
 
 > For the full `node.toml` reference, storage path design, and resource configuration, see [design/agent-bun.md](design/agent-bun.md).
 

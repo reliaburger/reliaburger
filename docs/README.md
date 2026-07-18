@@ -287,6 +287,34 @@ survive a node failure. The API listens at `https://127.0.0.1:9117`. On Apple
 Silicon use `--runtime apple` and run Bun as your ordinary user; don't put
 Apple Container behind `sudo`.
 
+To grow this into a resilient three-voter council, mint one token per new
+node. Join tokens are deliberately separate from API bearer tokens:
+
+```sh
+JOIN_NODE_02="$(target/debug/relish \
+  --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
+JOIN_NODE_03="$(target/debug/relish \
+  --ca-cert cluster/identity/root-ca.crt \
+  join-token create --ttl 15m)"
+
+# Run this on node-02 after provisioning the binary, cluster master key and
+# a node-specific config. Repeat with JOIN_NODE_03 and node-03.
+target/debug/relish join --token "$JOIN_NODE_02" --node-id node-02 \
+  --identity-dir identity \
+  --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> \
+  https://<CURRENT_LEADER>:9117
+```
+
+Set each joiner's `[cluster].join` to an existing member's gossip address
+(port 9443 by default), give it unique storage paths and ports, and then start
+`bun --cluster` with that config. `relish join` enrols identity only; it
+doesn't provision or start the node. Token creation accepts `--ttl` from `1s`
+to `1h` (default `15m`), requires an Admin bearer after bootstrap, commits only
+the token hash and expiry to Raft, and prints the plaintext once. During an
+election, retry against the current leader: a follower returns an error and
+does not commit or disclose a usable token.
+
 The generated security section contains the material paths and the secure
 mode:
 
@@ -344,6 +372,7 @@ Commands:
 | `nodes` | List cluster nodes and their gossip state |
 | `council` | Show council (Raft) composition and status |
 | `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
+| `join-token create --ttl 15m` | Mint one Admin-authorised, single-use node-enrolment token |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |

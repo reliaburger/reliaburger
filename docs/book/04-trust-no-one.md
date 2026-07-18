@@ -146,19 +146,26 @@ The issuer takes exactly one thing from the CSR — its public key. Every other 
 That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
 
 But that first token is single-use. It expires after 15 minutes, and once one
-node has used it, it's gone. How do you add a second node? Right now, you
-can't. This is a current provisioning gap, not something we should paper over
-with a plausible-looking command. `relish token create` mints an **API bearer
-token**; it does not mint a join token. The council has the state-machine
-operation needed to store and consume join tokens, but no authenticated API or
-CLI command issues a replacement after bootstrap.
+node has used it, it's gone. How do you add a second node? Mint another
+credential, explicitly:
 
-The missing surface should be explicit, probably `relish join-token create
---ttl ...`, guarded by the Admin role, with the plaintext printed once and the
-hash committed to Raft. Until that lands, the bootstrap token can enrol one
-additional node. A three-node production cluster therefore needs this
-prerequisite fixed first. Honest limitations make better roadmaps. They also
-make considerably less exciting incident reports.
+```sh
+JOIN_TOKEN="$(relish --ca-cert root-ca.crt --token "$ADMIN_TOKEN" \
+  join-token create --ttl 15m)"
+```
+
+`relish token create` still means an **API bearer token**. `relish join-token
+create` means a short-lived credential that can enrol exactly one node. The
+hyphen is doing useful security work here: operators and scripts can't quietly
+confuse two secrets with very different powers.
+
+The CLI parser turns `15m` into seconds and rejects anything below one second
+or above one hour. The Admin-only handler generates the random plaintext,
+commits a `JoinToken` containing only its SHA-256 hash and expiry to Raft, and
+prints the plaintext after that write succeeds. If the request lands on a
+follower during an election it returns an error without the plaintext. Point
+the retry at the current leader. No orphan token, no optimistic success, no
+creative archaeology in the Raft data directory. Nice and boring.
 
 After that, every internal TCP connection between cluster nodes uses mutual TLS. Raft and reporting require node certificates. Peer API clients present the same identity too, although the API listener also accepts certificate-less Relish and browser connections because those authenticate with a bearer token or session cookie. Both peer sides verify the Node CA chain and the live revocation list. A plain TCP connection to one of these TLS ports gets rejected immediately.
 

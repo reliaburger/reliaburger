@@ -775,15 +775,30 @@ Cluster initialised.
 
 ### 5.2 Node Join (`relish join`)
 
-1. The joining node connects to the specified cluster node over TLS (server-authenticated only at this stage, using the root CA certificate that was provided alongside the join token or downloaded via a trust-on-first-use pinning step).
+After bootstrap, an administrator creates one credential per joining node:
+
+```bash
+$ relish --endpoint https://leader.example:9117 \
+    --ca-cert root-ca.crt --token "$ADMIN_TOKEN" \
+    join-token create --ttl 15m
+```
+
+`POST /v1/join-token/create` accepts `ttl_seconds` in the bounded range
+`1..=3600`, requires the Admin role, generates the secret on the leader and
+commits only its SHA-256 hash, expiry and attestation mode through
+`RaftRequest::CreateJoinToken`. The response carries the plaintext once. A
+follower returns `503` without the plaintext; retrying against the elected
+leader cannot create an orphan credential.
+
+1. The joining node connects to the current leader over TLS (server-authenticated only at this stage, using the root CA certificate that was provided alongside the join token or downloaded via a trust-on-first-use pinning step).
 2. The joining node presents the join token.
-3. The cluster node forwards the token to the council leader via Raft.
-4. The leader validates: token is not expired, token is not already consumed, marks the token as consumed via a Raft write.
+3. The leader validates that the token exists, is not expired and has not already been consumed.
+4. One Raft entry atomically marks the token consumed and allocates the certificate serial. A retry or concurrent reuse is refused.
 5. If `node_attestation = "tpm"`: the joining node presents a TPM attestation quote. The leader verifies it against the pre-registered endorsement keys.
 6. If `node_attestation = "certificate"`: the joining node presents a client certificate. The leader verifies it against the configured external CA trust store.
-7. The leader generates a node certificate signed by the Node CA (1-year validity) with the node's unique ID as the CN.
-8. The signed certificate, the Node CA certificate, the Workload CA certificate chain, and the root CA certificate are sent to the joining node.
-9. The joining node stores the certificate and keys, enables mTLS, and begins participating in Mustard gossip.
+7. The leader signs the joining node's CSR with the Node CA. The node's private key never crosses the network.
+8. The signed certificate, the Node CA certificate and the root CA certificate are sent to the joining node.
+9. The joining node transactionally stores the identity. Provisioning still has to supply its config and cluster master key, and start Bun before it participates in gossip.
 
 ### 5.3 Workload Certificate Rotation
 

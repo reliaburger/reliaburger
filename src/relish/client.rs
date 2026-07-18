@@ -1320,6 +1320,37 @@ impl BunClient {
             .to_string())
     }
 
+    /// Create a single-use node join token. The server commits only its hash
+    /// to Raft and returns the plaintext once.
+    pub async fn join_token_create(&self, ttl_seconds: u64) -> Result<String, RelishError> {
+        let url = format!("{}/v1/join-token/create", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token response: {e}"),
+        })?;
+        json["token"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RelishError::ApiError {
+                status: 0,
+                body: "response missing join token".to_string(),
+            })
+    }
+
     /// Rotate or finalise the secret encryption key.
     pub async fn secret_rotate(&self, finalize: bool) -> Result<String, RelishError> {
         let url = format!("{}/v1/secret/rotate", self.base_url);

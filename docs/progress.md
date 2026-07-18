@@ -1337,10 +1337,14 @@ convergence and adoption" theme under 12b.6).
   working command/port, remote endpoints require HTTPS, and clap/doc guards
   reject the old `apply -f`, port-9443 join and missing-`--node-id` shapes.
   Portable 2,662/2,662, no-default 2,644/2,644 and cluster 21/21 pass.
-- [ ] Add authenticated post-bootstrap join-token issuance (H6) — the one
-  bootstrap token can enrol only one additional node; no reachable API/CLI
-  currently drives the existing Raft `CreateJoinToken` operation, so a fresh
-  cluster cannot form a three-node council through supported commands.
+- [x] Add authenticated post-bootstrap join-token issuance (H6) — dedicated
+  Admin-only `relish join-token create --ttl 15m`, bounded `1s..=1h`; only the
+  hash and expiry enter Raft and plaintext is returned once after commit. A
+  real Bun/Relish test enrols two CSR-bearing nodes, proves Deployer, reuse and
+  expiry refusal, starts both joiners and observes a three-voter mTLS council;
+  a three-member Raft test proves follower refusal and post-failover issuance.
+  Portable 2,670/2,670, no-default 2,652/2,652, cluster 21/21, Clippy,
+  doctests and the dependency audit pass.
 - [ ] Rerun the complete review matrix and close the high-value gate
 
 ### Medium-value

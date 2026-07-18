@@ -253,20 +253,30 @@ exist, but nothing reachable connects them. `relish token create` creates an
 API bearer token, not a join token. A fresh cluster therefore cannot enrol a
 third node through the supported interface.
 
-- [ ] Write an authenticated API contract and CLI command dedicated to join
+- [x] Write an authenticated API contract and CLI command dedicated to join
   tokens; don't overload API bearer-token commands.
-- [ ] Require Admin authorisation, validate a bounded TTL and commit only the
+- [x] Require Admin authorisation, validate a bounded TTL and commit only the
   hash plus expiry to Raft. Print the plaintext exactly once.
-- [ ] Prove two separately minted tokens enrol two distinct CSR-bearing nodes,
+- [x] Prove two separately minted tokens enrol two distinct CSR-bearing nodes,
   while reuse, expiry, a non-Admin principal and a follower/leader transition
   fail safely.
-- [ ] Add a three-node executable provisioning walkthrough only after the
-  command exists. Until then, keep the documented first run to the truthful
-  one-voter cluster and label the one-extra-node limit.
+- [x] Add a three-node executable provisioning walkthrough after the command
+  exists, replacing the temporary one-extra-node limitation with tested
+  issuance, enrolment and startup steps.
 
 **Acceptance:** an authenticated operator can enrol enough nodes to form a
 three-voter council without regenerating PKI or editing Raft state, and the
 full sequence is covered by a real cluster test.
+
+**Delivered:** `relish join-token create --ttl 15m` calls an Admin-only API,
+accepts `1s..=1h`, and returns plaintext only after the hash and expiry commit.
+A real-binary test creates two credentials, enrols two independently generated
+CSRs, proves Deployer/reuse/expiry refusal, starts both Bun joiners and waits
+for all three nodes to converge on the voter set. A separate three-member Raft
+test proves a follower's refused token never appears in state and issuance
+continues after leader replacement. The regression gate passes 2,670 portable,
+2,652 no-default and all 21 gated cluster tests; warnings-as-errors Clippy,
+doctests and the RustSec audit also pass.
 
 ## Medium-value
 
