@@ -356,6 +356,28 @@ impl StateMachineInner {
                 self.state.security_state.api_tokens.push(token.clone());
             }
             RaftRequest::RevokeApiToken { name } => {
+                // Never let a revoke empty the store of Admin tokens. An empty
+                // token store reopens the middleware's bootstrap allow-all
+                // (`sesame::auth`), and the loopback-only bind guard is a
+                // startup check — a node already bound to a routable address
+                // would drop to fully unauthenticated at runtime. Applying
+                // sequentially, this check is race-free: two concurrent revokes
+                // of two distinct Admins become two entries, and the second one
+                // (now the last Admin) is refused.
+                use crate::sesame::types::ApiRole;
+                let tokens = &self.state.security_state.api_tokens;
+                let target_is_admin = tokens
+                    .iter()
+                    .any(|t| t.name == *name && t.role == ApiRole::Admin);
+                let admin_count = tokens.iter().filter(|t| t.role == ApiRole::Admin).count();
+                if target_is_admin && admin_count <= 1 {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "refusing to revoke {name:?}: it is the last Admin token; \
+                             create a replacement Admin token before revoking this one"
+                        ),
+                    });
+                }
                 self.state
                     .security_state
                     .api_tokens
@@ -2422,6 +2444,77 @@ mod tests {
             name: "ci".to_string(),
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
+    }
+
+    #[test]
+    fn revoke_refuses_to_remove_the_last_admin_token() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        let api_token = |name: &str, role: ApiRole| ApiToken {
+            name: name.to_string(),
+            token_hash: vec![1, 2, 3],
+            token_salt: vec![4, 5, 6],
+            role,
+            scope: TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::now(),
+        };
+
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(api_token(
+            "admin-a",
+            ApiRole::Admin,
+        )));
+        inner.apply_request(&RaftRequest::CreateApiToken(api_token(
+            "deployer",
+            ApiRole::Deployer,
+        )));
+
+        // The sole Admin can't be revoked — the store must never lose its last
+        // Admin at runtime (which would reopen the bootstrap allow-all).
+        let resp = inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: "admin-a".to_string(),
+        });
+        assert!(matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert!(
+            inner
+                .state
+                .security_state
+                .api_tokens
+                .iter()
+                .any(|t| t.name == "admin-a"),
+            "the last Admin token must survive the refused revoke"
+        );
+
+        // A non-Admin token is always revocable, even as the only non-Admin.
+        inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: "deployer".to_string(),
+        });
+        assert!(
+            !inner
+                .state
+                .security_state
+                .api_tokens
+                .iter()
+                .any(|t| t.name == "deployer")
+        );
+
+        // With a second Admin present, the first becomes revocable.
+        inner.apply_request(&RaftRequest::CreateApiToken(api_token(
+            "admin-b",
+            ApiRole::Admin,
+        )));
+        inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: "admin-a".to_string(),
+        });
+        let admins: Vec<_> = inner
+            .state
+            .security_state
+            .api_tokens
+            .iter()
+            .filter(|t| t.role == ApiRole::Admin)
+            .map(|t| t.name.clone())
+            .collect();
+        assert_eq!(admins, vec!["admin-b".to_string()]);
     }
 
     #[test]

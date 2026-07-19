@@ -3729,6 +3729,11 @@ async fn token_revoke_handler(
         })
         .await
     {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response(),
         Ok(_) => Json(serde_json::json!({ "message": format!("token {} revoked", req.name) }))
             .into_response(),
         Err(e) => (
