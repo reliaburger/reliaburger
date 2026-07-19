@@ -212,6 +212,18 @@ impl GitRepo {
             .output()
             .map_err(|e| LettuceError::GitFailed(e.to_string()))?;
 
+        // A failed ls-tree (a renamed watched directory, a typo in
+        // `[gitops] path`, a bad object) exits non-zero with empty stdout.
+        // Without this check the empty listing becomes an empty config, whose
+        // diff removes every app/namespace/permission — a full desired-state
+        // wipe reported as a successful sync. Fail loudly instead.
+        if !output.status.success() {
+            return Err(LettuceError::GitFailed(format!(
+                "git ls-tree {tree_arg:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
         let listing = String::from_utf8_lossy(&output.stdout);
         let mut files = HashMap::new();
 
@@ -435,12 +447,31 @@ mod tests {
             "a leading-dash ref must be rejected, not run as an option"
         );
 
-        // A hostile path prefix likewise resolves to nothing, not a flag.
+        // A hostile path prefix likewise resolves to a missing object; with the
+        // ls-tree exit-status check it is a clean error, not an executed option
+        // and not a silent empty listing.
         let sha = repo.head_sha().unwrap();
-        let files = repo.list_toml_files(&sha, "--exec=/bin/false").unwrap();
         assert!(
-            files.is_empty(),
-            "a leading-dash path must list no files, not execute an option"
+            repo.list_toml_files(&sha, "--exec=/bin/false").is_err(),
+            "a leading-dash path must error, not execute an option or list nothing"
+        );
+    }
+
+    /// C10: a failed `ls-tree` (e.g. a path that isn't in the tree) must be a
+    /// hard error, never a silent empty listing — an empty listing would let
+    /// the sync diff remove every resource and wipe the cluster.
+    #[test]
+    fn list_toml_files_errors_when_the_path_is_missing() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let sha = repo.head_sha().unwrap();
+
+        assert!(
+            repo.list_toml_files(&sha, "this-directory-does-not-exist")
+                .is_err(),
+            "a missing path must error rather than return an empty file set"
         );
     }
 
