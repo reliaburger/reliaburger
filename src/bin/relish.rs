@@ -303,6 +303,17 @@ enum Command {
         #[command(subcommand)]
         action: UpgradeAction,
     },
+    /// Read the built-in manual (searchable TUI; --web for the browser).
+    Manual {
+        /// Serve the manual as one HTML page and open the browser.
+        #[arg(long)]
+        web: bool,
+        /// Port for --web (0 picks an ephemeral port).
+        #[arg(long, default_value_t = 8642)]
+        port: u16,
+        #[command(subcommand)]
+        action: Option<ManualAction>,
+    },
     /// Guided setup: detect or install bun, then write a starter config.
     Setup {
         /// Accept the default answer to every question (non-interactive).
@@ -318,6 +329,16 @@ enum Command {
         /// (default: ~/.reliaburger/bin).
         #[arg(long)]
         binary_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManualAction {
+    /// Write the embedded example configs into a directory.
+    Examples {
+        /// Target directory (an examples/ tree is created inside).
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -1122,6 +1143,15 @@ async fn main() -> ExitCode {
                 UpgradeAction::Resume => reliaburger::relish::upgrade::resume(&client).await,
             }
         }
+        Command::Manual {
+            web,
+            port,
+            ref action,
+        } => match action {
+            Some(ManualAction::Examples { dir }) => reliaburger::relish::manual::examples(dir),
+            None if web => reliaburger::relish::manual::web::serve(port).await,
+            None => reliaburger::relish::manual::run().await,
+        },
         Command::Setup {
             yes,
             ref dir,
@@ -1910,6 +1940,48 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn parse_manual_defaults_to_the_reader() {
+        let cli = parse(&["relish", "manual"]).unwrap();
+        match cli.command {
+            Command::Manual {
+                web,
+                port,
+                ref action,
+            } => {
+                assert!(!web);
+                assert_eq!(port, 8642);
+                assert!(action.is_none());
+            }
+            _ => panic!("expected Manual command"),
+        }
+    }
+
+    #[test]
+    fn parse_manual_web_with_port() {
+        let cli = parse(&["relish", "manual", "--web", "--port", "0"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Manual {
+                web: true,
+                port: 0,
+                action: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_manual_examples_with_dir() {
+        let cli = parse(&["relish", "manual", "examples", "--dir", "/tmp/burger"]).unwrap();
+        match cli.command {
+            Command::Manual {
+                action: Some(ManualAction::Examples { ref dir }),
+                ..
+            } => assert_eq!(dir.to_str(), Some("/tmp/burger")),
+            _ => panic!("expected Manual Examples command"),
+        }
     }
 
     #[test]

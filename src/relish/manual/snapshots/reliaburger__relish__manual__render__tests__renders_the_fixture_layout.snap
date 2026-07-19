@@ -1,0 +1,19 @@
+---
+source: src/relish/manual/render.rs
+expression: "text.join(\"\\n\")"
+---
+Title
+
+Intro with inline code here.
+
+Section
+
+- first item
+- second item
+
+  relish status
+  relish top
+
+> a quote
+
+the book (https://example.com/book)
