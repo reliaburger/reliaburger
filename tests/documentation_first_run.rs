@@ -735,11 +735,17 @@ fn published_first_run_snippets_do_not_drift() {
             "{} publishes the wrong apply syntax",
             document.display()
         );
-        assert!(
-            text.contains("--node-id"),
-            "{} omits the required join/init node id",
-            document.display()
-        );
+        // A published join command must show the required node id. The
+        // top-level README no longer carries the enrolment walkthrough (it
+        // moved to docs/README.md and the manual), so the guard applies
+        // wherever the command itself is published.
+        if text.contains("relish join") {
+            assert!(
+                text.contains("--node-id"),
+                "{} publishes a join command without the required node id",
+                document.display()
+            );
+        }
     }
 
     let whitepaper = std::fs::read_to_string(root.join("docs/whitepaper.md")).unwrap();
