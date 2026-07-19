@@ -209,6 +209,10 @@ impl ReaderState {
                 }
             })
             .collect();
+        // A document's first line is its title (or, for source files, its
+        // path); those hits jump to a whole document and belong on top.
+        // The sort is stable, so nucleo's order holds within each group.
+        search.results.sort_by_key(|result| result.line != 0);
         search.cursor = 0;
     }
 
@@ -517,6 +521,18 @@ mod tests {
         assert!(!search.results.is_empty());
         assert_eq!(search.results[0].doc, 1);
         assert!(search.results[0].preview.contains("fault"));
+    }
+
+    #[test]
+    fn first_line_hits_rank_above_content_hits() {
+        // "chaos" matches doc 1's title line and nothing else's line 0;
+        // it also fuzzy-matches content elsewhere. The title hit wins.
+        let mut state = ReaderState::new(docs());
+        state.open_search("chaos");
+        let results = &state.search.as_ref().unwrap().results;
+        assert!(!results.is_empty());
+        assert_eq!(results[0].doc, 1);
+        assert_eq!(results[0].line, 0);
     }
 
     #[test]

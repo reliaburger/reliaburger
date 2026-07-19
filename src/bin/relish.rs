@@ -314,6 +314,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<ManualAction>,
     },
+    /// Browse and fuzzy-search the source this binary was built from.
+    Source {
+        /// Open with this search query pre-seeded (e.g. "ebpf").
+        query: Option<String>,
+    },
     /// Guided setup: detect or install bun, then write a starter config.
     Setup {
         /// Accept the default answer to every question (non-interactive).
@@ -1152,6 +1157,7 @@ async fn main() -> ExitCode {
             None if web => reliaburger::relish::manual::web::serve(port).await,
             None => reliaburger::relish::manual::run().await,
         },
+        Command::Source { query } => reliaburger::relish::source::run(query).await,
         Command::Setup {
             yes,
             ref dir,
@@ -1982,6 +1988,21 @@ mod tests {
             } => assert_eq!(dir.to_str(), Some("/tmp/burger")),
             _ => panic!("expected Manual Examples command"),
         }
+    }
+
+    #[test]
+    fn parse_source_without_query() {
+        let cli = parse(&["relish", "source"]).unwrap();
+        assert!(matches!(cli.command, Command::Source { query: None }));
+    }
+
+    #[test]
+    fn parse_source_with_seed_query() {
+        let cli = parse(&["relish", "source", "ebpf"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Source { query: Some(ref q) } if q == "ebpf"
+        ));
     }
 
     #[test]
