@@ -27,6 +27,7 @@ pub mod k8s_export;
 pub mod k8s_import;
 pub mod output;
 pub mod plan;
+pub mod setup;
 pub mod tui;
 pub mod upgrade;
 

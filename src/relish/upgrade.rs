@@ -457,7 +457,8 @@ fn default_registry_for(base_url: &str) -> String {
     format!("{host}:5050")
 }
 
-async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
+/// Download a URL into memory (shared with `relish setup`).
+pub(crate) async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
     let response = reqwest::get(url)
         .await
         .map_err(|e| RelishError::FormatFailed(format!("download failed: {e}")))?;

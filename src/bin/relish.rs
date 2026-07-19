@@ -303,6 +303,22 @@ enum Command {
         #[command(subcommand)]
         action: UpgradeAction,
     },
+    /// Guided setup: detect or install bun, then write a starter config.
+    Setup {
+        /// Accept the default answer to every question (non-interactive).
+        #[arg(long)]
+        yes: bool,
+        /// Directory to write reliaburger.toml into.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Release metadata URL.
+        #[arg(long, default_value = reliaburger::relish::upgrade::DEFAULT_RELEASE_URL)]
+        release_url: String,
+        /// Directory to install the bun binary into
+        /// (default: ~/.reliaburger/bin).
+        #[arg(long)]
+        binary_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1106,6 +1122,20 @@ async fn main() -> ExitCode {
                 UpgradeAction::Resume => reliaburger::relish::upgrade::resume(&client).await,
             }
         }
+        Command::Setup {
+            yes,
+            ref dir,
+            ref release_url,
+            ref binary_dir,
+        } => {
+            reliaburger::relish::setup::run(reliaburger::relish::setup::SetupOptions {
+                yes,
+                dir: dir.clone(),
+                release_url: release_url.clone(),
+                binary_dir: binary_dir.clone(),
+            })
+            .await
+        }
     };
 
     finish(result)
@@ -1880,6 +1910,58 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn parse_setup_defaults() {
+        let cli = parse(&["relish", "setup"]).unwrap();
+        match cli.command {
+            Command::Setup {
+                yes,
+                ref dir,
+                ref release_url,
+                ref binary_dir,
+            } => {
+                assert!(!yes);
+                assert_eq!(dir.to_str(), Some("."));
+                assert_eq!(
+                    release_url,
+                    reliaburger::relish::upgrade::DEFAULT_RELEASE_URL
+                );
+                assert!(binary_dir.is_none());
+            }
+            _ => panic!("expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_with_flags() {
+        let cli = parse(&[
+            "relish",
+            "setup",
+            "--yes",
+            "--dir",
+            "/tmp/burger",
+            "--binary-dir",
+            "/opt/reliaburger/bin",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Setup {
+                yes,
+                ref dir,
+                ref binary_dir,
+                ..
+            } => {
+                assert!(yes);
+                assert_eq!(dir.to_str(), Some("/tmp/burger"));
+                assert_eq!(
+                    binary_dir.as_ref().and_then(|p| p.to_str()),
+                    Some("/opt/reliaburger/bin")
+                );
+            }
+            _ => panic!("expected Setup command"),
+        }
     }
 
     #[test]
