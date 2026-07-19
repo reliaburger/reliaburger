@@ -234,6 +234,24 @@ impl BunClient {
     /// Create a client with an explicit token (or none). Used by tests; `new`
     /// resolves the token from the flag/env instead.
     pub fn new_with_token(base_url: &str, token: Option<&str>) -> Self {
+        let ca_pem = resolve_ca_cert().and_then(|ca_path| match std::fs::read(&ca_path) {
+            Ok(pem) => Some(pem),
+            Err(e) => {
+                eprintln!(
+                    "relish: warning — could not load --ca-cert {}: {e}",
+                    ca_path.display()
+                );
+                None
+            }
+        });
+        Self::build(base_url, token, ca_pem.as_deref())
+    }
+
+    /// Build a client with an explicit cluster CA (PEM), if any.
+    ///
+    /// Split out from [`new_with_token`] so the TLS trust configuration can be
+    /// exercised without the process-global `--ca-cert` state.
+    fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
         let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
         if let Some(t) = token {
             let mut headers = reqwest::header::HeaderMap::new();
@@ -244,23 +262,24 @@ impl BunClient {
             }
         }
         // Under mTLS the API cert is issued for the node id, not "127.0.0.1",
-        // so trust the cluster CA and skip the hostname check (the CA pin is
-        // the real guarantee).
-        if let Some(ca_path) = resolve_ca_cert() {
-            match std::fs::read(&ca_path).and_then(|pem| {
-                reqwest::Certificate::from_pem(&pem)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            }) {
+        // so we trust the cluster CA and skip the hostname check. For that to
+        // be safe the cluster CA must be the *only* trust anchor: reqwest keeps
+        // the built-in webpki/system roots by default, so without disabling
+        // them any certificate chaining to a public CA would be accepted while
+        // the hostname check is off — a MITM could then present a valid public
+        // cert and harvest the bearer token. `tls_built_in_root_certs(false)`
+        // makes the pin real, mirroring the cluster HTTP client's empty root
+        // store (`sesame::mtls`).
+        if let Some(pem) = ca_pem {
+            match reqwest::Certificate::from_pem(pem) {
                 Ok(cert) => {
                     builder = builder
+                        .tls_built_in_root_certs(false)
                         .add_root_certificate(cert)
                         .danger_accept_invalid_hostnames(true);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "relish: warning — could not load --ca-cert {}: {e}",
-                        ca_path.display()
-                    );
+                    eprintln!("relish: warning — invalid --ca-cert PEM: {e}");
                 }
             }
         }
@@ -1558,6 +1577,127 @@ impl BunClient {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// PEM-encode a DER certificate for `reqwest::Certificate::from_pem`.
+    fn pem_cert(der: &[u8]) -> Vec<u8> {
+        pem::encode(&pem::Pem::new("CERTIFICATE", der.to_vec())).into_bytes()
+    }
+
+    /// Serve `GET /v1/health` over TLS with `identity`'s cert on an ephemeral
+    /// port. Returns the address; the task ends when `shutdown` fires.
+    async fn spawn_tls_health(
+        identity: &crate::sesame::identity_store::NodeIdentity,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> std::net::SocketAddr {
+        use axum::{Router, routing::get};
+        use tower::Service as _;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            crate::sesame::mtls::build_api_server_config(
+                identity,
+                crate::sesame::mtls::CrlHandle::default(),
+            )
+            .unwrap(),
+        );
+        let router = Router::new().route("/v1/health", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut make_service = router.into_make_service();
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    accepted = listener.accept() => {
+                        let Ok((tcp, _)) = accepted else { continue };
+                        let acceptor = acceptor.clone();
+                        let service = match make_service.call(()).await {
+                            Ok(s) => s,
+                            Err(infallible) => match infallible {},
+                        };
+                        tokio::spawn(async move {
+                            let Ok(tls) = acceptor.accept(tcp).await else { return };
+                            let svc = hyper_util::service::TowerToHyperService::new(service);
+                            let _ = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                            .await;
+                        });
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    fn test_identity(
+        hierarchy: &crate::sesame::ca::CaHierarchy,
+        node_id: &str,
+    ) -> crate::sesame::identity_store::NodeIdentity {
+        use std::time::{Duration, SystemTime};
+        let (cert_der, key_der, serial) = crate::sesame::ca::issue_node_cert(
+            node_id,
+            crate::sesame::types::SerialNumber(1),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        crate::sesame::identity_store::NodeIdentity {
+            node_id: node_id.to_string(),
+            certificate_der: cert_der,
+            private_key_der: key_der,
+            serial,
+            ca_generation: 0,
+            node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: now,
+            not_after: now + Duration::from_secs(3600),
+        }
+    }
+
+    /// The legitimate mTLS path must keep working with built-in roots disabled:
+    /// a client trusting the cluster CA reaches the agent over HTTPS even though
+    /// the server certificate's name (`node-01`) doesn't match `127.0.0.1`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ca_cert_client_completes_https_round_trip_with_hostname_mismatch() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("client-tls-test", b"ikm").unwrap();
+        let server = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let addr = spawn_tls_health(&server, shutdown.clone()).await;
+
+        let ca_pem = pem_cert(&hierarchy.node.ca.certificate_der);
+        let client = BunClient::build(&format!("https://{addr}"), None, Some(&ca_pem));
+        client
+            .health()
+            .await
+            .expect("cluster-CA client should reach the agent over HTTPS");
+
+        shutdown.cancel();
+    }
+
+    /// With built-in roots off, only the configured CA is trusted: a client
+    /// handed a *different* CA must refuse the connection rather than fall back
+    /// to any other trust anchor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_rejects_a_server_signed_by_an_untrusted_ca() {
+        let server_hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("server-ca", b"ikm").unwrap();
+        let other_hierarchy = crate::sesame::ca::generate_ca_hierarchy("other-ca", b"ikm").unwrap();
+        let server = test_identity(&server_hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let addr = spawn_tls_health(&server, shutdown.clone()).await;
+
+        let wrong_ca_pem = pem_cert(&other_hierarchy.node.ca.certificate_der);
+        let client = BunClient::build(&format!("https://{addr}"), None, Some(&wrong_ca_pem));
+        assert!(
+            client.health().await.is_err(),
+            "a client trusting a different CA must refuse the connection"
+        );
+
+        shutdown.cancel();
+    }
 
     /// Start a throwaway server that records the Authorization header it sees on
     /// `GET /v1/health`. Returns its base URL and the captured value.
