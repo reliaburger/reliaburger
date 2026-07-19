@@ -49,6 +49,20 @@ fn skipped(reason: &str) -> SyncOutcome {
 ///
 /// This is the pure logic of the sync loop, separated from the
 /// async runtime and Raft interaction so it can be tested in isolation.
+/// Whether a commit's signature status may be applied under the signing policy.
+///
+/// Fails **closed**: when `require_signed` is set, only a genuinely `Verified`
+/// signature passes. `NotChecked` means verification never ran — no trusted
+/// keys are configured, or `git` could not be spawned — and admitting it would
+/// silently apply unsigned commits despite `require_signed_commits = true`.
+fn signature_admitted(status: &SignatureStatus, require_signed: bool) -> bool {
+    if require_signed {
+        *status == SignatureStatus::Verified
+    } else {
+        true
+    }
+}
+
 pub fn execute_sync(
     repo: &GitRepo,
     config: &GitOpsConfig,
@@ -98,19 +112,20 @@ pub fn execute_sync(
     if config.require_signed_commits {
         let status = verify::verify_commit(repo.path(), &commit, &config.trusted_signing_keys);
         commit.signature = status.clone();
-        match status {
-            SignatureStatus::Verified | SignatureStatus::NotChecked => {}
-            _ => {
-                return SyncOutcome {
-                    commit: Some(commit.clone()),
-                    result: SyncResult::Failure {
-                        error: format!("commit {} signature: {:?}", commit.sha, commit.signature),
-                    },
-                    diff_summary: None,
-                    changes: Vec::new(),
-                    file_errors: HashMap::new(),
-                };
-            }
+        if !signature_admitted(&status, true) {
+            return SyncOutcome {
+                commit: Some(commit.clone()),
+                result: SyncResult::Failure {
+                    error: format!(
+                        "commit {} rejected: require_signed_commits is set but the \
+                         signature is {:?} (configure trusted_signing_keys and sign commits)",
+                        commit.sha, commit.signature
+                    ),
+                },
+                diff_summary: None,
+                changes: Vec::new(),
+                file_errors: HashMap::new(),
+            };
         }
     }
 
@@ -345,6 +360,36 @@ mod tests {
         // The later file's collision is surfaced, not swallowed.
         assert!(errors.contains_key("b-second.toml"));
         assert!(errors["b-second.toml"].contains("duplicate resource app.web"));
+    }
+
+    /// C11: with `require_signed_commits`, verification must fail closed —
+    /// only `Verified` is admissible. `NotChecked` (empty trusted keys or git
+    /// unavailable) must be refused, not silently applied.
+    #[test]
+    fn require_signed_commits_admits_only_verified() {
+        assert!(signature_admitted(&SignatureStatus::Verified, true));
+        for status in [
+            SignatureStatus::NotChecked,
+            SignatureStatus::Unsigned,
+            SignatureStatus::UntrustedKey,
+            SignatureStatus::InvalidSignature,
+        ] {
+            assert!(
+                !signature_admitted(&status, true),
+                "{status:?} must be refused when signatures are required"
+            );
+        }
+    }
+
+    #[test]
+    fn without_required_signing_any_status_is_admitted() {
+        for status in [
+            SignatureStatus::Verified,
+            SignatureStatus::NotChecked,
+            SignatureStatus::Unsigned,
+        ] {
+            assert!(signature_admitted(&status, false));
+        }
     }
 
     #[test]
