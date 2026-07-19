@@ -682,6 +682,27 @@ impl CouncilStateMachine {
     /// format version, or won't decode is a hard error, never an empty state.
     // `SnapshotStoreError` is large but dictated by the redb/openraft errors
     // it wraps; boxing it here buys nothing.
+    /// Whether a committed snapshot blob is present in `db`.
+    ///
+    /// [`with_store`](Self::with_store) loads an EMPTY `DesiredState` when no
+    /// snapshot blob exists — the normal state of a young/low-churn cluster
+    /// that has not yet crossed `snapshot_threshold`. Disaster recovery must
+    /// distinguish "no snapshot yet" from a genuine one so it refuses to
+    /// re-bootstrap an empty cluster instead of silently discarding all
+    /// desired and security state.
+    #[allow(clippy::result_large_err)]
+    pub fn snapshot_present(db: &Database) -> Result<bool, SnapshotStoreError> {
+        // Materialise the table so the read doesn't error on a fresh store.
+        let wtx = db.begin_write()?;
+        {
+            wtx.open_table(SNAPSHOT)?;
+        }
+        wtx.commit()?;
+        let rtx = db.begin_read()?;
+        let t = rtx.open_table(SNAPSHOT)?;
+        Ok(t.get(SNAP_DATA_KEY)?.is_some())
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn with_store(db: Arc<Database>) -> Result<Self, SnapshotStoreError> {
         // Materialise the table so reads on a fresh store don't error.
