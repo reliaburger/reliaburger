@@ -343,6 +343,14 @@ impl NodeConfig {
                 "must retain at least one version".to_string(),
             ));
         }
+        if self.upgrades.max_boot_attempts == 0 {
+            // With a zero budget, startup reverts every upgrade on its first
+            // boot (`boot_attempts + 1 > 0`), so no upgrade can ever commit.
+            return Err(upgrade_validation(
+                "upgrades.max_boot_attempts",
+                "must allow at least one boot attempt".to_string(),
+            ));
+        }
         if let Some(dir) = &self.upgrades.binary_dir
             && !dir.is_absolute()
         {
@@ -565,6 +573,15 @@ mod tests {
     fn upgrades_retain_versions_zero_rejected() {
         let mut nc = NodeConfig::default();
         nc.upgrades.retain_versions = 0;
+        assert!(matches!(nc.validate(), Err(ConfigError::Validation { .. })));
+    }
+
+    #[test]
+    fn upgrades_max_boot_attempts_zero_rejected() {
+        // A zero boot budget reverts every upgrade on its first boot, so no
+        // upgrade can ever commit — reject it at config load.
+        let mut nc = NodeConfig::default();
+        nc.upgrades.max_boot_attempts = 0;
         assert!(matches!(nc.validate(), Err(ConfigError::Validation { .. })));
     }
 
