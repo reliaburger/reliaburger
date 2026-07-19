@@ -81,9 +81,77 @@ fn reserve_ports() -> [u16; 3] {
     ]
 }
 
+/// How a freshly spawned bun came up.
+enum BunStart {
+    /// The API answered on its address; every earlier bind succeeded.
+    Ready,
+    /// Bun exited with "Address already in use": between reserving a port
+    /// and bun binding it, another process on the runner grabbed it.
+    PortRace,
+}
+
+/// Wait until `bun` accepts TCP on its API address, distinguishing the
+/// reserved-port race from a genuine startup failure (which still panics).
+fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(status) = bun.child.try_wait().unwrap() {
+            let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+            if log.contains("Address already in use") {
+                return BunStart::PortRace;
+            }
+            panic!("bun exited before binding its listeners ({status}):\n{log}");
+        }
+        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            return BunStart::Ready;
+        }
+        assert!(Instant::now() < deadline, "bun never listened on {address}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Spawn a bun and wait for its API listener, re-reserving every port and
+/// respawning when it loses the reserve-then-bind race.
+///
+/// `reserve_ports` releases its listeners before bun rebinds the ports, so a
+/// concurrently running test can steal one in between; with harness retries
+/// deliberately at zero, that host-level race must be healed here, scoped to
+/// the exact "Address already in use" exit. `build` reserves fresh ports,
+/// writes the config and returns `(config, api_address, log_path)`; on the
+/// race it runs again, so nothing from the lost attempt is reused.
+fn spawn_bun_with_port_retry<F>(clustered: bool, mut build: F) -> (BunProcess, SocketAddr)
+where
+    F: FnMut() -> (PathBuf, SocketAddr, PathBuf),
+{
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let (config, address, log_path) = build();
+        let mut bun = BunProcess::spawn(&config, address, clustered, log_path);
+        match wait_for_bind(&mut bun, address) {
+            BunStart::Ready => return (bun, address),
+            BunStart::PortRace => {
+                let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
+                assert!(
+                    attempt < ATTEMPTS,
+                    "bun lost the reserved-port race {ATTEMPTS} times in a row:\n{log}"
+                );
+                eprintln!(
+                    "bun lost the reserved-port race (attempt {attempt}); \
+                     retrying with freshly reserved ports"
+                );
+            }
+        }
+    }
+    unreachable!("the retry loop returns on success and panics on exhaustion");
+}
+
 fn write_portable_node_config(root: &Path) -> PathBuf {
+    write_portable_node_config_with_ports(root, reserve_ports())
+}
+
+fn write_portable_node_config_with_ports(root: &Path, ports: [u16; 3]) -> PathBuf {
     let config = root.join("node.toml");
-    let [gossip_port, raft_port, reporting_port] = reserve_ports();
+    let [gossip_port, raft_port, reporting_port] = ports;
     std::fs::write(
         &config,
         format!(
@@ -176,24 +244,16 @@ fn wait_for_relish_output(bun: &mut BunProcess, args: &[&str], expected: &str) -
     }
 }
 
-fn wait_for_tcp(bun: &mut BunProcess, address: SocketAddr) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        bun.assert_running();
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "bun never listened on {address}");
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 #[test]
 fn standalone_first_run_reaches_a_running_workload() {
     let root = tempfile::tempdir().unwrap();
-    let address = reserve_address();
-    let config = write_portable_node_config(root.path());
-    let mut bun = BunProcess::spawn(&config, address, false, root.path().join("bun.log"));
+    let (mut bun, address) = spawn_bun_with_port_retry(false, || {
+        (
+            write_portable_node_config(root.path()),
+            reserve_address(),
+            root.path().join("bun.log"),
+        )
+    });
     let endpoint = format!("http://{address}");
 
     wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
@@ -222,6 +282,40 @@ fn standalone_first_run_reaches_a_running_workload() {
 }
 
 #[test]
+fn spawn_retries_after_a_lost_port_race() {
+    // Force the race deterministically: keep listening on a port and hand
+    // it to the first attempt as the Raft port (the CI failure shape —
+    // gossip comes up, a later cluster bind hits EADDRINUSE and bun
+    // exits). The helper's second attempt reserves freely and must boot.
+    let root = tempfile::tempdir().unwrap();
+    let hostage = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stolen_raft = hostage.local_addr().unwrap().port();
+    let mut attempt = 0;
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        attempt += 1;
+        let config = if attempt == 1 {
+            let [gossip, _, reporting] = reserve_ports();
+            write_portable_node_config_with_ports(root.path(), [gossip, stolen_raft, reporting])
+        } else {
+            write_portable_node_config(root.path())
+        };
+        (
+            config,
+            reserve_address(),
+            root.path().join(format!("race-bun-{attempt}.log")),
+        )
+    });
+
+    bun.assert_running();
+    assert!(TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok());
+    let first_log = std::fs::read_to_string(root.path().join("race-bun-1.log")).unwrap();
+    assert!(
+        first_log.contains("Address already in use"),
+        "the first attempt should have lost its Raft bind:\n{first_log}"
+    );
+}
+
+#[test]
 fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
@@ -237,11 +331,7 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
 
     let node_path = cluster_dir.join("reliaburger.toml");
     let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
-    let [gossip_port, raft_port, reporting_port] = reserve_ports();
     node.node.name = Some("node-01".to_string());
-    node.cluster.gossip_port = gossip_port;
-    node.cluster.raft_port = raft_port;
-    node.cluster.reporting_port = reporting_port;
     node.network.advertise_address = Some("127.0.0.1".to_string());
     node.storage.data = root.path().join("data");
     node.storage.images = root.path().join("images");
@@ -249,16 +339,19 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
-    std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
 
-    let address = reserve_address();
-    let mut bun = BunProcess::spawn(
-        &node_path,
-        address,
-        true,
-        root.path().join("cluster-bun.log"),
-    );
-    wait_for_tcp(&mut bun, address);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip_port, raft_port, reporting_port] = reserve_ports();
+        node.cluster.gossip_port = gossip_port;
+        node.cluster.raft_port = raft_port;
+        node.cluster.reporting_port = reporting_port;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("cluster-bun.log"),
+        )
+    });
 
     let endpoint = format!("https://{address}");
     let ca = cluster_dir.join("identity/root-ca.crt");
@@ -358,11 +451,7 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
 
     let node_path = cluster_dir.join("reliaburger.toml");
     let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
-    let [gossip_port, raft_port, reporting_port] = reserve_ports();
     node.node.name = Some("node-01".to_string());
-    node.cluster.gossip_port = gossip_port;
-    node.cluster.raft_port = raft_port;
-    node.cluster.reporting_port = reporting_port;
     node.network.advertise_address = Some("127.0.0.1".to_string());
     node.storage.data = root.path().join("data");
     node.storage.images = root.path().join("images");
@@ -370,16 +459,22 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
-    std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
 
-    let address = reserve_address();
-    let mut bun = BunProcess::spawn(
-        &node_path,
-        address,
-        true,
-        root.path().join("join-token-bun.log"),
-    );
-    wait_for_tcp(&mut bun, address);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip_port, raft_port, reporting_port] = reserve_ports();
+        node.cluster.gossip_port = gossip_port;
+        node.cluster.raft_port = raft_port;
+        node.cluster.reporting_port = reporting_port;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("join-token-bun.log"),
+        )
+    });
+    // The joiners below seed off whichever gossip port the surviving
+    // attempt actually bound.
+    let gossip_port = node.cluster.gossip_port;
     let endpoint = format!("https://{address}");
     let ca_path = cluster_dir.join("identity/root-ca.crt");
     let ca = ca_path.to_str().unwrap();
@@ -553,14 +648,10 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     // gets its own ports and state paths, shares the cluster wrapping key,
     // and discovers node-01 through its gossip address.
     let mut joiners = Vec::new();
-    for (index, node_id) in ["node-02", "node-03"].iter().enumerate() {
+    for node_id in ["node-02", "node-03"] {
         let mut joiner = node.clone();
-        let [joiner_gossip, joiner_raft, joiner_reporting] = reserve_ports();
-        joiner.node.name = Some((*node_id).to_string());
+        joiner.node.name = Some(node_id.to_string());
         joiner.cluster.join = vec![format!("127.0.0.1:{gossip_port}")];
-        joiner.cluster.gossip_port = joiner_gossip;
-        joiner.cluster.raft_port = joiner_raft;
-        joiner.cluster.reporting_port = joiner_reporting;
         joiner.security.bootstrap_path = None;
         joiner.security.identity_dir = Some(root.path().join(node_id));
         let state = root.path().join(format!("state-{node_id}"));
@@ -570,15 +661,19 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         joiner.storage.metrics = state.join("metrics");
         joiner.storage.volumes = state.join("volumes");
         let config = root.path().join(format!("{node_id}.toml"));
-        std::fs::write(&config, toml::to_string_pretty(&joiner).unwrap()).unwrap();
-        let api = reserve_address();
-        joiners.push(BunProcess::spawn(
-            &config,
-            api,
-            true,
-            root.path().join(format!("{node_id}.log")),
-        ));
-        wait_for_tcp(&mut joiners[index], api);
+        let (joiner_bun, _api) = spawn_bun_with_port_retry(true, || {
+            let [joiner_gossip, joiner_raft, joiner_reporting] = reserve_ports();
+            joiner.cluster.gossip_port = joiner_gossip;
+            joiner.cluster.raft_port = joiner_raft;
+            joiner.cluster.reporting_port = joiner_reporting;
+            std::fs::write(&config, toml::to_string_pretty(&joiner).unwrap()).unwrap();
+            (
+                config.clone(),
+                reserve_address(),
+                root.path().join(format!("{node_id}.log")),
+            )
+        });
+        joiners.push(joiner_bun);
     }
 
     let convergence_deadline = Instant::now() + WAIT;
