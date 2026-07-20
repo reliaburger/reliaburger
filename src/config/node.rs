@@ -238,6 +238,15 @@ pub struct SecuritySection {
     /// identity on disk, and a joiner starts in enrollment mode until
     /// `relish join` installs one.
     pub require_mtls: bool,
+    /// Acknowledge running cluster transports (gossip, Raft, reporting) in
+    /// the clear on a routable address. Without `require_mtls`, a clustered
+    /// node refuses to bind these unauthenticated transports on a non-loopback
+    /// address unless this is explicitly set — otherwise any host that can
+    /// reach the ports could inject Raft RPCs, forge reports or gossip a
+    /// poison leader hint. Loopback-only plaintext clusters (single-host dev)
+    /// don't need it; `relish init --development-plaintext` and `relish dev`
+    /// set it for their deliberately-insecure local clusters.
+    pub allow_insecure_cluster: bool,
 }
 
 /// Self-upgrade configuration (Phase 14).

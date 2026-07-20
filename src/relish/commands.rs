@@ -438,6 +438,11 @@ pub fn init_with_security(
     node_config.security.bootstrap_path = Some(bootstrap_path.clone());
     node_config.security.identity_dir = Some(identity_dir.clone());
     node_config.security.require_mtls = security_mode == InitSecurityMode::MutualTls;
+    // Development plaintext is a deliberate, warned choice, so it also
+    // acknowledges running the cluster transports in the clear on a routable
+    // address — bun otherwise refuses to bind them (C7).
+    node_config.security.allow_insecure_cluster =
+        security_mode == InitSecurityMode::DevelopmentPlaintext;
     let security_header = match security_mode {
         InitSecurityMode::MutualTls => "# Internal cluster transports require mTLS.\n",
         InitSecurityMode::DevelopmentPlaintext => {

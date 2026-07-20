@@ -230,6 +230,35 @@ fn enforce_mtls_mode(
     );
 }
 
+/// Fail closed on unauthenticated cluster transports (C7).
+///
+/// With `require_mtls` off, gossip carries no HMAC and the Raft/reporting
+/// listeners are plaintext. On a routable advertise address any host that can
+/// reach those ports could inject Raft RPCs, forge state reports, or gossip a
+/// poison leader hint. Loopback-only plaintext clusters (single-host dev) are
+/// safe; a routable plaintext cluster must be an explicit, acknowledged choice
+/// rather than the silent default of an omitted `[security]` section.
+fn enforce_cluster_transport_security(
+    config: &NodeConfig,
+    params: &reliaburger::cluster::runtime::ClusterParams,
+) -> anyhow::Result<()> {
+    // mTLS (identity present) or an explicit acknowledgement both permit start.
+    if config.security.require_mtls || config.security.allow_insecure_cluster {
+        return Ok(());
+    }
+    let ip = params.gossip_addr.ip();
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to bind unauthenticated cluster transports on routable address {ip}: \
+         [security] require_mtls is false, so gossip, Raft and reporting would run in the clear \
+         and any host reaching these ports could poison consensus. Enable mTLS (`relish init`), \
+         advertise a loopback address for single-host testing, or set \
+         [security] allow_insecure_cluster = true to accept plaintext on this network."
+    );
+}
+
 /// Schedulable node capacity: system totals minus the `[resources]`
 /// reservation. Read once at startup.
 fn node_capacity(config: &NodeConfig) -> (u32, u32) {
@@ -506,6 +535,9 @@ async fn main() -> anyhow::Result<()> {
         // disk before it can speak the internal transports. Refuse to start
         // otherwise, with the command that fixes it.
         enforce_mtls_mode(&config, &params)?;
+        // Fail closed on plaintext cluster transports bound to a routable
+        // address unless the operator explicitly accepted it.
+        enforce_cluster_transport_security(&config, &params)?;
         api_identity = params.identity.clone();
         if params.identity.is_some() {
             println!("bun: mTLS enabled on the Raft RPC, reporting and API transports");
@@ -2158,6 +2190,67 @@ mod tests {
             .expect("normal init should produce loadable mTLS identity parameters");
         assert_eq!(identity.node_id, "node-secure");
         enforce_mtls_mode(&config, &params).unwrap();
+    }
+
+    fn plaintext_cluster_config(advertise: &str) -> NodeConfig {
+        let mut config = NodeConfig::default();
+        config.security.require_mtls = false;
+        config.network.advertise_address = Some(advertise.to_string());
+        config
+    }
+
+    #[test]
+    fn plaintext_cluster_on_a_routable_address_is_refused_without_ack() {
+        let config = plaintext_cluster_config("192.0.2.10");
+        let params = cluster_params_from_config(&config).unwrap();
+        let err = enforce_cluster_transport_security(&config, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("allow_insecure_cluster")
+                && err.to_string().contains("192.0.2.10"),
+            "routable plaintext cluster must be refused with guidance, got: {err}"
+        );
+    }
+
+    #[test]
+    fn plaintext_cluster_on_loopback_is_allowed() {
+        // Single-host dev/test: loopback plaintext is not network-reachable.
+        let config = plaintext_cluster_config("127.0.0.1");
+        let params = cluster_params_from_config(&config).unwrap();
+        enforce_cluster_transport_security(&config, &params).unwrap();
+    }
+
+    #[test]
+    fn plaintext_cluster_on_a_routable_address_is_allowed_with_explicit_ack() {
+        let mut config = plaintext_cluster_config("192.0.2.10");
+        config.security.allow_insecure_cluster = true;
+        let params = cluster_params_from_config(&config).unwrap();
+        enforce_cluster_transport_security(&config, &params).unwrap();
+    }
+
+    #[test]
+    fn mtls_cluster_on_a_routable_address_needs_no_insecure_ack() {
+        let mut config = plaintext_cluster_config("192.0.2.10");
+        config.security.require_mtls = true; // identity handling is enforce_mtls_mode's job
+        let params = cluster_params_from_config(&config).unwrap();
+        enforce_cluster_transport_security(&config, &params).unwrap();
+    }
+
+    #[test]
+    fn development_plaintext_init_sets_the_insecure_cluster_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        reliaburger::relish::commands::init_with_security(
+            dir.path(),
+            "dev",
+            "node-01",
+            reliaburger::relish::commands::InitSecurityMode::DevelopmentPlaintext,
+        )
+        .unwrap();
+        let config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
+        assert!(!config.security.require_mtls);
+        assert!(
+            config.security.allow_insecure_cluster,
+            "development-plaintext init must acknowledge insecure cluster transports"
+        );
     }
 
     #[test]

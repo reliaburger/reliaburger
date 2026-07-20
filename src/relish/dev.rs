@@ -317,6 +317,9 @@ reporting_port = 9445
 [security]
 master_key_path = "/etc/reliaburger/master.key"{bootstrap_line}
 require_mtls = false
+# Deliberate local dev cluster: accept plaintext cluster transports on the
+# inter-VM (routable) network. Never do this on a shared or production network.
+allow_insecure_cluster = true
 "#
     )
 }
