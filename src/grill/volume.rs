@@ -15,6 +15,8 @@ pub enum VolumeError {
     CreateFailed { path: String, reason: String },
     #[error("invalid size value: {0}")]
     InvalidSize(String),
+    #[error("mount path {0:?} escapes the volumes directory")]
+    PathTraversal(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -52,6 +54,16 @@ impl VolumeManager {
         mount_path: &Path,
         size_limit: Option<&str>,
     ) -> Result<PathBuf, VolumeError> {
+        // Defence in depth (config validation also rejects this): a `..`
+        // component in the mount path would escape `volumes_dir` once joined,
+        // giving a deploy a read-write bind mount of an arbitrary host
+        // directory as root. Refuse rather than provision.
+        if mount_path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(VolumeError::PathTraversal(mount_path.display().to_string()));
+        }
         let relative_path = mount_path.strip_prefix("/").unwrap_or(mount_path);
         let host_path = self
             .volumes_dir
@@ -357,6 +369,21 @@ mod tests {
         assert!(path.exists());
         assert!(path.is_dir());
         assert!(path.ends_with("default/redis/data"));
+    }
+
+    #[test]
+    fn create_managed_volume_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+
+        let result =
+            vm.create_managed_volume("default", "app", Path::new("/../../../etc/cron.d"), None);
+        assert!(
+            matches!(result, Err(VolumeError::PathTraversal(_))),
+            "a `..` mount path must be refused, not provisioned outside volumes_dir"
+        );
+        // Nothing was created outside the volumes directory.
+        assert!(!dir.path().join("../../../etc/cron.d").exists());
     }
 
     #[test]

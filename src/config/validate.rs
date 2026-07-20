@@ -228,6 +228,24 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
                 reason: format!("mount path {:?} must be absolute", vol.path.display()),
             });
         }
+        // A managed-volume host path is derived by joining the mount path
+        // under the node's volumes directory, so a `..` component escapes that
+        // directory — an absolute `/../../etc/cron.d` passes the check above
+        // yet lets a deploy create and read-write bind-mount an arbitrary host
+        // directory as root. Reject traversal outright.
+        if vol
+            .path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(ConfigError::InvalidVolume {
+                name: name.to_string(),
+                reason: format!(
+                    "mount path {:?} must not contain '..' components",
+                    vol.path.display()
+                ),
+            });
+        }
         if let Some(ref source) = vol.source
             && !source.is_absolute()
         {
@@ -616,6 +634,23 @@ mod tests {
         app.volumes.push(crate::config::types::VolumeSpec {
             path: PathBuf::from("/data"),
             source: Some(PathBuf::from("relative/host/path")),
+            size: None,
+        });
+        let config = config_with_app("test", app);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidVolume { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_volume_traversal_mount_path_rejected() {
+        // An absolute path with `..` passes the absolute check but escapes the
+        // volumes directory once joined — reject it.
+        let mut app = minimal_app();
+        app.volumes.push(crate::config::types::VolumeSpec {
+            path: PathBuf::from("/../../../../etc/cron.d"),
+            source: None,
             size: None,
         });
         let config = config_with_app("test", app);
