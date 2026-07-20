@@ -16,6 +16,18 @@ use crate::council::types::CouncilNodeInfo;
 use crate::meat::types::NodeId;
 use crate::mustard::directory::NodeDirectory;
 
+/// How far a gossip leader hint's term may legitimately lead this node's own
+/// Raft term before it is treated as bogus.
+///
+/// A real election bumps the term by one, and a follower/learner learns the
+/// current term from the leader's AppendEntries, so a hint should sit at or
+/// just above the local term — the small lead absorbs gossip out-running Raft
+/// replication to a lagging node. A hint claiming a term far beyond the local
+/// term (e.g. `u64::MAX`) is rejected: because the reporting epoch only ever
+/// grows, adopting one would wedge reporting cluster-wide past every
+/// subsequent real election.
+pub const MAX_LEADER_HINT_TERM_LEAD: u64 = 10;
+
 /// The resolved route to the current leader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderView {
@@ -49,6 +61,7 @@ pub fn resolve_leader(
     resolve_leader_view(
         raft_leader,
         directory,
+        metrics.current_term,
         raft_to_api_offset,
         raft_to_reporting_offset,
     )
@@ -60,15 +73,25 @@ pub fn resolve_leader(
 pub fn resolve_leader_view(
     raft_leader: Option<(NodeId, SocketAddr, u64)>,
     directory: &NodeDirectory,
+    local_term: u64,
     raft_to_api_offset: i32,
     raft_to_reporting_offset: i32,
 ) -> Option<LeaderView> {
+    // A gossip leader hint is only trusted when its term is plausibly close to
+    // this node's own Raft term (see [`MAX_LEADER_HINT_TERM_LEAD`]). An
+    // implausibly high term is bogus and, because the reporting epoch only
+    // grows, would otherwise wedge reporting forever.
+    let hint_plausible = |hint: &crate::mustard::message::LeaderHint| {
+        hint.term <= local_term.saturating_add(MAX_LEADER_HINT_TERM_LEAD)
+    };
     if let Some((node_id, raft_address, term)) = raft_leader {
         // A strictly newer gossip hint outranks local Raft metrics: a
         // partitioned ex-leader can keep reporting itself as leader until
-        // it steps down, while the rest of the cluster has moved on.
+        // it steps down, while the rest of the cluster has moved on. But a
+        // hint far beyond the local term can never outrank real metrics.
         if let Some(hint) = &directory.leader
             && hint.term > term
+            && hint_plausible(hint)
         {
             return Some(hint_view(hint));
         }
@@ -90,7 +113,11 @@ pub fn resolve_leader_view(
             reporting_address,
         });
     }
-    directory.leader.as_ref().map(hint_view)
+    directory
+        .leader
+        .as_ref()
+        .filter(|hint| hint_plausible(hint))
+        .map(hint_view)
 }
 
 fn hint_view(hint: &crate::mustard::message::LeaderHint) -> LeaderView {
@@ -140,7 +167,7 @@ mod tests {
             leader: Some(hint("leader", 5, 9117, 9445)),
             ..Default::default()
         };
-        let view = resolve_leader_view(None, &directory, 2, 1).unwrap();
+        let view = resolve_leader_view(None, &directory, 5, 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("leader"));
         assert_eq!(view.term, 5);
         assert_eq!(view.api_address, Some(addr(9117)));
@@ -149,7 +176,7 @@ mod tests {
 
     #[test]
     fn no_leader_anywhere_resolves_to_none() {
-        assert!(resolve_leader_view(None, &NodeDirectory::default(), 2, 1).is_none());
+        assert!(resolve_leader_view(None, &NodeDirectory::default(), 0, 2, 1).is_none());
     }
 
     #[test]
@@ -165,7 +192,7 @@ mod tests {
         // Raft knows the leader at raft port 9444; the directory's
         // advertised addresses win over 9444+offset.
         let raft = Some((NodeId::new("leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &directory, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, 7, 2, 1).unwrap();
         assert_eq!(view.term, 7);
         assert_eq!(view.api_address, Some(addr(19117)));
         assert_eq!(view.reporting_address, Some(addr(19445)));
@@ -174,7 +201,7 @@ mod tests {
     #[test]
     fn voter_falls_back_to_offset_derivation_without_a_directory_entry() {
         let raft = Some((NodeId::new("leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &NodeDirectory::default(), 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &NodeDirectory::default(), 7, 2, 1).unwrap();
         assert_eq!(view.api_address, Some(addr(9446)));
         assert_eq!(view.reporting_address, Some(addr(9445)));
     }
@@ -188,7 +215,7 @@ mod tests {
             ..Default::default()
         };
         let raft = Some((NodeId::new("old-leader"), addr(9444), 6));
-        let view = resolve_leader_view(raft, &directory, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, 6, 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("new-leader"));
         assert_eq!(view.term, 7);
     }
@@ -200,14 +227,45 @@ mod tests {
             ..Default::default()
         };
         let raft = Some((NodeId::new("raft-leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &directory, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, 7, 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("raft-leader"));
+    }
+
+    #[test]
+    fn implausible_gossip_hint_term_cannot_wedge_reporting() {
+        // A member gossips a leader hint with an absurd term to ratchet the
+        // (monotonic) reporting epoch to u64::MAX forever.
+        let directory = NodeDirectory {
+            leader: Some(hint("bogus", u64::MAX, 9217, 9545)),
+            ..Default::default()
+        };
+
+        // Voter path: the absurd hint cannot outrank the node's own metrics.
+        let raft = Some((NodeId::new("real-leader"), addr(9444), 7));
+        let view = resolve_leader_view(raft, &directory, 7, 2, 1).unwrap();
+        assert_eq!(
+            view.node_id,
+            NodeId::new("real-leader"),
+            "an implausible hint term must not outrank real Raft metrics"
+        );
+        assert_eq!(view.term, 7);
+
+        // Non-voter path: with no Raft leader, the absurd hint is rejected
+        // outright rather than adopted (which would fix the epoch at MAX).
+        assert!(resolve_leader_view(None, &directory, 7, 2, 1).is_none());
+
+        // A hint just within the window is still honoured.
+        let near = NodeDirectory {
+            leader: Some(hint("near", 7 + MAX_LEADER_HINT_TERM_LEAD, 9217, 9545)),
+            ..Default::default()
+        };
+        assert!(resolve_leader_view(None, &near, 7, 2, 1).is_some());
     }
 
     #[test]
     fn offset_derivation_rejects_out_of_range_ports() {
         let raft = Some((NodeId::new("leader"), addr(65535), 1));
-        let view = resolve_leader_view(raft, &NodeDirectory::default(), 2, -1).unwrap();
+        let view = resolve_leader_view(raft, &NodeDirectory::default(), 1, 2, -1).unwrap();
         assert_eq!(view.api_address, None);
         assert_eq!(view.reporting_address, Some(addr(65534)));
     }
