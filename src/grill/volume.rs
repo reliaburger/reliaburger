@@ -382,8 +382,11 @@ mod tests {
             matches!(result, Err(VolumeError::PathTraversal(_))),
             "a `..` mount path must be refused, not provisioned outside volumes_dir"
         );
-        // Nothing was created outside the volumes directory.
-        assert!(!dir.path().join("../../../etc/cron.d").exists());
+        // The function returned before touching the filesystem: no namespace
+        // subdirectory was created under the volumes directory. (Don't probe
+        // the escaped path itself — `<tmp>/../../../etc/cron.d` canonicalises
+        // to the host's real /etc/cron.d, which exists on Linux regardless.)
+        assert!(!dir.path().join("default").exists());
     }
 
     #[test]
