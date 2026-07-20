@@ -464,9 +464,19 @@ impl UpgradeManager {
         // the race the retention test hit on a loaded runner. Retention GC is
         // best-effort: failing to prune an old binary must never fail an
         // otherwise-verified upgrade.
+        // Protect BOTH the version we rolled back from (`previous_version`,
+        // kept for a re-roll-forward) AND the version the symlink now points
+        // at (`target_version`, the live binary). A rollback to a version
+        // older than the retention window would otherwise leave `target_version`
+        // among the deletion candidates and GC would delete the running
+        // binary — the symlink then dangles and the next exec/restart hits
+        // ENOENT with no automatic revert.
         match self.store.garbage_collect(
             self.retain_versions,
-            std::slice::from_ref(&marker.previous_version),
+            &[
+                marker.previous_version.clone(),
+                marker.target_version.clone(),
+            ],
         ) {
             Ok(deleted) => {
                 for version in deleted {
@@ -800,6 +810,58 @@ mod tests {
         // oldest stubs are gone.
         assert!(!fixture.binary_dir.join("bun-v0.0.1").exists());
         assert!(fixture.binary_dir.join("bun-v0.1.0").is_file());
+    }
+
+    #[test]
+    fn commit_never_gc_deletes_the_current_symlink_target_on_rollback() {
+        let fixture = fixture();
+        let stub = SignatureEnvelope {
+            schema: 1,
+            sha256: String::new(),
+            embedded: String::new(),
+            external: None,
+        };
+        // Store holds 0.1.0 (active, from the fixture) plus four newer
+        // versions: five in total, retention default is 3.
+        for version in ["0.2.0", "0.3.0", "0.4.0", "0.5.0"] {
+            fixture
+                .manager
+                .store()
+                .stage(&v(version), b"x", &stub)
+                .unwrap();
+        }
+        // The symlink still targets 0.1.0 — the version we rolled back to,
+        // which sorts oldest and would be a GC candidate.
+        assert_eq!(
+            fixture.manager.store().current_target().unwrap(),
+            v("0.1.0")
+        );
+
+        let marker = UpgradeMarker {
+            schema: 1,
+            upgrade_id: "rollback-to-0.1.0".to_string(),
+            previous_version: v("0.5.0"),
+            previous_binary: v("0.5.0").file_name("bun"),
+            target_version: v("0.1.0"),
+            target_binary: v("0.1.0").file_name("bun"),
+            phase: MarkerPhase::Executed,
+            boot_attempts: 1,
+            pre_upgrade_instances: vec![],
+        };
+
+        fixture.manager.commit(&marker).unwrap();
+
+        // The live binary and its symlink must survive the retention sweep;
+        // only a genuinely superseded, unprotected version (0.2.0) is pruned.
+        assert!(
+            fixture.binary_dir.join("bun-v0.1.0").is_file(),
+            "GC deleted the running rollback target — the node would fail to exec"
+        );
+        assert_eq!(
+            fixture.manager.store().current_target().unwrap(),
+            v("0.1.0")
+        );
+        assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
     }
 
     #[tokio::test]

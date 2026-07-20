@@ -42,6 +42,12 @@ pub enum RecoveryError {
     NoBackup { url: String },
     #[error("open recovery source: {0}")]
     OpenSource(String),
+    #[error(
+        "no committed snapshot exists at {path}: this node holds no durable state to recover from \
+         (a young or low-churn cluster may never have snapshotted — restore from a sealed backup \
+         with `--from` instead of the node's data directory)"
+    )]
+    EmptySnapshot { path: String },
     #[error("re-bootstrap: {0}")]
     Bootstrap(String),
     #[error("persist recovered snapshot: {0}")]
@@ -97,10 +103,26 @@ pub async fn load_recovery_state(
 /// holds the most recent committed state.
 async fn load_state_from_data_dir(data_dir: &Path) -> Result<DesiredState, RecoveryError> {
     let snapshot_path = data_dir.join("raft").join("snapshot.redb");
+    // `redb::Database::create` would fabricate an empty store for a missing
+    // file, and `with_store` returns empty state when no snapshot blob has
+    // been written yet — so a young cluster would "recover" into zero apps,
+    // no CAs and no tokens, reported as success. Refuse both cases.
+    if !snapshot_path.exists() {
+        return Err(RecoveryError::EmptySnapshot {
+            path: snapshot_path.display().to_string(),
+        });
+    }
     let db = std::sync::Arc::new(
         redb::Database::create(&snapshot_path)
             .map_err(|e| RecoveryError::OpenSource(format!("open snapshot store: {e}")))?,
     );
+    if !CouncilStateMachine::snapshot_present(&db)
+        .map_err(|e| RecoveryError::OpenSource(format!("inspect snapshot store: {e}")))?
+    {
+        return Err(RecoveryError::EmptySnapshot {
+            path: snapshot_path.display().to_string(),
+        });
+    }
     let state_machine = CouncilStateMachine::with_store(db)
         .map_err(|e| RecoveryError::OpenSource(format!("load snapshot: {e}")))?;
     Ok(state_machine.desired_state().await)
@@ -247,6 +269,50 @@ mod tests {
         assert_eq!(loaded.config.get("k").map(String::as_str), Some("v"));
         assert_eq!(loaded.recovery_epoch, 1);
         assert!(loaded.last_applied_log.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_a_data_dir_with_no_snapshot_file() {
+        // A young cluster that never snapshotted: no snapshot.redb at all.
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_state_from_data_dir(dir.path()).await.unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::EmptySnapshot { .. }),
+            "expected EmptySnapshot, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_a_snapshot_store_with_no_committed_blob() {
+        // snapshot.redb exists but holds no snapshot blob (the normal state
+        // before the first snapshot is written). Recovery must refuse rather
+        // than load an empty DesiredState.
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("raft").join("snapshot.redb");
+        std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+        {
+            let db = std::sync::Arc::new(redb::Database::create(&snapshot_path).unwrap());
+            // Materialise the (empty) snapshot table, then drop the handle.
+            let _ = CouncilStateMachine::with_store(db).unwrap();
+        }
+
+        let err = load_state_from_data_dir(dir.path()).await.unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::EmptySnapshot { .. }),
+            "expected EmptySnapshot, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_loads_a_genuine_snapshot() {
+        // A node that WAS a voter and holds a real snapshot recovers its state.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DesiredState::default();
+        state.config.insert("k".to_string(), "v".to_string());
+        recover_data_dir(dir.path(), state).unwrap();
+
+        let loaded = load_state_from_data_dir(dir.path()).await.unwrap();
+        assert_eq!(loaded.config.get("k").map(String::as_str), Some("v"));
     }
 
     #[tokio::test]

@@ -45,6 +45,20 @@ fn skipped(reason: &str) -> SyncOutcome {
     }
 }
 
+/// Whether a commit's signature status may be applied under the signing policy.
+///
+/// Fails **closed**: when `require_signed` is set, only a genuinely `Verified`
+/// signature passes. `NotChecked` means verification never ran — no trusted
+/// keys are configured, or `git` could not be spawned — and admitting it would
+/// silently apply unsigned commits despite `require_signed_commits = true`.
+fn signature_admitted(status: &SignatureStatus, require_signed: bool) -> bool {
+    if require_signed {
+        *status == SignatureStatus::Verified
+    } else {
+        true
+    }
+}
+
 /// Execute a single sync cycle.
 ///
 /// This is the pure logic of the sync loop, separated from the
@@ -98,19 +112,20 @@ pub fn execute_sync(
     if config.require_signed_commits {
         let status = verify::verify_commit(repo.path(), &commit, &config.trusted_signing_keys);
         commit.signature = status.clone();
-        match status {
-            SignatureStatus::Verified | SignatureStatus::NotChecked => {}
-            _ => {
-                return SyncOutcome {
-                    commit: Some(commit.clone()),
-                    result: SyncResult::Failure {
-                        error: format!("commit {} signature: {:?}", commit.sha, commit.signature),
-                    },
-                    diff_summary: None,
-                    changes: Vec::new(),
-                    file_errors: HashMap::new(),
-                };
-            }
+        if !signature_admitted(&status, true) {
+            return SyncOutcome {
+                commit: Some(commit.clone()),
+                result: SyncResult::Failure {
+                    error: format!(
+                        "commit {} rejected: require_signed_commits is set but the \
+                         signature is {:?} (configure trusted_signing_keys and sign commits)",
+                        commit.sha, commit.signature
+                    ),
+                },
+                diff_summary: None,
+                changes: Vec::new(),
+                file_errors: HashMap::new(),
+            };
         }
     }
 
@@ -172,7 +187,34 @@ pub fn execute_sync(
 
     let (git_config, file_errors) = parse_toml_files(&toml_files);
 
-    // Step 4: Compute diff
+    // A parse or duplicate-resource error means the merged config is
+    // INCOMPLETE: the resources declared in the failed files are absent, so a
+    // diff would emit `Remove` for every one of them and the runner would
+    // delete live workloads on a single typo, advancing the applied commit as
+    // it went. Fail closed — apply nothing and don't advance the commit until
+    // the whole tree parses cleanly.
+    if !file_errors.is_empty() {
+        let mut reasons: Vec<String> = file_errors
+            .iter()
+            .map(|(file, error)| format!("{file}: {error}"))
+            .collect();
+        reasons.sort();
+        return SyncOutcome {
+            commit: Some(commit),
+            result: SyncResult::Failure {
+                error: format!(
+                    "refusing to apply an incomplete config ({} file(s) failed to parse): {}",
+                    reasons.len(),
+                    reasons.join("; ")
+                ),
+            },
+            diff_summary: None,
+            changes: Vec::new(),
+            file_errors,
+        };
+    }
+
+    // Step 4: Compute diff (only on a fully-parsed config).
     let current = CurrentState {
         apps: current_apps,
         namespaces: current_namespaces,
@@ -180,18 +222,9 @@ pub fn execute_sync(
     };
     let (changes, summary) = diff::compute_diff(&git_config, &current, autoscale_overrides);
 
-    // Step 5: Determine result
-    let result = if file_errors.is_empty() {
-        SyncResult::Success
-    } else {
-        SyncResult::PartialSuccess {
-            errors: file_errors.values().cloned().collect(),
-        }
-    };
-
     SyncOutcome {
         commit: Some(commit),
-        result,
+        result: SyncResult::Success,
         diff_summary: Some(summary),
         changes,
         file_errors,
@@ -345,6 +378,124 @@ mod tests {
         // The later file's collision is surfaced, not swallowed.
         assert!(errors.contains_key("b-second.toml"));
         assert!(errors["b-second.toml"].contains("duplicate resource app.web"));
+    }
+
+    /// C11: with `require_signed_commits`, verification must fail closed —
+    /// only `Verified` is admissible. `NotChecked` (empty trusted keys or git
+    /// unavailable) must be refused, not silently applied.
+    #[test]
+    fn require_signed_commits_admits_only_verified() {
+        assert!(signature_admitted(&SignatureStatus::Verified, true));
+        for status in [
+            SignatureStatus::NotChecked,
+            SignatureStatus::Unsigned,
+            SignatureStatus::UntrustedKey,
+            SignatureStatus::InvalidSignature,
+        ] {
+            assert!(
+                !signature_admitted(&status, true),
+                "{status:?} must be refused when signatures are required"
+            );
+        }
+    }
+
+    #[test]
+    fn without_required_signing_any_status_is_admitted() {
+        for status in [
+            SignatureStatus::Verified,
+            SignatureStatus::NotChecked,
+            SignatureStatus::Unsigned,
+        ] {
+            assert!(signature_admitted(&status, false));
+        }
+    }
+
+    /// C10: a parse error in one file must fail the whole sync and emit NO
+    /// changes — never a `Remove` for the resources the broken file would have
+    /// declared, which would delete live workloads and advance the commit.
+    #[test]
+    fn parse_error_fails_closed_and_emits_no_removals() {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("repo.git");
+        let work = dir.path().join("work");
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+        };
+        Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["clone"])
+            .arg(&bare)
+            .arg(&work)
+            .output()
+            .unwrap();
+        run(&["config", "user.email", "t@t.test"], &work);
+        run(&["config", "user.name", "T"], &work);
+        run(&["checkout", "-B", "main"], &work);
+        std::fs::write(work.join("keep.toml"), "[app.web]\nimage = \"web:v1\"\n").unwrap();
+        // Intended to declare `app.critical`, but the string is unterminated.
+        std::fs::write(work.join("broken.toml"), "[app.critical]\nimage = \"oops\n").unwrap();
+        run(&["add", "."], &work);
+        run(&["commit", "-m", "init"], &work);
+        run(&["push", "origin", "main"], &work);
+
+        let url = format!("file://{}", bare.display());
+        let repo = GitRepo::clone_or_open(&url, &dir.path().join("clone"), "main").unwrap();
+        let config = GitOpsConfig {
+            repo: url,
+            branch: "main".to_string(),
+            path: "/".to_string(),
+            poll_interval_secs: 30,
+            require_signed_commits: false,
+            trusted_signing_keys: vec![],
+            webhook_secret: None,
+            recursive: false,
+            webhook_rate_limit: 10,
+        };
+
+        // Raft currently holds `critical` (from the now-broken file) and `web`.
+        // A naive incomplete diff would `Remove` `critical`.
+        let mut current: HashMap<AppId, AppSpec> = HashMap::new();
+        current.insert(
+            AppId::new("critical", "default"),
+            toml::from_str(r#"image = "c:v1""#).unwrap(),
+        );
+        current.insert(
+            AppId::new("web", "default"),
+            toml::from_str(r#"image = "web:v1""#).unwrap(),
+        );
+        let namespaces = BTreeMap::new();
+        let permissions = BTreeMap::new();
+
+        let outcome = execute_sync(
+            &repo,
+            &config,
+            &current,
+            &namespaces,
+            &permissions,
+            &[],
+            None,
+        );
+
+        assert!(
+            matches!(outcome.result, SyncResult::Failure { .. }),
+            "a parse error must fail the sync, got {:?}",
+            outcome.result
+        );
+        assert!(
+            outcome.changes.is_empty(),
+            "a failed parse must emit no changes — never a Remove of a live app"
+        );
+        assert!(outcome.file_errors.contains_key("broken.toml"));
     }
 
     #[test]
