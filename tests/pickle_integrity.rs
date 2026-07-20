@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::pickle::api::{PickleState, router};
-use reliaburger::pickle::gc::{GcConfig, delete_approved, gc_candidates};
+use reliaburger::pickle::gc::{GcConfig, delete_approved, gc_candidates, referenced_digests};
 use reliaburger::pickle::replication::Peer;
 use reliaburger::pickle::store::{BlobStore, compute_sha256};
 use reliaburger::pickle::types::{Digest, ManifestCatalog};
@@ -165,7 +165,8 @@ async fn run_gc(registry: &Registry) {
             .write()
             .await
             .apply_gc_report(&report);
-        delete_approved(&registry.state.store, &approved);
+        let referenced = referenced_digests(&registry.state.catalog.read().await.clone());
+        delete_approved(&registry.state.store, &approved, &referenced);
     }
 }
 
