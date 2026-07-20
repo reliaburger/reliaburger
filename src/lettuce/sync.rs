@@ -214,7 +214,26 @@ pub fn execute_sync(
         };
     }
 
-    // Step 4: Compute diff (only on a fully-parsed config).
+    // Step 3b: Validate exactly as manual `apply` does (config.rs
+    // `validate_against`), against the union of the repo's namespaces and the
+    // already-committed ones. Without this, a config that `relish apply`
+    // rejects — an inverted `[autoscale]` range, a `request > limit` resource
+    // spec, a permission/build targeting an unknown namespace — was committed
+    // straight to desired state via git and then silently ignored downstream.
+    let known_namespaces: Vec<String> = current_namespaces.keys().cloned().collect();
+    if let Err(e) = git_config.validate_against(&known_namespaces) {
+        return SyncOutcome {
+            commit: Some(commit),
+            result: SyncResult::Failure {
+                error: format!("config validation failed: {e}"),
+            },
+            diff_summary: None,
+            changes: Vec::new(),
+            file_errors,
+        };
+    }
+
+    // Step 4: Compute diff (only on a fully-parsed, valid config).
     let current = CurrentState {
         apps: current_apps,
         namespaces: current_namespaces,
@@ -496,6 +515,78 @@ mod tests {
             "a failed parse must emit no changes — never a Remove of a live app"
         );
         assert!(outcome.file_errors.contains_key("broken.toml"));
+    }
+
+    /// C13: a config that parses but fails validation (here, a namespace with
+    /// a zero cap, which `relish apply` rejects) must fail the GitOps sync with
+    /// no changes — never committed straight to desired state.
+    #[test]
+    fn invalid_config_fails_the_sync_via_the_same_validation_as_apply() {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("repo.git");
+        let work = dir.path().join("work");
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+        };
+        Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["clone"])
+            .arg(&bare)
+            .arg(&work)
+            .output()
+            .unwrap();
+        run(&["config", "user.email", "t@t.test"], &work);
+        run(&["config", "user.name", "T"], &work);
+        run(&["checkout", "-B", "main"], &work);
+        // Valid TOML, invalid semantics: a zero namespace cap.
+        std::fs::write(work.join("ns.toml"), "[namespace.prod]\nmax_apps = 0\n").unwrap();
+        run(&["add", "."], &work);
+        run(&["commit", "-m", "init"], &work);
+        run(&["push", "origin", "main"], &work);
+
+        let url = format!("file://{}", bare.display());
+        let repo = GitRepo::clone_or_open(&url, &dir.path().join("clone"), "main").unwrap();
+        let config = GitOpsConfig {
+            repo: url,
+            branch: "main".to_string(),
+            path: "/".to_string(),
+            poll_interval_secs: 30,
+            require_signed_commits: false,
+            trusted_signing_keys: vec![],
+            webhook_secret: None,
+            recursive: false,
+            webhook_rate_limit: 10,
+        };
+
+        let outcome = execute_sync(
+            &repo,
+            &config,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            None,
+        );
+
+        assert!(
+            matches!(outcome.result, SyncResult::Failure { .. }),
+            "an invalid config must fail the sync, got {:?}",
+            outcome.result
+        );
+        assert!(
+            outcome.changes.is_empty(),
+            "a validation failure must emit no changes"
+        );
     }
 
     #[test]
