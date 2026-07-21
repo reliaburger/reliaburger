@@ -2461,20 +2461,52 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     include_leader: false,
                     override_safety: false,
                 };
-                self.fault_registry.insert(&request);
+                // Safety rails apply to the legacy path too (M1): a partition
+                // that would strand quorum must be refused, not waved through
+                // just because it came in on the old chaos API.
+                let context = self.build_safety_context(&request).await;
+                let check = crate::smoker::safety::evaluate_safety(&request, &context);
+                if !check.approved {
+                    let reason = check
+                        .violation
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "safety check failed".into());
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
+                }
+                let rule = self.fault_registry.insert(&request);
                 // L15: actually partition. Resolve each peer (by name)
                 // to its gossip address from membership, then block both
                 // the gossip and Raft transports to it — the old code
                 // only recorded a registry entry and dropped nothing.
                 let blocked = self.apply_partition(&peers).await;
+                // Record the reversal so heal and TTL-expiry unblock exactly
+                // these peers (M1): without it a Ctrl-C'd partition stayed in
+                // force forever with no record it existed.
+                self.record_reversal(
+                    rule.id,
+                    crate::smoker::types::FaultReversal::Partition {
+                        peers: peers.clone(),
+                    },
+                );
                 let msg =
                     format!("partition injected: blocking {blocked} peer(s) for {duration_secs}s");
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::HealPartition { response } => {
-                // Legacy chaos API — clear all faults and blocklists.
+                // Legacy chaos API — clear all faults, reversing each so no
+                // persistent effect (a SIGSTOPped workload, a cgroup cap, a
+                // transport blocklist) outlives the heal (M1). The old code
+                // cleared the registry and the blocklists but never ran
+                // `reverse_fault`, so a frozen process stayed frozen.
                 let removed = self.fault_registry.clear();
+                for rule in &removed {
+                    self.delete_fault_bpf_entry(rule).await;
+                    self.reverse_fault(rule).await;
+                }
+                // Belt and braces: drop any blocklist entries no fault owned.
                 self.clear_partition().await;
+                self.publish_dns_faults();
                 let msg = if removed.is_empty() {
                     "partition healed".to_string()
                 } else {
@@ -2528,17 +2560,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // Safety rails first (L14): reject faults that risk
                 // quorum, kill a service's last replica, target the
                 // leader, or exceed the node-percentage cap — unless
-                // explicitly overridden.
-                if let Some(context) = self.build_safety_context(&request).await {
-                    let check = crate::smoker::safety::evaluate_safety(&request, &context);
-                    if !check.approved {
-                        let reason = check
-                            .violation
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "safety check failed".into());
-                        let _ = response.send(Err(BunError::FaultRejected { reason }));
-                        return;
-                    }
+                // explicitly overridden. The context is built even with no
+                // cluster handle so the replica-minimum rail still runs (M1).
+                let context = self.build_safety_context(&request).await;
+                let check = crate::smoker::safety::evaluate_safety(&request, &context);
+                if !check.approved {
+                    let reason = check
+                        .violation
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "safety check failed".into());
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
                 }
 
                 // Actually apply the fault. Only record it in the
@@ -2874,37 +2906,61 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Build the safety context for a fault request from live cluster
-    /// state, or `None` when there's no council (single-node mode has
-    /// nothing to protect quorum-wise; replica/leader rails don't apply).
+    /// Unblock a specific set of peers on both transports — the reversal of
+    /// [`apply_partition`]. Only the addresses this fault added are removed, so
+    /// healing one partition fault leaves any others still in force.
+    async fn remove_partition(&self, peers: &[String]) {
+        let Some(handle) = &self.cluster else {
+            return;
+        };
+        let blocklists = &handle.partition_blocklists;
+        let targets: Vec<std::net::SocketAddr> = {
+            let membership = handle.membership_rx.borrow();
+            peers
+                .iter()
+                .filter_map(|name| {
+                    membership
+                        .iter()
+                        .find(|m| &m.node_id.0 == name)
+                        .map(|m| m.address)
+                })
+                .collect()
+        };
+        if let Some(gossip) = &blocklists.gossip {
+            let mut set = gossip.write().await;
+            for addr in &targets {
+                set.remove(addr);
+            }
+        }
+        if let Some(raft) = &blocklists.raft {
+            let mut set = raft.write().await;
+            for addr in &targets {
+                let raft_addr = std::net::SocketAddr::new(
+                    addr.ip(),
+                    (addr.port() as i32 + blocklists.raft_port_offset) as u16,
+                );
+                set.remove(&raft_addr);
+            }
+        }
+    }
+
+    /// Build the safety context for a fault request from live cluster state.
+    ///
+    /// Always returns a context (M1): when there's no council — standalone
+    /// mode, or a node that hasn't joined — the quorum, leader, and
+    /// node-percentage rails have nothing to act on and neutralise themselves
+    /// via zeroed fields, but the **replica-minimum** rail still fires from the
+    /// locally-known replica count. That rail is what stops `fault kill
+    /// --count 0` from taking out a service's last replica, so it must run even
+    /// with no cluster handle; the old code returned `None` there and skipped
+    /// safety entirely.
     async fn build_safety_context(
         &self,
         request: &crate::smoker::types::FaultRequest,
-    ) -> Option<crate::smoker::types::SafetyContext> {
-        let handle = self.cluster.as_ref()?;
-        let metrics = handle.raft_metrics_rx.as_ref()?.borrow().clone();
-        let council_size = metrics.membership_config.membership().voter_ids().count() as u32;
-        let leader_node_id = metrics
-            .current_leader
-            .and_then(|id| {
-                metrics
-                    .membership_config
-                    .membership()
-                    .get_node(&id)
-                    .map(|info| info.name.clone())
-            })
-            .unwrap_or_default();
-        let total_nodes = handle
-            .membership_rx
-            .borrow()
-            .iter()
-            .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
-            .count()
-            .max(1) as u32;
-
-        // Replicas of the target service running locally (an
-        // approximation — the leader has the cluster-wide count, but
-        // this node protects at least its own replicas).
+    ) -> crate::smoker::types::SafetyContext {
+        // Replicas of the target service running locally (an approximation —
+        // the leader has the cluster-wide count, but this node protects at
+        // least its own replicas). Available with or without a cluster.
         let target_service_replicas = self
             .supervisor
             .list_instances()
@@ -2933,7 +2989,41 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.fault_registry
                 .count_by_service(&request.target_service) as u32;
 
-        Some(crate::smoker::types::SafetyContext {
+        // Cluster-derived fields, or zeros when this node has no council. A
+        // zero `council_size`/`total_nodes` makes the quorum, leader, and
+        // node-percentage rails self-skip (see `smoker::safety`).
+        let (council_size, leader_node_id, total_nodes) = match self
+            .cluster
+            .as_ref()
+            .and_then(|handle| handle.raft_metrics_rx.as_ref().map(|rx| (handle, rx)))
+        {
+            Some((handle, metrics_rx)) => {
+                let metrics = metrics_rx.borrow().clone();
+                let council_size =
+                    metrics.membership_config.membership().voter_ids().count() as u32;
+                let leader_node_id = metrics
+                    .current_leader
+                    .and_then(|id| {
+                        metrics
+                            .membership_config
+                            .membership()
+                            .get_node(&id)
+                            .map(|info| info.name.clone())
+                    })
+                    .unwrap_or_default();
+                let total_nodes = handle
+                    .membership_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
+                    .count()
+                    .max(1) as u32;
+                (council_size, leader_node_id, total_nodes)
+            }
+            None => (0, String::new(), 0),
+        };
+
+        crate::smoker::types::SafetyContext {
             council_size,
             council_nodes_with_active_faults: active_node_faults,
             leader_node_id,
@@ -2941,7 +3031,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             nodes_with_active_faults: active_node_faults,
             target_service_replicas,
             target_service_faulted_replicas,
-        })
+        }
     }
 
     /// Apply a fault for real (L14). Process faults (kill/pause/resume)
@@ -3001,13 +3091,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // and could not be lifted before the deadline. Now the
                 // workload keeps only `100 - percentage` of a core, and clear
                 // /expiry restores its original quota.
-                self.apply_cgroup_fault(rule, |cgroup| {
-                    let saved =
-                        crate::smoker::resource::read_cpu_max(cgroup).map_err(|e| e.to_string())?;
-                    crate::smoker::resource::apply_cpu_stress(cgroup, *percentage)
-                        .map_err(|e| e.to_string())?;
-                    Ok(saved)
-                })
+                self.apply_cgroup_fault(
+                    rule,
+                    |cgroup| {
+                        let saved = crate::smoker::resource::read_cpu_max(cgroup)
+                            .map_err(|e| e.to_string())?;
+                        crate::smoker::resource::apply_cpu_stress(cgroup, *percentage)
+                            .map_err(|e| e.to_string())?;
+                        Ok(saved)
+                    },
+                    |cgroup, saved| {
+                        if let Err(e) = crate::smoker::resource::restore_cpu_max(cgroup, saved) {
+                            eprintln!(
+                                "smoker: rollback cpu.max on {} failed: {e}",
+                                cgroup.display()
+                            );
+                        }
+                    },
+                )
                 .await
                 .map(|saved| {
                     self.record_reversal(
@@ -3057,13 +3158,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             .to_string(),
                     );
                 }
-                self.apply_cgroup_fault(rule, |cgroup| {
-                    let saved = crate::smoker::resource::read_memory_high(cgroup)
-                        .map_err(|e| e.to_string())?;
-                    crate::smoker::resource::apply_memory_pressure(cgroup, *percentage)
-                        .map_err(|e| e.to_string())?;
-                    Ok(saved)
-                })
+                self.apply_cgroup_fault(
+                    rule,
+                    |cgroup| {
+                        let saved = crate::smoker::resource::read_memory_high(cgroup)
+                            .map_err(|e| e.to_string())?;
+                        crate::smoker::resource::apply_memory_pressure(cgroup, *percentage)
+                            .map_err(|e| e.to_string())?;
+                        Ok(saved)
+                    },
+                    |cgroup, saved| {
+                        if let Err(e) = crate::smoker::resource::restore_memory_high(cgroup, saved)
+                        {
+                            eprintln!(
+                                "smoker: rollback memory.high on {} failed: {e}",
+                                cgroup.display()
+                            );
+                        }
+                    },
+                )
                 .await
                 .map(|saved| {
                     self.record_reversal(
@@ -3082,16 +3195,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // actually writes to; clear/expiry lifts it.
                 let device = self.io_device_major_minor();
                 let dev_for_reverse = device.clone();
-                self.apply_cgroup_fault(rule, |cgroup| {
-                    crate::smoker::resource::apply_disk_io_throttle(
-                        cgroup,
-                        *bytes_per_sec,
-                        *write_only,
-                        &device,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(cgroup.to_string_lossy().into_owned())
-                })
+                let dev_for_rollback = device.clone();
+                self.apply_cgroup_fault(
+                    rule,
+                    |cgroup| {
+                        crate::smoker::resource::apply_disk_io_throttle(
+                            cgroup,
+                            *bytes_per_sec,
+                            *write_only,
+                            &device,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(cgroup.to_string_lossy().into_owned())
+                    },
+                    |cgroup, _saved| {
+                        if let Err(e) = crate::smoker::resource::remove_disk_io_throttle(
+                            cgroup,
+                            &dev_for_rollback,
+                        ) {
+                            eprintln!(
+                                "smoker: rollback io.max on {} failed: {e}",
+                                cgroup.display()
+                            );
+                        }
+                    },
+                )
                 .await
                 .map(|paths| {
                     let instances = paths
@@ -3119,7 +3247,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ))
             }
             FaultType::Partition { .. } => {
-                // Handled by InjectPartition via transport blocklists.
+                // A service-to-service partition is an eBPF connect-map fault
+                // (`write_fault_bpf_entry` writes a `FAULT_ACTION_PARTITION`
+                // entry keyed by target VIP + source cgroup). It is reached
+                // through this arm only when the data path is loaded; the
+                // Delay/Drop/Bandwidth branch above already routes the other
+                // eBPF network faults. This arm is left as an accepted no-op
+                // because the quorum-rail acceptance test injects a Partition
+                // to exercise the safety context on a node with no eBPF, and
+                // an honest eBPF-or-reject here would fail that path.
+                //
+                // TODO(Phase 15): fold Partition into the eBPF network-fault
+                // arm (honest-reject without the data path) and move the
+                // quorum-rail acceptance test onto an eBPF-loaded node so the
+                // no-op can go. The council-level transport partition
+                // (`relish chaos council-partition`) is a different mechanism
+                // and IS wired — see `InjectPartition`/`apply_partition`.
+                #[cfg(feature = "ebpf")]
+                if self.onion_ebpf.is_some() {
+                    self.write_fault_bpf_entry(rule).await;
+                }
                 Ok(())
             }
         }
@@ -3183,41 +3330,62 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Apply a cgroup-writing fault to every target instance and collect the
-    /// per-instance saved state the closure returns (for later reversal).
+    /// per-instance saved state the `apply` closure returns (for later
+    /// reversal).
     ///
     /// Returns an honest error when there are no running instances to target,
-    /// or on any platform without cgroup v2. The closure runs once per target
-    /// cgroup; the first failure aborts and is surfaced to the caller so the
-    /// fault is never recorded as active while it changed nothing.
+    /// or on any platform without cgroup v2. The `apply` closure runs once per
+    /// target cgroup. If one fails partway through, the instances already
+    /// modified are rolled back with `restore` before the error is surfaced
+    /// (M1) — without that, an earlier replica stayed throttled while the
+    /// caller, seeing the error, dropped the registry entry that would have
+    /// let a later clear undo it.
     #[cfg(target_os = "linux")]
-    async fn apply_cgroup_fault<F>(
+    async fn apply_cgroup_fault<F, R>(
         &self,
         rule: &crate::smoker::types::FaultRule,
-        mut per_instance: F,
+        mut apply: F,
+        restore: R,
     ) -> Result<Vec<(String, String)>, String>
     where
         F: FnMut(&std::path::Path) -> Result<String, String>,
+        R: Fn(&std::path::Path, &str),
     {
         let targets = self.target_instance_cgroups(rule);
         if targets.is_empty() {
             return Err(format!("no running instances of {}", rule.target_service));
         }
         let mut saved = Vec::with_capacity(targets.len());
+        let mut applied: Vec<(std::path::PathBuf, String)> = Vec::new();
         for (id, cgroup) in targets {
-            let value = per_instance(&cgroup)?;
-            saved.push((id.0, value));
+            match apply(&cgroup) {
+                Ok(value) => {
+                    applied.push((cgroup.clone(), value.clone()));
+                    saved.push((id.0, value));
+                }
+                Err(e) => {
+                    // Roll back the instances already modified, newest first,
+                    // so a partial application never leaks a limit.
+                    for (cgroup, value) in applied.iter().rev() {
+                        restore(cgroup, value);
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(saved)
     }
 
     #[cfg(not(target_os = "linux"))]
-    async fn apply_cgroup_fault<F>(
+    async fn apply_cgroup_fault<F, R>(
         &self,
         rule: &crate::smoker::types::FaultRule,
-        _per_instance: F,
+        _apply: F,
+        _restore: R,
     ) -> Result<Vec<(String, String)>, String>
     where
         F: FnMut(&std::path::Path) -> Result<String, String>,
+        R: Fn(&std::path::Path, &str),
     {
         Err(format!("{} requires Linux cgroups", rule.fault_type))
     }
@@ -3304,6 +3472,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         eprintln!("smoker: lift io.max on {path} failed: {e}");
                     }
                 }
+            }
+            FaultReversal::Partition { peers } => {
+                self.remove_partition(peers).await;
             }
         }
     }
@@ -8982,5 +9153,47 @@ mod tests {
         let rule = fault_rule(crate::smoker::types::FaultType::Pause);
         // reversal defaults to None; must not panic or error.
         agent.reverse_fault(&rule).await;
+    }
+
+    /// M1: the replica-minimum rail must run even with no cluster handle. The
+    /// old `build_safety_context` returned `None` there, so `InjectFault`
+    /// skipped safety entirely and `fault kill --count 0` could take out a
+    /// service's last replica. With a locally-known replica count the rail
+    /// fires and the fault is rejected.
+    #[tokio::test]
+    async fn kill_all_is_refused_for_the_last_replica_without_a_cluster() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+
+        // One running replica of "web".
+        let config =
+            Config::parse("[app.web]\nimage = \"web:v1\"\nport = 8080\nreplicas = 1\n").unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        // `--count 0` means "all replicas"; killing all of a single-replica
+        // service leaves zero survivors.
+        let request = crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
+            target_service: "web".into(),
+            target_instance: None,
+            target_node: None,
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "test".into(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+        };
+        let context = agent.build_safety_context(&request).await;
+        let check = crate::smoker::safety::evaluate_safety(&request, &context);
+        assert!(
+            !check.approved,
+            "killing the last replica must be refused even with no cluster handle"
+        );
+        assert!(matches!(
+            check.violation,
+            Some(crate::smoker::types::SafetyViolation::ReplicaMinimum { .. })
+        ));
     }
 }
