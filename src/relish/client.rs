@@ -1341,12 +1341,16 @@ impl BunClient {
 
     /// Create a single-use node join token. The server commits only its hash
     /// to Raft and returns the plaintext once.
-    pub async fn join_token_create(&self, ttl_seconds: u64) -> Result<String, RelishError> {
+    pub async fn join_token_create(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/join-token/create", self.base_url);
         let response = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds }))
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id }))
             .send()
             .await
             .map_err(classify_error)?;

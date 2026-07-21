@@ -34,6 +34,10 @@ pub enum JoinError {
     TokenConsumed,
     #[error("join token TTL must be between 1 second and 1 hour (got {seconds} seconds)")]
     InvalidTtl { seconds: u64 },
+    #[error("join token is bound to a different node id")]
+    NodeIdMismatch,
+    #[error("join token node id must not be empty")]
+    EmptyNodeId,
     #[error("no Node CA found in security state")]
     NoNodeCa,
     #[error("Node CA private key is not available")]
@@ -239,6 +243,7 @@ pub async fn request_join(
 /// passes here can still lose the race and be refused at commit time.
 pub fn check_join_token(
     token_plaintext: &str,
+    requested_node_id: &str,
     state: &SecurityState,
 ) -> Result<[u8; 32], JoinError> {
     let join_token = state
@@ -252,6 +257,12 @@ pub fn check_join_token(
     }
     if SystemTime::now() > join_token.expires_at {
         return Err(JoinError::TokenExpired);
+    }
+    // The token is bound to one node id: the request must ask for exactly that
+    // id (M4). A legacy token loads with an empty id and so matches no real
+    // node id — it is refused here, failing closed.
+    if join_token.node_id != requested_node_id {
+        return Err(JoinError::NodeIdMismatch);
     }
     Ok(join_token.token_hash)
 }
@@ -321,8 +332,9 @@ pub fn sign_join_csr(
 pub fn generate_new_join_token(
     state: &mut SecurityState,
     ttl: Duration,
+    node_id: &str,
 ) -> Result<String, JoinError> {
-    let (plaintext, join_token) = create_join_token(ttl)?;
+    let (plaintext, join_token) = create_join_token(ttl, node_id)?;
     state.join_tokens.push(join_token);
     Ok(plaintext)
 }
@@ -333,11 +345,14 @@ pub fn generate_new_join_token(
 /// plaintext to the operator exactly once. Keeping creation separate from
 /// storage prevents a failed Raft write from producing a token that looks
 /// usable but no council member can validate.
-pub fn create_join_token(ttl: Duration) -> Result<(String, JoinToken), JoinError> {
+pub fn create_join_token(ttl: Duration, node_id: &str) -> Result<(String, JoinToken), JoinError> {
     if !(MIN_JOIN_TOKEN_TTL..=MAX_JOIN_TOKEN_TTL).contains(&ttl) {
         return Err(JoinError::InvalidTtl {
             seconds: ttl.as_secs(),
         });
+    }
+    if node_id.is_empty() {
+        return Err(JoinError::EmptyNodeId);
     }
     let (plaintext, hash) = ca::generate_join_token()?;
     let join_token = JoinToken {
@@ -345,6 +360,7 @@ pub fn create_join_token(ttl: Duration) -> Result<(String, JoinToken), JoinError
         expires_at: SystemTime::now() + ttl,
         consumed: false,
         attestation_mode: super::types::AttestationMode::None,
+        node_id: node_id.to_string(),
     };
     Ok((plaintext, join_token))
 }
@@ -388,6 +404,7 @@ mod tests {
             expires_at: SystemTime::now() + Duration::from_secs(900),
             consumed: false,
             attestation_mode: super::super::types::AttestationMode::None,
+            node_id: "node-02".to_string(),
         };
 
         let state = SecurityState {
@@ -422,7 +439,7 @@ mod tests {
         serial: SerialNumber,
         master_secret: &[u8],
     ) -> Result<(JoinResult, Vec<u8>), JoinError> {
-        check_join_token(token, state)?;
+        check_join_token(token, node_id, state)?;
         let (csr_der, key_der) = ca::create_node_csr(node_id).unwrap();
         let result = sign_join_csr(&csr_der, node_id, serial, state, master_secret)?;
         Ok((result, key_der))
@@ -512,7 +529,7 @@ mod tests {
     fn check_join_token_rejects_a_consumed_token() {
         let (mut state, token, _master_secret) = setup_with_known_key();
         state.join_tokens[0].consumed = true;
-        let err = check_join_token(&token, &state).unwrap_err();
+        let err = check_join_token(&token, "node-02", &state).unwrap_err();
         assert!(matches!(err, JoinError::TokenConsumed));
     }
 
@@ -520,15 +537,39 @@ mod tests {
     fn check_join_token_rejects_an_expired_token() {
         let (mut state, token, _master_secret) = setup_with_known_key();
         state.join_tokens[0].expires_at = SystemTime::now() - Duration::from_secs(60);
-        let err = check_join_token(&token, &state).unwrap_err();
+        let err = check_join_token(&token, "node-02", &state).unwrap_err();
         assert!(matches!(err, JoinError::TokenExpired));
     }
 
     #[test]
     fn check_join_token_rejects_an_unknown_token() {
         let (state, _token, _master_secret) = setup_with_known_key();
-        let err = check_join_token("rbrg_join_1_deadbeef", &state).unwrap_err();
+        let err = check_join_token("rbrg_join_1_deadbeef", "node-02", &state).unwrap_err();
         assert!(matches!(err, JoinError::InvalidToken));
+    }
+
+    #[test]
+    fn check_join_token_rejects_a_mismatched_node_id() {
+        // M4: a token bound to node-02 must not enrol node-01, even though the
+        // token is otherwise valid — this is the impersonation guard.
+        let (state, token, _master_secret) = setup_with_known_key();
+        let err = check_join_token(&token, "node-01", &state).unwrap_err();
+        assert!(matches!(err, JoinError::NodeIdMismatch));
+    }
+
+    #[test]
+    fn issue_refuses_a_csr_for_a_node_the_token_is_not_bound_to() {
+        // End-to-end of the guard: the token is bound to node-02, so signing a
+        // CSR that asks for node-01 is refused before any cert is minted (M4).
+        let (state, token, master_secret) = setup_with_known_key();
+        let err = issue(&state, &token, "node-01", SerialNumber(6), &master_secret).unwrap_err();
+        assert!(matches!(err, JoinError::NodeIdMismatch));
+    }
+
+    #[test]
+    fn create_join_token_refuses_an_empty_node_id() {
+        let err = create_join_token(DEFAULT_JOIN_TOKEN_TTL, "").unwrap_err();
+        assert!(matches!(err, JoinError::EmptyNodeId));
     }
 
     #[test]

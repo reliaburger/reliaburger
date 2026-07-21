@@ -1546,13 +1546,14 @@ pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
 }
 
 /// Mint a short-lived, single-use node join token through the council.
-pub async fn join_token_create(ttl_seconds: u64) -> Result<(), RelishError> {
+pub async fn join_token_create(node_id: &str, ttl_seconds: u64) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let plaintext = client.join_token_create(ttl_seconds).await?;
+    let plaintext = client.join_token_create(node_id, ttl_seconds).await?;
     eprintln!(
-        "Join token created (expires in {}).",
+        "Join token created for {node_id} (expires in {}).",
         format_ttl(ttl_seconds)
     );
+    eprintln!("The joining node must enrol with `relish join --node-id {node_id}`.");
     eprintln!("The plaintext is shown once:");
     println!("{plaintext}");
     Ok(())

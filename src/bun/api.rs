@@ -3868,6 +3868,10 @@ async fn join_token_create_handler(
     struct CreateRequest {
         #[serde(default = "default_ttl_seconds")]
         ttl_seconds: u64,
+        /// The node id this token may enrol (M4). Required: a token is bound to
+        /// exactly one node id so it cannot be replayed to impersonate another.
+        #[serde(default)]
+        node_id: String,
     }
 
     let req: CreateRequest = match serde_json::from_str(&body) {
@@ -3890,8 +3894,15 @@ async fn join_token_create_handler(
     };
 
     let ttl = std::time::Duration::from_secs(req.ttl_seconds);
-    let (plaintext, join_token) = match crate::sesame::join::create_join_token(ttl) {
+    let (plaintext, join_token) = match crate::sesame::join::create_join_token(ttl, &req.node_id) {
         Ok(created) => created,
+        Err(crate::sesame::join::JoinError::EmptyNodeId) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "node_id is required" })),
+            )
+                .into_response();
+        }
         Err(crate::sesame::join::JoinError::InvalidTtl { .. }) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -4409,7 +4420,7 @@ mod tests {
                     .uri("/v1/join-token/create")
                     .header("authorization", format!("Bearer {tok}"))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"ttl_seconds":900}"#))
+                    .body(Body::from(r#"{"ttl_seconds":900,"node_id":"node-02"}"#))
                     .unwrap(),
             )
             .await
@@ -4423,6 +4434,18 @@ mod tests {
                 .is_some_and(|token| token.starts_with("rbrg_join_1_"))
         );
         assert_eq!(json["ttl_seconds"], 900);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn join_token_requires_a_node_id() {
+        // M4: a token must be bound to a node id. A request without one is a 400,
+        // not a token that could enrol anyone.
+        let (app, shutdown, tok) =
+            setup_with_role("role-admin-join-noid", crate::sesame::types::ApiRole::Admin).await;
+        let status =
+            post_status(app, "/v1/join-token/create", &tok, r#"{"ttl_seconds":900}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         shutdown.cancel();
     }
 
@@ -4467,7 +4490,7 @@ mod tests {
                 app,
                 "/v1/join-token/create",
                 &tok,
-                &serde_json::json!({ "ttl_seconds": ttl }).to_string(),
+                &serde_json::json!({ "ttl_seconds": ttl, "node_id": "node-02" }).to_string(),
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "ttl={ttl}");
@@ -5022,7 +5045,8 @@ mod tests {
         );
 
         let mut plaintexts = Vec::new();
-        for _ in 0..2 {
+        for index in 0..2 {
+            let node_id = format!("node-{:02}", index + 2);
             let response = app
                 .clone()
                 .oneshot(
@@ -5030,7 +5054,10 @@ mod tests {
                         .method("POST")
                         .uri("/v1/join-token/create")
                         .header("content-type", "application/json")
-                        .body(Body::from(r#"{"ttl_seconds":900}"#))
+                        .body(Body::from(
+                            serde_json::json!({ "ttl_seconds": 900, "node_id": node_id })
+                                .to_string(),
+                        ))
                         .unwrap(),
                 )
                 .await
@@ -5043,7 +5070,7 @@ mod tests {
         assert_ne!(plaintexts[0], plaintexts[1]);
 
         let stored = council.security_state().await.join_tokens;
-        assert_eq!(stored.len(), 3, "bootstrap token plus two new tokens");
+        assert_eq!(stored.len(), 2, "init mints none; two new tokens");
         for plaintext in &plaintexts {
             assert!(
                 stored

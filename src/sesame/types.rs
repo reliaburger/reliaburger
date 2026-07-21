@@ -372,6 +372,14 @@ pub struct JoinToken {
     pub consumed: bool,
     /// Node attestation mode required for this token.
     pub attestation_mode: AttestationMode,
+    /// The node id this token may enrol (PKI4/M4). A join request must carry
+    /// exactly this id, and the issued cert's SPIFFE SAN is built from it, so a
+    /// token minted for `node-05` cannot be used to obtain a `node-01`
+    /// certificate. `#[serde(default)]` (empty) so a token persisted before
+    /// this field existed loads as bound-to-nothing — it matches no real node
+    /// id and is therefore refused, failing closed rather than open.
+    #[serde(default)]
+    pub node_id: String,
 }
 
 // ---------------------------------------------------------------------------

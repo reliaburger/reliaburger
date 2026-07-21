@@ -729,8 +729,7 @@ This is the single most security-critical operation. It generates all root key m
 11. Encrypt the root CA private key with the cluster's age public key.
 12. Write the sealed root CA backup to the admin's filesystem.
 13. Delete the root CA private key from memory.
-14. Generate a one-time join token and output it to stderr only.
-15. Write the first node config with `require_mtls = true`; when Bun starts
+14. Write the first node config with `require_mtls = true`; when Bun starts
     with that file, it refuses to enter cluster mode without the identity and
     brings up the authenticated transports.
 
@@ -769,9 +768,14 @@ Cluster initialised.
 
   Losing this file means a full PKI re-bootstrap.
 
-  Join token (valid 15 minutes, single use):
-    rbrg_join_1_a7f3b9c2e1d4...
+  To enrol another node, start this one, then mint a token bound
+  to that node's id:
+    relish join-token create --node-id <node-id>
 ```
+
+`init` mints no join token: a token is bound to the one node id it may enrol
+(§5.2), and bootstrap cannot know the id of a node you haven't added yet. The
+operator mints one after boot with `relish join-token create --node-id`.
 
 ### 5.2 Node Join (`relish join`)
 
@@ -780,7 +784,7 @@ After bootstrap, an administrator creates one credential per joining node:
 ```bash
 $ relish --endpoint https://leader.example:9117 \
     --ca-cert root-ca.crt --token "$ADMIN_TOKEN" \
-    join-token create --ttl 15m
+    join-token create --node-id node-02 --ttl 15m
 ```
 
 `POST /v1/join-token/create` accepts `ttl_seconds` in the bounded range

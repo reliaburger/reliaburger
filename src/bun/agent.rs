@@ -5573,11 +5573,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Fast-fail check against the replicated state (unknown/expired/already
         // consumed token). The authoritative consume happens atomically below.
         let security_state = council.security_state().await;
-        let token_hash =
-            crate::sesame::join::check_join_token(token, &security_state).map_err(|e| {
-                BunError::SecurityError {
-                    reason: format!("join validation failed: {e}"),
-                }
+        let token_hash = crate::sesame::join::check_join_token(token, node_id, &security_state)
+            .map_err(|e| BunError::SecurityError {
+                reason: format!("join validation failed: {e}"),
             })?;
 
         // Atomically consume the token and allocate a serial in one committed

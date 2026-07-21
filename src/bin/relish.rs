@@ -112,7 +112,7 @@ enum Command {
         /// App name.
         app: String,
     },
-    /// Initialise a new cluster (generates CAs, age keypair, join token).
+    /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init {
         /// Directory to create config files in.
         #[arg(default_value = ".")]
@@ -468,6 +468,11 @@ enum TokenAction {
 enum JoinTokenAction {
     /// Create a single-use token for enrolling one node.
     Create {
+        /// The node id this token may enrol. The joining node must present
+        /// exactly this id (`relish join --node-id <id>`); the token cannot be
+        /// used for any other node.
+        #[arg(long)]
+        node_id: String,
         /// Lifetime: an integer followed by s, m or h (1s to 1h).
         #[arg(long, default_value = "15m", value_parser = parse_join_token_ttl)]
         ttl: u64,
@@ -1058,7 +1063,9 @@ async fn main() -> ExitCode {
             TokenAction::Revoke { name } => commands::token_revoke(name).await,
         },
         Command::JoinToken { action } => match &action {
-            JoinTokenAction::Create { ttl } => commands::join_token_create(*ttl).await,
+            JoinTokenAction::Create { node_id, ttl } => {
+                commands::join_token_create(node_id, *ttl).await
+            }
         },
         Command::Sign { ref image } => commands::sign(image).await,
         Command::Dev { action } => match &action {
@@ -2059,21 +2066,56 @@ mod tests {
 
     #[test]
     fn parse_join_token_create_with_a_bounded_ttl() {
-        let cli = Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "30m"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "relish",
+            "join-token",
+            "create",
+            "--node-id",
+            "node-02",
+            "--ttl",
+            "30m",
+        ])
+        .unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::JoinToken {
-                action: JoinTokenAction::Create { ttl: 1_800 }
+                action: JoinTokenAction::Create { ttl: 1_800, .. }
             })
         ));
-        let cli = Cli::try_parse_from(["relish", "join-token", "create"]).unwrap();
+        // TTL defaults to 15m when omitted; node id is required.
+        let cli = Cli::try_parse_from(["relish", "join-token", "create", "--node-id", "node-02"])
+            .unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::JoinToken {
-                action: JoinTokenAction::Create { ttl: 900 }
+                action: JoinTokenAction::Create { ttl: 900, .. }
             })
         ));
-        assert!(Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "0s"]).is_err());
-        assert!(Cli::try_parse_from(["relish", "join-token", "create", "--ttl", "61m"]).is_err());
+        // --node-id is mandatory: a token must be bound to exactly one node.
+        assert!(Cli::try_parse_from(["relish", "join-token", "create"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "join-token",
+                "create",
+                "--node-id",
+                "node-02",
+                "--ttl",
+                "0s"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "join-token",
+                "create",
+                "--node-id",
+                "node-02",
+                "--ttl",
+                "61m"
+            ])
+            .is_err()
+        );
     }
 }

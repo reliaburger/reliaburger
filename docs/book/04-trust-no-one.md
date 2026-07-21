@@ -100,7 +100,13 @@ Under the hood:
 6. Issue the first node's certificate (signed by Node CA, 1-year lifetime)
 7. Seal the root CA private key with the `age` public key, write to disk
 8. Delete the root CA private key from memory
-9. Generate a one-time join token and print it to stderr
+
+Notice what step 8 does *not* do: mint a join token. An earlier version did,
+and printed it in the summary. We took it out, and the reason is worth a
+paragraph because it's the whole point of the next section. A join token now
+names the one node it may enrol, and `init` cannot know the id of a node you
+haven't added yet. So it mints nothing and tells you how to mint one once the
+cluster is up.
 
 The output tells you everything you need:
 
@@ -118,8 +124,9 @@ Cluster initialised.
 
   Losing this file means a full PKI re-bootstrap.
 
-  Join token (valid 15 minutes, single use):
-    rbrg_join_1_a7f3b9c2e1d4...
+  To enrol another node, start this one, then mint a token bound
+  to that node's id:
+    relish join-token create --node-id <node-id>
 ```
 
 ## Join tokens and node certificates
@@ -135,23 +142,22 @@ Port 9117 is the member's agent API. Port 9443 is the gossip seed that belongs
 in the joining node's `[cluster].join` configuration; pointing the HTTPS client
 at it can't work.
 
-The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, and hasn't been consumed, the council marks it as consumed and issues a node certificate.
+The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, hasn't been consumed, and names the very node id in the request, the council marks it as consumed and issues a node certificate.
 
 There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs to that member's `/v1/cluster/join` endpoint, which validates the token and signs the joiner a certificate, returning a bundle with the new cert plus the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
 
 Read that again, though, and one word should worry you: *returns*. An earlier version of this flow had the issuer generate the joiner's keypair and post the private key back in the bundle. That's a private key travelling over the wire and sitting in the issuer's memory — a key that's supposed to be the one thing only the joiner ever holds. So we changed it. The joiner now generates its own keypair locally and sends only a **CSR** (a certificate signing request: a public key plus the identity it's asking to be certified for, signed by the matching private key to prove possession). The issuer signs the CSR and returns just the leaf certificate. The private key never leaves the joining node. This is the same shape as the workload-identity flow from Chapter 10, and for the same reason: a key you never transmit is a key you can't leak in transit.
 
-The issuer takes exactly one thing from the CSR — its public key. Every other field of the certificate, the node-id SAN in particular, it rebuilds from the id *it* validated. So a joiner that stuffs a rival node's id into its CSR gets a certificate for its own id anyway; the request is a request, not an instruction.
+The issuer takes exactly one thing from the CSR — its public key. Every other field of the certificate, the node-id SAN in particular, it rebuilds from the id *it* validated. And validation is the load-bearing word: the token is minted for one id, and the request must ask for exactly that id. A token created for `node-05` cannot obtain a `node-01` certificate, no matter what the CSR or the request body claims — the mismatch is refused before the CA key is ever touched. So a joiner that stuffs a rival node's id into its CSR gets nothing; the request is a request, not an instruction, and it's a request the token has to have authorised in the first place.
 
 That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
 
-But that first token is single-use. It expires after 15 minutes, and once one
-node has used it, it's gone. How do you add a second node? Mint another
-credential, explicitly:
+So how do you add a node? Mint a credential for it, explicitly, naming the id
+it will enrol as:
 
 ```sh
 JOIN_TOKEN="$(relish --ca-cert root-ca.crt --token "$ADMIN_TOKEN" \
-  join-token create --ttl 15m)"
+  join-token create --node-id node-02 --ttl 15m)"
 ```
 
 `relish token create` still means an **API bearer token**. `relish join-token
@@ -159,13 +165,23 @@ create` means a short-lived credential that can enrol exactly one node. The
 hyphen is doing useful security work here: operators and scripts can't quietly
 confuse two secrets with very different powers.
 
+`--node-id` is mandatory, and it's the crux of the impersonation guard. The
+token isn't a blank cheque that enrols *a* node; it's bound to *this* node id,
+and the join handler refuses any request that asks for a different one. Without
+that binding, an Admin who minted a token for a throwaway worker could — or
+could be tricked into letting someone — turn it into a certificate for a
+council member's id, which the bound Raft verifier from later in this chapter
+would then accept as that member. Binding the id at mint time closes the gap:
+the token can only ever enrol the node it was written for.
+
 The CLI parser turns `15m` into seconds and rejects anything below one second
 or above one hour. The Admin-only handler generates the random plaintext,
-commits a `JoinToken` containing only its SHA-256 hash and expiry to Raft, and
-prints the plaintext after that write succeeds. If the request lands on a
-follower during an election it returns an error without the plaintext. Point
-the retry at the current leader. No orphan token, no optimistic success, no
-creative archaeology in the Raft data directory. Nice and boring.
+commits a `JoinToken` containing only its SHA-256 hash, expiry, and bound node
+id to Raft, and prints the plaintext after that write succeeds. If the request
+lands on a follower during an election it returns an error without the
+plaintext. Point the retry at the current leader. No orphan token, no
+optimistic success, no creative archaeology in the Raft data directory. Nice
+and boring.
 
 After that, every internal TCP connection between cluster nodes uses mutual TLS. Raft and reporting require node certificates. Peer API clients present the same identity too, although the API listener also accepts certificate-less Relish and browser connections because those authenticate with a bearer token or session cookie. Both peer sides verify the Node CA chain and the live revocation list. A plain TCP connection to one of these TLS ports gets rejected immediately.
 

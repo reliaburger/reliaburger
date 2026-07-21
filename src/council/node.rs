@@ -848,9 +848,11 @@ mod tests {
             .await
             .unwrap();
         let leader = &nodes[(leader_id - 1) as usize];
-        let (_, before_failover) =
-            crate::sesame::join::create_join_token(crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL)
-                .unwrap();
+        let (_, before_failover) = crate::sesame::join::create_join_token(
+            crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL,
+            "node-99",
+        )
+        .unwrap();
         let before_hash = before_failover.token_hash;
         leader
             .write(RaftRequest::CreateJoinToken(before_failover))
@@ -873,9 +875,11 @@ mod tests {
             .find(|(index, _)| *index as u64 + 1 != leader_id)
             .map(|(index, _)| index)
             .unwrap();
-        let (_, refused) =
-            crate::sesame::join::create_join_token(crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL)
-                .unwrap();
+        let (_, refused) = crate::sesame::join::create_join_token(
+            crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL,
+            "node-99",
+        )
+        .unwrap();
         let refused_hash = refused.token_hash;
         assert!(matches!(
             nodes[follower_idx]
@@ -907,9 +911,11 @@ mod tests {
                 .expect("no new leader");
         let new_leader = &nodes[(new_leader_id - 1) as usize];
 
-        let (_, after_failover) =
-            crate::sesame::join::create_join_token(crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL)
-                .unwrap();
+        let (_, after_failover) = crate::sesame::join::create_join_token(
+            crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL,
+            "node-99",
+        )
+        .unwrap();
         let after_hash = after_failover.token_hash;
         new_leader
             .write(RaftRequest::CreateJoinToken(after_failover))
