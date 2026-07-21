@@ -375,35 +375,57 @@ impl<G: Grill> WorkloadSupervisor<G> {
             Replicas::DaemonSet => 1,
         };
 
-        let mut instance_ids = Vec::with_capacity(replica_count as usize);
-
+        // Build every replica into locals FIRST, committing nothing to
+        // `self` until they all succeed (M24). If a later replica's port
+        // allocation fails, the `?` used to bail after earlier replicas were
+        // already inserted into `self.instances` and their ports allocated —
+        // but `app_instances` was only written after the loop, so `remove_app`
+        // couldn't find them and their ports leaked until agent restart.
+        let mut prepared: Vec<WorkloadInstance> = Vec::with_capacity(replica_count as usize);
+        let mut allocated_ports: Vec<u16> = Vec::new();
         for i in 0..replica_count {
             let instance_id =
                 crate::grill::InstanceIdentity::new(namespace, app_name, i).instance_id();
 
-            // Allocate a host port if the app declares one
+            // Allocate a host port if the app declares one. On failure, release
+            // every port already allocated in this pass before returning, so a
+            // partial deploy leaks nothing.
             let host_port = if spec.port.is_some() {
-                Some(self.port_allocator.allocate().await?)
+                match self.port_allocator.allocate().await {
+                    Ok(port) => {
+                        allocated_ports.push(port);
+                        Some(port)
+                    }
+                    Err(e) => {
+                        for port in &allocated_ports {
+                            let _ = self.port_allocator.release(*port).await;
+                        }
+                        return Err(e.into());
+                    }
+                }
             } else {
                 None
             };
 
-            // Resolve health check config if specified
             let health_config = if let Some(ref health_spec) = spec.health {
-                let app_port = spec.port.ok_or_else(|| BunError::NoPortForHealthCheck {
-                    app_name: app_name.to_string(),
-                })?;
-                let config = HealthCheckConfig::from_spec(health_spec, app_port);
-                // Register with the scheduler
-                self.health_checker
-                    .register(instance_id.clone(), config.clone(), now);
-                Some(config)
+                let app_port = match spec.port {
+                    Some(port) => port,
+                    None => {
+                        for port in &allocated_ports {
+                            let _ = self.port_allocator.release(*port).await;
+                        }
+                        return Err(BunError::NoPortForHealthCheck {
+                            app_name: app_name.to_string(),
+                        });
+                    }
+                };
+                Some(HealthCheckConfig::from_spec(health_spec, app_port))
             } else {
                 None
             };
 
-            let instance = WorkloadInstance {
-                id: instance_id.clone(),
+            prepared.push(WorkloadInstance {
+                id: instance_id,
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 state: ContainerState::Pending,
@@ -420,8 +442,19 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 oci_spec: None,
                 identity: None,
                 identity_mount: None,
-            };
+            });
+        }
 
+        // Every replica prepared successfully: commit them together, so the
+        // instances, the app index and the health registrations are always
+        // consistent — there is no half-applied state to leak.
+        let mut instance_ids = Vec::with_capacity(prepared.len());
+        for instance in prepared {
+            let instance_id = instance.id.clone();
+            if let Some(config) = &instance.health_config {
+                self.health_checker
+                    .register(instance_id.clone(), config.clone(), now);
+            }
             self.instances.insert(instance_id.clone(), instance);
             instance_ids.push(instance_id);
         }
@@ -692,6 +725,41 @@ mod tests {
         let grill = MockGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
         WorkloadSupervisor::new(grill, port_allocator)
+    }
+
+    #[tokio::test]
+    async fn deploy_app_leaks_nothing_when_a_replica_port_allocation_fails() {
+        // M24: a 3-replica app with a port, but a pool of only 2 ports. The
+        // third replica's allocation fails; the deploy must roll back cleanly
+        // — no orphaned instances, no leaked ports.
+        let grill = MockGrill::new();
+        let allocator = PortAllocator::new(40000, 40002); // exactly 2 ports
+        let mut sup = WorkloadSupervisor::new(grill, allocator.clone());
+
+        let mut spec = basic_app_spec(Some(8080));
+        spec.replicas = Replicas::Fixed(3);
+
+        let err = sup
+            .deploy_app("web", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BunError::Port(_)),
+            "expected a port error, got {err:?}"
+        );
+
+        assert_eq!(sup.list_instances().len(), 0, "no orphaned instances");
+        assert!(
+            sup.app_instances
+                .get(&("web".to_string(), "default".to_string()))
+                .is_none(),
+            "no app index entry"
+        );
+        assert_eq!(
+            allocator.allocated_count().await,
+            0,
+            "every allocated port must be released on rollback"
+        );
     }
 
     /// A supervisor whose process policy allowlists the given host binaries.
