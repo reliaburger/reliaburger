@@ -6674,7 +6674,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .as_ref()
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
-        let health_wait = deploy_config.health_timeout;
 
         let deploy_gen = self.ops.next_deploy_gen().await;
         let replica_count = match spec.replicas {
@@ -6777,8 +6776,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
-            // Health wait: poll until Running, off the command loop.
-            let wait = health_wait.min(std::time::Duration::from_secs(5));
+            // Health wait: poll until Running, off the command loop. This runs
+            // on a spawned per-deploy task, not the command loop, so the full
+            // configured `health_timeout` is honoured — the old `.min(5s)` cap
+            // silently failed a container that legitimately took longer than 5s
+            // to become healthy and rolled the deploy back (M7).
+            let wait = effective_health_wait(&deploy_config);
             let deadline = std::time::Instant::now() + wait;
             let mut probe = self.grill.state(&new_id).await;
             while std::time::Instant::now() < deadline
@@ -6886,6 +6889,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
         std::ops::ControlFlow::Continue(())
     }
+}
+
+/// The health-wait deadline for a rolling redeploy: the configured
+/// `health_timeout`, uncapped (M7).
+///
+/// The rolling redeploy runs on a spawned per-deploy task, so a long wait
+/// doesn't stall the command loop; the previous `.min(5s)` cap silently
+/// clamped a configured 60s timeout to 5s and rolled back any container slower
+/// than that to become healthy.
+fn effective_health_wait(config: &crate::meat::deploy_types::DeployConfig) -> std::time::Duration {
+    config.health_timeout
 }
 
 /// Return the last `n` lines of a string.
@@ -8163,6 +8177,30 @@ mod tests {
     #[test]
     fn tail_lines_empty_string() {
         assert_eq!(super::tail_lines("", 5), "");
+    }
+
+    #[test]
+    fn rolling_health_wait_honours_the_configured_timeout_not_a_5s_cap() {
+        // M7: a configured 60s health_timeout must be used in full, not
+        // clamped to 5s (which would fail a slow-starting container).
+        let config = crate::meat::deploy_types::DeployConfig {
+            health_timeout: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::effective_health_wait(&config),
+            std::time::Duration::from_secs(60)
+        );
+
+        let short = crate::meat::deploy_types::DeployConfig {
+            health_timeout: std::time::Duration::from_secs(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::effective_health_wait(&short),
+            std::time::Duration::from_secs(2),
+            "a short timeout is still honoured exactly"
+        );
     }
 
     #[test]
