@@ -232,9 +232,10 @@ impl<G: Grill> WorkloadSupervisor<G> {
         })
     }
 
-    /// Refuse an un-allowlisted host binary or script (D17/H8). Also enforces
-    /// mount isolation for scripts: when the config asks for it but the node
-    /// can't provide it, we don't silently write the temp file unprotected.
+    /// Refuse an un-allowlisted host binary or script (D17/H8). Also refuses a
+    /// host workload that requests mount isolation, which is documented and on
+    /// by default but not yet implemented — see [`admit_process_workload`]'s
+    /// mount-isolation guard.
     fn admit_process_workload(
         &self,
         app_name: &str,
@@ -261,17 +262,23 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 },
             ));
         }
-        // Mount isolation is a Linux-only guarantee. If an operator turned it
-        // on but the node isn't Linux, refuse rather than run a host process
-        // that can see every workload's volumes.
+        // Mount-namespace isolation for host `exec`/`script` workloads is
+        // documented and on by default (on Linux), but it is NOT implemented:
+        // the process is spawned with no namespace of its own. Refuse a host
+        // workload that requests isolation rather than run it unprotected while
+        // signalling that it's contained — such a process reads every other
+        // workload's volumes and the node's identity/secret material as root.
+        // An operator who accepts an unisolated host process must say so
+        // explicitly with `mount_isolation = false`.
         let is_host_workload = exec.is_some() || script.is_some();
-        if is_host_workload
-            && self.process_manager.config().mount_isolation
-            && !cfg!(target_os = "linux")
-        {
+        if is_host_workload && self.process_manager.config().mount_isolation {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
-                reason: "process workload requires mount isolation but this node is not Linux"
+                reason: "process workload requests mount isolation \
+                         ([process_workloads] mount_isolation, on by default on Linux) but \
+                         mount-namespace isolation is not yet implemented; set \
+                         mount_isolation = false to run it unisolated on the host, or run it \
+                         as a container instead"
                     .to_string(),
             });
         }
@@ -1185,6 +1192,39 @@ mod tests {
             .await
             .expect("allowlisted exec should deploy");
         assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_workload_requesting_mount_isolation_is_refused() {
+        // Even with the binary allowlisted, a host workload that requests mount
+        // isolation (the Linux default) is refused: mount-namespace isolation
+        // is not implemented, so admitting it would run an unprotected host
+        // process while signalling it is contained. Only an explicit
+        // `mount_isolation = false` opt-out (see `allowlisted_host_exec_runs`)
+        // admits an unisolated host workload.
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut sup = WorkloadSupervisor::with_process_config(
+            grill,
+            port_allocator,
+            crate::config::process_workloads::ProcessWorkloadsConfig {
+                allowed_binaries: vec![std::path::PathBuf::from("/usr/bin/python3")],
+                mount_isolation: true,
+                script_dir: std::env::temp_dir().join("reliaburger-sup-iso-test"),
+            },
+        );
+        let spec = exec_app_spec("/usr/bin/python3");
+        let err = sup
+            .deploy_app("runner", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        match err {
+            BunError::DeployFailed { reason, .. } => {
+                assert!(reason.contains("mount_isolation"), "reason: {reason}");
+            }
+            other => panic!("expected DeployFailed, got {other:?}"),
+        }
+        assert_eq!(sup.list_instances().len(), 0, "nothing must be created");
     }
 
     #[tokio::test]

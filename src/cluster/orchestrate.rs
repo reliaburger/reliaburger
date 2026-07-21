@@ -267,6 +267,17 @@ fn plan_scheduling_pass_with_dns(
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
     app_ids.sort_by_key(|a| a.to_string());
 
+    // Precompute each app's target replica count and whether it is already
+    // converged, up front. A placement is only OK if it targets a node still
+    // alive, ready and capable of enforcing the spec — capability loss is a
+    // state change that forces the same re-plan as node loss or a cordon.
+    let mut planned: Vec<(
+        &crate::meat::types::AppId,
+        &AppSpec,
+        Option<u32>,
+        usize,
+        bool,
+    )> = Vec::with_capacity(app_ids.len());
     for app_id in &app_ids {
         let Some(spec) = desired.apps.get(app_id) else {
             continue;
@@ -277,13 +288,8 @@ fn plan_scheduling_pass_with_dns(
             .find(|(k, _)| k == &app_id.to_string())
             .map(|(_, n)| *n);
         let want = effective_replicas(spec, override_replicas, alive.len());
-
-        // Already converged? A placement is only OK if it targets a node
-        // that is still alive, ready and capable of enforcing the spec.
-        // Capability loss is a state change, not a warning: it must force
-        // the same re-plan as node loss or a cordon.
         let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
-        let placements_ok = desired
+        let converged = desired
             .scheduling
             .get(app_id)
             .map(|placements| {
@@ -300,13 +306,35 @@ fn plan_scheduling_pass_with_dns(
                     })
             })
             .unwrap_or(false);
-        if placements_ok {
+        planned.push((app_id, spec, override_replicas, want, converged));
+    }
+
+    // Seed the quota ledger with every already-converged app's footprint
+    // BEFORE admitting any new app. Converged apps `continue` below and never
+    // reach `try_admit`; without this seeding they contribute nothing to their
+    // namespace's usage, so a later new app is admitted against a clean slate
+    // and the budget is silently busted once the earlier apps converge.
+    if !quotas.is_empty() {
+        for (app_id, spec, _, want, converged) in &planned {
+            if *converged {
+                quotas.charge_committed(
+                    &app_id.namespace,
+                    &scheduler_resources(spec),
+                    *want as u32,
+                );
+            }
+        }
+    }
+
+    for (app_id, spec, override_replicas, want, converged) in planned {
+        if converged {
             continue;
         }
 
-        // Quota admission (cumulative within the pass). A rejection is a
-        // deploy-time error surfaced through the log, not a silent skip
-        // that leaves the app forever pending without explanation.
+        // Quota admission (cumulative within the pass, on top of the seeded
+        // committed usage). A rejection is a deploy-time error surfaced
+        // through the log, not a silent skip that leaves the app forever
+        // pending without explanation.
         let per_replica = scheduler_resources(spec);
         let is_new_app = !desired.scheduling.contains_key(app_id);
         if !quotas.is_empty()
@@ -1221,6 +1249,52 @@ mod tests {
             decisions[0].placements.len(),
             3,
             "daemon should gain a placement on the new node"
+        );
+    }
+
+    /// C12: a namespace quota must count already-converged apps, so a new app
+    /// that pushes the namespace over budget is rejected. Before seeding the
+    /// ledger from committed state, the converged app contributed nothing and
+    /// the new app was admitted against a clean slate.
+    #[test]
+    fn converged_apps_count_against_the_namespace_quota() {
+        let mut cache = ClusterStateCache::new();
+        // Ample node capacity — the only limit under test is the quota.
+        cache.set_node(sched_node("big", 100_000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("big")]);
+
+        let mut desired = DesiredState::default();
+        let a = AppId::new("a", "prod");
+        let b = AppId::new("b", "prod");
+        desired.apps.insert(a.clone(), app_spec(600, 1));
+        desired.apps.insert(b.clone(), app_spec(600, 1));
+        // App "a" is already converged on the live, ready node.
+        desired.scheduling.insert(
+            a.clone(),
+            vec![crate::meat::types::Placement {
+                node_id: NodeId::new("big"),
+                resources: Resources::new(600, 0, 0),
+            }],
+        );
+
+        // prod budget: 1000m — fits one 600m app, not two.
+        let quota = NamespaceQuota {
+            namespace: "prod".to_string(),
+            max_cpu_millicores: Some(1000),
+            max_memory_bytes: None,
+            max_gpus: None,
+            max_apps: None,
+            max_replicas: None,
+        };
+        let mut quotas = QuotaLedger::new(HashMap::from([("prod".to_string(), quota)]));
+
+        let decisions = plan_scheduling_pass(&mut cache, &desired, &alive, &mut quotas);
+
+        // "a" is converged (no new decision); "b" is rejected because a's
+        // 600m already fills the 1000m budget. Nothing new is scheduled.
+        assert!(
+            !decisions.iter().any(|d| d.app_id == b),
+            "the new app must be rejected once the converged app is counted: {decisions:?}"
         );
     }
 

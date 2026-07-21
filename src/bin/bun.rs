@@ -1565,7 +1565,9 @@ async fn main() -> anyhow::Result<()> {
     // rule otherwise) approve, then delete only what was approved.
     {
         use reliaburger::council::types::{CouncilResponse, RaftRequest};
-        use reliaburger::pickle::gc::{GcConfig, delete_approved, gc_candidates};
+        use reliaburger::pickle::gc::{
+            GcConfig, delete_approved, gc_candidates, referenced_digests,
+        };
 
         let gc_store = Arc::clone(&blob_store);
         let gc_catalog = Arc::clone(&pickle_catalog);
@@ -1650,7 +1652,10 @@ async fn main() -> anyhow::Result<()> {
                     if let Err(e) = snapshot.persist_to(&persist) {
                         eprintln!("bun: gc failed to persist catalog: {e}");
                     }
-                    delete_approved(&store, &approved)
+                    // Re-check against the freshly-snapshotted catalogue so a
+                    // blob re-referenced since arbitration is never deleted.
+                    let referenced = referenced_digests(&snapshot);
+                    delete_approved(&store, &approved, &referenced)
                 })
                 .await
                 .unwrap_or_default();

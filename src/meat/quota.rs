@@ -243,22 +243,41 @@ impl QuotaLedger {
         if let Some(quota) = self.quotas.get(namespace) {
             check_quota(quota, entry, per_replica, replicas, is_new_app)?;
         }
-        entry.cpu_millicores = entry.cpu_millicores.saturating_add(
-            per_replica
-                .cpu_millicores
-                .saturating_mul(u64::from(replicas)),
-        );
-        entry.memory_bytes = entry
-            .memory_bytes
-            .saturating_add(per_replica.memory_bytes.saturating_mul(u64::from(replicas)));
-        entry.gpus = entry
-            .gpus
-            .saturating_add(per_replica.gpus.saturating_mul(replicas));
-        entry.replica_count = entry.replica_count.saturating_add(replicas);
-        if is_new_app {
-            entry.app_count = entry.app_count.saturating_add(1);
-        }
+        accumulate(entry, per_replica, replicas, is_new_app);
         Ok(())
+    }
+
+    /// Record an already-committed app's footprint without an admission
+    /// check, so the ledger reflects real namespace usage before any new app
+    /// is admitted.
+    ///
+    /// The leader's scheduling pass skips apps that are already converged, so
+    /// they never reach [`try_admit`]; seeding them here first is what stops a
+    /// namespace's budget being bypassed once its apps converge (a later new
+    /// app would otherwise be checked against a clean slate). Already-running
+    /// apps are never rejected — hence no check.
+    pub fn charge_committed(&mut self, namespace: &str, per_replica: &Resources, replicas: u32) {
+        let entry = self.usage.entry(namespace.to_string()).or_default();
+        accumulate(entry, per_replica, replicas, true);
+    }
+}
+
+/// Add `replicas` of `per_replica` (and, when `count_app`, one app) to `entry`.
+fn accumulate(entry: &mut NamespaceUsage, per_replica: &Resources, replicas: u32, count_app: bool) {
+    entry.cpu_millicores = entry.cpu_millicores.saturating_add(
+        per_replica
+            .cpu_millicores
+            .saturating_mul(u64::from(replicas)),
+    );
+    entry.memory_bytes = entry
+        .memory_bytes
+        .saturating_add(per_replica.memory_bytes.saturating_mul(u64::from(replicas)));
+    entry.gpus = entry
+        .gpus
+        .saturating_add(per_replica.gpus.saturating_mul(replicas));
+    entry.replica_count = entry.replica_count.saturating_add(replicas);
+    if count_app {
+        entry.app_count = entry.app_count.saturating_add(1);
     }
 }
 

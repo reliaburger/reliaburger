@@ -151,14 +151,43 @@ pub fn gc_candidates(
     })
 }
 
-/// Phase 2: physically delete the blobs the arbiter approved.
+/// Every digest currently pinned by a manifest in `catalog` (each
+/// manifest's own bytes included), for the delete-time re-check.
+pub fn referenced_digests(catalog: &ManifestCatalog) -> HashSet<String> {
+    let mut referenced = HashSet::new();
+    for (_, manifest) in &catalog.manifests {
+        for digest in manifest.referenced_digests() {
+            referenced.insert(digest.0.clone());
+        }
+    }
+    referenced
+}
+
+/// Phase 2: physically delete the blobs the arbiter approved, skipping any
+/// that have become referenced since.
 ///
-/// Per-blob failures are logged and skipped — a blob that fails to
-/// delete stays on disk and gets re-nominated next sweep (its holder
-/// entry is already gone, so it counts as an orphan then).
-pub fn delete_approved(store: &BlobStore, approved: &[Digest]) -> Vec<Digest> {
+/// The approval is a snapshot in time. Between arbitration and this delete a
+/// client can re-reference an about-to-be-deleted orphan via the standard
+/// docker push dedup — `HEAD` the blob → 200 → skip the upload → `PUT` a
+/// manifest that pins it — and the commit lands because the blob is still on
+/// disk. Deleting it then would leave the catalogue pointing at a blob that
+/// exists nowhere, 404-ing every deploy of that image. Re-check the live
+/// reference set (`referenced`, taken immediately before this call) per blob
+/// and skip anything now pinned.
+///
+/// Per-blob delete failures are logged and skipped — a blob that fails to
+/// delete stays on disk and gets re-nominated next sweep.
+pub fn delete_approved(
+    store: &BlobStore,
+    approved: &[Digest],
+    referenced: &HashSet<String>,
+) -> Vec<Digest> {
     let mut deleted = Vec::new();
     for digest in approved {
+        if referenced.contains(digest.as_str()) {
+            eprintln!("gc: keeping blob {digest}: re-referenced since GC approval");
+            continue;
+        }
         match store.delete_blob(digest) {
             Ok(()) => deleted.push(digest.clone()),
             Err(e) => eprintln!("gc: failed to delete blob {digest}: {e}"),
@@ -239,9 +268,60 @@ mod tests {
         assert!(store.has_blob(&orphan));
 
         // Phase 2 deletes only what was approved.
-        let deleted = delete_approved(&store, &result.candidates);
+        let deleted = delete_approved(&store, &result.candidates, &HashSet::new());
         assert_eq!(deleted.len(), 1);
         assert!(!store.has_blob(&orphan));
+    }
+
+    #[test]
+    fn delete_approved_skips_a_blob_re_referenced_since_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+
+        // Two blobs approved for deletion while orphans.
+        let re_referenced = test_digest("re-referenced");
+        let still_orphan = test_digest("still-orphan");
+        write_fake_blob(&store, &re_referenced);
+        write_fake_blob(&store, &still_orphan);
+        let approved = vec![re_referenced.clone(), still_orphan.clone()];
+
+        // Between arbitration and delete, a manifest_put re-referenced the
+        // first blob (standard push dedup), so it is now in the live set.
+        let referenced = HashSet::from([re_referenced.0.clone()]);
+
+        let deleted = delete_approved(&store, &approved, &referenced);
+
+        assert_eq!(
+            deleted,
+            vec![still_orphan.clone()],
+            "only the true orphan is deleted"
+        );
+        assert!(
+            store.has_blob(&re_referenced),
+            "a blob re-referenced since approval must survive, not 404 its image"
+        );
+        assert!(!store.has_blob(&still_orphan));
+    }
+
+    #[test]
+    fn referenced_digests_collects_every_manifest_pin() {
+        let mut catalog = ManifestCatalog::default();
+        let manifest = test_manifest("myapp", "m1", SystemTime::UNIX_EPOCH);
+        let pinned: Vec<String> = manifest
+            .referenced_digests()
+            .iter()
+            .map(|d| d.0.clone())
+            .collect();
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "latest".to_string(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+
+        let referenced = referenced_digests(&catalog);
+        for digest in pinned {
+            assert!(referenced.contains(&digest), "missing {digest}");
+        }
     }
 
     #[test]
