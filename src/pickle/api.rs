@@ -740,6 +740,15 @@ fn check_descriptor(
 /// use OCI Distribution error bodies, so real clients print something
 /// sensible. Only then are the raw bytes stored as a content-addressed
 /// blob and the catalogue commit recorded.
+/// Whether `name` is in the reserved pull-through cache namespace (M3).
+///
+/// The cache stores upstream images under `cache/<host>/<repo>`; only the
+/// internal cache-fill path may write there. A bare `cache` repo is fine — the
+/// reservation is the `cache/` prefix.
+fn is_reserved_cache_repo(name: &str) -> bool {
+    name == "cache" || name.starts_with("cache/")
+}
+
 async fn manifest_put(
     state: &PickleState,
     name: &str,
@@ -750,6 +759,22 @@ async fn manifest_put(
     // Registry writes require a principal once auth is configured (REG4).
     if let Err(response) = state.authorise_write(headers).await {
         return response;
+    }
+
+    // The `cache/` namespace is reserved for the pull-through cache, filled
+    // internally via record_commit (M3). A client push there would let a
+    // Deployer plant an image under `cache/<host>/<repo>` that the scheduler
+    // exempts from signature checks and upstream::decide treats as a cache hit
+    // — poisoning every node's pull of that image and bypassing
+    // require_signatures. Refuse it.
+    if is_reserved_cache_repo(name) {
+        return oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "the cache/ namespace is reserved for the pull-through cache and \
+             cannot be pushed to directly"
+                .to_string(),
+        );
     }
 
     // Hash the manifest bytes off the async runtime (REG4) — small for a
@@ -1259,6 +1284,37 @@ mod tests {
         let body = body_bytes(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["errors"][0]["code"], code, "body: {json}");
+    }
+
+    #[test]
+    fn cache_namespace_is_reserved() {
+        assert!(is_reserved_cache_repo("cache"));
+        assert!(is_reserved_cache_repo("cache/docker.io/library/redis"));
+        // Not the reserved namespace.
+        assert!(!is_reserved_cache_repo("cached"));
+        assert!(!is_reserved_cache_repo("myteam/cache-warmer"));
+        assert!(!is_reserved_cache_repo("redis"));
+    }
+
+    /// M3: a client push to the reserved `cache/` namespace is refused, so it
+    /// can't poison the pull-through cache to bypass signature checks.
+    #[tokio::test]
+    async fn push_to_cache_namespace_is_forbidden() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": format!("sha256:{}", "b".repeat(64)), "size": 1 },
+            "layers": []
+        });
+        let resp = put_manifest(
+            &app,
+            "/v2/cache/docker.io/library/redis/manifests/7",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     /// REG3: a manifest referencing a blob the registry never received
