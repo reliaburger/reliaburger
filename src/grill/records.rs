@@ -155,8 +155,17 @@ pub fn is_live(record: &InstanceRecord) -> bool {
 /// were reparented elsewhere and `waitpid` gives `ECHILD`; fall back to
 /// `kill(pid, 0)` liveness, where the exit code is unknowable.
 ///
+/// `pid_started_at` is the adoptee's recorded start time (`None` if it was
+/// adopted by an older bun that didn't record it, in which case the recheck is
+/// skipped). On the `ECHILD` liveness path the pid may have exited and been
+/// reused by an unrelated process, so — when the start time is known — we
+/// confirm the live pid's start time still matches (±2s, mirroring [`is_live`]).
+/// A mismatch means our adoptee is gone and this pid belongs to someone else,
+/// so it is reported exited — without this a reused pid reads Running forever
+/// and a later stop/kill would signal an innocent process (M23).
+///
 /// Returns `(running, exit_code)`.
-pub fn poll_adopted_process(pid: u32) -> (bool, Option<i32>) {
+pub fn poll_adopted_process(pid: u32, pid_started_at: Option<u64>) -> (bool, Option<i32>) {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -167,7 +176,16 @@ pub fn poll_adopted_process(pid: u32) -> (bool, Option<i32>) {
         Ok(WaitStatus::Exited(_, code)) => (false, Some(code)),
         Ok(_) => (false, None),
         Err(Errno::ECHILD) => match kill(nix_pid, None) {
-            Ok(()) => (true, None),
+            // The pid is live, but confirm it is still *our* adoptee and not a
+            // reused pid before reporting it Running.
+            Ok(()) => match (pid_started_at, process_start_time(pid)) {
+                // Known start that no longer matches the live pid: it was reused.
+                (Some(recorded), Some(current)) if current.abs_diff(recorded) > 2 => (false, None),
+                // Known start but the pid vanished between kill and the read.
+                (Some(_), None) => (false, None),
+                // Match, or no recorded start (legacy adoptee): trust liveness.
+                _ => (true, None),
+            },
             Err(_) => (false, None),
         },
         Err(_) => (false, None),
@@ -285,5 +303,35 @@ mod tests {
         let my_pid = std::process::id();
         let real_start = process_start_time(my_pid).unwrap();
         assert!(is_live(&record(my_pid, real_start)));
+    }
+
+    // -- M23: adopted-pid reuse on the ECHILD liveness path ------------------
+
+    #[test]
+    fn poll_adopted_detects_pid_reuse_on_the_echild_path() {
+        // Our own pid is not our child, so waitpid gives ECHILD and the
+        // function falls back to kill-liveness — the reparented-adoptee case.
+        let my_pid = std::process::id();
+        let real_start = process_start_time(my_pid).unwrap();
+
+        // Recorded start matches the live pid: still our adoptee, Running.
+        assert_eq!(poll_adopted_process(my_pid, Some(real_start)), (true, None));
+        // Recorded start is from another era: the pid was reused, so it must
+        // NOT read Running (else a later stop/kill signals an innocent pid).
+        assert_eq!(
+            poll_adopted_process(my_pid, Some(real_start + 3600)),
+            (false, None)
+        );
+        // No recorded start (legacy adoptee): fall back to liveness only.
+        assert_eq!(poll_adopted_process(my_pid, None), (true, None));
+    }
+
+    #[test]
+    fn poll_adopted_reports_a_dead_pid_exited() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        // Reaped: waitpid gives ECHILD, kill fails → exited.
+        assert_eq!(poll_adopted_process(pid, Some(1000)), (false, None));
     }
 }
