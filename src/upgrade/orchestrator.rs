@@ -401,6 +401,7 @@ fn build_directive(state: &ClusterUpgradeState) -> UpgradeDirective {
         source: BinarySource::Pickle {
             registry_address: state.registry_address.clone(),
         },
+        network_provenance: true,
     }
 }
 

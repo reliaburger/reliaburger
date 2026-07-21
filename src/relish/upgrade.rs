@@ -178,6 +178,10 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
                 embedded_signature,
                 external_signature,
                 source: BinarySource::LocalFile { path },
+                // Air-gapped `--binary` is not network; a downloaded artefact
+                // staged as a local file IS, so it still requires the external
+                // signature (M5).
+                network_provenance: args.binary.is_none(),
             };
             client.upgrade_apply(&directive).await?;
             println!("node upgrade to {target_version} started");
