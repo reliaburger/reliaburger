@@ -634,10 +634,10 @@ security/data-loss; do it before anything else.
 13. C5 — carry the recovery epoch inside Raft RPCs as a real fence. ✅ (Phase C part 2) — implemented as a transport-layer envelope fence (RaftRpcEnvelope stamped with the sender's recovery epoch; the accept side drops different-epoch RPCs). This fences the two epochs apart at the RPC boundary — the split-brain vector — rather than embedding the epoch in the openraft Vote type itself.
 
 **Phase D — deploy/runtime correctness**
-15. M14 — timeout the reconciler's terminal-event wait.
-16. M7 — honour `health_timeout` (drop the 5s cap) and implement `max_surge`/`max_unavailable`.
-17. M22 + M23 + M24 — ProcessGrill limit admission, adopted-pid start-time recheck, transactional port allocation.
-18. M25 + M26 — scheduler pass-cache discard on error, daemon-set `want` from eligible set, namespace-qualified autoscale match.
+15. M14 — timeout the reconciler's terminal-event wait. ✅ (Phase D)
+16. M7 — honour `health_timeout` (drop the 5s cap) ✅ (Phase D); `max_surge`/`max_unavailable` still deferred (deploy-loop rewrite; noted in the M7 commit).
+17. M22 + M23 + M24 — ProcessGrill limit admission, adopted-pid start-time recheck, transactional port allocation. ✅ (Phase D)
+18. M25 + M26 — scheduler pass-cache discard on error, daemon-set `want` from eligible set, namespace-qualified autoscale match. ✅ (Phase D)
 
 **Phase E — chaos, registry, supply-chain, upgrade**
 19. M1 — make Smoker faults real and reversible (partition arm, heal/TTL reversal loop, safety on every path).
