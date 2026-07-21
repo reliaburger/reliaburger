@@ -575,7 +575,7 @@ struct CompleteUploadQueryOpt {
 /// `PUT /v2/{name}/blobs/uploads/{upload_id}?digest=` — complete upload.
 async fn blob_upload_complete(
     state: &PickleState,
-    _name: &str,
+    name: &str,
     upload_id: &str,
     digest_str: &str,
     headers_in: &HeaderMap,
@@ -603,6 +603,25 @@ async fn blob_upload_complete(
         }
     }
 
+    // Enforce the storage quota against the fully-assembled blob before it is
+    // committed (M10). The monolithic POST path checks at initiate time, but a
+    // chunked or bare-PUT upload only knows its total size here — the on-disk
+    // temp file is authoritative. Over quota: drop the temp and the session so
+    // nothing lands in the blob store.
+    match state.store.upload_size(upload_id).await {
+        Ok(incoming) => {
+            if let Err(response) = state.enforce_quota(name, incoming).await {
+                state.store.cancel_upload(upload_id).await;
+                state.sessions.complete(upload_id).await;
+                return response;
+            }
+        }
+        Err(super::types::PickleError::InvalidUploadId(_)) => {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    }
+
     let result = state.store.complete_upload(upload_id, &digest).await;
     // Whatever the outcome, the session is finished (REG8).
     state.sessions.complete(upload_id).await;
@@ -612,7 +631,7 @@ async fn blob_upload_complete(
             // Location of the created blob (OCI distribution spec).
             headers.insert(
                 "location",
-                format!("/v2/{_name}/blobs/{}", digest.as_str())
+                format!("/v2/{name}/blobs/{}", digest.as_str())
                     .parse()
                     .expect("ASCII header value"),
             );
@@ -1762,6 +1781,78 @@ mod tests {
         assert!(
             !store.has_blob(&digest),
             "over-quota blob must not be stored"
+        );
+    }
+
+    /// REG4/M10: a chunked upload whose assembled size breaches the quota is
+    /// refused at completion, and nothing lands in the blob store. The
+    /// monolithic path checks at initiate; this covers the chunked/bare-PUT
+    /// path that previously skipped quota entirely.
+    #[tokio::test]
+    async fn chunked_upload_over_repository_quota_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlobStore::new(dir.path()));
+        let state = PickleState {
+            store: Arc::clone(&store),
+            catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+            node_raft_id: 7,
+            council: None,
+            persist_path: None,
+            auth: None,
+            quota: QuotaConfig {
+                per_repository_bytes: 4,
+                total_bytes: 0,
+            },
+            sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
+        };
+        let app = test_router(state);
+
+        // Initiate a chunked session (no digest, no body).
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
+
+        // Push a chunk larger than the 4-byte quota.
+        let blob = b"way too big for the quota".to_vec();
+        let digest = compute_sha256(&blob);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(&location)
+                    .body(Body::from(blob.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Completing must be refused with 413 and store nothing.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("{location}?digest={}", digest.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !store.has_blob(&digest),
+            "over-quota chunked blob must not be committed"
         );
     }
 

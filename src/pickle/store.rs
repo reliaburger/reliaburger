@@ -266,6 +266,20 @@ impl BlobStore {
         Ok(())
     }
 
+    /// The number of bytes accumulated in an in-flight upload session.
+    ///
+    /// Used to enforce the storage quota on chunked and bare-PUT uploads
+    /// before they are committed (REG4/M10) — the on-disk temp file is the
+    /// authoritative running size, independent of what the client claimed.
+    pub async fn upload_size(&self, upload_id: &str) -> Result<u64, PickleError> {
+        validate_upload_id(upload_id)?;
+        let path = self.upload_path(upload_id);
+        if !path.exists() {
+            return Err(PickleError::UploadNotFound(upload_id.to_string()));
+        }
+        Ok(tokio::fs::metadata(&path).await?.len())
+    }
+
     /// Cancel an upload session, cleaning up the temp file.
     pub async fn cancel_upload(&self, upload_id: &str) {
         if validate_upload_id(upload_id).is_err() {
