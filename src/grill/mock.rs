@@ -21,6 +21,7 @@ pub struct MockGrill {
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
+    runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
     /// Deterministic gate for tests that need `create()` to remain in flight.
     block_create: Arc<AtomicBool>,
     create_started: Arc<tokio::sync::Semaphore>,
@@ -40,6 +41,7 @@ impl Default for MockGrill {
             adopt_results: Arc::default(),
             container_ip: Arc::default(),
             honours_cgroup_path: Arc::default(),
+            runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             block_create: Arc::new(AtomicBool::new(false)),
             create_started: Arc::new(tokio::sync::Semaphore::new(0)),
             create_release: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -101,6 +103,13 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_honours_cgroup_path(&self, value: bool) {
         *self.honours_cgroup_path.lock().unwrap() = value;
+    }
+
+    /// Make `runtime_kind()` report `kind`, so tests can model a runc/Apple
+    /// node (which enforces cgroup limits) versus the process runtime.
+    #[allow(dead_code)]
+    pub fn set_runtime_kind(&self, kind: crate::grill::records::RuntimeKind) {
+        *self.runtime_kind.lock().unwrap() = kind;
     }
 
     /// Hold future `create()` calls until [`Self::release_creates`] is called.
@@ -210,6 +219,10 @@ impl super::Grill for MockGrill {
 
     async fn container_ip(&self, _instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
         *self.container_ip.lock().unwrap()
+    }
+
+    fn runtime_kind(&self) -> crate::grill::records::RuntimeKind {
+        *self.runtime_kind.lock().unwrap()
     }
 
     fn honours_cgroup_path(&self) -> bool {

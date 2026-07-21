@@ -312,15 +312,33 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Refuse a limit-requiring workload on a rootless node (M22): rootless
-    /// runc can't set cgroup CPU/memory limits without a systemd user scope
-    /// we don't wire, so the limit would be silently dropped. Fail loudly.
+    /// Refuse a limit-requiring workload the node can't enforce (M22).
+    ///
+    /// Two cases silently drop a declared cpu/memory limit rather than enforce
+    /// it, so both fail loudly instead:
+    /// - a rootless node (rootless runc can't set cgroup limits without a
+    ///   systemd user scope we don't wire); and
+    /// - a ProcessGrill node (the process runtime never reads
+    ///   `spec.linux.resources` at all — a rootful node without runc falls back
+    ///   to it and would otherwise accept and ignore the limit).
     fn admit_rootless_limits(&self, app_name: &str, has_limits: bool) -> Result<(), BunError> {
-        if self.capabilities.rootless && has_limits {
+        if !has_limits {
+            return Ok(());
+        }
+        if self.capabilities.rootless {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: "workload declares cpu/memory limits but this node is rootless and \
                          cannot enforce cgroup limits; run bun as root or drop the limits"
+                    .to_string(),
+            });
+        }
+        if self.grill.runtime_kind() == crate::grill::records::RuntimeKind::Process {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: "workload declares cpu/memory limits but this node runs the process \
+                         runtime (ProcessGrill), which cannot enforce cgroup limits; install a \
+                         container runtime (runc) or drop the limits"
                     .to_string(),
             });
         }
@@ -1439,6 +1457,39 @@ mod tests {
             matches!(err, BunError::DeployFailed { .. }),
             "rootless nodes must refuse cgroup-limit workloads, not silently drop the limit"
         );
+    }
+
+    #[tokio::test]
+    async fn process_grill_node_refuses_limit_requiring_workload() {
+        // M22: the process runtime never enforces cgroup limits. A rootful
+        // node without runc falls back to it, so a limit-bearing workload must
+        // be refused rather than run unbounded. MockGrill defaults to the
+        // process runtime kind.
+        let mut sup = test_supervisor();
+        let mut spec = basic_app_spec(None);
+        spec.memory = Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").unwrap());
+        let err = sup
+            .deploy_app("limited", "default", &spec, Instant::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BunError::DeployFailed { .. }));
+        assert_eq!(sup.list_instances().len(), 0, "nothing must be created");
+    }
+
+    #[tokio::test]
+    async fn runc_node_admits_limit_requiring_workload() {
+        // A runc node enforces cgroup limits, so the same workload deploys.
+        let grill = MockGrill::new();
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut sup = WorkloadSupervisor::new(grill, port_allocator);
+        let mut spec = basic_app_spec(None);
+        spec.memory = Some(crate::config::types::ResourceRange::parse("128Mi-512Mi").unwrap());
+        let ids = sup
+            .deploy_app("limited", "default", &spec, Instant::now())
+            .await
+            .expect("a runc node enforces cgroup limits, so this must deploy");
+        assert_eq!(ids.len(), 1);
     }
 
     #[tokio::test]
