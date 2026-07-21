@@ -284,10 +284,16 @@ pub async fn start(
         None => (None, None, None),
     };
 
+    // This node's recovery epoch, captured once at startup (recovery is an
+    // offline operation, so it is constant for the process). Stamped on Raft
+    // RPCs and enforced by the accept side to fence a recovered survivor off
+    // from the dead cluster's peers (C5).
+    let recovery_epoch = state_machine.desired_state().await.recovery_epoch;
     let factory = match raft_tls_material {
         Some(material) => TcpRaftNetworkFactory::new_tls_bound(raft_id, material),
         None => TcpRaftNetworkFactory::new(raft_id),
-    };
+    }
+    .with_recovery_epoch(recovery_epoch);
     // Same for the Raft RPC blocklist — a partition must cut both the
     // gossip and Raft transports or SWIM half-detects the peer.
     let raft_blocklist = factory.blocklist();
@@ -348,7 +354,14 @@ pub async fn start(
     let rpc_shutdown = shutdown.clone();
     let rpc_acceptor = raft_acceptor.clone();
     tokio::spawn(async move {
-        serve_raft_rpc(raft_listener, raft, rpc_shutdown, rpc_acceptor).await;
+        serve_raft_rpc(
+            raft_listener,
+            raft,
+            rpc_shutdown,
+            rpc_acceptor,
+            recovery_epoch,
+        )
+        .await;
     });
 
     // Bootstrap ONLY a genuinely new cluster: no seeds AND a fresh durable
