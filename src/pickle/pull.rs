@@ -9,9 +9,10 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use sha2::{Digest as Sha2Digest, Sha256};
 
 use super::replication::Peer;
-use super::store::{BlobStore, compute_sha256};
+use super::store::BlobStore;
 use super::types::{Digest, ManifestCatalog, PickleError};
 
 /// Hard ceiling on a single blob pulled from a peer (REG6).
@@ -75,9 +76,21 @@ pub async fn pull_layer_from_peer(
             peer.node_id
         )));
     }
-    let data = tokio::time::timeout(timeout, async {
+
+    // Stream to a temp file, hashing incrementally, instead of buffering the
+    // whole blob in RAM (M11). A 2 GiB layer used to sit fully in memory —
+    // multiplied by every concurrent pull — before it was written. Now peak
+    // memory is one chunk: chunks stream straight to the upload temp, the hash
+    // is computed as they pass, and the verified temp is committed by rename
+    // (no re-read). On any error the temp is dropped.
+    let upload_id = store.initiate_upload().await.map_err(|e| {
+        PickleError::ReplicationFailed(format!("peer {}: staging upload: {e}", peer.node_id))
+    })?;
+
+    let streamed = tokio::time::timeout(timeout, async {
         let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut total: usize = 0;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
                 PickleError::ReplicationFailed(format!(
@@ -85,31 +98,49 @@ pub async fn pull_layer_from_peer(
                     peer.node_id
                 ))
             })?;
-            if buf.len() + chunk.len() > MAX_PEER_BLOB_BYTES {
+            total = total.saturating_add(chunk.len());
+            if total > MAX_PEER_BLOB_BYTES {
                 return Err(PickleError::ReplicationFailed(format!(
                     "peer {} blob exceeded the {MAX_PEER_BLOB_BYTES} byte cap",
                     peer.node_id
                 )));
             }
-            buf.extend_from_slice(&chunk);
+            hasher.update(&chunk);
+            store
+                .write_upload_chunk(&upload_id, &chunk)
+                .await
+                .map_err(|e| {
+                    PickleError::ReplicationFailed(format!(
+                        "peer {}: writing blob to disk: {e}",
+                        peer.node_id
+                    ))
+                })?;
         }
-        Ok(buf)
+        let actual = Digest::from_sha256_hex(&hex::encode(hasher.finalize()));
+        if actual.as_str() != digest.as_str() {
+            return Err(PickleError::DigestMismatch {
+                expected: digest.clone(),
+                actual,
+            });
+        }
+        Ok(())
     })
     .await
     .map_err(|_| {
         PickleError::ReplicationFailed(format!("timeout reading blob from peer {}", peer.node_id))
-    })??;
+    });
 
-    // Verify digest
-    let actual = compute_sha256(&data);
-    if actual.as_str() != digest.as_str() {
-        return Err(PickleError::DigestMismatch {
-            expected: digest.clone(),
-            actual,
-        });
+    // Flatten the timeout and inner results; on any failure drop the temp.
+    match streamed.and_then(|inner| inner) {
+        Ok(()) => {}
+        Err(e) => {
+            store.cancel_upload(&upload_id).await;
+            return Err(e);
+        }
     }
 
-    store.write_blob(&data, digest)?;
+    // Digest verified above; commit the temp into the blob store by rename.
+    store.commit_upload_as_blob(&upload_id, digest).await?;
     Ok(())
 }
 
@@ -184,6 +215,7 @@ pub fn image_available_locally(
 mod tests {
     use super::*;
     use crate::pickle::replication::Peer;
+    use crate::pickle::store::compute_sha256;
     use crate::pickle::types::{ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
     use std::collections::BTreeSet;
     use std::time::SystemTime;
@@ -391,5 +423,97 @@ mod tests {
         assert!(!image_available_locally(
             "myapp", "latest", &catalog, &store
         ));
+    }
+
+    /// Serve `body` at `GET /v2/{repo}/blobs/{digest}` on an ephemeral port,
+    /// returning the base URL. Used to drive the real streaming pull path.
+    async fn serve_blob(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        let app = axum::Router::new().route(
+            "/v2/{*rest}",
+            get(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// M11: a peer pull streams the blob to disk and commits it. The stored
+    /// bytes are byte-identical and no upload temp is left behind.
+    #[tokio::test]
+    async fn pull_layer_streams_and_commits_a_valid_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let content = b"a realistic layer body streamed in".to_vec();
+        let digest = compute_sha256(&content);
+
+        let (base_url, server) = serve_blob(content.clone()).await;
+        let peer = Peer {
+            node_id: 2,
+            base_url,
+        };
+        let client = reqwest::Client::new();
+
+        pull_layer_from_peer(
+            &peer,
+            "myapp",
+            &digest,
+            &store,
+            &client,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("valid blob should pull and commit");
+
+        assert!(store.has_blob(&digest));
+        assert_eq!(store.read_blob(&digest).unwrap(), content);
+        // The uploads dir holds no leftover temps.
+        let uploads = dir.path().join("uploads");
+        let leftover = std::fs::read_dir(&uploads)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        assert_eq!(leftover, 0, "a committed pull must leave no upload temp");
+        server.abort();
+    }
+
+    /// M11: a peer that serves bytes not matching the requested digest is
+    /// rejected, and the streamed temp is dropped rather than committed.
+    #[tokio::test]
+    async fn pull_layer_rejects_a_digest_mismatch_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        // Ask for one digest, serve different bytes.
+        let requested = compute_sha256(b"what we asked for");
+        let (base_url, server) = serve_blob(b"something else entirely".to_vec()).await;
+        let peer = Peer {
+            node_id: 2,
+            base_url,
+        };
+        let client = reqwest::Client::new();
+
+        let err = pull_layer_from_peer(
+            &peer,
+            "myapp",
+            &requested,
+            &store,
+            &client,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a digest mismatch must be refused");
+        assert!(matches!(err, PickleError::DigestMismatch { .. }));
+        assert!(!store.has_blob(&requested));
+        let uploads = dir.path().join("uploads");
+        let leftover = std::fs::read_dir(&uploads)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+        assert_eq!(leftover, 0, "a rejected pull must leave no upload temp");
+        server.abort();
     }
 }

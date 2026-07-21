@@ -24,6 +24,14 @@ use crate::sesame::auth::AuthState;
 /// Layers are pushed monolithically or chunked; each PATCH/PUT body is
 /// bounded so one request can't buffer an unbounded blob in memory. Large
 /// layers arrive as multiple bounded chunks.
+///
+/// Note (M11): this bounds *one* request, not aggregate memory — the handlers
+/// take the body as an in-memory `Bytes`, so N concurrent monolithic pushes
+/// can still buffer up to N × this. The peer-pull path already streams to disk
+/// (see `pull::pull_layer_from_peer`); streaming the push handlers the same way
+/// — consuming the request body as a chunked stream straight into the upload
+/// temp — is TODO(Phase 15). Until then, keep this ceiling modest and rely on
+/// chunked pushes (buildah/docker default) to keep individual bodies small.
 const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 
 /// Shared state for Pickle API handlers.
