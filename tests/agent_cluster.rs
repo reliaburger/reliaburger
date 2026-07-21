@@ -268,7 +268,7 @@ async fn tcp_reporting_transport_round_trip() {
 
     let result = tokio::time::timeout(Duration::from_secs(2), server.recv()).await;
     assert!(result.is_ok());
-    let (_, received) = result.unwrap().unwrap();
+    let (_, _, received) = result.unwrap().unwrap();
     match received {
         ReportingMessage::Report(r) => assert_eq!(r.node_id, NodeId::new("w1")),
         _ => panic!("expected Report"),

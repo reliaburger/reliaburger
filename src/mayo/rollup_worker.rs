@@ -197,7 +197,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(2), council_transport.recv()).await;
             assert!(result.is_ok(), "should receive a rollup message");
 
-            let (from, msg) = result.unwrap().unwrap();
+            let (from, _, msg) = result.unwrap().unwrap();
             assert_eq!(from, addr(1));
             match msg {
                 ReportingMessage::MetricsRollup(r) => {
