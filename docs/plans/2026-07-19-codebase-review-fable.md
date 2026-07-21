@@ -613,25 +613,25 @@ defensively in `decide_startup`.
 Ordered by (impact × reachability) ÷ fix cost. The first block is cheap, high-impact
 security/data-loss; do it before anything else.
 
-**Phase A — stop the bleeding (small diffs, severe impact)**
-1. C1 — add `tls_built_in_root_certs(false)` on the relish `--ca-cert` path (one line; stops admin-token MITM).
-2. C16 + M29 — protect the current symlink target in upgrade GC, and reject `max_boot_attempts == 0` in config validation (stops node-bricking / never-committing upgrades).
-3. C2 — fail closed on an empty post-bootstrap token store + refuse revoking the last Admin token.
-4. C11 — make GitOps signature verification fail closed when `require_signed_commits`.
-5. C10 — make any GitOps file/parse error or non-zero `ls-tree` a hard `Failure` (suppress `Remove` when errors exist).
-6. C4 — error (don't return empty) when disaster recovery finds no snapshot.
+**Phase A — stop the bleeding (small diffs, severe impact)** — DONE (PR #133, merged)
+1. C1 — add `tls_built_in_root_certs(false)` on the relish `--ca-cert` path (one line; stops admin-token MITM). ✅
+2. C16 + M29 — protect the current symlink target in upgrade GC, and reject `max_boot_attempts == 0` in config validation (stops node-bricking / never-committing upgrades). ✅
+3. C2 — fail closed on an empty post-bootstrap token store + refuse revoking the last Admin token. ✅ (last-Admin-revoke floor; the broader bootstrap-flag hardening deferred)
+4. C11 — make GitOps signature verification fail closed when `require_signed_commits`. ✅
+5. C10 — make any GitOps file/parse error or non-zero `ls-tree` a hard `Failure` (suppress `Remove` when errors exist). ✅
+6. C4 — error (don't return empty) when disaster recovery finds no snapshot. ✅
 
-**Phase B — close the data-loss and quota holes**
-7. C9 — re-check the reference set immediately before each Pickle blob delete.
-8. C12 + C13 — seed the namespace quota ledger from committed state, and run `validate_against` on the GitOps path.
-9. C15 — reject managed-volume paths containing `..` / non-absolute before provisioning.
-10. C14 — implement mount-namespace isolation for host workloads (or refuse isolation-requesting workloads until it exists).
+**Phase B — close the data-loss and quota holes** — DONE (PR #134)
+7. C9 — re-check the reference set immediately before each Pickle blob delete. ✅
+8. C12 + C13 — seed the namespace quota ledger from committed state, and run `validate_against` on the GitOps path. ✅
+9. C15 — reject managed-volume paths containing `..` / non-absolute before provisioning. ✅
+10. C14 — refuse host workloads that request the (unimplemented) mount isolation; real mount-namespace isolation deferred. ✅
 
 **Phase C — authenticate the cluster plane (the systemic theme)**
-11. C7 — refuse to bind Raft/reporting/gossip unauthenticated in `--cluster` mode.
-12. C6 — bind report identity to the authenticated TLS client cert.
-13. C5 — carry the recovery epoch inside Raft Vote/RPCs as a real fence.
-14. C8 — bound gossip leader-hint terms against the local Raft term window.
+11. C7 — refuse to bind Raft/reporting/gossip unauthenticated in `--cluster` mode. ✅ (PR: Phase C, part 1)
+14. C8 — bound gossip leader-hint terms against the local Raft term window. ✅ (PR: Phase C, part 1)
+12. C6 — bind report identity to the authenticated TLS client cert. ⏳ deferred to Phase C part 2 (cross-cutting reporting-transport identity plumbing; only effective under mTLS).
+13. C5 — carry the recovery epoch inside Raft Vote/RPCs as a real fence. ⏳ deferred to Phase C part 2 (deep openraft Vote-layer work; split-brain risk if rushed).
 
 **Phase D — deploy/runtime correctness**
 15. M14 — timeout the reconciler's terminal-event wait.
