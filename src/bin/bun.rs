@@ -1474,13 +1474,18 @@ async fn main() -> anyhow::Result<()> {
     // through every peer-URL derivation so they stay consistent.
     let registry_over_tls = api_identity.is_some();
     let registry_scheme = if registry_over_tls { "https" } else { "http" };
+    // The registry replication/P2P client presents the internal service token
+    // as a bearer: Pickle authorises node-to-node writes by that token, not by
+    // the client certificate, so it is required even under mTLS (M2).
     let registry_client = match &api_identity {
-        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client(
+        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client_with_bearer(
             identity,
             crl_refresh.clone().unwrap_or_default(),
+            service_token.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("failed to build registry mTLS client: {e}"))?,
-        None => reqwest::Client::new(),
+        None => reliaburger::sesame::mtls::build_bearer_http_client(service_token.as_deref())
+            .map_err(|e| anyhow::anyhow!("failed to build registry client: {e}"))?,
     };
 
     // Cluster-first image pulls (Phase 12 C2): the grill consults the
