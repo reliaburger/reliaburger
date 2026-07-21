@@ -155,7 +155,22 @@ pub async fn step<C: NodeControl>(
         }
 
         ClusterUpgradePhase::UpgradingLeader => {
-            poll_and_drive_group(&mut state, control, context, NodeRole::Leader, true).await;
+            // Gate the in-place leader upgrade on live quorum, exactly as the
+            // council phase does (M6). The leader upgrades in place expecting a
+            // >=3-voter council to keep quorum through the sub-second exec — but
+            // if a voter has since gone gossip-dead, `quorum_ok` is false and
+            // bouncing the leader now would drop live voters below quorum
+            // (indefinitely if the new binary crash-loops before revert). When
+            // quorum is short we hold: poll/failure-detect still run, only
+            // *directing* the leader to swap waits for headroom.
+            poll_and_drive_group(
+                &mut state,
+                control,
+                context,
+                NodeRole::Leader,
+                context.quorum_ok,
+            )
+            .await;
             if let Some(reason) = first_failure(&state) {
                 state.phase = ClusterUpgradePhase::Paused { reason };
             } else if group_done(&state, NodeRole::Leader) {
@@ -1193,6 +1208,38 @@ mod tests {
         let state = step(state, &control, &context()).await;
         assert_eq!(state.nodes[1].phase, NodeUpgradePhase::Directed);
         assert_eq!(control.directed(), vec!["addr-leader"]);
+    }
+
+    #[tokio::test]
+    async fn leader_upgrade_waits_when_quorum_is_short() {
+        // M6: a voter went gossip-dead, so quorum_ok is false. The leader must
+        // NOT direct its own in-place upgrade (which would drop live voters
+        // below quorum); it holds until headroom returns.
+        let control = MockControl::default();
+        control.set("addr-leader", "0.1.0", true, false);
+        let mut state = cluster_state(
+            vec![
+                record("c1", NodeRole::Council, NodeUpgradePhase::Healthy),
+                record("leader", NodeRole::Leader, NodeUpgradePhase::Pending),
+            ],
+            1,
+        );
+        state.phase = ClusterUpgradePhase::UpgradingLeader;
+
+        let mut ctx = context();
+        ctx.quorum_ok = false;
+
+        let state = step(state, &control, &ctx).await;
+        assert_eq!(
+            state.nodes[1].phase,
+            NodeUpgradePhase::Pending,
+            "the leader must not be directed to swap while quorum is short"
+        );
+        assert!(
+            control.directed().is_empty(),
+            "no directive should be sent: {:?}",
+            control.directed()
+        );
     }
 
     #[tokio::test]
