@@ -750,9 +750,8 @@ mod tests {
 
         assert_eq!(sup.list_instances().len(), 0, "no orphaned instances");
         assert!(
-            sup.app_instances
-                .get(&("web".to_string(), "default".to_string()))
-                .is_none(),
+            !sup.app_instances
+                .contains_key(&("web".to_string(), "default".to_string())),
             "no app index entry"
         );
         assert_eq!(
