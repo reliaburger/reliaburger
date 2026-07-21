@@ -772,7 +772,7 @@ pub fn spawn_placement_reconciler(
                 {
                     continue; // agent gone; retry next tick
                 }
-                if deploy_succeeded(event_rx).await {
+                if deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT).await {
                     applied.insert(key, fingerprint);
                     changed = true;
                 }
@@ -807,19 +807,42 @@ pub fn spawn_placement_reconciler(
     });
 }
 
-/// Drain a deploy's event stream and report whether it reached `Complete`.
+/// How long the reconciler waits for a deploy's terminal event before giving
+/// up on this tick (M14). Without a bound, a deploy that stalls (a stuck image
+/// pull, a hung runtime holding the event sender) would block the reconcile
+/// tick forever: the node would stop polling the leader, never converge other
+/// apps, and silently drop out of reconciliation while still alive. On timeout
+/// the placement is treated as not-yet-applied and retried next tick.
+const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Drain a deploy's event stream and report whether it reached `Complete`
+/// within `timeout`.
 ///
-/// Returns `false` if the deploy emitted `Error` or the channel closed
-/// without a terminal event (the agent dropped it), so the caller retries.
-async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>) -> bool {
-    while let Some(event) = events.recv().await {
-        match event {
-            ApplyEvent::Complete { .. } => return true,
-            ApplyEvent::Error { .. } => return false,
-            _ => {}
+/// Returns `false` if the deploy emitted `Error`, the channel closed without a
+/// terminal event (the agent dropped it), or `timeout` elapsed first — in every
+/// case the caller leaves the placement unapplied and retries next tick.
+async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>, timeout: Duration) -> bool {
+    let drain = async {
+        while let Some(event) = events.recv().await {
+            match event {
+                ApplyEvent::Complete { .. } => return true,
+                ApplyEvent::Error { .. } => return false,
+                _ => {}
+            }
+        }
+        false
+    };
+    match tokio::time::timeout(timeout, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!(
+                "reconciler: deploy did not reach a terminal event within {}s; \
+                 leaving it unapplied and retrying next tick",
+                timeout.as_secs()
+            );
+            false
         }
     }
-    false
 }
 
 #[cfg(test)]
@@ -828,6 +851,48 @@ mod tests {
     use crate::reporting::types::{ResourceUsage, StateReport};
     use std::collections::HashMap;
     use std::time::{Instant, SystemTime};
+
+    // -- M14: reconciler deploy-wait timeout ---------------------------------
+
+    #[tokio::test]
+    async fn deploy_succeeded_returns_true_on_complete() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::Complete {
+            created: 1,
+            instances: vec!["web-0".to_string()],
+        })
+        .await
+        .unwrap();
+        assert!(deploy_succeeded(rx, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn deploy_succeeded_returns_false_on_error() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::Error {
+            message: "boom".to_string(),
+        })
+        .await
+        .unwrap();
+        assert!(!deploy_succeeded(rx, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn deploy_succeeded_times_out_on_a_hung_deploy() {
+        // The sender is held open and never emits a terminal event — modelling
+        // a stuck image pull / hung runtime. Without the timeout this would
+        // wedge the reconcile tick forever; with it, the deploy is treated as
+        // not-applied so the tick returns and retries.
+        let (tx, rx) = mpsc::channel::<ApplyEvent>(4);
+        let started = Instant::now();
+        let result = deploy_succeeded(rx, Duration::from_millis(100)).await;
+        assert!(!result, "a hung deploy must time out to `false`, not block");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it must not block"
+        );
+        drop(tx);
+    }
 
     fn member(name: &str, port: u16) -> MembershipSnapshot {
         MembershipSnapshot {
