@@ -487,7 +487,7 @@ pub fn spawn_autoscaler(
                 let Some(metric) = app_metric_utilisation(
                     &rollup_store,
                     &config.metric,
-                    &app_id.name,
+                    app_id,
                     config.evaluation_window,
                 )
                 .await
@@ -535,7 +535,7 @@ pub fn spawn_autoscaler(
 async fn app_metric_utilisation(
     rollup_store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
     metric: &str,
-    app: &str,
+    app_id: &crate::meat::types::AppId,
     window: Duration,
 ) -> Option<f64> {
     let now = std::time::SystemTime::now()
@@ -549,17 +549,30 @@ async fn app_metric_utilisation(
         .query_cluster_aggregates(metric, window_start, now)
         .await
         .ok()?;
-    // Filter to rows whose labels mention this app, and average the
-    // per-timestamp means (sum/count).
     let mut total = 0.0;
     let mut n = 0u64;
     for agg in &aggregates {
-        if agg.labels.contains(app) && agg.count > 0 {
+        if agg.count > 0 && aggregate_is_for_app(&agg.labels, app_id) {
             total += agg.sum / f64::from(agg.count);
             n += 1;
         }
     }
     if n == 0 { None } else { Some(total / n as f64) }
+}
+
+/// Whether a rollup aggregate's labels belong to exactly `app_id` (M26).
+///
+/// The collector labels per-app metrics with `app = "<namespace>/<app>"`
+/// (`mayo::collector`). The old autoscaler used `labels.contains(bare_name)`,
+/// a substring match that pooled `web` with `webhook`/`web-api` and merged the
+/// same app name across namespaces. Parse the labels JSON and compare the
+/// `app` field to the namespace-qualified id exactly.
+fn aggregate_is_for_app(labels_json: &str, app_id: &crate::meat::types::AppId) -> bool {
+    let qualified = format!("{}/{}", app_id.namespace, app_id.name);
+    serde_json::from_str::<serde_json::Value>(labels_json)
+        .ok()
+        .and_then(|v| v.get("app").and_then(|a| a.as_str()).map(String::from))
+        .is_some_and(|app_label| app_label == qualified)
 }
 
 /// Build the cluster-wide service endpoint catalogue from node reports.
@@ -1199,7 +1212,7 @@ mod tests {
                 .unwrap()
                 .as_secs();
             let mut labels = Map::new();
-            labels.insert("app".to_string(), "web".to_string());
+            labels.insert("app".to_string(), "prod/web".to_string());
             let rollup = NodeRollup {
                 node_id: NodeId::new("n1"),
                 timestamp: now.saturating_sub(60),
@@ -1221,15 +1234,21 @@ mod tests {
         }
 
         let window = Duration::from_secs(300);
-        let value = app_metric_utilisation(&store, "cpu", "web", window).await;
+        let value = app_metric_utilisation(&store, "cpu", &AppId::new("web", "prod"), window).await;
         assert!(
             value.is_some_and(|v| (v - 0.8).abs() < 1e-9),
             "expected mean utilisation 0.8, got {value:?}"
         );
 
+        // Same app name, different namespace → no data (M26).
+        assert!(
+            app_metric_utilisation(&store, "cpu", &AppId::new("web", "staging"), window)
+                .await
+                .is_none()
+        );
         // Unknown app → no data.
         assert!(
-            app_metric_utilisation(&store, "cpu", "other", window)
+            app_metric_utilisation(&store, "cpu", &AppId::new("other", "prod"), window)
                 .await
                 .is_none()
         );
@@ -1400,6 +1419,28 @@ mod tests {
             decisions.is_empty(),
             "a daemon covering every eligible node must not re-plan: {decisions:?}"
         );
+    }
+
+    /// M26: the autoscaler metric match is namespace-qualified and exact — it
+    /// no longer pools distinct apps by a bare-name substring.
+    #[test]
+    fn autoscale_metric_match_is_namespace_qualified_and_exact() {
+        let web_prod = AppId::new("web", "prod");
+        // Exact qualified match.
+        assert!(aggregate_is_for_app(
+            r#"{"app":"prod/web","pid":"12"}"#,
+            &web_prod
+        ));
+        // A different namespace's same-named app must NOT match.
+        assert!(!aggregate_is_for_app(r#"{"app":"staging/web"}"#, &web_prod));
+        // A substring collision (webhook) must NOT match.
+        assert!(!aggregate_is_for_app(
+            r#"{"app":"prod/webhook"}"#,
+            &web_prod
+        ));
+        // Missing/omitted app label, and non-JSON, don't match.
+        assert!(!aggregate_is_for_app(r#"{"pid":"12"}"#, &web_prod));
+        assert!(!aggregate_is_for_app("not json", &web_prod));
     }
 
     /// M25a: a partially-placed fixed-replica app that then fails must not leak
