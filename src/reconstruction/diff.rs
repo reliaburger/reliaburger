@@ -37,9 +37,18 @@ pub fn compute_diff(
         }
     }
 
-    // Build the set of actual (app_id, node_id) placements from reports.
+    // Build the set of actual (app_id, node_id) placements from reports,
+    // excluding stale nodes (M15). A node that went silent still lingers in
+    // `reports` with its last snapshot for ~90s; trusting that snapshot as live
+    // means its apps count as running, so a node that actually died reports no
+    // `MissingApp` and its workloads are never rescheduled. Its own reports must
+    // not be treated as current truth.
+    let stale: HashSet<&NodeId> = actual.stale_nodes.iter().collect();
     let mut actual_placements: HashSet<(AppId, NodeId)> = HashSet::new();
     for (node_id, report) in &actual.reports {
+        if stale.contains(node_id) {
+            continue;
+        }
         for app in &report.running_apps {
             let app_id = AppId::new(&app.app_name, &app.namespace);
             actual_placements.insert((app_id, node_id.clone()));
@@ -184,6 +193,28 @@ mod tests {
             Correction::MissingApp { app_id, node_id }
             if *app_id == app("web", "prod") && *node_id == node("n1")
         ));
+    }
+
+    /// M15: a stale node's report is not current truth. Its running apps must
+    /// not count as actual, so a desired app on it is reported `MissingApp`
+    /// (the node went silent — we can't assume its workloads survived).
+    #[test]
+    fn stale_node_apps_are_not_counted_as_running() {
+        let desired = desired_with_placements(vec![(app("web", "prod"), node("n1"))]);
+        // n1 reports web/prod running, but n1 is stale.
+        let mut actual = actual_with_apps(vec![(node("n1"), vec![("web".into(), "prod".into())])]);
+        actual.stale_nodes = vec![node("n1")];
+        let reported: HashSet<NodeId> = [node("n1")].into();
+        let corrections = compute_diff(&desired, &actual, &[node("n1")], &reported);
+
+        assert!(
+            corrections.iter().any(|c| matches!(
+                c,
+                Correction::MissingApp { app_id, node_id }
+                if *app_id == app("web", "prod") && *node_id == node("n1")
+            )),
+            "a stale node's app must not count as running: {corrections:?}"
+        );
     }
 
     #[test]

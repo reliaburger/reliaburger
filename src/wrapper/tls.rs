@@ -148,6 +148,112 @@ pub fn build_tls_config(
     Ok(Arc::new(config))
 }
 
+/// Build a rustls `ServerConfig` that resolves certificates per SNI hostname
+/// (M8). Used for `tls = "cluster"` ingress: `resolver` issues each host a
+/// certificate from the cluster's Ingress CA on demand, so a client trusting
+/// the cluster root trusts the ingress instead of hitting a self-signed
+/// `localhost` cert.
+pub fn build_tls_config_with_resolver(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Result<Arc<ServerConfig>, TlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    Ok(Arc::new(config))
+}
+
+/// Turns a DER cert chain + key into a rustls [`CertifiedKey`] ready to serve.
+fn certified_key(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<rustls::sign::CertifiedKey>, TlsError> {
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| TlsError::ConfigFailed(format!("unsupported ingress key: {e}")))?;
+    Ok(Arc::new(rustls::sign::CertifiedKey::new(
+        certs,
+        signing_key,
+    )))
+}
+
+/// Per-SNI ingress certificate resolver backed by the cluster Ingress CA (M8).
+///
+/// On each TLS handshake it looks at the client's SNI hostname and returns a
+/// certificate for it, issued from the Ingress CA and cached so a repeat
+/// handshake doesn't re-sign. A handshake with no SNI (or an issuance failure)
+/// falls back to the self-signed default, preserving the previous behaviour
+/// rather than dropping the connection.
+///
+/// `rustls`'s `resolve` is a synchronous trait method called on the handshake
+/// path, so the cache uses `std::sync::Mutex` (not the tokio one): the lock is
+/// never held across an `.await`.
+pub struct IngressCertResolver {
+    ca_keypair: rcgen::KeyPair,
+    ca_params: rcgen::CertificateParams,
+    lifetime: std::time::Duration,
+    default_key: Arc<rustls::sign::CertifiedKey>,
+    cache: std::sync::Mutex<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for IngressCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngressCertResolver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl IngressCertResolver {
+    /// Build a resolver from the Ingress CA material and a self-signed
+    /// fallback cert/key (used when a handshake carries no SNI).
+    pub fn new(
+        ca_keypair: rcgen::KeyPair,
+        ca_params: rcgen::CertificateParams,
+        lifetime: std::time::Duration,
+        default_cert: Vec<CertificateDer<'static>>,
+        default_key: PrivateKeyDer<'static>,
+    ) -> Result<Self, TlsError> {
+        Ok(Self {
+            ca_keypair,
+            ca_params,
+            lifetime,
+            default_key: certified_key(default_cert, default_key)?,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Issue (or fetch from cache) a certified key for `hostname`.
+    fn key_for(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if let Ok(cache) = self.cache.lock()
+            && let Some(existing) = cache.get(hostname)
+        {
+            return Some(Arc::clone(existing));
+        }
+        let hosts = [hostname.to_string()];
+        let (chain, key) =
+            issue_ingress_cert(&hosts, self.lifetime, &self.ca_keypair, &self.ca_params).ok()?;
+        let certified = certified_key(chain, key).ok()?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(hostname.to_string(), Arc::clone(&certified));
+        }
+        Some(certified)
+    }
+}
+
+impl rustls::server::ResolvesServerCert for IngressCertResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        match client_hello.server_name() {
+            Some(name) => Some(
+                self.key_for(name)
+                    .unwrap_or_else(|| Arc::clone(&self.default_key)),
+            ),
+            None => Some(Arc::clone(&self.default_key)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +322,31 @@ mod tests {
             &hierarchy.ingress.certificate_params,
         );
         assert!(result.is_err());
+    }
+
+    /// M8: the per-SNI resolver issues a cluster-CA cert for the requested
+    /// host and caches it, and reuses the CA — proving `tls = "cluster"` gets a
+    /// cluster-signed cert rather than the self-signed fallback.
+    #[test]
+    fn ingress_resolver_issues_and_caches_per_host() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("test-cluster", b"test-wrap-ikm").unwrap();
+        let (default_cert, default_key) = generate_self_signed_cert().unwrap();
+        let resolver = IngressCertResolver::new(
+            hierarchy.ingress.signing_keypair,
+            hierarchy.ingress.certificate_params,
+            std::time::Duration::from_secs(90 * 24 * 3600),
+            vec![default_cert],
+            default_key,
+        )
+        .unwrap();
+
+        let first = resolver.key_for("myapp.example.com").unwrap();
+        let second = resolver.key_for("myapp.example.com").unwrap();
+        // Cache hit returns the very same Arc.
+        assert!(Arc::ptr_eq(&first, &second));
+        // A different host issues a distinct cert.
+        let other = resolver.key_for("other.example.com").unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 }

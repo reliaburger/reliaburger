@@ -210,6 +210,35 @@ pub fn node_id_from_spiffe_uri(uri: &str) -> Option<&str> {
 /// Issue an end-entity certificate (e.g. node cert) signed by an intermediate CA.
 ///
 /// Returns `(certificate_der, private_key_der, serial)`.
+/// Reconstruct a CA's signing keypair and issuer params from stored state.
+///
+/// Unwraps the CA's private key with `wrapping_ikm` and rebuilds the rcgen
+/// `KeyPair` + issuer `CertificateParams` from the stored certificate, so an
+/// end-entity cert issued with them chains to the CA in the trust store. Used
+/// by the ingress TLS resolver (M8), mirroring the join path's Node-CA rebuild.
+///
+/// Returns `None` when the role's CA is absent or its key isn't stored on this
+/// node (e.g. the Root CA, whose key is sealed offline).
+pub fn ca_signing_material(
+    ca: &CertificateAuthority,
+    wrapping_ikm: &[u8],
+) -> Result<(KeyPair, CertificateParams), CaError> {
+    let wrapped = ca
+        .private_key_wrapped
+        .as_ref()
+        .ok_or_else(|| CaError::KeyGenFailed("CA private key not stored on this node".into()))?;
+    let key_der = crypto::unwrap_key(wrapping_ikm, wrapped)
+        .map_err(|e| CaError::KeyGenFailed(format!("unwrap CA key: {e}")))?;
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_der)
+        .map_err(|e| CaError::KeyGenFailed(format!("invalid CA key DER: {e}")))?;
+    let keypair = KeyPair::from_der_and_sign_algo(&key_der, &rcgen::PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| CaError::KeyGenFailed(format!("invalid CA key: {e}")))?;
+    let cert_der = rustls::pki_types::CertificateDer::from(ca.certificate_der.clone());
+    let params = CertificateParams::from_ca_cert_der(&cert_der)
+        .map_err(|e| CaError::CertGenFailed(format!("invalid CA cert: {e}")))?;
+    Ok((keypair, params))
+}
+
 pub fn issue_end_entity_cert(
     common_name: &str,
     serial: SerialNumber,

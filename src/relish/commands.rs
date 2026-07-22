@@ -99,6 +99,7 @@ async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
 }
 
 /// Stream logs from an app or job.
+#[allow(clippy::too_many_arguments)]
 pub async fn logs(
     name: &str,
     tail: Option<usize>,
@@ -106,9 +107,10 @@ pub async fn logs(
     grep: Option<String>,
     since: Option<String>,
     json_field: Option<String>,
+    namespace: &str,
 ) -> Result<(), RelishError> {
     let options = build_log_options(tail, follow, grep, since, json_field, unix_now())?;
-    logs_with_client(name, &options, &BunClient::default_local()).await
+    logs_with_client(name, namespace, &options, &BunClient::default_local()).await
 }
 
 /// Translate the CLI flags into [`LogOptions`], validating as we go.
@@ -188,10 +190,11 @@ fn unix_now() -> u64 {
 
 async fn logs_with_client(
     name: &str,
+    namespace: &str,
     options: &super::client::LogOptions,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let log_output = client.logs(name, "default", options).await?;
+    let log_output = client.logs(name, namespace, options).await?;
     if !log_output.is_empty() {
         println!("{log_output}");
     }
@@ -290,16 +293,17 @@ pub async fn logs_search(source: &str, sql: &str) -> Result<(), RelishError> {
 }
 
 /// Execute a command inside a running container.
-pub async fn exec(app: &str, command: &[String]) -> Result<(), RelishError> {
-    exec_with_client(app, command, &BunClient::default_local()).await
+pub async fn exec(app: &str, command: &[String], namespace: &str) -> Result<(), RelishError> {
+    exec_with_client(app, namespace, command, &BunClient::default_local()).await
 }
 
 async fn exec_with_client(
     app: &str,
+    namespace: &str,
     command: &[String],
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let output = client.exec(app, "default", command).await?;
+    let output = client.exec(app, namespace, command).await?;
     if !output.is_empty() {
         print!("{output}");
     }
@@ -307,12 +311,16 @@ async fn exec_with_client(
 }
 
 /// Stop all instances of an app.
-pub async fn stop(app: &str) -> Result<(), RelishError> {
-    stop_with_client(app, &BunClient::default_local()).await
+pub async fn stop(app: &str, namespace: &str) -> Result<(), RelishError> {
+    stop_with_client(app, namespace, &BunClient::default_local()).await
 }
 
-async fn stop_with_client(app: &str, client: &BunClient) -> Result<(), RelishError> {
-    client.stop(app, "default").await?;
+async fn stop_with_client(
+    app: &str,
+    namespace: &str,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    client.stop(app, namespace).await?;
     println!("stopped {app}");
     Ok(())
 }
@@ -856,35 +864,28 @@ pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
 /// Show deploy history for an app.
 pub async fn history(app: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    client.health().await?;
+    // Authenticated + CA-trusting request (M21): the previous bare
+    // `reqwest::get` carried no bearer/CA, so it 401'd against a secured agent
+    // and silently exited 0. `deploy_history` routes through the configured
+    // client and propagates the failure.
+    let entries = client.deploy_history(app).await?;
 
-    let url = format!("{}/v1/deploys/history/{app}", client.base_url());
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|_| RelishError::AgentUnreachable)?;
-    let body: serde_json::Value = resp.json().await.map_err(|e| RelishError::ApiError {
-        status: 0,
-        body: e.to_string(),
-    })?;
-
-    if let Some(entries) = body["history"].as_array() {
-        if entries.is_empty() {
-            println!("no deploy history for {app}");
-        } else {
+    if entries.is_empty() {
+        println!("no deploy history for {app}");
+    } else {
+        println!(
+            "{:<8} {:<20} {:<12} {:<6} {:<6}",
+            "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
+        );
+        for e in &entries {
             println!(
                 "{:<8} {:<20} {:<12} {:<6} {:<6}",
-                "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
+                e["id"].as_u64().unwrap_or(0),
+                e["image"].as_str().unwrap_or("-"),
+                e["result"].as_str().unwrap_or("-"),
+                e["steps_completed"].as_u64().unwrap_or(0),
+                e["steps_total"].as_u64().unwrap_or(0),
             );
-            for e in entries {
-                println!(
-                    "{:<8} {:<20} {:<12} {:<6} {:<6}",
-                    e["id"].as_u64().unwrap_or(0),
-                    e["image"].as_str().unwrap_or("-"),
-                    e["result"].as_str().unwrap_or("-"),
-                    e["steps_completed"].as_u64().unwrap_or(0),
-                    e["steps_total"].as_u64().unwrap_or(0),
-                );
-            }
         }
     }
 
@@ -892,12 +893,12 @@ pub async fn history(app: &str) -> Result<(), RelishError> {
 }
 
 /// Rollback an app to the previous version.
-pub async fn rollback(app: &str) -> Result<(), RelishError> {
+pub async fn rollback(app: &str, namespace: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
     // X3: rollback used to only print advice. It now calls the server,
     // which redeploys the previous successful spec.
-    client.rollback(app, "default").await?;
+    client.rollback(app, namespace).await?;
     println!("rolled {app} back to its previous version");
     Ok(())
 }
@@ -1264,9 +1265,12 @@ pub async fn build(
         );
 
         // Upload context blob to the Pickle registry (X1: this used to
-        // target the Bun API port, which has no /v2 routes).
+        // target the Bun API port, which has no /v2 routes). Route through the
+        // authenticated client (M21): a bare client carried no bearer/CA, so it
+        // 401'd or failed TLS against a secured registry.
         let upload_url = crate::pickle::build::context_upload_url(registry_port, &digest);
-        let resp = reqwest::Client::new()
+        let resp = BunClient::default_local()
+            .http()
             .post(&upload_url)
             .body(tar_bytes)
             .send()
@@ -1816,7 +1820,7 @@ mod tests {
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
         let options = super::super::client::LogOptions::default();
-        let err = logs_with_client("web", &options, &bogus_client())
+        let err = logs_with_client("web", "default", &options, &bogus_client())
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
@@ -1824,7 +1828,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_returns_agent_unreachable() {
-        let err = exec_with_client("web", &["sh".to_string()], &bogus_client())
+        let err = exec_with_client("web", "default", &["sh".to_string()], &bogus_client())
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
@@ -1832,7 +1836,9 @@ mod tests {
 
     #[tokio::test]
     async fn stop_returns_agent_unreachable() {
-        let err = stop_with_client("web", &bogus_client()).await.unwrap_err();
+        let err = stop_with_client("web", "default", &bogus_client())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable));
     }
 

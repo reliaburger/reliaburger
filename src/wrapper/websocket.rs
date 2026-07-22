@@ -56,6 +56,8 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 pub async fn handle_websocket_upgrade(
     mut req: Request<Body>,
     backend: SocketAddr,
+    remote: SocketAddr,
+    over_tls: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     drain_guard: Option<Box<dyn std::any::Any + Send>>,
 ) -> Response {
@@ -68,7 +70,7 @@ pub async fn handle_websocket_upgrade(
         Ok(s) => s,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let upgrade_request = build_upgrade_request(&req, backend);
+    let upgrade_request = build_upgrade_request(&req, backend, remote, over_tls);
     if backend_stream
         .write_all(upgrade_request.as_bytes())
         .await
@@ -183,7 +185,17 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Build a raw HTTP/1.1 upgrade request string to send to the backend.
-fn build_upgrade_request(req: &Request<Body>, backend: SocketAddr) -> String {
+///
+/// Like the non-WS forward path, the client's own `X-Forwarded-*`/`Forwarded`
+/// headers are dropped and replaced with the proxy's own view (ING5/M9): a
+/// client opening a WebSocket must not be able to spoof `X-Forwarded-For` and
+/// lie to a backend that trusts it for rate-limiting or IP allow-listing.
+fn build_upgrade_request(
+    req: &Request<Body>,
+    backend: SocketAddr,
+    remote: SocketAddr,
+    over_tls: bool,
+) -> String {
     let method = req.method().as_str();
     let path = req
         .uri()
@@ -197,9 +209,15 @@ fn build_upgrade_request(req: &Request<Body>, backend: SocketAddr) -> String {
         if name == header::HOST {
             continue; // Already set above
         }
+        if super::proxy::is_forwarded_header(name.as_str()) {
+            continue; // Replaced with the proxy's own view below.
+        }
         if let Ok(v) = value.to_str() {
             request.push_str(&format!("{}: {v}\r\n", name.as_str()));
         }
+    }
+    for (name, value) in super::proxy::forwarded_headers(remote, over_tls) {
+        request.push_str(&format!("{name}: {value}\r\n"));
     }
     request.push_str("\r\n");
     request
@@ -308,12 +326,43 @@ mod tests {
     fn build_upgrade_request_format() {
         let req = make_ws_request();
         let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend);
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, false);
 
         assert!(raw.starts_with("GET /ws HTTP/1.1\r\n"));
         assert!(raw.contains("Host: 10.0.2.2:8080\r\n"));
         assert!(raw.contains("upgrade: websocket\r\n"));
         assert!(raw.contains("sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
         assert!(raw.ends_with("\r\n\r\n"));
+    }
+
+    /// M9: a WebSocket client cannot spoof `X-Forwarded-For`. The client's
+    /// forwarded headers are dropped and the proxy sets its own from the real
+    /// peer address, exactly like the non-WS forward path.
+    #[test]
+    fn build_upgrade_request_strips_client_forwarded_headers() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("X-Forwarded-For", "1.2.3.4")
+            .header("X-Forwarded-Proto", "https")
+            .header("Forwarded", "for=1.2.3.4")
+            .body(Body::empty())
+            .unwrap();
+        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, true).to_lowercase();
+
+        // The spoofed client value is gone; the proxy's real view is present.
+        assert!(
+            !raw.contains("1.2.3.4"),
+            "client XFF must be stripped: {raw}"
+        );
+        assert!(raw.contains("x-forwarded-for: 203.0.113.7\r\n"));
+        assert!(raw.contains("x-forwarded-proto: https\r\n"));
+        // Exactly one x-forwarded-for line (no duplicate from the client).
+        assert_eq!(raw.matches("x-forwarded-for:").count(), 1);
     }
 }

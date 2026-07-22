@@ -107,6 +107,55 @@ impl RollupStore {
         }
     }
 
+    /// Seed the idempotency tracker from Parquet already on disk (M17).
+    ///
+    /// `seen_windows` is process-local and starts empty after a restart, while
+    /// the flushed Parquet already holds prior windows. A reassigned worker
+    /// re-sending a `(node, window)` that was flushed before the restart would
+    /// then be ingested a second time, doubling `query_cluster_metric` sums for
+    /// that window. Loading the distinct `(node_id, timestamp)` pairs within the
+    /// idempotency horizon once at startup closes that gap. Call after `new()`
+    /// and before the first ingest.
+    pub async fn hydrate_seen_windows(&mut self) -> Result<(), MayoError> {
+        if !dir_has_parquet(&self.data_dir) {
+            return Ok(());
+        }
+        let ctx = self.session().await?;
+        let df = ctx
+            .sql("SELECT DISTINCT node_id, timestamp FROM rollups")
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        for batch in &batches {
+            if batch.num_columns() < 2 {
+                continue;
+            }
+            let nodes = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("node_id column type mismatch".into()))?;
+            let windows = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| MayoError::Arrow("timestamp column type mismatch".into()))?;
+            for i in 0..batch.num_rows() {
+                let window = windows.value(i);
+                self.newest_window = self.newest_window.max(window);
+                self.seen_windows
+                    .insert((nodes.value(i).to_string(), window));
+            }
+        }
+        // Keep the seeded set bounded to the idempotency horizon.
+        let cutoff = self.newest_window.saturating_sub(IDEMPOTENCY_HORIZON_SECS);
+        self.seen_windows.retain(|(_, window)| *window >= cutoff);
+        Ok(())
+    }
+
     /// Ingest a `NodeRollup` into the buffer.
     ///
     /// Idempotent per `(node_id, window)`: a window already ingested this
@@ -649,6 +698,36 @@ mod tests {
         store.ingest(&make_rollup("n1", 1000, "cpu", 42.0));
         // Don't flush — query should still see buffer data
         let results = store.query_cluster_metric("cpu", 0, 9999).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].3, 42.0);
+    }
+
+    /// M17: after a restart, a re-sent (node, window) that was already flushed
+    /// to Parquet must not be counted a second time. A fresh store over the
+    /// same directory, once its idempotency tracker is seeded from disk, rejects
+    /// the duplicate so the cluster sum stays correct.
+    #[tokio::test]
+    async fn restart_does_not_double_count_a_reflushed_window() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = RollupStore::new(dir.path().to_path_buf());
+            store.ingest(&make_rollup("n1", 1000, "cpu", 42.0));
+            store.flush().await.unwrap();
+        }
+
+        // Simulate a restart: a new store over the same dir. Without seeding it
+        // would happily re-ingest the same window.
+        let mut restarted = RollupStore::new(dir.path().to_path_buf());
+        restarted.hydrate_seen_windows().await.unwrap();
+        let accepted = restarted.ingest(&make_rollup("n1", 1000, "cpu", 42.0));
+        assert!(!accepted, "a window already on disk must be a duplicate");
+        restarted.flush().await.unwrap();
+
+        // The sum reflects the single ingest, not double.
+        let results = restarted
+            .query_cluster_metric("cpu", 0, 9999)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].3, 42.0);
     }

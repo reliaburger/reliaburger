@@ -13,6 +13,10 @@ use datafusion::arrow::array::UInt64Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::basic::{Compression, ZstdLevel};
 use datafusion::parquet::file::properties::WriterProperties;
@@ -335,51 +339,45 @@ impl LogStore {
         };
         let schema = Arc::new(log_schema());
 
-        let mut all_batches = self.read_disk_batches(&ctx).await?;
-        if let Some(buffer_batch) = self.buffer_to_batch()? {
-            all_batches.push(buffer_batch);
-        }
-        if all_batches.is_empty() {
-            all_batches.push(RecordBatch::new_empty(schema.clone()));
+        // On-disk logs: a streaming `ListingTable` over the Parquet directory
+        // (M19), so a large archive is scanned incrementally and charged to the
+        // memory pool — the old code `.collect()`ed every Parquet row into a
+        // MemTable before planning, so the OBS5 limit covered only aggregation,
+        // not the dominant base scan. An empty directory registers an empty
+        // table so the union view below always resolves.
+        if dir_has_parquet(&self.data_dir) {
+            let url = ListingTableUrl::parse(self.data_dir.to_string_lossy().as_ref())
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+            let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+                .with_file_extension(".parquet");
+            let listing = ListingTableConfig::new(url)
+                .with_listing_options(options)
+                .with_schema(schema.clone());
+            let table = ListingTable::try_new(listing)
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+            ctx.register_table("logs_disk", Arc::new(table))
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        } else {
+            let empty = MemTable::try_new(schema.clone(), vec![vec![]])
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+            ctx.register_table("logs_disk", Arc::new(empty))
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         }
 
-        let table = MemTable::try_new(schema, vec![all_batches])
+        // Unflushed buffer: a small MemTable (bounded by the flush interval).
+        let buffer_batch = self
+            .buffer_to_batch()?
+            .unwrap_or_else(|| RecordBatch::new_empty(schema.clone()));
+        let buffer_table = MemTable::try_new(schema.clone(), vec![vec![buffer_batch]])
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        ctx.register_table("logs", Arc::new(table))
+        ctx.register_table("logs_buffer", Arc::new(buffer_table))
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+
+        // Expose the union as `logs` so queries are unchanged.
+        ctx.sql("CREATE VIEW logs AS SELECT * FROM logs_disk UNION ALL SELECT * FROM logs_buffer")
+            .await
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
         Ok(ctx)
-    }
-
-    /// Read every `logs_*.parquet` file into RecordBatches normalised to the
-    /// canonical `log_schema`.
-    async fn read_disk_batches(
-        &self,
-        ctx: &SessionContext,
-    ) -> Result<Vec<RecordBatch>, KetchupError> {
-        if !dir_has_parquet(&self.data_dir) {
-            return Ok(Vec::new());
-        }
-        let dir = format!("{}/", self.data_dir.display());
-        ctx.register_parquet("logs_disk", &dir, ParquetReadOptions::default())
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        let batches = ctx
-            .sql("SELECT timestamp, app, namespace, stream, line FROM logs_disk")
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
-            .collect()
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        let schema = Arc::new(log_schema());
-        let mut normalised = Vec::with_capacity(batches.len());
-        for batch in batches {
-            normalised.push(
-                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-                    .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?,
-            );
-        }
-        Ok(normalised)
     }
 
     /// Query logs using SQL and return raw JSON rows.

@@ -295,6 +295,14 @@ impl BunClient {
         &self.base_url
     }
 
+    /// The underlying HTTP client, pre-configured with the resolved bearer
+    /// token and cluster-CA trust. Used for requests to an explicit URL that
+    /// isn't relative to `base_url` — e.g. a Pickle registry `/v2` upload on a
+    /// different port (M21) — so they, too, are authenticated and TLS-trusting.
+    pub fn http(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     /// Create a client pointing at the default local agent. Uses HTTPS when a
     /// cluster CA cert is configured (`--ca-cert` / `RELIABURGER_CA_CERT`). An
     /// explicit `--endpoint` / `RELIABURGER_ENDPOINT` replaces the whole URL.
