@@ -556,24 +556,32 @@ impl RollupStore {
         Ok(names)
     }
 
-    /// Prune Parquet files older than `before` timestamp.
+    /// Prune Parquet files whose newest datapoint is older than `before`.
+    ///
+    /// Keyed on the data's own newest timestamp (O12), read from row-group
+    /// statistics, not the file's mtime — the rollup schema shares the
+    /// leading `timestamp` column, so `store::file_max_timestamp` applies.
     pub fn prune(&self, before: u64) -> Result<usize, MayoError> {
         let mut deleted = 0;
         if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|e| e == "parquet")
-                    && let Ok(meta) = std::fs::metadata(&path)
-                    && let Ok(modified) = meta.modified()
-                {
-                    let mod_secs = modified
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if mod_secs < before {
-                        let _ = std::fs::remove_file(&path);
-                        deleted += 1;
-                    }
+                if !path.extension().is_some_and(|e| e == "parquet") {
+                    continue;
+                }
+                let newest = super::store::file_max_timestamp(&path).unwrap_or_else(|| {
+                    std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| {
+                            t.duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        })
+                        .unwrap_or(u64::MAX)
+                });
+                if newest < before {
+                    let _ = std::fs::remove_file(&path);
+                    deleted += 1;
                 }
             }
         }
