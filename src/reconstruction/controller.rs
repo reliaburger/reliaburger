@@ -71,25 +71,35 @@ impl ReconstructionController {
         self.reported_nodes.clear();
         self.alive_count_at_start = alive_count;
 
-        if alive_count == 0 {
-            // No nodes to wait for — go straight to Active.
-            let result = ReconstructionResult {
-                outcome: LearningOutcome::ThresholdMet {
-                    reported: 0,
-                    total: 0,
-                },
-                corrections: vec![],
-                unknown_nodes: vec![],
-                reported_nodes: vec![],
-            };
-            self.last_result = Some(result.clone());
-            self.phase = ReconstructionPhase::Active;
-            return Some(result);
-        }
-
+        // Always enter Learning — even at zero alive (M16). A leader elected
+        // during a gossip lull sees few or no peers; jumping straight to Active
+        // resumed scheduling against an empty view and rescheduled workloads
+        // still running elsewhere. Entering Learning lets `check_timeout`
+        // provide a settling delay for membership to populate, and the alive
+        // count is re-sampled as reports arrive so a transient lull can't let a
+        // handful of reports clear the threshold against a tiny denominator.
         self.learning_started = Some(Instant::now());
         self.phase = ReconstructionPhase::Learning;
         None
+    }
+
+    /// Report keys that are current truth — reporters minus stale nodes (M15).
+    ///
+    /// A stale node lingers in `reports` with its last snapshot; counting it as
+    /// a live reporter ends learning early and treats its (possibly dead) apps
+    /// as running. Only fresh reporters count toward coverage.
+    fn fresh_reporters(aggregated: &AggregatedState) -> impl Iterator<Item = &NodeId> {
+        let stale: HashSet<&NodeId> = aggregated.stale_nodes.iter().collect();
+        aggregated
+            .reports
+            .keys()
+            .filter(move |node_id| !stale.contains(node_id))
+    }
+
+    /// Raise the high-water alive count so a transient gossip lull can't shrink
+    /// the coverage denominator (M16).
+    fn resample_alive(&mut self, alive_nodes: &[NodeId]) {
+        self.alive_count_at_start = self.alive_count_at_start.max(alive_nodes.len());
     }
 
     /// Called when this node loses leadership.
@@ -116,9 +126,13 @@ impl ReconstructionController {
             return None;
         }
 
-        // Update reported nodes from the aggregated state.
-        for node_id in aggregated.reports.keys() {
-            self.reported_nodes.insert(node_id.clone());
+        // Re-sample the alive count and count only fresh reporters (M15/M16).
+        self.resample_alive(alive_nodes);
+        for node_id in Self::fresh_reporters(aggregated)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            self.reported_nodes.insert(node_id);
         }
 
         // Check if coverage threshold is met.
@@ -154,9 +168,13 @@ impl ReconstructionController {
 
         let started = self.learning_started?;
         if started.elapsed() >= self.effective_timeout() {
-            // Update reported nodes one last time.
-            for node_id in aggregated.reports.keys() {
-                self.reported_nodes.insert(node_id.clone());
+            // Update reported nodes one last time (fresh reporters only, M15).
+            self.resample_alive(alive_nodes);
+            for node_id in Self::fresh_reporters(aggregated)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                self.reported_nodes.insert(node_id);
             }
 
             let result = self.finish_reconstruction(
@@ -410,20 +428,32 @@ mod tests {
     }
 
     #[test]
-    fn zero_alive_nodes_immediately_active() {
+    fn zero_alive_nodes_enter_learning_then_settle_on_timeout() {
+        // M16: a leader elected during a gossip lull (0 alive seen) no longer
+        // jumps straight to Active against an empty view — it enters Learning
+        // so membership has a settling window to populate. Only the learning
+        // timeout completes it.
         let mut ctrl = ReconstructionController::new(default_config());
-        let result = ctrl
-            .on_leader_elected(0)
-            .expect("should complete immediately with zero nodes");
+        assert!(ctrl.on_leader_elected(0).is_none());
+        assert_eq!(ctrl.phase(), ReconstructionPhase::Learning);
+    }
 
-        assert_eq!(ctrl.phase(), ReconstructionPhase::Active);
-        assert!(matches!(
-            result.outcome,
-            LearningOutcome::ThresholdMet {
-                reported: 0,
-                total: 0
-            }
-        ));
+    /// M16: the alive count is a high-water mark. A leader that saw 0 alive at
+    /// election but then hears from real nodes must not treat those reports as
+    /// 100% coverage against a zero denominator — the denominator grows.
+    #[test]
+    fn alive_count_is_resampled_upward_after_a_lull() {
+        let mut ctrl = ReconstructionController::new(default_config());
+        ctrl.on_leader_elected(0);
+
+        // A report arrives from n1 while alive membership now shows two nodes.
+        let agg = aggregated_with_nodes(&["n1"]);
+        let alive = [node("n1"), node("n2")];
+        ctrl.on_report_received(&agg, &empty_desired(), &alive);
+
+        // 1 of 2 reported = 50%, below threshold — still Learning, not a
+        // trivially-met 1-of-0.
+        assert_eq!(ctrl.phase(), ReconstructionPhase::Learning);
     }
 
     #[test]
