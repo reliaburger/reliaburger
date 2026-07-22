@@ -296,6 +296,11 @@ pub struct FaultRule {
     pub reversal: FaultReversal,
 }
 
+/// Hard ceiling on a fault's lifetime (O17): 24 hours. A chaos fault is a
+/// bounded experiment, not a permanent config change; clamping here guarantees
+/// even an absurd `--duration` still expires.
+const MAX_FAULT_DURATION_NS: u64 = 24 * 3600 * 1_000_000_000;
+
 impl FaultRule {
     /// Create a new fault rule with the given parameters.
     pub fn new(
@@ -306,7 +311,10 @@ impl FaultRule {
         injected_by: String,
     ) -> Self {
         let now_ns = monotonic_now_ns();
-        let duration_ns = duration.as_nanos() as u64;
+        // Cap the TTL and use a saturating add (O17): every fault must expire,
+        // so an absurd or overflowing duration is clamped to a hard ceiling
+        // rather than truncating via `as u64` or wrapping past `now`.
+        let duration_ns = (duration.as_nanos().min(MAX_FAULT_DURATION_NS as u128)) as u64;
         Self {
             id,
             fault_type,
@@ -314,7 +322,7 @@ impl FaultRule {
             target_instance: None,
             target_node: None,
             activated_at_ns: now_ns,
-            expires_at_ns: now_ns + duration_ns,
+            expires_at_ns: now_ns.saturating_add(duration_ns),
             duration_ns,
             injected_by,
             reason: None,
