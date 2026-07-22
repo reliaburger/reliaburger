@@ -73,6 +73,10 @@ enum Command {
         /// Filter structured JSON logs by field (key=value).
         #[arg(long)]
         json_field: Option<String>,
+        /// Namespace the app lives in (as derived by `compile` from its
+        /// directory). Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
     },
     /// Export Parquet log files to a destination directory.
     #[command(name = "logs-export")]
@@ -98,6 +102,10 @@ enum Command {
     Exec {
         /// App name.
         app: String,
+        /// Namespace the app lives in (as derived by `compile` from its
+        /// directory). Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
         /// Command to run.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -111,6 +119,10 @@ enum Command {
     Stop {
         /// App name.
         app: String,
+        /// Namespace the app lives in (as derived by `compile` from its
+        /// directory). Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init {
@@ -194,6 +206,10 @@ enum Command {
     Rollback {
         /// App name.
         app: String,
+        /// Namespace the app lives in (as derived by `compile` from its
+        /// directory). Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
     },
     /// Validate a config file without deploying.
     Lint {
@@ -838,6 +854,7 @@ async fn main() -> ExitCode {
             ref grep,
             ref since,
             ref json_field,
+            ref namespace,
         } => {
             commands::logs(
                 name,
@@ -846,6 +863,7 @@ async fn main() -> ExitCode {
                 grep.clone(),
                 since.clone(),
                 json_field.clone(),
+                namespace,
             )
             .await
         }
@@ -861,9 +879,13 @@ async fn main() -> ExitCode {
         Command::Exec {
             ref app,
             ref command,
-        } => commands::exec(app, command).await,
+            ref namespace,
+        } => commands::exec(app, command, namespace).await,
         Command::Inspect { ref name } => commands::inspect(name).await,
-        Command::Stop { ref app } => commands::stop(app).await,
+        Command::Stop {
+            ref app,
+            ref namespace,
+        } => commands::stop(app, namespace).await,
         Command::Init {
             ref dir,
             ref cluster_name,
@@ -1015,7 +1037,10 @@ async fn main() -> ExitCode {
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, dry_run).await,
         Command::History { ref app } => commands::history(app).await,
-        Command::Rollback { ref app } => commands::rollback(app).await,
+        Command::Rollback {
+            ref app,
+            ref namespace,
+        } => commands::rollback(app, namespace).await,
         Command::Lint { ref path } => commands::lint(path),
         Command::Compile { ref path } => commands::compile(path),
         Command::Diff {
@@ -1269,10 +1294,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_namespace_flag_threads_through_app_commands() {
+        // M21: logs/exec/stop/rollback accept --namespace so an app in a
+        // non-default namespace can be managed, defaulting to "default".
+        let cli = parse(&["relish", "stop", "web", "--namespace", "team-a"]).unwrap();
+        assert!(matches!(cli.command, Command::Stop { namespace, .. } if namespace == "team-a"));
+        let cli = parse(&["relish", "rollback", "web"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Rollback { namespace, .. } if namespace == "default")
+        );
+        let cli = parse(&["relish", "exec", "web", "--namespace", "team-a", "sh"]).unwrap();
+        assert!(matches!(cli.command, Command::Exec { namespace, .. } if namespace == "team-a"));
+    }
+
+    #[test]
     fn parse_exec_with_trailing_args() {
         let cli = parse(&["relish", "exec", "web", "sh", "-c", "ls"]).unwrap();
         match cli.command {
-            Command::Exec { app, command } => {
+            Command::Exec { app, command, .. } => {
                 assert_eq!(app, "web");
                 assert_eq!(command, vec!["sh", "-c", "ls"]);
             }
@@ -1432,7 +1471,7 @@ mod tests {
     #[test]
     fn parse_stop_command() {
         let cli = parse(&["relish", "stop", "web"]).unwrap();
-        assert!(matches!(cli.command, Command::Stop { ref app } if app == "web"));
+        assert!(matches!(cli.command, Command::Stop { ref app, .. } if app == "web"));
     }
 
     #[test]
@@ -1600,7 +1639,7 @@ mod tests {
     fn parse_rollback_command() {
         let cli = parse(&["relish", "rollback", "web"]).unwrap();
         match cli.command {
-            Command::Rollback { app } => assert_eq!(app, "web"),
+            Command::Rollback { app, .. } => assert_eq!(app, "web"),
             _ => panic!("expected Rollback"),
         }
     }
