@@ -121,7 +121,7 @@ async fn make_node_tls(
     let raft = council.raft().clone();
     let sd = shutdown.clone();
     tokio::spawn(async move {
-        serve_raft_rpc(listener, raft, sd, acceptor).await;
+        serve_raft_rpc(listener, raft, sd, acceptor, 0).await;
     });
     (council, bound)
 }

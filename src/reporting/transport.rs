@@ -14,6 +14,16 @@ use tokio::sync::{Mutex, mpsc};
 
 use super::ReportingError;
 use super::types::ReportingMessage;
+use crate::meat::NodeId;
+
+/// An inbound reporting message plus the sender's authenticated identity.
+///
+/// `peer_node_id` is `Some` only when the connection was mutually
+/// authenticated and the peer's certificate carries a node SPIFFE id; it is
+/// `None` on plaintext transports (mTLS off). The aggregator uses it to bind a
+/// self-report's claimed `node_id` to the cert identity so a peer can't
+/// overwrite another node's entry (C6).
+pub type InboundReport = (SocketAddr, Option<NodeId>, ReportingMessage);
 
 /// Transport for sending and receiving reporting tree messages.
 ///
@@ -28,11 +38,10 @@ pub trait ReportingTransport: Send + Sync {
     ) -> impl std::future::Future<Output = Result<(), ReportingError>> + Send;
 
     /// Receive the next inbound reporting message.
-    /// Returns the sender's address and the message.
+    /// Returns the sender's address, its authenticated node id (if the
+    /// connection was mutually authenticated), and the message.
     /// Returns `None` when the transport is shut down.
-    fn recv(
-        &self,
-    ) -> impl std::future::Future<Output = Option<(SocketAddr, ReportingMessage)>> + Send;
+    fn recv(&self) -> impl std::future::Future<Output = Option<InboundReport>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -45,7 +54,7 @@ pub struct InMemoryReportingNetwork {
 }
 
 struct NetworkInner {
-    inboxes: HashMap<SocketAddr, mpsc::Sender<(SocketAddr, ReportingMessage)>>,
+    inboxes: HashMap<SocketAddr, mpsc::Sender<InboundReport>>,
     partitions: Vec<(SocketAddr, SocketAddr)>,
 }
 
@@ -60,13 +69,26 @@ impl InMemoryReportingNetwork {
         }
     }
 
-    /// Create a transport handle for a node at the given address.
+    /// Create a transport handle for a node at the given address. Messages it
+    /// sends carry no authenticated identity (models a plaintext peer).
     pub async fn register(&self, address: SocketAddr) -> InMemoryReportingTransport {
+        self.register_as(address, None).await
+    }
+
+    /// Like [`register`](Self::register), but messages this handle sends are
+    /// tagged with `authenticated_as` — modelling a peer whose mTLS client
+    /// certificate binds it to that node id, for testing the C6 identity check.
+    pub async fn register_as(
+        &self,
+        address: SocketAddr,
+        authenticated_as: Option<NodeId>,
+    ) -> InMemoryReportingTransport {
         let (tx, rx) = mpsc::channel(256);
         let mut inner = self.inner.lock().await;
         inner.inboxes.insert(address, tx);
         InMemoryReportingTransport {
             address,
+            authenticated_as,
             network: Arc::clone(&self.inner),
             rx: Mutex::new(rx),
         }
@@ -95,13 +117,15 @@ impl Default for InMemoryReportingNetwork {
 /// A single node's handle into the in-memory reporting network.
 pub struct InMemoryReportingTransport {
     address: SocketAddr,
+    /// The node id this handle's messages present as (mTLS cert identity).
+    authenticated_as: Option<NodeId>,
     network: Arc<Mutex<NetworkInner>>,
-    rx: Mutex<mpsc::Receiver<(SocketAddr, ReportingMessage)>>,
+    rx: Mutex<mpsc::Receiver<InboundReport>>,
 }
 
 impl InMemoryReportingTransport {
     /// Non-blocking receive for tests.
-    pub fn try_recv(&self) -> Option<(SocketAddr, ReportingMessage)> {
+    pub fn try_recv(&self) -> Option<InboundReport> {
         if let Ok(mut rx) = self.rx.try_lock() {
             rx.try_recv().ok()
         } else {
@@ -127,7 +151,7 @@ impl ReportingTransport for InMemoryReportingTransport {
         }
 
         if let Some(tx) = inner.inboxes.get(&target) {
-            let _ = tx.try_send((self.address, message.clone()));
+            let _ = tx.try_send((self.address, self.authenticated_as.clone(), message.clone()));
             Ok(())
         } else {
             Err(ReportingError::SendFailed {
@@ -136,7 +160,7 @@ impl ReportingTransport for InMemoryReportingTransport {
         }
     }
 
-    async fn recv(&self) -> Option<(SocketAddr, ReportingMessage)> {
+    async fn recv(&self) -> Option<InboundReport> {
         let mut rx = self.rx.lock().await;
         rx.recv().await
     }
@@ -162,7 +186,7 @@ const REPORT_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_se
 /// Supports a runtime blocklist for chaos testing.
 pub struct TcpReportingTransport {
     address: SocketAddr,
-    inbound_rx: Mutex<mpsc::Receiver<(SocketAddr, ReportingMessage)>>,
+    inbound_rx: Mutex<mpsc::Receiver<InboundReport>>,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
     /// When set, peers are dialled over mTLS. `None` keeps plaintext TCP.
     tls_connector: Option<tokio_rustls::TlsConnector>,
@@ -230,7 +254,7 @@ impl TcpReportingTransport {
     /// Background task: accept connections and read framed messages.
     async fn accept_loop(
         listener: tokio::net::TcpListener,
-        tx: mpsc::Sender<(SocketAddr, ReportingMessage)>,
+        tx: mpsc::Sender<InboundReport>,
         shutdown: tokio_util::sync::CancellationToken,
         acceptor: Option<tokio_rustls::TlsAcceptor>,
     ) {
@@ -253,7 +277,13 @@ impl TcpReportingTransport {
                                             REPORT_ACCEPT_DEADLINE,
                                             async {
                                                 if let Ok(tls) = acceptor.accept(stream).await {
-                                                    Self::handle_connection(tls, peer, tx).await;
+                                                    // The verified client cert
+                                                    // binds the peer's identity
+                                                    // (C6); extract it before
+                                                    // reading the message.
+                                                    let peer_id = peer_node_id_from_tls(&tls);
+                                                    Self::handle_connection(tls, peer, peer_id, tx)
+                                                        .await;
                                                 }
                                             },
                                         )
@@ -264,7 +294,7 @@ impl TcpReportingTransport {
                                     tokio::spawn(async move {
                                         let _ = tokio::time::timeout(
                                             REPORT_ACCEPT_DEADLINE,
-                                            Self::handle_connection(stream, peer, tx),
+                                            Self::handle_connection(stream, peer, None, tx),
                                         )
                                         .await;
                                     });
@@ -282,7 +312,8 @@ impl TcpReportingTransport {
     async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(
         mut stream: S,
         peer: SocketAddr,
-        tx: mpsc::Sender<(SocketAddr, ReportingMessage)>,
+        peer_node_id: Option<NodeId>,
+        tx: mpsc::Sender<InboundReport>,
     ) {
         use tokio::io::AsyncReadExt;
 
@@ -304,7 +335,7 @@ impl TcpReportingTransport {
 
         // Deserialise
         if let Ok(msg) = bincode::deserialize::<ReportingMessage>(&payload) {
-            let _ = tx.send((peer, msg)).await;
+            let _ = tx.send((peer, peer_node_id, msg)).await;
         }
     }
 
@@ -397,10 +428,27 @@ impl ReportingTransport for TcpReportingTransport {
         Self::send_framed(target, message, self.tls_connector.as_ref()).await
     }
 
-    async fn recv(&self) -> Option<(SocketAddr, ReportingMessage)> {
+    async fn recv(&self) -> Option<InboundReport> {
         let mut rx = self.inbound_rx.lock().await;
         rx.recv().await
     }
+}
+
+/// Extract the peer's node id from its verified TLS client certificate.
+///
+/// The accept path only reaches here after the client verifier accepted the
+/// chain, so the leaf certificate is trusted; we read the node SPIFFE id from
+/// its URI SAN. Returns `None` if the peer presented no certificate or none
+/// carrying a node identity (in which case the aggregator applies no binding).
+fn peer_node_id_from_tls(
+    tls: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Option<NodeId> {
+    let (_, connection) = tls.get_ref();
+    let leaf = connection.peer_certificates()?.first()?;
+    let uris = crate::sesame::cert::subject_uri_sans(leaf.as_ref()).ok()?;
+    uris.iter()
+        .find_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
+        .map(NodeId::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +491,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            TcpReportingTransport::handle_connection(server, addr(1), tx),
+            TcpReportingTransport::handle_connection(server, addr(1), None, tx),
         )
         .await;
         assert!(
@@ -460,7 +508,7 @@ mod tests {
 
         t1.send(addr(2), &sample_msg("w1")).await.unwrap();
 
-        let (from, msg) = t2.recv().await.unwrap();
+        let (from, _, msg) = t2.recv().await.unwrap();
         assert_eq!(from, addr(1));
         match msg {
             ReportingMessage::Report(r) => assert_eq!(r.node_id, NodeId::new("w1")),
@@ -501,7 +549,7 @@ mod tests {
         net.heal().await;
 
         t1.send(addr(2), &sample_msg("w1")).await.unwrap();
-        let (from, _) = t2.recv().await.unwrap();
+        let (from, _, _) = t2.recv().await.unwrap();
         assert_eq!(from, addr(1));
     }
 }

@@ -446,7 +446,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), council_transport.recv()).await;
         assert!(result.is_ok(), "should receive a report");
 
-        let (from, msg) = result.unwrap().unwrap();
+        let (from, _, msg) = result.unwrap().unwrap();
         assert_eq!(from, addr(1));
         match msg {
             ReportingMessage::Report(r) => {
@@ -465,7 +465,7 @@ mod tests {
             _ => panic!("expected Report"),
         }
 
-        let (_, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
+        let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
             .await
             .expect("should receive capability evidence after the state report")
             .unwrap();
@@ -482,7 +482,7 @@ mod tests {
             }]
         );
 
-        let (_, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
+        let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
             .await
             .expect("should receive DNS capability after egress capability")
             .unwrap();
@@ -669,7 +669,7 @@ mod tests {
             "c2 should receive a report after council change"
         );
 
-        let (_, msg) = result.unwrap().unwrap();
+        let (_, _, msg) = result.unwrap().unwrap();
         match msg {
             ReportingMessage::Report(r) => assert_eq!(r.node_id, NodeId::new("w1")),
             _ => panic!("expected Report"),

@@ -219,6 +219,49 @@ pub enum RaftRpc {
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
 }
 
+/// A Raft RPC stamped with the sender's recovery epoch (C5).
+///
+/// Disaster recovery (`relish council recover`) bumps a node's `recovery_epoch`
+/// and wipes the old Raft log, minting a fresh single-voter cluster. The epoch
+/// is a durable property of the recovered state and, because recovery is an
+/// offline operation, is constant for a running process. Stamping it on every
+/// RPC lets the accept side refuse RPCs from a peer at a different epoch, so a
+/// recovered survivor and the nodes of the dead cluster it was partitioned from
+/// can never re-form one Raft — the fence that stops a partitioned recovery
+/// from splitting the brain of a still-live cluster. The operator re-enrols the
+/// old nodes, which resets them onto the new epoch.
+#[derive(Serialize, Deserialize)]
+pub struct RaftRpcEnvelope {
+    /// The sending node's recovery epoch.
+    pub sender_recovery_epoch: u64,
+    pub rpc: RaftRpc,
+}
+
+/// Whether an RPC stamped with `sender_epoch` may be served by a node at
+/// `local_epoch`. Both sides of a partition-then-recover split carry different
+/// epochs, so only equal epochs are compatible.
+pub fn recovery_epochs_compatible(local_epoch: u64, sender_epoch: u64) -> bool {
+    local_epoch == sender_epoch
+}
+
+/// Decode a stamped Raft RPC frame and apply the recovery-epoch fence.
+///
+/// Returns the inner RPC only when it decodes and the sender's epoch matches
+/// `local_epoch`; `None` (drop the connection) otherwise. Kept pure so the
+/// fence is unit-tested without constructing a `Raft` instance.
+fn decode_and_fence(payload: &[u8], local_epoch: u64) -> Option<RaftRpc> {
+    let envelope = serde_json::from_slice::<RaftRpcEnvelope>(payload).ok()?;
+    if !recovery_epochs_compatible(local_epoch, envelope.sender_recovery_epoch) {
+        eprintln!(
+            "raft: dropping RPC from a peer at recovery epoch {} (local {local_epoch}); \
+             a recovered node fences off the dead cluster's peers",
+            envelope.sender_recovery_epoch
+        );
+        return None;
+    }
+    Some(envelope.rpc)
+}
+
 /// Raft RPC response envelope, serialised over TCP.
 #[derive(Serialize, Deserialize)]
 pub enum RaftRpcResponse {
@@ -266,6 +309,7 @@ pub async fn serve_raft_rpc(
     raft: Raft<TypeConfig>,
     shutdown: tokio_util::sync::CancellationToken,
     tls: Option<tokio_rustls::TlsAcceptor>,
+    local_recovery_epoch: u64,
 ) {
     loop {
         tokio::select! {
@@ -285,7 +329,8 @@ pub async fn serve_raft_rpc(
                                     // the task (CP11).
                                     let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
                                         if let Ok(tls_stream) = acceptor.accept(stream).await {
-                                            handle_raft_rpc(tls_stream, raft).await;
+                                            handle_raft_rpc(tls_stream, raft, local_recovery_epoch)
+                                                .await;
                                         }
                                     })
                                     .await;
@@ -295,7 +340,7 @@ pub async fn serve_raft_rpc(
                                 tokio::spawn(async move {
                                     let _ = tokio::time::timeout(
                                         RAFT_ACCEPT_DEADLINE,
-                                        handle_raft_rpc(stream, raft),
+                                        handle_raft_rpc(stream, raft, local_recovery_epoch),
                                     )
                                     .await;
                                 });
@@ -310,7 +355,11 @@ pub async fn serve_raft_rpc(
 }
 
 /// Handle a single Raft RPC connection over any byte stream.
-async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, raft: Raft<TypeConfig>) {
+async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    raft: Raft<TypeConfig>,
+    local_recovery_epoch: u64,
+) {
     let Some(payload) = read_frame(&mut stream).await else {
         return;
     };
@@ -319,7 +368,10 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, raft:
     // durable_log). bincode is not self-describing and corrupts them,
     // so a replicated AppSpec entry would never deserialise on the
     // follower and the write would hang forever.
-    let Ok(rpc) = serde_json::from_slice::<RaftRpc>(&payload) else {
+    //
+    // The frame is a `RaftRpcEnvelope`; the recovery-epoch fence (C5) drops
+    // any RPC whose sender is at a different epoch before it touches Raft.
+    let Some(rpc) = decode_and_fence(&payload, local_recovery_epoch) else {
         return;
     };
 
@@ -391,6 +443,8 @@ pub struct TcpRaftNetworkFactory {
     /// When set, each peer connection is dialled over a node-id-bound
     /// connector built from this material (PKI3). Takes precedence over `tls`.
     tls_material: Option<RaftTlsMaterial>,
+    /// This node's recovery epoch, stamped on every outgoing RPC (C5).
+    recovery_epoch: u64,
 }
 
 impl fmt::Debug for TcpRaftNetworkFactory {
@@ -403,7 +457,9 @@ impl fmt::Debug for TcpRaftNetworkFactory {
 }
 
 impl TcpRaftNetworkFactory {
-    /// Create a new plaintext factory for a specific source node.
+    /// Create a new plaintext factory for a specific source node. The recovery
+    /// epoch defaults to 0; use [`with_recovery_epoch`](Self::with_recovery_epoch)
+    /// to stamp a recovered node's epoch onto its RPCs.
     pub fn new(source_id: u64) -> Self {
         Self {
             source_id,
@@ -412,6 +468,7 @@ impl TcpRaftNetworkFactory {
             )),
             tls: None,
             tls_material: None,
+            recovery_epoch: 0,
         }
     }
 
@@ -425,6 +482,7 @@ impl TcpRaftNetworkFactory {
             )),
             tls: Some(connector),
             tls_material: None,
+            recovery_epoch: 0,
         }
     }
 
@@ -438,7 +496,15 @@ impl TcpRaftNetworkFactory {
             )),
             tls: None,
             tls_material: Some(material),
+            recovery_epoch: 0,
         }
+    }
+
+    /// Stamp this node's recovery epoch (C5) onto every RPC the factory's
+    /// clients send, so peers at a different epoch fence it off.
+    pub fn with_recovery_epoch(mut self, recovery_epoch: u64) -> Self {
+        self.recovery_epoch = recovery_epoch;
+        self
     }
 
     /// Get a handle to the blocklist for chaos injection.
@@ -463,6 +529,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
             target_addr: node.addr,
             blocklist: std::sync::Arc::clone(&self.blocklist),
             tls,
+            recovery_epoch: self.recovery_epoch,
         }
     }
 }
@@ -472,6 +539,8 @@ pub struct TcpRaftNetwork {
     target_addr: SocketAddr,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
     tls: Option<tokio_rustls::TlsConnector>,
+    /// This node's recovery epoch, stamped on each outgoing RPC (C5).
+    recovery_epoch: u64,
 }
 
 impl fmt::Debug for TcpRaftNetwork {
@@ -503,8 +572,14 @@ impl TcpRaftNetwork {
 
     /// Inner RPC implementation (called within a timeout).
     async fn rpc_inner(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
-        // JSON to match handle_raft_rpc (self-describing; see there).
-        let payload = serde_json::to_vec(&rpc)
+        // JSON to match handle_raft_rpc (self-describing; see there). The RPC is
+        // wrapped in a `RaftRpcEnvelope` stamped with this node's recovery epoch
+        // (C5) so the accept side can fence off a different-epoch peer.
+        let envelope = RaftRpcEnvelope {
+            sender_recovery_epoch: self.recovery_epoch,
+            rpc,
+        };
+        let payload = serde_json::to_vec(&envelope)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
 
         let tcp = tokio::net::TcpStream::connect(self.target_addr)
@@ -661,5 +736,45 @@ mod tests {
             result.is_err(),
             "a stalled half-frame read must be cut off by the deadline, not return"
         );
+    }
+
+    // -- recovery-epoch fence (C5) -------------------------------------------
+
+    #[test]
+    fn recovery_epochs_are_compatible_only_when_equal() {
+        assert!(recovery_epochs_compatible(0, 0));
+        assert!(recovery_epochs_compatible(3, 3));
+        // A recovered survivor (epoch 1) and a dead-cluster peer (epoch 0)
+        // must not be able to form one Raft — in either direction.
+        assert!(!recovery_epochs_compatible(1, 0));
+        assert!(!recovery_epochs_compatible(0, 1));
+    }
+
+    #[test]
+    fn decode_and_fence_drops_a_different_epoch_rpc() {
+        let envelope = RaftRpcEnvelope {
+            sender_recovery_epoch: 0,
+            rpc: RaftRpc::Vote(VoteRequest::new(
+                openraft::Vote::new(1, 7),
+                Some(openraft::LogId::new(
+                    openraft::CommittedLeaderId::new(1, 7),
+                    0,
+                )),
+            )),
+        };
+        let payload = serde_json::to_vec(&envelope).unwrap();
+
+        // A node that has recovered (local epoch 1) refuses the epoch-0 RPC.
+        assert!(decode_and_fence(&payload, 1).is_none());
+        // A node still at epoch 0 accepts it and yields the inner RPC.
+        assert!(matches!(
+            decode_and_fence(&payload, 0),
+            Some(RaftRpc::Vote(_))
+        ));
+    }
+
+    #[test]
+    fn decode_and_fence_rejects_a_malformed_frame() {
+        assert!(decode_and_fence(b"not json", 0).is_none());
     }
 }

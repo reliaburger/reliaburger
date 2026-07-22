@@ -136,33 +136,48 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                 _ = self.shutdown.cancelled() => break,
                 msg = self.transport.recv() => {
                     match msg {
-                        Some((_, ReportingMessage::Report(report))) => {
-                            self.store_report(report);
-                            self.publish();
+                        Some((_, peer, ReportingMessage::Report(report))) => {
+                            // C6: a self-report may only claim the node id the
+                            // peer's cert authenticates. Under mTLS a worker
+                            // that sends Report{node_id: victim} is dropped, so
+                            // it can't overwrite another node's entry. When mTLS
+                            // is off (`peer` is None) no binding is applied.
+                            if Self::report_identity_ok(&peer, &report.node_id) {
+                                self.store_report(report);
+                                self.publish();
+                            }
                         }
-                        Some((_, ReportingMessage::AggregatedReport { reports })) => {
-                            // Merge reports from another council member
-                            // (used for leader aggregation).
+                        Some((_, _peer, ReportingMessage::AggregatedReport { reports })) => {
+                            // Merge reports from another council member (leader
+                            // aggregation). This bundles many nodes' reports, so
+                            // it isn't bound to a single node id. Under mTLS the
+                            // reporting acceptor requires a client cert, so an
+                            // unauthenticated peer never reaches here; a
+                            // legitimate council member is trusted to forward.
                             for (_, report) in reports {
                                 self.store_report(report);
                             }
                             self.publish();
                         }
-                        Some((_, ReportingMessage::Ack { .. })) => {
+                        Some((_, _, ReportingMessage::Ack { .. })) => {
                             // Workers don't send Acks to the aggregator
                         }
-                        Some((_, ReportingMessage::MetricsRollup(rollup))) => {
+                        Some((_, _, ReportingMessage::MetricsRollup(rollup))) => {
                             if let Some(ref store) = self.rollup_store {
                                 store.write().await.ingest(&rollup);
                             }
                         }
-                        Some((_, ReportingMessage::CapabilityReport(report))) => {
-                            self.store_capability(report);
-                            self.publish();
+                        Some((_, peer, ReportingMessage::CapabilityReport(report))) => {
+                            if Self::report_identity_ok(&peer, &report.node_id) {
+                                self.store_capability(report);
+                                self.publish();
+                            }
                         }
-                        Some((_, ReportingMessage::DnsCapabilityReport(report))) => {
-                            self.store_dns_capability(report);
-                            self.publish();
+                        Some((_, peer, ReportingMessage::DnsCapabilityReport(report))) => {
+                            if Self::report_identity_ok(&peer, &report.node_id) {
+                                self.store_dns_capability(report);
+                                self.publish();
+                            }
                         }
                         None => {
                             // The transport only closes at shutdown; anything
@@ -216,6 +231,30 @@ impl<T: ReportingTransport> ReportAggregator<T> {
     /// The leadership epoch entries are currently tagged with.
     fn current_epoch(&self) -> u64 {
         self.epoch_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0)
+    }
+
+    /// Whether a self-report claiming `claimed` node id is admissible given
+    /// the sender's authenticated identity `peer` (C6).
+    ///
+    /// Under mTLS the reporting acceptor requires a client cert, so `peer` is
+    /// always `Some` for a real connection; a report may then only claim the
+    /// id the cert authenticates. On a plaintext cluster `peer` is `None` and
+    /// no binding is applied (behaviour unchanged).
+    fn report_identity_ok(peer: &Option<NodeId>, claimed: &NodeId) -> bool {
+        match peer {
+            Some(authenticated) => {
+                if authenticated == claimed {
+                    true
+                } else {
+                    eprintln!(
+                        "report aggregator: dropping report for {claimed:?} from a peer \
+                         authenticated as {authenticated:?} (identity mismatch)"
+                    );
+                    false
+                }
+            }
+            None => true,
+        }
     }
 
     fn store_report(&mut self, report: StateReport) {
@@ -423,6 +462,105 @@ mod tests {
             first_seen: std::time::Instant::now(),
             resources: None,
         }
+    }
+
+    #[tokio::test]
+    async fn under_mtls_a_peer_cannot_report_as_another_node() {
+        // C6: an authenticated peer may only claim its own cert identity.
+        let net = InMemoryReportingNetwork::new();
+        // The attacker's connection authenticates as "attacker".
+        let attacker = net
+            .register_as(addr(1), Some(NodeId::new("attacker")))
+            .await;
+        // An honest node authenticates as itself.
+        let honest = net.register_as(addr(3), Some(NodeId::new("honest"))).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            None,
+            None,
+            None,
+        );
+
+        // The attacker tries to overwrite "victim"'s entry, and to report as
+        // itself; the honest node reports as itself.
+        attacker
+            .send(addr(2), &ReportingMessage::Report(report("victim")))
+            .await
+            .unwrap();
+        attacker
+            .send(addr(2), &ReportingMessage::Report(report("attacker")))
+            .await
+            .unwrap();
+        honest
+            .send(addr(2), &ReportingMessage::Report(report("honest")))
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(async move { aggregator.run().await });
+
+        // Wait until both legitimate reports are visible.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let _ = tokio::time::timeout(Duration::from_millis(50), watch_rx.changed()).await;
+            let n = watch_rx.borrow().reports.len();
+            if n >= 2 || std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+
+        let state = watch_rx.borrow();
+        assert!(
+            state.reports.contains_key(&NodeId::new("attacker")),
+            "the attacker's own self-report is accepted"
+        );
+        assert!(
+            state.reports.contains_key(&NodeId::new("honest")),
+            "the honest node's report is accepted"
+        );
+        assert!(
+            !state.reports.contains_key(&NodeId::new("victim")),
+            "a report spoofing another node's id must be dropped, not stored"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn without_mtls_reports_are_stored_unchanged() {
+        // Plaintext cluster: no authenticated identity, so no binding applies
+        // and behaviour is unchanged.
+        let net = InMemoryReportingNetwork::new();
+        let worker = net.register(addr(1)).await; // authenticated_as: None
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            None,
+            None,
+            None,
+        );
+
+        worker
+            .send(addr(2), &ReportingMessage::Report(report("w1")))
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async move { aggregator.run().await });
+        tokio::time::timeout(Duration::from_millis(200), watch_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(watch_rx.borrow().reports.contains_key(&NodeId::new("w1")));
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 
     #[tokio::test]

@@ -630,8 +630,8 @@ security/data-loss; do it before anything else.
 **Phase C — authenticate the cluster plane (the systemic theme)**
 11. C7 — refuse to bind Raft/reporting/gossip unauthenticated in `--cluster` mode. ✅ (PR: Phase C, part 1)
 14. C8 — bound gossip leader-hint terms against the local Raft term window. ✅ (PR: Phase C, part 1)
-12. C6 — bind report identity to the authenticated TLS client cert. ⏳ deferred to Phase C part 2 (cross-cutting reporting-transport identity plumbing; only effective under mTLS).
-13. C5 — carry the recovery epoch inside Raft Vote/RPCs as a real fence. ⏳ deferred to Phase C part 2 (deep openraft Vote-layer work; split-brain risk if rushed).
+12. C6 — bind report identity to the authenticated TLS client cert. ✅ (Phase C part 2)
+13. C5 — carry the recovery epoch inside Raft RPCs as a real fence. ✅ (Phase C part 2) — implemented as a transport-layer envelope fence (RaftRpcEnvelope stamped with the sender's recovery epoch; the accept side drops different-epoch RPCs). This fences the two epochs apart at the RPC boundary — the split-brain vector — rather than embedding the epoch in the openraft Vote type itself.
 
 **Phase D — deploy/runtime correctness**
 15. M14 — timeout the reconciler's terminal-event wait.
