@@ -18,6 +18,21 @@ use datafusion::prelude::*;
 use super::log_store::log_schema;
 use super::types::{KetchupError, LogEntry, LogStream};
 
+/// Working-memory ceiling for an operator log-search query (O13). `relish
+/// logs-search` runs arbitrary SQL against a Parquet archive on the operator's
+/// own host; an unbounded aggregation or sort would OOM it. This makes such a
+/// query *error* instead. Generous (512 MiB) since it's local and interactive.
+const QUERY_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
+
+/// A DataFusion session with the working-memory limit applied (O13).
+fn bounded_session(config: SessionConfig) -> Result<SessionContext, KetchupError> {
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_memory_limit(QUERY_MEMORY_LIMIT_BYTES, 1.0)
+        .build_arc()
+        .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(SessionContext::new_with_config_rt(config, runtime))
+}
+
 /// Query exported Parquet log files using SQL.
 ///
 /// `source_path` is a directory containing `.parquet` files (e.g.,
@@ -34,7 +49,7 @@ pub async fn query_remote(source_path: &str, sql: &str) -> Result<Vec<LogEntry>,
     // set it explicitly so the behaviour can't silently regress.)
     let mut config = SessionConfig::new();
     config.options_mut().execution.parquet.bloom_filter_on_read = true;
-    let ctx = SessionContext::new_with_config(config);
+    let ctx = bounded_session(config)?;
 
     // Parse the source path as a ListingTableUrl
     let table_url = ListingTableUrl::parse(source_path).map_err(|e| {
@@ -136,7 +151,7 @@ pub async fn query_remote_json(
     source_path: &str,
     sql: &str,
 ) -> Result<Vec<serde_json::Value>, KetchupError> {
-    let ctx = SessionContext::new();
+    let ctx = bounded_session(SessionConfig::new())?;
 
     let table_url = ListingTableUrl::parse(source_path).map_err(|e| {
         KetchupError::Io(std::io::Error::other(format!("invalid source path: {e}")))
