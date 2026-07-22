@@ -39,6 +39,15 @@ pub enum BootstrapError {
 
     #[error("{path:?} is readable by group or other (mode {mode:#o}); expected 0600")]
     PermissionsTooOpen { path: PathBuf, mode: u32 },
+
+    #[error(
+        "{path:?} is owned by uid {owner}, not this process (uid {expected}); refusing to load"
+    )]
+    WrongOwner {
+        path: PathBuf,
+        owner: u32,
+        expected: u32,
+    },
 }
 
 /// Reject secret files that are readable beyond their owner.
@@ -58,6 +67,20 @@ fn check_permissions(path: &Path) -> Result<(), BootstrapError> {
         return Err(BootstrapError::PermissionsTooOpen {
             path: path.to_path_buf(),
             mode: mode & 0o777,
+        });
+    }
+    // Ownership matters as much as mode (O15): a `0600` file owned by another
+    // uid is that user's secret, not ours — mode `0600` on a file we don't own
+    // means *they* can read it, and loading it as our master key trusts a file
+    // an attacker placed. `root` (euid 0) may load any file it can already read.
+    use std::os::unix::fs::MetadataExt;
+    let owner = meta.uid();
+    let euid = nix::unistd::geteuid().as_raw();
+    if euid != 0 && owner != euid {
+        return Err(BootstrapError::WrongOwner {
+            path: path.to_path_buf(),
+            owner,
+            expected: euid,
         });
     }
     Ok(())
