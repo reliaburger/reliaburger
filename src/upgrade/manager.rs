@@ -360,6 +360,27 @@ impl UpgradeManager {
             return Err(UpgradeError::UnknownVersion { version: target });
         }
 
+        // Re-verify the stored binary against its signature envelope before
+        // staging it for exec (O4). Staging a binary already implied code-exec
+        // trust, but re-checking catches on-disk tampering or bit-rot between
+        // the original stage and the rollback, for the cost of a hash and a
+        // couple of signature verifications. A binary adopted from the running
+        // process carries a stub envelope with an empty embedded signature — it
+        // is trusted because it is already executing, so nothing to re-verify.
+        // An envelope carrying an external signature is verified as a network
+        // artefact (both signatures required); otherwise just the embedded one.
+        let envelope = SignatureEnvelope::load(&self.store.envelope_path(&target))?;
+        if !envelope.embedded.is_empty() {
+            let bytes = std::fs::read(self.store.binary_path(&target))?;
+            signing::verify_binary(
+                &bytes,
+                &envelope,
+                &self.release_keys,
+                self.external_key.as_ref(),
+                envelope.external.is_some(),
+            )?;
+        }
+
         let stem = self
             .store
             .symlink_path()
@@ -931,6 +952,71 @@ mod tests {
 
         let prepared = manager.prepare_rollback(None, vec![]).unwrap();
         assert_eq!(prepared.target_version(), &v("0.2.0"));
+    }
+
+    /// O4: a rollback target whose stored bytes no longer match its signature
+    /// envelope (on-disk tampering or rot) is refused before it's staged for
+    /// exec. A stub-envelope (adopted) binary is exempt — it carries no
+    /// signature and is trusted by virtue of having been the running process.
+    #[tokio::test]
+    async fn rollback_rejects_a_tampered_signed_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&binary_dir).unwrap();
+        let (release_pkcs8, release_public) = generate_keypair().unwrap();
+        let store = BinaryStore::new(binary_dir.clone(), "bun".to_string());
+
+        // A properly-signed older version, and a running version (adopted stub).
+        let old = b"old signed binary";
+        store
+            .stage(
+                &v("0.1.0"),
+                old,
+                &SignatureEnvelope {
+                    schema: 1,
+                    sha256: sha256_hex(old),
+                    embedded: sign(&release_pkcs8, old).unwrap(),
+                    external: None,
+                },
+            )
+            .unwrap();
+        let running = b"running binary";
+        store
+            .stage(
+                &v("0.2.0"),
+                running,
+                &SignatureEnvelope {
+                    schema: 1,
+                    sha256: sha256_hex(running),
+                    embedded: String::new(),
+                    external: None,
+                },
+            )
+            .unwrap();
+        store.activate(&v("0.2.0")).unwrap();
+
+        // Corrupt the signed 0.1.0 bytes on disk after staging.
+        std::fs::write(store.binary_path(&v("0.1.0")), b"TAMPERED").unwrap();
+
+        let config = UpgradeSection {
+            binary_dir: Some(binary_dir.clone()),
+            release_keys_override: Some(vec![encode_public_key(&release_public)]),
+            ..UpgradeSection::default()
+        };
+        let manager = UpgradeManager::new(
+            &config,
+            &dir.path().join("data"),
+            &binary_dir.join("bun"),
+            v("0.2.0"),
+            vec!["bun".to_string()],
+        )
+        .unwrap();
+
+        let err = manager.prepare_rollback(None, vec![]).unwrap_err();
+        assert!(
+            matches!(err, UpgradeError::HashMismatch { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
