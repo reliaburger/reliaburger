@@ -146,7 +146,10 @@ impl WebhookDispatcher {
             let body = match self.body_for(dest, transition) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("mayo: failed to serialise payload for {}: {e}", dest.url);
+                    eprintln!(
+                        "mayo: failed to serialise payload for {}: {e}",
+                        redact_url(&dest.url)
+                    );
                     continue;
                 }
             };
@@ -266,7 +269,7 @@ impl WebhookDispatcher {
                     eprintln!(
                         "mayo: webhook attempt {} to {} failed: {}",
                         attempt + 1,
-                        dest.url,
+                        redact_url(&dest.url),
                         e
                     );
                     if attempt < delays.len() - 1 {
@@ -277,7 +280,7 @@ impl WebhookDispatcher {
         }
         eprintln!(
             "mayo: webhook delivery to {} failed after 3 attempts",
-            dest.url
+            redact_url(&dest.url)
         );
     }
 
@@ -300,6 +303,23 @@ impl WebhookDispatcher {
         } else {
             Err(format!("HTTP {}", resp.status()))
         }
+    }
+}
+
+/// Redact a webhook URL for logging: keep only `scheme://host[:port]` and drop
+/// the path/query (M18). Slack incoming-webhook URLs carry the secret in the
+/// path, so logging the full URL on a delivery failure writes the credential to
+/// the node's stderr/journal (and possibly the collected logs). PagerDuty and
+/// generic secrets live in `dest.secret`, which is never logged.
+fn redact_url(url: &str) -> String {
+    // Split off the scheme, then trim the authority at the first `/`, `?`, `#`.
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            format!("{scheme}://{}/…", &rest[..authority_end])
+        }
+        // No scheme — don't risk echoing an opaque secret-bearing string.
+        None => "<redacted>".to_string(),
     }
 }
 
@@ -863,5 +883,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(*received.lock().await, 0);
+    }
+
+    /// M18: a Slack webhook URL carries its secret in the path, so failure logs
+    /// must keep only the scheme+host and drop the path.
+    #[test]
+    fn redact_url_drops_the_secret_bearing_path() {
+        let redacted = redact_url("https://hooks.slack.com/services/T00/B00/XXXXsecretXXXX");
+        assert_eq!(redacted, "https://hooks.slack.com/…");
+        assert!(!redacted.contains("secret"));
+        // Port is preserved (part of the authority), path is not.
+        assert_eq!(
+            redact_url("http://example.com:8080/a/b?token=abc"),
+            "http://example.com:8080/…"
+        );
+        // A schemeless / opaque string is fully redacted.
+        assert_eq!(redact_url("weird-opaque-token"), "<redacted>");
     }
 }
