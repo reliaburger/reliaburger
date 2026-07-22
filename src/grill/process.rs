@@ -33,6 +33,8 @@ struct ProcessEntry {
     /// Pid of an adopted process (started by a previous bun). Mutually
     /// exclusive with `child`: adopted processes have no handle, only a pid.
     adopted_pid: Option<u32>,
+    /// Start time of the adopted pid, to detect pid reuse (M23).
+    adopted_pid_started_at: Option<u64>,
     state: ContainerState,
     stdout_buf: Arc<Mutex<Vec<u8>>>,
     stderr_buf: Arc<Mutex<Vec<u8>>>,
@@ -165,6 +167,7 @@ impl super::Grill for ProcessGrill {
                 spec: spec.clone(),
                 child: None,
                 adopted_pid: None,
+                adopted_pid_started_at: None,
                 state: ContainerState::Pending,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),
@@ -383,7 +386,7 @@ impl super::Grill for ProcessGrill {
             // doubles as the zombie reaper — the supervisor polls state
             // regularly, so exited adoptees get waitpid'd here.
             if entry.state != ContainerState::Stopped {
-                let (running, exit_code) = poll_adopted_process(pid);
+                let (running, exit_code) = poll_adopted_process(pid, entry.adopted_pid_started_at);
                 if !running {
                     entry.state = ContainerState::Stopped;
                     entry.exit_code = exit_code;
@@ -409,6 +412,7 @@ impl super::Grill for ProcessGrill {
                 spec: record.oci_spec.clone(),
                 child: None,
                 adopted_pid: Some(record.pid),
+                adopted_pid_started_at: Some(record.pid_started_at),
                 state: ContainerState::Running,
                 stdout_buf: Arc::new(Mutex::new(Vec::new())),
                 stderr_buf: Arc::new(Mutex::new(Vec::new())),

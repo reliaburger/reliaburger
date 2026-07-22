@@ -219,7 +219,7 @@ impl Scheduler {
 }
 
 /// Parse a list of "key=value" strings into a BTreeMap.
-fn parse_label_list(labels: &[String]) -> BTreeMap<String, String> {
+pub(crate) fn parse_label_list(labels: &[String]) -> BTreeMap<String, String> {
     labels
         .iter()
         .filter_map(|s| {

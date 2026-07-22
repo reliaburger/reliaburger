@@ -273,7 +273,6 @@ fn daemonset_spec(command_seconds: u32) -> reliaburger::config::app::AppSpec {
         image = "proc-grill:image-ignored"
         command = ["sleep", "{command_seconds}"]
         replicas = "*"
-        cpu = "100m-200m"
         "#
     ))
     .unwrap()
@@ -288,7 +287,6 @@ fn ported_service_spec(name_port: u16) -> reliaburger::config::app::AppSpec {
         command = ["sleep", "600"]
         replicas = 1
         port = {name_port}
-        cpu = "100m-200m"
         "#
     ))
     .unwrap()

@@ -287,7 +287,13 @@ fn plan_scheduling_pass_with_dns(
             .iter()
             .find(|(k, _)| k == &app_id.to_string())
             .map(|(_, n)| *n);
-        let want = effective_replicas(spec, override_replicas, alive.len());
+        // A daemon set targets every *eligible* node, so its convergence count
+        // is the eligible-node count, not every alive node (M25).
+        let want = if override_replicas.is_none() && matches!(spec.replicas, Replicas::DaemonSet) {
+            daemon_eligible_count(cache, spec, dns_required)
+        } else {
+            effective_replicas(spec, override_replicas, alive.len())
+        };
         let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
         let converged = desired
             .scheduling
@@ -354,15 +360,45 @@ fn plan_scheduling_pass_with_dns(
         }
         // The scheduler owns its cache, so hand it the shared one and take
         // it back afterwards (Rust move semantics — no shared &mut alias).
+        // Snapshot first: a partially-placed fixed-replica app reserves some
+        // nodes and then errors (M25), and writing the scheduler's mutated
+        // cache back unconditionally would leak those phantom reservations
+        // into the shared pass, wrongly starving later apps. On error we
+        // restore the pre-call cache; only a successful placement's
+        // reservations are kept.
+        let snapshot = (*cache).clone();
         let mut scheduler = Scheduler::new(std::mem::take(cache)).with_dns_required(dns_required);
         let result = scheduler.schedule_app(app_id, &effective_spec);
-        *cache = scheduler.cluster;
         match result {
-            Ok(decision) => decisions.push(decision),
-            Err(e) => eprintln!("scheduler: cannot place {app_id}: {e}"),
+            Ok(decision) => {
+                *cache = scheduler.cluster;
+                decisions.push(decision);
+            }
+            Err(e) => {
+                *cache = snapshot;
+                eprintln!("scheduler: cannot place {app_id}: {e}");
+            }
         }
     }
     decisions
+}
+
+/// The number of nodes a daemon set of `spec` can currently be placed on
+/// (M25). A daemon set targets every *eligible* node, not every alive node, so
+/// its convergence must be judged against this — otherwise, whenever any alive
+/// node is ineligible (not ready, lacks a required capability, doesn't fit),
+/// `placements.len()` never equals `alive.len()` and the leader re-commits an
+/// identical `SchedulingDecision` to Raft every tick.
+fn daemon_eligible_count(cache: &ClusterStateCache, spec: &AppSpec, dns_required: bool) -> usize {
+    let resources = scheduler_resources(spec);
+    let required = spec
+        .placement
+        .as_ref()
+        .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
+        .unwrap_or_default();
+    let requires_egress = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+    crate::meat::filter::filter_nodes(&resources, &required, requires_egress, dns_required, cache)
+        .len()
 }
 
 /// The per-replica resources an app requests, for quota accounting. Mirrors
@@ -451,7 +487,7 @@ pub fn spawn_autoscaler(
                 let Some(metric) = app_metric_utilisation(
                     &rollup_store,
                     &config.metric,
-                    &app_id.name,
+                    app_id,
                     config.evaluation_window,
                 )
                 .await
@@ -499,7 +535,7 @@ pub fn spawn_autoscaler(
 async fn app_metric_utilisation(
     rollup_store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
     metric: &str,
-    app: &str,
+    app_id: &crate::meat::types::AppId,
     window: Duration,
 ) -> Option<f64> {
     let now = std::time::SystemTime::now()
@@ -513,17 +549,30 @@ async fn app_metric_utilisation(
         .query_cluster_aggregates(metric, window_start, now)
         .await
         .ok()?;
-    // Filter to rows whose labels mention this app, and average the
-    // per-timestamp means (sum/count).
     let mut total = 0.0;
     let mut n = 0u64;
     for agg in &aggregates {
-        if agg.labels.contains(app) && agg.count > 0 {
+        if agg.count > 0 && aggregate_is_for_app(&agg.labels, app_id) {
             total += agg.sum / f64::from(agg.count);
             n += 1;
         }
     }
     if n == 0 { None } else { Some(total / n as f64) }
+}
+
+/// Whether a rollup aggregate's labels belong to exactly `app_id` (M26).
+///
+/// The collector labels per-app metrics with `app = "<namespace>/<app>"`
+/// (`mayo::collector`). The old autoscaler used `labels.contains(bare_name)`,
+/// a substring match that pooled `web` with `webhook`/`web-api` and merged the
+/// same app name across namespaces. Parse the labels JSON and compare the
+/// `app` field to the namespace-qualified id exactly.
+fn aggregate_is_for_app(labels_json: &str, app_id: &crate::meat::types::AppId) -> bool {
+    let qualified = format!("{}/{}", app_id.namespace, app_id.name);
+    serde_json::from_str::<serde_json::Value>(labels_json)
+        .ok()
+        .and_then(|v| v.get("app").and_then(|a| a.as_str()).map(String::from))
+        .is_some_and(|app_label| app_label == qualified)
 }
 
 /// Build the cluster-wide service endpoint catalogue from node reports.
@@ -772,7 +821,7 @@ pub fn spawn_placement_reconciler(
                 {
                     continue; // agent gone; retry next tick
                 }
-                if deploy_succeeded(event_rx).await {
+                if deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT).await {
                     applied.insert(key, fingerprint);
                     changed = true;
                 }
@@ -807,19 +856,42 @@ pub fn spawn_placement_reconciler(
     });
 }
 
-/// Drain a deploy's event stream and report whether it reached `Complete`.
+/// How long the reconciler waits for a deploy's terminal event before giving
+/// up on this tick (M14). Without a bound, a deploy that stalls (a stuck image
+/// pull, a hung runtime holding the event sender) would block the reconcile
+/// tick forever: the node would stop polling the leader, never converge other
+/// apps, and silently drop out of reconciliation while still alive. On timeout
+/// the placement is treated as not-yet-applied and retried next tick.
+const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Drain a deploy's event stream and report whether it reached `Complete`
+/// within `timeout`.
 ///
-/// Returns `false` if the deploy emitted `Error` or the channel closed
-/// without a terminal event (the agent dropped it), so the caller retries.
-async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>) -> bool {
-    while let Some(event) = events.recv().await {
-        match event {
-            ApplyEvent::Complete { .. } => return true,
-            ApplyEvent::Error { .. } => return false,
-            _ => {}
+/// Returns `false` if the deploy emitted `Error`, the channel closed without a
+/// terminal event (the agent dropped it), or `timeout` elapsed first — in every
+/// case the caller leaves the placement unapplied and retries next tick.
+async fn deploy_succeeded(mut events: mpsc::Receiver<ApplyEvent>, timeout: Duration) -> bool {
+    let drain = async {
+        while let Some(event) = events.recv().await {
+            match event {
+                ApplyEvent::Complete { .. } => return true,
+                ApplyEvent::Error { .. } => return false,
+                _ => {}
+            }
+        }
+        false
+    };
+    match tokio::time::timeout(timeout, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!(
+                "reconciler: deploy did not reach a terminal event within {}s; \
+                 leaving it unapplied and retrying next tick",
+                timeout.as_secs()
+            );
+            false
         }
     }
-    false
 }
 
 #[cfg(test)]
@@ -828,6 +900,48 @@ mod tests {
     use crate::reporting::types::{ResourceUsage, StateReport};
     use std::collections::HashMap;
     use std::time::{Instant, SystemTime};
+
+    // -- M14: reconciler deploy-wait timeout ---------------------------------
+
+    #[tokio::test]
+    async fn deploy_succeeded_returns_true_on_complete() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::Complete {
+            created: 1,
+            instances: vec!["web-0".to_string()],
+        })
+        .await
+        .unwrap();
+        assert!(deploy_succeeded(rx, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn deploy_succeeded_returns_false_on_error() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::Error {
+            message: "boom".to_string(),
+        })
+        .await
+        .unwrap();
+        assert!(!deploy_succeeded(rx, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn deploy_succeeded_times_out_on_a_hung_deploy() {
+        // The sender is held open and never emits a terminal event — modelling
+        // a stuck image pull / hung runtime. Without the timeout this would
+        // wedge the reconcile tick forever; with it, the deploy is treated as
+        // not-applied so the tick returns and retries.
+        let (tx, rx) = mpsc::channel::<ApplyEvent>(4);
+        let started = Instant::now();
+        let result = deploy_succeeded(rx, Duration::from_millis(100)).await;
+        assert!(!result, "a hung deploy must time out to `false`, not block");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it must not block"
+        );
+        drop(tx);
+    }
 
     fn member(name: &str, port: u16) -> MembershipSnapshot {
         MembershipSnapshot {
@@ -1098,7 +1212,7 @@ mod tests {
                 .unwrap()
                 .as_secs();
             let mut labels = Map::new();
-            labels.insert("app".to_string(), "web".to_string());
+            labels.insert("app".to_string(), "prod/web".to_string());
             let rollup = NodeRollup {
                 node_id: NodeId::new("n1"),
                 timestamp: now.saturating_sub(60),
@@ -1120,15 +1234,21 @@ mod tests {
         }
 
         let window = Duration::from_secs(300);
-        let value = app_metric_utilisation(&store, "cpu", "web", window).await;
+        let value = app_metric_utilisation(&store, "cpu", &AppId::new("web", "prod"), window).await;
         assert!(
             value.is_some_and(|v| (v - 0.8).abs() < 1e-9),
             "expected mean utilisation 0.8, got {value:?}"
         );
 
+        // Same app name, different namespace → no data (M26).
+        assert!(
+            app_metric_utilisation(&store, "cpu", &AppId::new("web", "staging"), window)
+                .await
+                .is_none()
+        );
         // Unknown app → no data.
         assert!(
-            app_metric_utilisation(&store, "cpu", "other", window)
+            app_metric_utilisation(&store, "cpu", &AppId::new("other", "prod"), window)
                 .await
                 .is_none()
         );
@@ -1249,6 +1369,106 @@ mod tests {
             decisions[0].placements.len(),
             3,
             "daemon should gain a placement on the new node"
+        );
+    }
+
+    /// M25b: a daemon set with an ineligible (not-ready) alive node converges
+    /// once it's placed on every *eligible* node — it must not re-commit an
+    /// identical decision every tick.
+    #[test]
+    fn daemon_converges_against_the_eligible_node_set_not_all_alive() {
+        let mut desired = DesiredState::default();
+        let a = AppId::new("mon", "system");
+        let mut spec = app_spec(100, 1);
+        spec.replicas = Replicas::DaemonSet;
+        desired.apps.insert(a.clone(), spec);
+
+        // Two nodes ready, one alive-but-not-ready (ineligible).
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        let mut not_ready = sched_node("n3", 4000, BTreeMap::new());
+        not_ready.ready = false;
+        cache.set_node(not_ready);
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n2"), NodeId::new("n3")]);
+
+        // First pass places on the two eligible nodes.
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(
+            decisions[0].placements.len(),
+            2,
+            "placed on the eligible nodes"
+        );
+        desired
+            .scheduling
+            .insert(a.clone(), decisions[0].placements.clone());
+
+        // Second pass: the committed placements already cover every eligible
+        // node, so the daemon is converged and produces NO new decision — no
+        // per-tick Raft churn.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n2", 4000, BTreeMap::new()));
+        let mut not_ready = sched_node("n3", 4000, BTreeMap::new());
+        not_ready.ready = false;
+        cache.set_node(not_ready);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(
+            decisions.is_empty(),
+            "a daemon covering every eligible node must not re-plan: {decisions:?}"
+        );
+    }
+
+    /// M26: the autoscaler metric match is namespace-qualified and exact — it
+    /// no longer pools distinct apps by a bare-name substring.
+    #[test]
+    fn autoscale_metric_match_is_namespace_qualified_and_exact() {
+        let web_prod = AppId::new("web", "prod");
+        // Exact qualified match.
+        assert!(aggregate_is_for_app(
+            r#"{"app":"prod/web","pid":"12"}"#,
+            &web_prod
+        ));
+        // A different namespace's same-named app must NOT match.
+        assert!(!aggregate_is_for_app(r#"{"app":"staging/web"}"#, &web_prod));
+        // A substring collision (webhook) must NOT match.
+        assert!(!aggregate_is_for_app(
+            r#"{"app":"prod/webhook"}"#,
+            &web_prod
+        ));
+        // Missing/omitted app label, and non-JSON, don't match.
+        assert!(!aggregate_is_for_app(r#"{"pid":"12"}"#, &web_prod));
+        assert!(!aggregate_is_for_app("not json", &web_prod));
+    }
+
+    /// M25a: a partially-placed fixed-replica app that then fails must not leak
+    /// its phantom reservations into the shared pass cache and starve a later
+    /// app that would otherwise fit.
+    #[test]
+    fn failed_placement_does_not_leak_reservations_to_later_apps() {
+        // One node with room for exactly one 600m replica.
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("solo", 1000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("solo")]);
+
+        let mut desired = DesiredState::default();
+        // App "a" wants 2 replicas of 600m — only one fits, so it fails after
+        // reserving one node. It sorts before "b".
+        let a = AppId::new("a", "prod");
+        let b = AppId::new("b", "prod");
+        desired.apps.insert(a, app_spec(600, 2));
+        desired.apps.insert(b.clone(), app_spec(600, 1));
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        // "a" fails (only 1 of 2 fits). Its phantom reservation must be
+        // discarded so "b" (a single 600m replica) still places on the node.
+        assert!(
+            decisions.iter().any(|d| d.app_id == b),
+            "the later app must still place after a failed app's reservations are discarded: {decisions:?}"
         );
     }
 

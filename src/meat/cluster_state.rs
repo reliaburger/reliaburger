@@ -74,6 +74,7 @@ impl SchedulerNodeState {
 }
 
 /// The scheduler's view of the cluster.
+#[derive(Clone)]
 pub struct ClusterStateCache {
     nodes: HashMap<NodeId, SchedulerNodeState>,
 }

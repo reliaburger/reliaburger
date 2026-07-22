@@ -35,6 +35,8 @@ struct RuncEntry {
     /// Pid of an adopted `runc run` process (started by a previous bun).
     /// Mutually exclusive with `child`.
     adopted_pid: Option<u32>,
+    /// Start time of the adopted pid, to detect pid reuse (M23).
+    adopted_pid_started_at: Option<u64>,
     state: ContainerState,
     exit_code: Option<i32>,
 }
@@ -389,6 +391,7 @@ impl RuncGrill {
                 log_path,
                 child: None,
                 adopted_pid: None,
+                adopted_pid_started_at: None,
                 state: ContainerState::Pending,
                 exit_code: None,
             },
@@ -535,7 +538,8 @@ impl super::Grill for RuncGrill {
             {
                 // Adopted `runc run` process: no handle, poll (and reap)
                 // by pid. See records::poll_adopted_process.
-                let (running, exit_code) = super::records::poll_adopted_process(pid);
+                let (running, exit_code) =
+                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at);
                 if !running {
                     just_exited = true;
                     entry.state = ContainerState::Stopped;
@@ -568,7 +572,8 @@ impl super::Grill for RuncGrill {
             } else if let Some(pid) = entry.adopted_pid
                 && entry.state != ContainerState::Stopped
             {
-                let (running, exit_code) = super::records::poll_adopted_process(pid);
+                let (running, exit_code) =
+                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at);
                 if !running {
                     just_exited = true;
                     entry.state = ContainerState::Stopped;
@@ -653,6 +658,7 @@ impl super::Grill for RuncGrill {
                 log_path,
                 child: None,
                 adopted_pid: Some(record.pid),
+                adopted_pid_started_at: Some(record.pid_started_at),
                 state: ContainerState::Running,
                 exit_code: None,
             },
