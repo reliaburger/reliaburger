@@ -364,13 +364,16 @@ impl UpgradeManager {
         // staging it for exec (O4). Staging a binary already implied code-exec
         // trust, but re-checking catches on-disk tampering or bit-rot between
         // the original stage and the rollback, for the cost of a hash and a
-        // couple of signature verifications. A binary adopted from the running
-        // process carries a stub envelope with an empty embedded signature — it
-        // is trusted because it is already executing, so nothing to re-verify.
-        // An envelope carrying an external signature is verified as a network
+        // couple of signature verifications. Only a binary that carries a real
+        // signature is re-verified: a pre-existing / directly-installed binary
+        // has no `.sig`, and one adopted from the running process carries a stub
+        // envelope with an empty embedded signature — both are trusted by virtue
+        // of already being on disk / executing, so there is nothing to check.
+        // An envelope with an external signature is verified as a network
         // artefact (both signatures required); otherwise just the embedded one.
-        let envelope = SignatureEnvelope::load(&self.store.envelope_path(&target))?;
-        if !envelope.embedded.is_empty() {
+        if let Ok(envelope) = SignatureEnvelope::load(&self.store.envelope_path(&target))
+            && !envelope.embedded.is_empty()
+        {
             let bytes = std::fs::read(self.store.binary_path(&target))?;
             signing::verify_binary(
                 &bytes,
