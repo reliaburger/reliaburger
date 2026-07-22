@@ -436,7 +436,15 @@ async fn do_proxy(
     if is_ws {
         let boxed_guard: Option<Box<dyn std::any::Any + Send>> =
             drain_guard.map(|g| Box::new(g) as Box<dyn std::any::Any + Send>);
-        return super::websocket::handle_websocket_upgrade(req, backend, permit, boxed_guard).await;
+        return super::websocket::handle_websocket_upgrade(
+            req,
+            backend,
+            remote,
+            over_tls,
+            permit,
+            boxed_guard,
+        )
+        .await;
     }
 
     // Build the upstream URL
@@ -571,7 +579,7 @@ fn redirect_to_https(host: &str, uri: &Uri) -> Response {
 
 /// Whether a header name is one of the forwarding headers the proxy owns and
 /// therefore must strip from client input (ING5).
-fn is_forwarded_header(name: &str) -> bool {
+pub(super) fn is_forwarded_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("x-forwarded-for")
         || name.eq_ignore_ascii_case("x-forwarded-proto")
         || name.eq_ignore_ascii_case("forwarded")
@@ -580,7 +588,7 @@ fn is_forwarded_header(name: &str) -> bool {
 /// The `X-Forwarded-*` headers the proxy sets from its own view of the
 /// connection. A client cannot influence these — we already stripped any it
 /// sent — so a backend can trust them (ING5).
-fn forwarded_headers(remote: SocketAddr, over_tls: bool) -> Vec<(&'static str, String)> {
+pub(super) fn forwarded_headers(remote: SocketAddr, over_tls: bool) -> Vec<(&'static str, String)> {
     vec![
         ("x-forwarded-for", remote.ip().to_string()),
         (
