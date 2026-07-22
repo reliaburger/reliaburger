@@ -147,18 +147,27 @@ pub fn import_from_yaml(yaml: &str) -> Result<ImportResult, RelishError> {
 // ---------------------------------------------------------------------------
 
 /// Parse a multi-document YAML string into typed K8s resources.
+///
+/// Uses `serde_yaml::Deserializer` to split documents (M28) rather than a naive
+/// `split("---")`: the latter shredded any document with an embedded `---` (a
+/// PEM block or a `|`-scalar), and skipping documents that *start with* `#`
+/// dropped every Helm-rendered manifest, since Helm prefixes each with a
+/// `# Source: ...` comment — so `helm template ... | relish import` imported
+/// nothing and exited 0. The deserializer respects real document boundaries and
+/// leading comments.
 fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError> {
+    use serde::Deserialize as _;
+
     let mut resources = Vec::new();
 
-    for doc in yaml.split("---") {
-        let doc = doc.trim();
-        if doc.is_empty() || doc.starts_with('#') {
+    for document in serde_yaml::Deserializer::from_str(yaml) {
+        let value = serde_yaml::Value::deserialize(document)
+            .map_err(|e| RelishError::FormatFailed(format!("YAML parse error: {e}")))?;
+
+        // A comment-only or empty document deserialises to null — skip it.
+        if value.is_null() {
             continue;
         }
-
-        // Peek at kind and name
-        let value: serde_yaml::Value = serde_yaml::from_str(doc)
-            .map_err(|e| RelishError::FormatFailed(format!("YAML parse error: {e}")))?;
 
         let kind = value["kind"].as_str().unwrap_or("").to_string();
         let name = value["metadata"]["name"]
@@ -168,57 +177,57 @@ fn parse_multi_document_yaml(yaml: &str) -> Result<Vec<K8sResource>, RelishError
 
         let resource = match kind.as_str() {
             "Deployment" => {
-                let d: Deployment = serde_yaml::from_str(doc)
+                let d: Deployment = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Deployment(name, d)
             }
             "DaemonSet" => {
-                let d: DaemonSet = serde_yaml::from_str(doc)
+                let d: DaemonSet = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::DaemonSet(name, d)
             }
             "StatefulSet" => {
-                let d: StatefulSet = serde_yaml::from_str(doc)
+                let d: StatefulSet = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::StatefulSet(name, d)
             }
             "Service" => {
-                let s: Service = serde_yaml::from_str(doc)
+                let s: Service = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Service(name, s)
             }
             "Ingress" => {
-                let i: Ingress = serde_yaml::from_str(doc)
+                let i: Ingress = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Ingress(name, i)
             }
             "HorizontalPodAutoscaler" => {
-                let h: HorizontalPodAutoscaler = serde_yaml::from_str(doc)
+                let h: HorizontalPodAutoscaler = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Hpa(name, h)
             }
             "ConfigMap" => {
-                let c: ConfigMap = serde_yaml::from_str(doc)
+                let c: ConfigMap = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::ConfigMap(name, c)
             }
             "Secret" => {
-                let s: Secret = serde_yaml::from_str(doc)
+                let s: Secret = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Secret(name, s)
             }
             "Job" => {
-                let j: Job = serde_yaml::from_str(doc)
+                let j: Job = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Job(name, j)
             }
             "CronJob" => {
-                let c: CronJob = serde_yaml::from_str(doc)
+                let c: CronJob = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::CronJob(name, c)
             }
             "Namespace" => {
-                let n: Namespace = serde_yaml::from_str(doc)
+                let n: Namespace = serde_yaml::from_value(value.clone())
                     .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
                 K8sResource::Namespace(name, n)
             }
@@ -427,6 +436,35 @@ fn deployment_to_app(name: &str, deploy: &Deployment, report: &mut MigrationRepo
     let mut app = empty_app_spec();
     app.image = container.and_then(|c| c.image.clone());
     app.namespace = deploy.metadata.namespace.clone();
+
+    // Warn about fields we only partially import, so a silent drop becomes
+    // visible in the migration report rather than a surprise in production (M28).
+    if let Some(ps) = pod_spec {
+        if ps.containers.len() > 1 {
+            report.warnings.push(MigrationWarning {
+                resource: format!("Deployment/{name}"),
+                message: format!(
+                    "only the first of {} containers is imported; {} sidecar(s) dropped",
+                    ps.containers.len(),
+                    ps.containers.len() - 1
+                ),
+            });
+        }
+        if ps.volumes.as_ref().is_some_and(|v| !v.is_empty()) {
+            report.warnings.push(MigrationWarning {
+                resource: format!("Deployment/{name}"),
+                message: "pod volumes are not imported; declare Reliaburger volumes manually"
+                    .to_string(),
+            });
+        }
+    }
+    if container.and_then(|c| c.liveness_probe.as_ref()).is_some() {
+        report.warnings.push(MigrationWarning {
+            resource: format!("Deployment/{name}"),
+            message: "livenessProbe is not imported (only readinessProbe maps to a health check)"
+                .to_string(),
+        });
+    }
 
     // K8s splits the entrypoint into `command` (argv prefix) and `args`;
     // Reliaburger has a single command vector — concatenate them.
@@ -1124,6 +1162,44 @@ spec:
 "#;
         let result = import_from_yaml(yaml).unwrap();
         assert_eq!(result.config.app.len(), 2);
+        assert!(result.config.app.contains_key("web"));
+        assert!(result.config.app.contains_key("api"));
+    }
+
+    /// M28: a Helm-rendered manifest prefixes each document with a `# Source:`
+    /// comment. The old `split("---")` + `starts_with('#')` skip dropped every
+    /// such document and exited 0. The Deserializer path imports them.
+    #[test]
+    fn import_helm_style_source_comments() {
+        let yaml = r#"---
+# Source: chart/templates/web.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+---
+# Source: chart/templates/api.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: api
+        image: api:v1
+"#;
+        let result = import_from_yaml(yaml).unwrap();
+        assert_eq!(result.config.app.len(), 2, "Helm docs must not be skipped");
         assert!(result.config.app.contains_key("web"));
         assert!(result.config.app.contains_key("api"));
     }
