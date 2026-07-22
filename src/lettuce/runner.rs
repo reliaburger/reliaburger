@@ -198,10 +198,14 @@ async fn backoff(poll: Duration, consecutive_failures: u32, shutdown: &Cancellat
 /// couldn't tell a broken sync from a quiet one. Now the last error,
 /// failure count and attempt time land in Raft.
 async fn record_failure(council: &CouncilNode, desired: &DesiredState, error: &str) {
+    // Redact any credential embedded in a URL before the error is echoed or
+    // written to Raft `last_error` (M27) — defence in depth on top of the
+    // source-level redaction in `git::redact_git_output`.
+    let error = super::git::redact_url_credentials(error);
     eprintln!("gitops: sync failed: {error}");
     let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
     sync_state.phase = SyncPhase::Error;
-    sync_state.last_error = Some(error.to_string());
+    sync_state.last_error = Some(error.clone());
     sync_state.consecutive_failures = sync_state.consecutive_failures.saturating_add(1);
     sync_state.last_attempt_at = Some(now_millis());
     if let Err(e) = council

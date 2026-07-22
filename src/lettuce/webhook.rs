@@ -92,16 +92,23 @@ impl WebhookValidator {
 
     /// Run the replay and rate-limit checks shared by every provider.
     fn check_replay_and_rate(&mut self, delivery_id: Option<&str>) -> Result<(), LettuceError> {
-        if let Some(id) = delivery_id {
-            if self.recent_ids.iter().any(|existing| existing == id) {
-                return Err(LettuceError::WebhookInvalid(
-                    "duplicate delivery ID (replay)".to_string(),
-                ));
-            }
-            self.recent_ids.push_back(id.to_string());
-            if self.recent_ids.len() > self.max_replay_entries {
-                self.recent_ids.pop_front();
-            }
+        // A delivery ID is mandatory (M27): the endpoint is secret-authenticated,
+        // and without an id there is nothing to deduplicate against, so a
+        // captured request could be replayed indefinitely. Refuse rather than
+        // silently skip replay protection.
+        let id = delivery_id.ok_or_else(|| {
+            LettuceError::WebhookInvalid(
+                "missing delivery ID; replay protection requires one".to_string(),
+            )
+        })?;
+        if self.recent_ids.iter().any(|existing| existing == id) {
+            return Err(LettuceError::WebhookInvalid(
+                "duplicate delivery ID (replay)".to_string(),
+            ));
+        }
+        self.recent_ids.push_back(id.to_string());
+        if self.recent_ids.len() > self.max_replay_entries {
+            self.recent_ids.pop_front();
         }
 
         let now = Instant::now();
@@ -227,6 +234,19 @@ mod tests {
                 .to_string()
                 .contains("duplicate delivery ID")
         );
+    }
+
+    /// M27: a valid signature with no delivery ID is refused — replay
+    /// protection is impossible without one, so we must not silently skip it.
+    #[test]
+    fn webhook_without_delivery_id_is_rejected() {
+        let mut validator = WebhookValidator::new("mysecret", 10);
+        let body = br#"{"after": "abc"}"#;
+        let sig = sign_payload("mysecret", body);
+        let err = validator
+            .validate(body, Some(&sig), None, "main")
+            .unwrap_err();
+        assert!(err.to_string().contains("delivery ID"), "got: {err}");
     }
 
     #[test]

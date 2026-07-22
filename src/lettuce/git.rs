@@ -73,7 +73,7 @@ impl GitRepo {
         if !output.status.success() {
             return Err(LettuceError::GitFailed(format!(
                 "git clone failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                redact_git_output(&output.stderr, url)
             )));
         }
 
@@ -100,11 +100,39 @@ impl GitRepo {
         if !output.status.success() {
             return Err(LettuceError::GitFailed(format!(
                 "git fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                redact_git_output(&output.stderr, &self.url)
             )));
         }
 
         let new_head = self.remote_head_sha()?;
+
+        // Advance the local branch ref to the fetched commit (M27). A bare
+        // `git fetch` updates `origin/<branch>` and `FETCH_HEAD` but not the
+        // local `HEAD`/branch ref, so `head_sha()` stayed pinned at the
+        // clone-time commit forever. Every subsequent poll then saw
+        // `old_head (clone) != new_head (remote)` and reported a change, writing
+        // a `GitOpsSyncUpdate` to Raft every 30s — unbounded log churn. Move the
+        // local ref forward so a genuinely unchanged remote reports `None`.
+        if old_head.as_deref() != Some(&new_head) {
+            let update = Command::new("git")
+                .args([
+                    "update-ref",
+                    &format!("refs/heads/{}", self.branch),
+                    "--end-of-options",
+                ])
+                .arg(&new_head)
+                .current_dir(&self.path)
+                .output()
+                .map_err(|e| {
+                    LettuceError::GitFailed(format!("failed to run git update-ref: {e}"))
+                })?;
+            if !update.status.success() {
+                return Err(LettuceError::GitFailed(format!(
+                    "git update-ref failed: {}",
+                    redact_git_output(&update.stderr, &self.url)
+                )));
+            }
+        }
 
         if old_head.as_deref() == Some(&new_head) {
             return Ok(None);
@@ -272,6 +300,47 @@ impl GitRepo {
     }
 }
 
+/// Redact a git command's stderr for an error message (M27).
+///
+/// GitOps errors are stored durably in Raft (`GitOpsSyncUpdate.last_error`), and
+/// git echoes the remote URL — which may embed a `https://<token>@host/...`
+/// credential — into its stderr on failure. Replace any occurrence of the
+/// configured URL with `<repo>` and strip an inline `user:pass@`/`token@`
+/// credential from anything URL-shaped, so the token never lands in the Raft
+/// log or the operator's terminal.
+fn redact_git_output(stderr: &[u8], url: &str) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let without_url = if url.is_empty() {
+        text.into_owned()
+    } else {
+        text.replace(url, "<repo>")
+    };
+    redact_url_credentials(&without_url)
+}
+
+/// Strip `scheme://user:pass@host` / `scheme://token@host` credentials from any
+/// URL-shaped substring, leaving `scheme://host`.
+pub(crate) fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for token in text.split_inclusive(char::is_whitespace) {
+        let (word, trailing_ws) = match token.char_indices().last() {
+            Some((i, c)) if c.is_whitespace() => (&token[..i], &token[i..]),
+            _ => (token, ""),
+        };
+        match word.split_once("://") {
+            Some((scheme, rest)) if rest.contains('@') => {
+                let host = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
+                out.push_str(scheme);
+                out.push_str("://");
+                out.push_str(host);
+            }
+            _ => out.push_str(word),
+        }
+        out.push_str(trailing_ws);
+    }
+    out
+}
+
 /// Does the clone already at `path` still track `url` on `branch`?
 ///
 /// Reads the clone's `remote.origin.url` and confirms the branch ref
@@ -308,6 +377,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// M27: git stderr echoed into a durable error must not leak a URL-embedded
+    /// credential.
+    #[test]
+    fn redact_git_output_strips_credentials() {
+        let url = "https://x-access-token:ghp_SECRET@github.com/acme/app.git";
+        let stderr = format!("fatal: could not read from {url}\n").into_bytes();
+        let redacted = redact_git_output(&stderr, url);
+        assert!(!redacted.contains("ghp_SECRET"), "leaked token: {redacted}");
+        assert!(redacted.contains("<repo>"));
+
+        // Even without the configured URL to match on, an inline credential in
+        // any URL-shaped word is stripped.
+        let other = redact_url_credentials("cloning https://tok@example.com/r.git now");
+        assert_eq!(other, "cloning https://example.com/r.git now");
+    }
 
     /// Create a test git repo with a TOML file.
     fn create_test_repo() -> (TempDir, PathBuf) {
