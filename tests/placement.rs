@@ -322,7 +322,6 @@ async fn apply_on_any_node_places_across_the_cluster() {
         image = "proc-grill:image-ignored"
         command = ["sleep", "600"]
         replicas = 3
-        cpu = "200m-400m"
     "#,
     )
     .unwrap();
@@ -439,7 +438,6 @@ async fn cluster_stop_clears_desired_state_and_does_not_resurrect() {
         image = "proc-grill:image-ignored"
         command = ["sleep", "600"]
         replicas = 1
-        cpu = "200m-400m"
     "#,
     )
     .unwrap();
@@ -558,7 +556,6 @@ async fn autoscaler_scales_up_on_high_metric() {
         image = "proc-grill:image-ignored"
         command = ["sleep", "600"]
         replicas = 1
-        cpu = "100m-200m"
 
         [app.scaler.autoscale]
         metric = "cpu"
@@ -599,8 +596,11 @@ async fn autoscaler_scales_up_on_high_metric() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        // The real collector labels per-app metrics `namespace/app` (see
+        // mayo::collector), and the autoscaler match is namespace-qualified
+        // (M26). Feed the metric in that same form, not the bare app name.
         let mut labels = std::collections::BTreeMap::new();
-        labels.insert("app".to_string(), "scaler".to_string());
+        labels.insert("app".to_string(), "default/scaler".to_string());
         let rollup = NodeRollup {
             node_id: reliaburger::meat::NodeId::new(&node.name),
             timestamp: now.saturating_sub(30),
