@@ -425,7 +425,9 @@ pub async fn create(
     // `create` resumes rather than erroring on "instance already exists".
     let existing = limactl(&["list", "--format", "{{.Name}}"]).await?;
     for i in 1..=nodes {
-        let node_name = format!("reliaburger-{i}");
+        // Embed the cluster name so two dev clusters with different `--name`
+        // don't collide on `reliaburger-1`, `-2`, … and share VMs (O14).
+        let node_name = format!("reliaburger-{name}-{i}");
 
         if existing.lines().any(|l| l.trim() == node_name) {
             println!("  {node_name} already exists — reusing");
@@ -691,13 +693,10 @@ pub async fn destroy(name: &str) -> Result<(), RelishError> {
     delete_cluster_state(name);
     println!("Dev cluster \"{name}\" destroyed.");
 
-    // Also remove the test VM if it exists
-    let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
-    if list.lines().any(|l| l.trim() == TEST_VM_NAME) {
-        eprintln!("deleting test VM ({TEST_VM_NAME})...");
-        limactl(&["delete", "--force", TEST_VM_NAME]).await?;
-        println!("Test VM deleted.");
-    }
+    // The build VM (`reliaburger-test`) is shared across all dev clusters, so
+    // destroying one cluster must NOT delete it (O14) — that would break every
+    // other cluster's next `create`/`test`. Remove it explicitly with
+    // `relish dev test-vm-destroy` when you actually want it gone.
 
     Ok(())
 }

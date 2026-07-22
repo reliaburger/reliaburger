@@ -51,7 +51,15 @@ impl PortAllocator {
     /// Allocate a random available port from the range.
     pub async fn allocate(&self) -> Result<u16, PortError> {
         let mut allocated = self.allocated.lock().await;
-        if allocated.len() >= self.total_ports() {
+        // Count only ports inside the allocatable range toward exhaustion (O18):
+        // `reserve()` accepts out-of-range ports (adopted workloads), and
+        // counting those against the cap made `allocate` report the pool
+        // exhausted while in-range ports were still free.
+        let in_range = allocated
+            .iter()
+            .filter(|p| (self.range_start..self.range_end).contains(p))
+            .count();
+        if in_range >= self.total_ports() {
             return Err(PortError::Exhausted {
                 start: self.range_start,
                 end: self.range_end,
@@ -107,9 +115,11 @@ impl PortAllocator {
         allocated.len()
     }
 
-    /// Total number of ports in the range.
+    /// Total number of ports in the range. `0` for an empty/inverted range
+    /// (config validation rejects `start >= end`, but saturate defensively so
+    /// a stray direct constructor can't underflow).
     pub fn total_ports(&self) -> usize {
-        (self.range_end - self.range_start) as usize
+        self.range_end.saturating_sub(self.range_start) as usize
     }
 }
 
@@ -207,6 +217,27 @@ mod tests {
     async fn total_ports_returns_range_size() {
         let alloc = PortAllocator::new(10000, 10050);
         assert_eq!(alloc.total_ports(), 50);
+    }
+
+    /// O18: reserving a port outside the range (adopted workload) must not
+    /// count against the range's exhaustion cap.
+    #[tokio::test]
+    async fn out_of_range_reserve_does_not_exhaust_the_pool() {
+        let alloc = PortAllocator::new(5000, 5002); // two allocatable ports
+        // Reserve several out-of-range ports (as adoption does).
+        for p in [80u16, 443, 8080] {
+            alloc.reserve(p).await.unwrap();
+        }
+        // Both in-range ports are still allocatable.
+        assert!(alloc.allocate().await.is_ok());
+        assert!(alloc.allocate().await.is_ok());
+        assert!(alloc.allocate().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn total_ports_saturates_on_an_inverted_range() {
+        let alloc = PortAllocator::new(6000, 5000);
+        assert_eq!(alloc.total_ports(), 0);
     }
 
     #[tokio::test]

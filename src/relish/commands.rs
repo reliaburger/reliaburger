@@ -1036,7 +1036,11 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Show live resource usage for all apps and nodes.
+/// Show the status of all running workloads — state, PID, restart count.
+///
+/// Named `top` by analogy, but it does not (yet) report live CPU/memory usage;
+/// the title and help say what it actually shows rather than promising resource
+/// figures it doesn't print (O19).
 pub async fn top() -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let statuses = client.status().await?;

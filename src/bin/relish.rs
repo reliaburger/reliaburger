@@ -96,7 +96,7 @@ enum Command {
         /// SQL query against the `logs` table.
         sql: String,
     },
-    /// Show live resource usage (CPU, memory) for all apps.
+    /// Show the status (state, PID, restarts) of all running workloads.
     Top,
     /// Execute a command inside a running container.
     Exec {

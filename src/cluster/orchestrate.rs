@@ -770,12 +770,18 @@ pub fn spawn_placement_reconciler(
             if let Some(token) = &service_token {
                 request = request.bearer_auth(token);
             }
-            let assignments: NodeAssignments = match request.send().await {
-                Ok(response) if response.status().is_success() => match response.json().await {
+            // Bound the poll explicitly (O8): a leader that completes the TCP
+            // connect then stalls would otherwise block this reconciler tick
+            // indefinitely on TCP defaults, so the node stops converging while
+            // still alive. Treat a timeout like any other unreachable-leader
+            // error and retry next tick.
+            let sent = tokio::time::timeout(Duration::from_secs(10), request.send()).await;
+            let assignments: NodeAssignments = match sent {
+                Ok(Ok(response)) if response.status().is_success() => match response.json().await {
                     Ok(a) => a,
                     Err(_) => continue,
                 },
-                _ => continue, // leader unreachable; retry next tick
+                _ => continue, // leader unreachable / timed out; retry next tick
             };
 
             // Install the replicated endpoint catalogue (12b.4). The agent

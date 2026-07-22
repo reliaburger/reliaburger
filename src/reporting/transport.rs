@@ -366,22 +366,32 @@ impl TcpReportingTransport {
             reason: format!("TCP connect to {target}: {e}"),
         })?;
 
-        match connector {
-            Some(connector) => {
-                // The pinned server verifier ignores the name; rustls still
-                // requires a valid one.
-                let name = rustls::pki_types::ServerName::IpAddress(target.ip().into());
-                let tls =
-                    connector
-                        .connect(name, tcp)
-                        .await
-                        .map_err(|e| ReportingError::SendFailed {
+        // Bound the handshake and write too (O8): a peer that completes the TCP
+        // connect then stalls during the TLS handshake or the body write would
+        // otherwise hang the sender on TCP defaults. Wrap the remainder in one
+        // overall deadline.
+        let deadline = std::time::Duration::from_secs(10);
+        let write = async {
+            match connector {
+                Some(connector) => {
+                    // The pinned server verifier ignores the name; rustls still
+                    // requires a valid one.
+                    let name = rustls::pki_types::ServerName::IpAddress(target.ip().into());
+                    let tls = connector.connect(name, tcp).await.map_err(|e| {
+                        ReportingError::SendFailed {
                             reason: format!("TLS connect to {target}: {e}"),
-                        })?;
-                Self::write_framed(tls, &payload, target).await
+                        }
+                    })?;
+                    Self::write_framed(tls, &payload, target).await
+                }
+                None => Self::write_framed(tcp, &payload, target).await,
             }
-            None => Self::write_framed(tcp, &payload, target).await,
-        }
+        };
+        tokio::time::timeout(deadline, write)
+            .await
+            .map_err(|_| ReportingError::SendFailed {
+                reason: format!("send to {target} timed out"),
+            })?
     }
 
     /// Write a length-prefixed payload over an established stream.

@@ -313,7 +313,21 @@ impl StateMachineInner {
                 self.state.security_state = *ss.clone();
             }
             RaftRequest::CreateJoinToken(jt) => {
-                self.state.security_state.join_tokens.push(jt.clone());
+                // Prune consumed tokens and cap the list so it can't grow
+                // without bound over a long-lived cluster (O5). Pruning keys on
+                // `consumed` (replicated state) and a fixed cap, not wall-clock
+                // expiry — a wall-clock check inside Raft apply would evaluate
+                // differently on each node and diverge the state machine.
+                // Expired-but-unconsumed tokens within the cap are harmless:
+                // `check_join_token` rejects them.
+                let tokens = &mut self.state.security_state.join_tokens;
+                tokens.retain(|t| !t.consumed);
+                tokens.push(jt.clone());
+                const MAX_JOIN_TOKENS: usize = 1024;
+                if tokens.len() > MAX_JOIN_TOKENS {
+                    let overflow = tokens.len() - MAX_JOIN_TOKENS;
+                    tokens.drain(0..overflow);
+                }
             }
             RaftRequest::ConsumeJoinToken { token_hash } => {
                 if let Some(jt) = self
@@ -2386,6 +2400,29 @@ mod tests {
             token_hash: [0xAB; 32],
         });
         assert!(inner.state.security_state.join_tokens[0].consumed);
+    }
+
+    /// O5: creating a new join token prunes previously-consumed ones so the
+    /// list can't grow without bound.
+    #[test]
+    fn creating_a_join_token_prunes_consumed_ones() {
+        let mut inner = StateMachineInner::default();
+        let token = |b: u8| crate::sesame::types::JoinToken {
+            token_hash: [b; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: crate::sesame::types::AttestationMode::None,
+            node_id: "node-02".to_string(),
+        };
+        inner.apply_request(&RaftRequest::CreateJoinToken(token(0xAA)));
+        inner.apply_request(&RaftRequest::ConsumeJoinToken {
+            token_hash: [0xAA; 32],
+        });
+        // A second create prunes the consumed one and keeps the new one.
+        inner.apply_request(&RaftRequest::CreateJoinToken(token(0xBB)));
+        let tokens = &inner.state.security_state.join_tokens;
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].token_hash, [0xBB; 32]);
     }
 
     #[test]

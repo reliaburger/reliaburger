@@ -4,7 +4,7 @@
 //! and queryable via DataFusion SQL. Periodically flushed to Parquet
 //! files for persistence. The same architecture as InfluxDB IOx.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -578,29 +578,66 @@ impl MayoStore {
         Ok(results)
     }
 
-    /// Prune Parquet files older than `before` timestamp.
+    /// Prune Parquet files whose newest datapoint is older than `before`.
+    ///
+    /// Retention is keyed on the data's own newest timestamp (O12), read from
+    /// the file's row-group statistics — not the file's mtime, which a
+    /// touch/copy or clock skew can push forward and so drop in-range data. A
+    /// file whose max timestamp can't be read falls back to mtime so a
+    /// malformed file is still eligible for pruning.
     pub fn prune(&self, before: u64) -> Result<usize, MayoError> {
         let mut deleted = 0;
         if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|e| e == "parquet")
-                    && let Ok(meta) = std::fs::metadata(&path)
-                    && let Ok(modified) = meta.modified()
-                {
-                    let mod_secs = modified
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if mod_secs < before {
-                        let _ = std::fs::remove_file(&path);
-                        deleted += 1;
-                    }
+                if !path.extension().is_some_and(|e| e == "parquet") {
+                    continue;
+                }
+                let newest = file_max_timestamp(&path).unwrap_or_else(|| {
+                    std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| {
+                            t.duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        })
+                        .unwrap_or(u64::MAX)
+                });
+                if newest < before {
+                    let _ = std::fs::remove_file(&path);
+                    deleted += 1;
                 }
             }
         }
         Ok(deleted)
     }
+}
+
+/// The maximum `timestamp` (column 0) across a Parquet file's row groups, read
+/// from statistics without scanning the data. `None` if the file is unreadable
+/// or carries no usable stats.
+pub(crate) fn file_max_timestamp(path: &Path) -> Option<u64> {
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+    use datafusion::parquet::file::statistics::Statistics;
+
+    let reader = SerializedFileReader::new(std::fs::File::open(path).ok()?).ok()?;
+    let meta = reader.metadata();
+    let mut max: Option<u64> = None;
+    for i in 0..meta.num_row_groups() {
+        let rg = meta.row_group(i);
+        if rg.num_columns() == 0 {
+            continue;
+        }
+        let candidate = match rg.column(0).statistics() {
+            Some(Statistics::Int64(s)) => s.max_opt().map(|v| *v as u64),
+            Some(Statistics::Int32(s)) => s.max_opt().map(|v| *v as u64),
+            _ => None,
+        };
+        if let Some(c) = candidate {
+            max = Some(max.map_or(c, |cur| cur.max(c)));
+        }
+    }
+    max
 }
 
 #[cfg(test)]
@@ -629,6 +666,28 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "parquet"))
             .collect();
         assert_eq!(files.len(), 1);
+    }
+
+    /// O12: retention keys on the data's own newest timestamp, not the file's
+    /// mtime. A file just written (recent mtime) but holding only old data is
+    /// pruned; a file holding recent data is kept regardless of mtime.
+    #[tokio::test]
+    async fn prune_uses_data_timestamp_not_file_mtime() {
+        let (mut store, dir) = test_store();
+        // Freshly written file (mtime ~now), but its newest datapoint is ts=5.
+        store.insert(&MetricKey::simple("cpu"), Sample::at(5, 1.0));
+        store.flush().await.unwrap();
+
+        // mtime-based pruning would keep this (mtime is now); timestamp-based
+        // prunes it (data max 5 < 100).
+        assert_eq!(store.prune(100).unwrap(), 1);
+        assert!(!dir_has_parquet(dir.path()));
+
+        // A file with recent data survives the same cutoff.
+        store.insert(&MetricKey::simple("cpu"), Sample::at(1_000, 2.0));
+        store.flush().await.unwrap();
+        assert_eq!(store.prune(100).unwrap(), 0);
+        assert!(dir_has_parquet(dir.path()));
     }
 
     #[tokio::test]

@@ -74,6 +74,10 @@ pub fn parse_percentage(s: &str) -> Result<u8, RelishError> {
 }
 
 /// Parse a bandwidth string like "1mbps", "10mbps" into bytes/sec.
+///
+/// The `bps` suffix means bits per second (O17): `1mbps` is one megabit/s =
+/// 1_000_000 / 8 = 125_000 bytes/s, not one mebibyte/s. The old code multiplied
+/// by 1024×1024, over-provisioning the throttle ~8.4×.
 pub fn parse_bandwidth(s: &str) -> Result<u64, RelishError> {
     let s = s.trim();
     if let Some(rest) = s.strip_suffix("mbps") {
@@ -81,14 +85,16 @@ pub fn parse_bandwidth(s: &str) -> Result<u64, RelishError> {
             status: 0,
             body: format!("invalid bandwidth: {s}"),
         })?;
-        return Ok(mbps * 1024 * 1024);
+        // megabits/s → bytes/s
+        return Ok(mbps * 1_000_000 / 8);
     }
     if let Some(rest) = s.strip_suffix("kbps") {
         let kbps: u64 = rest.parse().map_err(|_| RelishError::ApiError {
             status: 0,
             body: format!("invalid bandwidth: {s}"),
         })?;
-        return Ok(kbps * 1024);
+        // kilobits/s → bytes/s
+        return Ok(kbps * 1000 / 8);
     }
     Err(RelishError::ApiError {
         status: 0,
@@ -578,12 +584,14 @@ mod tests {
 
     #[test]
     fn parse_bandwidth_mbps() {
-        assert_eq!(parse_bandwidth("1mbps").unwrap(), 1024 * 1024);
+        // 1 megabit/s = 1_000_000 bits / 8 = 125_000 bytes/s (O17).
+        assert_eq!(parse_bandwidth("1mbps").unwrap(), 125_000);
     }
 
     #[test]
     fn parse_bandwidth_kbps() {
-        assert_eq!(parse_bandwidth("100kbps").unwrap(), 100 * 1024);
+        // 100 kilobits/s = 100_000 bits / 8 = 12_500 bytes/s.
+        assert_eq!(parse_bandwidth("100kbps").unwrap(), 12_500);
     }
 
     #[test]

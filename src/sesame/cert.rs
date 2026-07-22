@@ -27,6 +27,10 @@ pub enum CertError {
     },
     #[error("certificate is missing the code-signing extended key usage")]
     NotCodeSigning,
+    #[error(
+        "leaf certificate asserts the CA basic constraint; a CA must not be used as an end-entity"
+    )]
+    LeafIsCa,
     #[error("issuer/subject mismatch: {0}")]
     IssuerMismatch(String),
 }
@@ -142,6 +146,29 @@ pub fn validate_chain(
     check_validity(leaf_der)?;
     check_validity(intermediate_der)?;
     check_validity(root_der)?;
+    // Defence in depth (O16): the leaf must not itself be a CA. CA-pinning and
+    // the path-length constraint on our intermediates already prevent a CA cert
+    // being accepted as an end-entity, but asserting `CA:FALSE` on the leaf
+    // closes the gap explicitly rather than relying on the issuer's constraints.
+    assert_leaf_not_ca(leaf_der)?;
+    Ok(())
+}
+
+/// Reject a leaf that asserts the CA basic constraint (O16).
+///
+/// A certificate with no BasicConstraints extension, or `CA:FALSE`, is a valid
+/// end-entity. Only an explicit `CA:TRUE` is refused.
+fn assert_leaf_not_ca(der: &[u8]) -> Result<(), CertError> {
+    let (_, cert) =
+        X509Certificate::from_der(der).map_err(|e| CertError::ParseFailed(format!("{e}")))?;
+    let is_ca = cert
+        .basic_constraints()
+        .map_err(|e| CertError::ParseFailed(format!("failed to read basic constraints: {e}")))?
+        .map(|ext| ext.value.ca)
+        .unwrap_or(false);
+    if is_ca {
+        return Err(CertError::LeafIsCa);
+    }
     Ok(())
 }
 
@@ -381,6 +408,37 @@ mod tests {
     fn check_validity_on_fresh_cert() {
         let root = ca::generate_root_ca("test", SerialNumber(1)).unwrap();
         check_validity(&root.ca.certificate_der).unwrap();
+    }
+
+    /// O16: a CA certificate presented as the leaf is refused, even though its
+    /// signatures and validity check out.
+    #[test]
+    fn validate_chain_rejects_a_ca_as_the_leaf() {
+        let hierarchy = ca::generate_ca_hierarchy("test", b"ikm").unwrap();
+        // The Node CA is a CA cert, signed by the root — a valid chain link,
+        // but not a valid end-entity.
+        let err = validate_chain(
+            &hierarchy.node.ca.certificate_der,
+            &hierarchy.root.ca.certificate_der,
+            &hierarchy.root.ca.certificate_der,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CertError::LeafIsCa), "got: {err:?}");
+
+        // A genuine leaf still passes `assert_leaf_not_ca`.
+        assert!(
+            assert_leaf_not_ca(
+                &ca::issue_node_cert(
+                    "node-01",
+                    SerialNumber(10),
+                    &hierarchy.node.signing_keypair,
+                    &hierarchy.node.certificate_params,
+                )
+                .unwrap()
+                .0
+            )
+            .is_ok()
+        );
     }
 
     #[test]
