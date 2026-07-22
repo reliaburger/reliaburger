@@ -482,10 +482,15 @@ pub async fn start(
     .map_err(|e| std::io::Error::other(format!("reporting bind failed: {e}")))?;
     // The rollup store lives on every node (cheap when empty) so a
     // leadership change needs no start/stop dance — only the leader's
-    // aggregator actually receives rollups to ingest into it.
-    let rollup_store = Arc::new(tokio::sync::RwLock::new(
-        crate::mayo::rollup_store::RollupStore::new(params.data_dir.join("rollups")),
-    ));
+    // aggregator actually receives rollups to ingest into it. Seed the
+    // idempotency tracker from any Parquet already on disk so a restart doesn't
+    // double-count a re-sent window that was already flushed (M17).
+    let mut initial_rollup_store =
+        crate::mayo::rollup_store::RollupStore::new(params.data_dir.join("rollups"));
+    if let Err(e) = initial_rollup_store.hydrate_seen_windows().await {
+        eprintln!("bun: WARNING: could not seed rollup idempotency from disk: {e}");
+    }
+    let rollup_store = Arc::new(tokio::sync::RwLock::new(initial_rollup_store));
     let (mut aggregator, aggregated_rx) = ReportAggregator::new(
         agg_transport,
         params.reporting_config.clone(),
