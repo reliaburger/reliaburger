@@ -315,6 +315,48 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
+///
+/// Returns `None` — falling back to a self-signed `localhost` cert — when the
+/// Ingress CA or the wrapping IKM is unavailable, or reconstruction fails. A
+/// warning is logged so the operator knows `tls = "cluster"` routes are not
+/// yet cluster-signed.
+async fn build_ingress_cert_resolver(
+    council: &std::sync::Arc<reliaburger::council::CouncilNode>,
+) -> Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> {
+    use reliaburger::sesame::types::CaRole;
+
+    let ikm = council.wrapping_ikm()?;
+    let state = council.security_state().await;
+    let ingress_ca = state.get_ca(CaRole::Ingress)?;
+    let (keypair, params) = match reliaburger::sesame::ca::ca_signing_material(ingress_ca, ikm) {
+        Ok(material) => material,
+        Err(e) => {
+            eprintln!(
+                "bun: WARNING: could not load the Ingress CA ({e}); \
+                 `tls = \"cluster\"` routes will use a self-signed cert"
+            );
+            return None;
+        }
+    };
+    let (default_cert, default_key) =
+        reliaburger::wrapper::tls::generate_self_signed_cert().ok()?;
+    let lifetime = std::time::Duration::from_secs(90 * 24 * 3600);
+    match reliaburger::wrapper::tls::IngressCertResolver::new(
+        keypair,
+        params,
+        lifetime,
+        vec![default_cert],
+        default_key,
+    ) {
+        Ok(resolver) => Some(std::sync::Arc::new(resolver)),
+        Err(e) => {
+            eprintln!("bun: WARNING: could not build the ingress cert resolver ({e})");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -903,10 +945,20 @@ async fn main() -> anyhow::Result<()> {
         let drains = agent.drains_handle();
         let wrapper_config = config.ingress.to_wrapper_config();
         let ingress_shutdown = shutdown.clone();
-        let bound = reliaburger::wrapper::proxy::bind_proxy_with_drains(
+        // Wire the cluster Ingress CA into TLS so `tls = "cluster"` routes are
+        // served a cluster-signed cert per SNI (M8), not a self-signed
+        // `localhost` cert. Available only in cluster mode (a council + the
+        // wrapping IKM to unwrap the Ingress CA key). A disk cert still wins.
+        let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
+            match &api_council {
+                Some(council) => build_ingress_cert_resolver(council).await,
+                None => None,
+            };
+        let bound = reliaburger::wrapper::proxy::bind_proxy_with_tls(
             wrapper_config,
             routing_table,
             Some(drains),
+            ingress_resolver,
             ingress_shutdown,
         )
         .await
