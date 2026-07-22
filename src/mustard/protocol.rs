@@ -479,14 +479,24 @@ impl<T: MustardTransport> MustardNode<T> {
             self.ingest_extension(extension);
         }
 
-        // Register the sender if we haven't seen them
-        let is_new = self.membership.add_node(
-            message.sender.clone(),
-            from,
-            message.incarnation,
-            BTreeMap::new(),
-            now,
-        );
+        // Register the sender at the socket it came from — but NOT for a
+        // relayed ACK, whose socket is the relay's, not the sender's (M13).
+        // Recording the probed node at the relay's address made the next
+        // direct probe hit the relay, whose ACK (sender = relay ≠ probed node)
+        // never matched, falsely evicting a healthy node. The relayed sender is
+        // already the probe target we know; its liveness is applied below.
+        let is_relayed_ack = matches!(&message.payload, GossipPayload::Ack { relayed: true, .. });
+        let is_new = if is_relayed_ack {
+            false
+        } else {
+            self.membership.add_node(
+                message.sender.clone(),
+                from,
+                message.incarnation,
+                BTreeMap::new(),
+                now,
+            )
+        };
 
         // Mirror the freshly-registered sender's advertised labels onto its
         // membership record. `ingest_extension` above ran before `add_node`,
@@ -531,7 +541,7 @@ impl<T: MustardTransport> MustardNode<T> {
             if update.node_id == self.node_id
                 && matches!(update.state, NodeState::Suspect | NodeState::Dead)
             {
-                self.refute();
+                self.refute(update.incarnation);
             }
         }
 
@@ -543,7 +553,10 @@ impl<T: MustardTransport> MustardNode<T> {
                 let ack = GossipMessage::new(
                     self.node_id.clone(),
                     self.incarnation,
-                    GossipPayload::Ack { updates },
+                    GossipPayload::Ack {
+                        updates,
+                        relayed: false,
+                    },
                 );
                 let _ = self.transport.send(from, &self.stamp(ack)).await;
             }
@@ -583,6 +596,10 @@ impl<T: MustardTransport> MustardNode<T> {
                                 target_inc,
                                 GossipPayload::Ack {
                                     updates: fwd_updates,
+                                    // Forwarded on the target's behalf: the
+                                    // requester must not learn the target's
+                                    // address from our socket (M13).
+                                    relayed: true,
                                 },
                             );
                             let _ = self.transport.send(req_addr, &self.stamp(fwd_ack)).await;
@@ -604,8 +621,17 @@ impl<T: MustardTransport> MustardNode<T> {
     }
 
     /// Bump incarnation and disseminate an Alive update to refute suspicion.
-    fn refute(&mut self) {
-        self.incarnation += 1;
+    /// Refute a Suspect/Dead claim about this node by broadcasting a fresh
+    /// Alive at a higher incarnation.
+    ///
+    /// `offending_incarnation` is the incarnation of the claim being refuted.
+    /// We jump *past* it — `max(local, offending) + 1` — rather than merely
+    /// `local + 1` (M12). A node that reached incarnation 50, crashed while
+    /// peers held it Dead@50, and restarted at 1 would otherwise need ~49
+    /// refutes (often longer than the 60s reap) before its Alive out-ranks the
+    /// stale Dead. Seeding from the seen value means a single refute wins.
+    fn refute(&mut self, offending_incarnation: u64) {
+        self.incarnation = self.incarnation.max(offending_incarnation) + 1;
         self.tick_lamport();
         self.dissemination.enqueue(
             MembershipUpdate {
@@ -1726,6 +1752,93 @@ mod tests {
         assert_eq!(
             node2.membership.get(&NodeId::new("n1")).unwrap().state,
             NodeState::Left,
+        );
+    }
+
+    /// M12: a node that restarts at incarnation 1 while peers hold it Dead at a
+    /// far higher incarnation refutes past that value in a single step, so its
+    /// Alive immediately out-ranks the stale Dead instead of needing dozens of
+    /// refutes.
+    #[tokio::test]
+    async fn refute_seeds_incarnation_past_a_stale_dead() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        assert_eq!(node.incarnation, 1);
+
+        // A peer gossips that we are Dead at incarnation 50 (we crashed there
+        // and restarted at 1).
+        let stale_dead = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Dead,
+                    incarnation: 50,
+                    lamport: 1,
+                }],
+            },
+        );
+        node.handle_message(addr(9), stale_dead).await;
+
+        assert_eq!(
+            node.incarnation, 51,
+            "refute must jump past the stale Dead's incarnation in one step"
+        );
+    }
+
+    /// M13: a relayed ACK (forwarded by a relay on the target's behalf) must
+    /// not overwrite the target's recorded address with the relay's socket —
+    /// doing so made the next direct probe hit the relay and falsely evict the
+    /// healthy target.
+    #[tokio::test]
+    async fn relayed_ack_does_not_rewrite_the_targets_address() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let mut node_a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        // A knows B at its real address (addr 2).
+        node_a.membership.add_node(
+            NodeId::new("b"),
+            addr(2),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        // A relay C (socket addr 3) forwards B's ACK to A.
+        let relayed = GossipMessage::new(
+            NodeId::new("b"),
+            2,
+            GossipPayload::Ack {
+                updates: vec![],
+                relayed: true,
+            },
+        );
+        node_a.handle_message(addr(3), relayed).await;
+
+        // B's address is unchanged — still its own, not the relay's.
+        assert_eq!(
+            node_a.membership.get(&NodeId::new("b")).unwrap().address,
+            addr(2),
+            "a relayed ACK must not record the target at the relay's address"
+        );
+
+        // A direct ACK, by contrast, does refresh the address (B legitimately
+        // reachable at the socket it came from).
+        let direct = GossipMessage::new(
+            NodeId::new("b"),
+            2,
+            GossipPayload::Ack {
+                updates: vec![],
+                relayed: false,
+            },
+        );
+        node_a.handle_message(addr(2), direct).await;
+        assert_eq!(
+            node_a.membership.get(&NodeId::new("b")).unwrap().address,
+            addr(2),
         );
     }
 }

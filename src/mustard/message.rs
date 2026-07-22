@@ -129,6 +129,14 @@ pub enum GossipPayload {
     Ack {
         /// Piggybacked membership updates.
         updates: Vec<MembershipUpdate>,
+        /// Whether this ACK was *forwarded* by a relay on behalf of the
+        /// `sender` (an indirect-probe rescue), rather than sent directly by
+        /// the sender itself. On a relayed ACK the transport socket is the
+        /// relay's, not the sender's, so the receiver must NOT record the
+        /// sender's address from it (M13). `#[serde(default)]` so an ACK from a
+        /// peer predating this field decodes as a direct ACK.
+        #[serde(default)]
+        relayed: bool,
     },
 }
 
@@ -138,7 +146,7 @@ impl GossipPayload {
         match self {
             GossipPayload::Ping { updates }
             | GossipPayload::PingReq { updates, .. }
-            | GossipPayload::Ack { updates } => updates,
+            | GossipPayload::Ack { updates, .. } => updates,
         }
     }
 }
@@ -446,7 +454,10 @@ mod tests {
 
     #[test]
     fn gossip_payload_updates_extracts_from_ack() {
-        let payload = GossipPayload::Ack { updates: vec![] };
+        let payload = GossipPayload::Ack {
+            updates: vec![],
+            relayed: false,
+        };
         assert!(payload.updates().is_empty());
     }
 
