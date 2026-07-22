@@ -1012,32 +1012,47 @@ async fn kill_fault_actually_kills_the_instance() {
 
     let harness = TestHarness::start().await;
 
-    // A long-running process app so there's a live PID to kill.
+    // Two replicas so killing one leaves a survivor — the replica-minimum
+    // safety rail (M1) refuses a Kill that would take out a service's last
+    // replica, so a single-replica victim can't be killed by design.
     let config = Config::parse(
         r#"
         [app.victim]
         image = "proc-grill:image-ignored"
         command = ["sleep", "600"]
+        replicas = 2
     "#,
     )
     .unwrap();
     harness.client.apply(&config).await.unwrap();
-    harness
-        .wait_for_instance("victim", Duration::from_secs(2), |status| {
-            status.pid.is_some()
-        })
-        .await;
 
-    // Grab the PID before the kill.
-    let before = harness.client.status().await.unwrap();
-    let pid_before = before
-        .iter()
-        .find(|s| s.app_name == "victim")
-        .and_then(|s| s.pid)
-        .expect("victim should have a pid");
+    // Wait until both replicas have live PIDs.
+    let mut pids_before: Vec<u32> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        pids_before = harness
+            .client
+            .status()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|s| s.app_name == "victim")
+            .filter_map(|s| s.pid)
+            .collect();
+        if pids_before.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        pids_before.len(),
+        2,
+        "both victim replicas should have pids"
+    );
 
+    // Kill one of the two replicas — within the safety budget (one survives).
     let fault = FaultRequest {
-        fault_type: FaultType::Kill { count: 0 },
+        fault_type: FaultType::Kill { count: 1 },
         target_service: "victim".into(),
         target_instance: None,
         target_node: None,
@@ -1049,15 +1064,15 @@ async fn kill_fault_actually_kills_the_instance() {
     };
     harness.client.inject_fault(&fault).await.unwrap();
 
-    // The original PID must be dead (the supervisor may restart the app
-    // with a NEW pid, but the killed process is gone).
+    // At least one of the original PIDs must be dead (the supervisor may
+    // restart with a NEW pid, but the killed process is gone).
     let killed = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut ok = false;
         while tokio::time::Instant::now() < deadline {
-            // kill -0 to the old pid: an error means it's gone.
-            let alive = libc_kill(pid_before as i32, 0) == 0;
-            if !alive {
+            // kill -0 to an old pid: an error means it's gone.
+            let any_dead = pids_before.iter().any(|pid| libc_kill(*pid as i32, 0) != 0);
+            if any_dead {
                 ok = true;
                 break;
             }
@@ -1067,7 +1082,7 @@ async fn kill_fault_actually_kills_the_instance() {
     };
     assert!(
         killed,
-        "the victim's original process {pid_before} survived the Kill fault"
+        "no victim process among {pids_before:?} died after the Kill fault"
     );
 }
 

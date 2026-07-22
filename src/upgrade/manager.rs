@@ -214,12 +214,16 @@ impl UpgradeManager {
             embedded: directive.embedded_signature.clone(),
             external: directive.external_signature.clone(),
         };
+        // Treat the upgrade as network — and so demand the external signature —
+        // when the bytes came from the network by either route (M5): a Pickle
+        // fetch, or a single-node download staged as a local file.
+        let is_network = directive.source.is_network() || directive.network_provenance;
         signing::verify_binary(
             &bytes,
             &envelope,
             &self.release_keys,
             self.external_key.as_ref(),
-            directive.source.is_network(),
+            is_network,
         )?;
 
         // First upgrade from an un-versioned install: adopt the running
@@ -680,6 +684,7 @@ mod tests {
             embedded_signature: sign(&fixture.release_pkcs8, bytes).unwrap(),
             external_signature: Some(sign(&fixture.external_pkcs8, bytes).unwrap()),
             source: BinarySource::LocalFile { path },
+            network_provenance: false,
         }
     }
 
@@ -960,11 +965,54 @@ mod tests {
             embedded_signature: sign(&release_pkcs8, bytes).unwrap(),
             external_signature: None,
             source: BinarySource::LocalFile { path },
+            network_provenance: false,
         };
         manager.prepare(&directive, vec![]).await.unwrap().unwrap();
 
         // The running (test) binary was copied in as the rollback target.
         assert!(binary_dir.join("bun-v0.1.0").is_file());
+    }
+
+    // M5: the single-node network flow downloads the artefact and stages it as
+    // a LocalFile, so `source.is_network()` is false. It must still demand the
+    // operator's external signature — otherwise anyone who can write the staged
+    // file bypasses the second key that network upgrades exist to require.
+    #[tokio::test]
+    async fn network_provenance_local_file_still_requires_external_signature() {
+        let fixture = fixture();
+        let bytes = b"downloaded binary";
+        let path = fixture.binary_dir.join("staged-download");
+        std::fs::write(&path, bytes).unwrap();
+
+        // A downloaded-then-staged binary with only the embedded signature: the
+        // shape a compromised mirror or a stripped external signature produces.
+        let unsigned = UpgradeDirective {
+            upgrade_id: "net-1".to_string(),
+            target_version: v("0.2.0"),
+            binary_sha256: sha256_hex(bytes),
+            embedded_signature: sign(&fixture.release_pkcs8, bytes).unwrap(),
+            external_signature: None,
+            source: BinarySource::LocalFile { path: path.clone() },
+            network_provenance: true,
+        };
+        let err = fixture
+            .manager
+            .prepare(&unsigned, vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpgradeError::ExternalSignatureInvalid));
+
+        // The same provenance with the external signature present is accepted.
+        let signed = UpgradeDirective {
+            external_signature: Some(sign(&fixture.external_pkcs8, bytes).unwrap()),
+            ..unsigned
+        };
+        fixture
+            .manager
+            .prepare(&signed, vec![])
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

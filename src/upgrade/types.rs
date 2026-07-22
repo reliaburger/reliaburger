@@ -23,6 +23,15 @@ pub struct UpgradeDirective {
     /// `None` only for air-gapped (local file) upgrades.
     pub external_signature: Option<String>,
     pub source: BinarySource,
+    /// Whether the binary bytes came from the network, independent of how they
+    /// are delivered to the node (M5). The single-node network flow downloads
+    /// the artefact and stages it as a `LocalFile`, but it is still a network
+    /// upgrade and must require the operator's external signature. Verification
+    /// treats the upgrade as network when this is set OR the source is network.
+    /// `#[serde(default)]` so directives from older peers still parse (as
+    /// non-network, matching their old behaviour).
+    #[serde(default)]
+    pub network_provenance: bool,
 }
 
 /// Where the node obtains the binary bytes.

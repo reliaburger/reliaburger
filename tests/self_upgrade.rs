@@ -254,6 +254,7 @@ command = ["{testapp}", "--mode", "healthy", "--port", "{port}"]
             embedded_signature: signing::sign(&self.release_pkcs8, &bytes).unwrap(),
             external_signature: Some(signing::sign(&self.external_pkcs8, &bytes).unwrap()),
             source: BinarySource::LocalFile { path },
+            network_provenance: false,
         }
     }
 

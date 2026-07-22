@@ -2364,6 +2364,7 @@ mod tests {
             expires_at: std::time::SystemTime::now(),
             consumed: false,
             attestation_mode: crate::sesame::types::AttestationMode::None,
+            node_id: "node-02".to_string(),
         };
         inner.apply_request(&RaftRequest::CreateJoinToken(jt));
         assert_eq!(inner.state.security_state.join_tokens.len(), 1);
@@ -2378,6 +2379,7 @@ mod tests {
             expires_at: std::time::SystemTime::now(),
             consumed: false,
             attestation_mode: crate::sesame::types::AttestationMode::None,
+            node_id: "node-02".to_string(),
         };
         inner.apply_request(&RaftRequest::CreateJoinToken(jt));
         inner.apply_request(&RaftRequest::ConsumeJoinToken {
@@ -2398,6 +2400,7 @@ mod tests {
             expires_at: std::time::SystemTime::now(),
             consumed: false,
             attestation_mode: crate::sesame::types::AttestationMode::None,
+            node_id: "node-02".to_string(),
         };
         inner.apply_request(&RaftRequest::CreateJoinToken(jt));
 

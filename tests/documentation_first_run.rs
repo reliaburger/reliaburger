@@ -551,12 +551,15 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         deployer,
         "join-token",
         "create",
+        "--node-id",
+        "node-02",
     ]);
     assert_eq!(denied.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&denied.stderr).contains("403"));
 
     let mut issued = Vec::new();
-    for _ in 0..2 {
+    for index in 0..2 {
+        let node_id = format!("node-{:02}", index + 2);
         let output = run_relish(&[
             "--endpoint",
             &endpoint,
@@ -566,6 +569,8 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
             admin,
             "join-token",
             "create",
+            "--node-id",
+            &node_id,
             "--ttl",
             "15m",
         ]);
@@ -603,14 +608,16 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         assert_eq!(identity.node_id, node_id);
     }
 
+    // issued[0] is bound to node-02 and was already consumed by it, so
+    // re-enrolling node-02 is refused as consumed (single-use).
     let reused = run_relish(&[
         "join",
         "--token",
         &issued[0],
         "--node-id",
-        "node-04",
+        "node-02",
         "--identity-dir",
-        root.path().join("node-04").to_str().unwrap(),
+        root.path().join("node-02-reuse").to_str().unwrap(),
         &endpoint,
     ]);
     assert_eq!(reused.status.code(), Some(1));
@@ -625,6 +632,8 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         admin,
         "join-token",
         "create",
+        "--node-id",
+        "node-05",
         "--ttl",
         "1s",
     ]);
@@ -756,7 +765,7 @@ fn published_first_run_snippets_do_not_drift() {
     let security_book = std::fs::read_to_string(root.join("docs/book/04-trust-no-one.md")).unwrap();
     assert!(security_book.contains("--node-id node-02"));
     assert!(security_book.contains("https://10.0.1.5:9117"));
-    assert!(security_book.contains("join-token create --ttl 15m"));
+    assert!(security_book.contains("join-token create --node-id node-02 --ttl 15m"));
     assert!(!security_book.contains("Right now, you\ncan't"));
     assert!(!security_book.contains("relish join --token rbrg_join_1_a7f3b9c2... 10.0.1.5:9443"));
 }

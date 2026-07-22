@@ -1,5 +1,5 @@
-//! Cluster initialisation — generates the full CA hierarchy,
-//! age keypair, and first join token.
+//! Cluster initialisation — generates the full CA hierarchy, age keypair,
+//! and the first node's certificate.
 //!
 //! Called by `relish init` to bootstrap a new cluster's security state.
 
@@ -11,8 +11,7 @@ use super::crypto;
 use super::oidc;
 use super::secret;
 use super::types::{
-    AgeKeyScope, AttestationMode, CertificateAuthority, JoinToken, NodeCertificate, SecurityState,
-    SerialNumber,
+    AgeKeyScope, CertificateAuthority, NodeCertificate, SecurityState, SerialNumber,
 };
 
 /// Errors from cluster initialisation.
@@ -36,8 +35,6 @@ pub struct InitResult {
     pub security_state: SecurityState,
     /// The first node's certificate (private key stays on this node).
     pub node_certificate: NodeCertificate,
-    /// The join token plaintext (shown to admin once).
-    pub join_token_plaintext: String,
     /// The age public key (for encrypting secrets).
     pub age_public_key: String,
     /// The cluster name.
@@ -51,14 +48,12 @@ pub struct InitResult {
     pub master_secret: [u8; 32],
 }
 
-/// Default join token TTL: 15 minutes.
-const JOIN_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
-
 /// Initialise a new cluster's security state.
 ///
-/// Generates the full CA hierarchy, age keypair, first node certificate,
-/// and a one-time join token. The root CA private key is encrypted with
-/// the age public key and written to disk as a sealed backup.
+/// Generates the full CA hierarchy, age keypair, and first node certificate.
+/// No join token is minted: a token is bound to the one node id it may enrol
+/// (M4), which init cannot know. The root CA private key is encrypted with the
+/// age public key and written to disk as a sealed backup.
 pub fn initialize_cluster(
     cluster_name: &str,
     node_id: &str,
@@ -106,23 +101,18 @@ pub fn initialize_cluster(
         ca_generation: 0,
     };
 
-    // Step 6: Generate a join token
-    let (token_plaintext, token_hash) = ca::generate_join_token()?;
-    let join_token = JoinToken {
-        token_hash,
-        expires_at: SystemTime::now() + JOIN_TOKEN_TTL,
-        consumed: false,
-        attestation_mode: AttestationMode::None,
-    };
+    // No bootstrap join token: a join token is now bound to the id of the one
+    // node it may enrol (M4), and init cannot know the next node's id. The
+    // operator mints one after boot with `relish join-token create --node-id`.
 
-    // Step 7: Wrap the root CA private key with age and store in the CA
+    // Step 6: Wrap the root CA private key with age and store in the CA
     // (Root CA private key is deleted from cluster nodes — only sealed backup exists)
     let root_ca_wrapped = CertificateAuthority {
         private_key_wrapped: None, // Root key NOT stored in Raft
         ..hierarchy.root.ca
     };
 
-    // Step 8: Build the security state for Raft
+    // Step 7: Build the security state for Raft
     let security_state = SecurityState {
         certificate_authorities: vec![
             root_ca_wrapped,
@@ -132,7 +122,7 @@ pub fn initialize_cluster(
         ],
         age_keypairs: vec![age_keypair],
         api_tokens: vec![],
-        join_tokens: vec![join_token],
+        join_tokens: vec![],
         next_serial: 6, // Next available serial after root(1), node(2), workload(3), ingress(4), first-node(5)
         oidc_signing_config: Some(oidc_config),
         crl: super::types::Crl::default(),
@@ -142,7 +132,6 @@ pub fn initialize_cluster(
     Ok(InitResult {
         security_state,
         node_certificate,
-        join_token_plaintext: token_plaintext,
         age_public_key,
         cluster_name: cluster_name.to_string(),
         sealed_root_ca_path: sealed_path.display().to_string(),
@@ -176,8 +165,9 @@ pub fn format_init_output(result: &InitResult) -> String {
          \n\
          \x20 OIDC key ID:     {oidc_kid}\n\
          \n\
-         \x20 Join token (valid 15 minutes, single use):\n\
-         \x20   {join_token}\n",
+         \x20 To enrol another node, start this one, then mint a token bound\n\
+         \x20 to that node's id:\n\
+         \x20   relish join-token create --node-id <node-id>\n",
         cluster = result.cluster_name,
         root_serial = root.serial,
         node_serial = node_ca.serial,
@@ -185,7 +175,6 @@ pub fn format_init_output(result: &InitResult) -> String {
         ingress_serial = ingress_ca.serial,
         sealed_path = result.sealed_root_ca_path,
         oidc_kid = result.oidc_key_id,
-        join_token = result.join_token_plaintext,
     )
 }
 
@@ -221,20 +210,14 @@ mod tests {
     }
 
     #[test]
-    fn initialize_cluster_produces_usable_join_token() {
+    fn initialize_cluster_mints_no_bootstrap_join_token() {
         let dir = tempfile::tempdir().unwrap();
         let result = initialize_cluster("test", "node-01", dir.path()).unwrap();
 
-        assert!(result.join_token_plaintext.starts_with("rbrg_join_1_"));
-        assert_eq!(result.security_state.join_tokens.len(), 1);
-
-        let stored = &result.security_state.join_tokens[0];
-        assert!(!stored.consumed);
-        assert!(stored.expires_at > SystemTime::now());
-        assert!(super::super::ca::verify_join_token(
-            &result.join_token_plaintext,
-            &stored.token_hash
-        ));
+        // A join token is bound to the id of the one node it enrols (M4), and
+        // init cannot know the next node's id — so it mints none. The operator
+        // creates a bound token after boot with `relish join-token create`.
+        assert!(result.security_state.join_tokens.is_empty());
     }
 
     #[test]
@@ -288,7 +271,10 @@ mod tests {
 
         assert!(output.contains("Cluster initialised."));
         assert!(output.contains("prod"));
-        assert!(output.contains("rbrg_join_1_"));
+        // Init no longer mints a bootstrap token (M4); it points the operator
+        // at the bound-token mint command instead.
+        assert!(!output.contains("rbrg_join_1_"));
+        assert!(output.contains("join-token create --node-id"));
         assert!(output.contains("root-ca.age"));
         assert!(output.contains("OIDC key ID:"));
     }

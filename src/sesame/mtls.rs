@@ -421,6 +421,21 @@ pub fn build_cluster_http_client(
     identity: &NodeIdentity,
     crl: CrlHandle,
 ) -> Result<reqwest::Client, MtlsError> {
+    build_cluster_http_client_with_bearer(identity, crl, None)
+}
+
+/// Like [`build_cluster_http_client`], but attaches `bearer` as a default
+/// `Authorization: Bearer` header on every request.
+///
+/// The Pickle registry authorises node-to-node replication by the internal
+/// service token, not by the client certificate, so the replication client
+/// must present the token even under mTLS (M2). Passing `None` behaves
+/// exactly like [`build_cluster_http_client`].
+pub fn build_cluster_http_client_with_bearer(
+    identity: &NodeIdentity,
+    crl: CrlHandle,
+    bearer: Option<&str>,
+) -> Result<reqwest::Client, MtlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let verifier = Arc::new(PinnedChainServerVerifier::new(
         identity.node_ca_der.clone(),
@@ -433,10 +448,42 @@ pub fn build_cluster_http_client(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
+    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
+    if let Some(headers) = bearer_default_headers(bearer)? {
+        builder = builder.default_headers(headers);
+    }
+    builder
         .build()
         .map_err(|e| MtlsError::ConfigFailed(format!("cluster http client: {e}")))
+}
+
+/// Build a default-header map carrying `Authorization: Bearer <token>`, or
+/// `None` when no token is supplied.
+fn bearer_default_headers(
+    bearer: Option<&str>,
+) -> Result<Option<reqwest::header::HeaderMap>, MtlsError> {
+    let Some(token) = bearer else {
+        return Ok(None);
+    };
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|e| MtlsError::ConfigFailed(format!("service token header: {e}")))?;
+    value.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, value);
+    Ok(Some(headers))
+}
+
+/// Build a plain (non-mTLS) HTTP client that attaches `bearer` as a default
+/// `Authorization: Bearer` header. Used for the registry replication client
+/// when the cluster is running without mTLS.
+pub fn build_bearer_http_client(bearer: Option<&str>) -> Result<reqwest::Client, MtlsError> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(headers) = bearer_default_headers(bearer)? {
+        builder = builder.default_headers(headers);
+    }
+    builder
+        .build()
+        .map_err(|e| MtlsError::ConfigFailed(format!("bearer http client: {e}")))
 }
 
 /// Build a rustls `ClientConfig` for connecting to cluster peers.
@@ -949,5 +996,19 @@ mod tests {
         let tag = gossip_hmac::sign(&key1, b"test");
         // Same master secret → same key → cross-verifies.
         assert!(gossip_hmac::verify(&key2, b"test", &tag));
+    }
+
+    #[test]
+    fn bearer_headers_are_present_and_sensitive_when_a_token_is_given() {
+        let headers = bearer_default_headers(Some("s3cr3t")).unwrap().unwrap();
+        let value = headers.get(reqwest::header::AUTHORIZATION).unwrap();
+        assert_eq!(value.to_str().unwrap(), "Bearer s3cr3t");
+        // Marked sensitive so it is redacted from logs (M2).
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn no_bearer_headers_without_a_token() {
+        assert!(bearer_default_headers(None).unwrap().is_none());
     }
 }

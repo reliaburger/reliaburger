@@ -24,6 +24,14 @@ use crate::sesame::auth::AuthState;
 /// Layers are pushed monolithically or chunked; each PATCH/PUT body is
 /// bounded so one request can't buffer an unbounded blob in memory. Large
 /// layers arrive as multiple bounded chunks.
+///
+/// Note (M11): this bounds *one* request, not aggregate memory — the handlers
+/// take the body as an in-memory `Bytes`, so N concurrent monolithic pushes
+/// can still buffer up to N × this. The peer-pull path already streams to disk
+/// (see `pull::pull_layer_from_peer`); streaming the push handlers the same way
+/// — consuming the request body as a chunked stream straight into the upload
+/// temp — is TODO(Phase 15). Until then, keep this ceiling modest and rely on
+/// chunked pushes (buildah/docker default) to keep individual bodies small.
 const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
 
 /// Shared state for Pickle API handlers.
@@ -575,7 +583,7 @@ struct CompleteUploadQueryOpt {
 /// `PUT /v2/{name}/blobs/uploads/{upload_id}?digest=` — complete upload.
 async fn blob_upload_complete(
     state: &PickleState,
-    _name: &str,
+    name: &str,
     upload_id: &str,
     digest_str: &str,
     headers_in: &HeaderMap,
@@ -603,6 +611,25 @@ async fn blob_upload_complete(
         }
     }
 
+    // Enforce the storage quota against the fully-assembled blob before it is
+    // committed (M10). The monolithic POST path checks at initiate time, but a
+    // chunked or bare-PUT upload only knows its total size here — the on-disk
+    // temp file is authoritative. Over quota: drop the temp and the session so
+    // nothing lands in the blob store.
+    match state.store.upload_size(upload_id).await {
+        Ok(incoming) => {
+            if let Err(response) = state.enforce_quota(name, incoming).await {
+                state.store.cancel_upload(upload_id).await;
+                state.sessions.complete(upload_id).await;
+                return response;
+            }
+        }
+        Err(super::types::PickleError::InvalidUploadId(_)) => {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    }
+
     let result = state.store.complete_upload(upload_id, &digest).await;
     // Whatever the outcome, the session is finished (REG8).
     state.sessions.complete(upload_id).await;
@@ -612,7 +639,7 @@ async fn blob_upload_complete(
             // Location of the created blob (OCI distribution spec).
             headers.insert(
                 "location",
-                format!("/v2/{_name}/blobs/{}", digest.as_str())
+                format!("/v2/{name}/blobs/{}", digest.as_str())
                     .parse()
                     .expect("ASCII header value"),
             );
@@ -740,6 +767,15 @@ fn check_descriptor(
 /// use OCI Distribution error bodies, so real clients print something
 /// sensible. Only then are the raw bytes stored as a content-addressed
 /// blob and the catalogue commit recorded.
+/// Whether `name` is in the reserved pull-through cache namespace (M3).
+///
+/// The cache stores upstream images under `cache/<host>/<repo>`; only the
+/// internal cache-fill path may write there. A bare `cache` repo is fine — the
+/// reservation is the `cache/` prefix.
+fn is_reserved_cache_repo(name: &str) -> bool {
+    name == "cache" || name.starts_with("cache/")
+}
+
 async fn manifest_put(
     state: &PickleState,
     name: &str,
@@ -750,6 +786,22 @@ async fn manifest_put(
     // Registry writes require a principal once auth is configured (REG4).
     if let Err(response) = state.authorise_write(headers).await {
         return response;
+    }
+
+    // The `cache/` namespace is reserved for the pull-through cache, filled
+    // internally via record_commit (M3). A client push there would let a
+    // Deployer plant an image under `cache/<host>/<repo>` that the scheduler
+    // exempts from signature checks and upstream::decide treats as a cache hit
+    // — poisoning every node's pull of that image and bypassing
+    // require_signatures. Refuse it.
+    if is_reserved_cache_repo(name) {
+        return oci_error(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "the cache/ namespace is reserved for the pull-through cache and \
+             cannot be pushed to directly"
+                .to_string(),
+        );
     }
 
     // Hash the manifest bytes off the async runtime (REG4) — small for a
@@ -1261,6 +1313,37 @@ mod tests {
         assert_eq!(json["errors"][0]["code"], code, "body: {json}");
     }
 
+    #[test]
+    fn cache_namespace_is_reserved() {
+        assert!(is_reserved_cache_repo("cache"));
+        assert!(is_reserved_cache_repo("cache/docker.io/library/redis"));
+        // Not the reserved namespace.
+        assert!(!is_reserved_cache_repo("cached"));
+        assert!(!is_reserved_cache_repo("myteam/cache-warmer"));
+        assert!(!is_reserved_cache_repo("redis"));
+    }
+
+    /// M3: a client push to the reserved `cache/` namespace is refused, so it
+    /// can't poison the pull-through cache to bypass signature checks.
+    #[tokio::test]
+    async fn push_to_cache_namespace_is_forbidden() {
+        let (state, _dir) = test_state();
+        let app = test_router(state);
+        let manifest_json = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": format!("sha256:{}", "b".repeat(64)), "size": 1 },
+            "layers": []
+        });
+        let resp = put_manifest(
+            &app,
+            "/v2/cache/docker.io/library/redis/manifests/7",
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     /// REG3: a manifest referencing a blob the registry never received
     /// is rejected with `MANIFEST_BLOB_UNKNOWN` — the previous version
     /// of this test asserted Created, encoding the bug.
@@ -1706,6 +1789,78 @@ mod tests {
         assert!(
             !store.has_blob(&digest),
             "over-quota blob must not be stored"
+        );
+    }
+
+    /// REG4/M10: a chunked upload whose assembled size breaches the quota is
+    /// refused at completion, and nothing lands in the blob store. The
+    /// monolithic path checks at initiate; this covers the chunked/bare-PUT
+    /// path that previously skipped quota entirely.
+    #[tokio::test]
+    async fn chunked_upload_over_repository_quota_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlobStore::new(dir.path()));
+        let state = PickleState {
+            store: Arc::clone(&store),
+            catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
+            node_raft_id: 7,
+            council: None,
+            persist_path: None,
+            auth: None,
+            quota: QuotaConfig {
+                per_repository_bytes: 4,
+                total_bytes: 0,
+            },
+            sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
+        };
+        let app = test_router(state);
+
+        // Initiate a chunked session (no digest, no body).
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
+
+        // Push a chunk larger than the 4-byte quota.
+        let blob = b"way too big for the quota".to_vec();
+        let digest = compute_sha256(&blob);
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(&location)
+                    .body(Body::from(blob.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Completing must be refused with 413 and store nothing.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("{location}?digest={}", digest.as_str()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !store.has_blob(&digest),
+            "over-quota chunked blob must not be committed"
         );
     }
 

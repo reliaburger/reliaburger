@@ -720,7 +720,7 @@ relish secret encrypt --pubkey <key> --file <path> # Encrypt a file
 relish secret rotate                # Generate new keypair, re-encrypt all secrets
 
 # Tokens
-relish join-token create --ttl 15m # Create one node-enrolment token
+relish join-token create --node-id <id> --ttl 15m # One token, bound to that node id
 relish token create --name <name>   # Create new API token
 relish token create --name <name> --role <role> # admin, deployer, read-only
 relish token create --name <name> --ttl-days <days>
@@ -1133,14 +1133,17 @@ cluster master key, start Bun or claim that gossip membership has converged;
 those are explicit provisioning and startup steps. Port 9443 is a gossip seed,
 not a valid API address for this command.
 
-**`relish join-token create [--ttl <duration>]`**
+**`relish join-token create --node-id <id> [--ttl <duration>]`**
 
-Calls `POST /v1/join-token/create` with `ttl_seconds`. The command accepts a
-whole number followed by `s`, `m` or `h`, defaults to `15m`, and rejects values
-outside `1s..=1h` before dispatch. The API requires a user Admin principal
-(the internal service principal is not enough), creates the token server-side,
-commits only `JoinToken { token_hash, expires_at, consumed: false,
-attestation_mode }` to Raft, then returns the plaintext once:
+Calls `POST /v1/join-token/create` with `ttl_seconds` and `node_id`. `--node-id`
+is mandatory: the token is bound to the one node id it may enrol, so it cannot be
+replayed to obtain a certificate for another node (a token minted for `node-05`
+is refused if used to enrol `node-01`). The command accepts a whole number
+followed by `s`, `m` or `h`, defaults to `15m`, and rejects values outside
+`1s..=1h` before dispatch. The API requires a user Admin principal (the internal
+service principal is not enough), creates the token server-side, commits only
+`JoinToken { token_hash, expires_at, consumed: false, attestation_mode, node_id }`
+to Raft, then returns the plaintext once:
 
 ```json
 {

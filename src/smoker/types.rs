@@ -255,6 +255,10 @@ pub enum FaultReversal {
     },
     /// A Pause: SIGCONT every instance that was frozen.
     Pause(Vec<i32>),
+    /// A network partition: unblock the named peers on both transports.
+    /// Stored as peer node ids (resolved to addresses at reversal time so a
+    /// peer that changed address is still cleared correctly).
+    Partition { peers: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------

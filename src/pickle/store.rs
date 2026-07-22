@@ -266,6 +266,64 @@ impl BlobStore {
         Ok(())
     }
 
+    /// Commit an already-verified upload temp into the blob store by moving
+    /// it, without re-reading its bytes (M11).
+    ///
+    /// [`complete_upload`] reads the whole temp file back into memory to
+    /// re-hash it — fine for a small monolithic push, but for a multi-gigabyte
+    /// layer streamed from a peer it would re-buffer the entire blob. The peer
+    /// pull hashes incrementally as it streams to disk, so the digest is
+    /// already proven; this just fsyncs the temp, renames it into place, and
+    /// fsyncs the parent directory (REG5), all O(1) in memory. The caller MUST
+    /// have verified the content hashes to `digest` first.
+    pub async fn commit_upload_as_blob(
+        &self,
+        upload_id: &str,
+        digest: &Digest,
+    ) -> Result<(), PickleError> {
+        validate_upload_id(upload_id)?;
+        let upload_path = self.upload_path(upload_id);
+        if !upload_path.exists() {
+            return Err(PickleError::UploadNotFound(upload_id.to_string()));
+        }
+        let blob_path = self.blob_path(digest);
+        // The temp and the blob store live under the same base dir, so the
+        // rename is a same-filesystem atomic move. Runs on the blocking pool:
+        // fsync and rename are blocking syscalls. A concurrent pull of the same
+        // digest renames identical content-addressed bytes over the same
+        // target — harmless.
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let parent = blob_path.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            {
+                let file = std::fs::File::open(&upload_path)?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&upload_path, &blob_path)?;
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| PickleError::CatalogPersist(format!("blob commit task failed: {e}")))??;
+        Ok(())
+    }
+
+    /// The number of bytes accumulated in an in-flight upload session.
+    ///
+    /// Used to enforce the storage quota on chunked and bare-PUT uploads
+    /// before they are committed (REG4/M10) — the on-disk temp file is the
+    /// authoritative running size, independent of what the client claimed.
+    pub async fn upload_size(&self, upload_id: &str) -> Result<u64, PickleError> {
+        validate_upload_id(upload_id)?;
+        let path = self.upload_path(upload_id);
+        if !path.exists() {
+            return Err(PickleError::UploadNotFound(upload_id.to_string()));
+        }
+        Ok(tokio::fs::metadata(&path).await?.len())
+    }
+
     /// Cancel an upload session, cleaning up the temp file.
     pub async fn cancel_upload(&self, upload_id: &str) {
         if validate_upload_id(upload_id).is_err() {
@@ -420,6 +478,41 @@ mod tests {
 
         store.complete_upload(&upload_id, &digest).await.unwrap();
         assert_eq!(store.read_blob(&digest).unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn commit_upload_as_blob_moves_the_temp_without_re_reading() {
+        // M11: the streaming peer-pull path hashes as it writes, then commits
+        // by rename. The committed blob must be byte-identical and the temp
+        // gone (moved, not copied).
+        let (store, _dir) = test_store();
+        let part1 = b"streamed ";
+        let part2 = b"in chunks";
+        let full = [&part1[..], &part2[..]].concat();
+        let digest = compute_sha256(&full);
+
+        let upload_id = store.initiate_upload().await.unwrap();
+        store.write_upload_chunk(&upload_id, part1).await.unwrap();
+        store.write_upload_chunk(&upload_id, part2).await.unwrap();
+
+        store
+            .commit_upload_as_blob(&upload_id, &digest)
+            .await
+            .unwrap();
+
+        assert!(store.has_blob(&digest));
+        assert_eq!(store.read_blob(&digest).unwrap(), full);
+        // The temp was moved, not left behind.
+        assert!(!store.upload_path(&upload_id).exists());
+    }
+
+    #[tokio::test]
+    async fn commit_upload_as_blob_fails_for_an_unknown_session() {
+        let (store, _dir) = test_store();
+        let digest = compute_sha256(b"anything");
+        // A validly-shaped but never-created upload id.
+        let result = store.commit_upload_as_blob(&"a".repeat(32), &digest).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

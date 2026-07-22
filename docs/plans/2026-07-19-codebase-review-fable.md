@@ -640,10 +640,10 @@ security/data-loss; do it before anything else.
 18. M25 + M26 — scheduler pass-cache discard on error, daemon-set `want` from eligible set, namespace-qualified autoscale match. ✅ (Phase D)
 
 **Phase E — chaos, registry, supply-chain, upgrade**
-19. M1 — make Smoker faults real and reversible (partition arm, heal/TTL reversal loop, safety on every path).
-20. M2 + M3 + M10 + M11 — Pickle replication auth, reserve `cache/`, quota on chunked uploads, streaming to bound memory.
-21. M4 — bind join tokens to a node id.
-22. M5 + M6 — upgrade dual-sig on single-node network path, live-quorum gate on the leader bounce.
+19. M1 — make Smoker faults real and reversible. ✅ (Phase E) — heal/TTL reversal loop, `FaultReversal::Partition` for the council-partition path, safety context built (and rails run) on every inject path including with no cluster handle, and partial-cgroup rollback. The service-to-service `Partition` apply arm stays an accepted no-op without eBPF, flagged `TODO(Phase 15)`: the quorum-rail acceptance test injects a Partition to exercise the safety context on a no-eBPF cluster, so tightening it needs that test moved onto an eBPF node first.
+20. M2 + M3 + M10 + M11 — Pickle replication auth ✅, reserve `cache/` ✅, quota on chunked uploads ✅, streaming peer pulls to bound memory ✅ (Phase E). Push-side request-body streaming (`MAX_REQUEST_BYTES`) deferred `TODO(Phase 15)`.
+21. M4 — bind join tokens to a node id. ✅ (Phase E) — `--node-id` mandatory on `join-token create`; `check_join_token` refuses a mismatched id; `init` mints no bootstrap token.
+22. M5 + M6 — upgrade dual-sig on single-node network path ✅ (Phase E), live-quorum gate on the leader bounce ✅ (Phase C part 2 branch, M6 commit).
 
 **Phase F — observability, ingress, CLI, then the Optional list**
 23. M8 + M9 — ingress cluster-CA cert issuance, WS `X-Forwarded-*` sanitisation.

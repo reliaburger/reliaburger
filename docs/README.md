@@ -294,10 +294,10 @@ node. Join tokens are deliberately separate from API bearer tokens:
 ```sh
 JOIN_NODE_02="$(target/debug/relish \
   --ca-cert cluster/identity/root-ca.crt \
-  join-token create --ttl 15m)"
+  join-token create --node-id node-02 --ttl 15m)"
 JOIN_NODE_03="$(target/debug/relish \
   --ca-cert cluster/identity/root-ca.crt \
-  join-token create --ttl 15m)"
+  join-token create --node-id node-03 --ttl 15m)"
 
 # Run this on node-02 after provisioning the binary, cluster master key and
 # a node-specific config. Repeat with JOIN_NODE_03 and node-03.
@@ -378,7 +378,7 @@ Commands:
 | `nodes` | List cluster nodes and their gossip state |
 | `council` | Show council (Raft) composition and status |
 | `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
-| `join-token create --ttl 15m` | Mint one Admin-authorised, single-use node-enrolment token |
+| `join-token create --node-id <id> --ttl 15m` | Mint one Admin-authorised, single-use token that enrols exactly that node id |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |

@@ -532,6 +532,7 @@ mod tests {
                 expires_at: std::time::SystemTime::UNIX_EPOCH,
                 consumed: false,
                 attestation_mode: crate::sesame::types::AttestationMode::None,
+                node_id: "node-02".to_string(),
             }),
             RaftRequest::ConsumeJoinToken {
                 token_hash: [0xAB; 32],

@@ -24,6 +24,7 @@ fn bootstrap_security_state() -> (SecurityState, String, [u8; 32]) {
         expires_at: SystemTime::now() + Duration::from_secs(900),
         consumed: false,
         attestation_mode: AttestationMode::None,
+        node_id: "node-02".to_string(),
     };
 
     let state = SecurityState {
@@ -61,7 +62,7 @@ fn issue_for(
     node_id: &str,
     ikm: &[u8],
 ) -> Result<join::JoinResult, join::JoinError> {
-    join::check_join_token(token, state)?;
+    join::check_join_token(token, node_id, state)?;
     // Atomic consume + serial (single-node stand-in for the Raft entry).
     let jt = state
         .join_tokens
@@ -85,7 +86,7 @@ fn join_token_single_use_enforced() {
     assert!(result.is_ok());
 
     // Second use should fail — token is consumed
-    let result2 = issue_for(&mut state, &token, "node-03", &ikm);
+    let result2 = issue_for(&mut state, &token, "node-02", &ikm);
     assert!(result2.is_err());
     let err = format!("{}", result2.unwrap_err());
     assert!(
@@ -106,6 +107,7 @@ fn join_token_expiry_enforced() {
         expires_at: SystemTime::now() - Duration::from_secs(1),
         consumed: false,
         attestation_mode: AttestationMode::None,
+        node_id: "node-02".to_string(),
     };
 
     let mut state = SecurityState {
@@ -283,7 +285,7 @@ async fn spawn_issuer(
 
         let mut state = issuer.state.lock().unwrap();
         let issued = (|| {
-            join::check_join_token(token, &state)?;
+            join::check_join_token(token, node_id, &state)?;
             let jt = state
                 .join_tokens
                 .iter_mut()
