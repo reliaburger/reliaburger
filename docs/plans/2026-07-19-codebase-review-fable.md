@@ -645,11 +645,11 @@ security/data-loss; do it before anything else.
 21. M4 — bind join tokens to a node id. ✅ (Phase E) — `--node-id` mandatory on `join-token create`; `check_join_token` refuses a mismatched id; `init` mints no bootstrap token.
 22. M5 + M6 — upgrade dual-sig on single-node network path ✅ (Phase E), live-quorum gate on the leader bounce ✅ (Phase C part 2 branch, M6 commit).
 
-**Phase F — observability, ingress, CLI, then the Optional list**
-23. M8 + M9 — ingress cluster-CA cert issuance, WS `X-Forwarded-*` sanitisation.
-24. M17–M20 — rollup restart idempotency, webhook-URL redaction, streaming log SQL, alert freshness.
-25. M12 + M13 + M15 + M16 — gossip incarnation persistence, relay-ACK address handling, reconstruction staleness/coverage.
-26. M21 + M27 + M28 — CLI namespaces + auth, GitOps HEAD/replay/credentials, k8s import/export fidelity.
+**Phase F — observability, ingress, CLI** — DONE (one PR)
+23. M8 + M9 — ingress per-SNI cluster-CA cert resolver ✅, WS `X-Forwarded-*` sanitisation ✅.
+24. M17 + M18 + M19 — rollup restart idempotency (seed from disk) ✅, webhook-URL redaction ✅, streaming log SQL via `ListingTable` ✅. M20 (alert freshness/label-collapse) moved to the Optional PR — the review's own correction downgraded it to Optional-tier, and its full-label-keying fix ripples into the alert evaluator's contract.
+25. M12 + M13 + M15 + M16 — gossip refute seeds from `max(seen)+1` ✅, relayed-ACK address ignored ✅, reconstruction excludes stale reports + settling delay/alive re-sample ✅.
+26. M21 + M27 + M28 — CLI `--namespace` + authenticated history/build ✅, GitOps HEAD advance/delivery-id/URL redaction ✅ (GIT_ASKPASS argv follow-up), k8s multi-doc Deserializer + dropped-field warnings ✅ (broader export fidelity follow-up).
 27. Work the Optional (O1–O20) list as capacity allows; O5/O6/O7/O8/O15/O16 are the security-adjacent ones to prioritise within it.
 
 ---
