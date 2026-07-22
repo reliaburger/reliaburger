@@ -114,7 +114,7 @@ fn cert_error_to_rustls(err: CertError) -> rustls::Error {
         CertError::ChainInvalid(_) | CertError::IssuerMismatch(_) => {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)
         }
-        CertError::NotCodeSigning => {
+        CertError::NotCodeSigning | CertError::LeafIsCa => {
             rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
         }
     }
