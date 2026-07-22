@@ -1044,7 +1044,11 @@ async fn kill_fault_actually_kills_the_instance() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(pids_before.len(), 2, "both victim replicas should have pids");
+    assert_eq!(
+        pids_before.len(),
+        2,
+        "both victim replicas should have pids"
+    );
 
     // Kill one of the two replicas — within the safety budget (one survives).
     let fault = FaultRequest {
@@ -1067,9 +1071,7 @@ async fn kill_fault_actually_kills_the_instance() {
         let mut ok = false;
         while tokio::time::Instant::now() < deadline {
             // kill -0 to an old pid: an error means it's gone.
-            let any_dead = pids_before
-                .iter()
-                .any(|pid| libc_kill(*pid as i32, 0) != 0);
+            let any_dead = pids_before.iter().any(|pid| libc_kill(*pid as i32, 0) != 0);
             if any_dead {
                 ok = true;
                 break;
