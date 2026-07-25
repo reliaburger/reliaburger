@@ -9,6 +9,14 @@ Single source of truth for what's done and what's next. Check off an item only w
 > "not reachable from the running binary". Critical bugs in *wired* paths are tagged with their
 > ID too (e.g. `C4`). See the review doc for `file:line` and the staged fix plan.
 
+> **Three reviews, three ID spaces.** Finding IDs are scoped to the review that raised them, and
+> all three reviews reuse `C1`/`M1`/`O1`. When you see a bare ID, check which section you're in:
+> Phases 1–12 use the [2026-07-02 wiring review](plans/2026-07-02-review-codebase.md);
+> Phase 15a uses the [2026-07-17 posture review](plans/2026-07-17-review-codebase-current-state.md);
+> Phase 15b uses the [2026-07-19 code-logic review](plans/2026-07-19-codebase-review-fable.md).
+> Where a later review contradicts an older caveat below, the later one wins — the Phase 15b
+> section records which earlier caveats it supersedes.
+
 ---
 
 ## Phase 1: Foundation
@@ -1287,6 +1295,10 @@ convergence and adoption" theme under 12b.6).
 
 > Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
 > (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
+>
+> The harness half is done; the five diagnostic commands are the largest block of genuinely
+> unbuilt feature work left in the project. Two `TODO(Phase 15)` deferrals from Phase 15b land
+> here as well (Smoker's service-to-service `Partition` arm, Pickle push-side body streaming).
 
 - [x] Test harness audit and suite taxonomy: nextest local/CI profiles, JUnit, timeouts,
   zero retries, serial resources and no-tests-selected failures; portable, wall-clock,
@@ -1322,6 +1334,12 @@ convergence and adoption" theme under 12b.6).
 > This is a hardening gate before the unfinished Phase 15 diagnostic commands,
 > not a declaration that Phase 15 is complete. The source review is
 > [2026-07-17-review-codebase-current-state.md](plans/2026-07-17-review-codebase-current-state.md).
+>
+> **`M`/`O` IDs in this section belong to the 2026-07-17 review, not the 2026-07-19 one in
+> Phase 15b.** The 15b review re-verified this review's four security P1s as fixed by H1–H7
+> (SEC-1 empty-token non-loopback bind, SEC-2 mTLS opt-in, SEC-3 egress fail-open, NET-1 DNS
+> unreachable) plus the non-executable first-run path. Its dependency-advisory P1 (H0) was not
+> re-scanned there.
 
 ### High-value / must fix
 
@@ -1366,6 +1384,152 @@ convergence and adoption" theme under 12b.6).
 - [ ] Public API doctests (O3)
 - [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4)
 - [ ] Mechanical shipped/planned/experimental/historical documentation markers (O5)
+
+## Phase 15b: Code-Logic Review Hardening
+
+> Source review: [2026-07-19-codebase-review-fable.md](plans/2026-07-19-codebase-review-fable.md)
+> (16 Critical, 29 Medium, 20 Optional). Written independently of the 2026-07-17 posture
+> review and against `main` *after* the Phase 15a H1–H7 PRs landed, so the two barely
+> overlap: 15a is a **posture** review (fail-open defaults, docs drift, dependency shape),
+> 15b is a **code-logic** review (what the code actually does on the exploited path).
+>
+> Findings were worked as six stacked PRs, one commit per finding. Every theme box below is
+> checked only when its PR merged with `make ci` green.
+
+### Merged (PRs #133–#140)
+
+- [x] **Phase A — stop the bleeding** (#133): `C1` relish trusted public CAs while disabling
+  hostname checks (admin-bearer MITM) — now `tls_built_in_root_certs(false)` on the
+  `--ca-cert` path; `C16`+`M29` upgrade GC could delete the running binary and
+  `max_boot_attempts = 0` made an upgrade uncommittable; `C2` auth middleware failed **open**
+  on an empty token store, reachable by revoking the last token — last-Admin-revoke floor
+  added (broader bootstrap-flag hardening deferred); `C11` GitOps signature verification
+  failed open under `require_signed_commits`; `C10` a GitOps parse error or failed `ls-tree`
+  wiped cluster desired state and reported success; `C4` disaster recovery restored **empty**
+  state when no snapshot existed (silent total data loss) — now an error.
+- [x] **Phase B — data-loss and quota holes** (#134): `C9` Pickle GC deleted a blob
+  re-referenced between Raft approval and physical delete (reference set now re-checked
+  immediately before each delete); `C12` namespace quota was bypassed once apps converged +
+  `C13` GitOps skipped the validation manual apply enforces; `C15` managed-volume paths were
+  unvalidated (host path-traversal write as root); `C14` process-workload mount isolation was
+  admission-gated but never implemented — host workloads requesting it are now refused (real
+  mount-namespace isolation deferred).
+- [x] **Phase C — authenticate the cluster plane** (#135, #136): `C7` Raft/reporting/gossip
+  ran plaintext and unauthenticated when identity/master-key was unset — `--cluster` on a
+  routable address now fails closed; `C8` an untrusted gossip leader-hint term ratcheted the
+  reporting epoch into a permanent cluster-wide wedge — terms are bounded against the local
+  Raft window; `C6` state reports were trusted by self-declared `node_id` (one peer poisoned
+  the whole cluster view) — report identity is now bound to the authenticated TLS client
+  cert; `C5` disaster recovery had no protocol-level fence, so a partition split-brained a
+  live cluster — implemented as a transport-layer `RaftRpcEnvelope` stamped with the sender's
+  recovery epoch, with different-epoch RPCs dropped on accept (fencing at the RPC boundary
+  rather than inside openraft's `Vote` type).
+- [x] **Phase D — deploy/runtime correctness** (#137): `M14` the placement reconciler wedged
+  forever on a hung deploy (terminal-event wait now timed out); `M7` rolling redeploy capped
+  the health wait at 5s and ignored the configured `health_timeout`; `M22` ProcessGrill
+  silently ignored cgroup CPU/memory limits (now refused at admission); `M23` adopted-process
+  polling had no start-time recheck (pid reuse → wrong-process kills); `M24` `deploy_app`
+  leaked ports and orphaned instances on mid-loop failure (allocation is now transactional);
+  `M25` scheduler pass-cache and daemon-set convergence defects; `M26` the autoscaler's metric
+  lookup was a namespace-blind substring match.
+- [x] **Phase E — chaos, registry, supply chain, upgrade** (#138): `M1` Smoker faults were
+  unreliable and could leave a node damaged — `fault partition` was a silent no-op, `chaos
+  heal` cleared faults without reversing them, TTL expiry never healed the legacy partition,
+  partial cgroup application leaked limits, and safety rails were skipped with no cluster
+  handle; `M2` Pickle replication never authenticated (images stayed at one copy in any
+  cluster with tokens); `M3` the `cache/` namespace wasn't reserved on push (poisoning bypassed
+  `require_signatures`); `M10` storage quota was bypassable via chunked/bare-blob uploads;
+  `M11` whole-blob buffering enabled OOM (peer pulls now stream); `M4` join tokens weren't
+  bound to a node id, so a token holder could mint a cert impersonating any node —
+  `--node-id` is now mandatory on `join-token create` and `init` mints no bootstrap token;
+  `M5` the single-node network upgrade path silently downgraded dual-signature to
+  embedded-only; `M6` leader self-upgrade bypassed the live-quorum gate.
+- [x] **Phase F — observability, ingress, CLI** (#139): `M8` ingress `tls = "cluster"` served
+  a self-signed `localhost` cert — a per-SNI `IngressCertResolver` now issues from the cluster
+  Ingress CA (which finally gave the previously-dead `issue_ingress_cert` a caller); `M9` the
+  WebSocket upgrade path bypassed `X-Forwarded-*` sanitisation, letting a client spoof the
+  trusted client IP; `M12` gossip incarnation reset to 1 on restart, leaving a restarted node
+  stuck Suspect/Dead (refute now seeds from `max(seen) + 1`); `M13` a relayed ACK recorded the
+  probed node at the *relay's* address, falsely evicting a healthy node; `M15` reconstruction
+  counted stale reports as live actual state and `M16` its coverage shortcut could skip
+  learning entirely; `M17` rollup idempotency was in-memory only (restart double-counted
+  cluster sums); `M18` alert-webhook failure logs leaked the full Slack URL; `M19` the
+  "memory-capped" bounded log SQL materialised the whole archive into a MemTable first (now
+  streams over a `ListingTable`); `M21` the CLI couldn't manage non-default namespaces and
+  `history`/build-upload bypassed auth; `M27` GitOps never advanced local HEAD (Raft churn
+  every 30s), skipped replay protection without a delivery ID and leaked credential-bearing
+  URLs into Raft; `M28` `relish import` split on the substring `---` and skipped `#`-prefixed
+  documents, so Helm output imported nothing and exited 0.
+- [x] **Optional hardening, first tranche** (#140): `O15` bootstrap secret-file permission
+  check ignored ownership; `O18` out-of-range reserved ports counted toward allocator
+  exhaustion; `O16` `validate_chain` didn't assert the leaf is `CA:FALSE`; `O8` peer poll and
+  reporting send relied on TCP defaults with no timeout; `O4` `prepare_rollback` exec'd a
+  stored binary with no signature re-check; `O17` `mbps`/`kbps` meant MiB/s (~8.4× too loose)
+  and fault TTL had no upper bound; `O13` `relish logs-search` ran raw operator SQL with no
+  memory guard; `O12` retention pruned Parquet by file mtime instead of the data's own newest
+  timestamp; `O14` dev clusters shared VMs regardless of `--name` and `dev destroy` deleted
+  the shared build VM; `O19` `relish top` claimed "live resource usage" and printed none;
+  `O5` (partial) consumed join tokens were never pruned.
+
+Test counts at #140: portable nextest 2,809, no-default 2,790, doctests green; `cargo fmt
+--check` and default-feature clippy `-D warnings` clean.
+
+**Supersedes:** the Phase 4/10 `C5` "nothing is enforced" caveat is now historical for the
+cluster plane (Phase C closed the plaintext/unauthenticated paths). The Phase 8 Smoker caveat
+is *partly* addressed — Phase E made faults reversible and safety-checked; whether every
+advertised resource fault has a measurable effect is still owned by the 12b.6 smoker-effects
+work, not by `M1`.
+
+### Open — Critical
+
+- [ ] **`C3` — token namespace/app scope is enforced only on mutations; every per-app read
+  ignores it.** This finding was raised in the review but **omitted from the review's own
+  recommended implementation order**, so Phases A–F worked around it. Verified still live on
+  `main`: `status_app_handler` (`src/bun/api.rs:1399`), `logs_handler` (`:1593`),
+  `ws_logs_handler` (`:1660`), `app_env_handler` (`:3057`), `logs_sql_handler` (`:3087`) and
+  `metrics_app_handler` (`:3273`) take no `auth` argument and never call `authorize_scoped` —
+  contrast `stop`/`exec`/`rollback`, which do. A legitimately issued token scoped to namespace
+  `team-a` can read `team-b`'s logs, plaintext env, status and metrics; `/v1/logs/sql`
+  compounds it by exposing the node's entire `logs` table with no tenant filter at all.
+  Exploitable by a normal low-privilege token — no admin mistake required. **This is the last
+  unfixed Critical in the review.**
+
+### Open — deferred from merged PRs
+
+- [ ] `M7` residual — `max_surge`/`max_unavailable` parse and validate but the production
+  rolling deploy still ignores them (needs the deploy-loop rewrite; noted in the M7 commit)
+- [ ] `M20` — alert evaluation lacks per-value freshness and collapses metrics by name across
+  labels (downgraded to Optional-tier by the review's own correction; the full-label-keying
+  fix ripples into the alert evaluator's contract)
+- [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
+  (local-process-list exposure; the durable Raft leak is fixed)
+- [ ] `M28` residual — broader export-side field fidelity
+- [ ] `O5` residual — unbounded growth in the reporting aggregator maps, the mustard
+  dissemination heap and membership table, and never-pruned expired `crl.entries`
+- [ ] `O17` residual — `CpuStress --cores` multi-core arithmetic
+- [ ] `TODO(Phase 15)` — Smoker's service-to-service `Partition` apply arm stays an accepted
+  no-op without eBPF; tightening it needs the quorum-rail acceptance test moved onto an eBPF
+  node first
+- [ ] `TODO(Phase 15)` — Pickle push-side request-body streaming (`MAX_REQUEST_BYTES`)
+
+### Open — Optional list
+
+- [ ] `O1` anonymous Pickle reads are cluster-wide on a non-loopback bind
+- [ ] `O2` Pickle build-context URLs hardcode `http://` and `buildah push --tls-verify=false`
+- [ ] `O3` upgrade binary fetch/push is plaintext `http://` (integrity still sig+sha gated)
+- [ ] `O6` Raft RPC pre-allocates an attacker-controlled ≤64 MiB buffer per connection with no
+  connection cap
+- [ ] `O7` security-relevant reads are served from local follower state (a revoked cert can
+  read valid during a leadership transition)
+- [ ] `O9` SWIM `refute()` and the relay-ACK path don't refute about self, and `Left` is
+  unrefutable and sticky
+- [ ] `O10` `relish fmt` writes non-atomically and deletes comments; `compile` silently drops
+  duplicate app names
+- [ ] `O11` DNS forwards only over IPv4; bare `<app>.internal` resolves in the node's
+  `default_namespace`, not the caller's
+- [ ] `O20` stale/misleading docs and dead code sweep
+
+The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise within this list.
 
 ## UX Track: Learning Curve & Demonstrability
 
