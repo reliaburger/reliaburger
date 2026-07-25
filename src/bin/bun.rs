@@ -315,6 +315,20 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Whether the Pickle registry's bind address is reachable only from this
+/// host (O1).
+///
+/// `[images] registry_bind` is a bare host, not a `host:port`, so it's parsed
+/// as an `IpAddr`. Anything that isn't an IP literal — a hostname, or the
+/// unspecified `0.0.0.0`/`[::]` — counts as routable: we can't prove nobody
+/// else can reach it, and the failure we'd rather have is "you needed a token
+/// and didn't expect to".
+fn registry_bind_is_loopback(bind: &str) -> bool {
+    bind.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
 ///
 /// Returns `None` — falling back to a self-signed `localhost` cert — when the
@@ -1516,6 +1530,11 @@ async fn main() -> anyhow::Result<()> {
         council: api_council.clone(),
         persist_path: Some(catalog_path.clone()),
         auth: registry_auth,
+        // O1: reads stay open on the loopback default (a local pull needs no
+        // token) and require a principal anywhere a stranger could reach the
+        // port. A hostname we can't resolve to a literal is treated as
+        // routable — the safe way to be wrong.
+        require_read_auth: !registry_bind_is_loopback(&config.images.registry_bind),
         quota: registry_quota,
         sessions: upload_sessions.clone(),
     };
@@ -2072,6 +2091,23 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// O1: only an IP literal that *is* loopback keeps registry reads open.
+    /// `0.0.0.0` is the interesting case — it reads like a local default and
+    /// is the most exposed bind there is.
+    #[test]
+    fn only_loopback_literals_keep_registry_reads_open() {
+        assert!(registry_bind_is_loopback("127.0.0.1"));
+        assert!(registry_bind_is_loopback("::1"));
+
+        assert!(!registry_bind_is_loopback("0.0.0.0"));
+        assert!(!registry_bind_is_loopback("::"));
+        assert!(!registry_bind_is_loopback("10.0.1.5"));
+        // A hostname could resolve anywhere, and could resolve somewhere else
+        // tomorrow, so it counts as routable.
+        assert!(!registry_bind_is_loopback("localhost"));
+        assert!(!registry_bind_is_loopback(""));
+    }
 
     #[test]
     fn process_runtime_refuses_dns_before_workload_creation() {

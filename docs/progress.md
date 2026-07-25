@@ -1526,7 +1526,13 @@ work, not by `M1`.
 
 ### Open — Optional list
 
-- [ ] `O1` anonymous Pickle reads are cluster-wide on a non-loopback bind
+- [x] `O1` anonymous Pickle reads were cluster-wide on a non-loopback bind — any client that
+  could route a packet could enumerate and pull every image, including `cache/` copies of
+  private upstreams pulled with the operator's credentials. `PickleState.require_read_auth`
+  (set from the bind address; only an IP literal that *is* loopback keeps reads open, so
+  `0.0.0.0` and hostnames count as routable) gates every GET/HEAD through one choke point in
+  `dispatch_v2` plus the `/v2/` version probe. The bar is any valid token — pulling is what a
+  ReadOnly token is for — not the Deployer that writes require. Loopback is unchanged
 - [ ] `O2` Pickle build-context URLs hardcode `http://` and `buildah push --tls-verify=false`
 - [ ] `O3` upgrade binary fetch/push is plaintext `http://` (integrity still sig+sha gated)
 - [x] `O6` Raft RPC pre-allocated an attacker-controlled ≤64 MiB buffer per connection with no

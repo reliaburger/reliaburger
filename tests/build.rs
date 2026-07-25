@@ -290,6 +290,7 @@ async fn start_registry_with_council(
         council,
         persist_path: None,
         auth: None,
+        require_read_auth: false,
         quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
