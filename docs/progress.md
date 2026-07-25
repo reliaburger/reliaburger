@@ -1510,9 +1510,17 @@ work, not by `M1`.
 
 - [ ] `M7` residual — `max_surge`/`max_unavailable` parse and validate but the production
   rolling deploy still ignores them (needs the deploy-loop rewrite; noted in the M7 commit)
-- [ ] `M20` — alert evaluation lacks per-value freshness and collapses metrics by name across
-  labels (downgraded to Optional-tier by the review's own correction; the full-label-keying
-  fix ripples into the alert evaluator's contract)
+- [x] `M20` — alert evaluation lacked per-value freshness and collapsed metrics by name across
+  labels. `gather_latest_values` now keeps the newest reading per `(metric_name, labels)`
+  series and hands them to a pure `collapse_series`, which (a) applies an explicit
+  `MAX_VALUE_AGE_SECS` freshness bound separate from the query window — the window says how
+  far back to look, not how stale an answer may be; (b) computes derived percentages
+  **within** a label set, so `node_memory_usage_percent` can't divide one series' `used` by
+  another's `total`; and (c) breaks collapse ties on the label string, so the result never
+  depends on row order. **Residual, deliberately:** the evaluator still takes one value per
+  metric name. Giving each labelled series its own alert state changes that contract (alert
+  keying becomes rule+series) and is not attempted here — recorded rather than silently
+  skipped
 - [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
   (local-process-list exposure; the durable Raft leak is fixed)
 - [ ] `M28` residual — broader export-side field fidelity

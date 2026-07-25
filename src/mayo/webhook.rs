@@ -341,19 +341,108 @@ fn severity_matches(dest: &AlertDestination, severity: AlertSeverity) -> bool {
 // Latest values helper
 // ---------------------------------------------------------------------------
 
+/// How old a reading may be and still count as "current" for alerting.
+///
+/// The query window used to be the only bound, which conflated two
+/// different questions: "how far back do we look?" and "how stale may the
+/// answer be?" A metric that stopped being emitted 110 seconds ago would
+/// still be evaluated as though it were live. Naming the freshness bound
+/// separately makes it a decision rather than a side effect of the window
+/// (M20).
+const MAX_VALUE_AGE_SECS: u64 = 90;
+
+/// How far back to look for readings.
+const QUERY_WINDOW_SECS: u64 = 120;
+
+/// Collapse per-series readings into the one value per metric name that
+/// alert rules evaluate against (M20).
+///
+/// `series` maps `(metric_name, labels)` to its newest `(timestamp, value)`.
+/// Derived percentages are computed *within* a label set before collapsing,
+/// so `node_memory_usage_percent` can't end up dividing one series' `used`
+/// by another series' `total` — the mis-attribution the old
+/// entry-per-name collapse allowed.
+///
+/// Kept pure so the collapse rules are testable without a store.
+pub fn collapse_series(
+    series: &HashMap<(String, String), (u64, f64)>,
+    now_secs: u64,
+) -> HashMap<String, f64> {
+    // Derived percentages, per label set.
+    let mut derived: Vec<((String, String), (u64, f64))> = Vec::new();
+    for ((name, labels), (timestamp, _)) in series {
+        for (used_name, total_name, percent_name) in [
+            (
+                "node_memory_used_bytes",
+                "node_memory_total_bytes",
+                "node_memory_usage_percent",
+            ),
+            (
+                "node_disk_used_bytes",
+                "node_disk_total_bytes",
+                "node_disk_usage_percent",
+            ),
+        ] {
+            if name != used_name {
+                continue;
+            }
+            let Some((_, used)) = series.get(&(used_name.to_string(), labels.clone())) else {
+                continue;
+            };
+            let Some((_, total)) = series.get(&(total_name.to_string(), labels.clone())) else {
+                continue;
+            };
+            if *total > 0.0 {
+                derived.push((
+                    (percent_name.to_string(), labels.clone()),
+                    (*timestamp, (used / total) * 100.0),
+                ));
+            }
+        }
+    }
+
+    let mut all = series.clone();
+    all.extend(derived);
+
+    // Collapse to one value per name: the freshest series wins, and ties
+    // break on the label string so the result never depends on row order.
+    let mut best: HashMap<String, (u64, String, f64)> = HashMap::new();
+    for ((name, labels), (timestamp, value)) in all {
+        if now_secs.saturating_sub(timestamp) > MAX_VALUE_AGE_SECS {
+            continue;
+        }
+        match best.get(&name) {
+            Some((best_ts, best_labels, _))
+                if (*best_ts, best_labels.as_str()) >= (timestamp, labels.as_str()) => {}
+            _ => {
+                best.insert(name, (timestamp, labels, value));
+            }
+        }
+    }
+
+    best.into_iter()
+        .map(|(name, (_, _, value))| (name, value))
+        .collect()
+}
+
 /// Gather the latest metric values from a MayoStore for alert evaluation.
 ///
-/// Queries the most recent value per metric name from the last 120
-/// seconds, then computes derived percentage metrics needed by the
-/// default alert rules.
+/// Reads the last [`QUERY_WINDOW_SECS`] of metrics, keeps the newest
+/// reading per `(metric_name, labels)` series, then hands them to
+/// [`collapse_series`] for the freshness bound, the derived percentages and
+/// the per-name collapse the evaluator expects.
+///
+/// The evaluator still takes one value per metric name; giving each
+/// labelled series its own alert state is a larger change to that contract
+/// and is not attempted here (M20).
 pub async fn gather_latest_values(store: &crate::mayo::store::MayoStore) -> HashMap<String, f64> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let window_start = now.saturating_sub(120);
+    let window_start = now.saturating_sub(QUERY_WINDOW_SECS);
 
-    let mut values: HashMap<String, f64> = HashMap::new();
+    let mut series: HashMap<(String, String), (u64, f64)> = HashMap::new();
 
     let sql = format!(
         "SELECT timestamp, metric_name, labels, value FROM metrics \
@@ -361,35 +450,13 @@ pub async fn gather_latest_values(store: &crate::mayo::store::MayoStore) -> Hash
          ORDER BY timestamp DESC"
     );
     if let Ok(rows) = store.query_sql(&sql).await {
-        for (_ts, name, _labels, val) in rows {
-            // First seen per metric = latest (DESC order).
-            values.entry(name).or_insert(val);
+        for (timestamp, name, labels, value) in rows {
+            // DESC order means the first row per series is its newest.
+            series.entry((name, labels)).or_insert((timestamp, value));
         }
     }
 
-    // Compute derived percentage metrics for the default alert rules.
-    if let (Some(&used), Some(&total)) = (
-        values.get("node_memory_used_bytes"),
-        values.get("node_memory_total_bytes"),
-    ) && total > 0.0
-    {
-        values.insert(
-            "node_memory_usage_percent".to_string(),
-            (used / total) * 100.0,
-        );
-    }
-    if let (Some(&used), Some(&total)) = (
-        values.get("node_disk_used_bytes"),
-        values.get("node_disk_total_bytes"),
-    ) && total > 0.0
-    {
-        values.insert(
-            "node_disk_usage_percent".to_string(),
-            (used / total) * 100.0,
-        );
-    }
-
-    values
+    collapse_series(&series, now)
 }
 
 #[cfg(test)]
@@ -899,5 +966,84 @@ mod tests {
         );
         // A schemeless / opaque string is fully redacted.
         assert_eq!(redact_url("weird-opaque-token"), "<redacted>");
+    }
+
+    // -- collapse_series (M20) ------------------------------------------------
+
+    fn series(entries: &[(&str, &str, u64, f64)]) -> HashMap<(String, String), (u64, f64)> {
+        entries
+            .iter()
+            .map(|(name, labels, ts, value)| {
+                ((name.to_string(), labels.to_string()), (*ts, *value))
+            })
+            .collect()
+    }
+
+    /// M20: derived percentages used to divide whichever `used` happened to
+    /// be newest by whichever `total` happened to be newest, across
+    /// different label sets. Two nodes reporting into one store could
+    /// produce a percentage that belonged to neither.
+    #[test]
+    fn derived_percentages_stay_within_one_label_set() {
+        let values = collapse_series(
+            &series(&[
+                // node-a: 50% used, and the newest reading.
+                ("node_memory_used_bytes", "node=a", 100, 50.0),
+                ("node_memory_total_bytes", "node=a", 100, 100.0),
+                // node-b: tiny total, would give a wild percentage if
+                // crossed with node-a's `used`.
+                ("node_memory_used_bytes", "node=b", 90, 1.0),
+                ("node_memory_total_bytes", "node=b", 90, 2.0),
+            ]),
+            100,
+        );
+        assert_eq!(values.get("node_memory_usage_percent"), Some(&50.0));
+    }
+
+    /// A reading inside the query window but past the freshness bound is not
+    /// "current" — the window says how far back to look, not how stale an
+    /// answer may be.
+    #[test]
+    fn readings_past_the_freshness_bound_are_dropped() {
+        let values = collapse_series(
+            &series(&[("node_cpu_percent", "node=a", 0, 99.0)]),
+            MAX_VALUE_AGE_SECS + 1,
+        );
+        assert!(!values.contains_key("node_cpu_percent"));
+
+        let values = collapse_series(
+            &series(&[("node_cpu_percent", "node=a", 1, 99.0)]),
+            MAX_VALUE_AGE_SECS + 1,
+        );
+        assert_eq!(values.get("node_cpu_percent"), Some(&99.0));
+    }
+
+    /// The collapse must not depend on which row the query happened to
+    /// return first: same series, same answer, every time.
+    #[test]
+    fn collapsing_is_deterministic_across_equal_timestamps() {
+        let entries = [
+            ("node_cpu_percent", "node=a", 100, 10.0),
+            ("node_cpu_percent", "node=b", 100, 20.0),
+            ("node_cpu_percent", "node=c", 100, 30.0),
+        ];
+        let first = collapse_series(&series(&entries), 100);
+        let mut reversed = entries;
+        reversed.reverse();
+        let second = collapse_series(&series(&reversed), 100);
+        assert_eq!(first, second);
+    }
+
+    /// The freshest series wins, regardless of label ordering.
+    #[test]
+    fn the_freshest_series_wins() {
+        let values = collapse_series(
+            &series(&[
+                ("node_cpu_percent", "node=a", 90, 10.0),
+                ("node_cpu_percent", "node=z", 100, 70.0),
+            ]),
+            100,
+        );
+        assert_eq!(values.get("node_cpu_percent"), Some(&70.0));
     }
 }
