@@ -638,6 +638,34 @@ Every chapter is supposed to end with what was tricky, what clicked, and what we
 
 **kaniko died while we were designing.** We spent time evaluating kaniko as the build backend. Then Google archived it. The software industry doesn't owe you backward compatibility. We switched to buildah — daemonless, rootless, actively maintained, and it speaks the same OCI registry protocol. The transition was painless because we'd already designed the build system around a clean subprocess interface: prepare args, spawn, done. If buildah dies too, we swap the binary. The lesson: minimise your coupling surface to external tools. Two subprocess calls and a standard protocol are better than a deep SDK integration.
 
+**A chaos tool that lies is worse than no chaos tool.** This one took a while to land properly, because the bugs were all in the "close enough" category.
+
+`fault partition` returned `Ok(())` and blocked nothing. `chaos heal` cleared the registry without reversing anything, so a SIGSTOPped workload stayed frozen and cgroup caps outlived their fault. `CpuStress` accepted a `--cores` argument, ignored it, and computed its quota as though the target had exactly one core — on a four-core node "80% stress" quietly meant "you now have 20% of one core", a 95% cut.
+
+Take that last one seriously for a moment. Every individual piece works: the flag parses, the cgroup write succeeds, the workload really does slow down, the fault really does clear. Run the experiment and you get a plausible result. You just get it for a blast radius nobody chose, and you write down the number you asked for rather than the number you applied.
+
+That's the specific danger of tooling whose entire purpose is producing evidence. A monitoring bug shows up as a gap in a graph. A chaos bug shows up as *confidence* — you tested it, it held, ship it. The failure is silent by construction, because the thing that would have told you is the thing that's broken.
+
+So the quota now scales by the cores it's told to stress, and `None` means "as many cores as the workload actually has", derived from its own `cpu.max`:
+
+```rust
+pub fn baseline_cores(current_cpu_max: &str, host_cores: u32) -> u32 {
+    let mut parts = current_cpu_max.split_whitespace();
+    let (Some(quota), Some(period)) = (parts.next(), parts.next()) else {
+        return 1;
+    };
+    if quota == "max" {
+        return host_cores.max(1);
+    }
+    match (quota.parse::<u64>(), period.parse::<u64>()) {
+        (Ok(quota), Ok(period)) if period > 0 => ((quota / period) as u32).max(1),
+        _ => 1,
+    }
+}
+```
+
+Note which way the fallback leans. An unparseable `cpu.max` gives one core, which *under*-reads the baseline and makes the fault harsher than asked. That's deliberate. Between "your experiment was slightly more brutal than you specified" and "your experiment was much gentler than you specified and passed", only one of them lets a real weakness through.
+
 **Pickle is a better transport than you'd think.** The build context upload problem seemed like it needed a file transfer mechanism — scp, NFS, a custom sync protocol. Then we realised we already had a content-addressed blob store that every node in the cluster can talk to. Tar the context, upload it as a blob, let the build node download it. No shared filesystems, no new infrastructure. Sometimes the best solution is the one you've already built for a different purpose.
 
 ## Tests

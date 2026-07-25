@@ -456,6 +456,24 @@ The last one is about telling the truth. A push commits locally and to Raft, the
 
 The GC arbiter got stricter too. It used to recheck only sole-copy protection at deletion time. Now it rechecks against the *full catalogue reference set* immediately before approving: a blob any manifest still references — its config, a layer, or the manifest blob itself — is never approved for deletion, even if the nominating node saw it as an orphan when it built the report. A fresh push can re-reference a blob between nomination and approval; this serialised recheck is the last chance to refuse, and it takes it.
 
+### A scheme is a decision, not a default
+
+Once the registry can serve TLS, `http://` stops being a neutral default and becomes an assertion — one that three separate code paths were making on their own.
+
+The build-context URLs hardcoded it. So did the `buildah push`, via `--tls-verify=false`. So did the self-upgrade binary fetch. None of them worked against a TLS registry, and where plaintext did reach a listener they moved a build context (the caller's whole source tree) in the clear and pushed the result without checking the certificate they were pushing to.
+
+The fix is dull, which is the point: derive the scheme once, from the same condition that decides whether the registry gets a TLS identity, and thread it. `ApiState` carries `registry_scheme` beside `registry_port`, both server-owned, so a caller can't smuggle either. `bun` computes it next to `cluster_http` rather than in two places — deriving the same fact twice is how the two answers drift apart, and this fact is already used by the P2P and heal peer URLs.
+
+Two details worth stealing:
+
+**Which client, not just which scheme.** The build runner fetched its context with a bare `reqwest::get`. Point that at `https://` and it fails, because a default reqwest client trusts the public CA roots and our registry's certificate is signed by the cluster CA. So the scheme change is only half a fix; the request has to move onto the client that holds the trust anchors too. Any time you make something TLS-aware, check whether the *client* knows about your PKI.
+
+**`--tls-verify` mirrors reality.** It's now `--tls-verify={registry_over_tls}` rather than a constant. Against a plaintext registry the flag is still false — that's not a compromise, it's accurate, and there's no certificate to verify. What changed is that the value now describes the world instead of assuming it.
+
+The upgrade path is the interesting counter-example, because it's the one where none of this touched integrity. Binaries are content-addressed and dual-signed; `verify_binary` checks the sha256 and the embedded release signature on every path, plaintext or not. Nobody was going to slip you a modified binary. What plaintext actually cost was *working at all* against a TLS-only registry, plus telling anyone on the path which build you were rolling out. Worth fixing, worth being precise about why — "we added TLS so nobody can tamper with the binary" would have been a nice story and a false one.
+
+The registry's read side moved too, though for a different reason. Reads were open on the assumption of a loopback bind, which is right: a local `docker pull` shouldn't need a token. Published on a routable address, that same openness hands every image in the cluster to anyone who can reach the port — including the `cache/` copies of private upstream registries, pulled with the operator's credentials. So reads now need a principal when the bind isn't loopback. The classifier is deliberately strict: only an IP literal that *is* loopback counts. A hostname could resolve anywhere, and could resolve somewhere else tomorrow; `0.0.0.0` reads like a local default while being the most exposed bind there is. Both count as routable, because the failure we'd rather have is "you needed a token and didn't expect to".
+
 ## Tests
 
 Pickle is almost entirely testable in-process. A blob store is a directory, the OCI API is an axum router, and the catalog is a `Vec` — none of that needs the internet or another node. So the default suite spins up a Pickle server in the test, pushes a manifest and its blobs, then pulls them back, all without leaving the process.

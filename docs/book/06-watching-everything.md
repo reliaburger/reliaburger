@@ -310,6 +310,26 @@ We thought operators would want to define custom alert rules from day one. In pr
 
 The lesson: don't build config for things that have obvious defaults. Ship the defaults, add config later if someone needs it.
 
+### "How far back do we look?" is not "how stale may this be?"
+
+The evaluator needs one number per metric, so something has to turn a table of readings into that number. The first version queried the last 120 seconds and took the newest row per metric *name*:
+
+```rust
+for (_ts, name, _labels, val) in rows {
+    values.entry(name).or_insert(val);   // DESC order, so first = newest
+}
+```
+
+Two problems hide in those three lines, and both are the same mistake: treating a query bound as an answer.
+
+The `_ts` is discarded, so the 120-second window is doing double duty. It's the range we search, and by accident it's also the freshness guarantee — a metric that stopped being emitted 110 seconds ago is still evaluated as though it were live. Those are different questions with different right answers, so they now have different names: `QUERY_WINDOW_SECS` for how far back to look, `MAX_VALUE_AGE_SECS` for how stale an answer may be. Naming the second one made it a decision rather than a leftover.
+
+The `_labels` is discarded too, so distinct labelled series collapse into whichever one happened to be newest. For a single node's own gauges that's harmless. For the derived percentages it isn't: `node_memory_usage_percent` divided a `used` from one series by a `total` from another, and could produce a number that belonged to neither. The values are now keyed by `(name, labels)` and the percentages computed *within* a label set before anything collapses.
+
+There's a smaller lesson in the collapse itself. When two series tie on timestamp, the old code picked whichever row the query returned first — deterministic in practice, arbitrary in principle, and a lovely source of a test that passes on your machine and fails in CI. Ties now break on the label string. If a rule can go either way, pick the way that doesn't depend on row order.
+
+What we *didn't* do is worth recording: the evaluator still takes one value per metric name. Giving each labelled series its own alert state is the honest fix, and it changes what an alert is keyed on — rule, or rule-and-series? That ripples into state storage, transition detection and webhook dedup keys. It's a real change, not a tidy-up, so it's written down as open rather than half-done and quietly declared finished.
+
 ### Server-rendered HTML with meta refresh beats React
 
 The Brioche dashboard is a single server-rendered HTML page. No JavaScript framework, no API calls, no state management. The browser refreshes every 5 seconds. Total payload: 10KB. Time to first meaningful paint: zero seconds (it's all in the HTML response).
