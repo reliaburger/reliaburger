@@ -861,17 +861,17 @@ pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
     }
 }
 
-/// Show deploy history for an app.
-pub async fn history(app: &str) -> Result<(), RelishError> {
+/// Show deploy history for an app in a namespace.
+pub async fn history(app: &str, namespace: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     // Authenticated + CA-trusting request (M21): the previous bare
     // `reqwest::get` carried no bearer/CA, so it 401'd against a secured agent
     // and silently exited 0. `deploy_history` routes through the configured
     // client and propagates the failure.
-    let entries = client.deploy_history(app).await?;
+    let entries = client.deploy_history(app, namespace).await?;
 
     if entries.is_empty() {
-        println!("no deploy history for {app}");
+        println!("no deploy history for {app} in namespace {namespace}");
     } else {
         println!(
             "{:<8} {:<20} {:<12} {:<6} {:<6}",

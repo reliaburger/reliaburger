@@ -77,6 +77,8 @@ pub struct ClusterData {
     pub routes: Vec<RouteInfo>,
     pub jobs: Vec<JobStatus>,
     pub events: VecDeque<ClusterEvent>,
+    /// Deploy history keyed by [`deploy_history_key`] — two apps of the same
+    /// name in different namespaces have separate histories (C3).
     pub deploy_history: HashMap<String, Vec<serde_json::Value>>,
     pub app_metrics: Option<MetricsQueryResult>,
     pub last_updated: Option<u64>,
@@ -130,8 +132,16 @@ pub enum Effect {
     RefreshAll,
     OpenLogStream { app: String, namespace: String },
     CloseLogStream,
-    FetchDeployHistory { app: String },
+    FetchDeployHistory { app: String, namespace: String },
     FetchAppMetrics { app: String, namespace: String },
+}
+
+/// Cache key for [`ClusterData::deploy_history`].
+///
+/// Mirrors `AppId`'s `namespace/name` display form, so an app called `web`
+/// in `team-a` never shows `team-b`'s deploys.
+pub fn deploy_history_key(app: &str, namespace: &str) -> String {
+    format!("{namespace}/{app}")
 }
 
 /// Complete state owned by the event loop.

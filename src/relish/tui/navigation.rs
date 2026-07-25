@@ -95,9 +95,10 @@ impl TuiApp {
                 app: app.clone(),
                 namespace: namespace.clone(),
             }),
-            DetailTab::Deploys => self
-                .pending
-                .push(Effect::FetchDeployHistory { app: app.clone() }),
+            DetailTab::Deploys => self.pending.push(Effect::FetchDeployHistory {
+                app: app.clone(),
+                namespace: namespace.clone(),
+            }),
             _ => {}
         }
     }

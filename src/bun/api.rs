@@ -1397,9 +1397,13 @@ async fn ws_events_session(
 
 /// Status for a specific app.
 async fn status_app_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -1591,10 +1595,14 @@ struct LogsQuery {
 /// Supports `?tail=N` to return only the last N lines, and
 /// `?follow=true` to stream new lines as an SSE stream.
 async fn logs_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<LogsQuery>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let follow = query.follow.unwrap_or(false);
 
     if follow {
@@ -1658,11 +1666,17 @@ async fn logs_handler(
 
 /// Upgrade an authenticated request to a live log stream.
 async fn ws_logs_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<LogsQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    // Scope is checked *before* the upgrade: once the socket is live there
+    // is no response left to refuse with.
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     upgrade
         .on_upgrade(move |socket| ws_logs_session(socket, state.cmd_tx, app, namespace, query.tail))
         .into_response()
@@ -1704,10 +1718,14 @@ async fn ws_logs_session(
 /// Internal structured log query endpoint. Returns `Vec<LogEntry>` as
 /// JSON. Called by `fan_out_query` on each node during cross-node queries.
 async fn logs_entries_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<LogsQuery>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return Json(Vec::<LogEntry>::new()).into_response();
     };
@@ -1739,11 +1757,16 @@ async fn logs_entries_handler(
 /// council placement state, fans out the query to those nodes, and
 /// merge-sorts results by timestamp.
 async fn logs_cross_node_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(query): Query<LogsQuery>,
 ) -> Response {
     use crate::meat::types::AppId;
+
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
 
     // Build a LogQuery from request params
     let log_query = LogQuery {
@@ -2331,9 +2354,13 @@ async fn snapshot_create_handler(
 }
 
 async fn snapshot_list_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((namespace, app)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -2901,9 +2928,13 @@ async fn dashboard_handler(State(state): State<ApiState>) -> Response {
 
 /// `GET /ui/app/{app}/{namespace}` — app detail page.
 async fn app_detail_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let statuses = gather_statuses(&state).await;
     let instances: Vec<InstanceStatus> = statuses
         .into_iter()
@@ -3039,9 +3070,13 @@ async fn fragment_alerts_handler(State(state): State<ApiState>) -> Response {
 
 /// `GET /ui/fragment/app/{app}/{namespace}/instances` — instance table fragment.
 async fn fragment_instances_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let statuses = gather_statuses(&state).await;
     let instances: Vec<InstanceStatus> = statuses
         .into_iter()
@@ -3055,9 +3090,13 @@ async fn fragment_instances_handler(
 /// Encrypted values are replaced with `"[encrypted]"`. The raw
 /// ciphertext never reaches the browser.
 async fn app_env_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let (tx, rx) = oneshot::channel();
     let _ = state
         .cmd_tx
@@ -3085,9 +3124,16 @@ async fn app_env_handler(
 
 /// `GET /v1/logs/sql?q=SELECT...` — query logs via DataFusion SQL.
 async fn logs_sql_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    // C3: this endpoint exposes the whole `logs` table. `LogStore::query`
+    // filters by tenant; arbitrary SQL cannot be made to, so a scoped token
+    // is refused rather than served another tenant's logs.
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(log_store) = &state.log_store else {
         return Json(serde_json::json!({"error": "log store not enabled"})).into_response();
     };
@@ -3271,10 +3317,14 @@ async fn metrics_cluster_handler(
 /// full cluster deployment, this would fan out to nodes running the app
 /// using the Meat placement map.
 async fn metrics_app_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path((app, namespace)): Path<(String, String)>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(MetricsQueryResult {
             data: vec![],
@@ -3351,17 +3401,39 @@ async fn deploys_active_handler() -> impl IntoResponse {
     Json(serde_json::json!({"active_deploys": []}))
 }
 
+#[derive(Deserialize)]
+struct NamespaceQuery {
+    namespace: Option<String>,
+}
+
 /// `GET /v1/deploys/history/{app}` — deploy history for an app.
+///
+/// The namespace rides in as a query parameter rather than a path segment
+/// so the route (and every client bookmarking it) keeps its shape. It
+/// matters for more than tidiness: since DEP1 two apps of the same name can
+/// coexist in different namespaces, so filtering on the bare name returned
+/// both tenants' history to whoever asked (C3).
 async fn deploys_history_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path(app): Path<String>,
-) -> impl IntoResponse {
+    Query(query): Query<NamespaceQuery>,
+) -> Response {
+    let namespace = query.namespace.as_deref().unwrap_or("default");
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, namespace) {
+        return resp;
+    }
     let Some(history) = &state.deploy_history else {
-        return Json(serde_json::json!({"app": app, "history": []}));
+        return Json(serde_json::json!({"app": app, "namespace": namespace, "history": []}))
+            .into_response();
     };
     let all = history.read().await;
-    let filtered: Vec<&DeployHistoryEntry> = all.iter().filter(|e| e.app_id.name == app).collect();
-    Json(serde_json::json!({"app": app, "history": filtered}))
+    let filtered: Vec<&DeployHistoryEntry> = all
+        .iter()
+        .filter(|e| e.app_id.name == app && e.app_id.namespace == namespace)
+        .collect();
+    Json(serde_json::json!({"app": app, "namespace": namespace, "history": filtered}))
+        .into_response()
 }
 
 /// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
@@ -4785,6 +4857,216 @@ mod tests {
         let manifest = "[app.web]\nimage = \"x:1\"\nnamespace = \"b\"\n";
         let status = post_status(app, "/v1/apply", &tok, manifest).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// A completed history entry for `web` in the `default` namespace; tests
+    /// override the fields they care about.
+    fn sample_history_entry(image: &str) -> DeployHistoryEntry {
+        use crate::meat::types::AppId;
+        DeployHistoryEntry {
+            id: crate::meat::deploy_types::DeployId(1),
+            app_id: AppId {
+                name: "web".to_string(),
+                namespace: "default".to_string(),
+            },
+            image: image.to_string(),
+            result: crate::meat::deploy_types::DeployResult::Completed,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+            steps_completed: 1,
+            steps_total: 1,
+            spec: None,
+        }
+    }
+
+    /// Router with a seeded deploy history and no token store, so the
+    /// namespace filter can be checked without an auth layer in the way.
+    async fn setup_with_deploy_history(
+        history: Arc<RwLock<Vec<DeployHistoryEntry>>>,
+    ) -> (Router, CancellationToken) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            Some(history),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+        (app, shutdown)
+    }
+
+    /// GET a URI and return the response body as a string.
+    async fn get_body(app: Router, uri: &str) -> String {
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Every route that addresses one app used to check the caller's *role*
+    /// and stop there, so a legitimately issued token scoped to one namespace
+    /// could read every other tenant's logs, env, status and metrics (C3).
+    /// Reads are the interesting half: `stop`/`exec`/`rollback` were scoped
+    /// from the start, which is what made the gap easy to miss.
+    #[tokio::test]
+    async fn scoped_token_is_refused_reading_another_namespace() {
+        let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+        for uri in [
+            "/v1/status/web/team-b",
+            "/v1/logs/web/team-b",
+            "/v1/logs/entries/web/team-b",
+            "/v1/logs/query/web/team-b",
+            "/v1/metrics/app/web/team-b",
+            "/v1/snapshots/team-b/web",
+            "/v1/deploys/history/web?namespace=team-b",
+            "/ui/app/web/team-b",
+            "/ui/app/web/team-b/env",
+            "/ui/fragment/app/web/team-b/instances",
+        ] {
+            assert_eq!(
+                get_status(app.clone(), uri, Some(&tok)).await,
+                StatusCode::FORBIDDEN,
+                "{uri} served a namespace the token has no scope for"
+            );
+        }
+        shutdown.cancel();
+    }
+
+    /// The mirror image: the same routes must not start refusing work the
+    /// token *is* scoped for. (A missing app 404s; what matters is never 403.)
+    #[tokio::test]
+    async fn scoped_token_still_reads_inside_its_namespace() {
+        let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+        for uri in [
+            "/v1/status/web/team-a",
+            "/v1/logs/web/team-a",
+            "/v1/logs/entries/web/team-a",
+            "/v1/metrics/app/web/team-a",
+            "/v1/deploys/history/web?namespace=team-a",
+            "/ui/app/web/team-a",
+            "/ui/app/web/team-a/env",
+            "/ui/fragment/app/web/team-a/instances",
+        ] {
+            assert_ne!(
+                get_status(app.clone(), uri, Some(&tok)).await,
+                StatusCode::FORBIDDEN,
+                "{uri} refused an in-scope read"
+            );
+        }
+        shutdown.cancel();
+    }
+
+    /// The WebSocket log stream needs a real server: `WebSocketUpgrade` is an
+    /// extractor and rejects a hand-built request with 426 before the handler
+    /// body runs, so `oneshot` can never reach the scope check. Bind an
+    /// ephemeral port, do an actual handshake, and the upgrade must be refused.
+    #[tokio::test]
+    async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { serving.cancelled().await })
+                .await
+                .unwrap();
+        });
+
+        let mut request = format!("ws://{address}/v1/ws/logs/web/team-b")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {tok}").parse().unwrap());
+        let error = tokio_tungstenite::connect_async(request)
+            .await
+            .expect_err("the log stream upgraded for an out-of-scope namespace");
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            }
+            other => panic!("expected an HTTP refusal, got {other:?}"),
+        }
+
+        shutdown.cancel();
+        let _ = server.await;
+    }
+
+    /// `/v1/logs/sql` takes no app or namespace to check a scope against, and
+    /// arbitrary SQL can't be rewritten into a tenant-filtered query. A scoped
+    /// token is refused outright rather than served every tenant's logs (C3).
+    #[tokio::test]
+    async fn scoped_token_is_refused_raw_log_sql() {
+        let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+        let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// …while an unscoped token keeps the operator query it has always had.
+    #[tokio::test]
+    async fn unscoped_token_still_runs_raw_log_sql() {
+        let (app, shutdown, tok) =
+            setup_with_role("sql-unscoped", crate::sesame::types::ApiRole::Admin).await;
+        let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
+        assert_ne!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// Two apps of the same name in different namespaces have coexisted since
+    /// DEP1; the history endpoint filtered on the bare name, so it returned
+    /// both tenants' deploys to whoever asked.
+    #[tokio::test]
+    async fn deploy_history_is_filtered_by_namespace() {
+        use crate::meat::types::AppId;
+
+        let entry = |namespace: &str, image: &str| DeployHistoryEntry {
+            app_id: AppId {
+                name: "web".to_string(),
+                namespace: namespace.to_string(),
+            },
+            ..sample_history_entry(image)
+        };
+        let history = Arc::new(RwLock::new(vec![
+            entry("team-a", "a:1"),
+            entry("team-b", "b:1"),
+        ]));
+        let (app, shutdown) = setup_with_deploy_history(history).await;
+
+        let body = get_body(app, "/v1/deploys/history/web?namespace=team-a").await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entries = parsed["history"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "history leaked across namespaces: {body}");
+        assert_eq!(entries[0]["image"], "a:1");
         shutdown.cancel();
     }
 

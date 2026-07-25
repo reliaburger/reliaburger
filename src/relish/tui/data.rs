@@ -51,6 +51,7 @@ pub trait DataProvider: Send + Sync + 'static {
     fn deploy_history(
         &self,
         app: &str,
+        namespace: &str,
     ) -> impl Future<Output = Result<Vec<serde_json::Value>, ProviderError>> + Send;
     fn app_metrics(
         &self,
@@ -99,8 +100,15 @@ impl DataProvider for HttpDataProvider {
     async fn recent_events(&self, limit: usize) -> Result<Vec<ClusterEvent>, ProviderError> {
         self.client.events(limit).await.map_err(Into::into)
     }
-    async fn deploy_history(&self, app: &str) -> Result<Vec<serde_json::Value>, ProviderError> {
-        self.client.deploy_history(app).await.map_err(Into::into)
+    async fn deploy_history(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<Vec<serde_json::Value>, ProviderError> {
+        self.client
+            .deploy_history(app, namespace)
+            .await
+            .map_err(Into::into)
     }
     async fn app_metrics(
         &self,
@@ -166,7 +174,11 @@ impl DataProvider for MockDataProvider {
             .rev()
             .collect())
     }
-    async fn deploy_history(&self, app: &str) -> Result<Vec<serde_json::Value>, ProviderError> {
+    async fn deploy_history(
+        &self,
+        app: &str,
+        _namespace: &str,
+    ) -> Result<Vec<serde_json::Value>, ProviderError> {
         Ok(self
             .scenario
             .data()

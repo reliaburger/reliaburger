@@ -470,6 +470,36 @@ for (app_name, spec) in &config.app {
 
 Snapshot mutation used to ride on "any authenticated caller". So did app rollback. Both mutate real state, so both should want a Deployer plus a matching scope. The fix is one role check and one scope check per handler, and a matching update to the route matrix so the audit table and the handlers agree. If you're wondering why we keep a separate table when the checks live in the handlers: the table is the thing a reviewer can read in one sitting, and a test fails if a mounted route is missing from it. The handlers do the work; the table is how we *notice* when a handler forgot to.
 
+### Reads leak too
+
+Everything above is about *mutations*. Look back at that list: apply, stop, exec, rollback, snapshot mutations. Spot the pattern? Every single one changes something. Not one of them is a read.
+
+That's not a coincidence, it's a bias. When you think "authorisation", you picture someone doing damage. So you guard the verbs that do damage and move on, and a later review finds that a token scoped to `team-a` can `GET /v1/logs/web/team-b` and read another tenant's logs, which routinely carry credentials, tokens and personal data. It can read their plaintext environment through the dashboard's env endpoint. Their status. Their metrics. Their deploy history. No admin mistake required, no privilege escalation, just a normal low-privilege token asking politely for someone else's data.
+
+The fix per handler is the same two lines you've already seen. The interesting question is why the gap existed at all, and the answer is that "call `authorize_scoped` in every per-app handler" was a *convention*. Conventions are what you have instead of a rule. They hold right up until someone adds a handler on a Friday.
+
+So we made it a rule the compiler's test harness enforces. If a route pattern names an app, its handler must call `authorize_scoped`:
+
+```rust
+for (path, handlers) in mounted_route_handlers(source) {
+    if !path.contains("{app}") {
+        continue;
+    }
+    for handler in handlers {
+        let body = handler_body(source, &handler).expect("handler exists");
+        if !body.contains("authorize_scoped") {
+            unscoped.push(format!("{path} → {handler}"));
+        }
+    }
+}
+```
+
+This reads the crate's own source with `include_str!`, which embeds a file's contents as a `&'static str` at compile time. The test is scanning text, not types, so it's a blunt instrument: it can't tell you the check is *correct*, only that it's *there*. That's still the difference between a rule and a hope. Add `/v1/logs/{app}/{namespace}` without a scope check and the suite goes red before review does.
+
+One route wouldn't fit the pattern. `/v1/logs/sql` takes operator SQL and runs it over the whole `logs` table, so there's no app or namespace to check a scope against. We could try rewriting arbitrary SQL into a tenant-filtered query. Please don't: that way lies a bespoke SQL parser and a long tail of bypasses through subqueries and CTEs you didn't think of. A scoped token is refused outright and pointed at `/v1/logs/query/{app}/{namespace}`, which *can* filter. Unscoped tokens keep the endpoint they've always had.
+
+The deploy-history endpoint had a quieter version of the same bug. It filtered on the bare app name, and since instance identity gained namespaces (chapter 2), two apps called `web` can live in different namespaces quite happily. Filtering by name alone returned both. The namespace now rides in as a query parameter, and the handler filters and scope-checks on it.
+
 ### Fail closed, not open
 
 A brand-new cluster has no tokens yet. The middleware treats an empty token store as a bootstrap window and lets everything through, because the operator needs *some* way to create the first token before any token exists. On loopback that's fine: you're the only one who can reach it. Bind that same token-less API to a routable address, though, and you've published an unauthenticated control plane to everyone who can route a packet to it.

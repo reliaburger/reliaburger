@@ -201,6 +201,9 @@ enum Command {
     History {
         /// App name.
         app: String,
+        /// Namespace the app lives in. Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
     },
     /// Rollback an app to the previous version.
     Rollback {
@@ -1036,7 +1039,10 @@ async fn main() -> ExitCode {
             } => reliaburger::relish::fault::scenario(path, *dry_run, *speed).await,
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, dry_run).await,
-        Command::History { ref app } => commands::history(app).await,
+        Command::History {
+            ref app,
+            ref namespace,
+        } => commands::history(app, namespace).await,
         Command::Rollback {
             ref app,
             ref namespace,
@@ -1630,7 +1636,22 @@ mod tests {
     fn parse_history_command() {
         let cli = parse(&["relish", "history", "web"]).unwrap();
         match cli.command {
-            Command::History { app } => assert_eq!(app, "web"),
+            Command::History { app, namespace } => {
+                assert_eq!(app, "web");
+                assert_eq!(namespace, "default");
+            }
+            _ => panic!("expected History"),
+        }
+    }
+
+    #[test]
+    fn parse_history_command_with_namespace() {
+        let cli = parse(&["relish", "history", "web", "--namespace", "team-a"]).unwrap();
+        match cli.command {
+            Command::History { app, namespace } => {
+                assert_eq!(app, "web");
+                assert_eq!(namespace, "team-a");
+            }
             _ => panic!("expected History"),
         }
     }

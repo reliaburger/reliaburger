@@ -518,10 +518,21 @@ impl BunClient {
         })
     }
 
-    /// Fetch deploy history for an app.
-    pub async fn deploy_history(&self, app: &str) -> Result<Vec<serde_json::Value>, RelishError> {
+    /// Fetch deploy history for an app in a namespace.
+    pub async fn deploy_history(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<Vec<serde_json::Value>, RelishError> {
+        // Encode both: an app or namespace carrying `/`, `&` or a space would
+        // otherwise split into extra path segments or query parameters.
+        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
+        let namespace_value: String =
+            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
         let value: serde_json::Value = self
-            .get_typed_json(&format!("/v1/deploys/history/{app}"))
+            .get_typed_json(&format!(
+                "/v1/deploys/history/{app_segment}?namespace={namespace_value}"
+            ))
             .await?;
         Ok(value["history"].as_array().cloned().unwrap_or_default())
     }

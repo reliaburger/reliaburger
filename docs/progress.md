@@ -1480,19 +1480,31 @@ is *partly* addressed — Phase E made faults reversible and safety-checked; whe
 advertised resource fault has a measurable effect is still owned by the 12b.6 smoker-effects
 work, not by `M1`.
 
-### Open — Critical
+### Critical
 
-- [ ] **`C3` — token namespace/app scope is enforced only on mutations; every per-app read
-  ignores it.** This finding was raised in the review but **omitted from the review's own
-  recommended implementation order**, so Phases A–F worked around it. Verified still live on
-  `main`: `status_app_handler` (`src/bun/api.rs:1399`), `logs_handler` (`:1593`),
-  `ws_logs_handler` (`:1660`), `app_env_handler` (`:3057`), `logs_sql_handler` (`:3087`) and
-  `metrics_app_handler` (`:3273`) take no `auth` argument and never call `authorize_scoped` —
-  contrast `stop`/`exec`/`rollback`, which do. A legitimately issued token scoped to namespace
-  `team-a` can read `team-b`'s logs, plaintext env, status and metrics; `/v1/logs/sql`
-  compounds it by exposing the node's entire `logs` table with no tenant filter at all.
-  Exploitable by a normal low-privilege token — no admin mistake required. **This is the last
-  unfixed Critical in the review.**
+- [x] **`C3` — token namespace/app scope was enforced only on mutations; every per-app read
+  ignored it.** Raised in the review but **omitted from the review's own recommended
+  implementation order**, so Phases A–F worked around it — the last unfixed Critical. A token
+  scoped to `team-a` could read `team-b`'s logs, plaintext env, status, metrics, snapshots and
+  deploy history; no admin mistake required. Eleven per-app read handlers now take `auth` and
+  call `authorize_scoped`: status, logs, log entries, cross-node log query, WS log stream,
+  metrics, snapshot list, deploy history, and the three UI routes (app detail, env, instances
+  fragment). `/v1/logs/sql` takes no app to scope against and arbitrary SQL can't be rewritten
+  into a tenant-filtered query, so a scoped token is refused outright
+  (`sesame::auth::require_unscoped`) and pointed at `/v1/logs/query/{app}/{namespace}`;
+  unscoped tokens keep it. `/v1/deploys/history/{app}` filtered on the bare app name, which
+  since DEP1 spans namespaces — it now takes `?namespace=` and filters on both (`relish
+  history --namespace`, threaded through the client and the TUI, whose history cache is keyed
+  `namespace/app`).
+  - [x] Drift guard: `every_per_app_route_checks_the_callers_scope` scans the router's own
+    source and fails if a route pattern naming `{app}` dispatches to a handler that never
+    calls `authorize_scoped` — the convention that failed here is now a test. A companion
+    test pins `/v1/logs/sql` to `require_unscoped`.
+  - [x] Runtime tests: a `team-a` token gets 403 on all ten per-app read routes for `team-b`
+    and non-403 for its own; the WS stream is refused through a real handshake against an
+    ephemeral listener (a hand-built request can't reach the handler — `WebSocketUpgrade`
+    rejects it with 426 first); raw log SQL is refused scoped and allowed unscoped; deploy
+    history no longer returns two namespaces' entries.
 
 ### Open — deferred from merged PRs
 
