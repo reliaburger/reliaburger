@@ -74,6 +74,7 @@ fn revoked_crl(serial: u64) -> CrlHandle {
             issuer: CaRole::Node,
             revoked_at: SystemTime::now(),
             reason: "test".to_string(),
+            expires_at: None,
         }],
         version: 1,
         updated_at: SystemTime::now(),

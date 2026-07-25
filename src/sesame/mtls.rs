@@ -694,6 +694,7 @@ mod tests {
                 issuer: crate::sesame::types::CaRole::Node,
                 revoked_at: SystemTime::now(),
                 reason: "test revocation".to_string(),
+                expires_at: None,
             }],
             version: 1,
             updated_at: SystemTime::now(),

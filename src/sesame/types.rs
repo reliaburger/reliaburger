@@ -418,6 +418,18 @@ pub struct CrlEntry {
     pub revoked_at: SystemTime,
     /// Human-readable reason (e.g. "node-07 compromised").
     pub reason: String,
+    /// When the revoked certificate would have expired on its own.
+    ///
+    /// Once it has, the entry is dead weight: an expired certificate fails
+    /// validation whether or not it appears on a revocation list. Carrying it
+    /// forever is how a long-lived cluster's CRL — replicated in every Raft
+    /// snapshot and re-read on every TLS handshake — grows without bound (O5).
+    ///
+    /// `None` for entries written before this field existed, and for callers
+    /// that don't know the certificate's validity; those are never pruned,
+    /// which is the safe direction to be wrong.
+    #[serde(default)]
+    pub expires_at: Option<SystemTime>,
 }
 
 // ---------------------------------------------------------------------------

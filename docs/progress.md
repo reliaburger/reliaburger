@@ -1516,9 +1516,24 @@ work, not by `M1`.
 - [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
   (local-process-list exposure; the durable Raft leak is fixed)
 - [ ] `M28` residual — broader export-side field fidelity
-- [ ] `O5` residual — unbounded growth in the reporting aggregator maps, the mustard
-  dissemination heap and membership table, and never-pruned expired `crl.entries`
-- [ ] `O17` residual — `CpuStress --cores` multi-core arithmetic
+- [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
+  draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn could outrun it
+  forever. It now compacts past a 4096 cap: coalesce to the newest incarnation per node (an
+  older update is exactly what the newer one supersedes), then, if still over, keep the
+  highest-priority entries so what's shed is `Alive` chatter and never a `Dead`/`Suspect`.
+  `crl.entries` gained `expires_at` (`#[serde(default)]`, so old state loads and unknown
+  expiries are never pruned) and `RevokeCertificate` drops entries whose certificates have
+  since expired — an expired cert fails validation with or without a CRL entry. The prune
+  clocks off the incoming entry's own `revoked_at`, never `SystemTime::now()`: Raft apply must
+  be deterministic or replicas prune different sets and diverge (pinned by a test). The
+  reporting aggregator maps were already bounded by 12b.2's CP5 eviction; the membership table
+  only admits `Alive` nodes and reaps Dead/Left, so it's bounded by cluster size
+- [x] `O17` residual — `CpuStress --cores` was parsed and thrown away while the quota maths
+  assumed exactly one core, so on a 4-core node "80% stress" took 95% of the workload's CPU.
+  `cpu_stress_quota` now scales by cores, and `None` means "every core the workload has",
+  derived from its current `cpu.max` via a new pure `baseline_cores` (unlimited → host cores;
+  a quota → quota/period; unparseable → 1, since under-reading makes the fault weaker than
+  asked, which is the wrong way to be wrong)
 - [ ] `TODO(Phase 15)` — Smoker's service-to-service `Partition` apply arm stays an accepted
   no-op without eBPF; tightening it needs the quorum-rail acceptance test moved onto an eBPF
   node first

@@ -49,6 +49,16 @@ impl PartialOrd for QueuedUpdate {
     }
 }
 
+/// Ceiling on queued updates before the queue compacts itself (O5).
+///
+/// Nothing bounded this heap: `enqueue` pushed unconditionally while
+/// `select_updates` drains at most [`MAX_PIGGYBACK_UPDATES`] per outgoing
+/// message, so a churning cluster (or a peer replaying old updates) could
+/// enqueue faster than the queue drains, forever. Comfortably above any
+/// real cluster's steady state, so compaction is an anomaly, not a
+/// hot path.
+const MAX_QUEUED_UPDATES: usize = 4096;
+
 /// The dissemination queue that selects updates to piggyback on messages.
 pub struct DisseminationQueue {
     queue: BinaryHeap<QueuedUpdate>,
@@ -73,6 +83,48 @@ impl DisseminationQueue {
             update,
             remaining_broadcasts: broadcasts,
         });
+        if self.queue.len() > MAX_QUEUED_UPDATES {
+            self.compact();
+        }
+    }
+
+    /// Bound the queue by throwing away what nobody needs (O5).
+    ///
+    /// Two passes. First coalesce: keep only the highest-incarnation entry
+    /// per node, because an older update about a node is exactly what the
+    /// newer one supersedes — sending both wastes datagram space to tell
+    /// peers something they will immediately overwrite. On a healthy cluster
+    /// that alone bounds the queue at one entry per member.
+    ///
+    /// If that isn't enough (a very large cluster, or a flood of distinct
+    /// node ids), keep the highest-priority [`MAX_QUEUED_UPDATES`]. Dropping
+    /// the tail is safe: dissemination is best-effort by design, and SWIM's
+    /// probe cycle re-derives anything that goes missing. Dropping the
+    /// *lowest* priority means what we shed is `Alive` chatter, never a
+    /// `Dead` or `Suspect` that someone is waiting on.
+    fn compact(&mut self) {
+        use std::collections::HashMap;
+
+        let drained: Vec<QueuedUpdate> = self.queue.drain().collect();
+        let mut newest: HashMap<crate::meat::NodeId, QueuedUpdate> =
+            HashMap::with_capacity(drained.len());
+        for queued in drained {
+            match newest.get(&queued.update.node_id) {
+                Some(existing) if existing.update.incarnation >= queued.update.incarnation => {}
+                _ => {
+                    newest.insert(queued.update.node_id.clone(), queued);
+                }
+            }
+        }
+
+        let mut remaining: Vec<QueuedUpdate> = newest.into_values().collect();
+        if remaining.len() > MAX_QUEUED_UPDATES {
+            // Descending: highest priority first, so `truncate` sheds the
+            // least useful entries.
+            remaining.sort_by(|a, b| b.cmp(a));
+            remaining.truncate(MAX_QUEUED_UPDATES);
+        }
+        self.queue = remaining.into_iter().collect();
     }
 
     /// Select up to `MAX_PIGGYBACK_UPDATES` updates to piggyback on
@@ -314,5 +366,67 @@ mod tests {
         queue.enqueue(update("n1", NodeState::Alive), 2);
         queue.enqueue(update("n2", NodeState::Dead), 2);
         assert_eq!(queue.len(), 2);
+    }
+
+    // -- bounded growth (O5) --------------------------------------------------
+
+    /// The queue drains at most `MAX_PIGGYBACK_UPDATES` per outgoing message
+    /// but accepted enqueues without limit, so churn could outrun it forever.
+    #[test]
+    fn repeated_updates_about_one_node_do_not_grow_without_bound() {
+        let mut queue = DisseminationQueue::new();
+        for incarnation in 1..(MAX_QUEUED_UPDATES as u64 + 100) {
+            let mut u = update("n1", NodeState::Alive);
+            u.incarnation = incarnation;
+            queue.enqueue(u, 3);
+        }
+        let newest = MAX_QUEUED_UPDATES as u64 + 99;
+        // Compaction is amortised — it runs when the cap is crossed, not on
+        // every enqueue — so the queue sits under the cap rather than at 1.
+        // What matters is that it stops growing.
+        assert!(
+            queue.len() <= MAX_QUEUED_UPDATES,
+            "queue grew to {} past the {MAX_QUEUED_UPDATES} cap",
+            queue.len()
+        );
+        // …and that coalescing keeps the newest incarnation. Losing that
+        // would make the bound a correctness bug rather than a memory fix.
+        let mut seen_newest = false;
+        while !queue.is_empty() {
+            if queue
+                .select_updates()
+                .iter()
+                .any(|u| u.incarnation == newest)
+            {
+                seen_newest = true;
+                break;
+            }
+        }
+        assert!(seen_newest, "compaction dropped the newest incarnation");
+    }
+
+    /// With enough *distinct* nodes, coalescing alone can't bound the queue,
+    /// so the cap applies — and what it sheds is the lowest priority.
+    #[test]
+    fn a_flood_of_distinct_nodes_is_capped_and_sheds_the_least_urgent() {
+        let mut queue = DisseminationQueue::new();
+        // One Dead update we must not lose, buried under a flood of Alive.
+        queue.enqueue(update("critical", NodeState::Dead), 3);
+        for i in 0..(MAX_QUEUED_UPDATES + 500) {
+            queue.enqueue(update(&format!("n{i}"), NodeState::Alive), 3);
+        }
+
+        assert!(
+            queue.len() <= MAX_QUEUED_UPDATES,
+            "queue grew to {} past the {MAX_QUEUED_UPDATES} cap",
+            queue.len()
+        );
+        let selected = queue.select_updates();
+        assert!(
+            selected
+                .iter()
+                .any(|u| u.node_id == NodeId::new("critical")),
+            "the cap dropped a Dead update while keeping Alive chatter"
+        );
     }
 }
