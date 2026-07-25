@@ -67,7 +67,10 @@ fn compile_directory_with_defaults(
     let mut warnings = Vec::new();
 
     // Load defaults: own file takes priority, fall back to parent's
-    let own_defaults = load_defaults(dir);
+    let (own_defaults, defaults_warning) = load_defaults(dir);
+    if let Some(warning) = defaults_warning {
+        warnings.push(warning);
+    }
     let defaults = own_defaults.as_ref().or(parent_defaults);
 
     // Process all .toml files in this directory (except _defaults.toml)
@@ -96,7 +99,9 @@ fn compile_directory_with_defaults(
                     apply_namespace(&mut file_config, ns);
                 }
 
-                merge_into(&mut merged, file_config);
+                for collision in merge_into(&mut merged, file_config) {
+                    warnings.push(format!("{}: {collision}", entry_path.display()));
+                }
                 merged_from.push(entry_path.clone());
             }
             Err(e) => {
@@ -121,7 +126,9 @@ fn compile_directory_with_defaults(
                     if let Some(ns) = subdir.file_name().and_then(|n| n.to_str()) {
                         apply_namespace(&mut sub_result.config, ns);
                     }
-                    merge_into(&mut merged, sub_result.config);
+                    for collision in merge_into(&mut merged, sub_result.config) {
+                        warnings.push(format!("{}: {collision}", subdir.display()));
+                    }
                     merged_from.extend(sub_result.merged_from);
                     warnings.extend(sub_result.warnings);
                 }
@@ -152,13 +159,36 @@ fn collect_toml_files(dir: &Path) -> Result<Vec<PathBuf>, RelishError> {
 }
 
 /// Load `_defaults.toml` from a directory, if present.
-fn load_defaults(dir: &Path) -> Option<BTreeMap<String, toml::Value>> {
+///
+/// Returns the defaults and any reason they could not be loaded (O10). The
+/// `.ok()?` this replaced turned an unreadable or malformed defaults file
+/// into "there are no defaults" — so a typo in `_defaults.toml` didn't fail
+/// the compile, it silently dropped the default image from every app in the
+/// directory and let the error surface much later as a missing field.
+fn load_defaults(dir: &Path) -> (Option<BTreeMap<String, toml::Value>>, Option<String>) {
     let defaults_path = dir.join("_defaults.toml");
     if !defaults_path.is_file() {
-        return None;
+        return (None, None);
     }
-    let content = std::fs::read_to_string(&defaults_path).ok()?;
-    toml::from_str(&content).ok()
+    let content = match std::fs::read_to_string(&defaults_path) {
+        Ok(content) => content,
+        Err(e) => {
+            return (
+                None,
+                Some(format!("{}: unreadable: {e}", defaults_path.display())),
+            );
+        }
+    };
+    match toml::from_str(&content) {
+        Ok(parsed) => (Some(parsed), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "{}: invalid TOML, defaults not applied: {e}",
+                defaults_path.display()
+            )),
+        ),
+    }
 }
 
 /// Apply defaults to a config. For each app, if a field from defaults
@@ -204,12 +234,49 @@ fn apply_namespace(config: &mut Config, namespace: &str) {
 }
 
 /// Merge `source` into `target`, appending all resources.
-fn merge_into(target: &mut Config, source: Config) {
-    target.app.extend(source.app);
-    target.job.extend(source.job);
+///
+/// Returns a warning for every resource the merge *overwrote* (O10). The
+/// maps are keyed by name, so `extend` silently replaced a same-named app
+/// from an earlier file — split your apps across two files, name one twice
+/// by accident, and `compile` would emit one of them with no hint that the
+/// other ever existed. Two apps of the same name in *different* namespaces
+/// are legitimate (DEP1) and are not reported.
+#[must_use]
+fn merge_into(target: &mut Config, source: Config) -> Vec<String> {
+    let mut collisions = Vec::new();
+
+    for (name, spec) in source.app {
+        let namespace = spec.namespace.clone();
+        if let Some(existing) = target.app.get(&name)
+            && existing.namespace == namespace
+        {
+            collisions.push(format!(
+                "duplicate app {:?} in namespace {:?}: the later definition wins",
+                name,
+                namespace.as_deref().unwrap_or("default")
+            ));
+        }
+        target.app.insert(name, spec);
+    }
+
+    for (name, spec) in source.job {
+        let namespace = spec.namespace.clone();
+        if let Some(existing) = target.job.get(&name)
+            && existing.namespace == namespace
+        {
+            collisions.push(format!(
+                "duplicate job {:?} in namespace {:?}: the later definition wins",
+                name,
+                namespace.as_deref().unwrap_or("default")
+            ));
+        }
+        target.job.insert(name, spec);
+    }
+
     target.namespace.extend(source.namespace);
     target.permission.extend(source.permission);
     target.build.extend(source.build);
+    collisions
 }
 
 #[cfg(test)]
@@ -266,6 +333,70 @@ mod tests {
             web.image.as_deref(),
             Some("base:v1"),
             "default image should be applied"
+        );
+    }
+
+    /// O10: the maps are keyed by name, so `extend` silently replaced a
+    /// same-named app from an earlier file. `compile` emitted one of them
+    /// and said nothing about the other.
+    #[test]
+    fn duplicate_app_names_in_one_namespace_are_reported() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "a.toml", "[app.web]\nimage = \"first:1\"\n");
+        write_file(dir.path(), "b.toml", "[app.web]\nimage = \"second:1\"\n");
+
+        let result = compile(dir.path()).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w.contains("duplicate app")),
+            "a silently overwritten app produced no warning: {:?}",
+            result.warnings
+        );
+        // Last file still wins — the fix is visibility, not new semantics.
+        assert_eq!(result.config.app["web"].image.as_deref(), Some("second:1"));
+    }
+
+    /// Two apps of the same name in different namespaces have been
+    /// legitimate since DEP1, and must not be reported as a collision.
+    #[test]
+    fn same_app_name_in_two_namespaces_is_not_a_duplicate() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("team-a")).unwrap();
+        fs::create_dir(dir.path().join("team-b")).unwrap();
+        write_file(
+            &dir.path().join("team-a"),
+            "web.toml",
+            "[app.web]\nimage = \"a:1\"\n",
+        );
+        write_file(
+            &dir.path().join("team-b"),
+            "web.toml",
+            "[app.web]\nimage = \"b:1\"\n",
+        );
+
+        let result = compile(dir.path()).unwrap();
+        assert!(
+            !result.warnings.iter().any(|w| w.contains("duplicate app")),
+            "namespaced apps were reported as duplicates: {:?}",
+            result.warnings
+        );
+    }
+
+    /// O10: a malformed `_defaults.toml` used to be indistinguishable from
+    /// no defaults at all, so the error surfaced later as a missing field.
+    #[test]
+    fn a_malformed_defaults_file_is_reported() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "_defaults.toml", "image = \"not closed\n");
+        write_file(dir.path(), "a.toml", "[app.web]\nimage = \"x:1\"\n");
+
+        let result = compile(dir.path()).unwrap();
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("_defaults.toml") && w.contains("invalid TOML")),
+            "a malformed defaults file was swallowed: {:?}",
+            result.warnings
         );
     }
 

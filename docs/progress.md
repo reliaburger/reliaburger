@@ -1522,8 +1522,9 @@ work, not by `M1`.
   keying becomes rule+series) and is not attempted here — recorded rather than silently
   skipped
 - [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
-  (local-process-list exposure; the durable Raft leak is fixed)
-- [ ] `M28` residual — broader export-side field fidelity
+  (local-process-list exposure; the durable Raft leak is fixed). Needs a temp askpass helper
+  with 0700 perms and cleanup, so it rides with the follow-up PR
+- [ ] `M28` residual — broader export-side field fidelity (follow-up PR)
 - [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
   draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn could outrun it
   forever. It now compacts past a 4096 cap: coalesce to the newest incarnation per node (an
@@ -1597,10 +1598,22 @@ work, not by `M1`.
   numbers — and `leave()` sets a flag so a node's own departure echoing back off a peer isn't
   mistaken for a replay to refute. The `resolve_conflict` proptest invariant moved from "Left
   is terminal" to "Left wins at an equal or higher incarnation"
-- [ ] `O10` `relish fmt` writes non-atomically and deletes comments; `compile` silently drops
-  duplicate app names
-- [ ] `O11` DNS forwards only over IPv4; bare `<app>.internal` resolves in the node's
-  `default_namespace`, not the caller's
+- [x] `O10` `relish fmt` wrote non-atomically (`fs::write` truncates first, so an interrupted
+  write left a half-file where a valid config used to be — one the node reads at startup) and
+  deleted comments in silence. It now writes to a sibling temp file and renames (same
+  filesystem, so the rename is atomic) and warns once when the input had comments. `compile`
+  merged with `extend`, so a same-named app from an earlier file was silently replaced — it
+  now reports each overwrite as a warning, while two apps of the same name in *different*
+  namespaces stay legal (DEP1). `_defaults.toml` parse errors were swallowed by `.ok()?`,
+  making a typo indistinguishable from "no defaults"; they surface as warnings now
+- [x] `O11` (IPv4 forwarding) DNS forwarded from a hardcoded `0.0.0.0:0`, so an IPv6 upstream
+  was unreachable and every non-`.internal` query SERVFAILed — a failure that reads as "DNS is
+  broken" rather than "your upstream is v6". The forward socket now binds the upstream's
+  address family, proven against real v4 and v6 loopback resolvers.
+  **Residual:** a bare `<app>.internal` still resolves in the node's `default_namespace`
+  rather than the caller's. Fixing it needs a source-IP→namespace map the userspace responder
+  doesn't have (the limitation is already documented on `DnsConfig::default_namespace`), and
+  eBPF connect enforcement remains the primary control here
 - [ ] `O20` stale/misleading docs and dead code sweep
 
 The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise within this list.
