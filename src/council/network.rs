@@ -211,6 +211,22 @@ const MAX_RAFT_RPC_SIZE: usize = 64 * 1024 * 1024;
 /// pin the task forever.
 const RAFT_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How much of a frame we read (and therefore allocate) at a time.
+///
+/// The length prefix is attacker-controlled up to [`MAX_RAFT_RPC_SIZE`], so
+/// allocating it up front let one connection claim 64 MiB by sending four
+/// bytes. Reading in chunks means the buffer only grows as bytes actually
+/// arrive (O6).
+const FRAME_CHUNK_SIZE: usize = 64 * 1024;
+
+/// How many Raft RPC connections may be in flight at once.
+///
+/// Each one is already bounded in time by [`RAFT_ACCEPT_DEADLINE`] and in
+/// size by [`MAX_RAFT_RPC_SIZE`]; this bounds them in *number*, so a peer
+/// opening connections in a loop can't fan out unbounded tasks and buffers.
+/// A real council is a handful of nodes, so this is generous (O6).
+const MAX_RAFT_CONNECTIONS: usize = 64;
+
 /// Raft RPC request envelope, serialised over TCP.
 #[derive(Serialize, Deserialize)]
 pub enum RaftRpc {
@@ -279,8 +295,17 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
         eprintln!("raft: dropping oversized frame: {len} bytes (max {MAX_RAFT_RPC_SIZE})");
         return None;
     }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await.ok()?;
+    // O6: grow the buffer as bytes arrive rather than trusting `len`. A peer
+    // that declares 64 MiB and then sends nothing costs one chunk, not 64 MiB.
+    let mut payload = Vec::new();
+    let mut chunk = vec![0u8; FRAME_CHUNK_SIZE.min(len.max(1))];
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        stream.read_exact(&mut chunk[..want]).await.ok()?;
+        payload.extend_from_slice(&chunk[..want]);
+        remaining -= want;
+    }
     Some(payload)
 }
 
@@ -311,7 +336,41 @@ pub async fn serve_raft_rpc(
     tls: Option<tokio_rustls::TlsAcceptor>,
     local_recovery_epoch: u64,
 ) {
+    serve_raft_rpc_with_limit(
+        listener,
+        raft,
+        shutdown,
+        tls,
+        local_recovery_epoch,
+        MAX_RAFT_CONNECTIONS,
+    )
+    .await
+}
+
+/// [`serve_raft_rpc`] with an injectable connection cap, so the bound can be
+/// exercised without opening [`MAX_RAFT_CONNECTIONS`] sockets.
+pub async fn serve_raft_rpc_with_limit(
+    listener: tokio::net::TcpListener,
+    raft: Raft<TypeConfig>,
+    shutdown: tokio_util::sync::CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    local_recovery_epoch: u64,
+    max_connections: usize,
+) {
+    // O6: hold a permit for the whole lifetime of a connection. Acquiring
+    // *before* accepting means excess peers queue in the kernel's backlog
+    // instead of each costing a task and a buffer. Every permit is released
+    // within RAFT_ACCEPT_DEADLINE, so a stalled peer can't hold one forever.
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
     loop {
+        let permit = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            permit = connections.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                // Only returned once the semaphore is closed, which we never do.
+                Err(_) => break,
+            },
+        };
         tokio::select! {
             _ = shutdown.cancelled() => break,
             result = listener.accept() => {
@@ -321,6 +380,7 @@ pub async fn serve_raft_rpc(
                         match tls.clone() {
                             Some(acceptor) => {
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     // A failed handshake (no/invalid/revoked
                                     // client cert) is dropped silently — a
                                     // rejected peer must not learn why. The
@@ -338,6 +398,7 @@ pub async fn serve_raft_rpc(
                             }
                             None => {
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     let _ = tokio::time::timeout(
                                         RAFT_ACCEPT_DEADLINE,
                                         handle_raft_rpc(stream, raft, local_recovery_epoch),
@@ -347,6 +408,8 @@ pub async fn serve_raft_rpc(
                             }
                         }
                     }
+                    // Nothing was accepted, so release the permit rather than
+                    // leaking it on a transient accept error.
                     Err(_) => continue,
                 }
             }
@@ -736,6 +799,49 @@ mod tests {
             result.is_err(),
             "a stalled half-frame read must be cut off by the deadline, not return"
         );
+    }
+
+    /// O6: a frame spanning several chunks must reassemble byte for byte —
+    /// the whole point of the chunked read is that it can't lose or reorder
+    /// anything while it grows.
+    #[tokio::test]
+    async fn read_frame_reassembles_a_multi_chunk_payload() {
+        use tokio::io::AsyncWriteExt;
+
+        let payload: Vec<u8> = (0..FRAME_CHUNK_SIZE * 2 + 7)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(&(payload.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            client.write_all(&payload).await.unwrap();
+            payload
+        });
+
+        let read = read_frame(&mut server).await.expect("frame");
+        let written = writer.await.unwrap();
+        assert_eq!(read, written);
+    }
+
+    /// O6: the length prefix is attacker-controlled. Declaring the maximum
+    /// and then sending almost nothing must fail on the short read rather
+    /// than reserving 64 MiB per connection first.
+    #[tokio::test]
+    async fn read_frame_does_not_trust_a_declared_length() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(&(MAX_RAFT_RPC_SIZE as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(b"ten bytes!").await.unwrap();
+        drop(client); // EOF: the rest never arrives.
+
+        assert!(read_frame(&mut server).await.is_none());
     }
 
     // -- recovery-epoch fence (C5) -------------------------------------------

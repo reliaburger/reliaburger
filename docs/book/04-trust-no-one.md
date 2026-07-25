@@ -281,6 +281,59 @@ let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
 
 A peer that stalls is dropped when the deadline fires, and the task is freed. `tokio::time::timeout` wraps any future and races it against a timer, returning `Err` if the timer wins — a much better tool than trusting TCP's own timeouts, which are measured in minutes and aren't really yours to set. The outbound side already had a connect timeout; this closes the same gap on the way in.
 
+### A number is a promise, not a fact
+
+That fixed the clock. There were two more bounds missing on the same listener, and both come from the same habit: believing what a stranger tells you.
+
+Here's the original frame read. It looks fine:
+
+```rust
+let len = u32::from_be_bytes(len_buf) as usize;
+if len > MAX_RAFT_RPC_SIZE {
+    return None;
+}
+let mut payload = vec![0u8; len];
+stream.read_exact(&mut payload).await.ok()?;
+```
+
+There's a cap, the cap is checked, and an oversized frame is rejected. So what's wrong? `vec![0u8; len]` allocates `len` bytes *before* a single byte of payload has arrived. Snapshots can legitimately be large, so `MAX_RAFT_RPC_SIZE` is 64 MiB. Send four bytes saying "64 MiB incoming" and the node hands you 64 MiB of memory for the privilege. Send four bytes a hundred times and it's 6.4 GiB. The cheapest possible attack: four bytes.
+
+The fix is to let the buffer grow with reality rather than with the claim:
+
+```rust
+let mut payload = Vec::new();
+let mut chunk = vec![0u8; FRAME_CHUNK_SIZE.min(len.max(1))];
+let mut remaining = len;
+while remaining > 0 {
+    let want = remaining.min(chunk.len());
+    stream.read_exact(&mut chunk[..want]).await.ok()?;
+    payload.extend_from_slice(&chunk[..want]);
+    remaining -= want;
+}
+```
+
+A liar now costs one 64 KiB chunk. An honest peer sending a real snapshot pays the same total, just in instalments — `Vec` grows geometrically, so the reallocation cost is amortised and nobody notices. The declared length still bounds the loop, so it's not useless; it's just no longer taken as an instruction to allocate.
+
+The third bound is *how many* connections exist at once. Each one is capped in time and in size now, but nothing stopped a peer opening ten thousand of them. So the accept loop holds a semaphore permit for the lifetime of each connection:
+
+```rust
+let connections = Arc::new(Semaphore::new(max_connections));
+loop {
+    let permit = connections.clone().acquire_owned().await?;
+    let (stream, _peer) = listener.accept().await?;
+    tokio::spawn(async move {
+        let _permit = permit;   // released when the task ends
+        // …serve the connection…
+    });
+}
+```
+
+Acquiring *before* `accept()` is the part worth pausing on. Excess peers then wait in the kernel's accept backlog, where they cost a socket and nothing of ours — no task, no buffer. Accept first and you've already paid for the connection before deciding you didn't want it.
+
+`let _permit = permit;` inside the task is doing real work despite looking like a no-op. Rust drops a value at the end of the scope that owns it, and dropping a semaphore permit returns it. Moving the permit into the task is what ties "this connection is finished" to "this slot is free" — no release call to forget, no error path that skips it. This is RAII, the same pattern as a `MutexGuard`: the type's `Drop` impl *is* the cleanup, so the compiler's scope rules enforce what a human would otherwise have to remember.
+
+Naming it `_permit` rather than `_` matters too. A bare `_` doesn't bind, so the permit would drop immediately at the top of the task and the cap would silently do nothing — a bug that only shows up under load, which is exactly when you'd rather not be debugging. The test for this leaks a permit on purpose and asserts the *second* connection is never served.
+
 ## Gossip HMAC
 
 Gossip uses UDP, which can't do TLS. Instead, we authenticate gossip messages with HMAC-SHA256. The HMAC key is derived from the cluster master secret (which members hold, but outsiders don't). Deriving it from the public Root CA certificate would prove nothing. This proves the sender holds cluster key material without the overhead of TLS on every UDP datagram.
