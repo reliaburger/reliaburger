@@ -142,7 +142,7 @@ Any ──> Left  (graceful departure)
 
 `Alive` → `Suspect` happens when a node fails to respond to probes. `Suspect` → `Dead` happens after a timeout with no refutation. And `Suspect` → `Alive` happens when the suspected node hears about the suspicion and refutes it by bumping its incarnation number.
 
-`Left` is special — it's a graceful departure. When a node shuts down cleanly, it announces "I'm leaving" and that overrides everything. Once a node has left, even a higher incarnation number can't bring it back.
+`Left` is special — it's a graceful departure. When a node shuts down cleanly, it announces "I'm leaving" and that overrides every opinion formed at or before that incarnation. Only the node itself, at a strictly higher incarnation, can take it back; we'll come to why that exception exists in "Coming back after maintenance".
 
 ### Incarnation numbers and conflict resolution
 
@@ -157,11 +157,11 @@ pub fn resolve_conflict(
     new_state: NodeState,
     new_incarnation: u64,
 ) -> (NodeState, u64) {
-    // Left is terminal
-    if new_state == NodeState::Left {
+    // Left outranks anything at or below its incarnation
+    if new_state == NodeState::Left && new_incarnation >= old_incarnation {
         return (NodeState::Left, new_incarnation);
     }
-    if old_state == NodeState::Left {
+    if old_state == NodeState::Left && old_incarnation >= new_incarnation {
         return (NodeState::Left, old_incarnation);
     }
 
@@ -183,7 +183,7 @@ pub fn resolve_conflict(
 Three rules:
 1. Higher incarnation always wins.
 2. At equal incarnation, the more severe state wins (`Dead > Suspect > Alive`).
-3. `Left` always wins — graceful departure is final.
+3. `Left` wins at an equal or higher incarnation — graceful departure outranks any opinion formed before it.
 
 Rule 2 is important. If two updates arrive with the same incarnation — say, one marking a node Suspect and one marking it Alive — the Suspect update wins. This biases the protocol towards detecting failures rather than missing them. A false positive (marking a healthy node as suspect) is recoverable: the node just bumps its incarnation. A false negative (thinking a dead node is alive) isn't.
 
@@ -476,7 +476,28 @@ This is fire-and-forget: the node can't stick around waiting for acknowledgement
 
 So what happens when the node finishes maintenance and rejoins the cluster?
 
-Left is terminal. No Alive update, at any incarnation number, can override it. This is deliberate: if a node said "I'm leaving," we don't want stale gossip from before the departure to accidentally resurrect it. The other nodes must agree that the node is gone before it can come back.
+Left beats everything at the same or a lower incarnation. That's deliberate: if a node said "I'm leaving," we don't want stale gossip from before the departure to accidentally resurrect it. The other nodes must agree it's gone before it can come back.
+
+For a long time that rule had no exception at all: Left won at *any* incarnation, full stop. Read that back and the problem shows itself. Every other state a node can be accused of, it can argue with. Suspect? Refute it. Dead? Refute it. Left was the one accusation with no appeal.
+
+Does that matter, given gossip is HMAC-authenticated and an outsider can't forge a departure? It does, because authentication stops forgery, not *replay*. A datagram that legitimately said "n1 has left" during last week's maintenance is a perfectly valid datagram this week too. Replay it at a node that has since rejoined and it drops out of the cluster for the full 60-second reap, protesting the whole time to an audience that has stopped listening.
+
+So Left now loses to a strictly higher incarnation, like everything else:
+
+```rust
+if new_state == NodeState::Left && new_incarnation >= old_incarnation {
+    return (NodeState::Left, new_incarnation);
+}
+if old_state == NodeState::Left && old_incarnation >= new_incarnation {
+    return (NodeState::Left, old_incarnation);
+}
+```
+
+Why is that safe when "Left is final" was the point? Because of who owns an incarnation number. A node's incarnation is only ever increased by that node, about itself. A peer replaying an old departure has the old incarnation baked into the bytes it captured and no way to mint a newer one. So the only party who can override a Left is the node it's about — which is precisely the party we wanted to give a voice to, and nobody else.
+
+There's an obvious way to get this wrong, and we did, briefly. A node that has genuinely left keeps running for a moment while its own announcement propagates, and that announcement comes echoing back off the peers it just told. Refute *that* and the node resurrects itself, undoing a deliberate shutdown. The fix is a one-line piece of state: a `left: bool` set in `leave()`, checked before refuting a Left. Our own departure coming home is not an accusation.
+
+The rest of the story is unchanged.
 
 The mechanism that makes this work is the cleanup timeout. After 60 seconds in the Left state, `reap_expired_dead` removes the entry from every node's membership table. When the returning node sends its first PING, none of its peers recognise it — so `add_node` creates a fresh entry with state Alive. From the cluster's perspective, it's a brand new node joining for the first time.
 

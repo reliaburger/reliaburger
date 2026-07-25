@@ -59,6 +59,12 @@ pub struct MustardNode<T: MustardTransport> {
     /// Digest of the last-published membership. Used to publish on any content
     /// change (state/incarnation/council/leader), not just a count change.
     last_published_digest: Vec<(NodeId, NodeState, u64, bool, bool)>,
+    /// Whether this node has announced its own departure.
+    ///
+    /// Once it has, a `Left` about us echoing back off a peer is our own
+    /// announcement coming home, not a replay to refute — resurrecting
+    /// ourselves there would undo a deliberate shutdown (O9).
+    left: bool,
     /// Seed addresses to (re-)contact while this node has no live peers.
     /// Used to bootstrap a join by address without inserting a placeholder
     /// member: we ping the seed, and learn its real identity from the reply.
@@ -107,6 +113,7 @@ impl<T: MustardTransport> MustardNode<T> {
             lamport: 0,
             membership_watch: None,
             last_published_digest: Vec::new(),
+            left: false,
             seeds: Vec::new(),
             advertised: None,
             advertised_labels: BTreeMap::new(),
@@ -308,6 +315,7 @@ impl<T: MustardTransport> MustardNode<T> {
     /// quickly. The node does not wait for acknowledgement.
     pub async fn leave(&mut self) {
         let now = Instant::now();
+        self.left = true;
 
         // Mark ourselves as Left
         if let Some(member) = self.membership.get_mut(&self.node_id) {
@@ -533,14 +541,24 @@ impl<T: MustardTransport> MustardNode<T> {
                     .enqueue(update.clone(), self.membership.len());
             }
 
-            // If we're being suspected *or* declared dead, refute it. Refuting
-            // Dead matters as much as Suspect: without it a false Dead about us
-            // is unrecoverable until the 60s reap (we'd be invisible to
-            // scheduling and the council the whole time). A higher incarnation
-            // resurrects us — see `resolve_conflict`.
-            if update.node_id == self.node_id
-                && matches!(update.state, NodeState::Suspect | NodeState::Dead)
-            {
+            // If we're being suspected, declared dead, or reported as having
+            // left, refute it. Refuting Dead matters as much as Suspect:
+            // without it a false Dead about us is unrecoverable until the 60s
+            // reap (we'd be invisible to scheduling and the council the whole
+            // time). A higher incarnation resurrects us — see
+            // `resolve_conflict`.
+            //
+            // Left is here for the same reason (O9). We only ever announce our
+            // own departure on the way down, so a Left about us arriving at a
+            // running node is a replay of an older one; refuting it at a higher
+            // incarnation is the only way back, and it's a route nobody else
+            // can take — peers can't mint our incarnation numbers.
+            let refutable = match update.state {
+                NodeState::Suspect | NodeState::Dead => true,
+                NodeState::Left => !self.left,
+                NodeState::Alive => false,
+            };
+            if update.node_id == self.node_id && refutable {
                 self.refute(update.incarnation);
             }
         }
@@ -633,16 +651,20 @@ impl<T: MustardTransport> MustardNode<T> {
     fn refute(&mut self, offending_incarnation: u64) {
         self.incarnation = self.incarnation.max(offending_incarnation) + 1;
         self.tick_lamport();
-        self.dissemination.enqueue(
-            MembershipUpdate {
-                node_id: self.node_id.clone(),
-                address: self.address,
-                state: NodeState::Alive,
-                incarnation: self.incarnation,
-                lamport: self.lamport,
-            },
-            self.membership.len(),
-        );
+        let update = MembershipUpdate {
+            node_id: self.node_id.clone(),
+            address: self.address,
+            state: NodeState::Alive,
+            incarnation: self.incarnation,
+            lamport: self.lamport,
+        };
+        // Apply the refutation to our own record too, not just the outbound
+        // queue (O9). The claim we're refuting was applied a moment ago, so
+        // without this a node tells the cluster it's Alive while its own
+        // membership table — the one its scheduler and council reads see —
+        // still holds it Suspect, Dead or Left.
+        self.membership.apply_update(&update, Instant::now());
+        self.dissemination.enqueue(update, self.membership.len());
     }
 
     /// Promote suspects whose suspicion timeout has expired to Dead.
@@ -1786,6 +1808,125 @@ mod tests {
         assert_eq!(
             node.incarnation, 51,
             "refute must jump past the stale Dead's incarnation in one step"
+        );
+    }
+
+    /// O9: refuting told the cluster we're alive but left our own record
+    /// holding the claim we'd just refuted, so the node disagreed with
+    /// everyone else about itself — including the scheduler and council reads
+    /// that go through the membership table.
+    #[tokio::test]
+    async fn refute_marks_this_node_alive_in_its_own_table() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n1"),
+            addr(1),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        let suspected = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Suspect,
+                    incarnation: 4,
+                    lamport: 1,
+                }],
+            },
+        );
+        node.handle_message(addr(9), suspected).await;
+
+        assert_eq!(
+            node.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Alive,
+            "a node that refuted suspicion still saw itself as Suspect"
+        );
+    }
+
+    /// O9: `Left` was the one claim a node could not refute about itself, so a
+    /// replayed departure (gossip is authenticated, so replayable but not
+    /// forgeable) took a healthy node out until the 60s reap.
+    #[tokio::test]
+    async fn a_replayed_left_does_not_evict_a_running_node() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n1"),
+            addr(1),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+
+        let replayed_left = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Left,
+                    incarnation: 1,
+                    lamport: 1,
+                }],
+            },
+        );
+        node.handle_message(addr(9), replayed_left).await;
+
+        assert_eq!(
+            node.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Alive,
+            "a replayed Left evicted a node that never left"
+        );
+        assert!(
+            node.incarnation > 1,
+            "refuting a Left must bump the incarnation so peers prefer it"
+        );
+    }
+
+    /// …but a node that really did leave must stay left. Its own departure
+    /// echoing back off a peer is not a replay to refute.
+    #[tokio::test]
+    async fn a_departed_node_does_not_resurrect_itself_on_its_own_echo() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n1"),
+            addr(1),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.leave().await;
+
+        let echoed = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("n1"),
+                    address: addr(1),
+                    state: NodeState::Left,
+                    incarnation: node.incarnation,
+                    lamport: 9,
+                }],
+            },
+        );
+        node.handle_message(addr(9), echoed).await;
+
+        assert_eq!(
+            node.membership.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Left,
+            "a deliberate shutdown was undone by its own gossip echo"
         );
     }
 

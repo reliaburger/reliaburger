@@ -67,18 +67,30 @@ impl NodeState {
 ///
 /// 1. Higher incarnation always wins.
 /// 2. At equal incarnation, `Dead > Suspect > Alive`.
-/// 3. `Left` always wins (explicit departure overrides everything).
+/// 3. `Left` beats everything at the same or a lower incarnation — an
+///    explicit departure outranks any opinion formed before it.
+///
+/// `Left` used to win outright, at any incarnation. That made it the one
+/// state a node could not refute about itself: a replayed departure
+/// datagram (gossip is authenticated, so it can be replayed but not forged)
+/// evicted a healthy node until the 60s reap, and re-announcing itself
+/// Alive changed nothing because every peer discarded the announcement.
+///
+/// Only the node itself increases its own incarnation, so requiring a
+/// *strictly higher* one to override `Left` gives exactly the refutation
+/// SWIM already grants for `Suspect` and `Dead`, and gives it to nobody
+/// else: a peer replaying an old departure can't invent a newer
+/// incarnation to go with it (O9).
 pub fn resolve_conflict(
     old_state: NodeState,
     old_incarnation: u64,
     new_state: NodeState,
     new_incarnation: u64,
 ) -> (NodeState, u64) {
-    // Left is terminal — graceful departure overrides everything
-    if new_state == NodeState::Left {
+    if new_state == NodeState::Left && new_incarnation >= old_incarnation {
         return (NodeState::Left, new_incarnation);
     }
-    if old_state == NodeState::Left {
+    if old_state == NodeState::Left && old_incarnation >= new_incarnation {
         return (NodeState::Left, old_incarnation);
     }
 
@@ -160,16 +172,37 @@ mod tests {
     }
 
     #[test]
-    fn left_always_wins_over_alive() {
-        let (state, _) = resolve_conflict(NodeState::Alive, 100, NodeState::Left, 1);
+    fn left_wins_over_an_older_alive() {
+        // A departure outranks any opinion formed at or before its
+        // incarnation, which is every opinion a peer could hold about a
+        // node that is shutting down.
+        let (state, _) = resolve_conflict(NodeState::Alive, 1, NodeState::Left, 1);
         assert_eq!(state, NodeState::Left);
     }
 
     #[test]
-    fn left_is_sticky() {
-        // Once a node has left, even a higher incarnation alive doesn't revive it
-        let (state, _) = resolve_conflict(NodeState::Left, 1, NodeState::Alive, 100);
+    fn left_is_sticky_against_a_stale_alive() {
+        let (state, _) = resolve_conflict(NodeState::Left, 100, NodeState::Alive, 100);
         assert_eq!(state, NodeState::Left);
+    }
+
+    #[test]
+    fn a_node_can_refute_a_left_about_itself() {
+        // O9: only the node itself mints its incarnation numbers, so a
+        // strictly higher Alive is proof it's still running — and is the
+        // one thing a peer replaying an old departure cannot produce.
+        let (state, incarnation) = resolve_conflict(NodeState::Left, 1, NodeState::Alive, 2);
+        assert_eq!(state, NodeState::Alive);
+        assert_eq!(incarnation, 2);
+    }
+
+    #[test]
+    fn a_stale_left_cannot_evict_a_node_that_moved_on() {
+        // The replay case from the other direction: the node is already at a
+        // higher incarnation when the old Left arrives.
+        let (state, incarnation) = resolve_conflict(NodeState::Alive, 7, NodeState::Left, 3);
+        assert_eq!(state, NodeState::Alive);
+        assert_eq!(incarnation, 7);
     }
 
     #[test]
@@ -243,20 +276,24 @@ mod tests {
             // Winner incarnation is one of the two inputs
             prop_assert!(i1 == old_inc || i1 == new_inc);
 
-            // Left is terminal: if either side is Left, result is Left
-            if old_state == NodeState::Left || new_state == NodeState::Left {
+            // Left wins at an equal or higher incarnation than the state it
+            // meets. Below that it loses like any other stale opinion — that
+            // is the only door a node has to refute a departure claimed
+            // about it (O9).
+            if new_state == NodeState::Left && new_inc >= old_inc {
+                prop_assert_eq!(r1, NodeState::Left);
+            }
+            if old_state == NodeState::Left && old_inc >= new_inc {
                 prop_assert_eq!(r1, NodeState::Left);
             }
 
-            // Higher incarnation wins (when neither is Left)
-            if old_state != NodeState::Left && new_state != NodeState::Left {
-                if new_inc > old_inc {
-                    prop_assert_eq!(r1, new_state);
-                    prop_assert_eq!(i1, new_inc);
-                } else if new_inc < old_inc {
-                    prop_assert_eq!(r1, old_state);
-                    prop_assert_eq!(i1, old_inc);
-                }
+            // Higher incarnation wins, Left included.
+            if new_inc > old_inc {
+                prop_assert_eq!(r1, new_state);
+                prop_assert_eq!(i1, new_inc);
+            } else if new_inc < old_inc {
+                prop_assert_eq!(r1, old_state);
+                prop_assert_eq!(i1, old_inc);
             }
         }
     }
