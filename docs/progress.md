@@ -1529,12 +1529,31 @@ work, not by `M1`.
 - [ ] `O1` anonymous Pickle reads are cluster-wide on a non-loopback bind
 - [ ] `O2` Pickle build-context URLs hardcode `http://` and `buildah push --tls-verify=false`
 - [ ] `O3` upgrade binary fetch/push is plaintext `http://` (integrity still sig+sha gated)
-- [ ] `O6` Raft RPC pre-allocates an attacker-controlled ≤64 MiB buffer per connection with no
-  connection cap
-- [ ] `O7` security-relevant reads are served from local follower state (a revoked cert can
-  read valid during a leadership transition)
-- [ ] `O9` SWIM `refute()` and the relay-ACK path don't refute about self, and `Left` is
-  unrefutable and sticky
+- [x] `O6` Raft RPC pre-allocated an attacker-controlled ≤64 MiB buffer per connection with no
+  connection cap — the frame reader now grows in 64 KiB chunks with the bytes that actually
+  arrive (four bytes no longer buy 64 MiB), and the accept loop holds an owned semaphore
+  permit per connection, acquired *before* `accept()` so excess peers wait in the kernel
+  backlog. Tests: multi-chunk reassembly, a declared-maximum frame with a ten-byte body, and
+  a listener capped at one connection serving three sequential peers (verified to fail when
+  the permit is leaked on purpose)
+- [x] `O7` security-relevant reads were served from local follower state — **partially
+  addressed, deliberately.** New `CouncilNode::security_state_linearizable()` proves the read
+  is current via `ensure_linearizable()` and errors rather than answering when it can't, and
+  workload-CSR signing (where the read *is* the decision: it yields a valid certificate) now
+  uses it. The two remaining local readers stay local **by design**, documented at the
+  accessor: the CRL refresh ticker is advisory and already 5s stale by construction, and the
+  join-token pre-check is a fast-fail whose authoritative decision is the
+  `ConsumeJoinTokenForIssue` Raft write. A follower cannot do a linearizable read at all, so
+  forcing one there would break validation rather than tighten it
+- [x] `O9` SWIM `refute()` didn't apply the fresh Alive to the local record (a refuting node
+  told the cluster it was alive while its own membership table — what the scheduler and
+  council reads go through — still held it Suspect/Dead), and `Left` won at any incarnation,
+  making it the one claim a node could not refute. Gossip HMAC stops forgery but not replay,
+  so a captured departure datagram evicted a rejoined node until the 60s reap. `Left` now
+  loses to a strictly higher incarnation — safe because only a node mints its own incarnation
+  numbers — and `leave()` sets a flag so a node's own departure echoing back off a peer isn't
+  mistaken for a replay to refute. The `resolve_conflict` proptest invariant moved from "Left
+  is terminal" to "Left wins at an equal or higher incarnation"
 - [ ] `O10` `relish fmt` writes non-atomically and deletes comments; `compile` silently drops
   duplicate app names
 - [ ] `O11` DNS forwards only over IPv4; bare `<app>.internal` resolves in the node's

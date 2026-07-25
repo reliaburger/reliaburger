@@ -220,9 +220,34 @@ impl CouncilNode {
         self.wrapping_ikm.as_ref()
     }
 
-    /// Read the current security state from the state machine.
+    /// Read the current security state from the **local** state machine.
+    ///
+    /// This is a follower-local read: it reflects everything this node has
+    /// applied, which during a leadership transition can lag the committed
+    /// state by a replication round. Fine for advisory uses (the CRL refresh
+    /// ticker, fast-fail pre-checks whose authoritative decision goes through
+    /// Raft anyway). For a read that *is* the security decision, use
+    /// [`Self::security_state_linearizable`].
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
         self.state_machine.desired_state().await.security_state
+    }
+
+    /// Read the security state only if this node can prove the read is current.
+    ///
+    /// `ensure_linearizable` confirms with a quorum that this node is still
+    /// the leader and has applied everything committed, so a `RevokeCertificate`
+    /// or token change that committed elsewhere can't be missed. It fails on a
+    /// follower (and on a leader that has been deposed and doesn't know it yet),
+    /// which is the point: a node that cannot prove freshness returns an error
+    /// rather than a stale answer it presents as authoritative (O7).
+    pub async fn security_state_linearizable(
+        &self,
+    ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
+        Ok(self.state_machine.desired_state().await.security_state)
     }
 
     /// Read the current Pickle manifest catalogue from the state machine.
@@ -249,7 +274,12 @@ impl CouncilNode {
             .as_ref()
             .ok_or_else(|| CouncilError::SecurityError("no wrapping IKM available".to_string()))?;
 
-        let security_state = self.security_state().await;
+        // O7: signing a workload certificate *is* the security decision, and
+        // it reads CA material and the revocation list. A deposed leader
+        // serving this from stale local state would mint certificates against
+        // a CA or CRL the cluster has already moved past, so the read has to
+        // prove it's current or fail.
+        let security_state = self.security_state_linearizable().await?;
 
         // Get Workload CA
         let workload_ca = security_state

@@ -760,6 +760,33 @@ There's a related wrinkle on the client side. Peer nodes are dialled by gossip I
 
 Third, the one the new tests caught on their first run. `crl_updates_apply_to_new_handshakes_without_rebuilding_configs` revokes a client's serial through the shared handle, reconnects, and expects a refusal. It got a success. TLS 1.3 session resumption: the client had a ticket from its first connection, and a resumed session skips client-certificate verification entirely. A freshly revoked node could have reconnected forever on old tickets. The server config now disables resumption (`NoServerSessionStorage`, zero tickets) — cluster connections are few and long-lived, so paying for a full handshake each time is nothing next to a revocation that doesn't revoke.
 
+### How fresh is "the current state"?
+
+Every security check in this chapter starts the same way: read `SecurityState` out of the Raft state machine, then decide. Which raises a question we skipped: whose copy?
+
+`security_state()` reads the *local* applied state. Every node has one, followers included, and it's usually current. "Usually" is doing the work. Raft commits an entry once a quorum has it; a given follower applies it whenever replication reaches it. And a leader that's been partitioned away doesn't find out it's no longer leader until it tries to talk to a quorum. So there's a window — normally milliseconds, longer during an election — where a node will hand you a `SecurityState` that's missing a `RevokeCertificate` the cluster has already committed.
+
+For most readers that's fine, and saying so precisely is the useful part:
+
+- The CRL refresh ticker is advisory by construction. It copies the list every five seconds, so it's *already* up to five seconds stale by design. A replication round doesn't change the character of that.
+- The join-token pre-check is a fast-fail. The decision that counts is `ConsumeJoinTokenForIssue`, a Raft write, and a write is linearizable whether you like it or not — it either commits through a quorum or it doesn't. A stale pre-check can only wave through a request that the commit then refuses.
+
+Signing a workload certificate is different. That read *is* the decision: it pulls the CA material and the revocation list, and what comes out the other side is a valid certificate. A deposed leader serving it from stale local state mints credentials against a CA the cluster has moved past. So that path uses a different accessor:
+
+```rust
+pub async fn security_state_linearizable(
+    &self,
+) -> Result<SecurityState, CouncilError> {
+    self.raft.ensure_linearizable().await
+        .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
+    Ok(self.state_machine.desired_state().await.security_state)
+}
+```
+
+`ensure_linearizable` checks with a quorum that this node is still the leader and has applied everything committed. On a follower it fails, and on a deposed leader it fails, which sounds like a limitation and is actually the entire point. The alternative isn't a fresh answer — followers can't produce one — it's a stale answer presented as authoritative. Returning an error says "I can't prove this is current", and the caller can forward to the leader or refuse.
+
+The general shape is worth keeping: a read whose staleness only costs you a retry can be local, a read that *is* the security decision has to prove it's current, and the two should be different function names so you can't pick the wrong one by accident.
+
 ## Egress DNS resolution
 
 Apps can restrict outbound connections to specific destinations via `[egress] allow = ["api.stripe.com:443"]`. The initial resolution happens at deploy time using synchronous DNS. But hostnames can change IPs.
