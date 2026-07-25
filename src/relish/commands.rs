@@ -1272,8 +1272,12 @@ pub async fn build(
         // target the Bun API port, which has no /v2 routes). Route through the
         // authenticated client (M21): a bare client carried no bearer/CA, so it
         // 401'd or failed TLS against a secured registry.
-        let upload_url = crate::pickle::build::context_upload_url(registry_port, &digest);
-        let resp = BunClient::default_local()
+        // O2: address the registry the way it actually serves. Hardcoding
+        // `http://` failed outright against a TLS registry, and where it
+        // worked it pushed the context — the caller's source tree — in clear.
+        let upload_url =
+            crate::pickle::build::context_upload_url(client.scheme(), registry_port, &digest);
+        let resp = client
             .http()
             .post(&upload_url)
             .body(tar_bytes)
@@ -1294,11 +1298,15 @@ pub async fn build(
         println!("  context uploaded to Pickle");
 
         // Prepare the build job (for display; the agent re-derives it)
-        let job = execute_build(spec, &digest, Some(registry_port)).map_err(|e| {
-            RelishError::ApiError {
-                status: 0,
-                body: format!("build preparation failed: {e}"),
-            }
+        let job = execute_build(
+            spec,
+            &digest,
+            Some(registry_port),
+            client.scheme() == "https",
+        )
+        .map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("build preparation failed: {e}"),
         })?;
 
         println!(

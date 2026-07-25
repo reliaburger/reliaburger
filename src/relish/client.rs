@@ -291,6 +291,20 @@ impl BunClient {
     }
 
     /// Get the base URL.
+    /// The scheme this client addresses the agent by, `"http"` or `"https"`.
+    ///
+    /// The Pickle registry is a second listener on the same host, and it
+    /// gains TLS under the same condition the agent API does (the node
+    /// holding an mTLS identity), so this is how the CLI knows whether to
+    /// address the registry as https when uploading a build context (O2).
+    pub fn scheme(&self) -> &'static str {
+        if self.base_url.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

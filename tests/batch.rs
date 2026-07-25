@@ -130,6 +130,7 @@ impl Harness {
             900,
             reliaburger::cluster::ClusterHttp::plaintext(),
             5050,
+            "http",
             256 * 1024 * 1024,
             false,
         );

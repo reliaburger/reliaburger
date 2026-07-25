@@ -72,6 +72,15 @@ pub struct UpgradeManager {
     external_key: Option<PublicKey>,
     retain_versions: u32,
     max_boot_attempts: u32,
+    /// How this node addresses peers, so a binary fetch from Pickle uses the
+    /// scheme the registry actually serves and a client that trusts the
+    /// cluster CA (O3). Defaults to plaintext; `bun` sets the real one.
+    ///
+    /// Integrity was never at stake here — the sha256 gate and the embedded
+    /// release signature are checked on every path regardless. What plaintext
+    /// cost was *working at all* against a TLS-only registry, plus disclosing
+    /// which build a node is moving to.
+    cluster_http: crate::cluster::ClusterHttp,
 }
 
 /// Derive the store stem from the executable path bun was invoked as.
@@ -135,7 +144,17 @@ impl UpgradeManager {
             external_key,
             retain_versions: config.retain_versions,
             max_boot_attempts: config.max_boot_attempts,
+            cluster_http: crate::cluster::ClusterHttp::plaintext(),
         })
+    }
+
+    /// Address peers the way this node's cluster plane does (O3).
+    ///
+    /// Builder-style rather than a `new` parameter: every test constructs a
+    /// manager and none of them need TLS, so only `bun` has to say so.
+    pub fn with_cluster_http(mut self, cluster_http: crate::cluster::ClusterHttp) -> Self {
+        self.cluster_http = cluster_http;
+        self
     }
 
     /// The version this process is running.
@@ -543,12 +562,19 @@ impl UpgradeManager {
             BinarySource::Pickle { registry_address } => {
                 // Pickle stores the binary as a content-addressed blob under
                 // a single-segment repository name (axum {name} routes).
-                let url = format!(
-                    "http://{registry_address}/v2/{}/blobs/sha256:{}",
-                    super::BINARY_BLOB_REPO,
-                    directive.binary_sha256
+                let url = self.cluster_http.url(
+                    registry_address,
+                    &format!(
+                        "/v2/{}/blobs/sha256:{}",
+                        super::BINARY_BLOB_REPO,
+                        directive.binary_sha256
+                    ),
                 );
-                let response = reqwest::get(&url)
+                let response = self
+                    .cluster_http
+                    .client()
+                    .get(&url)
+                    .send()
                     .await
                     .map_err(|e| UpgradeError::FetchFailed {
                         url: url.clone(),
@@ -1102,6 +1128,52 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// O3: the Pickle fetch URL was a hardcoded `http://`, so a node could
+    /// not pull a binary from a TLS-only registry at all. It now follows the
+    /// cluster plane's own scheme.
+    ///
+    /// Driven through the real fetch against a closed port: the error carries
+    /// the URL it tried, which is the observable we care about. Integrity is
+    /// unaffected either way — the sha256 gate and embedded release signature
+    /// are checked on every path.
+    #[tokio::test]
+    async fn a_pickle_binary_fetch_follows_the_cluster_scheme() {
+        let fixture = fixture();
+        let directive = UpgradeDirective {
+            upgrade_id: "u1".to_string(),
+            target_version: v("0.2.0"),
+            binary_sha256: "abc123".to_string(),
+            embedded_signature: String::new(),
+            external_signature: None,
+            source: BinarySource::Pickle {
+                // Port 1 is reserved and never listening, so the fetch fails
+                // fast without depending on anything being up.
+                registry_address: "127.0.0.1:1".to_string(),
+            },
+            network_provenance: true,
+        };
+
+        let plaintext = fixture.manager.fetch_binary(&directive).await;
+        match plaintext {
+            Err(UpgradeError::FetchFailed { url, .. }) => {
+                assert!(url.starts_with("http://127.0.0.1:1/v2/"), "got {url}");
+            }
+            other => panic!("expected a fetch failure, got {other:?}"),
+        }
+
+        let secure = fixture
+            .manager
+            .with_cluster_http(crate::cluster::ClusterHttp::secure(reqwest::Client::new()))
+            .fetch_binary(&directive)
+            .await;
+        match secure {
+            Err(UpgradeError::FetchFailed { url, .. }) => {
+                assert!(url.starts_with("https://127.0.0.1:1/v2/"), "got {url}");
+            }
+            other => panic!("expected a fetch failure, got {other:?}"),
+        }
     }
 
     #[test]

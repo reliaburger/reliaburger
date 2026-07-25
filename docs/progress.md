@@ -1533,8 +1533,22 @@ work, not by `M1`.
   `0.0.0.0` and hostnames count as routable) gates every GET/HEAD through one choke point in
   `dispatch_v2` plus the `/v2/` version probe. The bar is any valid token — pulling is what a
   ReadOnly token is for — not the Deployer that writes require. Loopback is unchanged
-- [ ] `O2` Pickle build-context URLs hardcode `http://` and `buildah push --tls-verify=false`
-- [ ] `O3` upgrade binary fetch/push is plaintext `http://` (integrity still sig+sha gated)
+- [x] `O2` Pickle build-context URLs hardcoded `http://` and `buildah push` hardcoded
+  `--tls-verify=false` — against a TLS registry a delegated build failed outright, and where
+  plaintext did reach a listener the build context (the caller's source tree) crossed the
+  network in clear while the push never checked the certificate it was pushing to. All four
+  context-URL builders take the registry's scheme and `execute_build` takes
+  `registry_over_tls`; `ApiState.registry_scheme` is server-owned beside `registry_port`, the
+  CLI derives it from its own client, and `bun` derives both once beside `cluster_http` so
+  they can't drift. The runner's context download also moved off a bare `reqwest::get` onto
+  the CA-trusting cluster client
+- [x] `O3` upgrade binary fetch/push was plaintext `http://` — integrity was never at stake
+  (sha256 gate + embedded release signature run on every path), but a plaintext fetch simply
+  fails against a TLS-only registry. `UpgradeManager` gained a `cluster_http` (late-injected
+  via `with_cluster_http`, since the manager is built before the node's identity is known) and
+  `relish upgrade`'s `push_blob` now goes through the authenticated `BunClient`, which also
+  gets it past O1's read gate and the existing write gate. Tested through the real fetch seam
+  against a closed port, asserting the attempted URL's scheme
 - [x] `O6` Raft RPC pre-allocated an attacker-controlled ≤64 MiB buffer per connection with no
   connection cap — the frame reader now grows in 64 KiB chunks with the bytes that actually
   arrive (four bytes no longer buy 64 MiB), and the accept loop holds an owned semaphore

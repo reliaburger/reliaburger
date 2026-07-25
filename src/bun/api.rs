@@ -116,6 +116,12 @@ pub struct ApiState {
     /// runner fetches context from and pushes to. Server-owned: never
     /// taken from a build request body (JOB2).
     pub registry_port: u16,
+    /// The scheme the local Pickle registry actually serves on, `"http"`
+    /// or `"https"` (O2). Server-owned like `registry_port`, and derived
+    /// from the same condition that decides whether the registry gets a
+    /// TLS identity, so build-context transfers address the registry the
+    /// way it really listens instead of assuming plaintext.
+    pub registry_scheme: &'static str,
     /// `[images] max_context_bytes` — hard cap on an extracted build
     /// context (JOB6).
     pub max_context_bytes: u64,
@@ -179,6 +185,7 @@ pub fn router(
         900,
         crate::cluster::ClusterHttp::plaintext(),
         5050,
+        "http",
         256 * 1024 * 1024,
         false,
     )
@@ -212,6 +219,7 @@ pub fn router_with_upgrade(
     build_timeout_secs: u64,
     cluster_http: crate::cluster::ClusterHttp,
     registry_port: u16,
+    registry_scheme: &'static str,
     max_context_bytes: u64,
     require_signatures: bool,
 ) -> Router {
@@ -243,6 +251,7 @@ pub fn router_with_upgrade(
         )),
         build_timeout_secs,
         registry_port,
+        registry_scheme,
         max_context_bytes,
         require_signatures,
         batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -5933,6 +5942,7 @@ mod tests {
             900,
             crate::cluster::ClusterHttp::plaintext(),
             5050,
+            "http",
             256 * 1024 * 1024,
             false,
         );
@@ -6110,6 +6120,7 @@ mod tests {
             900,
             crate::cluster::ClusterHttp::plaintext(),
             5050,
+            "http",
             256 * 1024 * 1024,
             false,
         );

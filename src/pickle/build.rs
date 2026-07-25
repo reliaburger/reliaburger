@@ -159,17 +159,20 @@ pub fn digest_of(data: &[u8]) -> String {
 /// The `context_digest` is the Pickle blob digest of the tarred build
 /// context (uploaded by the CLI before scheduling the job). The build
 /// node downloads this blob, extracts it, and runs buildah.
+/// `registry_over_tls` decides whether the push verifies the registry's
+/// certificate (O2).
 pub fn execute_build(
     spec: &BuildSpec,
     context_digest: &str,
     pickle_port: Option<u16>,
+    registry_over_tls: bool,
 ) -> Result<BuildahJob, BuildError> {
     let dest = validate_build(spec)?;
     let port = pickle_port.unwrap_or(DEFAULT_PICKLE_PORT);
 
     let local_tag = format!("localhost:{port}/{}:{}", dest.name, dest.tag);
     let build_cmd = buildah_build_args(spec, &local_tag);
-    let push_cmd = buildah_push_args(&local_tag);
+    let push_cmd = buildah_push_args(&local_tag, registry_over_tls);
 
     Ok(BuildahJob {
         build_cmd,
@@ -221,13 +224,18 @@ fn buildah_build_args(spec: &BuildSpec, local_tag: &str) -> Vec<String> {
 }
 
 /// Generate the `buildah push` command arguments.
-fn buildah_push_args(local_tag: &str) -> Vec<String> {
+///
+/// `tls_verify` mirrors how the destination registry actually serves
+/// (O2). It was hardcoded off, which is right for the plaintext loopback
+/// default and wrong the moment the registry runs over TLS: a build would
+/// push its image without checking the certificate it was pushing to.
+fn buildah_push_args(local_tag: &str, tls_verify: bool) -> Vec<String> {
     vec![
         "buildah".to_string(),
         "push".to_string(),
         "--storage-driver".to_string(),
         "vfs".to_string(),
-        "--tls-verify=false".to_string(),
+        format!("--tls-verify={tls_verify}"),
         local_tag.to_string(),
         format!("docker://{local_tag}"),
     ]
@@ -235,26 +243,30 @@ fn buildah_push_args(local_tag: &str) -> Vec<String> {
 
 /// Build the URL to download a context blob from Pickle.
 ///
-/// The build node fetches this before running buildah.
-pub fn context_download_url(pickle_port: u16, digest: &str) -> String {
+/// The build node fetches this before running buildah. `scheme` is the
+/// registry's own scheme (`"http"` or `"https"`), threaded from config
+/// rather than hardcoded: against a TLS registry the old `http://` URLs
+/// simply failed, and where they worked they moved the build context —
+/// which is the caller's source tree — in the clear (O2).
+pub fn context_download_url(scheme: &str, pickle_port: u16, digest: &str) -> String {
     // Uses the OCI blob GET endpoint. The "name" is _buildcontext
     // (a reserved namespace that doesn't clash with real images).
-    format!("http://localhost:{pickle_port}/v2/_buildcontext/blobs/{digest}")
+    format!("{scheme}://localhost:{pickle_port}/v2/_buildcontext/blobs/{digest}")
 }
 
 /// Build the URL to download a context blob from a specific node's
 /// Pickle registry (`address` is `host:port`). Used by a delegated
 /// builder to fetch the context from the entry node — the address is
 /// derived from cluster membership, never from the request body (JOB2).
-pub fn context_download_url_at(address: &str, digest: &str) -> String {
-    format!("http://{address}/v2/_buildcontext/blobs/{digest}")
+pub fn context_download_url_at(scheme: &str, address: &str, digest: &str) -> String {
+    format!("{scheme}://{address}/v2/_buildcontext/blobs/{digest}")
 }
 
 /// Build the URL to upload a context blob to Pickle.
 ///
 /// The CLI uploads the tarred context here before scheduling the build.
-pub fn context_upload_url(pickle_port: u16, digest: &str) -> String {
-    format!("http://localhost:{pickle_port}/v2/_buildcontext/blobs/uploads/?digest={digest}")
+pub fn context_upload_url(scheme: &str, pickle_port: u16, digest: &str) -> String {
+    format!("{scheme}://localhost:{pickle_port}/v2/_buildcontext/blobs/uploads/?digest={digest}")
 }
 
 /// Build the URL to upload a context blob to a specific node's Pickle
@@ -263,8 +275,8 @@ pub fn context_upload_url(pickle_port: u16, digest: &str) -> String {
 /// `_buildcontext` blobs have no manifest, so nothing replicates them
 /// — the delegator copies the blob across before the run request. The
 /// address derives from cluster membership, never from request data.
-pub fn context_upload_url_at(address: &str, digest: &str) -> String {
-    format!("http://{address}/v2/_buildcontext/blobs/uploads/?digest={digest}")
+pub fn context_upload_url_at(scheme: &str, address: &str, digest: &str) -> String {
+    format!("{scheme}://{address}/v2/_buildcontext/blobs/uploads/?digest={digest}")
 }
 
 /// Check that a build's namespace is allowed to push to the destination.
@@ -549,7 +561,7 @@ mod tests {
     #[test]
     fn execute_build_produces_valid_job() {
         let spec = spec_with_destination("pickle://myapp:v2");
-        let job = execute_build(&spec, "sha256:abc123", Some(9117)).unwrap();
+        let job = execute_build(&spec, "sha256:abc123", Some(9117), false).unwrap();
         assert_eq!(job.destination.name, "myapp");
         assert_eq!(job.destination.tag, "v2");
         assert_eq!(job.local_tag, "localhost:9117/myapp:v2");
@@ -559,7 +571,7 @@ mod tests {
     #[test]
     fn execute_build_uses_default_port() {
         let spec = spec_with_destination("pickle://app:latest");
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         // Defaults to the Pickle registry port (5050), not the Bun API
         // port — see the X1 regression note on DEFAULT_PICKLE_PORT.
         assert!(job.local_tag.contains("5050"));
@@ -575,7 +587,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let err = execute_build(&spec, "sha256:abc", None).unwrap_err();
+        let err = execute_build(&spec, "sha256:abc", None, false).unwrap_err();
         assert!(matches!(err, BuildError::ContextNotFound { .. }));
     }
 
@@ -584,7 +596,7 @@ mod tests {
     #[test]
     fn buildah_build_cmd_uses_vfs_storage() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         assert!(job.build_cmd.contains(&"--storage-driver".to_string()));
         assert!(job.build_cmd.contains(&"vfs".to_string()));
     }
@@ -599,7 +611,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         let f_idx = job.build_cmd.iter().position(|a| a == "-f").unwrap();
         assert_eq!(job.build_cmd[f_idx + 1], "Dockerfile.prod");
     }
@@ -610,7 +622,7 @@ mod tests {
         args.insert("VERSION".to_string(), "1.78".to_string());
         args.insert("FEATURES".to_string(), "ebpf".to_string());
         let spec = spec_with_args(args);
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
 
         let build_arg_count = job
             .build_cmd
@@ -625,7 +637,7 @@ mod tests {
     #[test]
     fn buildah_build_cmd_ends_with_context_dot() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         assert_eq!(job.build_cmd.last().unwrap(), ".");
     }
 
@@ -634,7 +646,7 @@ mod tests {
     #[test]
     fn buildah_push_cmd_targets_pickle() {
         let spec = spec_with_destination("pickle://myapp:v3");
-        let job = execute_build(&spec, "sha256:abc", Some(5000)).unwrap();
+        let job = execute_build(&spec, "sha256:abc", Some(5000), false).unwrap();
         assert!(
             job.push_cmd
                 .contains(&"localhost:5000/myapp:v3".to_string())
@@ -648,23 +660,33 @@ mod tests {
     #[test]
     fn buildah_push_cmd_uses_vfs_storage() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         assert!(job.push_cmd.contains(&"--storage-driver".to_string()));
         assert!(job.push_cmd.contains(&"vfs".to_string()));
     }
 
     #[test]
-    fn buildah_push_cmd_disables_tls() {
+    fn buildah_push_skips_tls_verification_against_a_plaintext_registry() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         assert!(job.push_cmd.contains(&"--tls-verify=false".to_string()));
+    }
+
+    /// O2: `--tls-verify=false` was hardcoded, so a build pushed to a TLS
+    /// registry without ever checking the certificate it was pushing to.
+    #[test]
+    fn buildah_push_verifies_tls_against_a_secured_registry() {
+        let spec = spec_with_destination("pickle://app:v1");
+        let job = execute_build(&spec, "sha256:abc", None, true).unwrap();
+        assert!(job.push_cmd.contains(&"--tls-verify=true".to_string()));
+        assert!(!job.push_cmd.contains(&"--tls-verify=false".to_string()));
     }
 
     // --- context URLs ---
 
     #[test]
     fn context_download_url_format() {
-        let url = context_download_url(9117, "sha256:abc123");
+        let url = context_download_url("http", 9117, "sha256:abc123");
         assert_eq!(
             url,
             "http://localhost:9117/v2/_buildcontext/blobs/sha256:abc123"
@@ -673,10 +695,33 @@ mod tests {
 
     #[test]
     fn context_upload_url_targets_the_registry_port() {
-        let url = context_upload_url(5050, "sha256:abc123");
+        let url = context_upload_url("http", 5050, "sha256:abc123");
         assert_eq!(
             url,
             "http://localhost:5050/v2/_buildcontext/blobs/uploads/?digest=sha256:abc123"
+        );
+    }
+
+    /// O2: every context URL was hardcoded `http://`, so against a TLS
+    /// registry a delegated build simply failed — and where plaintext did
+    /// reach a listener, the context (the caller's source tree) crossed the
+    /// network in clear.
+    #[test]
+    fn context_urls_follow_the_registrys_scheme() {
+        assert!(
+            context_download_url("https", 5050, "sha256:abc")
+                .starts_with("https://localhost:5050/")
+        );
+        assert!(
+            context_upload_url("https", 5050, "sha256:abc").starts_with("https://localhost:5050/")
+        );
+        assert!(
+            context_download_url_at("https", "10.0.1.5:5050", "sha256:abc")
+                .starts_with("https://10.0.1.5:5050/")
+        );
+        assert!(
+            context_upload_url_at("https", "10.0.1.5:5050", "sha256:abc")
+                .starts_with("https://10.0.1.5:5050/")
         );
     }
 
@@ -718,7 +763,7 @@ mod tests {
     #[test]
     fn buildah_multi_platform_uses_manifest_flag() {
         let spec = spec_with_destination("pickle://app:v1");
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         assert!(job.build_cmd.contains(&"--manifest".to_string()));
         assert!(job.build_cmd.contains(&"--platform".to_string()));
         assert!(job.build_cmd.iter().any(|a| a == "linux/amd64,linux/arm64"));
@@ -735,7 +780,7 @@ mod tests {
             namespace: None,
             platform: vec!["linux/amd64".into()],
         };
-        let job = execute_build(&spec, "sha256:abc", None).unwrap();
+        let job = execute_build(&spec, "sha256:abc", None, false).unwrap();
         assert!(job.build_cmd.contains(&"-t".to_string()));
         assert!(job.build_cmd.contains(&"--platform".to_string()));
         assert!(job.build_cmd.iter().any(|a| a == "linux/amd64"));
@@ -940,7 +985,7 @@ mod tests {
 
     #[test]
     fn context_download_url_at_targets_the_given_node() {
-        let url = context_download_url_at("10.0.0.7:5050", "sha256:abc");
+        let url = context_download_url_at("http", "10.0.0.7:5050", "sha256:abc");
         assert_eq!(
             url,
             "http://10.0.0.7:5050/v2/_buildcontext/blobs/sha256:abc"
