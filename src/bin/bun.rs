@@ -43,6 +43,37 @@ struct Cli {
     /// Without this flag, bun runs as a single node, as before.
     #[arg(long)]
     cluster: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands `bun` answers to besides running as an agent.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run the built-in test workload.
+    ///
+    /// The same server the library exposes, shipped inside `bun` so every
+    /// cluster node carries the test workload without pulling an image. The
+    /// standalone `testapp` binary is the same code; this subcommand means a
+    /// node needs nothing but `bun` on its PATH.
+    Testapp {
+        /// Behaviour: healthy, unhealthy-after, hang, exit-after, slow, alloc.
+        #[arg(long, default_value = "healthy")]
+        mode: String,
+        /// Port to listen on.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Request count for unhealthy-after and exit-after.
+        #[arg(long, default_value = "5")]
+        count: u32,
+        /// Delay in milliseconds for slow mode.
+        #[arg(long, default_value = "3000")]
+        delay: u64,
+        /// Resident megabytes for alloc mode.
+        #[arg(long, default_value = "64")]
+        alloc_mib: usize,
+    },
 }
 
 /// Build cluster startup parameters from node config.
@@ -371,9 +402,43 @@ async fn build_ingress_cert_resolver(
     }
 }
 
+/// Run the built-in test workload until interrupted.
+async fn run_testapp(
+    mode: &str,
+    port: u16,
+    count: u32,
+    delay_ms: u64,
+    alloc_mib: usize,
+) -> anyhow::Result<()> {
+    let parsed = reliaburger::bun::testapp::parse_mode(mode, count, delay_ms, alloc_mib)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let app = reliaburger::bun::testapp::TestApp::start_on_port(parsed, port).await;
+    println!(
+        "testapp: listening on 0.0.0.0:{} (mode: {mode})",
+        app.port()
+    );
+    tokio::signal::ctrl_c().await.ok();
+    println!("testapp: shutting down");
+    app.shutdown();
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // `bun testapp` never becomes an agent — it's the workload, not the
+    // orchestrator. Handle it before any node config is touched.
+    if let Some(Command::Testapp {
+        mode,
+        port,
+        count,
+        delay,
+        alloc_mib,
+    }) = &cli.command
+    {
+        return run_testapp(mode, *port, *count, *delay, *alloc_mib).await;
+    }
 
     // Resolve the running version from the real executable path (not argv[0]):
     // in debug builds a `.version` sidecar next to the binary can override it,
@@ -504,6 +569,15 @@ async fn main() -> anyhow::Result<()> {
     // both sockets before starting the agent, reporting readiness or adopting
     // any surviving workloads.
     let (runtime, bound_dns, dns_capability) = prepare_dns_runtime(runtime, &config.dns).await?;
+    // Remember which runtime we settled on — `/v1/capabilities` reports it,
+    // and several test cases are runtime-specific.
+    let runtime_kind = match &runtime {
+        AnyGrill::Process(_) => "process",
+        #[cfg(target_os = "linux")]
+        AnyGrill::Runc(_) => "runc",
+        #[cfg(target_os = "macos")]
+        AnyGrill::Apple(_) => "apple",
+    };
     // Image-store handle for installing the cluster P2P image source
     // once the registry and catalog exist — the runtime is selected
     // long before them, so the source is injected late via a OnceLock
@@ -722,6 +796,13 @@ async fn main() -> anyhow::Result<()> {
     // A load failure is logged and the node continues without kernel
     // enforcement rather than refusing to start.
     agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
+    // Observed, not configured: `enabled = true` with a failed load means no
+    // enforcement, and a capability report must say so.
+    // `mut` only matters on an `ebpf` build — the assignment below lives
+    // inside a `#[cfg(feature = "ebpf")]` block, so a default build never
+    // writes to it and would warn.
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_mut))]
+    let mut ebpf_loaded = false;
     if config.ebpf.enabled {
         match config.ebpf.resolve_program_dir() {
             Some(program_dir) => {
@@ -736,6 +817,7 @@ async fn main() -> anyhow::Result<()> {
                             program_dir.display(),
                             ebpf.is_attached()
                         );
+                        ebpf_loaded = ebpf.is_attached();
                         agent
                             .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
                             .await;
@@ -1387,6 +1469,42 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // What this node can actually do, for `/v1/capabilities` (Phase 15).
+    // Everything here is observed at startup rather than assumed: a
+    // capability report that overstates is worse than none, because it turns
+    // "this cluster can't" into "this test mysteriously fails".
+    let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+        environment: config.cluster.environment.clone(),
+        container_runtime: runtime_kind.to_string(),
+        // Whether the programs actually loaded and attached, not merely
+        // whether the operator asked for them.
+        ebpf: ebpf_loaded,
+        ingress: config.ingress.enabled,
+        // The perimeter firewall is Linux-only and disabled in rootless
+        // mode, matching `BunAgent`'s own `perimeter_config` decision.
+        firewall: {
+            #[cfg(target_os = "linux")]
+            {
+                !reliaburger::grill::rootless::is_rootless()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        },
+        // Identity work dead-ends without a wrapping IKM to unwrap CA keys
+        // with, so that — not config — is the real signal.
+        identity: api_council
+            .as_ref()
+            .and_then(|council| council.wrapping_ikm())
+            .is_some(),
+        // Host execution is deny-by-default: an empty allowlist refuses
+        // every process workload.
+        process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
+        // CPU/memory/disk faults write cgroup v2 files.
+        cgroup_faults: cfg!(target_os = "linux"),
+    };
+
     let app = api::router_with_upgrade(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
@@ -1415,6 +1533,7 @@ async fn main() -> anyhow::Result<()> {
         // Signing becomes part of a build's terminal state under a
         // signature-requiring trust policy (12b.2 JOB7).
         config.images.trust_policy.require_signatures,
+        static_capabilities,
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener

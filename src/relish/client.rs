@@ -532,6 +532,17 @@ impl BunClient {
         })
     }
 
+    /// Ask a node what it has wired up (Phase 15).
+    ///
+    /// The test runner, `wtf` and `bench` all consult this before deciding
+    /// whether a check is meaningful, so that an absent subsystem reports as
+    /// skipped rather than as a mysterious failure.
+    pub async fn capabilities(
+        &self,
+    ) -> Result<crate::bun::capabilities::ClusterCapabilities, RelishError> {
+        self.get_typed_json("/v1/capabilities").await
+    }
+
     /// Fetch deploy history for an app in a namespace.
     pub async fn deploy_history(
         &self,

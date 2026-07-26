@@ -327,3 +327,198 @@ quieter way to forget a problem.
 Now a green portable run means something narrow and valuable: the portable behaviour ran,
 without retries, on this machine. The privileged, cluster, upgrade, slow and benchmark jobs
 make their own claims. Smaller claims. Better evidence.
+
+## Asking the cluster what it can do
+
+Everything above is about *our* tests — the ones that run in CI, against code, before it
+ships. The rest of this chapter is about a different animal: tests that run against a
+cluster that's already up, from the outside, as a user.
+
+`relish test` deploys real workloads onto a real cluster and checks they behave. That
+raises a question CI never had to answer. Our CI knows exactly what it built. A running
+cluster is whatever the operator configured — eBPF on or off, ingress bound or not,
+a council or a single node. So what does a test do when the thing it tests isn't there?
+
+There are three states, and they're easy to conflate:
+
+1. The subsystem works.
+2. The subsystem is switched off.
+3. The subsystem is broken.
+
+Guessing from responses collapses all three. A 404 from `/v1/metrics` looks identical
+whether Mayo was never configured or has fallen over. Get that wrong in a test runner and
+you produce the two worst outcomes available: a failure that isn't one (noise, which
+teaches people to ignore red), or a pass that isn't one (a hollow green, which is the very
+thing this chapter opened by complaining about).
+
+So the cluster tells you. `GET /v1/capabilities`:
+
+```json
+{
+  "version": "0.1.0",
+  "environment": "staging",
+  "container_runtime": "runc",
+  "cluster": true,
+  "node_count": 3,
+  "metrics": true,
+  "council": true,
+  "ebpf": false,
+  "ingress": true,
+  ...
+}
+```
+
+A test that needs eBPF sees `"ebpf": false` and reports **skipped, with the reason**,
+which is honest in a way that neither red nor green would be.
+
+### Derived, never asserted
+
+The whole value of this endpoint is that it's true, so not one field is a literal:
+
+```rust
+let wired = WiredSubsystems {
+    metrics: state.mayo.is_some(),
+    logs: state.log_store.is_some(),
+    council: state.council.is_some(),
+    // …
+};
+```
+
+`ApiState` carries `Option<Arc<RwLock<MayoStore>>>` and friends. That `Option` isn't
+defensive coding — it's the wiring itself. A node built without metrics has `None` there,
+and no amount of configuration can make it `Some`. Reporting `is_some()` reports what was
+built. This is a small illustration of something Rust does well: the type already
+encodes "might not exist", so the capability report is a rename of information the
+program was carrying anyway. In a language where everything is nullable, you'd be
+maintaining a separate registry of what's switched on, and it would drift.
+
+Two fields resisted the pattern, and both are worth the detour.
+
+**eBPF** is configured *and* observed. `[ebpf] enabled = true` says the operator wants it;
+whether the programs actually loaded and attached is a different fact, and a node that
+tried and failed logs a warning and carries on without enforcement. So the capability is
+`ebpf.is_attached()` at load time, not the config flag. Reporting intent as achievement is
+exactly the lie this endpoint exists to prevent.
+
+**Fault injection** was going to be `true`, because the Smoker API is always mounted. Then
+it's not information — a caller learns nothing from a field that's always the same. What
+they actually want to know is whether any fault can *do* something, and that varies:
+cgroup faults need Linux, network faults need eBPF, node-level faults need a cluster plane
+to disturb. So:
+
+```rust
+fault_injection: statics.cgroup_faults || statics.ebpf || cluster,
+```
+
+If a field would always be `true`, it isn't a capability. Either derive it from something
+real or delete it.
+
+### A tag that decides whether we're allowed to break things
+
+One field isn't about wiring at all. `[cluster] environment` is a free-form string —
+`"production"`, `"staging"`, whatever you like — and the chaos suite refuses to run
+against a cluster tagged production unless you pass `--override`.
+
+Note which way the default fails. An *untagged* cluster counts as non-production. Requiring
+a tag to avoid chaos would mean the cluster nobody remembered to label is the one that gets
+its leader killed, and "we forgot to set a config field" is a bad reason to have an
+outage. The tag is a brake, not an accelerator, so absent means "no brake requested",
+and the operator who wants the brake is the one who has to say so.
+
+The comparison is case-insensitive, which sounds like a detail and is really a small
+lesson about guards. An operator who writes `environment = "Production"` means precisely
+what one who writes `"production"` means. A guard that only matches one spelling isn't a
+strict guard — it's a broken one, and it fails silently in the direction of *not*
+protecting you.
+
+## A workload in your pocket
+
+`relish test` needs something to deploy. The obvious answer is a public image
+— `nginx`, or a hello-world container — and it's the wrong one twice over.
+
+It makes the test suite depend on the internet, so a registry outage becomes a
+failing cluster test and everyone learns to distrust the result. And it decouples
+the workload from the orchestrator: you'd be testing whatever `nginx:latest`
+means today against whatever `bun` means today, and when the pair stops working
+you get to find out which moved.
+
+So the test workload ships *inside* the orchestrator. `bun testapp` runs a small
+HTTP server that every node already has, because every node already has `bun`.
+Version-locked by construction, no registry involved.
+
+It's a hand-rolled TCP server rather than axum, which looks like the wrong call
+until you remember where it runs: inside a container, in its own network
+namespace, on a node under deliberate stress. It should have no opinions and no
+dependencies.
+
+### The bind address is not a detail
+
+The original bound `127.0.0.1`. As an in-process test fixture that's exactly
+right — nothing else should reach it.
+
+As a *workload*, it's fatal. A container gets its own network namespace, so
+loopback inside the container is not loopback on the node. The agent's health
+check would connect to the node's own loopback, find nothing, and mark a
+perfectly healthy app dead. Worse, it would do so consistently, which reads as a
+real bug in health checking.
+
+Binding `0.0.0.0` fixes it and costs nothing: it accepts on every interface,
+loopback included, so the in-process tests are unaffected. When code moves from
+"test fixture" to "thing that runs in production shapes", its assumptions about
+the network are the first thing to re-examine.
+
+### Two paths that ignore the mode
+
+The app's `TestAppMode` is its identity: a `Hang` app hangs, an `UnhealthyAfter`
+app starts failing on cue. Every path gets the same treatment, which is what
+makes the modes useful.
+
+Two paths break the rule, because tools need them whatever behaviour is being
+simulated:
+
+```rust
+pub fn special_route_response(path: &str) -> Option<String> {
+    // /payload?bytes=N  → exactly N bytes, for throughput measurement
+    // /env/NAME         → the variable's value, or 404
+}
+```
+
+`/env/NAME` earns its place. Chapter 4 decrypts `ENC[AGE:...]` secrets at
+container start — but how does a *test* prove the workload got the plaintext?
+Asking the API is circular: it tells you what it believes it did. Reading the
+variable from inside the process is the workload's own testimony, which is the
+only evidence that counts.
+
+`Option<String>` is doing the routing here, and it reads nicely: `Some` means
+"this is a special path, here's the response", `None` means "not mine — let the
+mode decide". No sentinel, no flag, no separate `is_special_path()` that could
+disagree with the handler.
+
+There's one exception to the exception. `Hang` hangs on the special paths too,
+because a hanging app that helpfully answers `/payload` isn't hanging, and a
+test that relies on it hanging would quietly stop testing anything.
+
+### A size on the wire is a claim
+
+`/payload?bytes=N` takes its size from the query string. That's the same shape as
+the Raft frame reader in chapter 4: a number from a stranger, used to decide how
+much memory to allocate. So it gets the same treatment — clamped to a ceiling,
+not honoured.
+
+It would be easy to argue this one doesn't matter. It's a test app; who would
+attack it? But it runs as a real workload on real clusters, sometimes on the
+same node as real work, and "who would attack it" is a question with a poor
+track record. The bound is one `.min()` call.
+
+### One parser, two front doors
+
+`bun testapp` and the standalone `testapp` binary run identical code, and they
+used to have identical-looking `match` statements over the mode string. Note the
+tense: they had *drifted*. The library grew an `exit-after` mode; the standalone
+binary's parser never learned about it, so passing `--mode exit-after` there
+printed "unknown mode" for a mode that existed.
+
+Duplicated logic doesn't stay duplicated, it diverges — and the divergence is
+invisible until someone uses the path you forgot. Both now call one
+`parse_mode`, and its error message lists the valid modes from a single place,
+so the next mode can only be added once.
