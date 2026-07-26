@@ -43,6 +43,37 @@ struct Cli {
     /// Without this flag, bun runs as a single node, as before.
     #[arg(long)]
     cluster: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands `bun` answers to besides running as an agent.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run the built-in test workload.
+    ///
+    /// The same server the library exposes, shipped inside `bun` so every
+    /// cluster node carries the test workload without pulling an image. The
+    /// standalone `testapp` binary is the same code; this subcommand means a
+    /// node needs nothing but `bun` on its PATH.
+    Testapp {
+        /// Behaviour: healthy, unhealthy-after, hang, exit-after, slow, alloc.
+        #[arg(long, default_value = "healthy")]
+        mode: String,
+        /// Port to listen on.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+        /// Request count for unhealthy-after and exit-after.
+        #[arg(long, default_value = "5")]
+        count: u32,
+        /// Delay in milliseconds for slow mode.
+        #[arg(long, default_value = "3000")]
+        delay: u64,
+        /// Resident megabytes for alloc mode.
+        #[arg(long, default_value = "64")]
+        alloc_mib: usize,
+    },
 }
 
 /// Build cluster startup parameters from node config.
@@ -371,9 +402,43 @@ async fn build_ingress_cert_resolver(
     }
 }
 
+/// Run the built-in test workload until interrupted.
+async fn run_testapp(
+    mode: &str,
+    port: u16,
+    count: u32,
+    delay_ms: u64,
+    alloc_mib: usize,
+) -> anyhow::Result<()> {
+    let parsed = reliaburger::bun::testapp::parse_mode(mode, count, delay_ms, alloc_mib)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let app = reliaburger::bun::testapp::TestApp::start_on_port(parsed, port).await;
+    println!(
+        "testapp: listening on 0.0.0.0:{} (mode: {mode})",
+        app.port()
+    );
+    tokio::signal::ctrl_c().await.ok();
+    println!("testapp: shutting down");
+    app.shutdown();
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // `bun testapp` never becomes an agent — it's the workload, not the
+    // orchestrator. Handle it before any node config is touched.
+    if let Some(Command::Testapp {
+        mode,
+        port,
+        count,
+        delay,
+        alloc_mib,
+    }) = &cli.command
+    {
+        return run_testapp(mode, *port, *count, *delay, *alloc_mib).await;
+    }
 
     // Resolve the running version from the real executable path (not argv[0]):
     // in debug builds a `.version` sidecar next to the binary can override it,

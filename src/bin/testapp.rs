@@ -3,20 +3,25 @@
 //! Wraps the library's `TestApp` as a standalone binary. Useful for
 //! running with ProcessGrill via the `command` field in app configs.
 //!
+//! `bun testapp` runs the same code, so a cluster node needs nothing but
+//! `bun` on its PATH. This binary stays for local demos and for configs that
+//! already reference it.
+//!
 //! Modes:
 //!   healthy           — always returns 200
 //!   unhealthy-after N — returns 200 for N requests, then 500
 //!   hang              — accepts connections, never responds
+//!   exit-after N      — exits cleanly after N requests
 //!   slow DELAY_MS     — responds after a delay
+//!   alloc MIB         — holds MIB megabytes resident, otherwise healthy
 
 use clap::Parser;
-use reliaburger::bun::testapp::{TestApp, TestAppMode};
-use std::time::Duration;
+use reliaburger::bun::testapp::{TestApp, parse_mode};
 
 #[derive(Parser)]
 #[command(name = "testapp", version, about = "Configurable test HTTP server")]
 struct Cli {
-    /// Behaviour mode: healthy, unhealthy-after, hang, slow.
+    /// Behaviour: healthy, unhealthy-after, hang, exit-after, slow, alloc.
     #[arg(long, default_value = "healthy")]
     mode: String,
 
@@ -24,34 +29,37 @@ struct Cli {
     #[arg(long, default_value = "8080")]
     port: u16,
 
-    /// Request count for unhealthy-after mode.
+    /// Request count for unhealthy-after and exit-after.
     #[arg(long, default_value = "5")]
     count: u32,
 
     /// Delay in milliseconds for slow mode.
     #[arg(long, default_value = "3000")]
     delay: u64,
+
+    /// Resident megabytes for alloc mode.
+    #[arg(long, default_value = "64")]
+    alloc_mib: usize,
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    let mode = match cli.mode.as_str() {
-        "healthy" => TestAppMode::Healthy,
-        "unhealthy-after" => TestAppMode::UnhealthyAfter(cli.count),
-        "hang" => TestAppMode::Hang,
-        "slow" => TestAppMode::Slow(Duration::from_millis(cli.delay)),
-        other => {
-            eprintln!("unknown mode: {other}");
-            eprintln!("valid modes: healthy, unhealthy-after, hang, slow");
+    // One parser, shared with `bun testapp`. The two used to have separate
+    // match arms and had already drifted — this binary silently lacked
+    // `exit-after`, which the library had supported for some time.
+    let mode = match parse_mode(&cli.mode, cli.count, cli.delay, cli.alloc_mib) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("testapp: {message}");
             std::process::exit(1);
         }
     };
 
     let app = TestApp::start_on_port(mode, cli.port).await;
     println!(
-        "testapp: listening on 127.0.0.1:{} (mode: {})",
+        "testapp: listening on 0.0.0.0:{} (mode: {})",
         app.port(),
         cli.mode
     );
