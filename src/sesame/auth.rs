@@ -396,6 +396,36 @@ pub fn authorize_scoped(
     }
 }
 
+/// Require a token whose scope covers the **whole cluster**.
+///
+/// Some endpoints take no app or namespace to check a scope against —
+/// `/v1/logs/sql` runs operator-supplied SQL over the node's entire `logs`
+/// table. There is no safe way to rewrite an arbitrary query into a
+/// tenant-filtered one, so rather than pretend, a scoped token is refused
+/// outright and pointed at the per-app endpoint that *can* filter (C3).
+///
+/// An unauthenticated context passes through for the same reason
+/// [`authorize`] does: the bootstrap window is handled by the middleware,
+/// not here.
+#[allow(clippy::result_large_err)]
+pub fn require_unscoped(ctx: Option<&AuthContext>) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    if ctx.scoped_apps.is_none() && ctx.scoped_namespaces.is_none() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "this endpoint reads across every app and namespace, so a scoped token \
+         cannot use it — query /v1/logs/query/{app}/{namespace} instead",
+    )
+        .into_response())
+}
+
 /// Require the internal **system principal** — the caller must have presented
 /// the cluster service token.
 ///

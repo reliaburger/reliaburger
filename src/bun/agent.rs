@@ -3083,7 +3083,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Ok(())
             }
-            FaultType::CpuStress { percentage, .. } => {
+            FaultType::CpuStress { percentage, cores } => {
                 // Cap the TARGET instance's `cpu.max` quota instead of
                 // burning cycles in Bun's own cgroup (CHAOS1). The old code
                 // spun blocking tasks that competed for whatever CPU the Bun
@@ -3096,7 +3096,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     |cgroup| {
                         let saved = crate::smoker::resource::read_cpu_max(cgroup)
                             .map_err(|e| e.to_string())?;
-                        crate::smoker::resource::apply_cpu_stress(cgroup, *percentage)
+                        // O17: `cores` used to be parsed and thrown away while
+                        // the quota maths assumed one core, so on a 4-core node
+                        // "80% stress" actually took 95%.
+                        crate::smoker::resource::apply_cpu_stress(cgroup, *percentage, *cores)
                             .map_err(|e| e.to_string())?;
                         Ok(saved)
                     },

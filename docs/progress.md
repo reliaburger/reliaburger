@@ -1480,33 +1480,75 @@ is *partly* addressed — Phase E made faults reversible and safety-checked; whe
 advertised resource fault has a measurable effect is still owned by the 12b.6 smoker-effects
 work, not by `M1`.
 
-### Open — Critical
+### Critical
 
-- [ ] **`C3` — token namespace/app scope is enforced only on mutations; every per-app read
-  ignores it.** This finding was raised in the review but **omitted from the review's own
-  recommended implementation order**, so Phases A–F worked around it. Verified still live on
-  `main`: `status_app_handler` (`src/bun/api.rs:1399`), `logs_handler` (`:1593`),
-  `ws_logs_handler` (`:1660`), `app_env_handler` (`:3057`), `logs_sql_handler` (`:3087`) and
-  `metrics_app_handler` (`:3273`) take no `auth` argument and never call `authorize_scoped` —
-  contrast `stop`/`exec`/`rollback`, which do. A legitimately issued token scoped to namespace
-  `team-a` can read `team-b`'s logs, plaintext env, status and metrics; `/v1/logs/sql`
-  compounds it by exposing the node's entire `logs` table with no tenant filter at all.
-  Exploitable by a normal low-privilege token — no admin mistake required. **This is the last
-  unfixed Critical in the review.**
+- [x] **`C3` — token namespace/app scope was enforced only on mutations; every per-app read
+  ignored it.** Raised in the review but **omitted from the review's own recommended
+  implementation order**, so Phases A–F worked around it — the last unfixed Critical. A token
+  scoped to `team-a` could read `team-b`'s logs, plaintext env, status, metrics, snapshots and
+  deploy history; no admin mistake required. Eleven per-app read handlers now take `auth` and
+  call `authorize_scoped`: status, logs, log entries, cross-node log query, WS log stream,
+  metrics, snapshot list, deploy history, and the three UI routes (app detail, env, instances
+  fragment). `/v1/logs/sql` takes no app to scope against and arbitrary SQL can't be rewritten
+  into a tenant-filtered query, so a scoped token is refused outright
+  (`sesame::auth::require_unscoped`) and pointed at `/v1/logs/query/{app}/{namespace}`;
+  unscoped tokens keep it. `/v1/deploys/history/{app}` filtered on the bare app name, which
+  since DEP1 spans namespaces — it now takes `?namespace=` and filters on both (`relish
+  history --namespace`, threaded through the client and the TUI, whose history cache is keyed
+  `namespace/app`).
+  - [x] Drift guard: `every_per_app_route_checks_the_callers_scope` scans the router's own
+    source and fails if a route pattern naming `{app}` dispatches to a handler that never
+    calls `authorize_scoped` — the convention that failed here is now a test. A companion
+    test pins `/v1/logs/sql` to `require_unscoped`.
+  - [x] Runtime tests: a `team-a` token gets 403 on all ten per-app read routes for `team-b`
+    and non-403 for its own; the WS stream is refused through a real handshake against an
+    ephemeral listener (a hand-built request can't reach the handler — `WebSocketUpgrade`
+    rejects it with 426 first); raw log SQL is refused scoped and allowed unscoped; deploy
+    history no longer returns two namespaces' entries.
 
 ### Open — deferred from merged PRs
 
 - [ ] `M7` residual — `max_surge`/`max_unavailable` parse and validate but the production
   rolling deploy still ignores them (needs the deploy-loop rewrite; noted in the M7 commit)
-- [ ] `M20` — alert evaluation lacks per-value freshness and collapses metrics by name across
-  labels (downgraded to Optional-tier by the review's own correction; the full-label-keying
-  fix ripples into the alert evaluator's contract)
+- [x] `M20` — alert evaluation lacked per-value freshness and collapsed metrics by name across
+  labels. `gather_latest_values` now keeps the newest reading per `(metric_name, labels)`
+  series and hands them to a pure `collapse_series`, which (a) applies an explicit
+  `MAX_VALUE_AGE_SECS` freshness bound separate from the query window — the window says how
+  far back to look, not how stale an answer may be; (b) computes derived percentages
+  **within** a label set, so `node_memory_usage_percent` can't divide one series' `used` by
+  another's `total`; and (c) breaks collapse ties on the label string, so the result never
+  depends on row order. **Residual, deliberately:** the evaluator still takes one value per
+  metric name. Giving each labelled series its own alert state changes that contract (alert
+  keying becomes rule+series) and is not attempted here — recorded rather than silently
+  skipped
 - [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
-  (local-process-list exposure; the durable Raft leak is fixed)
-- [ ] `M28` residual — broader export-side field fidelity
-- [ ] `O5` residual — unbounded growth in the reporting aggregator maps, the mustard
-  dissemination heap and membership table, and never-pruned expired `crl.entries`
-- [ ] `O17` residual — `CpuStress --cores` multi-core arithmetic
+  (local-process-list exposure; the durable Raft leak is fixed). Needs a temp askpass helper
+  with 0700 perms and cleanup, so it rides with the follow-up PR
+- [ ] `M28` residual — broader export-side field fidelity (follow-up PR)
+- [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
+  draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn about the same nodes
+  could outrun it forever. Compaction coalesces to the newest incarnation per node (an older
+  update is exactly what the newer one supersedes), which bounds the queue at the number of
+  distinct nodes — which cluster membership bounds in turn. The trigger scales with
+  `cluster_size` above a small-cluster floor, because **one queued update per member is the
+  normal shape of a first dissemination**: the first version of this used a flat 4096 cap and
+  truncated the excess, which silently dropped ~6,000 members on a 10,000-member cluster.
+  `tests/gossip_10k.rs` caught it in CI, not locally, because `make test` doesn't run the
+  ignored scale suite. A `HARD_CAP` of 65,536 remains as a backstop against updates about
+  non-members, and it logs what it drops rather than trimming in silence.
+  `crl.entries` gained `expires_at` (`#[serde(default)]`, so old state loads and unknown
+  expiries are never pruned) and `RevokeCertificate` drops entries whose certificates have
+  since expired — an expired cert fails validation with or without a CRL entry. The prune
+  clocks off the incoming entry's own `revoked_at`, never `SystemTime::now()`: Raft apply must
+  be deterministic or replicas prune different sets and diverge (pinned by a test). The
+  reporting aggregator maps were already bounded by 12b.2's CP5 eviction; the membership table
+  only admits `Alive` nodes and reaps Dead/Left, so it's bounded by cluster size
+- [x] `O17` residual — `CpuStress --cores` was parsed and thrown away while the quota maths
+  assumed exactly one core, so on a 4-core node "80% stress" took 95% of the workload's CPU.
+  `cpu_stress_quota` now scales by cores, and `None` means "every core the workload has",
+  derived from its current `cpu.max` via a new pure `baseline_cores` (unlimited → host cores;
+  a quota → quota/period; unparseable → 1, since under-reading makes the fault weaker than
+  asked, which is the wrong way to be wrong)
 - [ ] `TODO(Phase 15)` — Smoker's service-to-service `Partition` apply arm stays an accepted
   no-op without eBPF; tightening it needs the quorum-rail acceptance test moved onto an eBPF
   node first
@@ -1514,19 +1556,70 @@ work, not by `M1`.
 
 ### Open — Optional list
 
-- [ ] `O1` anonymous Pickle reads are cluster-wide on a non-loopback bind
-- [ ] `O2` Pickle build-context URLs hardcode `http://` and `buildah push --tls-verify=false`
-- [ ] `O3` upgrade binary fetch/push is plaintext `http://` (integrity still sig+sha gated)
-- [ ] `O6` Raft RPC pre-allocates an attacker-controlled ≤64 MiB buffer per connection with no
-  connection cap
-- [ ] `O7` security-relevant reads are served from local follower state (a revoked cert can
-  read valid during a leadership transition)
-- [ ] `O9` SWIM `refute()` and the relay-ACK path don't refute about self, and `Left` is
-  unrefutable and sticky
-- [ ] `O10` `relish fmt` writes non-atomically and deletes comments; `compile` silently drops
-  duplicate app names
-- [ ] `O11` DNS forwards only over IPv4; bare `<app>.internal` resolves in the node's
-  `default_namespace`, not the caller's
+- [x] `O1` anonymous Pickle reads were cluster-wide on a non-loopback bind — any client that
+  could route a packet could enumerate and pull every image, including `cache/` copies of
+  private upstreams pulled with the operator's credentials. `PickleState.require_read_auth`
+  (set from the bind address; only an IP literal that *is* loopback keeps reads open, so
+  `0.0.0.0` and hostnames count as routable) gates every GET/HEAD through one choke point in
+  `dispatch_v2` plus the `/v2/` version probe. The bar is any valid token — pulling is what a
+  ReadOnly token is for — not the Deployer that writes require. Loopback is unchanged
+- [x] `O2` Pickle build-context URLs hardcoded `http://` and `buildah push` hardcoded
+  `--tls-verify=false` — against a TLS registry a delegated build failed outright, and where
+  plaintext did reach a listener the build context (the caller's source tree) crossed the
+  network in clear while the push never checked the certificate it was pushing to. All four
+  context-URL builders take the registry's scheme and `execute_build` takes
+  `registry_over_tls`; `ApiState.registry_scheme` is server-owned beside `registry_port`, the
+  CLI derives it from its own client, and `bun` derives both once beside `cluster_http` so
+  they can't drift. The runner's context download also moved off a bare `reqwest::get` onto
+  the CA-trusting cluster client
+- [x] `O3` upgrade binary fetch/push was plaintext `http://` — integrity was never at stake
+  (sha256 gate + embedded release signature run on every path), but a plaintext fetch simply
+  fails against a TLS-only registry. `UpgradeManager` gained a `cluster_http` (late-injected
+  via `with_cluster_http`, since the manager is built before the node's identity is known) and
+  `relish upgrade`'s `push_blob` now goes through the authenticated `BunClient`, which also
+  gets it past O1's read gate and the existing write gate. Tested through the real fetch seam
+  against a closed port, asserting the attempted URL's scheme
+- [x] `O6` Raft RPC pre-allocated an attacker-controlled ≤64 MiB buffer per connection with no
+  connection cap — the frame reader now grows in 64 KiB chunks with the bytes that actually
+  arrive (four bytes no longer buy 64 MiB), and the accept loop holds an owned semaphore
+  permit per connection, acquired *before* `accept()` so excess peers wait in the kernel
+  backlog. Tests: multi-chunk reassembly, a declared-maximum frame with a ten-byte body, and
+  a listener capped at one connection serving three sequential peers (verified to fail when
+  the permit is leaked on purpose)
+- [x] `O7` security-relevant reads were served from local follower state — **partially
+  addressed, deliberately.** New `CouncilNode::security_state_linearizable()` proves the read
+  is current via `ensure_linearizable()` and errors rather than answering when it can't, and
+  workload-CSR signing (where the read *is* the decision: it yields a valid certificate) now
+  uses it. The two remaining local readers stay local **by design**, documented at the
+  accessor: the CRL refresh ticker is advisory and already 5s stale by construction, and the
+  join-token pre-check is a fast-fail whose authoritative decision is the
+  `ConsumeJoinTokenForIssue` Raft write. A follower cannot do a linearizable read at all, so
+  forcing one there would break validation rather than tighten it
+- [x] `O9` SWIM `refute()` didn't apply the fresh Alive to the local record (a refuting node
+  told the cluster it was alive while its own membership table — what the scheduler and
+  council reads go through — still held it Suspect/Dead), and `Left` won at any incarnation,
+  making it the one claim a node could not refute. Gossip HMAC stops forgery but not replay,
+  so a captured departure datagram evicted a rejoined node until the 60s reap. `Left` now
+  loses to a strictly higher incarnation — safe because only a node mints its own incarnation
+  numbers — and `leave()` sets a flag so a node's own departure echoing back off a peer isn't
+  mistaken for a replay to refute. The `resolve_conflict` proptest invariant moved from "Left
+  is terminal" to "Left wins at an equal or higher incarnation"
+- [x] `O10` `relish fmt` wrote non-atomically (`fs::write` truncates first, so an interrupted
+  write left a half-file where a valid config used to be — one the node reads at startup) and
+  deleted comments in silence. It now writes to a sibling temp file and renames (same
+  filesystem, so the rename is atomic) and warns once when the input had comments. `compile`
+  merged with `extend`, so a same-named app from an earlier file was silently replaced — it
+  now reports each overwrite as a warning, while two apps of the same name in *different*
+  namespaces stay legal (DEP1). `_defaults.toml` parse errors were swallowed by `.ok()?`,
+  making a typo indistinguishable from "no defaults"; they surface as warnings now
+- [x] `O11` (IPv4 forwarding) DNS forwarded from a hardcoded `0.0.0.0:0`, so an IPv6 upstream
+  was unreachable and every non-`.internal` query SERVFAILed — a failure that reads as "DNS is
+  broken" rather than "your upstream is v6". The forward socket now binds the upstream's
+  address family, proven against real v4 and v6 loopback resolvers.
+  **Residual:** a bare `<app>.internal` still resolves in the node's `default_namespace`
+  rather than the caller's. Fixing it needs a source-IP→namespace map the userspace responder
+  doesn't have (the limitation is already documented on `DnsConfig::default_namespace`), and
+  eBPF connect enforcement remains the primary control here
 - [ ] `O20` stale/misleading docs and dead code sweep
 
 The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise within this list.

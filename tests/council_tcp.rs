@@ -74,6 +74,7 @@ fn revoked_crl(serial: u64) -> CrlHandle {
             issuer: CaRole::Node,
             revoked_at: SystemTime::now(),
             reason: "test".to_string(),
+            expires_at: None,
         }],
         version: 1,
         updated_at: SystemTime::now(),
@@ -289,4 +290,70 @@ async fn raft_rpc_refuses_a_revoked_node_cert() {
     );
 
     shutdown_all(&shutdown, nodes).await;
+}
+
+/// O6: the accept loop holds a semaphore permit for the lifetime of each
+/// connection, so a permit that isn't released would wedge the listener after
+/// `max_connections` peers — silently, and only under load.
+///
+/// Serve with a cap of one and drive three connections through in sequence.
+/// Each sends a frame the server can't decode, which is the shortest path to
+/// "connection handled, permit dropped". If the permit leaked, the second
+/// connection would be accepted by the kernel but never served, and the read
+/// below would block until the test's timeout.
+#[tokio::test]
+async fn raft_rpc_connection_permits_are_released() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let shutdown = CancellationToken::new();
+    let council = CouncilNode::new(
+        1,
+        CouncilConfig::default(),
+        TcpRaftNetworkFactory::new(1),
+        MemLogStore::new(),
+        CouncilStateMachine::new(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let raft = council.raft().clone();
+    let serving = shutdown.clone();
+    tokio::spawn(async move {
+        reliaburger::council::network::serve_raft_rpc_with_limit(
+            listener, raft, serving, None, 0, 1,
+        )
+        .await;
+    });
+
+    for attempt in 0..3 {
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(bound),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("connect {attempt} timed out — a permit was never released"))
+        .unwrap();
+
+        let body = b"not a raft rpc";
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(body).await.unwrap();
+
+        // The server drops an undecodable frame, so we expect EOF. What
+        // matters is that it happens promptly rather than never.
+        let mut sink = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut sink))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("connection {attempt} was never served — a permit was never released")
+            })
+            .unwrap();
+    }
+
+    shutdown.cancel();
 }

@@ -69,6 +69,8 @@ pub enum CouncilError {
     InitError(String),
     #[error("raft write failed: {0}")]
     WriteFailed(String),
+    #[error("linearizable read failed: {0}")]
+    ReadFailed(String),
     #[error("network error: {0}")]
     Network(String),
     #[error("security operation failed: {0}")]

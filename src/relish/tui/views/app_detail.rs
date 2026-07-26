@@ -136,7 +136,12 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
             }
         }
         DetailTab::Deploys => {
-            let history = app.data.deploy_history.get(name);
+            let history =
+                app.data
+                    .deploy_history
+                    .get(&crate::relish::tui::state::deploy_history_key(
+                        name, namespace,
+                    ));
             if history.is_none_or(Vec::is_empty) {
                 lines.push(Line::raw("no deploy history"));
             } else if let Some(history) = history {

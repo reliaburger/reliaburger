@@ -1209,6 +1209,7 @@ mod tests {
                 issuer: crate::sesame::types::CaRole::Workload,
                 revoked_at: std::time::SystemTime::now(),
                 reason: "key leaked".to_string(),
+                expires_at: None,
             }],
             version: 1,
             updated_at: std::time::SystemTime::now(),

@@ -49,6 +49,31 @@ impl PartialOrd for QueuedUpdate {
     }
 }
 
+/// Smallest queue length that can trigger compaction (O5).
+///
+/// Nothing bounded this heap: `enqueue` pushed unconditionally while
+/// `select_updates` drains at most [`MAX_PIGGYBACK_UPDATES`] per outgoing
+/// message, so repeated updates about the same nodes could accumulate
+/// faster than the queue drains, forever.
+///
+/// The trigger scales with cluster size rather than being a flat ceiling,
+/// because one entry per member *is* the normal shape of a first
+/// dissemination: a 10,000-member cluster legitimately queues ~10,000
+/// updates and every one of them has to go out. A flat cap would silently
+/// throw away most of the cluster's initial view. This floor only matters
+/// for small clusters, where churn about a handful of nodes is the growth
+/// worth catching.
+const MIN_COMPACT_THRESHOLD: usize = 1024;
+
+/// Absolute backstop, far above any plausible cluster.
+///
+/// Coalescing bounds the queue at the number of distinct node ids, which a
+/// real cluster's membership bounds in turn. This only trips if something
+/// is feeding us updates about ids that don't correspond to members — and
+/// unlike the old flat cap it is loud about it, because a queue that has to
+/// discard real updates is an incident, not routine housekeeping.
+const HARD_CAP: usize = 65_536;
+
 /// The dissemination queue that selects updates to piggyback on messages.
 pub struct DisseminationQueue {
     queue: BinaryHeap<QueuedUpdate>,
@@ -73,6 +98,60 @@ impl DisseminationQueue {
             update,
             remaining_broadcasts: broadcasts,
         });
+        // Scale the trigger with the cluster: one queued update per member is
+        // normal, so compacting at a flat threshold would fire constantly on a
+        // large cluster and discard its first dissemination.
+        let threshold = cluster_size.saturating_mul(2).max(MIN_COMPACT_THRESHOLD);
+        if self.queue.len() > threshold {
+            self.compact();
+        }
+    }
+
+    /// Drop queued updates that nothing is waiting for (O5).
+    ///
+    /// Coalesce to the highest-incarnation entry per node. An older update
+    /// about a node is exactly what the newer one supersedes, so sending
+    /// both spends datagram space telling peers something they immediately
+    /// overwrite. This is the whole bound in practice: the queue can hold at
+    /// most one entry per distinct node, and a real cluster's membership
+    /// bounds that.
+    ///
+    /// Nothing legitimate is discarded here, which is the point — the
+    /// earlier version of this capped the queue at a flat 4096 and truncated
+    /// the excess, which quietly threw away 6,000 members' updates on a
+    /// 10,000-member cluster. The `gossip_10k` acceptance test caught it.
+    ///
+    /// [`HARD_CAP`] remains as a backstop against updates about ids that
+    /// aren't members at all, and it complains rather than trimming in
+    /// silence.
+    fn compact(&mut self) {
+        use std::collections::HashMap;
+
+        let drained: Vec<QueuedUpdate> = self.queue.drain().collect();
+        let mut newest: HashMap<crate::meat::NodeId, QueuedUpdate> =
+            HashMap::with_capacity(drained.len());
+        for queued in drained {
+            match newest.get(&queued.update.node_id) {
+                Some(existing) if existing.update.incarnation >= queued.update.incarnation => {}
+                _ => {
+                    newest.insert(queued.update.node_id.clone(), queued);
+                }
+            }
+        }
+
+        let mut remaining: Vec<QueuedUpdate> = newest.into_values().collect();
+        if remaining.len() > HARD_CAP {
+            // Descending: highest priority first, so what goes is `Alive`
+            // chatter rather than a `Dead`/`Suspect` someone is waiting on.
+            remaining.sort_by(|a, b| b.cmp(a));
+            let dropped = remaining.len() - HARD_CAP;
+            remaining.truncate(HARD_CAP);
+            eprintln!(
+                "mustard: dissemination queue exceeded {HARD_CAP} distinct nodes; \
+                 dropped {dropped} update(s) — this implies updates about non-members"
+            );
+        }
+        self.queue = remaining.into_iter().collect();
     }
 
     /// Select up to `MAX_PIGGYBACK_UPDATES` updates to piggyback on
@@ -314,5 +393,101 @@ mod tests {
         queue.enqueue(update("n1", NodeState::Alive), 2);
         queue.enqueue(update("n2", NodeState::Dead), 2);
         assert_eq!(queue.len(), 2);
+    }
+
+    // -- bounded growth (O5) --------------------------------------------------
+
+    /// The queue drains at most `MAX_PIGGYBACK_UPDATES` per outgoing message
+    /// but accepted enqueues without limit, so churn about one node could
+    /// outrun it forever.
+    #[test]
+    fn repeated_updates_about_one_node_do_not_grow_without_bound() {
+        let mut queue = DisseminationQueue::new();
+        let churn = MIN_COMPACT_THRESHOLD as u64 + 100;
+        for incarnation in 1..churn {
+            let mut u = update("n1", NodeState::Alive);
+            u.incarnation = incarnation;
+            queue.enqueue(u, 3);
+        }
+        let newest = churn - 1;
+
+        // Compaction is amortised — it runs when the threshold is crossed,
+        // not on every enqueue — so the queue sits under the threshold rather
+        // than at 1. What matters is that it stops growing.
+        assert!(
+            queue.len() <= MIN_COMPACT_THRESHOLD,
+            "queue grew to {} past the {MIN_COMPACT_THRESHOLD} threshold",
+            queue.len()
+        );
+        // …and that coalescing keeps the newest incarnation. Losing that
+        // would make the bound a correctness bug rather than a memory fix.
+        let mut seen_newest = false;
+        while !queue.is_empty() {
+            if queue
+                .select_updates()
+                .iter()
+                .any(|u| u.incarnation == newest)
+            {
+                seen_newest = true;
+                break;
+            }
+        }
+        assert!(seen_newest, "compaction dropped the newest incarnation");
+    }
+
+    /// The regression that CI caught. One queued update per member is the
+    /// normal shape of a first dissemination, so a large cluster must keep
+    /// *every* one of them — the first version of this bound capped the queue
+    /// at a flat 4096 and silently threw away the rest, which on a
+    /// 10,000-member cluster meant 6,000 members never disseminated at all.
+    #[test]
+    fn a_large_clusters_first_dissemination_keeps_every_member() {
+        let cluster_size = 10_000;
+        let mut queue = DisseminationQueue::new();
+        for i in 0..cluster_size {
+            queue.enqueue(update(&format!("n{i}"), NodeState::Alive), cluster_size);
+        }
+        assert_eq!(
+            queue.len(),
+            cluster_size,
+            "a legitimate one-per-member queue was trimmed"
+        );
+
+        // And every member is actually exposed by repeated selection, which is
+        // the property `tests/gossip_10k.rs` asserts end to end.
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < cluster_size && !queue.is_empty() {
+            let batch = queue.select_updates();
+            assert!(!batch.is_empty(), "updates expired before first broadcast");
+            seen.extend(batch.into_iter().map(|u| u.node_id));
+        }
+        assert_eq!(seen.len(), cluster_size);
+    }
+
+    /// Compaction never discards a distinct node's update below the hard
+    /// backstop, so a `Dead` buried under a flood of `Alive` still goes out.
+    #[test]
+    fn compaction_keeps_distinct_nodes_including_urgent_ones() {
+        let mut queue = DisseminationQueue::new();
+        queue.enqueue(update("critical", NodeState::Dead), 3);
+        // A small declared cluster size, so the floor threshold is what
+        // triggers compaction rather than the scaled one.
+        for i in 0..(MIN_COMPACT_THRESHOLD + 500) {
+            queue.enqueue(update(&format!("n{i}"), NodeState::Alive), 3);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        while !queue.is_empty() {
+            seen.extend(queue.select_updates().into_iter().map(|u| u.node_id));
+        }
+        assert!(
+            seen.contains(&NodeId::new("critical")),
+            "compaction dropped a Dead update"
+        );
+        assert_eq!(
+            seen.len(),
+            MIN_COMPACT_THRESHOLD + 501,
+            "compaction dropped distinct nodes below the hard backstop"
+        );
     }
 }

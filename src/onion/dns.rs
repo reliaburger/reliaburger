@@ -625,7 +625,16 @@ async fn forward_upstream(
     upstream: SocketAddr,
     timeout: Duration,
 ) -> Option<Vec<u8>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    // Bind the same address family as the upstream (O11). A hardcoded
+    // `0.0.0.0:0` cannot reach an IPv6 resolver at all, so every non-
+    // `.internal` query SERVFAILed on a v6-only network — a failure mode
+    // that looks like "DNS is broken" rather than "your upstream is v6".
+    let bind: SocketAddr = if upstream.is_ipv6() {
+        "[::]:0".parse().ok()?
+    } else {
+        "0.0.0.0:0".parse().ok()?
+    };
+    let socket = UdpSocket::bind(bind).await.ok()?;
     socket.connect(upstream).await.ok()?;
     socket.send(query).await.ok()?;
 
@@ -1241,5 +1250,52 @@ mod tests {
             resolves(&expired_rx),
             "an expired fault must not keep the name dark"
         );
+    }
+
+    /// O11: the forward socket was hardcoded to `0.0.0.0:0`, so an IPv6
+    /// upstream was unreachable and every non-`.internal` query SERVFAILed.
+    /// Stand up a real v6 upstream and prove the forward gets there.
+    #[tokio::test]
+    async fn upstream_forwarding_reaches_an_ipv6_resolver() {
+        let upstream = match UdpSocket::bind("[::1]:0").await {
+            Ok(socket) => socket,
+            // Some sandboxes have no IPv6 loopback; the fix is still
+            // exercised by the v4 path below.
+            Err(_) => return,
+        };
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        // Echo the query back with the same transaction id, which is all
+        // `forward_upstream` checks before returning it.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((len, from)) = upstream.recv_from(&mut buf).await {
+                let _ = upstream.send_to(&buf[..len], from).await;
+            }
+        });
+
+        let query = vec![0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        let reply = forward_upstream(&query, upstream_addr, Duration::from_secs(2)).await;
+        assert_eq!(
+            reply.as_deref(),
+            Some(query.as_slice()),
+            "an IPv6 upstream was unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_forwarding_still_reaches_an_ipv4_resolver() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((len, from)) = upstream.recv_from(&mut buf).await {
+                let _ = upstream.send_to(&buf[..len], from).await;
+            }
+        });
+
+        let query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        let reply = forward_upstream(&query, upstream_addr, Duration::from_secs(2)).await;
+        assert_eq!(reply.as_deref(), Some(query.as_slice()));
     }
 }

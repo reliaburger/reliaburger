@@ -291,6 +291,20 @@ impl BunClient {
     }
 
     /// Get the base URL.
+    /// The scheme this client addresses the agent by, `"http"` or `"https"`.
+    ///
+    /// The Pickle registry is a second listener on the same host, and it
+    /// gains TLS under the same condition the agent API does (the node
+    /// holding an mTLS identity), so this is how the CLI knows whether to
+    /// address the registry as https when uploading a build context (O2).
+    pub fn scheme(&self) -> &'static str {
+        if self.base_url.starts_with("https://") {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -518,10 +532,21 @@ impl BunClient {
         })
     }
 
-    /// Fetch deploy history for an app.
-    pub async fn deploy_history(&self, app: &str) -> Result<Vec<serde_json::Value>, RelishError> {
+    /// Fetch deploy history for an app in a namespace.
+    pub async fn deploy_history(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<Vec<serde_json::Value>, RelishError> {
+        // Encode both: an app or namespace carrying `/`, `&` or a space would
+        // otherwise split into extra path segments or query parameters.
+        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
+        let namespace_value: String =
+            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
         let value: serde_json::Value = self
-            .get_typed_json(&format!("/v1/deploys/history/{app}"))
+            .get_typed_json(&format!(
+                "/v1/deploys/history/{app_segment}?namespace={namespace_value}"
+            ))
             .await?;
         Ok(value["history"].as_array().cloned().unwrap_or_default())
     }

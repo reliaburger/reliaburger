@@ -602,21 +602,26 @@ pub fn find_peer_builders(
 /// registry endpoints: both addresses derive from config + membership.
 pub async fn transfer_context_to_builder(
     client: &reqwest::Client,
+    registry_scheme: &str,
     local_registry_port: u16,
     builder_registry_address: &str,
     digest: &str,
     max_bytes: u64,
 ) -> Result<(), String> {
     // Skip the copy if the builder already holds the blob.
-    let peer_blob_url =
-        crate::pickle::build::context_download_url_at(builder_registry_address, digest);
+    let peer_blob_url = crate::pickle::build::context_download_url_at(
+        registry_scheme,
+        builder_registry_address,
+        digest,
+    );
     if let Ok(response) = client.head(&peer_blob_url).send().await
         && response.status().is_success()
     {
         return Ok(());
     }
 
-    let local_url = crate::pickle::build::context_download_url(local_registry_port, digest);
+    let local_url =
+        crate::pickle::build::context_download_url(registry_scheme, local_registry_port, digest);
     let response = client
         .get(&local_url)
         .send()
@@ -631,7 +636,11 @@ pub async fn transfer_context_to_builder(
         .await
         .map_err(|e| format!("context read failed: {e}"))?;
 
-    let upload_url = crate::pickle::build::context_upload_url_at(builder_registry_address, digest);
+    let upload_url = crate::pickle::build::context_upload_url_at(
+        registry_scheme,
+        builder_registry_address,
+        digest,
+    );
     let response = client
         .post(&upload_url)
         .body(body)
@@ -847,6 +856,7 @@ async fn run_build_inner(
         &request.spec,
         &request.context_digest,
         Some(state.registry_port),
+        state.registry_scheme == "https",
     )
     .map_err(|e| format!("invalid build spec: {e}"))?;
 
@@ -864,9 +874,14 @@ async fn run_build_inner(
     // buffer), then extract through the hardened unpacker (bounds
     // size/entries, rejects traversal/symlinks, strips setuid) off the
     // async runtime.
-    let context_url =
-        crate::pickle::build::context_download_url(state.registry_port, &request.context_digest);
-    let response = match reqwest::get(&context_url).await {
+    let context_url = crate::pickle::build::context_download_url(
+        state.registry_scheme,
+        state.registry_port,
+        &request.context_digest,
+    );
+    // The cluster client, not a bare `reqwest::get`: over TLS the registry
+    // presents a cluster-CA certificate that a default client won't trust.
+    let response = match state.cluster_http.client().get(&context_url).send().await {
         Ok(response) if response.status().is_success() => response,
         _ => {
             return Err(format!(
@@ -1098,6 +1113,7 @@ pub async fn build_submit_handler(
         // the blob must be there before the run request lands (JOB5).
         if let Err(e) = transfer_context_to_builder(
             state.cluster_http.client(),
+            state.registry_scheme,
             state.registry_port,
             &candidate.registry_address,
             &request.context_digest,

@@ -315,6 +315,20 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
+/// Whether the Pickle registry's bind address is reachable only from this
+/// host (O1).
+///
+/// `[images] registry_bind` is a bare host, not a `host:port`, so it's parsed
+/// as an `IpAddr`. Anything that isn't an IP literal — a hostname, or the
+/// unspecified `0.0.0.0`/`[::]` — counts as routable: we can't prove nobody
+/// else can reach it, and the failure we'd rather have is "you needed a token
+/// and didn't expect to".
+fn registry_bind_is_loopback(bind: &str) -> bool {
+    bind.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
 ///
 /// Returns `None` — falling back to a self-signed `localhost` cert — when the
@@ -635,6 +649,22 @@ async fn main() -> anyhow::Result<()> {
         ),
         None => reliaburger::cluster::ClusterHttp::plaintext(),
     };
+
+    // The Pickle registry gains TLS under the same condition (REG4), so the
+    // scheme is derived from it once, here, and threaded to everything that
+    // addresses the registry — the API state, the P2P/heal peer URLs and the
+    // build-context transfers (O2). Deriving it in two places is how they
+    // drift apart.
+    let registry_over_tls = api_identity.is_some();
+    let registry_scheme = if registry_over_tls { "https" } else { "http" };
+
+    // O3: the upgrade manager fetches binaries from a peer's Pickle, so it
+    // needs the same scheme and CA-trusting client. It is built before the
+    // identity is known, hence the late injection rather than a `new`
+    // parameter. Integrity never depended on this — the sha256 gate and the
+    // embedded release signature run on every path — but a plaintext fetch
+    // simply fails against a TLS-only registry.
+    let upgrade_manager = upgrade_manager.map(|m| m.with_cluster_http(cluster_http.clone()));
 
     // Batch scheduling (F1) reads capacities from the same aggregated
     // view the deploy scheduler uses; None standalone.
@@ -1375,6 +1405,7 @@ async fn main() -> anyhow::Result<()> {
         config.images.build_timeout_secs,
         cluster_http.clone(),
         config.images.registry_port,
+        registry_scheme,
         config.images.max_context_bytes,
         // Signing becomes part of a build's terminal state under a
         // signature-requiring trust policy (12b.2 JOB7).
@@ -1516,16 +1547,19 @@ async fn main() -> anyhow::Result<()> {
         council: api_council.clone(),
         persist_path: Some(catalog_path.clone()),
         auth: registry_auth,
+        // O1: reads stay open on the loopback default (a local pull needs no
+        // token) and require a principal anywhere a stranger could reach the
+        // port. A hostname we can't resolve to a literal is treated as
+        // routable — the safe way to be wrong.
+        require_read_auth: !registry_bind_is_loopback(&config.images.registry_bind),
         quota: registry_quota,
         sessions: upload_sessions.clone(),
     };
-    // The registry serves over TLS when this node has an mTLS identity
-    // (REG4), so peers must be addressed as https and the replication /
-    // P2P client must trust the cluster CA. Without an identity it's plain
-    // http, and a default client. The scheme is derived once and threaded
-    // through every peer-URL derivation so they stay consistent.
-    let registry_over_tls = api_identity.is_some();
-    let registry_scheme = if registry_over_tls { "https" } else { "http" };
+    // `registry_over_tls` / `registry_scheme` are derived once, up where
+    // `cluster_http` is built (REG4/O2): peers must be addressed as https and
+    // the replication / P2P client must trust the cluster CA when the
+    // registry runs over TLS.
+    //
     // The registry replication/P2P client presents the internal service token
     // as a bearer: Pickle authorises node-to-node writes by that token, not by
     // the client certificate, so it is required even under mTLS (M2).
@@ -2072,6 +2106,23 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// O1: only an IP literal that *is* loopback keeps registry reads open.
+    /// `0.0.0.0` is the interesting case — it reads like a local default and
+    /// is the most exposed bind there is.
+    #[test]
+    fn only_loopback_literals_keep_registry_reads_open() {
+        assert!(registry_bind_is_loopback("127.0.0.1"));
+        assert!(registry_bind_is_loopback("::1"));
+
+        assert!(!registry_bind_is_loopback("0.0.0.0"));
+        assert!(!registry_bind_is_loopback("::"));
+        assert!(!registry_bind_is_loopback("10.0.1.5"));
+        // A hostname could resolve anywhere, and could resolve somewhere else
+        // tomorrow, so it counts as routable.
+        assert!(!registry_bind_is_loopback("localhost"));
+        assert!(!registry_bind_is_loopback(""));
+    }
 
     #[test]
     fn process_runtime_refuses_dns_before_workload_creation() {

@@ -497,6 +497,22 @@ impl StateMachineInner {
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
+                // O5: drop entries whose certificates have since expired —
+                // an expired certificate fails validation with or without a
+                // CRL entry, so keeping it only grows every snapshot and
+                // every handshake's scan.
+                //
+                // The clock is the incoming entry's own `revoked_at`, not
+                // `SystemTime::now()`. Raft apply must be deterministic:
+                // every replica applies this entry, and a wall-clock read
+                // would have them prune different sets and diverge. A
+                // timestamp carried *in the log* is the same on all of them.
+                let logical_now = entry.revoked_at;
+                self.state
+                    .security_state
+                    .crl
+                    .entries
+                    .retain(|e| e.expires_at.is_none_or(|expiry| expiry > logical_now));
                 self.state.security_state.crl.version += 1;
                 self.state.security_state.crl.updated_at = std::time::SystemTime::now();
             }
@@ -3020,5 +3036,97 @@ mod tests {
         assert!(state.apps.contains_key(&app_id));
         assert_eq!(state.batch_state.next_batch_id, 1);
         assert_eq!(state.build_state.next_build_id, 1);
+    }
+
+    /// O5: the CRL is replicated in every snapshot and scanned on every TLS
+    /// handshake, and nothing ever removed an entry. An expired certificate
+    /// fails validation with or without one, so those entries are pure
+    /// growth.
+    #[test]
+    fn revoking_prunes_entries_whose_certificates_have_expired() {
+        use crate::sesame::types::{CaRole, CrlEntry, SerialNumber};
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let at = |secs: u64| epoch + std::time::Duration::from_secs(secs);
+        let entry = |serial: u64, revoked: u64, expires: Option<u64>| CrlEntry {
+            serial: SerialNumber(serial),
+            issuer: CaRole::Node,
+            revoked_at: at(revoked),
+            reason: format!("node-{serial}"),
+            expires_at: expires.map(at),
+        };
+
+        let mut inner = StateMachineInner::default();
+        // Expires at t=100, revoked early.
+        inner.apply_request(&RaftRequest::RevokeCertificate(entry(1, 10, Some(100))));
+        // No known expiry: never pruned, the safe direction to be wrong.
+        inner.apply_request(&RaftRequest::RevokeCertificate(entry(2, 20, None)));
+        assert_eq!(inner.state.security_state.crl.entries.len(), 2);
+
+        // A revocation at t=200 is the logical clock: entry 1's certificate
+        // expired 100 seconds ago, so it goes.
+        inner.apply_request(&RaftRequest::RevokeCertificate(entry(3, 200, Some(900))));
+        let serials: Vec<u64> = inner
+            .state
+            .security_state
+            .crl
+            .entries
+            .iter()
+            .map(|e| e.serial.0)
+            .collect();
+        assert_eq!(
+            serials,
+            vec![2, 3],
+            "expected the expired entry to be pruned"
+        );
+
+        // The version still moves for every revocation — a pruning apply is
+        // not a no-op to peers refreshing their copy.
+        assert_eq!(inner.state.security_state.crl.version, 3);
+    }
+
+    /// The prune must use a timestamp carried in the log, never the wall
+    /// clock: every replica applies the same entry, and reading `now()` here
+    /// would have them prune different sets and diverge.
+    #[test]
+    fn crl_pruning_is_deterministic_across_replicas() {
+        use crate::sesame::types::{CaRole, CrlEntry, SerialNumber};
+
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let at = |secs: u64| epoch + std::time::Duration::from_secs(secs);
+        let requests = [
+            RaftRequest::RevokeCertificate(CrlEntry {
+                serial: SerialNumber(1),
+                issuer: CaRole::Node,
+                revoked_at: at(10),
+                reason: "one".to_string(),
+                expires_at: Some(at(50)),
+            }),
+            RaftRequest::RevokeCertificate(CrlEntry {
+                serial: SerialNumber(2),
+                issuer: CaRole::Node,
+                revoked_at: at(60),
+                reason: "two".to_string(),
+                expires_at: Some(at(500)),
+            }),
+        ];
+
+        let apply_all = || {
+            let mut inner = StateMachineInner::default();
+            for request in &requests {
+                inner.apply_request(request);
+            }
+            inner
+                .state
+                .security_state
+                .crl
+                .entries
+                .iter()
+                .map(|e| e.serial.0)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(apply_all(), apply_all());
+        assert_eq!(apply_all(), vec![2]);
     }
 }

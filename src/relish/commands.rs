@@ -861,17 +861,17 @@ pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
     }
 }
 
-/// Show deploy history for an app.
-pub async fn history(app: &str) -> Result<(), RelishError> {
+/// Show deploy history for an app in a namespace.
+pub async fn history(app: &str, namespace: &str) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     // Authenticated + CA-trusting request (M21): the previous bare
     // `reqwest::get` carried no bearer/CA, so it 401'd against a secured agent
     // and silently exited 0. `deploy_history` routes through the configured
     // client and propagates the failure.
-    let entries = client.deploy_history(app).await?;
+    let entries = client.deploy_history(app, namespace).await?;
 
     if entries.is_empty() {
-        println!("no deploy history for {app}");
+        println!("no deploy history for {app} in namespace {namespace}");
     } else {
         println!(
             "{:<8} {:<20} {:<12} {:<6} {:<6}",
@@ -989,8 +989,54 @@ pub fn fmt(path: &Path, check: bool) -> Result<(), RelishError> {
     }
 
     let formatted = super::fmt::format_toml(&content)?;
-    fs::write(path, &formatted)?;
+
+    // O10: comment loss is by design (the formatter round-trips through the
+    // `toml` crate's typed representation), but silently eating an
+    // operator's annotations is not. Say so, once, when there was something
+    // to lose.
+    if content
+        .lines()
+        .any(|line| line.trim_start().starts_with('#'))
+    {
+        eprintln!(
+            "warning: {} had comments; the formatter round-trips through TOML's \
+             typed representation, which discards them",
+            path.display()
+        );
+    }
+
+    // O10: write atomically. `fs::write` truncates first, so an interrupted
+    // or failing write leaves a half-file where a valid config used to be —
+    // and this is a config the node reads on startup. A temp file beside the
+    // target (same filesystem, so the rename is atomic) means the config is
+    // either the old one or the new one, never neither.
+    write_atomically(path, formatted.as_bytes())?;
     println!("formatted {}", path.display());
+    Ok(())
+}
+
+/// Replace a file's contents atomically: write a sibling temp file, then
+/// rename over the target.
+///
+/// The temp file must live in the same directory, not `/tmp` — `rename` is
+/// only atomic within a filesystem, and across one it degrades to a
+/// copy-then-delete with the same torn-write window we're trying to close.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), RelishError> {
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    let temp = directory.join(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    if let Err(e) = fs::write(&temp, bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -1272,8 +1318,12 @@ pub async fn build(
         // target the Bun API port, which has no /v2 routes). Route through the
         // authenticated client (M21): a bare client carried no bearer/CA, so it
         // 401'd or failed TLS against a secured registry.
-        let upload_url = crate::pickle::build::context_upload_url(registry_port, &digest);
-        let resp = BunClient::default_local()
+        // O2: address the registry the way it actually serves. Hardcoding
+        // `http://` failed outright against a TLS registry, and where it
+        // worked it pushed the context — the caller's source tree — in clear.
+        let upload_url =
+            crate::pickle::build::context_upload_url(client.scheme(), registry_port, &digest);
+        let resp = client
             .http()
             .post(&upload_url)
             .body(tar_bytes)
@@ -1294,11 +1344,15 @@ pub async fn build(
         println!("  context uploaded to Pickle");
 
         // Prepare the build job (for display; the agent re-derives it)
-        let job = execute_build(spec, &digest, Some(registry_port)).map_err(|e| {
-            RelishError::ApiError {
-                status: 0,
-                body: format!("build preparation failed: {e}"),
-            }
+        let job = execute_build(
+            spec,
+            &digest,
+            Some(registry_port),
+            client.scheme() == "https",
+        )
+        .map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("build preparation failed: {e}"),
         })?;
 
         println!(

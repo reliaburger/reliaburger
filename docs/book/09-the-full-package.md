@@ -235,6 +235,30 @@ Parse what you're about to write, and compare it with what you started from. `to
 
 Can you see what this buys us? The formatter can still have bugs. But now a bug produces an error message instead of a corrupted file. When a tool rewrites user data in place, "fail loudly" beats "trust the code" every time.
 
+And then, having built a guard against writing the *wrong* content, we went ahead and wrote the right content the wrong way:
+
+```rust
+fs::write(path, &formatted)?;
+```
+
+`fs::write` opens with `O_TRUNC`. The file is emptied first and refilled second, so between those two moments the config is zero bytes. Crash there, run out of disk there, get killed by the OOM killer there, and what's left isn't the old config and isn't the new one — and this is a file the node reads at startup. The round-trip guard is careful about *what* we write and said nothing about *when* the file stops being valid.
+
+The fix is the oldest trick in Unix:
+
+```rust
+let temp = directory.join(format!(".{file_name}.{}.tmp", std::process::id()));
+fs::write(&temp, bytes)?;
+fs::rename(&temp, path)?;
+```
+
+Write the whole thing somewhere else, then `rename` it over the target. `rename(2)` is atomic: any reader sees the old file or the new file, never a half-file. The temp goes in the *same directory* on purpose — rename is only atomic within a filesystem, and pointing at `/tmp` would silently degrade it to copy-then-delete, which is exactly the torn write we're trying to avoid. It also carries the pid, so two `relish fmt` runs in one directory don't fight over the same scratch file.
+
+Worth noticing how the two protections differ. The round-trip guard is about *correctness*: is this output the same config? The atomic rename is about *atomicity*: is there any instant where an observer sees neither? A tool that rewrites files in place needs both, and having one makes it very easy to assume you have the other.
+
+The third thing `fmt` did quietly was eat comments. That part is by design — the formatter round-trips through `toml`'s typed representation, which has nowhere to keep them — but "by design" is not the same as "the operator knows". It now says so, once, when the input had comments to lose. Design decisions that destroy user data should be announced by the program, not by the documentation.
+
+`compile` had the same shape of problem one level up. It merged files with `extend` on name-keyed maps, so a second `[app.web]` in a second file silently replaced the first, and the output looked complete. It now warns on every overwrite — while leaving two apps of the same name in *different* namespaces alone, since that's been legal since instance identity gained namespaces. And a malformed `_defaults.toml` used to be swallowed by `.ok()?`, making a typo indistinguishable from "there are no defaults": the default image vanished from every app in the directory and the error resurfaced much later as a missing field. `Option` is a lovely type for "there isn't one" and a terrible one for "there is one but I couldn't read it".
+
 ### `relish diff`
 
 Shows a structural, field-by-field diff between two configs. Not a text diff -- a semantic one. It knows that changing `image` from `v1` to `v2` is a modification, adding a new `[app.api]` section is an addition, and removing `[job.migrate]` is a deletion.

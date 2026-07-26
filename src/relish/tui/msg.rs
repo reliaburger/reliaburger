@@ -37,6 +37,7 @@ pub enum DataUpdate {
     EventsSeed(Result<Vec<ClusterEvent>, ProviderError>),
     DeployHistory {
         app: String,
+        namespace: String,
         result: Result<Vec<serde_json::Value>, ProviderError>,
     },
     AppMetrics(Result<MetricsQueryResult, ProviderError>),

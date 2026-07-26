@@ -53,6 +53,14 @@ pub struct PickleState {
     /// token store + service token — the same material the agent API uses.
     /// `None` disables the auth gate (single-node/tests): writes are open.
     pub auth: Option<AuthState>,
+    /// Whether registry *reads* also need a principal (O1).
+    ///
+    /// False on the loopback default, where an open read is the point: a
+    /// local `docker pull` and the node's own fetches shouldn't need a token.
+    /// True once the registry is published on a routable address, where an
+    /// open read hands every image in the cluster — including `cache/` copies
+    /// of credentialed private upstreams — to anyone who can reach the port.
+    pub require_read_auth: bool,
     /// Storage quotas (REG4). Default is unlimited.
     pub quota: QuotaConfig,
     /// Chunked upload-session tracking for TTL expiry (REG8).
@@ -88,6 +96,26 @@ impl PickleState {
                 StatusCode::FORBIDDEN,
                 "DENIED",
                 "insufficient permissions to push to the registry".to_string(),
+            )),
+        }
+    }
+
+    /// Authorise a registry read (O1). A no-op unless the registry is bound
+    /// somewhere a stranger could reach it.
+    async fn authorise_read(&self, headers: &HeaderMap) -> Result<(), Response> {
+        if !self.require_read_auth {
+            return Ok(());
+        }
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        let bearer = Self::bearer(headers);
+        match super::registry_auth::authorise_read(auth, bearer.as_deref()).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(oci_error(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "registry read requires authentication on a non-loopback bind".to_string(),
             )),
         }
     }
@@ -336,6 +364,14 @@ async fn dispatch_v2(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    // O1: writes authorise per handler (they have different role bars and
+    // quota checks); reads are uniform, so one gate covers every GET/HEAD.
+    if matches!(method, Method::GET | Method::HEAD)
+        && let Err(response) = state.authorise_read(&headers).await
+    {
+        return response;
+    }
+
     match (method, route) {
         (Method::HEAD, V2Route::Blob { name, digest }) => blob_head(&state, &name, &digest).await,
         (Method::GET, V2Route::Blob { name, digest }) => blob_get(&state, &name, &digest).await,
@@ -371,8 +407,13 @@ async fn dispatch_v2(
 // ---------------------------------------------------------------------------
 
 /// `GET /v2/` — OCI version check. Returns 200 OK.
-async fn v2_check() -> impl IntoResponse {
-    Json(serde_json::json!({}))
+async fn v2_check(State(state): State<PickleState>, headers: HeaderMap) -> Response {
+    // The OCI version probe is how a client discovers whether it needs
+    // credentials, so it answers 401 like every other read when it must.
+    if let Err(response) = state.authorise_read(&headers).await {
+        return response;
+    }
+    Json(serde_json::json!({})).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1128,7 @@ mod tests {
             council: None,
             persist_path: None,
             auth: None,
+            require_read_auth: false,
             quota: QuotaConfig::default(),
             sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
         };
@@ -1095,6 +1137,91 @@ mod tests {
 
     fn test_router(state: PickleState) -> Router {
         router(state)
+    }
+
+    /// A state whose registry is published on a routable address and holds
+    /// one ReadOnly token, so the O1 read gate is live.
+    async fn read_gated_state() -> (PickleState, tempfile::TempDir, String) {
+        let (mut state, dir) = test_state();
+        let created = crate::sesame::token::create_token(
+            "puller",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = crate::sesame::auth::new_token_store();
+        tokens.write().await.push(created.token);
+        state.auth = Some(crate::sesame::auth::AuthState::new(tokens, None));
+        state.require_read_auth = true;
+        (state, dir, created.plaintext)
+    }
+
+    /// O1: on a routable bind, an anonymous client could enumerate and pull
+    /// every image in the cluster — including `cache/` copies of private
+    /// upstreams pulled with the operator's credentials.
+    #[tokio::test]
+    async fn anonymous_reads_are_refused_on_a_routable_bind() {
+        let (state, _dir, _token) = read_gated_state().await;
+        let app = test_router(state);
+
+        for uri in ["/v2/", "/v2/team/app/tags/list"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} served an anonymous client on a routable bind"
+            );
+        }
+    }
+
+    /// Pulling is exactly what a ReadOnly token is for, so the bar for reads
+    /// is any valid token — not the Deployer that writes require.
+    #[tokio::test]
+    async fn a_readonly_token_may_still_pull() {
+        let (state, _dir, token) = read_gated_state().await;
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The loopback default is unchanged: a local pull needs no token, which
+    /// is the whole point of binding to loopback.
+    #[tokio::test]
+    async fn loopback_reads_stay_open() {
+        let (mut state, _dir, _token) = read_gated_state().await;
+        state.require_read_auth = false;
+        let app = test_router(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v2/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     async fn body_bytes(response: Response) -> Vec<u8> {
@@ -1764,6 +1891,7 @@ mod tests {
             council: None,
             persist_path: None,
             auth: None,
+            require_read_auth: false,
             quota: QuotaConfig {
                 per_repository_bytes: 4,
                 total_bytes: 0,
@@ -1807,6 +1935,7 @@ mod tests {
             council: None,
             persist_path: None,
             auth: None,
+            require_read_auth: false,
             quota: QuotaConfig {
                 per_repository_bytes: 4,
                 total_bytes: 0,
@@ -1877,6 +2006,7 @@ mod tests {
             council: None,
             persist_path: None,
             auth: None,
+            require_read_auth: false,
             quota: QuotaConfig::default(),
             // A zero TTL: any session is immediately expired on the next
             // chunk, which is exactly what we want to assert.

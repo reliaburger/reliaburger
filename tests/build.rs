@@ -117,6 +117,7 @@ impl Harness {
             } else {
                 options.registry_port
             },
+            "http",
             256 * 1024 * 1024,
             options.require_signatures,
         );
@@ -290,6 +291,7 @@ async fn start_registry_with_council(
         council,
         persist_path: None,
         auth: None,
+        require_read_auth: false,
         quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
@@ -321,7 +323,7 @@ async fn upload_trivial_context(registry_port: u16) -> String {
     .unwrap();
     let tar_bytes = reliaburger::pickle::build::tar_context(context_dir.path()).unwrap();
     let digest = reliaburger::pickle::build::digest_of(&tar_bytes);
-    let upload_url = reliaburger::pickle::build::context_upload_url(registry_port, &digest);
+    let upload_url = reliaburger::pickle::build::context_upload_url("http", registry_port, &digest);
     let response = reqwest::Client::new()
         .post(&upload_url)
         .body(tar_bytes)
@@ -539,6 +541,7 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
     let client = reqwest::Client::new();
     reliaburger::bun::build_runner::transfer_context_to_builder(
         &client,
+        "http",
         entry_port,
         &format!("127.0.0.1:{builder_port}"),
         &digest,
@@ -548,13 +551,14 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
     .expect("transfer should succeed");
 
     // The builder registry now serves the blob.
-    let url = reliaburger::pickle::build::context_download_url(builder_port, &digest);
+    let url = reliaburger::pickle::build::context_download_url("http", builder_port, &digest);
     let response = reqwest::get(&url).await.unwrap();
     assert_eq!(response.status().as_u16(), 200, "blob missing on builder");
 
     // Transferring again is an idempotent no-op (HEAD short-circuit).
     reliaburger::bun::build_runner::transfer_context_to_builder(
         &client,
+        "http",
         entry_port,
         &format!("127.0.0.1:{builder_port}"),
         &digest,
@@ -567,6 +571,7 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
     let missing = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     let err = reliaburger::bun::build_runner::transfer_context_to_builder(
         &client,
+        "http",
         entry_port,
         &format!("127.0.0.1:{builder_port}"),
         missing,

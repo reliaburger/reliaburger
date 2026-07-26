@@ -56,18 +56,51 @@ pub fn remove_disk_io_throttle(
 /// `"{quota_us} {period_us}"`; we keep the period fixed and vary the quota.
 const CPU_PERIOD_US: u64 = 100_000;
 
-/// Compute the `cpu.max` quota string that leaves a workload only
-/// `100 - percentage` of one core.
+/// How many cores a workload is entitled to today, given its current
+/// `cpu.max` and the host's core count (O17).
+///
+/// A `cpu.max` of `"max 100000"` means unlimited, so the baseline is every
+/// core on the box. A quota of `"200000 100000"` means two cores. Anything
+/// unparseable falls back to one core — the conservative reading, since
+/// over-estimating the baseline would make a stress fault weaker than asked
+/// for, and a chaos experiment that quietly does less than it claims is
+/// worse than one that does slightly more.
+pub fn baseline_cores(current_cpu_max: &str, host_cores: u32) -> u32 {
+    let mut parts = current_cpu_max.split_whitespace();
+    let (Some(quota), Some(period)) = (parts.next(), parts.next()) else {
+        return 1;
+    };
+    if quota == "max" {
+        return host_cores.max(1);
+    }
+    match (quota.parse::<u64>(), period.parse::<u64>()) {
+        (Ok(quota), Ok(period)) if period > 0 => ((quota / period) as u32).max(1),
+        _ => 1,
+    }
+}
+
+/// Compute the `cpu.max` quota string that leaves a workload
+/// `100 - percentage` of the CPU it is entitled to.
 ///
 /// A CPU-stress fault steals CPU by *capping* the target's quota rather than
-/// burning cycles in Bun's own cgroup. At 80% stress the workload keeps 20%
-/// of a core: `quota_us = (100 - 80) * period / 100 = 20000`. A percentage of
-/// 100 is clamped to a 1% floor so the process never wedges completely (that
-/// would be a Kill, not a stress). The returned string is written verbatim to
-/// the target cgroup's `cpu.max`.
-pub fn cpu_stress_quota(percentage: u8) -> String {
+/// burning cycles in Bun's own cgroup. At 80% stress across two cores the
+/// workload keeps 20% of two cores: `(100 - 80) * 2 * period / 100 = 40000`.
+///
+/// `cores` is the fault's `--cores`, which used to be accepted and silently
+/// ignored while the maths assumed exactly one core (O17). On a 4-core node
+/// that turned "80% stress" into "you now have 20% of one core" — a 95% cut,
+/// not an 80% one. `None` means "as many cores as the workload has", which
+/// the caller supplies via [`baseline_cores`].
+///
+/// A percentage of 100 is clamped to a 1% floor so the process never wedges
+/// completely (that would be a Kill, not a stress). The returned string is
+/// written verbatim to the target cgroup's `cpu.max`.
+pub fn cpu_stress_quota(percentage: u8, cores: u32) -> String {
     let remaining = 100u64.saturating_sub(percentage as u64).max(1);
-    let quota_us = remaining * CPU_PERIOD_US / 100;
+    let quota_us = remaining
+        .saturating_mul(CPU_PERIOD_US)
+        .saturating_mul(cores.max(1) as u64)
+        / 100;
     format!("{quota_us} {CPU_PERIOD_US}")
 }
 
@@ -85,10 +118,30 @@ pub fn read_cpu_max(cgroup_path: &Path) -> Result<String, ResourceFaultError> {
 }
 
 /// Apply a CPU-stress fault by capping the target cgroup's `cpu.max` quota.
+///
+/// `cores` is the fault's `--cores`; `None` stresses every core the workload
+/// currently has, read from its own `cpu.max` (O17).
 #[cfg(target_os = "linux")]
-pub fn apply_cpu_stress(cgroup_path: &Path, percentage: u8) -> Result<(), ResourceFaultError> {
+pub fn apply_cpu_stress(
+    cgroup_path: &Path,
+    percentage: u8,
+    cores: Option<u32>,
+) -> Result<(), ResourceFaultError> {
+    let cores = match cores {
+        Some(cores) => cores,
+        None => {
+            let current = read_cpu_max(cgroup_path)?;
+            let host = std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1);
+            baseline_cores(&current, host)
+        }
+    };
     let cpu_max_path = cgroup_path.join("cpu.max");
-    std::fs::write(&cpu_max_path, cpu_stress_quota(percentage).as_bytes())?;
+    std::fs::write(
+        &cpu_max_path,
+        cpu_stress_quota(percentage, cores).as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -225,7 +278,11 @@ pub fn read_cpu_max(_cgroup_path: &Path) -> Result<String, ResourceFaultError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_cpu_stress(_cgroup_path: &Path, _percentage: u8) -> Result<(), ResourceFaultError> {
+pub fn apply_cpu_stress(
+    _cgroup_path: &Path,
+    _percentage: u8,
+    _cores: Option<u32>,
+) -> Result<(), ResourceFaultError> {
     Err(ResourceFaultError::UnsupportedPlatform)
 }
 
@@ -271,12 +328,12 @@ mod tests {
     #[test]
     fn cpu_stress_80_percent_leaves_a_fifth_of_a_core() {
         // 80% stolen -> 20% of one 100ms period remains -> 20000us quota.
-        assert_eq!(cpu_stress_quota(80), "20000 100000");
+        assert_eq!(cpu_stress_quota(80, 1), "20000 100000");
     }
 
     #[test]
     fn cpu_stress_50_percent_leaves_half_a_core() {
-        assert_eq!(cpu_stress_quota(50), "50000 100000");
+        assert_eq!(cpu_stress_quota(50, 1), "50000 100000");
     }
 
     #[test]
@@ -284,12 +341,41 @@ mod tests {
         // A full 100% would wedge the process; we keep a 1% floor so the
         // workload can still make (very slow) progress — that's a stress,
         // not a Kill.
-        assert_eq!(cpu_stress_quota(100), "1000 100000");
+        assert_eq!(cpu_stress_quota(100, 1), "1000 100000");
     }
 
     #[test]
     fn cpu_stress_zero_percent_leaves_a_full_core() {
-        assert_eq!(cpu_stress_quota(0), "100000 100000");
+        assert_eq!(cpu_stress_quota(0, 1), "100000 100000");
+    }
+
+    /// O17: `--cores` was parsed and ignored while the maths assumed one
+    /// core, so on a 4-core node "80% stress" actually took 95% of the
+    /// workload's CPU.
+    #[test]
+    fn cpu_stress_scales_with_the_cores_it_is_told_to_stress() {
+        // 80% across 2 cores: 20% of 2 cores remains = 40000us.
+        assert_eq!(cpu_stress_quota(80, 2), "40000 100000");
+        // …and across 4: 20% of 4 cores = 80000us, not 20000.
+        assert_eq!(cpu_stress_quota(80, 4), "80000 100000");
+        // Zero cores is nonsense; treat it as one rather than divide by it.
+        assert_eq!(cpu_stress_quota(80, 0), "20000 100000");
+    }
+
+    #[test]
+    fn baseline_cores_reads_the_workloads_current_entitlement() {
+        // Unlimited: every core on the box.
+        assert_eq!(baseline_cores("max 100000", 8), 8);
+        // A two-core quota.
+        assert_eq!(baseline_cores("200000 100000", 8), 2);
+        // Sub-core quotas still count as one — you can't stress less than a
+        // core's worth of scheduling.
+        assert_eq!(baseline_cores("50000 100000", 8), 1);
+        // Garbage falls back to one: under-reading the baseline makes the
+        // fault weaker than asked, which is the wrong way to be wrong.
+        assert_eq!(baseline_cores("", 8), 1);
+        assert_eq!(baseline_cores("not a quota", 8), 1);
+        assert_eq!(baseline_cores("100000 0", 8), 1);
     }
 
     // -- Linux cgroup effect + reversal (gated) -------------------------------
@@ -317,7 +403,7 @@ mod tests {
         let saved = read_cpu_max(&dir).unwrap();
         assert_eq!(saved, "max 100000");
 
-        apply_cpu_stress(&dir, 80).unwrap();
+        apply_cpu_stress(&dir, 80, Some(1)).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("cpu.max")).unwrap().trim(),
             "20000 100000"

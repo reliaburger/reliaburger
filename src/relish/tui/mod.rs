@@ -123,13 +123,17 @@ async fn event_loop<P: DataProvider, B: Backend>(
                         previous.cancel();
                     }
                 }
-                Effect::FetchDeployHistory { app } => {
+                Effect::FetchDeployHistory { app, namespace } => {
                     let provider = Arc::clone(&provider);
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let result = provider.deploy_history(&app).await;
+                        let result = provider.deploy_history(&app, &namespace).await;
                         let _ = tx
-                            .send(Msg::Data(DataUpdate::DeployHistory { app, result }))
+                            .send(Msg::Data(DataUpdate::DeployHistory {
+                                app,
+                                namespace,
+                                result,
+                            }))
                             .await;
                     });
                 }

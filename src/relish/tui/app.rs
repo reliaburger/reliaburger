@@ -47,9 +47,15 @@ impl TuiApp {
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },
-            DataUpdate::DeployHistory { app, result } => match result {
+            DataUpdate::DeployHistory {
+                app,
+                namespace,
+                result,
+            } => match result {
                 Ok(value) => {
-                    self.data.deploy_history.insert(app, value);
+                    self.data
+                        .deploy_history
+                        .insert(super::state::deploy_history_key(&app, &namespace), value);
                     self.mark_connected();
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),

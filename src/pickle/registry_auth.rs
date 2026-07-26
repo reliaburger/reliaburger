@@ -164,6 +164,42 @@ pub async fn authorise_write(auth: &AuthState, bearer: Option<&str>) -> Result<(
     }
 }
 
+/// Whether a registry *read* is authorised (O1).
+///
+/// Reads were open unconditionally, which is right for the loopback default
+/// — a local `docker pull` and the node's own image fetches shouldn't need a
+/// token — but wrong once the registry is published on a routable address.
+/// There, any client that can route a packet could enumerate and pull every
+/// image in the cluster, including the `cache/` copies of private upstream
+/// registries pulled with the operator's credentials.
+///
+/// The caller decides whether reads need a principal (see
+/// `PickleState::require_read_auth`); this function answers *who counts* when
+/// they do. The bar is deliberately lower than for writes: any valid token,
+/// no minimum role, because pulling is what read-only tokens are for.
+pub async fn authorise_read(auth: &AuthState, bearer: Option<&str>) -> Result<(), WriteDenied> {
+    if let (Some(bearer), Some(service)) = (bearer, auth.service_token.as_deref())
+        && crate::sesame::auth::tokens_equal(bearer, service)
+    {
+        return Ok(());
+    }
+
+    let tokens = { auth.tokens.read().await.clone() };
+    // Bootstrap window, as for writes: no tokens minted yet, nothing to
+    // check against. `bun` refuses a non-loopback bind in that state anyway.
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    let Some(bearer) = bearer else {
+        return Err(WriteDenied::Unauthenticated);
+    };
+    match crate::sesame::auth::authenticate(bearer, &tokens) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(WriteDenied::Unauthenticated),
+    }
+}
+
 /// Why a write was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteDenied {

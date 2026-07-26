@@ -525,6 +525,17 @@ The connect rewrite — the part that actually matters for latency — is still 
 
 The responder answers `.internal` over both UDP and TCP. A resolver retries over TCP when a UDP reply comes back truncated (the TC bit set), so a UDP-only responder would leave that retry hanging with nobody home. Our answers are small — a single A record with a 4-byte VIP — so truncation is rare, but "rare" isn't "never," and a half-bound responder is a subtle way to lose DNS for one query in a thousand. TCP frames each message with a 2-byte length prefix; the listener reads the length, reads that many bytes, answers, and closes.
 
+The forwarding side had a hardcoded assumption that took a while to surface, because it only bites on networks we don't run on:
+
+```rust
+let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+socket.connect(upstream).await.ok()?;
+```
+
+`0.0.0.0` is the IPv4 wildcard. Point `upstream` at an IPv6 resolver and `connect` fails, `ok()?` turns that into `None`, and the caller sends SERVFAIL — so on a v6-only network *every* non-`.internal` query fails. And it fails in the least helpful way possible: "DNS is broken" rather than "your upstream is v6 and I only speak v4". The socket now binds the family the upstream actually uses.
+
+There's a general shape here. `0.0.0.0` and `127.0.0.1` are so familiar they stop reading as *choices* — they look like "the network" and "here" rather than "IPv4, specifically". Whenever a literal address is baked into code, it's worth asking what happens when someone's world is v6, because the answer is usually "nothing works and the error blames the wrong component".
+
 Not everyone gets to ask, though. The `.internal` zone is a map of the cluster's internal topology, and the responder also forwards ordinary public names. Neither service should be exposed as an open resolver. Every query is gated by a source ACL: loopback and the private ranges containers live in (RFC 1918, plus the `100.64.0.0/10` CGNAT block Lima and runc bridges hand out) are served; a query from a public address gets REFUSED — not answered, not forwarded, refused. The check is a small method on the config:
 
 ```rust

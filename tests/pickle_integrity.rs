@@ -39,6 +39,7 @@ impl Registry {
             council: None,
             persist_path: None,
             auth: None,
+            require_read_auth: false,
             quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
             sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
                 reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
@@ -439,6 +440,7 @@ async fn start_authenticated_registry(deployer_plaintext: &mut String) -> Regist
         council: None,
         persist_path: None,
         auth: Some(auth),
+        require_read_auth: false,
         quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
@@ -608,6 +610,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
         council: Some(council.clone()),
         persist_path: None,
         auth: None,
+        require_read_auth: false,
         quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,

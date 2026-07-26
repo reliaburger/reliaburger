@@ -7,12 +7,17 @@
 //! review. This module lifts those decisions into one table so they can
 //! be *audited in one place*.
 //!
-//! The table does **not** replace the per-handler checks yet (scope
-//! enforcement is a later theme), and it does **not** add new
-//! authorisation. It records the principal each mounted route requires
-//! today, and a test proves every route the router mounts appears here.
-//! A new route with no matrix entry fails that test, so the matrix can
-//! never silently fall behind the router.
+//! The table does **not** replace the per-handler checks, and it does
+//! **not** add new authorisation. It records the principal each mounted
+//! route requires today, and a test proves every route the router mounts
+//! appears here. A new route with no matrix entry fails that test, so the
+//! matrix can never silently fall behind the router.
+//!
+//! The *role* a route needs is only half the question; the other half is
+//! **which apps** the caller's token may touch. That half lived in the
+//! handlers by convention until C3 found every per-app read ignoring it,
+//! so it is now a test too: see `every_per_app_route_checks_the_callers_scope`
+//! below. A route pattern naming `{app}` must call `authorize_scoped`.
 
 use crate::sesame::types::ApiRole;
 
@@ -137,8 +142,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/chaos/partition", Deployer),
     route(Post, "/v1/chaos/heal", Deployer),
     route(Get, "/v1/chaos/status", AnyToken),
-    // Snapshots. Reads are open to any caller; mutations need a Deployer
-    // (plus the token's app/namespace scope), enforced in the handlers.
+    // Snapshots. Reads need any token, mutations a Deployer; both are
+    // additionally held to the token's app/namespace scope in the handlers.
     route(Get, "/v1/snapshots/{namespace}/{app}", AnyToken),
     route(Post, "/v1/snapshots/{namespace}/{app}", Deployer),
     route(Post, "/v1/snapshots/{namespace}/{app}/restore", Deployer),
@@ -265,6 +270,107 @@ mod tests {
             paths.push(rest[..close].to_string());
         }
         paths
+    }
+
+    /// Pair each mounted route path with the handler idents it dispatches
+    /// to, by reading the `get(...)`/`post(...)`/`delete(...)` calls in the
+    /// same `.route(...)` fragment.
+    fn mounted_route_handlers(source: &str) -> Vec<(String, Vec<String>)> {
+        let mut routes = Vec::new();
+        for fragment in source.split(".route(").skip(1) {
+            let Some(open) = fragment.find('"') else {
+                continue;
+            };
+            let rest = &fragment[open + 1..];
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            let path = rest[..close].to_string();
+            // The fragment runs to the next `.route(`, so everything after
+            // the path belongs to this route's method handlers. Only
+            // `*_handler` idents count, so an unrelated `.get(` on a map in
+            // the same fragment isn't mistaken for a route handler.
+            let args = &rest[close..];
+            let mut handlers = Vec::new();
+            for pattern in ["get(", "post(", "delete("] {
+                for (index, _) in args.match_indices(pattern) {
+                    let ident: String = args[index + pattern.len()..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if ident.ends_with("_handler") {
+                        handlers.push(ident);
+                    }
+                }
+            }
+            routes.push((path, handlers));
+        }
+        routes
+    }
+
+    /// The body of `async fn {ident}`, from its signature to the closing
+    /// brace at column zero.
+    fn handler_body<'a>(source: &'a str, ident: &str) -> Option<&'a str> {
+        let start = source.find(&format!("async fn {ident}("))?;
+        let rest = &source[start..];
+        let end = rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    /// Any route whose path names an app must check the caller's *scope*,
+    /// not just its role.
+    ///
+    /// This is the C3 guard. Role checks were universal from the start;
+    /// scope checks were on mutations only, so every per-app read handed a
+    /// scoped token another tenant's data. Enforcing it by convention is
+    /// exactly what failed, so the rule is a test: name an app in a route
+    /// pattern and your handler must call `authorize_scoped`.
+    #[test]
+    fn every_per_app_route_checks_the_callers_scope() {
+        let sources = [
+            include_str!("api.rs"),
+            include_str!("batch.rs"),
+            include_str!("build_runner.rs"),
+        ];
+        let mut unscoped = Vec::new();
+        let mut checked = 0;
+        for source in sources {
+            for (path, handlers) in mounted_route_handlers(source) {
+                if !path.contains("{app}") {
+                    continue;
+                }
+                for handler in handlers {
+                    let Some(body) = handler_body(source, &handler) else {
+                        panic!("route {path} dispatches to {handler}, which we cannot find");
+                    };
+                    checked += 1;
+                    if !body.contains("authorize_scoped") {
+                        unscoped.push(format!("{path} → {handler}"));
+                    }
+                }
+            }
+        }
+        // Guard against the scan silently matching nothing and "passing".
+        assert!(
+            checked >= 10,
+            "only found {checked} per-app handlers — the source scan is broken, not the code"
+        );
+        assert!(
+            unscoped.is_empty(),
+            "per-app routes that never check the token's scope (C3): {unscoped:?}"
+        );
+    }
+
+    /// `/v1/logs/sql` reads across every tenant and takes no app to scope
+    /// against, so it must refuse a scoped token outright.
+    #[test]
+    fn cluster_wide_log_sql_refuses_scoped_tokens() {
+        let source = include_str!("api.rs");
+        let body = handler_body(source, "logs_sql_handler").expect("logs_sql_handler");
+        assert!(
+            body.contains("require_unscoped"),
+            "/v1/logs/sql must refuse scoped tokens — it cannot filter arbitrary SQL by tenant"
+        );
     }
 
     /// Every route the router mounts must be present in the matrix. This

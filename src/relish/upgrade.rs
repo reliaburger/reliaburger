@@ -137,7 +137,7 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
                 .registry
                 .clone()
                 .unwrap_or_else(|| default_registry_for(client.base_url()));
-            push_blob(&registry, &bytes, &binary_sha256).await?;
+            push_blob(client, &registry, &bytes, &binary_sha256).await?;
 
             let nodes = client.nodes().await?;
             let overrides = parse_overrides(&args.node_addresses)?;
@@ -480,12 +480,23 @@ pub(crate) async fn download(url: &str) -> Result<Vec<u8>, RelishError> {
 }
 
 /// Push the binary as a content-addressed blob (monolithic upload).
-async fn push_blob(registry: &str, bytes: &[u8], sha256: &str) -> Result<(), RelishError> {
+/// `client` supplies both the scheme and a CA-trusting, bearer-carrying HTTP
+/// client (O3): the registry gains TLS with the agent API, and a registry
+/// published on a routable address now wants a token for writes as well as
+/// reads. A bare `reqwest::Client` on a hardcoded `http://` failed both tests.
+async fn push_blob(
+    client: &BunClient,
+    registry: &str,
+    bytes: &[u8],
+    sha256: &str,
+) -> Result<(), RelishError> {
     let url = format!(
-        "http://{registry}/v2/{}/blobs/uploads/?digest=sha256:{sha256}",
+        "{}://{registry}/v2/{}/blobs/uploads/?digest=sha256:{sha256}",
+        client.scheme(),
         crate::upgrade::BINARY_BLOB_REPO
     );
-    let response = reqwest::Client::new()
+    let response = client
+        .http()
         .post(&url)
         .body(bytes.to_vec())
         .send()
