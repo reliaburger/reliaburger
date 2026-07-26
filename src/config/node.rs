@@ -314,6 +314,14 @@ pub struct ClusterSection {
     pub raft_port: u16,
     /// Port for reporting tree state reports.
     pub reporting_port: u16,
+    /// Free-form environment tag, e.g. `"production"`, `"staging"`.
+    ///
+    /// Reported at `/v1/capabilities` and used as a safety interlock: the
+    /// chaos suite refuses to run against a cluster tagged `production`
+    /// unless explicitly overridden. Untagged clusters are assumed
+    /// non-production, because requiring a tag to *avoid* chaos would fail
+    /// in the wrong direction on a cluster nobody remembered to label.
+    pub environment: Option<String>,
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2
     /// D21/CP12). Off by default; set `url` to enable.
     pub backup: crate::council::backup::BackupConfig,
@@ -326,6 +334,7 @@ impl Default for ClusterSection {
             gossip_port: 9443,
             raft_port: 9444,
             reporting_port: 9445,
+            environment: None,
             backup: crate::council::backup::BackupConfig::default(),
         }
     }

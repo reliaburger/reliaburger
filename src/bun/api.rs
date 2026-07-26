@@ -122,6 +122,10 @@ pub struct ApiState {
     /// TLS identity, so build-context transfers address the registry the
     /// way it really listens instead of assuming plaintext.
     pub registry_scheme: &'static str,
+    /// Capability facts only the startup path knows (config, what actually
+    /// loaded). The rest of `/v1/capabilities` is derived from the `Option`
+    /// fields above — see `bun::capabilities`.
+    pub static_capabilities: Arc<crate::bun::capabilities::StaticCapabilities>,
     /// `[images] max_context_bytes` — hard cap on an extracted build
     /// context (JOB6).
     pub max_context_bytes: u64,
@@ -188,6 +192,7 @@ pub fn router(
         "http",
         256 * 1024 * 1024,
         false,
+        crate::bun::capabilities::StaticCapabilities::default(),
     )
 }
 
@@ -222,6 +227,7 @@ pub fn router_with_upgrade(
     registry_scheme: &'static str,
     max_context_bytes: u64,
     require_signatures: bool,
+    static_capabilities: crate::bun::capabilities::StaticCapabilities,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -252,6 +258,7 @@ pub fn router_with_upgrade(
         build_timeout_secs,
         registry_port,
         registry_scheme,
+        static_capabilities: Arc::new(static_capabilities),
         max_context_bytes,
         require_signatures,
         batch_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -325,6 +332,7 @@ pub fn router_with_upgrade(
             get(logs_cross_node_handler),
         )
         .route("/v1/exec/{app}/{namespace}", post(exec_handler))
+        .route("/v1/capabilities", get(capabilities_handler))
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
         .route("/v1/upgrade/apply", post(upgrade_apply_handler))
@@ -421,6 +429,31 @@ async fn health_handler() -> impl IntoResponse {
 /// The upgrade orchestrator polls this to decide whether a node has
 /// reached its target version, so it must answer even when the agent
 /// loop is busy — hence direct manager access, not an AgentCommand.
+/// `GET /v1/capabilities` — what this node has wired up.
+///
+/// The `Option` fields on `ApiState` are the source of truth for the
+/// subsystems: a `None` there means the subsystem was never built, which is
+/// exactly what a caller needs to distinguish from "built but failing".
+async fn capabilities_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let wired = crate::bun::capabilities::WiredSubsystems {
+        metrics: state.mayo.is_some(),
+        logs: state.log_store.is_some(),
+        rollups: state.rollup_store.is_some(),
+        council: state.council.is_some(),
+        registry: state.pickle_catalog.is_some(),
+        events: state.events.is_some(),
+        upgrade: state.upgrade.is_some(),
+        member_count: match &state.membership {
+            Some(members) => Some(members.read().await.len() as u32),
+            None => None,
+        },
+    };
+    Json(crate::bun::capabilities::ClusterCapabilities::derive(
+        &state.static_capabilities,
+        &wired,
+    ))
+}
+
 async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
     match &state.upgrade {
         Some(manager) => Json(serde_json::json!({
@@ -4938,6 +4971,122 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
+    /// Router whose `ApiState` reports the given static capabilities, so the
+    /// endpoint can be driven without a live cluster.
+    async fn setup_with_capabilities(
+        statics: crate::bun::capabilities::StaticCapabilities,
+        mayo: bool,
+    ) -> (Router, CancellationToken, tempfile::TempDir) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        // A real store, because the point is that `Some(..)` on `ApiState`
+        // is what the endpoint reads — not a flag we could fake.
+        let mayo_dir = tempfile::tempdir().unwrap();
+        let mayo_store = if mayo {
+            Some(Arc::new(RwLock::new(MayoStore::new(
+                mayo_dir.path().to_path_buf(),
+            ))))
+        } else {
+            None
+        };
+        let app = router_with_upgrade(
+            cmd_tx,
+            mayo_store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+            None,
+            None,
+            None,
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            statics,
+        );
+        (app, shutdown, mayo_dir)
+    }
+
+    /// The endpoint must read the *live* `ApiState`, not a snapshot taken at
+    /// construction: a subsystem that was never built shows as `false`, and
+    /// that is what tells a caller "skipped" rather than "broken".
+    #[tokio::test]
+    async fn capabilities_reports_wired_subsystems() {
+        let (app, shutdown, _mayo_dir) = setup_with_capabilities(
+            crate::bun::capabilities::StaticCapabilities {
+                container_runtime: "process".to_string(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let body = get_body(app, "/v1/capabilities").await;
+        let capabilities: crate::bun::capabilities::ClusterCapabilities =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+
+        assert!(capabilities.metrics, "mayo was wired: {body}");
+        assert!(!capabilities.council, "no council was wired: {body}");
+        assert!(!capabilities.registry);
+        assert_eq!(capabilities.container_runtime, "process");
+        assert!(!capabilities.version.is_empty());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_the_environment_tag() {
+        let (app, shutdown, _mayo_dir) = setup_with_capabilities(
+            crate::bun::capabilities::StaticCapabilities {
+                environment: Some("production".to_string()),
+                container_runtime: "runc".to_string(),
+                ..Default::default()
+            },
+            false,
+        )
+        .await;
+        let body = get_body(app, "/v1/capabilities").await;
+        let capabilities: crate::bun::capabilities::ClusterCapabilities =
+            serde_json::from_str(&body).unwrap();
+        assert_eq!(capabilities.environment.as_deref(), Some("production"));
+        assert!(capabilities.is_production());
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn capabilities_default_to_no_environment() {
+        let (app, shutdown, _mayo_dir) = setup_with_capabilities(
+            crate::bun::capabilities::StaticCapabilities::default(),
+            false,
+        )
+        .await;
+        let body = get_body(app, "/v1/capabilities").await;
+        let capabilities: crate::bun::capabilities::ClusterCapabilities =
+            serde_json::from_str(&body).unwrap();
+        assert_eq!(capabilities.environment, None);
+        assert!(!capabilities.is_production());
+        // A standalone node is a cluster of one, and knows it isn't clustered.
+        assert!(!capabilities.cluster);
+        assert_eq!(capabilities.node_count, 1);
+        shutdown.cancel();
+    }
+
     /// Every route that addresses one app used to check the caller's *role*
     /// and stop there, so a legitimately issued token scoped to one namespace
     /// could read every other tenant's logs, env, status and metrics (C3).
@@ -5945,6 +6094,7 @@ mod tests {
             "http",
             256 * 1024 * 1024,
             false,
+            crate::bun::capabilities::StaticCapabilities::default(),
         );
         (app, webhook_rx, shutdown)
     }
@@ -6123,6 +6273,7 @@ mod tests {
             "http",
             256 * 1024 * 1024,
             false,
+            crate::bun::capabilities::StaticCapabilities::default(),
         );
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

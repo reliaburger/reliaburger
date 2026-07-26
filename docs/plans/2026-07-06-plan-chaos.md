@@ -248,6 +248,16 @@ Unchanged from the 6 July plan except where noted. Reproduced here only where th
 
 ### 7.1 `ClusterCapabilities` — `src/bun/capabilities.rs`
 
+> **Deviation recorded during step 1.** The field list below dropped
+> `fault_injection` as a standalone flag and gained `cgroup_faults`, because
+> the Smoker API is always mounted — a bare `fault_injection: true` would
+> have told a caller nothing. It is now *derived*
+> (`cgroup_faults || ebpf || cluster`), i.e. "can any fault take real effect
+> here", with `cgroup_faults` exposed separately for finer gating. Also added
+> `events` and `upgrade` (both `ApiState` `Option`s worth reporting), and
+> `StaticCapabilities` / `WiredSubsystems` split the inputs so the derivation
+> is a pure function that unit-tests without an `ApiState`.
+
 **Renamed** from `Capabilities` to avoid colliding with `NodeCapabilities` (`meat/cluster_state.rs:15`) and `PlatformCapabilities` (`bun/supervisor.rs:74`).
 
 ```rust
@@ -792,7 +802,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 
 ## 10. Step checklist
 
-- [ ] 1/20 capabilities endpoint + `[cluster] environment`
+- [x] 1/20 capabilities endpoint + `[cluster] environment`
 - [ ] 2/20 testapp routes + alloc mode + `bun testapp`
 - [ ] 3/20 promote `TestHarness`
 - [ ] 4/20 testkit core types

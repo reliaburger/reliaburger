@@ -8,6 +8,7 @@ pub mod api;
 pub mod authz;
 pub mod batch;
 pub mod build_runner;
+pub mod capabilities;
 pub mod disk_pressure;
 pub mod events;
 pub mod gpu;

@@ -504,6 +504,15 @@ async fn main() -> anyhow::Result<()> {
     // both sockets before starting the agent, reporting readiness or adopting
     // any surviving workloads.
     let (runtime, bound_dns, dns_capability) = prepare_dns_runtime(runtime, &config.dns).await?;
+    // Remember which runtime we settled on — `/v1/capabilities` reports it,
+    // and several test cases are runtime-specific.
+    let runtime_kind = match &runtime {
+        AnyGrill::Process(_) => "process",
+        #[cfg(target_os = "linux")]
+        AnyGrill::Runc(_) => "runc",
+        #[cfg(target_os = "macos")]
+        AnyGrill::Apple(_) => "apple",
+    };
     // Image-store handle for installing the cluster P2P image source
     // once the registry and catalog exist — the runtime is selected
     // long before them, so the source is injected late via a OnceLock
@@ -722,6 +731,13 @@ async fn main() -> anyhow::Result<()> {
     // A load failure is logged and the node continues without kernel
     // enforcement rather than refusing to start.
     agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
+    // Observed, not configured: `enabled = true` with a failed load means no
+    // enforcement, and a capability report must say so.
+    // `mut` only matters on an `ebpf` build — the assignment below lives
+    // inside a `#[cfg(feature = "ebpf")]` block, so a default build never
+    // writes to it and would warn.
+    #[cfg_attr(not(feature = "ebpf"), allow(unused_mut))]
+    let mut ebpf_loaded = false;
     if config.ebpf.enabled {
         match config.ebpf.resolve_program_dir() {
             Some(program_dir) => {
@@ -736,6 +752,7 @@ async fn main() -> anyhow::Result<()> {
                             program_dir.display(),
                             ebpf.is_attached()
                         );
+                        ebpf_loaded = ebpf.is_attached();
                         agent
                             .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
                             .await;
@@ -1387,6 +1404,42 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // What this node can actually do, for `/v1/capabilities` (Phase 15).
+    // Everything here is observed at startup rather than assumed: a
+    // capability report that overstates is worse than none, because it turns
+    // "this cluster can't" into "this test mysteriously fails".
+    let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+        environment: config.cluster.environment.clone(),
+        container_runtime: runtime_kind.to_string(),
+        // Whether the programs actually loaded and attached, not merely
+        // whether the operator asked for them.
+        ebpf: ebpf_loaded,
+        ingress: config.ingress.enabled,
+        // The perimeter firewall is Linux-only and disabled in rootless
+        // mode, matching `BunAgent`'s own `perimeter_config` decision.
+        firewall: {
+            #[cfg(target_os = "linux")]
+            {
+                !reliaburger::grill::rootless::is_rootless()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        },
+        // Identity work dead-ends without a wrapping IKM to unwrap CA keys
+        // with, so that — not config — is the real signal.
+        identity: api_council
+            .as_ref()
+            .and_then(|council| council.wrapping_ikm())
+            .is_some(),
+        // Host execution is deny-by-default: an empty allowlist refuses
+        // every process workload.
+        process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
+        // CPU/memory/disk faults write cgroup v2 files.
+        cgroup_faults: cfg!(target_os = "linux"),
+    };
+
     let app = api::router_with_upgrade(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
@@ -1415,6 +1468,7 @@ async fn main() -> anyhow::Result<()> {
         // Signing becomes part of a build's terminal state under a
         // signature-requiring trust policy (12b.2 JOB7).
         config.images.trust_policy.require_signatures,
+        static_capabilities,
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener

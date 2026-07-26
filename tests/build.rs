@@ -120,6 +120,7 @@ impl Harness {
             "http",
             256 * 1024 * 1024,
             options.require_signatures,
+            reliaburger::bun::capabilities::StaticCapabilities::default(),
         );
         let server_shutdown = shutdown.clone();
         let server_task = tokio::spawn(async move {

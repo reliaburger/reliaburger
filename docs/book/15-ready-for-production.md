@@ -327,3 +327,106 @@ quieter way to forget a problem.
 Now a green portable run means something narrow and valuable: the portable behaviour ran,
 without retries, on this machine. The privileged, cluster, upgrade, slow and benchmark jobs
 make their own claims. Smaller claims. Better evidence.
+
+## Asking the cluster what it can do
+
+Everything above is about *our* tests — the ones that run in CI, against code, before it
+ships. The rest of this chapter is about a different animal: tests that run against a
+cluster that's already up, from the outside, as a user.
+
+`relish test` deploys real workloads onto a real cluster and checks they behave. That
+raises a question CI never had to answer. Our CI knows exactly what it built. A running
+cluster is whatever the operator configured — eBPF on or off, ingress bound or not,
+a council or a single node. So what does a test do when the thing it tests isn't there?
+
+There are three states, and they're easy to conflate:
+
+1. The subsystem works.
+2. The subsystem is switched off.
+3. The subsystem is broken.
+
+Guessing from responses collapses all three. A 404 from `/v1/metrics` looks identical
+whether Mayo was never configured or has fallen over. Get that wrong in a test runner and
+you produce the two worst outcomes available: a failure that isn't one (noise, which
+teaches people to ignore red), or a pass that isn't one (a hollow green, which is the very
+thing this chapter opened by complaining about).
+
+So the cluster tells you. `GET /v1/capabilities`:
+
+```json
+{
+  "version": "0.1.0",
+  "environment": "staging",
+  "container_runtime": "runc",
+  "cluster": true,
+  "node_count": 3,
+  "metrics": true,
+  "council": true,
+  "ebpf": false,
+  "ingress": true,
+  ...
+}
+```
+
+A test that needs eBPF sees `"ebpf": false` and reports **skipped, with the reason**,
+which is honest in a way that neither red nor green would be.
+
+### Derived, never asserted
+
+The whole value of this endpoint is that it's true, so not one field is a literal:
+
+```rust
+let wired = WiredSubsystems {
+    metrics: state.mayo.is_some(),
+    logs: state.log_store.is_some(),
+    council: state.council.is_some(),
+    // …
+};
+```
+
+`ApiState` carries `Option<Arc<RwLock<MayoStore>>>` and friends. That `Option` isn't
+defensive coding — it's the wiring itself. A node built without metrics has `None` there,
+and no amount of configuration can make it `Some`. Reporting `is_some()` reports what was
+built. This is a small illustration of something Rust does well: the type already
+encodes "might not exist", so the capability report is a rename of information the
+program was carrying anyway. In a language where everything is nullable, you'd be
+maintaining a separate registry of what's switched on, and it would drift.
+
+Two fields resisted the pattern, and both are worth the detour.
+
+**eBPF** is configured *and* observed. `[ebpf] enabled = true` says the operator wants it;
+whether the programs actually loaded and attached is a different fact, and a node that
+tried and failed logs a warning and carries on without enforcement. So the capability is
+`ebpf.is_attached()` at load time, not the config flag. Reporting intent as achievement is
+exactly the lie this endpoint exists to prevent.
+
+**Fault injection** was going to be `true`, because the Smoker API is always mounted. Then
+it's not information — a caller learns nothing from a field that's always the same. What
+they actually want to know is whether any fault can *do* something, and that varies:
+cgroup faults need Linux, network faults need eBPF, node-level faults need a cluster plane
+to disturb. So:
+
+```rust
+fault_injection: statics.cgroup_faults || statics.ebpf || cluster,
+```
+
+If a field would always be `true`, it isn't a capability. Either derive it from something
+real or delete it.
+
+### A tag that decides whether we're allowed to break things
+
+One field isn't about wiring at all. `[cluster] environment` is a free-form string —
+`"production"`, `"staging"`, whatever you like — and the chaos suite refuses to run
+against a cluster tagged production unless you pass `--override`.
+
+Note which way the default fails. An *untagged* cluster counts as non-production. Requiring
+a tag to avoid chaos would mean the cluster nobody remembered to label is the one that gets
+its leader killed, and "we forgot to set a config field" is a bad reason to have an
+outage. The tag is a brake, not an accelerator, so absent means "no brake requested",
+and the operator who wants the brake is the one who has to say so.
+
+The comparison is case-insensitive, which sounds like a detail and is really a small
+lesson about guards. An operator who writes `environment = "Production"` means precisely
+what one who writes `"production"` means. A guard that only matches one spelling isn't a
+strict guard — it's a broken one, and it fails silently in the direction of *not*
+protecting you.
