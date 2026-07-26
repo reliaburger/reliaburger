@@ -1539,9 +1539,17 @@ work, not by `M1`.
   metric name. Giving each labelled series its own alert state changes that contract (alert
   keying becomes rule+series) and is not attempted here — recorded rather than silently
   skipped
-- [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
-  (local-process-list exposure; the durable Raft leak is fixed). Needs a temp askpass helper
-  with 0700 perms and cleanup, so it rides with the follow-up PR
+- [x] `M27` residual — a `[gitops] repo` of `https://token@…` put the token in `git clone`'s
+  argv, where `/proc/<pid>/cmdline` is world-readable to any local user, and git then wrote the
+  whole URL into the clone's `.git/config` where it outlived the process entirely. `split_credentials`
+  keeps the username in the URL (git needs it; it isn't the secret) and moves the password into
+  the child's environment, read by a `credential.helper` that names the variable rather than
+  containing the value — so nothing secret reaches argv and no temp askpass file needs
+  creating or cleaning up. `fetch` supplies it the same way, since the stored remote is now
+  credential-free. **Regression caught while writing it:** `reused_clone_matches` compares the
+  stored remote against the configured URL, so storing a sanitised remote would have
+  re-cloned the repository on every startup — both sides are now sanitised before comparison,
+  which also makes a pre-change clone reusable rather than forcing one re-clone on upgrade
 - [ ] `M28` residual — broader export-side field fidelity (follow-up PR)
 - [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
   draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn about the same nodes

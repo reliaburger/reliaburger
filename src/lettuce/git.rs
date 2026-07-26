@@ -59,13 +59,20 @@ impl GitRepo {
 
     /// Perform a fresh bare clone at `path`.
     fn fresh_clone(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
+        // M27: keep the secret out of argv (world-readable via /proc) and out
+        // of the clone's `.git/config` (where it would outlive the process).
+        // The sanitised URL is what git stores as the remote; `fetch` supplies
+        // the credential the same way on every later call.
+        let (safe_url, password) = split_credentials(url);
         // `--` separates options from the URL and destination so a repo or
         // branch beginning with `-` can't be read as a git flag (GIT4).
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        with_credentials(&mut command, password.as_deref());
+        let output = command
             .args(["clone", "--bare", "--single-branch", "--branch"])
             .arg(branch)
             .arg("--")
-            .arg(url)
+            .arg(&safe_url)
             .arg(path)
             .output()
             .map_err(|e| LettuceError::GitFailed(format!("failed to run git clone: {e}")))?;
@@ -90,7 +97,12 @@ impl GitRepo {
     pub fn fetch(&self) -> Result<Option<CommitInfo>, LettuceError> {
         let old_head = self.head_sha().ok();
 
-        let output = Command::new("git")
+        // The stored remote is credential-free (M27), so the secret has to be
+        // supplied on every fetch too.
+        let (_, password) = split_credentials(&self.url);
+        let mut command = Command::new("git");
+        with_credentials(&mut command, password.as_deref());
+        let output = command
             .args(["fetch", "origin", "--"])
             .arg(&self.branch)
             .current_dir(&self.path)
@@ -318,6 +330,63 @@ fn redact_git_output(stderr: &[u8], url: &str) -> String {
     redact_url_credentials(&without_url)
 }
 
+/// Environment variable the credential helper reads the secret from (M27).
+const GIT_PASSWORD_ENV: &str = "RELIABURGER_GIT_PASSWORD";
+
+/// Split a remote URL into a form safe to hand to git, plus the secret it was
+/// carrying (M27).
+///
+/// A `[gitops] repo` of `https://x-access-token:ghp_abc@github.com/org/repo`
+/// put that token in `git clone`'s argv, where `/proc/<pid>/cmdline` is
+/// world-readable — any local user could read it while the clone ran. Worse,
+/// git then wrote the whole URL into the clone's `.git/config`, so it outlived
+/// the process entirely.
+///
+/// The username stays in the URL: git needs it, and it isn't the secret. Only
+/// the password moves, into the child's environment, where `/proc/<pid>/environ`
+/// is readable by the owning uid alone.
+///
+/// Returns `(sanitised_url, password)`. A URL with no `user:pass@` is returned
+/// unchanged with `None`.
+pub(crate) fn split_credentials(url: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_string(), None);
+    };
+    // Split on the LAST `@`: a password may legitimately contain one.
+    let Some((userinfo, host)) = rest.rsplit_once('@') else {
+        return (url.to_string(), None);
+    };
+    match userinfo.split_once(':') {
+        Some((user, password)) if !password.is_empty() => (
+            format!("{scheme}://{user}@{host}"),
+            Some(password.to_string()),
+        ),
+        // `scheme://token@host` — the whole userinfo IS the secret, but git
+        // reads it as a username. Leave it in place rather than guess: moving
+        // it to the password slot would change which credential git presents.
+        _ => (url.to_string(), None),
+    }
+}
+
+/// Configure `command` to supply `password` without it appearing in argv (M27).
+///
+/// git runs a `credential.helper` beginning with `!` through the shell, so the
+/// helper can read the secret from the environment. Only the helper *script*
+/// reaches argv, and it contains no secret — just the name of the variable.
+fn with_credentials(command: &mut Command, password: Option<&str>) {
+    let Some(password) = password else {
+        return;
+    };
+    command.args([
+        "-c",
+        &format!(
+            "credential.helper=!f() {{ test \"$1\" = get && \
+             printf 'password=%s\\n' \"${GIT_PASSWORD_ENV}\"; }}; f"
+        ),
+    ]);
+    command.env(GIT_PASSWORD_ENV, password);
+}
+
 /// Strip `scheme://user:pass@host` / `scheme://token@host` credentials from any
 /// URL-shaped substring, leaving `scheme://host`.
 pub(crate) fn redact_url_credentials(text: &str) -> String {
@@ -357,7 +426,16 @@ fn reused_clone_matches(path: &Path, url: &str, branch: &str) -> Result<bool, Le
         return Ok(false);
     }
     let current_url = String::from_utf8_lossy(&origin.stdout).trim().to_string();
-    if current_url != url {
+    // Compare the *sanitised* forms (M27). The clone stores a credential-free
+    // remote now, so comparing it against a configured URL that still carries
+    // `user:pass@` would mismatch every time and re-clone the repository on
+    // every startup — a subtle, expensive regression from moving the secret
+    // out of the URL. A clone made before that change stores the URL with
+    // credentials, so sanitising both sides also makes it reusable rather
+    // than forcing one re-clone on upgrade.
+    let (safe_configured, _) = split_credentials(url);
+    let (safe_current, _) = split_credentials(&current_url);
+    if safe_current != safe_configured {
         return Ok(false);
     }
 
@@ -377,6 +455,93 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// M27: the token used to sit in `git clone`'s argv, where
+    /// `/proc/<pid>/cmdline` is world-readable, and git then persisted the
+    /// whole URL into the clone's `.git/config` where it outlived the process.
+    #[test]
+    fn split_credentials_moves_only_the_password() {
+        let (url, password) =
+            split_credentials("https://x-access-token:ghp_secret@github.com/org/repo");
+        assert_eq!(url, "https://x-access-token@github.com/org/repo");
+        assert_eq!(password.as_deref(), Some("ghp_secret"));
+        assert!(
+            !url.contains("ghp_secret"),
+            "the secret must not survive in the URL"
+        );
+    }
+
+    #[test]
+    fn split_credentials_handles_an_at_sign_in_the_password() {
+        // Splitting on the FIRST `@` would truncate the password and produce a
+        // nonsense host.
+        let (url, password) = split_credentials("https://user:p@ss@example.com/repo");
+        assert_eq!(url, "https://user@example.com/repo");
+        assert_eq!(password.as_deref(), Some("p@ss"));
+    }
+
+    #[test]
+    fn split_credentials_leaves_urls_without_a_password_alone() {
+        for url in [
+            "https://github.com/org/repo",
+            "git@github.com:org/repo.git",
+            // A bare token in the username slot is what git presents as the
+            // username; moving it would change which credential is sent.
+            "https://ghp_token@github.com/org/repo",
+            "https://user:@github.com/org/repo",
+        ] {
+            let (out, password) = split_credentials(url);
+            assert_eq!(out, url, "{url} should be unchanged");
+            assert!(password.is_none(), "{url} should yield no password");
+        }
+    }
+
+    /// The credential helper reaches argv, so it must name the environment
+    /// variable rather than contain the secret.
+    #[test]
+    fn the_credential_helper_argv_carries_no_secret() {
+        let mut command = Command::new("git");
+        with_credentials(&mut command, Some("ghp_secret"));
+        let argv: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            argv.iter().any(|a| a.contains("credential.helper")),
+            "no credential helper was configured: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("ghp_secret")),
+            "the secret leaked into argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.contains(GIT_PASSWORD_ENV)),
+            "the helper must read the secret from the environment: {argv:?}"
+        );
+        // …and the secret is in the child's environment instead.
+        let env: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == GIT_PASSWORD_ENV && v.as_deref() == Some("ghp_secret")),
+            "the secret was not passed via the environment: {env:?}"
+        );
+    }
+
+    #[test]
+    fn no_password_configures_no_helper() {
+        let mut command = Command::new("git");
+        with_credentials(&mut command, None);
+        assert_eq!(command.get_args().count(), 0);
+        assert_eq!(command.get_envs().count(), 0);
+    }
 
     /// M27: git stderr echoed into a durable error must not leak a URL-embedded
     /// credential.
