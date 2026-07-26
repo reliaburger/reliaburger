@@ -1550,7 +1550,17 @@ work, not by `M1`.
   stored remote against the configured URL, so storing a sanitised remote would have
   re-cloned the repository on every startup — both sides are now sanitised before comparison,
   which also makes a pre-change clone reusable rather than forcing one re-clone on upgrade
-- [ ] `M28` residual — broader export-side field fidelity (follow-up PR)
+- [x] `M28` residual — `relish export` silently dropped ten field families, so an export that
+  looked complete produced a materially different workload. Now translated: `namespace` (every
+  resource landed in `default`, collapsing two namespaces' same-named apps into one — the DEP1
+  collision reintroduced on the way *out*, and the Service would never have found its pods),
+  `command` (the pod ran its image's default entrypoint instead), and `memory`/`cpu`/`gpu` as
+  `resources` — `ResourceRange`'s request/limit pair maps onto Kubernetes' two fields exactly,
+  so that one is lossless. The rest (`health`, `volumes`, `init`, `config_file`, `placement`)
+  are reported in a new `dropped` list, kept **separate from `unsupported`**: "Kubernetes can't
+  express this" and "we haven't written this bit yet" mean different things to whoever reads
+  the report, and conflating them sends an operator hunting for a workaround they don't need.
+  Silence was the actual bug
 - [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
   draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn about the same nodes
   could outrun it forever. Compaction coalesces to the newest incarnation per node (an older

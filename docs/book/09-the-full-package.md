@@ -604,6 +604,41 @@ CRDs, ServiceAccounts, PodDisruptionBudgets, RBAC — these either have no equiv
 
 Features with no K8s equivalent show up in the export report: `auto_rollback`, Smoker fault rules, process workloads, build jobs, `run_before` dependency ordering. The report suggests K8s alternatives where they exist (Argo Workflows for dependency ordering, NetworkPolicy for firewall rules).
 
+#### Two ways to not export something
+
+Reporting the unsupported features felt like the job was done. It wasn't, because it answered the wrong question. The report listed what Kubernetes *can't* express — and said nothing about what this exporter simply hadn't got round to.
+
+Ten field families fell into that gap. `namespace`, `command`, `memory`, `cpu`, `gpu`, `health`, `volumes`, `init`, `config_file`, `placement`. Every one has a perfectly ordinary Kubernetes equivalent. Every one was dropped in silence, so the YAML looked complete and described a materially different workload.
+
+Two of those are worth sitting with:
+
+**`namespace`.** Dropped, so every resource landed in `default`. Two teams' apps called `web` collapsed into one — the exact collision instance identity fixed *inside* Reliaburger (chapter 2), reintroduced on the way out. And because the Service lost its namespace too, it would have gone looking for pods in `default` and found nothing. A migration that silently merges tenants is not a migration.
+
+**`memory`/`cpu`.** Dropped, so a 512Mi-limited app exported as an unlimited pod. Kubernetes' scheduler would then place a workload it believed was free. This one's translation is unusually clean, because `ResourceRange` already carries a request *and* a limit:
+
+```rust
+if let Some(memory) = &app.memory {
+    requests.insert("memory".to_string(), quantity(memory.request.to_string()));
+    limits.insert("memory".to_string(), quantity(memory.limit.to_string()));
+}
+```
+
+Two fields on each side, same meaning. Most of this exporter is lossy; it's nice when something isn't.
+
+The remaining five are still not translated, and that's a defensible place to stop — they're real work, not a docs fix. What isn't defensible is saying nothing, so they go in a `dropped` list that is deliberately *not* the `unsupported` list:
+
+```
+Unsupported (no K8s equivalent):
+  - [app.web.firewall] — use NetworkPolicy manually
+
+Not exported yet (a K8s equivalent exists):
+  ! [app.web] health — has a K8s equivalent (livenessProbe/readinessProbe) but is not exported yet
+```
+
+The distinction matters to the person reading it. "Unsupported" tells them to stop looking; "not exported yet" tells them a solution exists and they'll have to write it by hand today. Filing the second under the first is a small lie that costs someone an afternoon.
+
+There's a general principle in here that keeps recurring in this project: an incomplete tool that reports its gaps is trustworthy, and a tool that quietly does less than it claims isn't — regardless of which one has more features.
+
 ## Lessons learned
 
 **The mock driver refactor was worth it.** When we added blue-green deploys, the existing `MockDriver` broke. It tracked steps by counting `stop_instance` calls, which worked for rolling (one stop per step). In blue-green, all starts happen before any stops. The fix: separate counters for start and health check calls. A small change, but it highlighted why the mock should model *operation counts*, not *lifecycle phases*.
