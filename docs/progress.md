@@ -1526,10 +1526,16 @@ work, not by `M1`.
   with 0700 perms and cleanup, so it rides with the follow-up PR
 - [ ] `M28` residual — broader export-side field fidelity (follow-up PR)
 - [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
-  draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn could outrun it
-  forever. It now compacts past a 4096 cap: coalesce to the newest incarnation per node (an
-  older update is exactly what the newer one supersedes), then, if still over, keep the
-  highest-priority entries so what's shed is `Alive` chatter and never a `Dead`/`Suspect`.
+  draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn about the same nodes
+  could outrun it forever. Compaction coalesces to the newest incarnation per node (an older
+  update is exactly what the newer one supersedes), which bounds the queue at the number of
+  distinct nodes — which cluster membership bounds in turn. The trigger scales with
+  `cluster_size` above a small-cluster floor, because **one queued update per member is the
+  normal shape of a first dissemination**: the first version of this used a flat 4096 cap and
+  truncated the excess, which silently dropped ~6,000 members on a 10,000-member cluster.
+  `tests/gossip_10k.rs` caught it in CI, not locally, because `make test` doesn't run the
+  ignored scale suite. A `HARD_CAP` of 65,536 remains as a backstop against updates about
+  non-members, and it logs what it drops rather than trimming in silence.
   `crl.entries` gained `expires_at` (`#[serde(default)]`, so old state loads and unknown
   expiries are never pruned) and `RevokeCertificate` drops entries whose certificates have
   since expired — an expired cert fails validation with or without a CRL entry. The prune

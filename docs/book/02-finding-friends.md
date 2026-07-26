@@ -240,6 +240,36 @@ impl NodeState {
 
 Dead and suspect updates jump the queue. If the queue is full and we have to choose between telling people about a new join and telling them about a failure, the failure wins. Failure detection is time-sensitive; join announcements can wait.
 
+### The queue that had no ceiling, and the ceiling that was wrong
+
+`enqueue` pushed unconditionally. `select_updates` drains at most eight per outgoing message. Nothing reconciled those two rates, so a node under churn — or one being fed replayed updates — could grow that heap without limit.
+
+The obvious fix is a cap, and the obvious cap is a number. We picked 4096, wrote "comfortably above any real cluster's steady state" in the comment, truncated the excess by priority, and shipped it with tests that passed.
+
+CI disagreed:
+
+```
+thread 'one_node_handles_10k_member_protocol_state' panicked at tests/gossip_10k.rs:87:9:
+updates expired before first broadcast
+```
+
+Read the comment again. "Any real cluster's steady state" — the mistake is sitting in that phrase. A 10,000-member cluster's first dissemination is *one update per member*: ten thousand entries, every one of which has to go out at least once. That isn't churn, it isn't an anomaly, it's a node joining and learning who else exists. Our cap threw away six thousand of them, and the queue that was supposed to be a memory fix became a correctness bug for exactly the clusters we most wanted to support.
+
+So what actually bounds this? Not a number we choose — a property of the data. At most one update matters per node, because a newer incarnation supersedes an older one. Coalesce on node id and the queue is bounded by the number of distinct nodes, which the cluster's membership bounds in turn. No magic constant, and nothing legitimate discarded:
+
+```rust
+let threshold = cluster_size.saturating_mul(2).max(MIN_COMPACT_THRESHOLD);
+if self.queue.len() > threshold {
+    self.compact();   // coalesce per node; never truncate
+}
+```
+
+The threshold that remains isn't a ceiling on what we keep, only a trigger for *when* to tidy — and it scales with the cluster, so a big cluster tidies later rather than constantly. There's still a `HARD_CAP` of 65,536 far above any plausible membership, but it exists for updates about ids that aren't members at all, and it logs what it drops. A queue forced to discard real updates is an incident; it shouldn't look like routine housekeeping.
+
+Two things worth taking from this. First: when you bound a queue, ask what the data's own structure says the bound should be before reaching for a number. Constants encode an assumption about scale, and assumptions about scale are wrong at the edges — which is where scale problems live.
+
+Second, and more uncomfortable: the unit tests passed. Of course they did, we wrote them to check the cap held, and it held beautifully. The test that caught this drives ten thousand real members through a real protocol state machine, and it's `#[ignore]`d because it takes minutes — so `make test` skips it and `make bench-10k` runs it in CI. A local run that skips the expensive tests is a *fast* signal, not a complete one, and it's worth knowing which of your gates you've actually passed before you push.
+
 ### Message types
 
 Every gossip message is a single UDP datagram, kept under 1400 bytes to avoid IP fragmentation:
