@@ -428,6 +428,57 @@ pub fn backoff_delay(base: Duration, failures: u32) -> Duration {
 }
 ```
 
+### Where a token ends up when you're not looking
+
+A private repo means a credential, and the natural place to put one is the URL: `https://x-access-token:ghp_abc@github.com/org/repo`. Configure that as `[gitops] repo`, hand it to `git clone`, and everything works.
+
+It also leaks twice.
+
+The first is argv. `git clone https://x-access-token:ghp_abc@…` puts the token in the process's command line, and `/proc/<pid>/cmdline` is readable by *every* local user, not just the owner. Any process on the node can read your deploy key while the clone runs. This is a well-known Unix hazard and it's easy to walk into, because a command line doesn't feel like a public place.
+
+The second is worse, because it's durable. git records the remote it cloned from in `.git/config` — including the credentials. The clone outlives the process, so the token sits on disk indefinitely, in a file with ordinary permissions, and nothing in the code that put it there mentions it.
+
+The fix is to split the URL:
+
+```rust
+pub(crate) fn split_credentials(url: &str) -> (String, Option<String>) {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return (url.to_string(), None);
+    };
+    // Split on the LAST `@`: a password may legitimately contain one.
+    let Some((userinfo, host)) = rest.rsplit_once('@') else {
+        return (url.to_string(), None);
+    };
+    match userinfo.split_once(':') {
+        Some((user, password)) if !password.is_empty() => (
+            format!("{scheme}://{user}@{host}"),
+            Some(password.to_string()),
+        ),
+        _ => (url.to_string(), None),
+    }
+}
+```
+
+`rsplit_once('@')` rather than `split_once` is not fussiness — a password containing `@` is legal, and splitting on the first one would truncate the secret and produce a nonsense hostname. Note also what *doesn't* move: the username. git needs it, it isn't the secret, and leaving it in the URL keeps the change small.
+
+The password goes into the child's environment instead, fetched by a credential helper:
+
+```rust
+command.args(["-c", &format!(
+    "credential.helper=!f() {{ test \"$1\" = get && \
+     printf 'password=%s\\n' \"${GIT_PASSWORD_ENV}\"; }}; f"
+)]);
+command.env(GIT_PASSWORD_ENV, password);
+```
+
+The helper string does reach argv — but it contains only the *name* of a variable, not its contents. `/proc/<pid>/environ`, unlike `cmdline`, is readable by the owning uid alone. The leading `!` tells git to run the helper through a shell, which is what lets it read the environment at all.
+
+Why not `GIT_ASKPASS`? Because askpass wants a *program*, so you'd write a script to a temp file with careful permissions and clean it up on every exit path. That's a file to leak instead of a command line to leak. The credential helper needs no file.
+
+And then there's the bug that writing this introduced, which is the part worth remembering. `reused_clone_matches` decides whether an existing clone can be reused by comparing its stored remote against the configured URL. Store a sanitised remote and that comparison fails *every time* — so every startup would delete and re-clone the repository. The security fix would have quietly turned into a performance bug that only shows on a large repo. Both sides are now sanitised before comparison, which as a bonus makes a clone from before the change reusable rather than forcing one re-clone on upgrade.
+
+Changing what you persist changes what your equality checks mean. If some code compares a stored value against a configured one, and you alter the stored form, go and find that comparison.
+
 ### Switching it on
 
 All of the above — `execute_sync`, the diff engine, signature verification, the webhook validator — was a library nobody ran. The July 2026 review found `execute_sync` had no caller, `/v1/gitops/webhook` returned 503 unconditionally (`gitops_webhook_tx` was hardcoded `None`), and the `[gitops]` config section was parsed and never read. A GitOps engine that never touches git.
@@ -552,6 +603,41 @@ CRDs, ServiceAccounts, PodDisruptionBudgets, RBAC — these either have no equiv
 `relish export` reads a TOML config and produces multi-document K8s YAML. Each app becomes a Deployment + Service (or DaemonSet). Ingress, HPA, ConfigMap, and Secret resources are added when the relevant config sections exist.
 
 Features with no K8s equivalent show up in the export report: `auto_rollback`, Smoker fault rules, process workloads, build jobs, `run_before` dependency ordering. The report suggests K8s alternatives where they exist (Argo Workflows for dependency ordering, NetworkPolicy for firewall rules).
+
+#### Two ways to not export something
+
+Reporting the unsupported features felt like the job was done. It wasn't, because it answered the wrong question. The report listed what Kubernetes *can't* express — and said nothing about what this exporter simply hadn't got round to.
+
+Ten field families fell into that gap. `namespace`, `command`, `memory`, `cpu`, `gpu`, `health`, `volumes`, `init`, `config_file`, `placement`. Every one has a perfectly ordinary Kubernetes equivalent. Every one was dropped in silence, so the YAML looked complete and described a materially different workload.
+
+Two of those are worth sitting with:
+
+**`namespace`.** Dropped, so every resource landed in `default`. Two teams' apps called `web` collapsed into one — the exact collision instance identity fixed *inside* Reliaburger (chapter 2), reintroduced on the way out. And because the Service lost its namespace too, it would have gone looking for pods in `default` and found nothing. A migration that silently merges tenants is not a migration.
+
+**`memory`/`cpu`.** Dropped, so a 512Mi-limited app exported as an unlimited pod. Kubernetes' scheduler would then place a workload it believed was free. This one's translation is unusually clean, because `ResourceRange` already carries a request *and* a limit:
+
+```rust
+if let Some(memory) = &app.memory {
+    requests.insert("memory".to_string(), quantity(memory.request.to_string()));
+    limits.insert("memory".to_string(), quantity(memory.limit.to_string()));
+}
+```
+
+Two fields on each side, same meaning. Most of this exporter is lossy; it's nice when something isn't.
+
+The remaining five are still not translated, and that's a defensible place to stop — they're real work, not a docs fix. What isn't defensible is saying nothing, so they go in a `dropped` list that is deliberately *not* the `unsupported` list:
+
+```
+Unsupported (no K8s equivalent):
+  - [app.web.firewall] — use NetworkPolicy manually
+
+Not exported yet (a K8s equivalent exists):
+  ! [app.web] health — has a K8s equivalent (livenessProbe/readinessProbe) but is not exported yet
+```
+
+The distinction matters to the person reading it. "Unsupported" tells them to stop looking; "not exported yet" tells them a solution exists and they'll have to write it by hand today. Filing the second under the first is a small lie that costs someone an afternoon.
+
+There's a general principle in here that keeps recurring in this project: an incomplete tool that reports its gaps is trustworthy, and a tool that quietly does less than it claims isn't — regardless of which one has more features.
 
 ## Lessons learned
 

@@ -89,6 +89,103 @@ impl DeployConfig {
         }
         cfg
     }
+
+    /// Reject a surge/unavailable pair that can't make progress (M7).
+    ///
+    /// With `max_surge = 0` a rollout may not exceed the replica target, and
+    /// with `max_unavailable = 0` it may not fall below it. Both at once
+    /// leaves no room to move: you can't start a new instance and you can't
+    /// retire an old one. Validated at apply time so it fails the deploy with
+    /// an explanation, rather than wedging a rollout that looks live.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_surge == 0 && self.max_unavailable == 0 {
+            return Err(
+                "max_surge and max_unavailable are both 0, so a rolling deploy can never \
+                 start a replacement or retire an old instance — set at least one to 1"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// What a rolling replacement should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollingStep {
+    /// Bring up one more new instance.
+    StartNew,
+    /// Retire one old instance.
+    RetireOld,
+    /// A replacement is still owed but surge is exhausted by instances that
+    /// haven't gone healthy yet. Wait for one of them, don't act.
+    Wait,
+    /// Every new instance is healthy and every old one is gone.
+    Done,
+    /// Neither action is permitted by the configured bounds. Only reachable
+    /// with `max_surge = 0 && max_unavailable = 0`, which
+    /// [`DeployConfig::validate`] rejects — so this exists to fail loudly
+    /// rather than spin, not as an expected state.
+    Stuck,
+}
+
+/// Decide the next step of a rolling replacement (M7).
+///
+/// The production rolling deploy used to bring up *every* replacement, then
+/// retire *every* old instance. That's a valid rollout, and it's the one
+/// `max_surge`/`max_unavailable` exist to let you avoid: on a 3-replica app
+/// it doubles peak resource use, and the knobs parsed, validated and changed
+/// nothing.
+///
+/// The two bounds are the whole decision:
+///
+/// - `max_surge` caps how far *above* the target the total may go, so it
+///   decides whether another replacement may start.
+/// - `max_unavailable` caps how far *below* the target the serving count may
+///   fall, so it decides whether an old instance may retire.
+///
+/// `new_pending` counts instances started but not yet healthy — they consume
+/// surge but don't serve. Kept pure so every combination is unit-testable
+/// without a runtime.
+pub fn plan_rolling_step(
+    target: u32,
+    new_healthy: u32,
+    new_pending: u32,
+    old_remaining: u32,
+    max_surge: u32,
+    max_unavailable: u32,
+) -> RollingStep {
+    if new_healthy >= target && old_remaining == 0 {
+        return RollingStep::Done;
+    }
+
+    let serving = new_healthy + old_remaining;
+    let total = new_healthy + new_pending + old_remaining;
+
+    // Start a replacement when one is still owed and surge allows it.
+    let owed = new_healthy + new_pending < target;
+    if owed && total < target.saturating_add(max_surge) {
+        return RollingStep::StartNew;
+    }
+
+    // Otherwise retire an old instance, provided serving stays within the
+    // unavailable budget. `>` not `>=`: retiring drops `serving` by one, and
+    // the floor is what we must not go below.
+    if old_remaining > 0 && serving > target.saturating_sub(max_unavailable) {
+        return RollingStep::RetireOld;
+    }
+
+    // A replacement is owed but surge is exhausted. If instances are still
+    // coming up, waiting for one is the answer — never `Done`, which would
+    // let a caller looping on "not Done" finish with work outstanding.
+    if new_pending > 0 {
+        return RollingStep::Wait;
+    }
+
+    if owed || old_remaining > 0 {
+        RollingStep::Stuck
+    } else {
+        RollingStep::Done
+    }
 }
 
 /// Deploy strategy.
@@ -795,5 +892,137 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: DeployHistoryEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.result, DeployResult::Completed);
+    }
+
+    // -- plan_rolling_step (M7) ----------------------------------------------
+
+    /// Drive a whole rollout through the planner, tracking the counts the
+    /// production loop tracks, and return (peak total, minimum serving).
+    ///
+    /// This is the property that matters: `max_surge` bounds the peak and
+    /// `max_unavailable` bounds the trough. Asserting on individual steps
+    /// would pin an implementation; asserting on the envelope pins the
+    /// contract.
+    fn run_rollout(target: u32, existing: u32, max_surge: u32, max_unavailable: u32) -> (u32, u32) {
+        let (mut healthy, mut old) = (0u32, existing);
+        let mut peak_total = healthy + old;
+        let mut min_serving = healthy + old;
+
+        for _ in 0..1000 {
+            match plan_rolling_step(target, healthy, 0, old, max_surge, max_unavailable) {
+                RollingStep::StartNew => healthy += 1,
+                RollingStep::RetireOld => old -= 1,
+                RollingStep::Done => {
+                    return (peak_total, min_serving);
+                }
+                other => panic!("unexpected {other:?} at healthy={healthy} old={old}"),
+            }
+            peak_total = peak_total.max(healthy + old);
+            min_serving = min_serving.min(healthy + old);
+        }
+        panic!("rollout did not converge");
+    }
+
+    /// The default (surge 1, unavailable 0) must never exceed one extra
+    /// instance and never drop below the target. The old code brought up all
+    /// three replacements before retiring anything — peak 6, not 4.
+    #[test]
+    fn default_surge_keeps_one_spare_and_never_dips() {
+        let (peak, min) = run_rollout(3, 3, 1, 0);
+        assert_eq!(peak, 4, "default max_surge=1 allows exactly one extra");
+        assert_eq!(
+            min, 3,
+            "default max_unavailable=0 must never dip below target"
+        );
+    }
+
+    /// The resource-frugal setting: no surge, one instance may be missing. It
+    /// retires first, then replaces, so total never exceeds the target.
+    #[test]
+    fn zero_surge_replaces_in_place() {
+        let (peak, min) = run_rollout(3, 3, 0, 1);
+        assert_eq!(peak, 3, "max_surge=0 must never exceed the target");
+        assert_eq!(min, 2, "max_unavailable=1 permits exactly one gap");
+    }
+
+    /// A wide surge is allowed to go fast, which is the old behaviour — now
+    /// as an explicit choice rather than the only option.
+    #[test]
+    fn full_surge_matches_the_old_all_at_once_behaviour() {
+        let (peak, min) = run_rollout(3, 3, 3, 0);
+        assert_eq!(peak, 6);
+        assert_eq!(min, 3);
+    }
+
+    #[test]
+    fn a_rollout_onto_an_empty_app_just_starts_replicas() {
+        let (peak, min) = run_rollout(2, 0, 1, 0);
+        assert_eq!(peak, 2);
+        assert_eq!(min, 0);
+    }
+
+    /// Scaling down mid-rollout: more old instances than the new target.
+    #[test]
+    fn extra_old_instances_are_retired() {
+        let (peak, _) = run_rollout(2, 5, 1, 0);
+        assert!(peak >= 5);
+        // Convergence (not panicking) is the assertion: every old instance
+        // must be retired even when there are more of them than the target.
+    }
+
+    #[test]
+    fn both_bounds_zero_is_stuck_and_rejected_by_validation() {
+        assert_eq!(
+            plan_rolling_step(3, 0, 0, 3, 0, 0),
+            RollingStep::Stuck,
+            "with no surge and no unavailable budget there is no legal move"
+        );
+        let config = DeployConfig {
+            max_surge: 0,
+            max_unavailable: 0,
+            ..DeployConfig::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(DeployConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn surge_exhausted_by_pending_instances_waits() {
+        // One replacement is up but not yet healthy, surge is 1, so there is
+        // no room to start another and nothing safe to retire.
+        assert_eq!(
+            plan_rolling_step(3, 0, 1, 3, 1, 0),
+            RollingStep::Wait,
+            "waiting is not the same as done — work is still owed"
+        );
+    }
+
+    proptest::proptest! {
+        /// For any target and any bounds that validation permits, a rollout
+        /// converges and stays inside both envelopes. This is the invariant
+        /// the whole feature exists to provide.
+        #[test]
+        fn rollouts_respect_both_bounds(
+            target in 1u32..6,
+            existing in 0u32..6,
+            surge in 0u32..4,
+            unavailable in 0u32..4,
+        ) {
+            proptest::prop_assume!(surge > 0 || unavailable > 0);
+            let (peak, min) = run_rollout(target, existing, surge, unavailable);
+            let ceiling = target + surge;
+            proptest::prop_assert!(
+                peak <= ceiling.max(existing),
+                "peak {peak} exceeded target+surge {ceiling} (existing {existing})"
+            );
+            let floor = target.saturating_sub(unavailable);
+            // A rollout that starts below the floor (scaling up from fewer
+            // instances) can't be blamed for starting there.
+            let start = existing.min(floor);
+            proptest::prop_assert!(
+                min >= floor.min(start),
+                "serving dropped to {min}, below the floor {floor}"
+            );
+        }
     }
 }

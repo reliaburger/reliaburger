@@ -1508,8 +1508,26 @@ work, not by `M1`.
 
 ### Open — deferred from merged PRs
 
-- [ ] `M7` residual — `max_surge`/`max_unavailable` parse and validate but the production
-  rolling deploy still ignores them (needs the deploy-loop rewrite; noted in the M7 commit)
+- [x] `M7` residual — `max_surge`/`max_unavailable` parsed, validated and changed nothing: the
+  rolling path started *every* replacement then retired *every* old instance, so a 3-replica
+  app peaked at 6 containers however `max_surge` was set (the default asks for 4). Worse than
+  unsupported, since an operator who set it because the node lacked the headroom had been told
+  their constraint was honoured. A pure `plan_rolling_step` now drives the rollout: `max_surge`
+  gates starting (how far above target `total` may go), `max_unavailable` gates retiring (how
+  far below `serving` may fall). Retirement and backend publication were split out of
+  `finalise_rolling_deploy` into per-instance `DeployOp`s so they interleave with replacement.
+  - [x] Both bounds at zero is unsatisfiable — no legal move in either direction. The planner
+    returns a distinct `Stuck` and `DeployConfig::validate` rejects the pair at apply time,
+    instead of a rollout that looks live and never progresses
+  - [x] Interleaving hazard: the command loop gets a turn between retirements, and a
+    deliberately stopped instance still in `supervisor.instances` is indistinguishable from a
+    crashed one, so the restart driver would resurrect it. `Supervisor::retire_instance` drops
+    it in the same turn that stops it
+  - [x] Tests: the planner's envelope (peak total, minimum serving) rather than step
+    sequences, plus a proptest over every validation-permitted combination; agent-level tests
+    replay the grill call log to count live containers (3 replicas × `max_surge = 1` peaks at
+    4, and at 6 against the old code — verified). Book chapter 7's claim that surge was "real
+    rather than aspirational" was itself the drift, and is corrected
 - [x] `M20` — alert evaluation lacked per-value freshness and collapsed metrics by name across
   labels. `gather_latest_values` now keeps the newest reading per `(metric_name, labels)`
   series and hands them to a pure `collapse_series`, which (a) applies an explicit
@@ -1521,10 +1539,28 @@ work, not by `M1`.
   metric name. Giving each labelled series its own alert state changes that contract (alert
   keying becomes rule+series) and is not attempted here — recorded rather than silently
   skipped
-- [ ] `M27` residual — remove the token from `git clone` argv via `GIT_ASKPASS`
-  (local-process-list exposure; the durable Raft leak is fixed). Needs a temp askpass helper
-  with 0700 perms and cleanup, so it rides with the follow-up PR
-- [ ] `M28` residual — broader export-side field fidelity (follow-up PR)
+- [x] `M27` residual — a `[gitops] repo` of `https://token@…` put the token in `git clone`'s
+  argv, where `/proc/<pid>/cmdline` is world-readable to any local user, and git then wrote the
+  whole URL into the clone's `.git/config` where it outlived the process entirely. `split_credentials`
+  keeps the username in the URL (git needs it; it isn't the secret) and moves the password into
+  the child's environment, read by a `credential.helper` that names the variable rather than
+  containing the value — so nothing secret reaches argv and no temp askpass file needs
+  creating or cleaning up. `fetch` supplies it the same way, since the stored remote is now
+  credential-free. **Regression caught while writing it:** `reused_clone_matches` compares the
+  stored remote against the configured URL, so storing a sanitised remote would have
+  re-cloned the repository on every startup — both sides are now sanitised before comparison,
+  which also makes a pre-change clone reusable rather than forcing one re-clone on upgrade
+- [x] `M28` residual — `relish export` silently dropped ten field families, so an export that
+  looked complete produced a materially different workload. Now translated: `namespace` (every
+  resource landed in `default`, collapsing two namespaces' same-named apps into one — the DEP1
+  collision reintroduced on the way *out*, and the Service would never have found its pods),
+  `command` (the pod ran its image's default entrypoint instead), and `memory`/`cpu`/`gpu` as
+  `resources` — `ResourceRange`'s request/limit pair maps onto Kubernetes' two fields exactly,
+  so that one is lossless. The rest (`health`, `volumes`, `init`, `config_file`, `placement`)
+  are reported in a new `dropped` list, kept **separate from `unsupported`**: "Kubernetes can't
+  express this" and "we haven't written this bit yet" mean different things to whoever reads
+  the report, and conflating them sends an operator hunting for a workaround they don't need.
+  Silence was the actual bug
 - [x] `O5` residual — the mustard dissemination heap accepted enqueues without limit while
   draining at most `MAX_PIGGYBACK_UPDATES` per outgoing message, so churn about the same nodes
   could outrun it forever. Compaction coalesces to the newest incarnation per node (an older
@@ -1620,7 +1656,32 @@ work, not by `M1`.
   rather than the caller's. Fixing it needs a source-IP→namespace map the userspace responder
   doesn't have (the limitation is already documented on `DnsConfig::default_namespace`), and
   eBPF connect enforcement remains the primary control here
-- [ ] `O20` stale/misleading docs and dead code sweep
+- [x] `O20` stale/misleading docs and dead code sweep — one genuine bug, one leak, two
+  honesty fixes, one deletion, one already-fine:
+  - [x] **Bug:** the gossip datagram was bincode-deserialised before its HMAC was checked (it
+    has to be — the tag is *inside* the message), and the deserialiser was unbounded, so a
+    length prefix in a 1500-byte datagram could claim gigabytes and bincode would try to
+    reserve it. The same "a number is a promise, not a fact" mistake as `O6`, one layer down.
+    The decode budget is now the datagram's own length, which can't reject anything
+    legitimate. Switching off bincode's deprecated `config()` meant explicitly re-pinning
+    `with_fixint_encoding().with_little_endian()` — the builder API defaults to *varint*, a
+    silent wire-format change that compiles fine and stops talking to every peer — so
+    `legacy_wire_bytes_decode_unchanged` pins the shape against `bincode::serialize` output
+  - [x] **Leak:** `AppDelete` cleared apps, scheduling, autoscale overrides and secret seals
+    but left `active_deploys`/`deploy_history`, so Raft state grew for the cluster's lifetime
+    and an app recreated under the same name inherited the dead one's history
+  - [x] **Honesty:** `[gitops] recursive` isn't ignored so much as redundant — `git ls-tree -r`
+    always descends — which makes `recursive = false` the misleading case, promising a shallow
+    sync and delivering a deep one. Documented, and `GitOpsConfig::warnings()` says so at
+    startup rather than correcting behaviour behind the operator's back. `SyncState::history`
+    (never written by the runner) and `coordinator_node_id` (informational — leadership is what
+    gates syncing) are documented at the fields, so the next reader doesn't trust them
+  - [x] **Deleted:** `smoker/node.rs` — `DrainPlan`/`KillPlan` had only self-tests and no
+    production callers, and described an "agent executes this plan" design that CHAOS1
+    explicitly rejected in favour of refusing node-level faults honestly
+  - [x] **Already fine:** the Raft-id djb2 collision risk is thoroughly documented at
+    `cluster::identity::raft_id_from_name` (12b.2/CP10), including why changing it needs a
+    flag day. No action
 
 The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise within this list.
 

@@ -572,6 +572,32 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
     }
 
+    /// Forget one retired instance without touching the rest of its app (M7).
+    ///
+    /// A rolling deploy retires old instances one at a time now, and an
+    /// instance that has been deliberately stopped but is still in
+    /// `instances` is indistinguishable from one that crashed — the restart
+    /// driver would bring it back. So retirement has to drop it here, in the
+    /// same command-loop turn that stopped it.
+    ///
+    /// The caller has already stopped the container; this releases the host
+    /// port, unregisters health checking and removes the bookkeeping, and
+    /// also drops the id from its app's instance list so a later
+    /// [`Self::remove_app`] doesn't try to kill it again.
+    pub async fn retire_instance(&mut self, id: &InstanceId) {
+        self.health_checker.unregister(id);
+        if let Some(instance) = self.instances.get(id) {
+            let key = (instance.app_name.clone(), instance.namespace.clone());
+            if let Some(ids) = self.app_instances.get_mut(&key) {
+                ids.retain(|existing| existing != id);
+            }
+            if let Some(port) = instance.host_port {
+                let _ = self.port_allocator.release(port).await;
+            }
+        }
+        self.instances.remove(id);
+    }
+
     /// Get a reference to an instance by ID.
     pub fn get_instance(&self, id: &InstanceId) -> Option<&WorkloadInstance> {
         self.instances.get(id)

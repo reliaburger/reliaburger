@@ -18,7 +18,6 @@
 /// - **node** — Node drain and node kill simulation.
 pub mod bpf_maps;
 pub mod bpf_types;
-pub mod node;
 pub mod process;
 pub mod registry;
 pub mod resource;
