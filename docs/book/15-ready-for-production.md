@@ -748,3 +748,74 @@ advance the virtual clock out from under the code driving it — a trap we've hi
 before in this codebase. So the runner is timed against the real clock, and its
 own tests use small real durations: a 50-millisecond timeout against a case that
 sleeps for 30 seconds proves the timeout fires without making anyone wait.
+
+## The exit code is the message
+
+`relish test` is the operator's door into all of this. It builds a client, asks
+the node `/v1/capabilities`, selects the cases that fit, runs them, and prints a
+report. The interesting design decision is what it *returns*.
+
+Every other Relish command returns `Result<(), RelishError>`, and the binary
+maps it the obvious way: `Ok` is exit 0, `Err` prints to stderr and exits 1.
+That's fine for `apply` or `stop` — either it worked or it didn't. But a test
+run has a third state. "The suite ran and everything passed" and "the suite ran
+and two cases failed" are *both* `Ok` as far as the tool is concerned: nothing
+went wrong with `relish test` itself. Yet CI has to tell them apart, because the
+whole point of running the suite in a pipeline is to fail the pipeline when a
+case fails.
+
+So the diagnostic commands return a small enum instead:
+
+```rust
+pub enum CommandOutcome {
+    Clean,     // ran fine, nothing wrong — exit 0
+    Problems,  // ran fine, found failures — exit 1
+    Warnings,  // ran fine, only warnings — exit 2
+}
+```
+
+`relish test` maps a report with any failure to `Problems` and a clean one to
+`Clean`. (`Warnings` is for `wtf`, later — a cluster that's degraded but not
+broken.) The binary keeps a second little function next to the original
+`finish`:
+
+```rust
+fn finish_outcome(result: Result<CommandOutcome, RelishError>) -> ExitCode {
+    match result {
+        Ok(outcome) => ExitCode::from(outcome.exit_code()),
+        Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+    }
+}
+```
+
+Read the two arms carefully, because they encode the distinction. An `Err` is
+still a *tool* failure — the agent was unreachable, a flag was malformed — and
+exits 1 with a message. An `Ok(Problems)` is the tool succeeding and reporting
+bad news, and *also* exits 1, but silently, because the report already said
+everything. Same exit code, two very different events, and the code says which
+is which. This is the sort of thing Rust's enums make pleasant: the states are
+named, the `match` is exhaustive, and there's no magic integer floating around
+that a reader has to decode.
+
+Two smaller choices round out the command. Selection: `--filter
+scheduling,firewall` parses to a list of groups and picks those; no filter runs
+everything. And the human report renders as plain aligned text with word labels
+rather than colour:
+
+```
+running 4 tests against a 3-node cluster
+
+scheduling
+  PASS  schedule_fixed_replicas_across_nodes  (120 ms)
+  SKIP  schedule_respects_required_placement_label  (0 ms)  requires multi_node
+service-discovery
+  FAIL  resolve_returns_vip_and_healthy_backends  (80 ms)  expected 2 backends, saw 1
+
+4 tests: 1 passed, 2 failed, 1 skipped  (4.3s)
+```
+
+No colour crate, no terminal detection — a report that reads identically in a
+terminal and in a CI log is one fewer thing to reason about, and `--output json`
+is there for anything that wants to parse rather than read. The renderer is a
+pure `&TestReport -> String`, so it snapshot-tests against a fixed report
+without a cluster anywhere in sight.

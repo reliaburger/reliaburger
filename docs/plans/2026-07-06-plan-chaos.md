@@ -807,7 +807,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 3/20 promote `TestHarness`
 - [x] 4/20 testkit core types
 - [x] 5/20 runner
-- [ ] 6/20 `relish test` CLI + `CommandOutcome`
+- [x] 6/20 `relish test` CLI + `CommandOutcome`
 - [ ] 7/20 catalogue A
 - [ ] 8/20 catalogue B
 - [ ] 9/20 fault targeting flags + CLI fidelity

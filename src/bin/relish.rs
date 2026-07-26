@@ -354,6 +354,30 @@ enum Command {
         #[arg(long)]
         binary_dir: Option<PathBuf>,
     },
+    /// Run the built-in integration test suite against the cluster.
+    Test {
+        /// Comma-separated groups, e.g. "scheduling,firewall". Omit for all.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Maximum concurrently running tests.
+        #[arg(long, default_value_t = 4)]
+        parallel: usize,
+        /// Per-test timeout, e.g. "120s", "5m".
+        #[arg(long, default_value = "120s")]
+        timeout: String,
+        /// Run the chaos suite instead of the integration suite.
+        #[arg(long)]
+        chaos: bool,
+        /// Allow chaos against a cluster tagged environment = "production".
+        #[arg(long = "override")]
+        override_production: bool,
+        /// Skip the interactive chaos confirmation prompt (for CI).
+        #[arg(long)]
+        yes: bool,
+        /// Run all tests inside one fixed namespace instead of one per test.
+        #[arg(long)]
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1210,9 +1234,51 @@ async fn main() -> ExitCode {
             })
             .await
         }
+        Command::Test {
+            filter,
+            parallel,
+            timeout,
+            chaos,
+            // The production/confirmation guards these two feed land with the
+            // chaos scenarios in a later Phase 15 step; parsed now so the flag
+            // surface is stable.
+            override_production: _,
+            yes: _,
+            namespace,
+        } => {
+            // `relish test` reports pass/fail through its exit code, so it
+            // bypasses the plain `finish` and maps a CommandOutcome instead.
+            return finish_outcome(
+                reliaburger::relish::test_cmd::run(reliaburger::relish::test_cmd::TestArgs {
+                    filter,
+                    parallel,
+                    timeout,
+                    chaos,
+                    namespace,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
     };
 
     finish(result)
+}
+
+/// Map a diagnostic command's outcome to a process exit code.
+///
+/// A `RelishError` is a tool failure (exit 1). A `CommandOutcome` is the tool
+/// succeeding and *reporting*: clean (0), problems found (1) or warnings (2).
+fn finish_outcome(
+    result: Result<reliaburger::relish::CommandOutcome, reliaburger::relish::RelishError>,
+) -> ExitCode {
+    match result {
+        Ok(outcome) => ExitCode::from(outcome.exit_code()),
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn finish(result: Result<(), reliaburger::relish::RelishError>) -> ExitCode {
@@ -1250,6 +1316,60 @@ mod tests {
         assert!(bare.command.is_none());
         let tui = Cli::try_parse_from(["relish", "tui"]).unwrap();
         assert!(matches!(tui.command, Some(Command::Tui)));
+    }
+
+    #[test]
+    fn parse_test_command_defaults_and_flags() {
+        let bare = parse(&["relish", "test"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Command::Test {
+                filter: None,
+                parallel: 4,
+                chaos: false,
+                override_production: false,
+                yes: false,
+                namespace: None,
+                ..
+            }
+        ));
+
+        let full = parse(&[
+            "relish",
+            "test",
+            "--filter",
+            "scheduling,firewall",
+            "--parallel",
+            "8",
+            "--timeout",
+            "5m",
+            "--chaos",
+            "--override",
+            "--yes",
+            "--namespace",
+            "rbtest-fixed",
+        ])
+        .unwrap();
+        match full.command {
+            Command::Test {
+                filter,
+                parallel,
+                timeout,
+                chaos,
+                override_production,
+                yes,
+                namespace,
+            } => {
+                assert_eq!(filter.as_deref(), Some("scheduling,firewall"));
+                assert_eq!(parallel, 8);
+                assert_eq!(timeout, "5m");
+                assert!(chaos);
+                assert!(override_production);
+                assert!(yes);
+                assert_eq!(namespace.as_deref(), Some("rbtest-fixed"));
+            }
+            _ => panic!("expected a Test command"),
+        }
     }
 
     #[test]
