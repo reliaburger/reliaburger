@@ -1,0 +1,23 @@
+//! The built-in cluster test and benchmark harness.
+//!
+//! Everything here runs **client-side**, inside the `relish` process, and
+//! talks to the cluster over `BunClient` exactly as an operator would. That
+//! is deliberate: a test that reaches inside the agent proves the agent
+//! agrees with itself, which is not the question. These cases prove the
+//! cluster does what its public API promises.
+//!
+//! - [`report`] — the `--output json` contract.
+//! - [`registry`] — the catalogue and `--filter` selection.
+//! - [`context`] — what a case is handed, and namespace isolation.
+//! - [`cases`] — the integration catalogue.
+//! - [`chaos`] — the chaos scenarios, selected by `--chaos`.
+
+pub mod cases;
+pub mod chaos;
+pub mod context;
+pub mod registry;
+pub mod report;
+
+pub use context::TestContext;
+pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select};
+pub use report::{TestCaseResult, TestGroup, TestOutcome, TestReport};

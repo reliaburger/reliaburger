@@ -522,3 +522,137 @@ Duplicated logic doesn't stay duplicated, it diverges — and the divergence is
 invisible until someone uses the path you forgot. Both now call one
 `parse_mode`, and its error message lists the valid modes from a single place,
 so the next mode can only be added once.
+
+## A test framework in four types
+
+`relish test` needs to describe a run: which cases exist, what each one did,
+and what the whole thing amounts to. Four types carry that, and two of them
+teach something about Rust.
+
+### An outcome with data attached
+
+The tempting shape is a boolean, or `Result<(), Error>`. Both are wrong here,
+because a case can finish in four ways and only two of them are pass and fail:
+
+```rust
+pub enum TestOutcome {
+    Passed,
+    Failed { message: String },
+    Skipped { reason: String },
+    TimedOut,
+}
+```
+
+This is a Rust enum — a *sum type*, not the integer constants C calls an enum.
+Each variant can carry different data: `Failed` has a message, `Skipped` has a
+reason, `Passed` and `TimedOut` carry nothing because there's nothing to say.
+Coming from Go you'd model this as `(bool, error)` and rely on a convention
+about which combinations are legal; coming from Python you'd raise different
+exception classes and hope every caller catches the right ones. Here the
+illegal states can't be written down: there is no `Passed` with a failure
+message.
+
+`Skipped` is the variant that earns its place, and it's the one a naive design
+omits. A case that needs eBPF, run against a cluster without it, has not
+passed and has not failed. Fold it into `Passed` and you have a green that
+never ran. Fold it into `Failed` and every partially-configured cluster is
+permanently red, which trains people to ignore red. The third state is the
+honest one, and it carries *why*, so the report says "skipped: capability
+`ebpf` unavailable" rather than leaving you to guess.
+
+The serde attributes matter for the same reason:
+
+```rust
+#[serde(rename_all = "snake_case", tag = "status")]
+```
+
+`tag = "status"` produces `{"status": "failed", "message": "..."}` rather than
+serde's default nesting. It's the shape a `jq` one-liner in someone's CI
+expects, and once shipped it's an API — hence `schema_version` on the report
+and a snapshot test pinning the whole thing.
+
+### Counters that can't lie
+
+`TestReport` carries `total`, `passed`, `failed` and `skipped` alongside the
+full results list. Two representations of the same facts is an invitation for
+them to disagree, and a summary line contradicting the list beneath it
+destroys trust in both.
+
+So the counters are *derived* in one place, from the results, at construction:
+
+```rust
+let passed = results.iter().filter(|r| r.outcome == TestOutcome::Passed).count();
+```
+
+Not incremented as tests finish. Incrementing works right up until an early
+return or a `?` skips one, and then the arithmetic is quietly wrong forever.
+A test asserts the parts sum to the whole.
+
+### Why a test case can't just be an async fn
+
+Here's a piece of Rust that surprises people arriving from Go, where you'd
+write `[]func(ctx) error` and move on.
+
+```rust
+pub type TestFn = fn(TestContext)
+    -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+```
+
+That's a lot of machinery for "a list of test functions". Every layer is
+load-bearing.
+
+An `async fn` isn't really a function that runs — it's a function that
+*returns a future*, and the compiler generates an anonymous type for that
+future, unique to each `async fn`. Two async functions with identical
+signatures return two different types. So there is no `fn` type they can share
+and no way to put them in a `Vec` directly.
+
+The escape is a trait object: `dyn Future`, which erases the concrete type and
+keeps only the behaviour. But a trait object has no size known at compile time,
+so it must live behind a pointer — hence `Box`.
+
+And `Pin` is the one with a real story. A future generated from an `async fn`
+can hold references *into itself*: if you write `let x = something(); foo(&x).await;`
+the generated state machine has a field for `x` and a field pointing at `x`.
+Move that struct in memory and the pointer dangles. `Pin` is the type-level
+promise that it won't move once polled. Rust makes you say this out loud;
+languages with a garbage collector and heap-allocated coroutines never have to
+because everything is already behind a pointer.
+
+We wrap it in a small macro so the catalogue stays readable:
+
+```rust
+TestCase {
+    name: "schedule_fixed_replicas_across_nodes",
+    group: TestGroup::Scheduling,
+    requires: &[Capability::Cluster, Capability::MultiNode],
+    run: testkit_case!(schedule_fixed_replicas_across_nodes),
+}
+```
+
+`requires` is the graceful-skip mechanism from earlier in this chapter, in its
+final form: the runner compares it against `/v1/capabilities` *before* running
+the body, so an unsupported case is skipped without side effects rather than
+failing halfway through setup.
+
+### A prefix as a safety net
+
+One more small thing with a large consequence. Every namespace the runner
+creates is `rbtest-{run}-{seq}`, and teardown checks the prefix before
+stopping anything:
+
+```rust
+pub fn is_test_namespace(namespace: &str) -> bool {
+    namespace.strip_prefix(TEST_NAMESPACE_PREFIX)
+        .is_some_and(|rest| rest.starts_with('-'))
+}
+```
+
+Note the second condition. `starts_with("rbtest")` alone would match
+`rbtestingground`, which might be somebody's real namespace — and the worst
+thing this tool could do is stop an operator's apps because a name looked
+similar. Requiring the separator makes the match exact in the way that
+matters. The check is a named function with its own test rather than an
+implication of how the name was built, because "we construct them correctly so
+they'll always match" is an assumption, and this is not a place for
+assumptions.
