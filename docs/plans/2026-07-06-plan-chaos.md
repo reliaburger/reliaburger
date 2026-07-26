@@ -803,11 +803,11 @@ Record date, cluster size and observed skips at the bottom of this file.
 ## 10. Step checklist
 
 - [x] 1/20 capabilities endpoint + `[cluster] environment`
-- [ ] 2/20 testapp routes + alloc mode + `bun testapp`
-- [ ] 3/20 promote `TestHarness`
-- [ ] 4/20 testkit core types
-- [ ] 5/20 runner
-- [ ] 6/20 `relish test` CLI + `CommandOutcome`
+- [x] 2/20 testapp routes + alloc mode + `bun testapp`
+- [x] 3/20 promote `TestHarness`
+- [x] 4/20 testkit core types
+- [x] 5/20 runner
+- [x] 6/20 `relish test` CLI + `CommandOutcome`
 - [ ] 7/20 catalogue A
 - [ ] 8/20 catalogue B
 - [ ] 9/20 fault targeting flags + CLI fidelity

@@ -522,3 +522,300 @@ Duplicated logic doesn't stay duplicated, it diverges — and the divergence is
 invisible until someone uses the path you forgot. Both now call one
 `parse_mode`, and its error message lists the valid modes from a single place,
 so the next mode can only be added once.
+
+## A test framework in four types
+
+`relish test` needs to describe a run: which cases exist, what each one did,
+and what the whole thing amounts to. Four types carry that, and two of them
+teach something about Rust.
+
+### An outcome with data attached
+
+The tempting shape is a boolean, or `Result<(), Error>`. Both are wrong here,
+because a case can finish in four ways and only two of them are pass and fail:
+
+```rust
+pub enum TestOutcome {
+    Passed,
+    Failed { message: String },
+    Skipped { reason: String },
+    TimedOut,
+}
+```
+
+This is a Rust enum — a *sum type*, not the integer constants C calls an enum.
+Each variant can carry different data: `Failed` has a message, `Skipped` has a
+reason, `Passed` and `TimedOut` carry nothing because there's nothing to say.
+Coming from Go you'd model this as `(bool, error)` and rely on a convention
+about which combinations are legal; coming from Python you'd raise different
+exception classes and hope every caller catches the right ones. Here the
+illegal states can't be written down: there is no `Passed` with a failure
+message.
+
+`Skipped` is the variant that earns its place, and it's the one a naive design
+omits. A case that needs eBPF, run against a cluster without it, has not
+passed and has not failed. Fold it into `Passed` and you have a green that
+never ran. Fold it into `Failed` and every partially-configured cluster is
+permanently red, which trains people to ignore red. The third state is the
+honest one, and it carries *why*, so the report says "skipped: capability
+`ebpf` unavailable" rather than leaving you to guess.
+
+The serde attributes matter for the same reason:
+
+```rust
+#[serde(rename_all = "snake_case", tag = "status")]
+```
+
+`tag = "status"` produces `{"status": "failed", "message": "..."}` rather than
+serde's default nesting. It's the shape a `jq` one-liner in someone's CI
+expects, and once shipped it's an API — hence `schema_version` on the report
+and a snapshot test pinning the whole thing.
+
+### Counters that can't lie
+
+`TestReport` carries `total`, `passed`, `failed` and `skipped` alongside the
+full results list. Two representations of the same facts is an invitation for
+them to disagree, and a summary line contradicting the list beneath it
+destroys trust in both.
+
+So the counters are *derived* in one place, from the results, at construction:
+
+```rust
+let passed = results.iter().filter(|r| r.outcome == TestOutcome::Passed).count();
+```
+
+Not incremented as tests finish. Incrementing works right up until an early
+return or a `?` skips one, and then the arithmetic is quietly wrong forever.
+A test asserts the parts sum to the whole.
+
+### Why a test case can't just be an async fn
+
+Here's a piece of Rust that surprises people arriving from Go, where you'd
+write `[]func(ctx) error` and move on.
+
+```rust
+pub type TestFn = fn(TestContext)
+    -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+```
+
+That's a lot of machinery for "a list of test functions". Every layer is
+load-bearing.
+
+An `async fn` isn't really a function that runs — it's a function that
+*returns a future*, and the compiler generates an anonymous type for that
+future, unique to each `async fn`. Two async functions with identical
+signatures return two different types. So there is no `fn` type they can share
+and no way to put them in a `Vec` directly.
+
+The escape is a trait object: `dyn Future`, which erases the concrete type and
+keeps only the behaviour. But a trait object has no size known at compile time,
+so it must live behind a pointer — hence `Box`.
+
+And `Pin` is the one with a real story. A future generated from an `async fn`
+can hold references *into itself*: if you write `let x = something(); foo(&x).await;`
+the generated state machine has a field for `x` and a field pointing at `x`.
+Move that struct in memory and the pointer dangles. `Pin` is the type-level
+promise that it won't move once polled. Rust makes you say this out loud;
+languages with a garbage collector and heap-allocated coroutines never have to
+because everything is already behind a pointer.
+
+We wrap it in a small macro so the catalogue stays readable:
+
+```rust
+TestCase {
+    name: "schedule_fixed_replicas_across_nodes",
+    group: TestGroup::Scheduling,
+    requires: &[Capability::Cluster, Capability::MultiNode],
+    run: testkit_case!(schedule_fixed_replicas_across_nodes),
+}
+```
+
+`requires` is the graceful-skip mechanism from earlier in this chapter, in its
+final form: the runner compares it against `/v1/capabilities` *before* running
+the body, so an unsupported case is skipped without side effects rather than
+failing halfway through setup.
+
+### A prefix as a safety net
+
+One more small thing with a large consequence. Every namespace the runner
+creates is `rbtest-{run}-{seq}`, and teardown checks the prefix before
+stopping anything:
+
+```rust
+pub fn is_test_namespace(namespace: &str) -> bool {
+    namespace.strip_prefix(TEST_NAMESPACE_PREFIX)
+        .is_some_and(|rest| rest.starts_with('-'))
+}
+```
+
+Note the second condition. `starts_with("rbtest")` alone would match
+`rbtestingground`, which might be somebody's real namespace — and the worst
+thing this tool could do is stop an operator's apps because a name looked
+similar. Requiring the separator makes the match exact in the way that
+matters. The check is a named function with its own test rather than an
+implication of how the name was built, because "we construct them correctly so
+they'll always match" is an assumption, and this is not a place for
+assumptions.
+
+## Running them all without a stampede
+
+We have a catalogue of cases and a way to select from it. Now something has to
+actually run them. That something is the runner, and it exists so a case body
+never has to. A case is a plain `async fn` that applies some config and asserts.
+Three concerns that would otherwise clutter every one of them live in the runner
+instead: how many run at once, what happens when one hangs, and who cleans up.
+
+Start with concurrency. Forty cases against a three-node cluster, all deploying
+apps at the same instant, is not a test — it's a load spike that makes every
+case flaky. So the runner caps how many run at once with a semaphore:
+
+```rust
+let semaphore = Arc::new(Semaphore::new(config.parallel.max(1)));
+```
+
+A semaphore is a counter with a waiting room. `parallel` permits go in; a task
+that wants to run takes one and gives it back when it finishes; a task that
+finds none waits. The subtle part is *where* you take the permit. Acquire it
+before spawning and you've bounded how many tasks you queue, which is not the
+same thing at all — you'd spawn all forty and they'd all start. Acquire it
+*inside* the spawned task and you've bounded how many actually run:
+
+```rust
+set.spawn(async move {
+    let _permit = semaphore.acquire().await.expect("never closed");
+    run_one(&case, client, namespace, capabilities.as_ref(), timeout).await
+});
+```
+
+The `_permit` is held for the case's lifetime and dropped when the task ends,
+which is what hands the permit to the next waiter. There's no explicit release
+call — the `Drop` does it — which is the same ownership story as a mutex guard,
+one of the places where Rust's "resources are freed when their owner goes out of
+scope" rule quietly does the bookkeeping a Go `defer` would do by hand.
+
+Next, hanging. A health check that never returns, a deploy that never
+completes — a case can wedge, and one wedged case must not take the run with it.
+Every case runs inside a budget:
+
+```rust
+match tokio::time::timeout(timeout, (case.run)(context.clone())).await {
+    Ok(Ok(()))       => TestOutcome::Passed,
+    Ok(Err(message)) => TestOutcome::Failed { message },
+    Err(_elapsed)    => TestOutcome::TimedOut,
+}
+```
+
+`TimedOut` is its own outcome, not a `Failed` with a "timed out" message,
+because a timeout and an assertion failure are different diagnoses: one says the
+system is stuck, the other says it did the wrong thing. Folding them together
+throws that away.
+
+Then teardown, which is the whole reason this is safe to point at a real
+cluster. It runs after every case:
+
+```rust
+let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, context.teardown()).await;
+```
+
+Note "after every case" — pass, fail *or* timeout. It's tempting to only clean
+up after a pass, but that's exactly backwards: the case that failed halfway is
+the one that left a workload running. Teardown is the runner's job precisely so
+a case body can `return Err(...)` the moment something's wrong without a pile of
+cleanup code first. And teardown itself gets a timeout, because "clean up after
+a hung agent" must not become the new way to hang.
+
+Two smaller decisions round it out. Cases finish whenever they finish — a
+250-millisecond case beats a 30-second one to the join — but a report where the
+rows jump around between runs is a report nobody trusts. So each case carries
+its catalogue index, and the results are sorted back into order at the end. And
+a case that *panics* (someone reached for `.unwrap()` where they should have
+returned an `Err`) is caught and turned into a failure at its right place,
+rather than vanishing from the report:
+
+```rust
+let mut identities: HashMap<tokio::task::Id, (usize, String, TestGroup)> = ...;
+```
+
+A panicked task aborts before it can return anything, so its name and index
+can't ride back on the return value — they have to be recorded out here, keyed
+by the task's id, and looked up when the join comes back an `Err`. One case
+mishandled shouldn't blank a forty-case run.
+
+One thing the runner deliberately does *not* do is pause the clock. Elsewhere in
+this book we drove time with `tokio::test(start_paused = true)` to make a
+health-check test instant. The runner spawns tasks, and a spawned task can
+advance the virtual clock out from under the code driving it — a trap we've hit
+before in this codebase. So the runner is timed against the real clock, and its
+own tests use small real durations: a 50-millisecond timeout against a case that
+sleeps for 30 seconds proves the timeout fires without making anyone wait.
+
+## The exit code is the message
+
+`relish test` is the operator's door into all of this. It builds a client, asks
+the node `/v1/capabilities`, selects the cases that fit, runs them, and prints a
+report. The interesting design decision is what it *returns*.
+
+Every other Relish command returns `Result<(), RelishError>`, and the binary
+maps it the obvious way: `Ok` is exit 0, `Err` prints to stderr and exits 1.
+That's fine for `apply` or `stop` — either it worked or it didn't. But a test
+run has a third state. "The suite ran and everything passed" and "the suite ran
+and two cases failed" are *both* `Ok` as far as the tool is concerned: nothing
+went wrong with `relish test` itself. Yet CI has to tell them apart, because the
+whole point of running the suite in a pipeline is to fail the pipeline when a
+case fails.
+
+So the diagnostic commands return a small enum instead:
+
+```rust
+pub enum CommandOutcome {
+    Clean,     // ran fine, nothing wrong — exit 0
+    Problems,  // ran fine, found failures — exit 1
+    Warnings,  // ran fine, only warnings — exit 2
+}
+```
+
+`relish test` maps a report with any failure to `Problems` and a clean one to
+`Clean`. (`Warnings` is for `wtf`, later — a cluster that's degraded but not
+broken.) The binary keeps a second little function next to the original
+`finish`:
+
+```rust
+fn finish_outcome(result: Result<CommandOutcome, RelishError>) -> ExitCode {
+    match result {
+        Ok(outcome) => ExitCode::from(outcome.exit_code()),
+        Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+    }
+}
+```
+
+Read the two arms carefully, because they encode the distinction. An `Err` is
+still a *tool* failure — the agent was unreachable, a flag was malformed — and
+exits 1 with a message. An `Ok(Problems)` is the tool succeeding and reporting
+bad news, and *also* exits 1, but silently, because the report already said
+everything. Same exit code, two very different events, and the code says which
+is which. This is the sort of thing Rust's enums make pleasant: the states are
+named, the `match` is exhaustive, and there's no magic integer floating around
+that a reader has to decode.
+
+Two smaller choices round out the command. Selection: `--filter
+scheduling,firewall` parses to a list of groups and picks those; no filter runs
+everything. And the human report renders as plain aligned text with word labels
+rather than colour:
+
+```
+running 4 tests against a 3-node cluster
+
+scheduling
+  PASS  schedule_fixed_replicas_across_nodes  (120 ms)
+  SKIP  schedule_respects_required_placement_label  (0 ms)  requires multi_node
+service-discovery
+  FAIL  resolve_returns_vip_and_healthy_backends  (80 ms)  expected 2 backends, saw 1
+
+4 tests: 1 passed, 2 failed, 1 skipped  (4.3s)
+```
+
+No colour crate, no terminal detection — a report that reads identically in a
+terminal and in a CI log is one fewer thing to reason about, and `--output json`
+is there for anything that wants to parse rather than read. The renderer is a
+pure `&TestReport -> String`, so it snapshot-tests against a fixed report
+without a cluster anywhere in sight.

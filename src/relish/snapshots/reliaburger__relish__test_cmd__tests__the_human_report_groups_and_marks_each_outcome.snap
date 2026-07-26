@@ -1,0 +1,15 @@
+---
+source: src/relish/test_cmd.rs
+expression: text
+---
+running 4 tests against a 3-node cluster
+
+scheduling
+  PASS  schedule_fixed_replicas_across_nodes  (120 ms)
+  SKIP  schedule_respects_required_placement_label  (0 ms)  requires multi_node
+service-discovery
+  FAIL  resolve_returns_vip_and_healthy_backends  (80 ms)  expected 2 backends, saw 1
+health-checks
+  TIME  hanging_health_check_marks_instance_unhealthy  (120000 ms)  timed out
+
+4 tests: 1 passed, 2 failed, 1 skipped  (4.3s)

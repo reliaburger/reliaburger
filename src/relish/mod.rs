@@ -31,6 +31,7 @@ pub mod plan;
 pub mod reader;
 pub mod setup;
 pub mod source;
+pub mod test_cmd;
 pub mod tui;
 pub mod upgrade;
 
@@ -38,6 +39,36 @@ pub use output::OutputFormat;
 pub use plan::{ApplyPlan, PlanAction, PlanEntry};
 
 use crate::config::ConfigError;
+
+/// The result of a diagnostic-style command whose *exit code* carries meaning
+/// beyond "did the tool itself error".
+///
+/// `relish test`, `wtf`, `bench` and `trace` need to say three different
+/// things a plain `Result<(), _>` cannot. An `Ok(())` collapses to exit 0 and
+/// an `Err` to exit 1 — but "the suite ran and everything passed" and "the
+/// suite ran and something failed" are both `Ok` as far as the *tool* is
+/// concerned, and CI needs to tell them apart. So these commands return this
+/// instead, and the binary maps it to a process exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// Ran fine, found nothing wrong. Exit 0.
+    Clean,
+    /// Ran fine, but found failures the caller should act on. Exit 1.
+    Problems,
+    /// Ran fine, found only warnings. Exit 2.
+    Warnings,
+}
+
+impl CommandOutcome {
+    /// The process exit code this outcome maps to.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            CommandOutcome::Clean => 0,
+            CommandOutcome::Problems => 1,
+            CommandOutcome::Warnings => 2,
+        }
+    }
+}
 
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
