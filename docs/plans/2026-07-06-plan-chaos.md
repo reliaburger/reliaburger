@@ -1,195 +1,294 @@
-# Phase 15 Implementation Plan — Testing, Benchmarking & Diagnostics
+# Phase 15 Implementation Plan — Testing, Benchmarking, Diagnostics & Chaos
 
-**Date:** July 2026
-**Scope:** `relish test`, `relish test --chaos`, `relish bench`, `relish wtf`, `relish trace`, plus book Chapter 15 ("Ready for Production").
-**Audience:** the implementing model. This plan is deliberately prescriptive: exact file paths, type names, function signatures, test names, and commit boundaries. When this plan and reality disagree (an API changed, a struct moved), verify against the source and prefer reality — then note the deviation in this file.
+**Originally written:** 6 July 2026
+**Revised:** 26 July 2026 — re-verified against `main` after the 12b programme, both codebase reviews (2026-07-17 posture, 2026-07-19 code-logic) and PRs #133–#142. **Scope extended** to complete the `relish fault`/`relish chaos` surface, which the original plan assumed was finished.
+
+**Audience:** the implementing model. Deliberately prescriptive: exact paths, type names, signatures, test names, commit boundaries. Where this plan and the source disagree, the source wins — then fix this file and say so in the commit.
 
 ---
 
-## 0. Ground rules (non-negotiable)
+## 0. What changed since 6 July (read this first)
 
-These come from CLAUDE.md and standing feedback. Follow all of them on every step:
+The original plan was written before Phase 12b, both reviews and their follow-up PRs. Fifteen of its factual claims are now wrong. Verified 26 July 2026:
 
-1. **Tests first.** Every step starts by writing failing tests, then implements until green.
-2. **`make ci` before every commit** (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`). All three must pass.
-3. **Ask before committing.** Show the commit message and file list, wait for confirmation. Never `git commit --amend`; always a new commit.
-4. **Update the book with every step.** Each step below names the section of `docs/book/15-ready-for-production.md` it must add. Do not batch book writing to the end. Book prose: British English, explain each new Rust concept on first appearance, target audience knows C/Python/Go but not Rust. Follow the writing style guide in CLAUDE.md (contractions, active voice, no "Notably,/Crucially," openers, minimal em dashes).
-5. **Code conventions:** no `unwrap()`/`expect()`/`panic!()` in production code; `thiserror` in the library, `anyhow`-style context in binaries (this crate uses `RelishError` in the CLI — extend it, don't bypass it); `tokio::sync` primitives only; explicit `tokio::time::timeout` on every network operation; British English in doc comments, American in serde derives.
-6. **Progress tracking:** after each step, tick the corresponding checkbox in §13 of this file. After the final step, update `docs/progress.md` Phase 15, `docs/README.md`, and the top-level `README.md` (test counts, new commands, chapter status).
-7. **Do not touch `prompts.md`** (untracked user file at repo root).
+| The old plan said | Reality on `main` today |
+|---|---|
+| CLI has 22 commands | **41** (`src/bin/relish.rs:43`), including `Chaos` and `Fault` |
+| `relish fault ...` exists and works | Exists — 15 subcommands — but with **real gaps** (§3) |
+| `router_with_upgrade` takes ~14 params | **23** (`src/bun/api.rs:196`) |
+| Chapter 15 is a stub to be written | **329 lines already written** — the harness/philosophy half from the earlier Phase 15 tranche. New sections *append*, they don't replace |
+| `TestAppMode` has 4 variants | **5** (`Healthy, UnhealthyAfter, Hang, ExitAfter, Slow`) — `src/bun/testapp.rs:16` |
+| testapp is an HTTP server we can add routes to | It's a **raw TCP server that answers every path identically** (`testapp.rs:74-111`). `/payload` and `/env/` mean teaching it to parse a request line |
+| `TestHarness` in `tests/integration.rs` is reusable | It's **private** (`tests/integration.rs:29`) and there's now a `tests/support/` directory. Needs promoting or duplicating |
+| Reuse `Capabilities` as a fresh name | **Name collision**: `NodeCapabilities` (`src/meat/cluster_state.rs:15`) and `PlatformCapabilities` (`src/bun/supervisor.rs:74`) exist. Use **`ClusterCapabilities`** |
+| `[cluster] environment` needs adding | Still true — `ClusterSection` (`src/config/node.rs:308`) has no `environment` |
+| Smoker is library-only (review L14/L15) | **Wired.** `apply_fault` (`src/bun/agent.rs:3102`) has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, and eBPF Delay/Drop/Bandwidth |
+| Graceful-skip is needed for most subsystems | Still the right stance, but **far fewer skips**: ingress, rollups, GitOps, egress, eBPF sync, identity are all wired now |
+| `relish test --chaos` scenarios use `node-kill` | **`node-kill`/`node-drain` always return an error** (`agent.rs:3299`). Three of the five scenarios cannot work until this is implemented — see §2 |
+| Faults apply cluster-wide | **Node-local only.** The CLI POSTs to one agent; `target_node` is never used to route (`src/relish/fault.rs:512`) |
+| `deployer` is the right role for faults | Design says **admin or an explicit `fault-injection` grant** (`chaos-smoker.md:88,1429`). Today plain `Deployer` (`src/bun/authz.rs:152`) |
 
-Commit message convention: `<summary> (Phase 15, N/15)`, e.g. `Add cluster capabilities endpoint (Phase 15, 1/15)`.
+**Still true and load-bearing:** `main() -> ExitCode` (`relish.rs:833`) but every dispatched command returns `Result<(), RelishError>`, so `wtf`'s 0/1/2 contract still needs a richer return; `insta` is a dev-dependency with existing snapshot dirs; `src/relish/fault.rs` has the duration/percentage/bandwidth parsers to reuse (`:16,:61,:81`); there is no `src/testkit/`, no `/v1/capabilities`, no `/v1/trace`, no `src/firewall/evaluate.rs`.
 
 ---
 
 ## 1. What Phase 15 delivers
 
-From `docs/roadmap.md` §Phase 15 and `docs/design/cli-relish.md` §5:
-
-| Command | Purpose | Exit codes |
+| Deliverable | Status today | Work |
 |---|---|---|
-| `relish test` | Built-in integration suite (39 tests, 13 groups) run against a **live cluster**, namespace-per-test, parallel, filterable, JSON output | 0 pass, 1 any failure |
-| `relish test --chaos` | Integration suite + Smoker fault injection: leader failure, node failure, partition, resource exhaustion, cascading failure. ≥3 nodes, confirmation prompt, production guard | 0 pass, 1 failure or refused |
-| `relish bench` | In-binary benchmark harness: deploy stress workloads, measure, tear down, report; `--compare <file>` flags >10 % regressions | 0 ok, 1 regressions/failure |
-| `relish wtf` | Automated cluster diagnosis with root-cause correlation and remediation suggestions | 0 ok, 1 criticals, 2 warnings only |
-| `relish trace <app> --to <dest>` | Four-step connectivity trace: service map → backends → firewall verdict → real TCP probe | 0 pass, 1 any step failed |
+| `relish test` | absent | build (§6 stream B) |
+| `relish test --chaos` | absent | build (stream D) — **blocked on stream C** |
+| `relish bench` | absent | build (stream E) |
+| `relish wtf` | absent | build (stream F) |
+| `relish trace` | absent | build (stream G) |
+| `relish fault ...` | 15 subcommands, gaps | **complete (stream C — new)** |
+| `relish chaos ...` | stringly-typed, undesigned | **fold into `fault` (stream C — new)** |
+| Book chapter 15 | harness half written | append command sections |
 
-**Milestone:** `relish test` runs the full suite green against a 3-node dev cluster; `relish bench` produces a valid report; `relish wtf` diagnoses seeded failures; all Phase 15 unit/integration tests pass; Chapter 15 written.
-
----
-
-## 2. Context the implementer must know
-
-### 2.1 Current code surface (verified July 2026)
-
-- **CLI:** `src/bin/relish.rs` holds the clap `Cli`/`Command` enum (22 commands) and `main() -> ExitCode`. Command bodies live in `src/relish/commands.rs` (async fns returning `Result<(), RelishError>`). `RelishError` is in `src/relish/mod.rs`; `OutputFormat` (global `--output` flag: human/json) in `src/relish/output.rs`. API client: `src/relish/client.rs` — `BunClient` wrapping `reqwest`, default `http://127.0.0.1:9117`, bearer-token auth, 300 s default timeout.
-- **Node API:** `src/bun/api.rs` — `pub fn router(...)` builds the axum app; `ApiState` carries `Option`s for mayo/ketchup/council/membership/etc. Protected routes sit behind `sesame::auth::auth_middleware`. Follow the existing handler pattern (extract `State<ApiState>`, return `Json<T>` or a typed error).
-- **Test app:** `src/bun/testapp.rs` (library `TestApp`, `TestAppMode::{Healthy, UnhealthyAfter(u32), Hang, Slow(Duration)}`) plus a standalone binary `src/bin/testapp.rs`.
-- **Smoker:** `src/smoker/` — `FaultType`, `FaultRequest`, `FaultRegistry`, `SafetyRails`. API: `POST/GET/DELETE /v1/fault`, `POST /v1/chaos/partition|heal`. CLI: `relish fault ...` (`src/relish/fault.rs`, which already has duration/percentage parsers — **reuse them**).
-- **Dev clusters:** `relish dev create --nodes 3` (`src/relish/dev.rs`) builds Lima VMs, installs `bun`/`relish`, launches `bun --cluster ... --runtime runc`. This is the acceptance environment for the phase.
-- **Benchmarks today:** criterion benches in `benches/gossip.rs` / `benches/gossip_large.rs`. These stay as-is; `relish bench` is a separate live-cluster harness.
-- **Existing repo tests:** `tests/integration.rs` has a `TestHarness` (in-process agent + ProcessGrill + ephemeral-port API + `BunClient`). Reuse this pattern for Phase 15's own integration tests.
-
-### 2.2 The July review and graceful degradation
-
-`docs/plans/2026-07-02-review-codebase.md` found many subsystems are library-only (Smoker enforcement L14/L15, eBPF L8, ingress L7, rollups L11, GitOps L13, egress L16, …). That wiring is being done **separately** and may land before, during, or after this phase.
-
-**Decision (user-confirmed): graceful skip.** Phase 15 tools detect unavailable subsystems at runtime and report them explicitly instead of failing:
-
-- `relish test`: a test whose required capability is missing reports `SKIPPED (capability X unavailable)` — counted separately from pass/fail, never causes exit 1.
-- `relish bench`: a suite whose dependency is missing is reported as skipped in the report.
-- `relish wtf`: an unavailable data source becomes a WARNING finding ("metrics store not configured on node-2"), never a crash.
-- `relish trace`: steps that can't be evaluated (e.g. firewall disabled) return `Pass` with an explanatory note in `details`, not a hard failure.
-
-The mechanism is a new `GET /v1/capabilities` endpoint (step 1). Do **not** invent per-feature cargo flags; this is a runtime concern.
-
-### 2.3 Topology decision
-
-**Decision (user-confirmed): real multi-host clusters only.** `relish test`, `--chaos`, and `bench` are designed for and validated against genuine multi-node clusters (the Lima dev clusters count — each VM is a real Linux host running `bun --cluster --runtime runc`). We do not build a local multi-process simulation mode. Consequences:
-
-- Repo-level integration tests (`tests/…`, run by `cargo test`) exercise the **runner machinery** (filtering, parallelism, timeouts, report schema, skip logic) against the single-node in-process `TestHarness` with a small synthetic suite — they do not run the full 39-test catalogue.
-- Full-suite and chaos acceptance is a documented manual/CI runbook against `relish dev create --nodes 3` (§12).
-- `relish test --chaos` hard-requires ≥3 nodes at runtime and refuses otherwise (this refusal *is* covered by an automated test).
-
-### 2.4 Test workloads on real clusters
-
-The design says "test apps are compiled into the Bun binary". The dev clusters run `--runtime runc`, and pulling public images inside tests would make the suite network-dependent. So:
-
-- **Step 2** embeds the test app into `bun` itself as a `bun testapp` subcommand (the library `TestApp` already exists; the binary just needs a mode). Every cluster node then carries the test workload at `/usr/local/bin/bun`.
-- Test specs use process workloads: `image = "proc-grill:image-ignored"`, `command = ["/usr/local/bin/bun", "testapp", "--mode", "healthy", "--port", "{port}"]`. **Checkpoint for the implementer:** verify how process workloads dispatch when the agent runs `--runtime runc` (see `src/bun/supervisor.rs` and the `[process_workloads]` config; review item M23 notes gaps). If process workloads are not runnable under a runc agent at implementation time, gate the affected groups on a `process_workloads` capability and skip gracefully; do not block the phase on it.
-- Only the `image-registry` group uses real OCI images (pushed to Pickle from a fixture generated in-test), and it is capability-gated.
+**Milestone:** `relish test` green against a 3-node dev cluster; `relish test --chaos` runs all five scenarios *with real node kills*; `relish bench` produces a comparable report; `relish wtf` diagnoses seeded failures; `relish trace` walks four steps; the documented fault surface matches the implemented one.
 
 ---
 
-## 3. Architecture overview
+## 2. The finding that reorders the plan
+
+The old plan's five chaos scenarios (§6 there, stream D here) are:
+
+| Scenario | Primary fault | Works today? |
+|---|---|---|
+| C1 leader failure | `node-kill` | ❌ hard error |
+| C2 dead worker rescheduled | `node-kill` | ❌ hard error |
+| C3 minority partition | `/v1/chaos/partition` | ✅ real (blocks gossip + Raft transports) |
+| C4 resource exhaustion | `cpu` + `memory` | ✅ on Linux |
+| C5 node death during deploy | `node-kill` | ❌ hard error |
+
+`apply_fault`'s `NodeDrain | NodeKill` arm returns *"is a cluster-level operation and cannot be applied as a node-local fault"* (`agent.rs:3299-3312`). That refusal is correct and honest — CHAOS1 made it so rather than let it lie — but it means **60 % of the chaos suite is unimplementable until node-level faults exist**.
+
+So chaos completion (stream C) must land **before** the chaos suite (stream D). The old plan had them as one step near the end.
+
+---
+
+## 3. The chaos gap, itemised
+
+From `docs/design/chaos-smoker.md`, `docs/design/cli-relish.md:760-782`, `docs/whitepaper.md:768-773`.
+
+### 3.1 Commands that don't match the docs
+
+| Documented | Today | Fix |
+|---|---|---|
+| `relish fault run <file>` | `relish fault scenario <file>` | alias `run`, keep `scenario` |
+| `relish fault clear <app>` | `clear [id: u64]` only | accept a name; `FaultRegistry::clear_by_service` (`registry.rs:88`) is **dead code** waiting for it |
+| `relish fault pause --resume` | absent | `FaultType::Resume` exists and the agent implements it (`agent.rs:3138`) — **no CLI path constructs it** |
+| `relish chaos council-partition` | bare `String` action, no flags, 30s hardcoded | promote to typed subcommands under `fault` |
+
+### 3.2 Flags whose plumbing exists but aren't exposed
+
+`--instance`, `--node`, `--reason` are on `FaultRequest`/`FaultRule` (`types.rs:397-405`), honoured by `target_pids` (`agent.rs:3348`) and `target_instance_cgroups` (`:3384`) — **and hardcoded to `None` in all 15 CLI handlers** (e.g. `fault.rs:136-142`). Dead code from the CLI down.
+
+`--override-safety` is hardcoded `false` everywhere, so the one *designed-as-overridable* rail (`check_node_percentage`, `safety.rs:164`) can't be overridden.
+
+### 3.3 Faults that can't take effect
+
+- **`node-drain` / `node-kill`** — always error. Needed by C1/C2/C5.
+- **`memory <app> oom`** — always rejected (`agent.rs:3219`), though the design's own example scenario uses it (`chaos-smoker.md:1170`).
+- **`partition`** — the last *silent* no-op: succeeds and does nothing without eBPF (`agent.rs:3313-3335`), with an explicit `TODO(Phase 15)` to fix here.
+- `delay`/`drop`/`bandwidth` honestly reject without eBPF; `cpu`/`memory`/`disk-io` reject off Linux. Both fine — capability-gate and skip.
+
+### 3.4 Design features absent
+
+- **`[smoker]` config section** (`default_duration`, `max_duration`) — doesn't exist. Default 10m is hardcoded CLI-side (`fault.rs:13`); the only ceiling is a hardcoded 24h clamp (`types.rs:302`), not the designed 1h with a rejection message.
+- **`fault-injection` permission** — absent. `Deployer` can inject; the design explicitly forbids it.
+- **Leader-mediated distribution** — the design routes faults leader → target nodes via the reporting tree (`chaos-smoker.md:84-91`). Implementation is node-local.
+- **Audit event `fault.injected`** — absent. `injected_by` comes from client-side `$USER` (`fault.rs:139`), i.e. spoofable; `source_ip` isn't even a field.
+- **Unix-socket `relish fault clear` fallback** for a degraded API — absent.
+- Startup sweep of stale kernel fault maps — absent (relies on the in-kernel `expires_ns`).
+
+### 3.5 Cosmetic bugs worth fixing in passing
+
+`fault dns <app> <type>` ignores its positional (`fault.rs:175`), so `dns redis banana` injects NXDOMAIN. `Bandwidth`/`DiskIoThrottle` `Display` divides by 1024² and calls it "mbps" while the parser correctly reads megabits (`types.rs:152`), so `bandwidth api 1mbps` echoes `0mbps`. `fault list` column widths are off by one label (`fault.rs:419`).
+
+---
+
+## 4. Decisions — all four settled (26 July 2026)
+
+**Resolved: option (a) on every one.** The recommendations below are now the
+plan of record; step 13b is in scope, and `--node` routing, the
+`fault-injection` permission, the `relish chaos` deprecation and
+transport-quiesce node kills all get built.
+
+**D1. Cluster-wide fault routing.** Faults are node-local. Options: (a) **implement `--node` routing via the leader's reporting tree, as designed** — makes `node-kill` meaningful and is what "inject into the live cluster" implies; (b) keep node-local and document the deviation. (a) is more work (~1 extra step) but (b) leaves `target_node` dead and the chaos suite weak.
+
+**D2. Fault authorisation.** Design says admin-or-`fault-injection`-grant; today any Deployer. Options: (a) **add the `fault-injection` permission and require it**, a small security fix in the same family as C3; (b) leave as Deployer and amend the design doc. (a).
+
+**D3. `relish chaos` fate.** It's undesigned, stringly-typed, and overlaps `fault`. Options: (a) **promote `council-partition`/`worker-isolation` to typed subcommands under `relish fault` and keep `relish chaos` as a deprecated alias for one release**; (b) delete it; (c) leave it. (a) — it's used by existing chaos tests.
+
+**D4. Scope of node-kill.** "Kill a node" on a real cluster means stopping that node's `bun`. Options: (a) **stop the agent's cluster transports (gossip + Raft + reporting) for the duration and restore on expiry** — reversible, testable, no supervision needed; (b) actually SIGKILL the process, requiring an external supervisor to restart it. (a) — it's what C1/C2/C5 actually assert (leader re-election, rescheduling, membership transitions) and it stays inside Smoker's reversibility guarantee.
+
+---
+
+## 5. Architecture (revised)
 
 ```
 src/
-  testkit/                  # NEW — everything compiled-in that tests/benches the cluster
-    mod.rs                  # pub use; TestGroup, Capability
-    report.rs               # TestReport, TestCaseResult, TestOutcome (serde)
-    registry.rs             # TestCase, all_cases(), filter matching
-    context.rs              # TestContext: client, namespace, helpers, teardown
-    runner.rs               # parallel executor: Semaphore + JoinSet + timeout
-    cases/
-      mod.rs
-      scheduling.rs         # 3 cases
-      service_discovery.rs  # 3
-      deployments.rs        # 3
-      health_checks.rs      # 3
-      secrets_config.rs     # 3
-      firewall.rs           # 3
-      workload_identity.rs  # 3
-      ingress.rs            # 3
-      volumes.rs            # 3
-      process_workloads.rs  # 3
-      jobs.rs               # 3
-      image_registry.rs     # 3
-      cluster_coordination.rs # 3   (13 groups × 3 = 39 tests)
-    chaos/
-      mod.rs                # ChaosScenario type, safety preamble
-      scenarios.rs          # 5 scenarios
-    bench/
-      mod.rs
-      report.rs             # BenchReport, BenchMetric, serde
-      compare.rs            # pure regression detection
-      suites.rs             # the seven measurements
+  testkit/                       # NEW — compiled-in cluster test/bench harness
+    mod.rs report.rs registry.rs context.rs runner.rs
+    cases/ …                     # the integration catalogue
+    chaos/ …                     # the 5 scenarios + preflight
+    bench/ mod.rs report.rs compare.rs suites.rs
+  smoker/
+    node_fault.rs                # NEW — node-kill/drain: transport quiesce + restore
+    types.rs                     # MODIFIED — SmokerConfig limits
   relish/
-    test_cmd.rs             # NEW — `relish test` command body + rendering
-    bench_cmd.rs            # NEW — `relish bench` command body + rendering
-    wtf.rs                  # NEW — collector + pure correlation engine + rendering
-    trace.rs                # NEW — client side of `relish trace` + rendering
-  firewall/
-    evaluate.rs             # NEW — pure policy evaluation for trace step 3
+    test_cmd.rs bench_cmd.rs wtf.rs trace.rs   # NEW command bodies
+    fault.rs                     # MODIFIED — new flags, run alias, clear-by-app, resume
+  firewall/evaluate.rs           # NEW — pure policy evaluation for trace step 3
+  onion/trace.rs                 # NEW — run_trace
   bun/
-    api.rs                  # MODIFIED — /v1/capabilities, /v1/trace
-    testapp.rs              # MODIFIED — new modes (alloc, payload endpoint)
-  bin/
-    bun.rs                  # MODIFIED — `bun testapp` subcommand
-    relish.rs               # MODIFIED — Test/Bench/Wtf/Trace variants
-  config/node.rs            # MODIFIED — [cluster] environment
+    capabilities.rs              # NEW — ClusterCapabilities (NOT `Capabilities`)
+    api.rs                       # MODIFIED — /v1/capabilities, /v1/trace
+    agent.rs                     # MODIFIED — node fault arms, audit event
+    testapp.rs                   # MODIFIED — request-line parsing, /payload, /env/
+  config/node.rs                 # MODIFIED — [cluster] environment, [smoker] section
+  bin/{bun,relish}.rs            # MODIFIED — subcommands
+tests/support/                   # MODIFIED — promote TestHarness for reuse
 ```
 
-Naming note: the CLI command files are `test_cmd.rs`/`bench_cmd.rs` because `test.rs` inside `src/relish/` invites confusion with `#[cfg(test)]` modules. Register modules in `src/relish/mod.rs` and `src/lib.rs` (`pub mod testkit;`).
-
-Division of labour:
-
-- **`testkit` runs client-side** (inside the `relish` process), talking to the cluster over `BunClient` exactly like a human operator. Tests are honest end-to-end checks, not in-process shortcuts.
-- **`wtf` is client-side**: fan-out GETs to existing endpoints, then a **pure** correlation function (unit-testable with fixtures).
-- **`trace` is mostly server-side**: a new `/v1/trace` endpoint on the node hosting the source instance assembles steps 1–4 (it has the service map, firewall state, and network locality for the probe). The CLI locates the right node, calls it, renders.
-- **`bench` is client-side** orchestration using `testkit::context` helpers, plus pure comparison logic.
+Division of labour unchanged from the original: `testkit` and `wtf` and `bench` run **client-side** through `BunClient`, exactly as an operator would; `trace` is **server-side** (`/v1/trace`) because only the node has the service map, firewall state and network locality.
 
 ---
 
-## 4. Data structures (write these verbatim, adjust only if compilation forces it)
+## 6. Work streams and steps
 
-All wire-crossing types live where noted, derive `Debug, Clone, Serialize, Deserialize`, and use `#[serde(rename_all = "snake_case")]` on enums.
+Twenty steps. Each: **(a)** failing tests, **(b)** implementation, **(c)** book section, **(d)** `make ci` + any gated suite the change touches → commit.
 
-### 4.1 Capabilities — `src/bun/api.rs` (or `src/bun/capabilities.rs` if api.rs is crowded)
+Commit convention: `<summary> (Phase 15, N/20)`.
+
+> **Gating reminder** (learned the hard way on PR #141): `make ci` runs the portable suite only. Match the gated target to what you touched — gossip/dissemination → `make bench-10k`; council/Raft/placement → `make test-cluster`; agent/deploy timing → `make test-slow`; runc/netns/eBPF → `sudo make test-linux`. Chaos work touches the agent and the cluster plane: run `make test-cluster` on every stream-C and stream-D commit.
+
+### Stream A — Foundations (steps 1–3)
+
+**1/20 — `ClusterCapabilities` endpoint + `[cluster] environment`**
+Tests: `capabilities_reports_wired_subsystems` (mayo=Some/council=None → `"metrics":true,"council":false`), `capabilities_reports_environment_tag`, `capabilities_defaults_to_no_environment`, client round-trip.
+Implement: `src/bun/capabilities.rs` — `ClusterCapabilities` derived field-by-field from `ApiState` (§7.1); `environment: Option<String>` on `ClusterSection`; `GET /v1/capabilities` (protected, add to `authz::ROUTE_MATRIX` — the source-scan test fails otherwise); `BunClient::capabilities()`.
+Book: §"Asking the cluster what it can do".
+
+**2/20 — testapp: request-line parsing, `/payload`, `/env/`, `alloc` mode**
+Tests: `payload_endpoint_serves_requested_bytes`, `env_endpoint_returns_variable_or_404`, `unknown_path_still_answers_healthy` (don't regress the answer-everything behaviour the existing tests rely on), `alloc_mode_holds_memory`.
+Implement: parse the request line in `testapp.rs`'s TCP loop (it currently only logs it); add `TestAppMode::Alloc(usize)`; add a `Testapp` subcommand to `src/bin/bun.rs` delegating to the same library as `src/bin/testapp.rs`; expose `exit-after` in the standalone binary's `--mode` parser (currently missing).
+Book: §"A workload in your pocket".
+
+**3/20 — Promote `TestHarness` into `tests/support/`**
+Tests: existing suites keep passing.
+Implement: move `TestHarness` from `tests/integration.rs` into `tests/support/harness.rs`, make it `pub(crate)`-visible to all integration tests, update `tests/integration.rs` to use it. No behaviour change.
+Book: none (mechanical).
+
+### Stream B — `relish test` (steps 4–8)
+
+**4/20 — testkit core: report types, registry, filters** (as original step 3; §7.2)
+**5/20 — runner: parallelism, timeouts, teardown, skips** (as original step 4; `Semaphore` + `JoinSet`; **no `start_paused`** — standing pitfall)
+**6/20 — `relish test` command + `CommandOutcome`** (as original step 5, plus: give the four new commands `Result<CommandOutcome, RelishError>` so exit codes 0/1/2 are expressible)
+**7/20 — catalogue part A** — scheduling, deployments, health-checks, process-workloads, jobs (18 cases)
+**8/20 — catalogue part B** — service-discovery, secrets-config, firewall, workload-identity, ingress, volumes, image-registry, cluster-coordination (21 cases). Most of these are now *actually testable* — the wiring landed in 12b.
+
+### Stream C — Complete the chaos surface (steps 9–13) — **NEW**
+
+**9/20 — Fault targeting flags and CLI fidelity**
+Tests: `fault_request_carries_instance_node_and_reason` (each flag reaches the POSTed body); `clear_by_app_removes_only_that_apps_faults` (gives `clear_by_service` its first caller); `run_is_an_alias_for_scenario`; `dns_rejects_an_unknown_fault_type` (today it silently injects NXDOMAIN); `bandwidth_display_round_trips_megabits` (today `1mbps` echoes `0mbps`).
+Implement: `--instance`, `--node`, `--reason` on every fault subcommand; `--override-safety` on those where the rail is designed as overridable; `fault run` alias; `clear <app|id>`; `fault resume <app>` constructing `FaultType::Resume`; fix the `dns` positional, the `Display` unit bug and the `list` column widths.
+Book: §"The flags that were already wired".
+
+**10/20 — `[smoker]` config: default and maximum duration**
+Tests: `smoker_config_defaults_to_ten_minutes_and_one_hour`; `fault_exceeding_max_duration_is_rejected_with_both_values`; `fault_without_duration_uses_the_configured_default`; `max_duration_is_clamped_to_the_hard_ceiling` (the 24h `types.rs` clamp stays as a backstop).
+Implement: `[smoker] default_duration`, `max_duration` in `src/config/node.rs`; enforce server-side in the inject handler (not just CLI-side, which a direct API call bypasses); keep the 24h clamp beneath it.
+Book: §"Every fault must expire".
+
+**11/20 — Node-level faults (D4: transport quiesce)**
+Tests: unit — `node_kill_quiesces_all_cluster_transports`, `node_kill_restores_on_expiry`, `node_drain_stops_scheduling_but_keeps_gossip`, `node_fault_refuses_without_a_duration`; gated cluster (`tests/chaos_node.rs`, `RELIABURGER_CLUSTER_TESTS=1`) — `killed_leader_is_replaced_and_rejoins`.
+Implement: `src/smoker/node_fault.rs` — a reversible quiesce that blocks gossip, Raft and reporting transports (the mechanism `/v1/chaos/partition` already uses at `agent.rs:2505`, generalised), with `FaultReversal::NodeQuiesce`; replace the `NodeDrain | NodeKill` refusal arm; `node-drain` additionally cordons the node (the scheduler's `apply_upgrade_cordon` seam from Phase 14 already exists).
+Book: §"Killing a node without killing the process".
+
+**12/20 — Partition stops lying; memory-oom decision**
+Tests: `partition_without_ebpf_is_refused_not_silently_dropped`; move the quorum-rail acceptance test onto an eBPF node or a mock so the `TODO(Phase 15)` no-op can go; `memory_oom_is_implemented_or_refused_consistently`.
+Implement: remove the silent-success `Partition` arm — honest error without eBPF, like `delay`/`drop`. Decide `memory oom`: implement via `memory.max` squeeze **or** remove it from the docs; don't leave documented-but-rejected.
+Book: §"The last fault that lied".
+
+**13/20 — Fault authorisation and audit (D2)**
+Tests: `deployer_cannot_inject_without_the_grant`; `admin_can_inject`; `fault_injection_permission_grants_a_deployer`; `injected_faults_emit_an_audit_event_with_the_authenticated_principal`.
+Implement: `fault-injection` permission; `require_fault_injection` in the inject/clear handlers; `ROUTE_MATRIX` updated; `injected_by` taken from the **authenticated principal server-side**, not the client's `$USER`; emit `fault.injected` into the event store with principal, target, type, duration.
+Book: §"Who may break production".
+
+*(If D1 = implement routing, insert **13b/20 — leader-mediated fault distribution**: `--node` routes through the leader's reporting tree; `target_node` stops being dead.)*
+
+### Stream D — `relish test --chaos` (step 14)
+
+**14/20 — Chaos suite with production guards**
+Tests: pure `chaos_preflight(caps, flags, is_tty) -> Result<(), RefusalReason>` — `refuses_fewer_than_three_nodes`, `refuses_production_without_override`, `allows_production_with_override`, `requires_yes_when_not_a_tty`; integration — `--chaos` against the 1-node harness exits 1 naming the 3-node requirement.
+Implement: the five scenarios (now genuinely runnable), `ChaosGuard` that always clears the faults **it injected** (track ids — never a blanket clear), `--chaos`/`--override`/`--yes`.
+Book: §"Chaos with a safety catch".
+
+### Stream E — `relish bench` (steps 15–16)
+
+**15/20 — bench schema + regression comparison** (direction-aware, 10 % threshold, `schema_version` guard)
+**16/20 — the seven suites** (`--quick` scaling, per-suite timeout, skip plumbing, `--capacity` opt-in)
+
+### Stream F — `relish wtf` (steps 17–18)
+
+**17/20 — pure `diagnose()` + pattern catalogue** (13 patterns, one `check_*` fn each, crashloop→deploy correlation)
+**18/20 — `collect()` fan-out + CLI** (parallel, 10s per-request timeouts, `--app`, `--watch`, exit 0/1/2)
+
+### Stream G — `relish trace` (steps 19–20)
+
+**19/20 — `/v1/trace` endpoint + pure firewall evaluator**
+**20/20 — `relish trace` CLI + phase close-out** (progress.md, both READMEs, chapter 15 final pass, this plan's checklist)
+
+---
+
+## 7. Data structures
+
+Unchanged from the 6 July plan except where noted. Reproduced here only where the revision changes them.
+
+### 7.1 `ClusterCapabilities` — `src/bun/capabilities.rs`
+
+**Renamed** from `Capabilities` to avoid colliding with `NodeCapabilities` (`meat/cluster_state.rs:15`) and `PlatformCapabilities` (`bun/supervisor.rs:74`).
 
 ```rust
-/// What this node/cluster actually has wired up. Diagnostics and the test
-/// runner consult this instead of guessing from errors.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Capabilities {
-    pub version: String,                 // env!("CARGO_PKG_VERSION")
-    pub environment: Option<String>,     // [cluster] environment, e.g. "production"
-    pub container_runtime: String,       // "process" | "runc" | "apple"
-    pub cluster: bool,                   // running with --cluster
-    pub node_count: u32,                 // from membership, 1 if standalone
-    pub metrics: bool,                   // ApiState.mayo.is_some()
-    pub logs: bool,                      // ApiState.log_store.is_some()
-    pub rollups: bool,                   // ApiState.rollup_store.is_some()
-    pub council: bool,                   // ApiState.council.is_some()
-    pub registry: bool,                  // ApiState.pickle_catalog.is_some()
-    pub fault_injection: bool,           // smoker enforcement wired (see step 1)
-    pub ebpf: bool,                      // cfg!(feature = "ebpf") && loader active
-    pub ingress: bool,                   // wrapper proxy listener bound
-    pub firewall: bool,                  // firewall enabled in config
-    pub identity: bool,                  // workload identity wired (wrapping IKM present)
+pub struct ClusterCapabilities {
+    pub version: String,
+    pub environment: Option<String>,
+    pub container_runtime: String,
+    pub cluster: bool,
+    pub node_count: u32,
+    pub metrics: bool,        // ApiState.mayo.is_some()
+    pub logs: bool,           // ApiState.log_store.is_some()
+    pub rollups: bool,        // ApiState.rollup_store.is_some()
+    pub council: bool,        // ApiState.council.is_some()
+    pub registry: bool,       // ApiState.pickle_catalog.is_some()
+    pub events: bool,         // ApiState.events.is_some()
+    pub upgrade: bool,        // ApiState.upgrade.is_some()
+    pub fault_injection: bool,
+    pub ebpf: bool,
+    pub ingress: bool,
+    pub firewall: bool,
+    pub identity: bool,
     pub process_workloads: bool,
 }
 ```
 
-Route: `GET /v1/capabilities` (protected). Handler derives every field from `ApiState` and config — no hardcoded `true`. For subsystems whose wiring lands later (ingress, eBPF), return `false` today; the field flips when the wiring commit sets it. Leave a `// TODO(review L7/L8):` marker where that will happen.
+Every field derives from `ApiState` or config — no hardcoded `true`. `Capability` (what a *test* requires) stays as specified, in `src/testkit/mod.rs`, with `MultiNode => node_count >= 3`.
 
-`Capability` (what a test requires) — `src/testkit/mod.rs`:
+### Carried forward verbatim (7.2 – 7.12)
 
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
-    Cluster, Metrics, Logs, Council, Registry, FaultInjection,
-    Ebpf, Ingress, Firewall, Identity, ProcessWorkloads, MultiNode,
-}
+Everything below this line is carried verbatim from the 6 July plan and is still
+correct. Two notes before it:
 
-impl Capabilities {
-    pub fn has(&self, c: Capability) -> bool { /* match, MultiNode => node_count >= 3 */ }
-    pub fn missing(&self, wanted: &[Capability]) -> Vec<Capability> { ... }
-}
-```
+- `TestFn = fn(TestContext) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>`
+  is still the shape (async fn pointers don't exist in Rust). Good book moment for
+  `Pin` and boxed trait objects.
+- The `CorrelatedEvent` deviation note still applies, **but** `ApiState.events` now
+  exists (`EventStore`), so correlation can draw on real events rather than only
+  deploy history. Prefer the event store; keep deploy history as a fallback.
 
-### 4.2 Test runner types — `src/testkit/report.rs`, `registry.rs`
+### 7.2 Test runner types — `src/testkit/report.rs`, `registry.rs`
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -262,7 +361,7 @@ fn boxed<F>(f: fn(TestContext) -> F) -> TestFn where F: Future<Output = Result<(
 
 (If the generic wrapper fights the type system, fall back to a `case!` macro_rules that wraps `Box::pin(body(ctx))`. Keep it simple; no external crates.)
 
-### 4.3 TestContext — `src/testkit/context.rs`
+### 7.3 TestContext — `src/testkit/context.rs`
 
 ```rust
 pub struct TestContext {
@@ -290,7 +389,7 @@ impl TestContext {
 
 Polling helpers use a 500 ms interval and the context deadline; every HTTP call goes through `tokio::time::timeout`.
 
-### 4.4 Bench types — `src/testkit/bench/report.rs`, `compare.rs`
+### 7.4 Bench types — `src/testkit/bench/report.rs`, `compare.rs`
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,7 +429,7 @@ pub fn compare(baseline: &BenchReport, current: &BenchReport, threshold: f64) ->
 
 Baseline file = a previous `relish bench --output json` capture, verbatim. Reject `schema_version != 1` with a clear error.
 
-### 4.5 Wtf types — `src/relish/wtf.rs` (structs match `docs/design/cli-relish.md` §4, with one deviation)
+### 7.5 Wtf types — `src/relish/wtf.rs` (structs match `docs/design/cli-relish.md` §4, with one deviation)
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,7 +493,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
 
 Reuse existing response structs from `src/relish/client.rs` / `src/bun/api.rs` rather than redefining them; add `pub` or move types if needed.
 
-### 4.6 Trace types — shared, so put them in `src/onion/trace.rs` or `src/bun/api.rs`; match the design doc exactly
+### 7.6 Trace types — shared, so put them in `src/onion/trace.rs` or `src/bun/api.rs`; match the design doc exactly
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,7 +524,7 @@ pub enum TraceVerdict {
 
 ---
 
-## 5. The test catalogue (39 cases)
+### 7.7 The test catalogue (39 cases)
 
 Names are behaviour sentences (project convention). Each case: apply config → wait → assert via API → runner tears down the namespace. `requires` lists capabilities beyond the implicit ones. If an assertion depends on wiring that hasn't landed (per `docs/plans/2026-07-02-review-codebase.md`), gate it on the capability and skip — never write a test that asserts broken behaviour just to pass.
 
@@ -496,7 +595,7 @@ Names are behaviour sentences (project convention). Each case: apply config → 
 
 ---
 
-## 6. The chaos suite (5 scenarios)
+### 7.8 The chaos suite (5 scenarios)
 
 Location: `src/testkit/chaos/scenarios.rs`. Runs through the same runner (they are `TestCase`s with `requires: &[Capability::MultiNode, Capability::FaultInjection, ...]`), selected by `--chaos`. Each scenario seeds workloads, injects via the fault API (`BunClient` → `/v1/fault`, `/v1/chaos/partition`), asserts recovery, then **clears all faults in teardown even on failure** (`DELETE /v1/fault` + `/v1/chaos/heal` — make `TestContext::teardown` chaos-aware or give scenarios a `ChaosGuard` RAII-ish struct whose cleanup the runner always awaits).
 
@@ -518,7 +617,7 @@ Report: chaos results are ordinary `TestCaseResult`s inside a `TestReport` with 
 
 ---
 
-## 7. The bench suites
+### 7.9 The bench suites
 
 Client-side orchestration in `src/testkit/bench/suites.rs`, all through public APIs, each suite returning `Vec<BenchMetric>` or a skip reason. Namespace `rbbench-{run_id}`; teardown always.
 
@@ -536,7 +635,7 @@ Rules: p-quantiles computed on sorted samples (no interpolation needed at these 
 
 ---
 
-## 8. The wtf pattern catalogue
+### 7.10 The wtf pattern catalogue
 
 `diagnose()` walks this table top-to-bottom. Every pattern is one small pure function `fn check_x(inputs: &WtfInputs, out: &mut WtfReport)` so each gets its own unit test.
 
@@ -566,7 +665,7 @@ OK entries (emit when the corresponding check passes and data was available): "a
 
 ---
 
-## 9. Trace: endpoint and semantics
+### 7.11 Trace: endpoint and semantics
 
 **Endpoint:** `GET /v1/trace?from={app}&namespace={ns}&to={dest}&port={port}` (protected) in `src/bun/api.rs`; assembly logic in a helper module so it stays testable (`src/onion/trace.rs`: `pub async fn run_trace(deps..., from, to, port) -> TraceResult`).
 
@@ -599,7 +698,7 @@ Failures print the failing step in red with its reason and stop the summary at `
 
 ---
 
-## 10. CLI wiring details
+### 7.12 CLI wiring details
 
 New variants in `Command` (`src/bin/relish.rs`), reusing the **global** `--output` flag rather than adding per-command ones:
 
@@ -654,170 +753,77 @@ Duration parsing: reuse the parser in `src/relish/fault.rs` (move it to a shared
 
 ---
 
-## 11. Commit-sized steps (the actual plan)
+## 8. Corrections to the catalogues above
 
-Each step: **(a)** failing tests first, **(b)** implementation, **(c)** book section, **(d)** `make ci` green → show commit → confirm → commit.
+The sections immediately above are the 6 July text. Apply these corrections when
+implementing them:
 
-### Step 1/15 — Capabilities endpoint and environment tag
-
-- **Tests first:** in `src/bun/api.rs` tests or `tests/capabilities.rs`: `capabilities_reports_wired_subsystems` (build `ApiState` with mayo=Some, council=None → JSON has `"metrics":true,"council":false`); `capabilities_reports_environment_tag` (config with `[cluster] environment = "production"`); `capabilities_defaults_to_no_environment`. Client test: `BunClient::capabilities()` deserialises.
-- **Implement:** `Capabilities` + `Capability` (§4.1); `[cluster] environment: Option<String>` in `src/config/node.rs` (plumb into `ApiState` — likely a new plain field set from config in `src/bin/bun.rs` and `tests` harness); `GET /v1/capabilities` route (protected); `BunClient::capabilities()`; `Capabilities::has/missing`.
-- **Book:** open Chapter 15 — replace the stub with the chapter intro ("Why a cluster should test itself") + §15.1 on capability discovery and graceful degradation as a design stance. Explain `Option` fields on `ApiState` as Rust's answer to nullable wiring.
-- **Commit:** `Add cluster capabilities endpoint (Phase 15, 1/15)`
-
-### Step 2/15 — Embed the test app in bun; extend its modes
-
-- **Tests first:** in `src/bun/testapp.rs`: `alloc_mode_grows_memory` (mode allocates and holds N MiB), `payload_endpoint_serves_requested_bytes` (GET `/payload?bytes=1048576` returns exactly that many bytes), `echo_env_endpoint_returns_variable` (GET `/env/FOO` returns the value or 404). Binary-level: `bun testapp --mode healthy` starts and answers `/` (spawn in a test with a random port, curl via reqwest, kill).
-- **Implement:** extend `TestAppMode` with `Alloc(usize /* MiB */)`; add `/payload` and `/env/{name}` routes to the test app server regardless of mode; add a `Testapp` subcommand to `src/bin/bun.rs`'s clap (delegating to the same code as `src/bin/testapp.rs` — keep the standalone binary, both are thin wrappers over the library).
-- **Book:** §15.2 "A workload in your pocket" — why the test workload ships inside the orchestrator binary (no registry dependence, version-locked to the cluster), and a short note on clap subcommands sharing a library core.
-- **Commit:** `Embed testapp in bun with alloc and payload modes (Phase 15, 2/15)`
-
-### Step 3/15 — Testkit core: types, registry, filters
-
-- **Tests first** (`src/testkit/` unit tests): `empty_filter_selects_all_groups`, `filter_matches_single_group`, `filter_matches_multiple_comma_separated_groups`, `filter_rejects_unknown_group_naming_valid_ones` (error text contains "scheduling"), `report_counts_match_outcomes`, `test_report_serialises_to_stable_json` (insta snapshot of a fixed `TestReport`), `skipped_outcome_carries_reason`.
-- **Implement:** §4.2 types, `parse_filter`, `select`, `all_cases()` returning an empty vec for now, `TestReport::from_results(...)` aggregation.
-- **Book:** §15.3 "A test framework in three types" — walk through `TestOutcome` as an enum with data (contrast Go's `(bool, error)` and Python exceptions), serde `tag = "status"`, and why `TestFn` is `fn(...) -> Pin<Box<dyn Future>>` (first-time explanation of `Pin`, boxed trait objects, and why async fn pointers don't exist).
-- **Commit:** `Add testkit report types, registry and filters (Phase 15, 3/15)`
-
-### Step 4/15 — Runner: parallelism, timeouts, teardown, skips
-
-- **Tests first** (unit tests with synthetic `TestCase`s built from closures over channels/AtomicU32 — no cluster): `runner_respects_parallel_limit` (track max concurrency with an atomic; assert ≤ limit), `runner_times_out_hung_test` (a case that `pending()`s forever → `TimedOut` within budget; use a short 100 ms timeout, **not** `start_paused` — remembered pitfall: `tokio::spawn` + `start_paused` don't mix), `runner_runs_teardown_after_failure` (teardown flag set even when case errs), `runner_skips_cases_missing_capabilities` (case requiring `Ebpf` against caps without it → `Skipped` and its body never ran), `runner_isolates_namespaces` (two cases see different `ctx.namespace`).
-- **Implement:** `src/testkit/runner.rs` — `pub async fn run(cases, caps, client, opts: RunOptions) -> TestReport`. Structure: `tokio::sync::Semaphore` (permits = parallel) + `tokio::task::JoinSet`; each task: acquire permit → build `TestContext` (fresh namespace unless `--namespace` pins one) → `tokio::time::timeout(opts.timeout, (case.run)(ctx.clone()))` → always `ctx.teardown().await` → outcome. Capability check happens *before* spawning (skip synchronously). Live progress line per finished test via a `mpsc` channel to the caller (the CLI prints `  ✓ name (1.2s)` as results arrive).
-- **Book:** §15.4 "Running forty tests without stepping on production" — namespaces as the isolation unit, `Semaphore` vs a worker pool, `JoinSet`, and why teardown lives in the runner not the test (compare Go's `t.Cleanup`).
-- **Commit:** `Add parallel test runner with timeouts and teardown (Phase 15, 4/15)`
-
-### Step 5/15 — `relish test` command
-
-- **Tests first:** `tests/testkit_cli.rs` using the in-process `TestHarness` from `tests/integration.rs`: register a tiny synthetic suite (pass/fail/skip) through a test-only hook (`runner::run` takes the case list as a parameter — the CLI passes `all_cases()`, the test passes fixtures), assert: JSON output parses back into `TestReport`; exit code 1 when a case fails, 0 when only skips; `--filter` narrows; human output snapshot (insta, strip durations with a regex before snapshotting). Also `test_context_apply_and_wait_running` — a real end-to-end: `TestContext` deploys `testapp_spec` against the harness and `wait_running` succeeds (this validates the helpers against ProcessGrill).
-- **Implement:** `src/relish/test_cmd.rs` (`pub async fn run_test(...) -> Result<ExitCode, RelishError>`), `Command::Test` variant, dispatch in `main`, human renderer (grouped by `TestGroup`, summary line `39 tests: 35 passed, 0 failed, 4 skipped (2m 14s)`), JSON = `serde_json::to_string_pretty(&report)`.
-- **Book:** §15.5 "The front door" — CLI wiring, exit codes as API (`ExitCode`), rendering the same struct as human text and JSON.
-- **Commit:** `Add relish test command with runner wiring (Phase 15, 5/15)`
-
-### Step 6/15 — Case catalogue part A
-
-- **Tests first:** the cases *are* tests; the repo-level guard is `tests/testkit_catalogue.rs`: `all_cases_have_unique_names`, `all_cases_declare_valid_groups`, `catalogue_covers_every_group` (once part B lands: exactly 39; for now assert the five part-A groups have 3 each). Where a case's logic has a pure core (e.g. "did replicas land on ≥2 nodes" from a status response), extract it and unit-test it with fixtures.
-- **Implement:** cases 1–12 + 28–33 (scheduling, deployments, health-checks, process-workloads, jobs — the groups exercisable on today's wiring) in `src/testkit/cases/`. Use `TestContext` helpers only; every wait has a deadline; failure messages must say what was expected vs observed (`"expected 3 running replicas within 60s, saw 1 (instances: […])"`).
-- **Book:** §15.6 "What we actually test" (first half) — pick two cases (7 rolling-deploy and 10 restart) and walk through them as exemplars: poll-with-deadline shape, asserting via the public API only.
-- **Commit:** `Add scheduling, deploy, health, process and job test cases (Phase 15, 6/15)`
-
-### Step 7/15 — Case catalogue part B
-
-- **Tests first:** extend `catalogue_covers_every_group` to 13 groups / 39 cases; unit-test pure helpers (e.g. the synthetic OCI image fixture builder: `fixture_image_has_valid_digests`).
-- **Implement:** cases 4–6, 13–27, 34–39 (service-discovery, secrets-config, firewall, workload-identity, ingress, volumes, image-registry, cluster-coordination) with their `requires` capability lists (§5). These are the groups most exposed to pending wiring — every one must skip cleanly on a bare cluster today and pass on a fully wired one later. Build the OCI fixture (deterministic tar layer + config JSON, sha256 via existing deps) for the registry group.
-- **Book:** §15.6 (second half) — the graceful-skip story: show `relish test` output on a partially wired cluster, and why SKIPPED is honest where a green fake would rot.
-- **Commit:** `Complete the 39-case integration catalogue (Phase 15, 7/15)`
-
-### Step 8/15 — Chaos suite
-
-- **Tests first:** unit: `chaos_refuses_fewer_than_three_nodes`, `chaos_refuses_production_without_override`, `chaos_allows_production_with_override`, `chaos_requires_yes_when_not_a_tty` (factor the guard into a pure `fn chaos_preflight(caps, flags, is_tty) -> Result<(), RefusalReason>`); integration (`tests/testkit_cli.rs`): `--chaos` against the 1-node harness exits 1 with the "requires at least 3 nodes" message.
-- **Implement:** `src/testkit/chaos/` — preflight + the 5 scenarios (§6) + `ChaosGuard` teardown that always clears faults and heals partitions; `--chaos`, `--override`, `--yes` handling in `test_cmd.rs`.
-- **Book:** §15.7 "Chaos with a safety catch" — production guards, the confirmation UX, and one scenario (C1 leader failure) end to end; connect back to Chapter 8's Smoker.
-- **Commit:** `Add the chaos test suite with production guards (Phase 15, 8/15)`
-
-### Step 9/15 — Bench core and CLI skeleton
-
-- **Tests first:** unit (`src/testkit/bench/`): `compare_flags_regression_over_threshold` (11 % worse → flagged), `compare_ignores_changes_within_threshold` (9 % → not), `compare_respects_metric_direction` (throughput drop = regression; latency drop = improvement), `compare_reports_missing_metrics_without_failing`, `baseline_rejects_unknown_schema_version`, `bench_report_serialises_to_stable_json` (insta).
-- **Implement:** §4.4 types, `compare`, baseline load (`std::fs` is fine in the CLI path — it's not the agent runtime; use `tokio::fs` if already conventional), `src/relish/bench_cmd.rs` + `Command::Bench` with an empty suite list, human renderer for report + comparison table (`name  baseline  current  Δ%  verdict`), exit 1 on any regression.
-- **Book:** §15.8 "Measuring without lying" (first half) — regression math, direction-aware comparison, why the threshold is 10 % and per-metric noise matters.
-- **Commit:** `Add bench report schema and regression comparison (Phase 15, 9/15)`
-
-### Step 10/15 — Bench suites A
-
-- **Tests first:** pure helpers unit-tested: `p99_of_sorted_samples`, `median_of_samples`; integration: `bench_quick_produces_valid_report_against_harness` — `--quick` against the in-process harness runs suites 1–3 (tiny sizes) and yields a parseable report with ≥3 metrics.
-- **Implement:** suites 1–3 (deploy_speed, scheduler_throughput, discovery_latency_p99) in `suites.rs`, `--quick` scaling, per-suite timeout envelope, live progress lines.
-- **Book:** §15.8 (second half) — walk suite 1: what "deploy speed" includes and excludes and why medians beat means here.
-- **Commit:** `Add deploy, scheduler and discovery bench suites (Phase 15, 10/15)`
-
-### Step 11/15 — Bench suites B
-
-- **Tests first:** `network_throughput_computes_mib_per_second` (pure maths from bytes+duration), `capacity_suite_requires_explicit_flag`, plus skip-reason assertions for suites 5/6 against a caps struct without fault-injection/registry.
-- **Implement:** suites 4–7 (network via `/payload`, reconstruction via leader kill, image distribution, capacity behind `--capacity`), skip plumbing into `BenchReport.skipped`.
-- **Book:** §15.9 "The expensive numbers" — reconstruction and capacity: benchmarks that hurt, and why they're opt-in/skip-by-default.
-- **Commit:** `Complete the bench suites (Phase 15, 11/15)`
-
-### Step 12/15 — Wtf engine (pure)
-
-- **Tests first** (all against hand-built `WtfInputs` fixtures; one per pattern in §8): `wtf_reports_ok_for_healthy_cluster`, `wtf_flags_dead_node`, `wtf_flags_quorum_loss`, `wtf_flags_missing_leader`, `wtf_flags_crashlooping_app`, `wtf_links_crashloop_to_recent_deploy` (the correlated event is attached and the suggestion names the previous version), `wtf_flags_service_without_backends`, `wtf_deduplicates_no_backend_finding_when_crashloop_explains_it`, `wtf_warns_on_active_faults`, `wtf_warns_on_high_disk_and_criticals_at_95`, `wtf_warns_when_source_unavailable`, `wtf_unreachable_node_is_critical`, `wtf_app_scope_limits_findings`. Plus an insta snapshot of the human rendering of a mixed report.
-- **Implement:** `src/relish/wtf.rs` — `WtfInputs`, `diagnose` composed of per-pattern `check_*` fns, renderer (`✗ CRITICAL`, `! WARNING`, `✓ OK` sections + summary + suggestions indented under each finding). Update `docs/design/cli-relish.md` with the `CorrelatedEvent` deviation note.
-- **Book:** §15.10 "wtf: diagnosis, not dashboards" — the case for correlation over enumeration; show a crashloop→deploy correlation as narrative. Rust angle: keeping the engine pure made all thirteen patterns unit-testable with zero mocks.
-- **Commit:** `Add the wtf correlation engine (Phase 15, 12/15)`
-
-### Step 13/15 — `relish wtf` command
-
-- **Tests first:** integration against the harness: `wtf_healthy_harness_exits_zero`, `wtf_reports_active_fault_as_warning_exit_two` (inject a fault via the API first), `wtf_json_output_round_trips`; unit: `watch_rejects_json_output`.
-- **Implement:** `collect()` fan-out (`tokio::join!` over the endpoints, 10 s per-request timeouts, unreachable-node accounting via `/v1/cluster/nodes` addresses), `Command::Wtf` wiring, `--app`, `--watch` loop, exit-code mapping 0/1/2 through `ExitCode`.
-- **Book:** §15.11 "Fanning out politely" — parallel collection with `tokio::join!`, partial results as a feature, and exit codes as a contract with CI.
-- **Commit:** `Add relish wtf with fan-out collection (Phase 15, 13/15)`
-
-### Step 14/15 — Trace endpoint
-
-- **Tests first:** unit for the pure firewall evaluator (`src/firewall/evaluate.rs`): `evaluate_permits_listed_source`, `evaluate_denies_unlisted_source`, `evaluate_permits_all_when_no_allow_from_declared` (match current semantics — check how allow_from is defined in config; adjust name to reality), `evaluate_identifies_matching_rule_text`; endpoint integration (harness): `trace_passes_between_two_running_apps` (deploy two testapps, trace → 4 passes, latency present), `trace_fails_at_resolution_for_unknown_service`, `trace_fails_on_no_healthy_backends` (deploy then stop), `trace_probe_reports_refused_port` (trace to a service whose backend died).
-- **Implement:** `evaluate.rs`; `src/onion/trace.rs::run_trace`; `GET /v1/trace` handler; external-host branch (system DNS + mandatory port).
-- **Book:** §15.12 "Following one connection" (first half) — the four layers a packet crosses and how each is interrogated; be explicit about the two honesty notes (declared policy vs live nftables; node-origin probe).
-- **Commit:** `Add /v1/trace connectivity endpoint (Phase 15, 14/15)`
-
-### Step 15/15 — `relish trace` command + phase close-out
-
-- **Tests first:** integration: `relish_trace_end_to_end_exit_codes` (pass → 0; unknown dest → 1); insta snapshots of pass and fail renderings from fixed `TraceResult`s.
-- **Implement:** `src/relish/trace.rs` (locate source node via `/v1/status` + `/v1/cluster/nodes`, call, render §9), `Command::Trace` wiring, `--port` defaulting from the destination app's declared port.
-- **Close-out (same step):** finish Chapter 15 — §15.12 second half, §15.13 "Lessons learned" (what was tricky: async fn pointers, teardown guarantees, honest skips), chapter intro/outro pass for flow; tick every Phase 15 box in `docs/progress.md`; update `docs/README.md` and top-level `README.md` (new commands with one-line descriptions, test counts from a fresh `cargo test` run, Phase 15 status, chapter table); update the roadmap milestone line if wording drifted; sweep this plan's §13 checklist.
-- **Commit:** `Add relish trace and close out Phase 15 (Phase 15, 15/15)`
+- **Fewer skips.** Ingress, workload-identity, firewall, image-registry, volumes and cluster-coordination groups were expected to skip on today's wiring. They mostly work now. Write them to run, and let the capability gate catch what doesn't.
+- **Chaos scenarios C1/C2/C5 depend on step 11.** Do not attempt stream D before stream C.
+- **Bench suite 6 (`image_distribution`)** was "skip until review L10 lands" — L10 landed. Implement it.
+- **wtf pattern `cert-expiring`** was `// TODO(review L18)` — L18 landed; certificate data is available via the identity endpoints. Implement it.
+- **Trace step 3** honesty note stands: it evaluates *declared* `allow_from` policy, not live nftables. Say so in `details` and in the book.
 
 ---
 
-## 12. Acceptance runbook (manual/CI, real cluster)
+## 9. Acceptance runbook
 
-Run after step 8 and again after step 15, on macOS with Lima installed:
+After step 14 and again after step 20, on macOS with Lima:
 
 ```bash
-relish dev create --nodes 3          # real 3-node Linux cluster (runc)
-relish dev status
-# point relish at a node (see dev status output / --cluster flag or RELIABURGER_* env)
-relish test --output json | tee /tmp/test-report.json      # expect: 0 failed; skips only for unwired capabilities, each with a reason
-relish test --filter scheduling                            # only scheduling group runs
-relish test --chaos --yes                                  # 5 scenarios, cluster healthy afterwards, `relish fault list` empty
+relish dev create --nodes 3
+relish test --output json | tee /tmp/test-report.json   # 0 failed; skips carry reasons
+relish test --filter scheduling
+relish fault kill web --count 1 --reason "runbook"      # new flags land in `fault list`
+relish fault clear web                                  # clear-by-app
+relish fault node-kill <node> --duration 60s            # real now
+relish test --chaos --yes                               # 5 scenarios; `fault list` empty after
 relish bench --quick --output json > /tmp/base.json
-relish bench --quick --compare /tmp/base.json              # ~0 regressions against itself
-relish wtf                                                 # exit 0 on the healthy cluster
-relish fault kill <some-test-app> --count 1 && relish wtf  # crashloop/backends finding appears; exit non-zero
-relish trace <appA> --to <appB>                            # 4 steps, PASS
+relish bench --quick --compare /tmp/base.json           # ~0 regressions against itself
+relish wtf                                              # exit 0 healthy
+relish fault kill <app> --count 1 && relish wtf         # finding appears; exit non-zero
+relish trace <appA> --to <appB>
 relish dev destroy
 ```
 
-Record the outcome (date, cluster size, skips observed) at the bottom of this file.
+Record date, cluster size and observed skips at the bottom of this file.
 
 ---
 
-## 13. Step checklist
+## 10. Step checklist
 
-- [ ] 1/15 capabilities endpoint
-- [ ] 2/15 embedded testapp + modes
-- [ ] 3/15 testkit core types
-- [ ] 4/15 runner
-- [ ] 5/15 `relish test` CLI
-- [ ] 6/15 catalogue A
-- [ ] 7/15 catalogue B
-- [ ] 8/15 chaos suite
-- [ ] 9/15 bench core
-- [ ] 10/15 bench suites A
-- [ ] 11/15 bench suites B
-- [ ] 12/15 wtf engine
-- [ ] 13/15 `relish wtf` CLI
-- [ ] 14/15 trace endpoint
-- [ ] 15/15 `relish trace` + close-out
+- [ ] 1/20 capabilities endpoint + `[cluster] environment`
+- [ ] 2/20 testapp routes + alloc mode + `bun testapp`
+- [ ] 3/20 promote `TestHarness`
+- [ ] 4/20 testkit core types
+- [ ] 5/20 runner
+- [ ] 6/20 `relish test` CLI + `CommandOutcome`
+- [ ] 7/20 catalogue A
+- [ ] 8/20 catalogue B
+- [ ] 9/20 fault targeting flags + CLI fidelity
+- [ ] 10/20 `[smoker]` duration config
+- [ ] 11/20 node-level faults
+- [ ] 12/20 partition honesty + memory-oom decision
+- [ ] 13/20 fault authorisation + audit
+- [ ] 13b/20 leader-mediated distribution *(in scope — D1 resolved)*
+- [ ] 14/20 chaos suite
+- [ ] 15/20 bench schema + comparison
+- [ ] 16/20 bench suites
+- [ ] 17/20 wtf engine
+- [ ] 18/20 `relish wtf` CLI
+- [ ] 19/20 trace endpoint
+- [ ] 20/20 `relish trace` + close-out
 - [ ] acceptance runbook on a 3-node dev cluster
 
 ---
 
-## 14. Risks and gotchas (read before starting)
+## 11. Risks and gotchas
 
-1. **Don't assert broken behaviour.** Several catalogue cases guard known review bugs (H1, H2, H8). If the fix hasn't landed when you get there, the case will genuinely fail on a real cluster — that's the point. In repo CI (single-node harness) those specific assertions may be unreachable; keep them capability-/topology-gated rather than watering them down.
-2. **`start_paused` + `tokio::spawn` don't mix** (standing feedback). Runner timing tests use short real timeouts or manual channel driving.
-3. **Teardown is the runner's job.** A panicking or timed-out test must still get its namespace cleaned. Since case bodies return `Result` (no panics in our code), timeout + always-await-teardown covers it; if a case panics anyway, `JoinSet` reports it — map to `Failed { message: "panicked: …" }` and still tear down.
-4. **Never block the runtime.** SHA-256 over the OCI fixture and any file I/O in the agent path go through `spawn_blocking`; CLI-side small file reads are fine.
-5. **Timeout everything.** Every reqwest call, every poll loop, every TCP probe. A diagnosis tool that hangs is worse than no tool.
-6. **JSON stability.** `schema_version` on both report types; insta snapshots pin the shape. Changing a field name after this ships breaks users' CI — treat the JSON as API.
-7. **Namespace hygiene on real clusters.** `rbtest-*`/`rbbench-*` prefixes are the safety net; teardown stops by namespace, never by "everything the cluster runs". Grep yourself honest: no code path may call stop/clear endpoints without a namespace or fault-id filter — except chaos fault-clearing, which clears only faults the suite injected (track injected fault ids in `ChaosGuard`).
-8. **Cross-node client calls** (wtf fan-out, trace node targeting) need node API addresses from `/v1/cluster/nodes` and the same bearer token; verify the token is honoured cluster-wide once review C5a wiring lands — until then, single-node collection with `source-unavailable` warnings is acceptable and must not crash.
-9. **eBPF fields** are capability data, not compile decisions: the same relish binary must behave sensibly against Linux (eBPF on) and macOS (off) clusters.
-10. **Keep the book chapter honest.** Where we deviated from the design docs (`--capacity` flag, `CorrelatedEvent`, node-origin probe, `--yes`), the chapter says so and why — that's the "what we decided not to do" the book promises.
+Carried from the 6 July plan (all still apply): don't assert broken behaviour; `start_paused` + `tokio::spawn` don't mix; teardown is the runner's job; never block the runtime; timeout everything; JSON is API (`schema_version` + insta); namespace hygiene (`rbtest-*`/`rbbench-*`, never a blanket stop); cross-node calls need addresses from `/v1/cluster/nodes`; eBPF is capability data not a compile decision; the book says where we deviated from the design.
+
+New for this revision:
+
+12. **Chaos work touches the cluster plane.** Run `make test-cluster` (21 tests) on every stream-C/D commit, not just `make ci`.
+13. **`ROUTE_MATRIX` is enforced by a test.** Every new route (`/v1/capabilities`, `/v1/trace`) needs a matrix entry or `matrix_covers_every_mounted_route` fails. Routes naming `{app}` additionally need `authorize_scoped` (the C3 drift guard).
+14. **Don't reintroduce a silent no-op.** Step 12 exists because `Partition` still succeeds while doing nothing. Any new fault arm either works, or returns an error saying why — never `Ok(())` with no effect.
+15. **`injected_by` is currently spoofable.** Until step 13, treat it as a hint, not an audit record.
