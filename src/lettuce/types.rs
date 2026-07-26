@@ -36,7 +36,17 @@ pub struct GitOpsConfig {
     /// HMAC-SHA256 secret for webhook validation.
     #[serde(default)]
     pub webhook_secret: Option<String>,
-    /// Whether to recurse into subdirectories.
+    /// **Ignored — the sync is always recursive** (O20).
+    ///
+    /// `list_files` shells out to `git ls-tree -r`, which descends
+    /// unconditionally, so this flag has never changed anything. That makes
+    /// `recursive = false` the misleading case: it promises a shallow sync of
+    /// the watched path and delivers a deep one.
+    ///
+    /// Kept (rather than removed) so existing configs still parse, and
+    /// [`GitOpsConfig::warnings`] tells anyone who set it `false` that it is
+    /// not honoured. Making the listing genuinely optional would be a feature,
+    /// not a docs fix, so it isn't attempted here.
     #[serde(default)]
     pub recursive: bool,
     /// Maximum webhook triggers per minute (default: 10).
@@ -61,6 +71,24 @@ impl GitOpsConfig {
     /// Get the poll interval as a Duration.
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_interval_secs)
+    }
+
+    /// Settings that parse but don't do what they say (O20).
+    ///
+    /// A silently-ignored knob is worse than a missing one: the operator has
+    /// been told their intent is respected. These are surfaced at startup
+    /// rather than corrected, because changing behaviour to match a
+    /// misleading default would be its own surprise.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !self.recursive {
+            warnings.push(
+                "[gitops] recursive = false is not honoured — the sync always \
+                 descends into subdirectories (git ls-tree -r)"
+                    .to_string(),
+            );
+        }
+        warnings
     }
 }
 
@@ -95,8 +123,23 @@ pub struct SyncState {
     /// Summary of the last applied diff.
     pub last_diff_summary: Option<DiffSummary>,
     /// History of recent syncs (ring buffer, max 100).
+    ///
+    /// **Never written by the runner (O20).** The sync loop maintains the
+    /// scalar fields above — `last_applied_commit`, `phase`,
+    /// `consecutive_failures`, `last_error` — and leaves this empty, so
+    /// anything reading it sees "no syncs have happened" no matter how many
+    /// have. Populating it is a small piece of work in
+    /// [`crate::lettuce::runner`]; it's recorded here rather than in a review
+    /// document so the next reader of this struct doesn't trust it.
     pub history: VecDeque<SyncHistoryEntry>,
     /// Node ID of the current GitOps coordinator.
+    ///
+    /// **Informational only (O20).** The runner sets this from
+    /// `elect_coordinator`, but leadership is what actually gates syncing —
+    /// the loop is spawned leader-only and re-checks Raft leadership each
+    /// tick. Nothing reads this field to decide whether to sync, so a stale
+    /// or wrong value can't cause two nodes to sync at once. It exists for
+    /// operator visibility, not exclusion.
     pub coordinator_node_id: Option<String>,
 }
 

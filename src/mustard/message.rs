@@ -335,15 +335,47 @@ pub fn encode_datagram(message: &GossipMessage) -> Result<Vec<u8>, bincode::Erro
 /// silently rather than failing the whole message: the membership payload is
 /// still good, and gossip must keep flowing across versions.
 pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
+    // The HMAC lives *inside* the encoded message, so we cannot authenticate
+    // before decoding — decoding is how we get the tag. That makes this the
+    // one place where unauthenticated bytes from any sender reach a
+    // deserialiser, so bound what that deserialiser may allocate (O20).
+    //
+    // A length prefix inside a 1500-byte datagram can claim a multi-gigabyte
+    // `Vec`, and unbounded bincode will faithfully try to reserve it: the same
+    // "a number is a promise, not a fact" mistake as the Raft frame reader
+    // (O6), one layer down. Limiting the budget to the datagram's own length
+    // can't reject anything legitimate — a message that arrived in this many
+    // bytes was encoded in this many bytes — and makes an over-long claim a
+    // decode error instead of an allocation.
+    //
+    // The encoding must stay byte-identical to `bincode::serialize`, which
+    // `encode_datagram` uses and every deployed peer speaks. `bincode`'s
+    // builder API defaults to *varint* encoding, so the legacy shape has to be
+    // asked for explicitly — `with_fixint_encoding().with_little_endian()`.
+    // Getting this wrong wouldn't fail to compile, it would fail to talk to
+    // the rest of the cluster, so `legacy_wire_bytes_decode_unchanged` pins it.
+    use bincode::Options;
     let mut cursor = std::io::Cursor::new(bytes);
-    let mut message: GossipMessage = bincode::deserialize_from(&mut cursor)?;
+    let mut message: GossipMessage = datagram_codec(bytes.len()).deserialize_from(&mut cursor)?;
     let consumed = cursor.position() as usize;
     if consumed < bytes.len()
-        && let Ok(extension) = bincode::deserialize::<DirectoryExtension>(&bytes[consumed..])
+        && let Ok(extension) =
+            datagram_codec(bytes.len()).deserialize::<DirectoryExtension>(&bytes[consumed..])
     {
         message.extension = Some(extension);
     }
     Ok(message)
+}
+
+/// The datagram decoder: the legacy bincode wire encoding, with reads bounded
+/// to `limit` bytes (O20).
+fn datagram_codec(limit: usize) -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .allow_trailing_bytes()
+        .with_limit(limit as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -793,5 +825,109 @@ mod tests {
         assert_eq!(decoded.version, msg.version);
         assert_eq!(decoded.sender, msg.sender);
         assert_eq!(decoded.incarnation, msg.incarnation);
+    }
+
+    /// The decoder switched from bincode's deprecated `config()` builder to
+    /// the `Options` builder, whose default is *varint* encoding — a silent
+    /// wire-format change that compiles perfectly and simply stops talking to
+    /// every deployed peer. Pin the legacy shape against bytes produced by
+    /// `bincode::serialize` directly, which is what peers send.
+    #[test]
+    fn legacy_wire_bytes_decode_unchanged() {
+        let msg = GossipMessage::new(
+            NodeId::new("legacy-peer"),
+            42,
+            GossipPayload::Ack {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("target"),
+                    address: test_addr(),
+                    state: NodeState::Suspect,
+                    incarnation: 7,
+                    lamport: 9,
+                }],
+                relayed: false,
+            },
+        );
+        // Exactly what an older peer puts on the wire: plain `bincode::serialize`.
+        let legacy = bincode::serialize(&msg).expect("legacy encode");
+        let decoded = decode_datagram(&legacy).expect("legacy bytes must still decode");
+
+        assert_eq!(decoded.version, msg.version);
+        assert_eq!(decoded.sender, msg.sender);
+        assert_eq!(decoded.incarnation, 42);
+        assert_eq!(decoded.payload.updates().len(), 1);
+        assert_eq!(decoded.payload.updates()[0].incarnation, 7);
+        assert!(
+            decoded.extension.is_none(),
+            "a legacy datagram carries no directory extension"
+        );
+    }
+
+    /// O20: `decode_datagram` is the one place unauthenticated bytes from any
+    /// sender reach a deserialiser — the HMAC is inside the message, so we
+    /// have to decode to get the tag. An unbounded bincode will honour a
+    /// length prefix that claims gigabytes, from a datagram of a few dozen
+    /// bytes.
+    #[test]
+    fn a_datagram_claiming_more_than_it_carries_is_a_decode_error() {
+        // A real message, then a hostile one built by overwriting the first
+        // Vec length prefix we can reach with an enormous value. Rather than
+        // hand-assemble the encoding, take a valid datagram and corrupt its
+        // length fields one at a time — every position that decodes must not
+        // allocate beyond the datagram.
+        let msg = GossipMessage::new(
+            NodeId::new("sender"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![MembershipUpdate {
+                    node_id: NodeId::new("target"),
+                    address: test_addr(),
+                    state: NodeState::Alive,
+                    incarnation: 1,
+                    lamport: 1,
+                }],
+            },
+        );
+        let valid = encode_datagram(&msg).expect("encode");
+        assert!(decode_datagram(&valid).is_ok(), "baseline must decode");
+
+        // Any 8-byte window read as a little-endian u64 length becomes a
+        // gigantic claim. None of them may succeed with a huge allocation;
+        // each must either fail or decode within the datagram's budget.
+        let mut rejected = 0;
+        for offset in 0..valid.len().saturating_sub(8) {
+            let mut hostile = valid.clone();
+            hostile[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            if decode_datagram(&hostile).is_err() {
+                rejected += 1;
+            }
+        }
+        assert!(
+            rejected > 0,
+            "no corrupted length was rejected — the decode budget is not being applied"
+        );
+    }
+
+    /// The bound must not reject anything a peer can legitimately send, so a
+    /// full-size datagram (many updates, labels, endpoints) still decodes.
+    #[test]
+    fn a_large_but_legitimate_datagram_still_decodes() {
+        let updates: Vec<MembershipUpdate> = (0..MAX_PIGGYBACK_UPDATES)
+            .map(|i| MembershipUpdate {
+                node_id: NodeId::new(format!("node-with-a-fairly-long-name-{i}")),
+                address: test_addr(),
+                state: NodeState::Suspect,
+                incarnation: u64::MAX,
+                lamport: u64::MAX,
+            })
+            .collect();
+        let msg = GossipMessage::new(
+            NodeId::new("sender"),
+            u64::MAX,
+            GossipPayload::Ping { updates },
+        );
+        let bytes = encode_datagram(&msg).expect("encode");
+        let decoded = decode_datagram(&bytes).expect("a full-size datagram must decode");
+        assert_eq!(decoded.sender, msg.sender);
     }
 }

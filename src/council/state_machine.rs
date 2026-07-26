@@ -209,6 +209,14 @@ impl StateMachineInner {
                 // from its own spec, not a ghost override (DEP8).
                 let key = app_id.to_string();
                 self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+                // An in-flight deploy for a deleted app has nothing left to
+                // deploy, and its history describes an app that no longer
+                // exists. Both are keyed on the same `app_id` string as the
+                // override above, and both were left behind — the deploy state
+                // grew for the lifetime of the cluster and a recreated app
+                // inherited the dead one's history (O20).
+                self.state.active_deploys.retain(|(k, _)| k != &key);
+                self.state.deploy_history.retain(|(k, _)| k != &key);
                 let prefix = format!("{app_id}/");
                 self.state
                     .security_state
@@ -3036,6 +3044,79 @@ mod tests {
         assert!(state.apps.contains_key(&app_id));
         assert_eq!(state.batch_state.next_batch_id, 1);
         assert_eq!(state.build_state.next_build_id, 1);
+    }
+
+    /// O20: `AppDelete` cleared apps, scheduling, autoscale overrides and
+    /// secret seals but left the deploy state behind, so the Raft state grew
+    /// for the lifetime of the cluster and an app recreated under the same
+    /// name inherited the dead one's history.
+    #[test]
+    fn deleting_an_app_clears_its_deploy_state() {
+        use crate::meat::deploy_types::{DeployHistoryEntry, DeployId, DeployResult, DeployState};
+        use crate::meat::types::AppId;
+
+        let app_id = AppId {
+            name: "web".to_string(),
+            namespace: "default".to_string(),
+        };
+        let other = AppId {
+            name: "api".to_string(),
+            namespace: "default".to_string(),
+        };
+        let request = |id: &AppId, image: &str| crate::meat::deploy_types::DeployRequest {
+            app_id: id.clone(),
+            new_image: image.to_string(),
+            previous_image: None,
+            config: Default::default(),
+            pre_deploy_jobs: Vec::new(),
+        };
+        let entry = |id: &AppId| DeployHistoryEntry {
+            id: DeployId(1),
+            app_id: id.clone(),
+            image: "web:v1".to_string(),
+            result: DeployResult::Completed,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            completed_at: std::time::SystemTime::UNIX_EPOCH,
+            steps_completed: 1,
+            steps_total: 1,
+            spec: None,
+        };
+
+        let mut inner = StateMachineInner::default();
+        for id in [&app_id, &other] {
+            inner.apply_request(&RaftRequest::DeployUpdate {
+                app_id: id.clone(),
+                state: Box::new(DeployState::new(DeployId(1), request(id, "web:v1"))),
+            });
+            inner.apply_request(&RaftRequest::DeployComplete {
+                app_id: id.clone(),
+                entry: entry(id),
+            });
+            // Re-open an active deploy so both maps have an entry to clear.
+            inner.apply_request(&RaftRequest::DeployUpdate {
+                app_id: id.clone(),
+                state: Box::new(DeployState::new(DeployId(2), request(id, "web:v2"))),
+            });
+        }
+        assert_eq!(inner.state.active_deploys.len(), 2);
+        assert_eq!(inner.state.deploy_history.len(), 2);
+
+        inner.apply_request(&RaftRequest::AppDelete {
+            app_id: app_id.clone(),
+        });
+
+        let key = app_id.to_string();
+        assert!(
+            !inner.state.active_deploys.iter().any(|(k, _)| k == &key),
+            "a deleted app left an active deploy behind"
+        );
+        assert!(
+            !inner.state.deploy_history.iter().any(|(k, _)| k == &key),
+            "a deleted app left its deploy history behind"
+        );
+        // The other app is untouched — deletion is scoped, not a sweep.
+        assert_eq!(inner.state.active_deploys.len(), 1);
+        assert_eq!(inner.state.deploy_history.len(), 1);
     }
 
     /// O5: the CRL is replicated in every snapshot and scanned on every TLS

@@ -1638,7 +1638,32 @@ work, not by `M1`.
   rather than the caller's. Fixing it needs a source-IP→namespace map the userspace responder
   doesn't have (the limitation is already documented on `DnsConfig::default_namespace`), and
   eBPF connect enforcement remains the primary control here
-- [ ] `O20` stale/misleading docs and dead code sweep
+- [x] `O20` stale/misleading docs and dead code sweep — one genuine bug, one leak, two
+  honesty fixes, one deletion, one already-fine:
+  - [x] **Bug:** the gossip datagram was bincode-deserialised before its HMAC was checked (it
+    has to be — the tag is *inside* the message), and the deserialiser was unbounded, so a
+    length prefix in a 1500-byte datagram could claim gigabytes and bincode would try to
+    reserve it. The same "a number is a promise, not a fact" mistake as `O6`, one layer down.
+    The decode budget is now the datagram's own length, which can't reject anything
+    legitimate. Switching off bincode's deprecated `config()` meant explicitly re-pinning
+    `with_fixint_encoding().with_little_endian()` — the builder API defaults to *varint*, a
+    silent wire-format change that compiles fine and stops talking to every peer — so
+    `legacy_wire_bytes_decode_unchanged` pins the shape against `bincode::serialize` output
+  - [x] **Leak:** `AppDelete` cleared apps, scheduling, autoscale overrides and secret seals
+    but left `active_deploys`/`deploy_history`, so Raft state grew for the cluster's lifetime
+    and an app recreated under the same name inherited the dead one's history
+  - [x] **Honesty:** `[gitops] recursive` isn't ignored so much as redundant — `git ls-tree -r`
+    always descends — which makes `recursive = false` the misleading case, promising a shallow
+    sync and delivering a deep one. Documented, and `GitOpsConfig::warnings()` says so at
+    startup rather than correcting behaviour behind the operator's back. `SyncState::history`
+    (never written by the runner) and `coordinator_node_id` (informational — leadership is what
+    gates syncing) are documented at the fields, so the next reader doesn't trust them
+  - [x] **Deleted:** `smoker/node.rs` — `DrainPlan`/`KillPlan` had only self-tests and no
+    production callers, and described an "agent executes this plan" design that CHAOS1
+    explicitly rejected in favour of refusing node-level faults honestly
+  - [x] **Already fine:** the Raft-id djb2 collision risk is thoroughly documented at
+    `cluster::identity::raft_id_from_name` (12b.2/CP10), including why changing it needs a
+    flag day. No action
 
 The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise within this list.
 

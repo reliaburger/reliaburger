@@ -1336,6 +1336,11 @@ async fn main() -> anyhow::Result<()> {
     let mut gitops_webhook_validator = None;
     let gitops_webhook_tx =
         if let (Some(gitops), Some(council)) = (config.gitops.clone(), api_council.clone()) {
+            // O20: surface settings that parse but aren't honoured, rather
+            // than letting the operator believe they took effect.
+            for warning in gitops.warnings() {
+                eprintln!("bun: WARNING: {warning}");
+            }
             let (webhook_tx, webhook_rx) = mpsc::channel::<()>(16);
             if let Some(secret) = gitops.webhook_secret.as_deref() {
                 gitops_webhook_validator = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
