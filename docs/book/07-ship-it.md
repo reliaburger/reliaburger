@@ -388,7 +388,49 @@ async fn retire_with_drain(&self, ids: &[InstanceId], drain_timeout: Duration) {
 
 Before this runs, the rolling finaliser registers the *new* backends and rebuilds the routing table. So by the time we start draining, the proxy is already sending new requests to the fresh instances. The old ones only have to wait out the requests they were already handling. `wait_drained` polls until the instance's in-flight count hits zero or its deadline passes — new traffic already goes elsewhere, so this is a countdown, not a losing battle.
 
-This is also where surge and `max_unavailable` become real rather than aspirational. The rolling path brings every new replica up and healthy *before* it retires a single old one. So the count of serving instances never dips below the target: while the old ones drain, the new ones are already taking traffic. Retiring old instances one at a time, each after its drain, means we never yank more than we've already replaced. A redeploy of a one-replica app with `max_unavailable = 1` still starts the new instance before stopping the old — availability holds.
+This is where `max_unavailable` becomes real rather than aspirational. The rolling path brings a new replica up and healthy *before* it retires an old one, so the count of serving instances never dips below the target: while the old ones drain, the new ones are already taking traffic.
+
+Read that back with `max_surge` in mind, though, and something's missing. "Bring every new replica up, then retire the old ones" satisfies `max_unavailable = 0` beautifully. It also completely ignores `max_surge`. On a three-replica app it means six containers at peak, whatever you configured — and the default is `max_surge = 1`, which asks for four.
+
+So one of the two knobs was load-bearing and the other was decoration. `max_surge` parsed, validated, appeared in the config docs, and changed nothing. That's a worse failure than not supporting it at all: an operator who sets `max_surge = 1` because the node hasn't the headroom for double has been told their constraint is respected, and it isn't.
+
+The two bounds are really one small decision, repeated:
+
+```rust
+pub fn plan_rolling_step(
+    target: u32,
+    new_healthy: u32,
+    new_pending: u32,
+    old_remaining: u32,
+    max_surge: u32,
+    max_unavailable: u32,
+) -> RollingStep {
+    if new_healthy >= target && old_remaining == 0 {
+        return RollingStep::Done;
+    }
+    let serving = new_healthy + old_remaining;
+    let total = new_healthy + new_pending + old_remaining;
+
+    let owed = new_healthy + new_pending < target;
+    if owed && total < target.saturating_add(max_surge) {
+        return RollingStep::StartNew;
+    }
+    if old_remaining > 0 && serving > target.saturating_sub(max_unavailable) {
+        return RollingStep::RetireOld;
+    }
+    // …
+}
+```
+
+`max_surge` gates starting (how far above the target may `total` go?), `max_unavailable` gates retiring (how far below may `serving` fall?). Ask that question repeatedly and the rollout walks itself: with the defaults it starts one, retires one, starts one, retires one. With `max_surge = 0, max_unavailable = 1` it retires *first* and never exceeds the target, which is what you want when there's no spare capacity at all.
+
+Two things fell out of writing it this way.
+
+The first is that `max_surge = 0` and `max_unavailable = 0` together are unsatisfiable. You may not go above the target, so you can't start a replacement; you may not go below it, so you can't retire anything. Nothing in the config validated that pair, so it would have produced a rollout that looked live and made no progress. The planner returns a distinct `Stuck` for it and `DeployConfig::validate` rejects it at apply time with an explanation. When you write a rule as an explicit predicate, its unsatisfiable cases tend to walk up and introduce themselves; buried in a loop they'd have stayed hidden until someone hit one.
+
+The second is a hazard the interleaving created. Retiring old instances *during* the rollout rather than all at the end means the command loop gets a turn between retirements — and a deliberately stopped instance still sitting in `supervisor.instances` looks exactly like a crashed one to the restart driver, which would helpfully bring it back. So retirement drops the instance from the supervisor in the same turn that stops it (`Supervisor::retire_instance`). Interleaving two loops that used to run one-after-the-other is a reliable way to discover which of your invariants were really just orderings.
+
+Testing this is where the pure planner pays off. The unit tests don't assert step sequences — that would pin the implementation — they replay a whole rollout and assert the *envelope*: peak total and minimum serving. A proptest then does the same for every combination of target, existing count and bounds that validation permits. And because a planner nothing calls is worse than no planner (this codebase has a long history of exactly that), there are agent-level tests that replay the grill's call log to count live containers: three replicas with `max_surge = 1` peak at four, and they peak at six against the old code.
 
 ### Stop must wait for the process to actually exit
 

@@ -436,6 +436,30 @@ enum DeployOp {
         now: Instant,
         reply: oneshot::Sender<()>,
     },
+    /// Publish one freshly-healthy replacement as a routable backend (M7).
+    ///
+    /// Split out of `FinaliseRollingDeploy` so a rolling deploy can move
+    /// traffic onto a replacement *before* retiring an old instance, which is
+    /// what makes `max_unavailable = 0` mean anything.
+    PublishNewBackend {
+        app_name: String,
+        namespace: String,
+        new_id: InstanceId,
+        host_port: Option<u16>,
+        container_ip: Option<std::net::Ipv4Addr>,
+        has_port: bool,
+        reply: oneshot::Sender<()>,
+    },
+    /// Drain, stop and forget one old instance (M7).
+    ///
+    /// Also split out of `FinaliseRollingDeploy`, so retirement can be
+    /// interleaved with replacement one instance at a time instead of
+    /// happening all at once at the end.
+    RetireOldInstance {
+        old_id: InstanceId,
+        drain_timeout: std::time::Duration,
+        reply: oneshot::Sender<()>,
+    },
     /// Append an entry to the deploy history.
     PushDeployHistory {
         entry: Box<crate::meat::deploy_types::DeployHistoryEntry>,
@@ -823,6 +847,43 @@ impl DeployOps {
                 new_ips,
                 new_specs,
                 now,
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_new_backend(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        new_id: &InstanceId,
+        host_port: Option<u16>,
+        container_ip: Option<std::net::Ipv4Addr>,
+        has_port: bool,
+    ) {
+        self.call(
+            |reply| DeployOp::PublishNewBackend {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+                new_id: new_id.clone(),
+                host_port,
+                container_ip,
+                has_port,
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
+    async fn retire_old_instance(&self, old_id: &InstanceId, drain_timeout: std::time::Duration) {
+        self.call(
+            |reply| DeployOp::RetireOldInstance {
+                old_id: old_id.clone(),
+                drain_timeout,
                 reply,
             },
             (),
@@ -4161,6 +4222,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .unwrap_or_default()
             .drain_timeout;
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        // M7: publishing backends and retiring old instances now happen
+        // incrementally as the rollout steps, so by the time we get here both
+        // are usually already done. These loops are idempotent catch-ups for
+        // anything the stepped path didn't cover (a zero-port app, or an
+        // instance the planner retired before this call).
         if spec.port.is_some() {
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
@@ -6096,6 +6162,56 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Add one freshly-healthy replacement to the service map and rebuild the
+    /// routing table, so traffic moves onto it before anything old retires (M7).
+    async fn publish_new_backend(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        new_id: &InstanceId,
+        host_port: Option<u16>,
+        container_ip: Option<std::net::Ipv4Addr>,
+        has_port: bool,
+    ) {
+        if !has_port {
+            return;
+        }
+        let Some(host_port) = host_port else {
+            return;
+        };
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        let backend = crate::onion::types::BackendInstance {
+            instance_id: new_id.0.clone(),
+            node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+            host_port,
+            healthy: true,
+        };
+        let _ = self.service_map.add_backend(&service_id, backend);
+        self.rebuild_routing_table().await;
+    }
+
+    /// Drain, stop and forget one old instance (M7).
+    ///
+    /// The per-instance half of what `finalise_rolling_deploy` used to do to
+    /// every old instance at once. Interleaving it with replacement is what
+    /// gives `max_surge` and `max_unavailable` their meaning.
+    async fn retire_one_old_instance(
+        &mut self,
+        old_id: &InstanceId,
+        drain_timeout: std::time::Duration,
+    ) {
+        self.retire_with_drain(std::slice::from_ref(old_id), drain_timeout)
+            .await;
+        // NET6: lift the retiring instance's egress enforcement.
+        self.clear_egress(old_id).await;
+        self.cleanup_instance_identity(old_id);
+        self.remove_instance_record(old_id);
+        // Drop it from the supervisor in this same turn. A stopped instance
+        // still listed there looks exactly like a crashed one to the restart
+        // driver, which gets a chance to run between two retirement ops.
+        self.supervisor.retire_instance(old_id).await;
+    }
+
     /// Retire a set of old instances with connection draining (DEP5).
     ///
     /// New traffic is already routed away (the caller rebuilds the routing
@@ -6421,6 +6537,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     new_specs, now,
                 )
                 .await;
+                let _ = reply.send(());
+            }
+            DeployOp::PublishNewBackend {
+                app_name,
+                namespace,
+                new_id,
+                host_port,
+                container_ip,
+                has_port,
+                reply,
+            } => {
+                self.publish_new_backend(
+                    &app_name,
+                    &namespace,
+                    &new_id,
+                    host_port,
+                    container_ip,
+                    has_port,
+                )
+                .await;
+                let _ = reply.send(());
+            }
+            DeployOp::RetireOldInstance {
+                old_id,
+                drain_timeout,
+                reply,
+            } => {
+                self.retire_one_old_instance(&old_id, drain_timeout).await;
                 let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
@@ -6863,7 +7007,65 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_prepared: Vec<InstanceId> = Vec::new();
         let mut new_failed = false;
 
-        for i in 0..replica_count {
+        // M7: drive the rollout through `plan_rolling_step` rather than
+        // "start everything, then retire everything". The planner decides
+        // whether the next move is a replacement or a retirement based on
+        // `max_surge` (how far above the target we may go) and
+        // `max_unavailable` (how far below), which previously parsed,
+        // validated and changed nothing.
+        //
+        // `retired` tracks how many of `existing` are gone; `finalise_rolling_deploy`
+        // is given only what's left, and its own retire loop is an idempotent
+        // catch-up for anything the planner didn't reach.
+        let mut retired: usize = 0;
+        let mut next_replica_index: u32 = 0;
+        loop {
+            let step = crate::meat::deploy_types::plan_rolling_step(
+                replica_count,
+                new_ids.len() as u32,
+                0, // the start path health-waits inline, so nothing is ever pending here
+                (existing.len() - retired) as u32,
+                deploy_config.max_surge,
+                deploy_config.max_unavailable,
+            );
+            match step {
+                crate::meat::deploy_types::RollingStep::Done => break,
+                crate::meat::deploy_types::RollingStep::Wait => break,
+                crate::meat::deploy_types::RollingStep::Stuck => {
+                    // Config validation rejects the only combination that can
+                    // produce this, so reaching it means the bounds came from
+                    // somewhere that skipped validation. Fail loudly rather
+                    // than spin.
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: format!(
+                                "rolling deploy cannot progress with max_surge={} and \
+                                 max_unavailable={}",
+                                deploy_config.max_surge, deploy_config.max_unavailable
+                            ),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
+                }
+                crate::meat::deploy_types::RollingStep::RetireOld => {
+                    let old_id = existing[retired].clone();
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("stopping old instance {}", old_id.0),
+                        })
+                        .await;
+                    self.ops
+                        .retire_old_instance(&old_id, deploy_config.drain_timeout)
+                        .await;
+                    retired += 1;
+                    continue;
+                }
+                crate::meat::deploy_types::RollingStep::StartNew => {}
+            }
+
+            let i = next_replica_index;
+            next_replica_index += 1;
             let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
                 .instance_id();
             let _ = events
@@ -7003,6 +7205,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_ports.insert(new_id.clone(), host_port);
             new_specs.insert(new_id.clone(), oci_spec);
             new_ips.insert(new_id.clone(), container_ip);
+            // DEP5/M7: route traffic onto the replacement the moment it's
+            // healthy, before the planner is allowed to retire anything. With
+            // `max_unavailable = 0` this is what makes the guarantee real —
+            // retiring first and publishing later would leave a gap however
+            // carefully the counts were tracked.
+            self.ops
+                .publish_new_backend(
+                    app_name,
+                    namespace,
+                    &new_id,
+                    host_port,
+                    container_ip,
+                    spec.port.is_some(),
+                )
+                .await;
             new_ids.push(new_id);
         }
 
@@ -7026,9 +7243,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             return std::ops::ControlFlow::Break(());
         }
 
-        // Emit a stop-progress line per retiring instance (kept explicit so the
-        // event stream matches the old serial path).
-        for old_id in &existing {
+        // Anything the planner didn't reach (it stops once every replacement is
+        // healthy, and a scale-down leaves surplus old instances) is retired
+        // here. On a default rollout this is empty — the stop-progress lines
+        // were already emitted per step above.
+        let outstanding: Vec<InstanceId> = existing[retired..].to_vec();
+        for old_id in &outstanding {
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("stopping old instance {}", old_id.0),
@@ -7041,7 +7261,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 app_name,
                 namespace,
                 spec,
-                existing,
+                outstanding,
                 new_ids.clone(),
                 new_ports,
                 new_ips,
@@ -9017,6 +9237,123 @@ mod tests {
         assert!(
             first_new_start < first_old_retire,
             "old instance was retired before the new one started — availability dropped below target"
+        );
+    }
+
+    /// M7: `max_surge` bounds how many containers exist at once during a
+    /// rollout. It used to parse, validate and change nothing — the rollout
+    /// started every replacement and only then retired every old instance, so
+    /// a 3-replica app peaked at 6 containers whatever the config said.
+    ///
+    /// Replay the grill's call log to reconstruct how many instances were live
+    /// at each moment, and assert the peak.
+    #[tokio::test]
+    async fn rolling_redeploy_honours_max_surge() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        // 3 replicas, default max_surge = 1, max_unavailable = 0.
+        let config = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\nport = 8080\nreplicas = 3\n\n[app.web.deploy]\nmax_surge = 1\nmax_unavailable = 0\ndrain_timeout = \"0s\"\n",
+        )
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        // Replay: a `start` adds a live instance, a `stop`/`kill` removes one.
+        // Three old instances are live when the rollout begins.
+        let mut live: std::collections::HashSet<String> =
+            (0..3).map(|i| format!("default__web-{i}")).collect();
+        let mut peak = live.len();
+        for (op, id) in &calls {
+            match op.as_str() {
+                "start" => {
+                    live.insert(id.0.clone());
+                    peak = peak.max(live.len());
+                }
+                "stop" | "kill" => {
+                    live.remove(&id.0);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            peak, 4,
+            "peaked at {peak} live instances; max_surge = 1 on 3 replicas allows 4 \
+             (the old behaviour peaked at 6)"
+        );
+    }
+
+    /// The mirror: `max_surge = 0` with `max_unavailable = 1` must never
+    /// exceed the replica target, retiring before replacing.
+    #[tokio::test]
+    async fn rolling_redeploy_honours_zero_surge() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        let config = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\nport = 8080\nreplicas = 2\n\n[app.web.deploy]\nmax_surge = 0\nmax_unavailable = 1\ndrain_timeout = \"0s\"\n",
+        )
+        .unwrap();
+
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config.clone(), &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+
+        let calls_before = grill.calls().len();
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        while ev_rx.recv().await.is_some() {}
+        let calls: Vec<(String, InstanceId)> = grill.calls().split_off(calls_before);
+
+        let mut live: std::collections::HashSet<String> =
+            (0..2).map(|i| format!("default__web-{i}")).collect();
+        let mut peak = live.len();
+        for (op, id) in &calls {
+            match op.as_str() {
+                "start" => {
+                    live.insert(id.0.clone());
+                    peak = peak.max(live.len());
+                }
+                "stop" | "kill" => {
+                    live.remove(&id.0);
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            peak, 2,
+            "peaked at {peak}; max_surge = 0 must never exceed the 2-replica target"
+        );
+    }
+
+    /// A deploy config with no room to move in either direction is refused at
+    /// validation rather than wedging a live rollout (M7).
+    #[test]
+    fn both_deploy_bounds_zero_is_rejected_at_validation() {
+        let config = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\nreplicas = 2\n\n[app.web.deploy]\nmax_surge = 0\nmax_unavailable = 0\n",
+        )
+        .unwrap();
+        let error = config
+            .validate()
+            .expect_err("both bounds at zero must not validate");
+        let message = error.to_string();
+        assert!(
+            message.contains("max_surge") && message.contains("max_unavailable"),
+            "unhelpful error: {message}"
         );
     }
 

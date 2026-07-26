@@ -1508,8 +1508,26 @@ work, not by `M1`.
 
 ### Open — deferred from merged PRs
 
-- [ ] `M7` residual — `max_surge`/`max_unavailable` parse and validate but the production
-  rolling deploy still ignores them (needs the deploy-loop rewrite; noted in the M7 commit)
+- [x] `M7` residual — `max_surge`/`max_unavailable` parsed, validated and changed nothing: the
+  rolling path started *every* replacement then retired *every* old instance, so a 3-replica
+  app peaked at 6 containers however `max_surge` was set (the default asks for 4). Worse than
+  unsupported, since an operator who set it because the node lacked the headroom had been told
+  their constraint was honoured. A pure `plan_rolling_step` now drives the rollout: `max_surge`
+  gates starting (how far above target `total` may go), `max_unavailable` gates retiring (how
+  far below `serving` may fall). Retirement and backend publication were split out of
+  `finalise_rolling_deploy` into per-instance `DeployOp`s so they interleave with replacement.
+  - [x] Both bounds at zero is unsatisfiable — no legal move in either direction. The planner
+    returns a distinct `Stuck` and `DeployConfig::validate` rejects the pair at apply time,
+    instead of a rollout that looks live and never progresses
+  - [x] Interleaving hazard: the command loop gets a turn between retirements, and a
+    deliberately stopped instance still in `supervisor.instances` is indistinguishable from a
+    crashed one, so the restart driver would resurrect it. `Supervisor::retire_instance` drops
+    it in the same turn that stops it
+  - [x] Tests: the planner's envelope (peak total, minimum serving) rather than step
+    sequences, plus a proptest over every validation-permitted combination; agent-level tests
+    replay the grill call log to count live containers (3 replicas × `max_surge = 1` peaks at
+    4, and at 6 against the old code — verified). Book chapter 7's claim that surge was "real
+    rather than aspirational" was itself the drift, and is corrected
 - [x] `M20` — alert evaluation lacked per-value freshness and collapsed metrics by name across
   labels. `gather_latest_values` now keeps the newest reading per `(metric_name, labels)`
   series and hands them to a pure `collapse_series`, which (a) applies an explicit

@@ -256,6 +256,19 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         }
     }
 
+    // Deploy block: `max_surge = 0` with `max_unavailable = 0` leaves a rolling
+    // deploy no legal move in either direction, so reject it here rather than
+    // let the rollout wedge (M7).
+    if let Some(deploy) = &app.deploy
+        && let Err(reason) = crate::meat::deploy_types::DeployConfig::from_spec(deploy).validate()
+    {
+        return Err(ConfigError::Validation {
+            field: "deploy".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        });
+    }
+
     // Autoscale block: bounds, windows and threshold are validated up front
     // so a bad `[autoscale]` fails the deploy instead of silently clamping
     // at runtime (DEP8).
