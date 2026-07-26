@@ -9,6 +9,7 @@
 //! - [`report`] — the `--output json` contract.
 //! - [`registry`] — the catalogue and `--filter` selection.
 //! - [`context`] — what a case is handed, and namespace isolation.
+//! - [`runner`] — parallelism, timeouts and teardown around a selection.
 //! - [`cases`] — the integration catalogue.
 //! - [`chaos`] — the chaos scenarios, selected by `--chaos`.
 
@@ -17,7 +18,9 @@ pub mod chaos;
 pub mod context;
 pub mod registry;
 pub mod report;
+pub mod runner;
 
 pub use context::TestContext;
 pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select};
 pub use report::{TestCaseResult, TestGroup, TestOutcome, TestReport};
+pub use runner::{RunConfig, run};

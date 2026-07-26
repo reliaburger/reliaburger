@@ -48,6 +48,35 @@ impl TestContext {
             .strip_prefix(TEST_NAMESPACE_PREFIX)
             .is_some_and(|rest| rest.starts_with('-'))
     }
+
+    /// Stop every app this case created. Best-effort: it never errors and
+    /// never returns anything the runner has to check.
+    ///
+    /// The runner calls this after *every* case — pass, fail or timeout —
+    /// because the case that failed halfway is exactly the one that left a
+    /// workload running. The [`is_test_namespace`](Self::is_test_namespace)
+    /// guard is a second lock on top of the name match: even a bug in
+    /// namespace construction cannot make teardown stop an operator's app.
+    pub async fn teardown(&self) {
+        if !Self::is_test_namespace(&self.namespace) {
+            return;
+        }
+        let Ok(instances) = self.client.status().await else {
+            // A cluster we can't reach has nothing we can tear down. Not an
+            // error the caller can act on — swallow it.
+            return;
+        };
+        let mut apps: Vec<&str> = instances
+            .iter()
+            .filter(|instance| instance.namespace == self.namespace)
+            .map(|instance| instance.app_name.as_str())
+            .collect();
+        apps.sort_unstable();
+        apps.dedup();
+        for app in apps {
+            let _ = self.client.stop(app, &self.namespace).await;
+        }
+    }
 }
 
 #[cfg(test)]

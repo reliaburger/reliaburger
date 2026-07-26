@@ -656,3 +656,95 @@ matters. The check is a named function with its own test rather than an
 implication of how the name was built, because "we construct them correctly so
 they'll always match" is an assumption, and this is not a place for
 assumptions.
+
+## Running them all without a stampede
+
+We have a catalogue of cases and a way to select from it. Now something has to
+actually run them. That something is the runner, and it exists so a case body
+never has to. A case is a plain `async fn` that applies some config and asserts.
+Three concerns that would otherwise clutter every one of them live in the runner
+instead: how many run at once, what happens when one hangs, and who cleans up.
+
+Start with concurrency. Forty cases against a three-node cluster, all deploying
+apps at the same instant, is not a test — it's a load spike that makes every
+case flaky. So the runner caps how many run at once with a semaphore:
+
+```rust
+let semaphore = Arc::new(Semaphore::new(config.parallel.max(1)));
+```
+
+A semaphore is a counter with a waiting room. `parallel` permits go in; a task
+that wants to run takes one and gives it back when it finishes; a task that
+finds none waits. The subtle part is *where* you take the permit. Acquire it
+before spawning and you've bounded how many tasks you queue, which is not the
+same thing at all — you'd spawn all forty and they'd all start. Acquire it
+*inside* the spawned task and you've bounded how many actually run:
+
+```rust
+set.spawn(async move {
+    let _permit = semaphore.acquire().await.expect("never closed");
+    run_one(&case, client, namespace, capabilities.as_ref(), timeout).await
+});
+```
+
+The `_permit` is held for the case's lifetime and dropped when the task ends,
+which is what hands the permit to the next waiter. There's no explicit release
+call — the `Drop` does it — which is the same ownership story as a mutex guard,
+one of the places where Rust's "resources are freed when their owner goes out of
+scope" rule quietly does the bookkeeping a Go `defer` would do by hand.
+
+Next, hanging. A health check that never returns, a deploy that never
+completes — a case can wedge, and one wedged case must not take the run with it.
+Every case runs inside a budget:
+
+```rust
+match tokio::time::timeout(timeout, (case.run)(context.clone())).await {
+    Ok(Ok(()))       => TestOutcome::Passed,
+    Ok(Err(message)) => TestOutcome::Failed { message },
+    Err(_elapsed)    => TestOutcome::TimedOut,
+}
+```
+
+`TimedOut` is its own outcome, not a `Failed` with a "timed out" message,
+because a timeout and an assertion failure are different diagnoses: one says the
+system is stuck, the other says it did the wrong thing. Folding them together
+throws that away.
+
+Then teardown, which is the whole reason this is safe to point at a real
+cluster. It runs after every case:
+
+```rust
+let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, context.teardown()).await;
+```
+
+Note "after every case" — pass, fail *or* timeout. It's tempting to only clean
+up after a pass, but that's exactly backwards: the case that failed halfway is
+the one that left a workload running. Teardown is the runner's job precisely so
+a case body can `return Err(...)` the moment something's wrong without a pile of
+cleanup code first. And teardown itself gets a timeout, because "clean up after
+a hung agent" must not become the new way to hang.
+
+Two smaller decisions round it out. Cases finish whenever they finish — a
+250-millisecond case beats a 30-second one to the join — but a report where the
+rows jump around between runs is a report nobody trusts. So each case carries
+its catalogue index, and the results are sorted back into order at the end. And
+a case that *panics* (someone reached for `.unwrap()` where they should have
+returned an `Err`) is caught and turned into a failure at its right place,
+rather than vanishing from the report:
+
+```rust
+let mut identities: HashMap<tokio::task::Id, (usize, String, TestGroup)> = ...;
+```
+
+A panicked task aborts before it can return anything, so its name and index
+can't ride back on the return value — they have to be recorded out here, keyed
+by the task's id, and looked up when the join comes back an `Err`. One case
+mishandled shouldn't blank a forty-case run.
+
+One thing the runner deliberately does *not* do is pause the clock. Elsewhere in
+this book we drove time with `tokio::test(start_paused = true)` to make a
+health-check test instant. The runner spawns tasks, and a spawned task can
+advance the virtual clock out from under the code driving it — a trap we've hit
+before in this codebase. So the runner is timed against the real clock, and its
+own tests use small real durations: a 50-millisecond timeout against a case that
+sleeps for 30 seconds proves the timeout fires without making anyone wait.
