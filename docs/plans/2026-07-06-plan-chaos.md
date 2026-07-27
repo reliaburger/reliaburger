@@ -207,7 +207,25 @@ Book: none (mechanical).
 >   `Vec<serde_json::Value>`; `DeployResult` serialises PascalCase (`"Completed"`).
 > - Cases run only against a live cluster (acceptance milestone); `make ci` covers the
 >   catalogue-integrity + helper + `testapp_spec` unit tests.
-**8/20 — catalogue part B** — service-discovery, secrets-config, firewall, workload-identity, ingress, volumes, image-registry, cluster-coordination (21 cases). Most of these are now *actually testable* — the wiring landed in 12b.
+**8/20 — catalogue part B** — service-discovery, secrets-config, firewall, workload-identity, ingress, volumes, image-registry, cluster-coordination.
+
+> **Deviation recorded during step 8.** The option-A workload decision (step 7:
+> `testapp` as a *process* workload) supports the **control-plane** part-B groups but
+> not the **container-workload** ones. Landed now (9 cases, real assertions, run on the
+> process acceptance cluster):
+> - **service-discovery** (resolve VIP/backends, scale-up, stop) — reads the userspace
+>   service map.
+> - **cluster-coordination** (all nodes alive, council leader/quorum, per-node health) —
+>   control-plane only, no workload.
+> - **workload-identity** (JWKS well-formed; namespace-scoped token rejected elsewhere;
+>   SPIFFE-cert case is a runtime `skip` — not exposed via the API).
+>
+> **Deferred** (need a container workload — eBPF/mount-namespace/OCI, which the process
+> runtime doesn't provide): **firewall** (eBPF enforcement), **ingress** (proxy + real
+> listener), **volumes** (bind mounts), **secrets-config** (mounted config/decrypt +
+> the cluster age pubkey isn't API-exposed), **image-registry** deploys (loopback-only
+> dev registry). These want a runc + small-image workload path — a follow-up before the
+> full catalogue is exercisable.
 
 ### Stream C — Complete the chaos surface (steps 9–13) — **NEW**
 
@@ -829,7 +847,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 5/20 runner
 - [x] 6/20 `relish test` CLI + `CommandOutcome`
 - [x] 7/20 catalogue A
-- [ ] 8/20 catalogue B
+- [~] 8/20 catalogue B — control-plane groups done (service-discovery, cluster-coordination, workload-identity); container-workload groups (firewall, ingress, volumes, secrets-config, image-registry) deferred pending a runc + image workload path
 - [ ] 9/20 fault targeting flags + CLI fidelity
 - [ ] 10/20 `[smoker]` duration config
 - [ ] 11/20 node-level faults

@@ -912,3 +912,39 @@ cases themselves earn their keep at the acceptance milestone, on a real
 three-node cluster. That split — unit-test the harness, acceptance-test the
 cluster — is the same honesty this chapter opened with: a green check should mean
 something specific, and never more than it can back up.
+
+## The line the workload draws
+
+Part A was scheduling, deploys, health and jobs — all of which a *process*
+workload exercises perfectly well. Part B is the rest of the catalogue, and here
+the choice we made in Part A shows its edge.
+
+Some part-B groups are about the **control plane**, and the control plane doesn't
+care what runtime it's on. Service discovery is a good example: deploy two
+replicas, ask `/v1/resolve/{app}`, and check the VIP has two healthy backends;
+scale to three and watch the backend list grow; stop the app and watch it leave.
+That's the userspace service map answering questions about registrations — no
+container required. Cluster-coordination is the same shape: every node reports
+alive, the council has a leader, every member answers `/v1/health` directly.
+And workload identity is API-level auth: the JWKS endpoint serves a well-formed
+signing key, and a token scoped to one namespace is refused when it tries to
+write to another. Mint the token, point a second client at it, watch the write
+bounce with a 403. None of that needs a container either.
+
+But the other part-B groups — firewall, ingress, volumes, mounted secrets,
+image-registry deploys — are exactly the ones that *do*. Firewall enforcement
+lives in eBPF, which needs a container network namespace. A managed volume is a
+bind mount into a container's root; a process workload has no mount namespace to
+bind into, so it just writes to the host. Ingress needs the proxy bound and a
+real listener behind it. These aren't test-harness problems; they're the honest
+consequence of running workloads as host processes. The same decision that let
+Part A run cleanly is the one that keeps these particular cases from running on a
+process cluster.
+
+So the catalogue gates them the way it gates everything else — on capabilities —
+and they'll skip where the capability is absent, ready to run the day a
+container-workload path exists. It would have been easy to write them anyway and
+let them quietly pass against a process runtime that isn't actually enforcing
+anything. That's the failure mode this whole chapter is about: a green that
+didn't test what it claims. Better a labelled skip and a note in the plan than a
+check that lies.
