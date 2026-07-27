@@ -124,6 +124,15 @@ pub enum FaultType {
     },
 }
 
+impl FaultType {
+    /// Whether this fault takes effect once and carries no meaningful
+    /// duration. Kill and Resume are one-shot signals; everything else lives
+    /// for a bounded window, so duration limits apply to them.
+    pub fn is_instantaneous(&self) -> bool {
+        matches!(self, FaultType::Kill { .. } | FaultType::Resume)
+    }
+}
+
 impl fmt::Display for FaultType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -788,6 +797,29 @@ mod tests {
         rule.expires_at_ns = 0;
         assert!(rule.is_expired());
         assert_eq!(rule.remaining(), Duration::ZERO);
+    }
+
+    /// The configurable `max_duration` sits above the hard 24h ceiling: even a
+    /// fault that slips past config with an absurd duration still can't outlive
+    /// a day, because `FaultRule::new` clamps it.
+    #[test]
+    fn max_duration_is_clamped_to_the_hard_ceiling() {
+        let rule = FaultRule::new(
+            FaultId(1),
+            FaultType::Pause,
+            "redis".into(),
+            Duration::from_secs(48 * 3600),
+            "alice".into(),
+        );
+        assert_eq!(rule.duration_ns, MAX_FAULT_DURATION_NS);
+    }
+
+    #[test]
+    fn kill_and_resume_are_instantaneous() {
+        assert!(FaultType::Kill { count: 1 }.is_instantaneous());
+        assert!(FaultType::Resume.is_instantaneous());
+        assert!(!FaultType::Pause.is_instantaneous());
+        assert!(!FaultType::DnsNxdomain.is_instantaneous());
     }
 
     #[test]

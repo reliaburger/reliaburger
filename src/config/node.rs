@@ -32,6 +32,7 @@ pub struct NodeConfig {
     pub dns: DnsSection,
     pub ebpf: EbpfSection,
     pub upgrades: UpgradeSection,
+    pub smoker: SmokerSection,
 }
 
 impl NodeConfig {
@@ -49,6 +50,40 @@ impl NodeConfig {
             }
         })?;
         Self::parse(&content)
+    }
+}
+
+/// Smoker fault-injection limits (`[smoker]`).
+///
+/// A chaos fault is a bounded experiment. `default_duration_secs` is applied
+/// when a fault names no duration; `max_duration_secs` rejects one asking to
+/// live longer. Both are enforced server-side, beneath which the 24h hard
+/// ceiling in `FaultRule::new` still applies as a backstop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmokerSection {
+    /// Duration applied when a fault is injected without one. Default 600s.
+    pub default_duration_secs: u64,
+    /// Ceiling on a fault's requested duration. Default 3600s.
+    pub max_duration_secs: u64,
+}
+
+impl Default for SmokerSection {
+    fn default() -> Self {
+        Self {
+            default_duration_secs: 600,
+            max_duration_secs: 3600,
+        }
+    }
+}
+
+impl SmokerSection {
+    /// Convert into the runtime [`SmokerConfig`](crate::smoker::config::SmokerConfig).
+    pub fn to_smoker_config(&self) -> crate::smoker::config::SmokerConfig {
+        crate::smoker::config::SmokerConfig {
+            default_duration: std::time::Duration::from_secs(self.default_duration_secs),
+            max_duration: std::time::Duration::from_secs(self.max_duration_secs),
+        }
     }
 }
 
@@ -780,6 +815,20 @@ mod tests {
             }
         );
         assert!(nc.cluster.join.is_empty());
+    }
+
+    #[test]
+    fn smoker_section_defaults_and_parses() {
+        let defaults = NodeConfig::parse("").unwrap();
+        assert_eq!(defaults.smoker.default_duration_secs, 600);
+        assert_eq!(defaults.smoker.max_duration_secs, 3600);
+
+        let nc =
+            NodeConfig::parse("[smoker]\ndefault_duration_secs = 120\nmax_duration_secs = 1800\n")
+                .unwrap();
+        let config = nc.smoker.to_smoker_config();
+        assert_eq!(config.default_duration, std::time::Duration::from_secs(120));
+        assert_eq!(config.max_duration, std::time::Duration::from_secs(1800));
     }
 
     /// L7: enabling ingress binds real listeners, so it must be opt-in.
