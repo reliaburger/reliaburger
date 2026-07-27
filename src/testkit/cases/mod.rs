@@ -5,20 +5,26 @@
 
 use super::registry::TestCase;
 
+mod cluster_coordination;
 mod deployments;
 mod health_checks;
 mod jobs;
 mod process_workloads;
 mod scheduling;
+mod service_discovery;
+mod workload_identity;
 
 /// Every integration case, in the order groups are reported.
 pub fn all() -> Vec<TestCase> {
     let mut cases = Vec::new();
     cases.extend(scheduling::cases());
+    cases.extend(service_discovery::cases());
     cases.extend(deployments::cases());
     cases.extend(health_checks::cases());
     cases.extend(process_workloads::cases());
     cases.extend(jobs::cases());
+    cases.extend(workload_identity::cases());
+    cases.extend(cluster_coordination::cases());
     cases
 }
 
@@ -51,41 +57,57 @@ mod tests {
         }
     }
 
-    /// This batch (catalogue part A) covers exactly these five groups. The
-    /// remaining groups arrive in part B.
+    /// The groups covered so far — part A plus the control-plane part-B
+    /// groups. The remaining part-B groups (firewall, ingress, volumes,
+    /// secrets-config, image-registry) need container workloads and land with
+    /// that path.
     #[test]
-    fn part_a_covers_the_expected_groups() {
+    fn the_expected_groups_are_covered() {
         let groups: HashSet<TestGroup> = all().iter().map(|case| case.group).collect();
         let expected: HashSet<TestGroup> = [
             TestGroup::Scheduling,
+            TestGroup::ServiceDiscovery,
             TestGroup::Deployments,
             TestGroup::HealthChecks,
             TestGroup::ProcessWorkloads,
             TestGroup::Jobs,
+            TestGroup::WorkloadIdentity,
+            TestGroup::ClusterCoordination,
         ]
         .into_iter()
         .collect();
         assert_eq!(groups, expected);
     }
 
+    /// Every case that deploys the `testapp` workload gates on ProcessRuntime,
+    /// or it would fail rather than skip on a runc cluster. Control-plane
+    /// groups (identity, cluster-coordination) deploy nothing, so they're
+    /// exempt.
     #[test]
-    fn every_case_that_deploys_testapp_requires_the_process_runtime() {
+    fn every_workload_case_requires_the_process_runtime() {
         use crate::bun::capabilities::Capability;
-        // Only the process runtime can run the `bun testapp` workload, so any
-        // case built on it must gate on ProcessRuntime or it would fail rather
-        // than skip on a runc cluster.
+        let workload_groups = [
+            TestGroup::Scheduling,
+            TestGroup::ServiceDiscovery,
+            TestGroup::Deployments,
+            TestGroup::HealthChecks,
+            TestGroup::ProcessWorkloads,
+            TestGroup::Jobs,
+        ];
         for case in all() {
-            assert!(
-                case.requires.contains(&Capability::ProcessRuntime),
-                "{} must require ProcessRuntime",
-                case.name
-            );
+            if workload_groups.contains(&case.group) {
+                assert!(
+                    case.requires.contains(&Capability::ProcessRuntime),
+                    "{} deploys a workload and must require ProcessRuntime",
+                    case.name
+                );
+            }
         }
     }
 
     #[test]
     fn the_catalogue_is_the_expected_size() {
-        // Five groups, three cases each.
-        assert_eq!(all().len(), 15);
+        // Eight groups, three cases each.
+        assert_eq!(all().len(), 24);
     }
 }
