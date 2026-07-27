@@ -819,3 +819,96 @@ terminal and in a CI log is one fewer thing to reason about, and `--output json`
 is there for anything that wants to parse rather than read. The renderer is a
 pure `&TestReport -> String`, so it snapshot-tests against a fixed report
 without a cluster anywhere in sight.
+
+## What the tests actually deploy
+
+An empty runner runs cleanly and proves nothing. Now it needs cases, and a case
+needs a workload to deploy. That workload turned out to be the most interesting
+decision in the whole chapter, because it forced a question we'd been able to
+dodge: *where does `relish test` actually run, and what can it run there?*
+
+The obvious answer was the `testapp` binary we've used in unit tests all along —
+a tiny server with modes (`healthy`, `unhealthy-after`, `hang`, `slow`) that let
+a case provoke exactly the behaviour it wants to observe. But `relish dev`
+creates a cluster running the **runc** container runtime, and runc wants an OCI
+image. Handing it `testapp` as a loose binary doesn't work. Packaging `testapp`
+as an image is a real project of its own: the dev nodes have no image builder,
+their registry is bound to loopback, and `testapp` is dynamically linked, so a
+one-binary scratch image won't even start under runc.
+
+The way out was already sitting on every node. `testapp` is a subcommand of
+`bun` (`bun testapp --mode healthy --port 8080` runs the identical server), and
+`bun` is installed at `/usr/local/bin/bun` on every dev node. So instead of an
+image, the harness deploys a **process workload** — a plain command — and lets
+the node run its own `bun`:
+
+```toml
+[app.web]
+command = ["/usr/local/bin/bun", "testapp", "--mode", "healthy", "--port", "40817"]
+```
+
+That needs the cluster to run the *process* runtime rather than runc, so
+`relish dev create` grew a `--runtime` flag (`runc` still the default). This is
+the honest engineering trade: a process-runtime cluster isn't bit-for-bit what
+production runs, but it exercises the scheduler, health checks, deploys, service
+discovery and jobs — all the things the suite is actually testing — without a
+container-image supply chain the harness has no business owning. `testapp_spec`
+builds that TOML, deriving a per-app port (an FNV hash of the name) so two apps
+in one case don't fight over a socket.
+
+### Two ways to skip
+
+A case that needs the process runtime shouldn't *fail* on a runc cluster — it
+should skip, the same way a case needing eBPF skips where eBPF is off. That's the
+`requires` list from earlier, and every `testapp` case lists
+`Capability::ProcessRuntime`. The runner checks it before the case runs.
+
+But some cases can only discover whether they apply once they've *asked* the
+cluster. A placement case needs a node that advertises a label to pin to; if none
+does, there's nothing to test. The static `requires` list can't express "a node
+has a label" — that's a runtime fact. So a case can skip itself from inside its
+body:
+
+```rust
+let Some((node, key, value)) = labelled_node else {
+    return skip("no node advertises a label to target");
+};
+```
+
+`skip` is just an `Err` carrying a marker prefix that the runner recognises and
+turns into `Skipped` rather than `Failed`. It's a small thing, but it's the
+difference between an honest "didn't apply here" and a red that scares someone at
+2 a.m.
+
+### Status is node-local
+
+One assumption in the cases bit back immediately. `/v1/status` reports the
+instances *this node* runs, not the cluster's. Deploy an app with three replicas
+across three nodes and ask any one node — it sees one. There's no cluster-wide
+instance list endpoint; the reporting tree aggregates to the leader internally
+but doesn't expose the raw list.
+
+So a case that reasons about placement fans out itself. `node_clients()` builds a
+`BunClient` for every node — each node's API address is its gossip IP with the
+entry node's API port, since every `bun` serves its API on the same port — and
+`cluster_instances(app)` gathers the app's instances from all of them. The
+"three replicas on at least two nodes" case counts how many nodes report a
+running replica; the health-check cases, whose single replica could be anywhere,
+wait on the cluster-wide view rather than the local one. It's more code than a
+single GET, but it matches reality: a distributed system's state is distributed,
+and a test that forgets that is testing one node while claiming to test a
+cluster.
+
+### The cases are the tests
+
+The catalogue is fifteen cases across five groups — scheduling, deployments,
+health-checks, process-workloads and jobs — each a behaviour sentence
+(`rolling_deploy_keeps_the_app_running`, `failing_job_retries_then_fails`). They
+run against a live cluster, so they can't run in `make ci`; what `make ci` checks
+is the scaffolding around them — that the catalogue has no duplicate names, that
+every group is covered, that every `testapp` case remembered to require the
+process runtime, that `testapp_spec` produces TOML the config parser accepts. The
+cases themselves earn their keep at the acceptance milestone, on a real
+three-node cluster. That split — unit-test the harness, acceptance-test the
+cluster — is the same honesty this chapter opened with: a green check should mean
+something specific, and never more than it can back up.

@@ -5,6 +5,22 @@ use crate::bun::capabilities::Capability;
 use super::context::TestContext;
 use super::report::TestGroup;
 
+/// Prefix a case body returns to skip itself at runtime rather than fail.
+///
+/// The static `requires` list gates on *capabilities*, but some cases can
+/// only tell whether they apply once they've asked the cluster — a placement
+/// case needs a node that advertises a label, an image case needs the
+/// provisioned fixture. Those return [`skip`], and the runner records
+/// `Skipped` instead of `Failed`.
+pub const SKIP_MARKER: &str = "__skip__:";
+
+/// Skip this case with a reason, from inside its body.
+///
+/// `return skip("no node advertises a label to target")`.
+pub fn skip(reason: impl std::fmt::Display) -> Result<(), String> {
+    Err(format!("{SKIP_MARKER}{reason}"))
+}
+
 /// A test case body.
 ///
 /// Rust has no `async fn` *pointers* — an `async fn` desugars to a function

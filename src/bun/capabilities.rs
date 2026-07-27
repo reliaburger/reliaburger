@@ -139,6 +139,7 @@ impl ClusterCapabilities {
         match capability {
             Capability::Cluster => self.cluster,
             Capability::MultiNode => self.node_count >= 3,
+            Capability::ProcessRuntime => self.container_runtime == "process",
             Capability::Metrics => self.metrics,
             Capability::Logs => self.logs,
             Capability::Council => self.council,
@@ -183,6 +184,11 @@ pub enum Capability {
     /// Three or more nodes — enough for a council and for chaos to have
     /// somewhere to fail over to.
     MultiNode,
+    /// The node runs the `process` runtime (ProcessGrill), so the `testapp`
+    /// workload can be launched directly from the installed `bun` binary
+    /// without a container image. Cases built on `testapp_spec` need this;
+    /// they skip on a runc/apple cluster.
+    ProcessRuntime,
     Metrics,
     Logs,
     Council,

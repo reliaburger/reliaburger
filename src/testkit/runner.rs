@@ -175,7 +175,15 @@ async fn run_one(
 
     let outcome = match tokio::time::timeout(timeout, (case.run)(context.clone())).await {
         Ok(Ok(())) => TestOutcome::Passed,
-        Ok(Err(message)) => TestOutcome::Failed { message },
+        // A case can skip itself at runtime for a condition `requires` can't
+        // express — it returns `skip(reason)`, which we translate here rather
+        // than count as a failure.
+        Ok(Err(message)) => match message.strip_prefix(super::registry::SKIP_MARKER) {
+            Some(reason) => TestOutcome::Skipped {
+                reason: reason.to_string(),
+            },
+            None => TestOutcome::Failed { message },
+        },
         Err(_elapsed) => TestOutcome::TimedOut,
     };
 
@@ -328,6 +336,25 @@ mod tests {
         match &report.results[1].outcome {
             TestOutcome::Failed { message } => assert_eq!(message, "expected 3, saw 1"),
             other => panic!("expected failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_case_can_skip_itself_at_runtime() {
+        async fn body(_ctx: TestContext) -> Result<(), String> {
+            super::super::registry::skip("no labelled node to target")
+        }
+        let cases = vec![case("runtime_skip", &[], testkit_case!(body))];
+
+        let report = run(cases, config(dead_client(), full_capabilities(), 4)).await;
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.failed, 0);
+        match &report.results[0].outcome {
+            TestOutcome::Skipped { reason } => {
+                assert_eq!(reason, "no labelled node to target");
+            }
+            other => panic!("expected skip, got {other:?}"),
         }
     }
 
