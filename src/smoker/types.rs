@@ -149,7 +149,10 @@ impl fmt::Display for FaultType {
                 }
             }
             Self::Bandwidth { bytes_per_sec } => {
-                let mbps = *bytes_per_sec / (1024 * 1024);
+                // The parser reads megabits/s (`1mbps` = 125_000 bytes/s), so
+                // invert that here rather than dividing by 1024² — otherwise
+                // `1mbps` echoes back as `0mbps`.
+                let mbps = *bytes_per_sec * 8 / 1_000_000;
                 write!(f, "bandwidth {mbps}mbps")
             }
             Self::CpuStress { percentage, cores } => {
@@ -170,7 +173,8 @@ impl fmt::Display for FaultType {
                 bytes_per_sec,
                 write_only,
             } => {
-                let mbps = *bytes_per_sec / (1024 * 1024);
+                // Megabits/s, matching the parser (see Bandwidth above).
+                let mbps = *bytes_per_sec * 8 / 1_000_000;
                 if *write_only {
                     write!(f, "disk-io {mbps}mbps (writes only)")
                 } else {
@@ -630,6 +634,21 @@ mod tests {
         assert_eq!(ft.to_string(), "kill 2");
         let ft_all = FaultType::Kill { count: 0 };
         assert_eq!(ft_all.to_string(), "kill (all)");
+    }
+
+    /// The parser reads megabits (`1mbps` = 125_000 bytes/s), so Display must
+    /// invert that — not divide by 1024². Previously `1mbps` echoed `0mbps`.
+    #[test]
+    fn bandwidth_display_round_trips_megabits() {
+        let one_mbps = FaultType::Bandwidth {
+            bytes_per_sec: 125_000,
+        };
+        assert_eq!(one_mbps.to_string(), "bandwidth 1mbps");
+        let ten_mbps = FaultType::DiskIoThrottle {
+            bytes_per_sec: 1_250_000,
+            write_only: false,
+        };
+        assert_eq!(ten_mbps.to_string(), "disk-io 10mbps");
     }
 
     #[test]

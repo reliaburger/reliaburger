@@ -948,3 +948,60 @@ let them quietly pass against a process runtime that isn't actually enforcing
 anything. That's the failure mode this whole chapter is about: a green that
 didn't test what it claims. Better a labelled skip and a note in the plan than a
 check that lies.
+
+## The flags that were already wired
+
+Before we can build a chaos *suite*, the `relish fault` command it drives has to
+actually be honest, and it wasn't quite. This is a different flavour of the same
+problem: not a test that lies, but a CLI that quietly does less than it says.
+
+The clearest case: `FaultRequest` — the struct sent to the agent — has carried
+`target_instance`, `target_node`, `reason` and `override_safety` fields for a
+long time, and the agent honours them. But every one of the fifteen CLI handlers
+built the request with those fields hardcoded to `None`/`false`. The plumbing ran
+from the agent all the way up to one layer below the command line, and stopped.
+So `relish fault kill redis --instance redis-1` didn't exist; you could kill the
+service but not one instance of it, even though the agent knew how.
+
+Wiring them through is the kind of change that's easy to do badly — four extra
+parameters on fifteen functions, sixty chances to fat-finger a `None`. So instead
+of threading four arguments everywhere, the flags became one struct that clap
+*flattens* into each subcommand:
+
+```rust
+#[derive(clap::Args, Clone, Default)]
+pub struct FaultTargeting {
+    #[arg(long)] pub instance: Option<String>,
+    #[arg(long)] pub node: Option<String>,
+    #[arg(long)] pub reason: Option<String>,
+    #[arg(long)] pub override_safety: bool,
+}
+```
+
+`#[command(flatten)]` splices those four flags into every fault subcommand as if
+they'd been declared inline, and one `make_request` helper reads them into the
+request. Add a flag once, get it on all fifteen commands, and the handlers shrink
+to almost nothing.
+
+A few smaller honesty fixes rode along. `relish fault dns redis banana` used to
+inject NXDOMAIN regardless of what you typed after the service name — the
+positional was read into a variable named `_fault_type` and thrown away. Now an
+unknown type is rejected before anything is sent. `relish fault clear` learned to
+take a service name as well as a numeric id (a bare number is an id, anything
+else is a service), which finally gave the registry's `clear_by_service` — dead
+code waiting for a caller — its first one, via a new `?service=` query on the
+clear endpoint. `fault run` became an alias for `fault scenario`, because the
+docs called it `run` and the binary shipped `scenario`. And `fault resume` got a
+CLI path at last: the `Resume` fault type existed and the agent implemented it,
+but nothing on the command line could construct it, so a paused service could
+only be un-paused by clearing the fault, not by resuming it.
+
+Last, a rounding bug that made a diagnostic lie. The bandwidth parser correctly
+reads `1mbps` as one megabit per second — 125,000 bytes/s. But the `Display` that
+echoes a fault back divided bytes/s by 1024², so it printed `bandwidth 0mbps` for
+exactly the throttle you'd just set. The number was right on the wire and wrong
+on the screen, which is the worst place for it, because the screen is how you
+check your work. Inverting the parser's own arithmetic — `bytes_per_sec * 8 /
+1_000_000` — makes the echo match the input. None of these are big changes. They
+just move the tool a little closer to meaning what it says, which is the whole
+job before we start breaking things on purpose.

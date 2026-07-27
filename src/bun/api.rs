@@ -2608,6 +2608,7 @@ async fn fault_clear_handler(
 async fn fault_clear_all_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::authorize_user(
         auth.as_deref(),
@@ -2616,12 +2617,15 @@ async fn fault_clear_all_handler(
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::ClearAllFaults { response: resp_tx })
-        .await
-        .is_err()
-    {
+    // `?service=NAME` clears only that service's faults; no query clears all.
+    let command = match params.get("service") {
+        Some(service) => AgentCommand::ClearFaultsByService {
+            service: service.clone(),
+            response: resp_tx,
+        },
+        None => AgentCommand::ClearAllFaults { response: resp_tx },
+    };
+    if state.cmd_tx.send(command).await.is_err() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent unavailable" })),

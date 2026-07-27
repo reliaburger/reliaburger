@@ -718,6 +718,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Fail a percentage of connections.
     Drop {
@@ -728,6 +730,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Return NXDOMAIN for DNS resolution.
     Dns {
@@ -738,6 +742,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Block traffic between services.
     Partition {
@@ -749,6 +755,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Throttle bandwidth to a service.
     Bandwidth {
@@ -759,6 +767,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Consume CPU in a service's cgroup.
     Cpu {
@@ -772,6 +782,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Push memory usage toward a service's limit.
     Memory {
@@ -782,6 +794,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Throttle disk I/O for a service.
     DiskIo {
@@ -795,6 +809,8 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Kill instances of a service (SIGKILL).
     Kill {
@@ -803,6 +819,8 @@ enum FaultAction {
         /// Number of instances to kill (0 = all).
         #[arg(long, default_value = "1")]
         count: u32,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Freeze instances of a service (SIGSTOP).
     Pause {
@@ -811,6 +829,15 @@ enum FaultAction {
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
+    },
+    /// Resume (unfreeze) previously paused instances of a service.
+    Resume {
+        /// Target service name.
+        target: String,
+        #[command(flatten)]
+        targeting: reliaburger::relish::fault::FaultTargeting,
     },
     /// Simulate graceful node departure.
     NodeDrain {
@@ -822,6 +849,12 @@ enum FaultAction {
         /// Allow targeting the cluster leader.
         #[arg(long)]
         include_leader: bool,
+        /// A human reason recorded alongside the fault.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Override the node-percentage safety rail.
+        #[arg(long)]
+        override_safety: bool,
     },
     /// Simulate abrupt node failure.
     NodeKill {
@@ -836,15 +869,22 @@ enum FaultAction {
         /// Allow targeting the cluster leader.
         #[arg(long)]
         include_leader: bool,
+        /// A human reason recorded alongside the fault.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Override the node-percentage safety rail.
+        #[arg(long)]
+        override_safety: bool,
     },
     /// List all active faults.
     List,
-    /// Clear all active faults (or a specific one by ID).
+    /// Clear faults — all, by numeric id, or by service name.
     Clear {
-        /// Fault ID to clear (omit to clear all).
-        id: Option<u64>,
+        /// Fault id or service name to clear (omit to clear all).
+        target: Option<String>,
     },
     /// Run a scripted chaos scenario from a TOML file.
+    #[command(visible_alias = "run")]
     Scenario {
         /// Path to the scenario TOML file.
         path: PathBuf,
@@ -993,73 +1033,124 @@ async fn main() -> ExitCode {
                 delay,
                 jitter,
                 duration,
+                targeting,
             } => {
-                reliaburger::relish::fault::delay(target, delay, jitter.as_deref(), duration).await
+                reliaburger::relish::fault::delay(
+                    target,
+                    delay,
+                    jitter.as_deref(),
+                    duration,
+                    targeting,
+                )
+                .await
             }
             FaultAction::Drop {
                 target,
                 percentage,
                 duration,
-            } => reliaburger::relish::fault::drop_fault(target, percentage, duration).await,
+                targeting,
+            } => {
+                reliaburger::relish::fault::drop_fault(target, percentage, duration, targeting)
+                    .await
+            }
             FaultAction::Dns {
                 target,
                 fault_type,
                 duration,
-            } => reliaburger::relish::fault::dns(target, fault_type, duration).await,
+                targeting,
+            } => reliaburger::relish::fault::dns(target, fault_type, duration, targeting).await,
             FaultAction::Partition {
                 target,
                 from,
                 duration,
-            } => reliaburger::relish::fault::partition(target, from.as_deref(), duration).await,
+                targeting,
+            } => {
+                reliaburger::relish::fault::partition(target, from.as_deref(), duration, targeting)
+                    .await
+            }
             FaultAction::Bandwidth {
                 target,
                 limit,
                 duration,
-            } => reliaburger::relish::fault::bandwidth(target, limit, duration).await,
+                targeting,
+            } => reliaburger::relish::fault::bandwidth(target, limit, duration, targeting).await,
             FaultAction::Cpu {
                 target,
                 percentage,
                 cores,
                 duration,
-            } => reliaburger::relish::fault::cpu(target, percentage, *cores, duration).await,
+                targeting,
+            } => {
+                reliaburger::relish::fault::cpu(target, percentage, *cores, duration, targeting)
+                    .await
+            }
             FaultAction::Memory {
                 target,
                 value,
                 duration,
-            } => reliaburger::relish::fault::memory(target, value, duration).await,
+                targeting,
+            } => reliaburger::relish::fault::memory(target, value, duration, targeting).await,
             FaultAction::DiskIo {
                 target,
                 limit,
                 write_only,
                 duration,
-            } => reliaburger::relish::fault::disk_io(target, limit, *write_only, duration).await,
-            FaultAction::Kill { target, count } => {
-                reliaburger::relish::fault::kill(target, *count).await
+                targeting,
+            } => {
+                reliaburger::relish::fault::disk_io(target, limit, *write_only, duration, targeting)
+                    .await
             }
-            FaultAction::Pause { target, duration } => {
-                reliaburger::relish::fault::pause(target, duration).await
+            FaultAction::Kill {
+                target,
+                count,
+                targeting,
+            } => reliaburger::relish::fault::kill(target, *count, targeting).await,
+            FaultAction::Pause {
+                target,
+                duration,
+                targeting,
+            } => reliaburger::relish::fault::pause(target, duration, targeting).await,
+            FaultAction::Resume { target, targeting } => {
+                reliaburger::relish::fault::resume(target, targeting).await
             }
             FaultAction::NodeDrain {
                 target,
                 duration,
                 include_leader,
-            } => reliaburger::relish::fault::node_drain(target, duration, *include_leader).await,
+                reason,
+                override_safety,
+            } => {
+                reliaburger::relish::fault::node_drain(
+                    target,
+                    duration,
+                    *include_leader,
+                    reason.as_deref(),
+                    *override_safety,
+                )
+                .await
+            }
             FaultAction::NodeKill {
                 target,
                 duration,
                 containers,
                 include_leader,
+                reason,
+                override_safety,
             } => {
                 reliaburger::relish::fault::node_kill(
                     target,
                     duration,
                     *containers,
                     *include_leader,
+                    reason.as_deref(),
+                    *override_safety,
                 )
                 .await
             }
             FaultAction::List => reliaburger::relish::fault::list().await,
-            FaultAction::Clear { id } => reliaburger::relish::fault::clear(*id).await,
+            FaultAction::Clear { target } => {
+                reliaburger::relish::fault::clear(target.clone()).await
+            }
             FaultAction::Scenario {
                 path,
                 dry_run,
@@ -1322,6 +1413,65 @@ mod tests {
         assert!(bare.command.is_none());
         let tui = Cli::try_parse_from(["relish", "tui"]).unwrap();
         assert!(matches!(tui.command, Some(Command::Tui)));
+    }
+
+    #[test]
+    fn fault_run_is_an_alias_for_scenario() {
+        let via_alias = parse(&["relish", "fault", "run", "scenario.toml"]).unwrap();
+        assert!(matches!(
+            via_alias.command,
+            Command::Fault {
+                action: FaultAction::Scenario { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn fault_targeting_flags_parse() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "delay",
+            "redis",
+            "200ms",
+            "--instance",
+            "redis-1",
+            "--node",
+            "node-2",
+            "--reason",
+            "game-day",
+            "--override-safety",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Delay { targeting, .. },
+            } => {
+                assert_eq!(targeting.instance.as_deref(), Some("redis-1"));
+                assert_eq!(targeting.node.as_deref(), Some("node-2"));
+                assert_eq!(targeting.reason.as_deref(), Some("game-day"));
+                assert!(targeting.override_safety);
+            }
+            _ => panic!("expected a fault delay command"),
+        }
+    }
+
+    #[test]
+    fn fault_clear_and_resume_parse() {
+        let clear_by_name = parse(&["relish", "fault", "clear", "redis"]).unwrap();
+        assert!(matches!(
+            clear_by_name.command,
+            Command::Fault {
+                action: FaultAction::Clear { target: Some(ref t) }
+            } if t == "redis"
+        ));
+        let resume = parse(&["relish", "fault", "resume", "redis"]).unwrap();
+        assert!(matches!(
+            resume.command,
+            Command::Fault {
+                action: FaultAction::Resume { .. }
+            }
+        ));
     }
 
     #[test]
@@ -1882,6 +2032,7 @@ mod tests {
                         delay,
                         jitter,
                         duration,
+                        ..
                     },
             } => {
                 assert_eq!(target, "redis");
@@ -1946,7 +2097,7 @@ mod tests {
         let cli = parse(&["relish", "fault", "kill", "web", "--count", "2"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Kill { target, count },
+                action: FaultAction::Kill { target, count, .. },
             } => {
                 assert_eq!(target, "web");
                 assert_eq!(count, 2);
@@ -1998,6 +2149,7 @@ mod tests {
                         containers,
                         include_leader,
                         duration,
+                        ..
                     },
             } => {
                 assert_eq!(target, "node-05");
@@ -2025,8 +2177,8 @@ mod tests {
         let cli = parse(&["relish", "fault", "clear"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Clear { id },
-            } => assert!(id.is_none()),
+                action: FaultAction::Clear { target },
+            } => assert!(target.is_none()),
             _ => panic!("expected Fault Clear"),
         }
     }
@@ -2036,8 +2188,8 @@ mod tests {
         let cli = parse(&["relish", "fault", "clear", "42"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Clear { id },
-            } => assert_eq!(id, Some(42)),
+                action: FaultAction::Clear { target },
+            } => assert_eq!(target.as_deref(), Some("42")),
             _ => panic!("expected Fault Clear"),
         }
     }
