@@ -580,6 +580,10 @@ enum DevAction {
         /// Memory per node (e.g. "2GiB").
         #[arg(long, default_value = "2GiB")]
         memory: String,
+        /// Container runtime each node runs. `process` runs workloads as host
+        /// processes, which the built-in `relish test` suite needs.
+        #[arg(long, default_value = "runc", value_parser = ["runc", "process"])]
+        runtime: String,
         /// Cluster name.
         #[arg(default_value = "default")]
         name: String,
@@ -1128,6 +1132,7 @@ async fn main() -> ExitCode {
                 nodes,
                 cpus,
                 memory,
+                runtime,
                 name,
                 bun,
                 relish,
@@ -1137,6 +1142,7 @@ async fn main() -> ExitCode {
                     *nodes,
                     *cpus,
                     memory,
+                    runtime,
                     bun.clone(),
                     relish.clone(),
                 )

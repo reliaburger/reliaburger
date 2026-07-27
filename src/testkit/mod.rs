@@ -21,6 +21,6 @@ pub mod report;
 pub mod runner;
 
 pub use context::TestContext;
-pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select};
+pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select, skip};
 pub use report::{TestCaseResult, TestGroup, TestOutcome, TestReport};
 pub use runner::{RunConfig, run};

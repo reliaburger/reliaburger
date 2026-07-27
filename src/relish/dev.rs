@@ -12,7 +12,23 @@ use super::RelishError;
 /// without it the agent ignores the `[cluster]` config and runs single-node.
 /// Launched via `sudo bash -c` so bun gets root (runc/netns) and can write the
 /// log file under `/var/log`.
-const AGENT_LAUNCH_CMD: &str = "nohup bun --cluster --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117 --runtime runc > /var/log/bun.log 2>&1 &";
+/// The command that launches a node's `bun` agent under the given runtime.
+///
+/// `runc` is the default for a realistic cluster; `process` runs workloads as
+/// host processes, which is what the built-in `relish test` suite needs — its
+/// `testapp` workload is a `bun` subcommand, so a process-runtime node runs it
+/// straight from the installed binary with no image.
+fn agent_launch_cmd(runtime: &str) -> String {
+    format!(
+        "nohup bun --cluster --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117 \
+         --runtime {runtime} > /var/log/bun.log 2>&1 &"
+    )
+}
+
+/// The runtime a dev cluster uses when its state file predates the field.
+fn default_runtime() -> String {
+    "runc".to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Lima wrapper
@@ -333,6 +349,10 @@ allow_insecure_cluster = true
 pub struct DevCluster {
     pub name: String,
     pub nodes: Vec<DevNode>,
+    /// The container runtime every node runs (`runc` or `process`). Persisted
+    /// so `start` relaunches with the same runtime `create` chose.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
 }
 
 /// A single node in the dev cluster.
@@ -394,6 +414,7 @@ pub async fn create(
     nodes: usize,
     cpus: usize,
     memory: &str,
+    runtime: &str,
     bun: Option<PathBuf>,
     relish: Option<PathBuf>,
 ) -> Result<(), RelishError> {
@@ -418,6 +439,7 @@ pub async fn create(
     let mut cluster = DevCluster {
         name: name.to_string(),
         nodes: Vec::new(),
+        runtime: runtime.to_string(),
     };
 
     // Create and start each VM. Idempotent: an existing VM (e.g. from an
@@ -551,8 +573,9 @@ pub async fn create(
 
     // Start bun agents
     println!("  starting bun agents...");
+    let launch = agent_launch_cmd(&cluster.runtime);
     for node in &cluster.nodes {
-        limactl(&["shell", &node.name, "sudo", "bash", "-c", AGENT_LAUNCH_CMD]).await?;
+        limactl(&["shell", &node.name, "sudo", "bash", "-c", &launch]).await?;
     }
 
     save_cluster(&cluster)?;
@@ -673,9 +696,10 @@ pub async fn start(name: &str) -> Result<(), RelishError> {
         limactl(&["start", &node.name]).await?;
     }
 
-    // Restart bun agents
+    // Restart bun agents with the runtime this cluster was created with.
+    let launch = agent_launch_cmd(&cluster.runtime);
     for node in &cluster.nodes {
-        limactl(&["shell", &node.name, "sudo", "bash", "-c", AGENT_LAUNCH_CMD]).await?;
+        limactl(&["shell", &node.name, "sudo", "bash", "-c", &launch]).await?;
     }
 
     println!("Dev cluster \"{name}\" started.");
@@ -1018,8 +1042,15 @@ mod tests {
     #[test]
     fn agent_launches_in_cluster_mode() {
         // The agent must start with --cluster or it ignores [cluster] config.
-        assert!(AGENT_LAUNCH_CMD.contains("--cluster"));
-        assert!(AGENT_LAUNCH_CMD.contains("--config /etc/reliaburger/node.toml"));
+        let launch = agent_launch_cmd("runc");
+        assert!(launch.contains("--cluster"));
+        assert!(launch.contains("--config /etc/reliaburger/node.toml"));
+    }
+
+    #[test]
+    fn agent_launch_honours_the_chosen_runtime() {
+        assert!(agent_launch_cmd("runc").contains("--runtime runc"));
+        assert!(agent_launch_cmd("process").contains("--runtime process"));
     }
 
     #[test]
@@ -1093,6 +1124,7 @@ mod tests {
                     memory: "2GiB".to_string(),
                 },
             ],
+            runtime: "process".to_string(),
         };
 
         let json = serde_json::to_string(&cluster).unwrap();
@@ -1100,6 +1132,16 @@ mod tests {
         assert_eq!(decoded.name, "test");
         assert_eq!(decoded.nodes.len(), 2);
         assert_eq!(decoded.nodes[0].ip.as_deref(), Some("192.168.105.2"));
+        assert_eq!(decoded.runtime, "process");
+    }
+
+    /// A state file written before the runtime field existed still loads,
+    /// defaulting to runc.
+    #[test]
+    fn cluster_state_without_runtime_defaults_to_runc() {
+        let legacy = r#"{"name":"old","nodes":[]}"#;
+        let decoded: DevCluster = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.runtime, "runc");
     }
 
     #[test]

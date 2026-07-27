@@ -186,7 +186,27 @@ Book: none (mechanical).
 **4/20 — testkit core: report types, registry, filters** (as original step 3; §7.2)
 **5/20 — runner: parallelism, timeouts, teardown, skips** (as original step 4; `Semaphore` + `JoinSet`; **no `start_paused`** — standing pitfall)
 **6/20 — `relish test` command + `CommandOutcome`** (as original step 5, plus: give the four new commands `Result<CommandOutcome, RelishError>` so exit codes 0/1/2 are expressible)
-**7/20 — catalogue part A** — scheduling, deployments, health-checks, process-workloads, jobs (18 cases)
+**7/20 — catalogue part A** — scheduling, deployments, health-checks, process-workloads, jobs (**15 cases**, three per group — the "18" was a miscount; §7.7 enumerates 3×5)
+
+> **Deviations recorded during step 7** (source wins; these correct the plan):
+> - **Workload = `testapp` as a *process* workload, not an OCI image.** `relish dev`
+>   nodes run runc, where a `proc-grill` command fails, and packaging `testapp` as an
+>   image is infeasible on dev nodes (no builder, loopback-only registry, glibc-dynamic
+>   binary). Since `testapp` is a `bun` subcommand and `bun` is at `/usr/local/bin/bun`
+>   on every node, `testapp_spec` emits `command = ["/usr/local/bin/bun", "testapp", …]`
+>   and `relish dev create` gained a `--runtime process` flag (default stays `runc`).
+>   Cases gate on the new **`Capability::ProcessRuntime`** and skip on a runc cluster.
+> - **Runtime skip mechanism.** A case can `skip(reason)` from its body for conditions
+>   `requires` can't express (no labelled node, etc.); the runner maps the marker to
+>   `Skipped`, not `Failed`.
+> - **Cluster-wide fan-out.** `/v1/status` is node-local (no aggregated endpoint), so
+>   `TestContext` grew `node_clients`/`cluster_instances`/`wait_running_cluster`/
+>   `wait_for_cluster` that fan out to each node (API address = gossip IP + entry node's
+>   API port).
+> - **Config facts:** `JobSpec` has no `retries` field; `deploy_history` returns untyped
+>   `Vec<serde_json::Value>`; `DeployResult` serialises PascalCase (`"Completed"`).
+> - Cases run only against a live cluster (acceptance milestone); `make ci` covers the
+>   catalogue-integrity + helper + `testapp_spec` unit tests.
 **8/20 — catalogue part B** — service-discovery, secrets-config, firewall, workload-identity, ingress, volumes, image-registry, cluster-coordination (21 cases). Most of these are now *actually testable* — the wiring landed in 12b.
 
 ### Stream C — Complete the chaos surface (steps 9–13) — **NEW**
@@ -808,7 +828,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 4/20 testkit core types
 - [x] 5/20 runner
 - [x] 6/20 `relish test` CLI + `CommandOutcome`
-- [ ] 7/20 catalogue A
+- [x] 7/20 catalogue A
 - [ ] 8/20 catalogue B
 - [ ] 9/20 fault targeting flags + CLI fidelity
 - [ ] 10/20 `[smoker]` duration config
