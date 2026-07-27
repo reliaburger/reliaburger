@@ -238,6 +238,11 @@ pub enum AgentCommand {
     ClearAllFaults {
         response: oneshot::Sender<Result<String, BunError>>,
     },
+    /// Clear every active fault targeting a given service.
+    ClearFaultsByService {
+        service: String,
+        response: oneshot::Sender<Result<String, BunError>>,
+    },
     /// List all active faults.
     ListFaults {
         response: oneshot::Sender<Vec<crate::smoker::types::FaultSummary>>,
@@ -2677,6 +2682,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // Republish the (now empty) DnsNxdomain set for the responder.
                 self.publish_dns_faults();
                 let msg = format!("cleared {} fault(s)", removed.len());
+                let _ = response.send(Ok(msg));
+            }
+            AgentCommand::ClearFaultsByService { service, response } => {
+                let removed = self.fault_registry.clear_by_service(&service);
+                for rule in &removed {
+                    self.delete_fault_bpf_entry(rule).await;
+                    self.reverse_fault(rule).await;
+                }
+                self.publish_dns_faults();
+                let msg = format!("cleared {} fault(s) for {service}", removed.len());
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::ListFaults { response } => {
