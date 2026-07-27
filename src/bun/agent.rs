@@ -1117,6 +1117,8 @@ pub struct BunAgent<G: Grill> {
     cluster: Option<ClusterHandle>,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
+    /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
+    smoker_config: crate::smoker::config::SmokerConfig,
     /// eBPF program handle for writing fault maps (Linux + ebpf feature only).
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(feature = "ebpf")]
@@ -1273,6 +1275,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            smoker_config: crate::smoker::config::SmokerConfig::default(),
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
             #[cfg(feature = "ebpf")]
@@ -1342,6 +1345,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            smoker_config: crate::smoker::config::SmokerConfig::default(),
             #[cfg(feature = "ebpf")]
             onion_ebpf: None,
             #[cfg(feature = "ebpf")]
@@ -1508,6 +1512,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         config: crate::config::process_workloads::ProcessWorkloadsConfig,
     ) {
         self.supervisor.set_process_config(config);
+    }
+
+    /// Thread the parsed `[smoker]` duration limits in, so faults are bounded
+    /// by config rather than only the hardcoded 24h backstop.
+    pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
+        self.smoker_config = config;
     }
 
     /// Record detected platform capabilities (GPUs, rootless mode) so the
@@ -2622,8 +2632,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .map_err(BunError::from),
                 );
             }
-            AgentCommand::InjectFault { request, response } => {
-                // Safety rails first (L14): reject faults that risk
+            AgentCommand::InjectFault {
+                mut request,
+                response,
+            } => {
+                // Duration bounds first (server-side, so a direct API call
+                // can't slip past the CLI's defaulting): apply the configured
+                // default when none was given, reject anything over the max.
+                match crate::smoker::config::effective_duration(
+                    request.duration,
+                    request.fault_type.is_instantaneous(),
+                    &self.smoker_config,
+                ) {
+                    Ok(effective) => request.duration = effective,
+                    Err(reason) => {
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        return;
+                    }
+                }
+
+                // Safety rails next (L14): reject faults that risk
                 // quorum, kill a service's last replica, target the
                 // leader, or exceed the node-percentage cap — unless
                 // explicitly overridden. The context is built even with no

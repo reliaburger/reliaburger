@@ -1005,3 +1005,46 @@ check your work. Inverting the parser's own arithmetic — `bytes_per_sec * 8 /
 1_000_000` — makes the echo match the input. None of these are big changes. They
 just move the tool a little closer to meaning what it says, which is the whole
 job before we start breaking things on purpose.
+
+## Every fault must expire
+
+There's one rail that matters more than the rest: a fault has to end. A chaos
+experiment that outlives the person who started it isn't chaos engineering, it's
+just a broken cluster. The code already had a backstop — `FaultRule::new` clamps
+any duration to a hard 24-hour ceiling — but 24 hours is a safety net, not a
+policy. The real limit an operator wants is "faults auto-expire in ten minutes
+unless I say otherwise, and nobody gets to inject a day-long one by accident."
+
+That's two numbers, and they belong in config:
+
+```toml
+[smoker]
+default_duration_secs = 600   # applied when a fault names no duration
+max_duration_secs = 3600      # a fault asking for longer is rejected
+```
+
+The decision worth dwelling on is *where* to enforce them. The CLI already
+defaulted a missing `--duration` to ten minutes, so it would have been easy to
+call it done there. But the CLI is one client among possible many — a script
+that POSTs straight to `/v1/fault` skips it entirely. A limit that only the
+friendly front door respects isn't a limit. So the enforcement lives in the
+agent, in the inject handler, where every fault converges regardless of how it
+arrived:
+
+```rust
+match effective_duration(request.duration, request.fault_type.is_instantaneous(), &self.smoker_config) {
+    Ok(effective) => request.duration = effective,
+    Err(reason)   => { respond(FaultRejected { reason }); return; }
+}
+```
+
+`effective_duration` is a pure function — requested duration in, effective
+duration or a rejection out — so it unit-tests without an agent at all. Three
+rules: an instantaneous fault (a kill, a resume) has no duration to bound and
+passes through; a zero duration means "unspecified" and becomes the configured
+default; anything over the maximum is rejected with *both* numbers in the
+message, because "too long" without saying "the limit is 3600s" just makes the
+operator go read the config. And underneath it, the 24-hour clamp still stands
+as the backstop for an absurd config — a maximum of 48 hours is still an
+experiment that ends within a day. Layered limits: a policy you set, and a floor
+you can't remove.

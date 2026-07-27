@@ -754,6 +754,8 @@ async fn main() -> anyhow::Result<()> {
     // policy and an operator's allowlist would be silently ignored — a
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
+    // Bound fault durations by the `[smoker]` policy (default + maximum).
+    agent.set_smoker_config(config.smoker.to_smoker_config());
 
     // Detect GPUs and record what this node can enforce, so the supervisor
     // refuses a GPU request or rootless resource limit it can't back (D15/M22)

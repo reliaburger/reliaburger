@@ -849,7 +849,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 7/20 catalogue A
 - [~] 8/20 catalogue B — control-plane groups done (service-discovery, cluster-coordination, workload-identity); container-workload groups (firewall, ingress, volumes, secrets-config, image-registry) deferred pending a runc + image workload path
 - [x] 9/20 fault targeting flags + CLI fidelity
-- [ ] 10/20 `[smoker]` duration config
+- [x] 10/20 `[smoker]` duration config
 - [ ] 11/20 node-level faults
 - [ ] 12/20 partition honesty + memory-oom decision
 - [ ] 13/20 fault authorisation + audit
