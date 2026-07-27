@@ -1048,3 +1048,51 @@ operator go read the config. And underneath it, the 24-hour clamp still stands
 as the backstop for an absurd config — a maximum of 48 hours is still an
 experiment that ends within a day. Layered limits: a policy you set, and a floor
 you can't remove.
+
+## The other half of the catalogue
+
+Part B's control-plane groups ran on a process cluster because they don't touch
+a container. The rest — firewall, ingress, volumes, mounted config — do, and we
+left them deferred with a note. Now we come back for them, and the question is
+the same one that shaped Part A: what workload, and where does it come from?
+
+The Part A answer (run `testapp` as a host process via the node's `bun`) is no
+help here, because the whole point of these cases is the container: a volume is a
+mount into a container's root, `allow_from` is enforced by eBPF in a container's
+network namespace, ingress routes to a container listening behind the proxy. A
+process has none of that. So these cases need a *real* image on a runc cluster.
+
+Building one turned out to be a rabbit hole — the dev nodes have no image
+builder, their registry is loopback-only, and our own binaries are dynamically
+linked, so a hand-rolled image is a project in itself. The way out was to stop
+building anything. `busybox` is a two-megabyte public image that every container
+runtime can pull, and it carries `sh`, `httpd` and `wget` — exactly the three
+tools these cases need. A volume case runs `busybox sleep infinity` and `exec`s a
+shell into it to write and read a file. A firewall case runs `busybox httpd` as
+the target and `wget`s it from another container. An ingress case puts `httpd`
+behind the proxy and sends it an HTTP request with the right `Host` header. No
+image to build, no registry to push to — just `image = "busybox:latest"` and a
+capability gate:
+
+```rust
+Capability::ContainerRuntime => self.container_runtime != "process",
+```
+
+That gate is the mirror of `ProcessRuntime` from Part A, and together they draw
+the honest line: the `testapp` cases run on a process cluster and skip on runc;
+the `busybox` cases run on runc and skip on a process cluster. Full coverage
+means two acceptance runs, one per runtime — which is exactly right, because the
+two runtimes really are different environments and a test suite that pretended
+otherwise would be hiding the seam, not testing it.
+
+Some cases still skip even on runc, and they say so honestly. Firewall
+enforcement needs eBPF, off by default on a dev cluster, so those cases require
+`Capability::Ebpf` and skip without it. Two of the three secrets cases need to
+*encrypt* a value with the cluster's age public key — and there's no API that
+hands it out, so they `skip` from inside their bodies with that exact reason
+rather than pretend. The config-file case, which only needs to mount a file and
+read it back, runs. One group is still missing entirely: image-registry, whose
+cases push a synthetic OCI image to the node's loopback registry, needs the
+harness to speak the raw `/v2` protocol from *on* a node — a genuinely different
+piece of plumbing, left for its own day. Twelve of thirteen groups, and the
+thirteenth's absence is written down rather than papered over.

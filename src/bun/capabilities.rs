@@ -140,6 +140,7 @@ impl ClusterCapabilities {
             Capability::Cluster => self.cluster,
             Capability::MultiNode => self.node_count >= 3,
             Capability::ProcessRuntime => self.container_runtime == "process",
+            Capability::ContainerRuntime => self.container_runtime != "process",
             Capability::Metrics => self.metrics,
             Capability::Logs => self.logs,
             Capability::Council => self.council,
@@ -189,6 +190,11 @@ pub enum Capability {
     /// without a container image. Cases built on `testapp_spec` need this;
     /// they skip on a runc/apple cluster.
     ProcessRuntime,
+    /// The node runs a *container* runtime (runc/apple), so cases that need a
+    /// real container — mount namespaces for volumes, eBPF for firewall
+    /// enforcement, an ingress listener behind a proxy — can run. They deploy
+    /// a stock public image (`busybox`) and skip on a process cluster.
+    ContainerRuntime,
     Metrics,
     Logs,
     Council,

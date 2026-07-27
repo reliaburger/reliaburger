@@ -7,11 +7,15 @@ use super::registry::TestCase;
 
 mod cluster_coordination;
 mod deployments;
+mod firewall;
 mod health_checks;
+mod ingress;
 mod jobs;
 mod process_workloads;
 mod scheduling;
+mod secrets_config;
 mod service_discovery;
+mod volumes;
 mod workload_identity;
 
 /// Every integration case, in the order groups are reported.
@@ -21,9 +25,13 @@ pub fn all() -> Vec<TestCase> {
     cases.extend(service_discovery::cases());
     cases.extend(deployments::cases());
     cases.extend(health_checks::cases());
+    cases.extend(secrets_config::cases());
+    cases.extend(firewall::cases());
+    cases.extend(workload_identity::cases());
+    cases.extend(ingress::cases());
+    cases.extend(volumes::cases());
     cases.extend(process_workloads::cases());
     cases.extend(jobs::cases());
-    cases.extend(workload_identity::cases());
     cases.extend(cluster_coordination::cases());
     cases
 }
@@ -57,10 +65,9 @@ mod tests {
         }
     }
 
-    /// The groups covered so far — part A plus the control-plane part-B
-    /// groups. The remaining part-B groups (firewall, ingress, volumes,
-    /// secrets-config, image-registry) need container workloads and land with
-    /// that path.
+    /// Every group but image-registry is covered. That last one needs the
+    /// harness to construct and push an OCI image to the on-node loopback
+    /// registry — a separate piece of work.
     #[test]
     fn the_expected_groups_are_covered() {
         let groups: HashSet<TestGroup> = all().iter().map(|case| case.group).collect();
@@ -69,9 +76,13 @@ mod tests {
             TestGroup::ServiceDiscovery,
             TestGroup::Deployments,
             TestGroup::HealthChecks,
+            TestGroup::SecretsConfig,
+            TestGroup::Firewall,
+            TestGroup::WorkloadIdentity,
+            TestGroup::Ingress,
+            TestGroup::Volumes,
             TestGroup::ProcessWorkloads,
             TestGroup::Jobs,
-            TestGroup::WorkloadIdentity,
             TestGroup::ClusterCoordination,
         ]
         .into_iter()
@@ -107,7 +118,7 @@ mod tests {
 
     #[test]
     fn the_catalogue_is_the_expected_size() {
-        // Eight groups, three cases each.
-        assert_eq!(all().len(), 24);
+        // Twelve groups, three cases each (image-registry pending).
+        assert_eq!(all().len(), 36);
     }
 }

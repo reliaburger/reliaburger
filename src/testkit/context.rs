@@ -26,6 +26,11 @@ pub const TEST_NAMESPACE_PREFIX: &str = "rbtest";
 /// on a process-runtime cluster without shipping a separate binary or image.
 pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 
+/// The stock public image container-workload cases deploy. Small, ubiquitous,
+/// and carries `sh`/`httpd`/`wget` — enough to exercise volumes, ingress and
+/// firewall without building an image.
+pub const BUSYBOX_IMAGE: &str = "busybox:latest";
+
 /// One test case's handle on the cluster.
 #[derive(Clone)]
 pub struct TestContext {
@@ -172,6 +177,54 @@ impl TestContext {
              namespace = \"{ns}\"\n",
             ns = self.namespace,
         )
+    }
+
+    /// A TOML spec for an idle container workload in this test's namespace.
+    ///
+    /// Runs a stock `busybox` image (pulled from Docker Hub by the runc
+    /// runtime) doing nothing but staying up, so a case can `exec` into it —
+    /// the workload for volume and firewall-source cases. No health check, so
+    /// it reaches Running as soon as the container starts. Needs
+    /// [`Capability::ContainerRuntime`](crate::bun::capabilities::Capability::ContainerRuntime).
+    pub fn container_idle_spec(&self, app: &str) -> String {
+        format!(
+            "[app.{app}]\n\
+             image = \"{BUSYBOX_IMAGE}\"\n\
+             command = [\"sleep\", \"infinity\"]\n\
+             namespace = \"{ns}\"\n",
+            ns = self.namespace,
+        )
+    }
+
+    /// A TOML spec for an HTTP container workload in this test's namespace.
+    ///
+    /// Runs `busybox httpd` serving `/etc`, health-checked on `/hostname`
+    /// (which maps to `/etc/hostname`, always present). The workload for
+    /// ingress and firewall-target cases. Port is derived from the app name.
+    pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
+        let port = testapp_port(app);
+        format!(
+            "[app.{app}]\n\
+             image = \"{BUSYBOX_IMAGE}\"\n\
+             command = [\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]\n\
+             port = {port}\n\
+             replicas = {replicas}\n\
+             namespace = \"{ns}\"\n\
+             \n\
+             [app.{app}.health]\n\
+             path = \"/hostname\"\n\
+             interval = 2\n\
+             timeout = 2\n\
+             threshold_unhealthy = 3\n\
+             threshold_healthy = 1\n",
+            ns = self.namespace,
+        )
+    }
+
+    /// The port [`container_http_spec`](Self::container_http_spec) derives for
+    /// `app` — so a case can build a URL to it.
+    pub fn container_port(&self, app: &str) -> u16 {
+        testapp_port(app)
     }
 
     /// A `BunClient` for every node in the cluster, paired with its node id.
@@ -396,6 +449,24 @@ mod tests {
             app.command
         );
         assert!(app.health.is_some(), "testapp_spec carries a health check");
+    }
+
+    #[test]
+    fn container_specs_parse_and_land_in_the_test_namespace() {
+        let ctx = context("rbtest-abc-00");
+
+        let http = Config::parse(&ctx.container_http_spec("web", 1)).unwrap();
+        let web = http.app.get("web").expect("app web");
+        assert_eq!(web.namespace.as_deref(), Some("rbtest-abc-00"));
+        assert_eq!(web.image.as_deref(), Some(BUSYBOX_IMAGE));
+        assert!(web.health.is_some());
+        assert_eq!(web.port, Some(ctx.container_port("web")));
+
+        let idle = Config::parse(&ctx.container_idle_spec("box")).unwrap();
+        let box_app = idle.app.get("box").expect("app box");
+        assert_eq!(box_app.namespace.as_deref(), Some("rbtest-abc-00"));
+        assert!(box_app.command.iter().any(|a| a == "sleep"));
+        assert!(box_app.health.is_none());
     }
 
     #[test]
