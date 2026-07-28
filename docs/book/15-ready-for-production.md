@@ -1220,9 +1220,17 @@ runtime can pull, and it carries `sh`, `httpd` and `wget` — exactly the three
 tools these cases need. A volume case runs `busybox sleep infinity` and `exec`s a
 shell into it to write and read a file. A firewall case runs `busybox httpd` as
 the target and `wget`s it from another container. An ingress case puts `httpd`
-behind the proxy and sends it an HTTP request with the right `Host` header. No
-image to build, no registry to push to — just `image = "busybox:latest"` and a
-capability gate:
+behind the proxy and sends it an HTTP request with the right `Host` header.
+
+A tag isn't an identity, though. `busybox:latest` can point at different bytes
+between two runs, which makes a failure impossible to reproduce and lets the
+runtime architectures drift apart. The catalogue uses BusyBox 1.37.0's OCI
+index digest instead. An OCI index maps one immutable name to platform-specific
+manifests, so runc selects `linux/amd64` and Apple Container selects
+`linux/arm64` without changing the test configuration. The runtime gates do
+more than pull it: they create, start and execute the workload, and any failure
+fails the test. No image to build, no registry to push to, and no moving tag.
+The capability gate stays explicit:
 
 ```rust
 Capability::ContainerRuntime => self.container_runtime != "process",
@@ -1230,10 +1238,11 @@ Capability::ContainerRuntime => self.container_runtime != "process",
 
 That gate is the mirror of `ProcessRuntime` from Part A, and together they draw
 the honest line: the `testapp` cases run on a process cluster and skip on runc;
-the `busybox` cases run on runc and skip on a process cluster. Full coverage
-means two acceptance runs, one per runtime — which is exactly right, because the
-two runtimes really are different environments and a test suite that pretended
-otherwise would be hiding the seam, not testing it.
+the pinned BusyBox cases run on runc or Apple Container and skip on a process
+cluster. Full coverage means separate acceptance runs for ProcessGrill, runc
+and Apple Container. That's exactly right. The runtimes really are different
+environments, and a test suite that pretended otherwise would hide the seam,
+not test it.
 
 Some cases still skip even on runc, and they say so honestly. Firewall
 enforcement needs eBPF, off by default on a dev cluster, so those cases require
@@ -1392,6 +1401,15 @@ concurrent cases was never isolation. After release, Relish polls every node
 using the original authenticated and CA-pinned client. A missing Raft record
 isn't proof that a runtime has stopped.
 
-The runner still needs a pinned, multi-architecture OCI workload which behaves
-identically under runc and Apple Container. Until that image passes both
-runtimes, the resource-lease milestone remains only half done.
+Container cases now use BusyBox 1.37.0 by immutable OCI index digest. The
+provisioned runc gate resolves and executes the `linux/amd64` manifest; the
+Apple Container gate does the same with `linux/arm64`. The Apple proof caught a
+nice final trap: its `container exec` command doesn't accept Docker's `--`
+separator, so our old adapter asked the runtime to execute a programme
+literally named `--`. A test which merely logged that error had been green.
+The new test fails on create, start, state or exec, and the adapter now emits
+the command shape Apple's CLI actually accepts.
+
+That closes the app/namespace and portable-workload part of the milestone.
+Jobs, faults, tokens, registry images, mounts and node state still need explicit
+ownership before the chaos catalogue can rely on them.

@@ -463,13 +463,13 @@ startup. M8 must add certificate expiry evidence and should not make
   a typed server-owned safety policy. Unknown clusters are protected and the
   old client-side production override no longer exists.
 - [x] Replace startup booleans with fresh expiring capability/evidence reports.
-- [ ] Add server-owned durable resource leases and a hermetic OCI workload.
+- [x] Add server-owned durable resource leases and a hermetic OCI workload.
   - [x] App/namespace-resource lease API, standalone/Raft ownership and
     restart-safe cleanup. Lease and resource counts, TTLs, forwarding and
     cleanup waits are server-bounded; reserved namespaces cannot bypass
     ownership.
   - [x] Make the runner use those leases for pass, failure, panic and timeout.
-  - [ ] Add a pinned multi-architecture OCI workload accepted through both
+  - [x] Add a pinned multi-architecture OCI workload accepted through both
     runc and Apple Container. Keep the ProcessGrill helper as a separate
     profile.
 - [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
@@ -515,8 +515,17 @@ failed, timed-out or interrupted attempt leaves the durable lease in
 `cleaning` for the one-second reaper to resume after process death or leadership
 change. The `rbtest-*` prefix is now lease-only, so an ordinary apply can't race
 ownership. This tranche owns apps and their namespace quota declaration. The
-OCI workload and ownership models for jobs, faults, tokens, images, mounts and
-node state remain open work.
+ownership models for jobs, faults, tokens, images, mounts and node state remain
+open work.
+
+**Hermetic workload delivered:** container cases use the official BusyBox
+1.37.0 OCI index pinned at
+`sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
+The index carries `linux/amd64` and `linux/arm64`; the real runc and Apple
+Container gates both create, start and exercise their selected manifest. The
+Apple proof exposed and fixed an invalid Docker-style `--` in
+`container exec`. ProcessGrill stays separate and continues to run the
+installed Bun's testapp.
 
 ## Optional
 

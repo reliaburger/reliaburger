@@ -523,23 +523,23 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
-    async fn apple_container_grill_creates_instance() {
+    async fn pinned_test_workload_runs_under_apple_container() {
         assert!(
             apple_tests_enabled(),
             "set RELIABURGER_APPLE_CONTAINER_TESTS=1 after installing and starting Apple Container"
         );
 
-        // This test requires Apple's container CLI installed and running
         let grill = AppleContainerGrill::new();
-        let id = InstanceId("apple-test-0".to_string());
+        let id = InstanceId("apple-pinned-workload-0".to_string());
+        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
-                args: vec!["echo".to_string(), "hello".to_string()],
+                args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec!["TEST=1".to_string()],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
@@ -554,15 +554,39 @@ mod tests {
             },
         };
 
-        let result = grill.create(&id, &spec).await;
-        if let Err(e) = &result {
-            eprintln!(
-                "Apple container create failed (expected if container CLI not installed): {e}"
-            );
+        let result: Result<(), String> = async {
+            grill
+                .create(&id, &spec)
+                .await
+                .map_err(|error| format!("pinned image create failed: {error}"))?;
+            grill
+                .start(&id)
+                .await
+                .map_err(|error| format!("pinned image start failed: {error}"))?;
+            if grill.state(&id).await.ok() != Some(ContainerState::Running) {
+                return Err("pinned image did not reach running".to_string());
+            }
+            let output = grill
+                .exec(
+                    &id,
+                    &[
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "printf reliaburger-pinned-workload".to_string(),
+                    ],
+                )
+                .await
+                .map_err(|error| format!("pinned image exec failed: {error}"))?;
+            if output != "reliaburger-pinned-workload" {
+                return Err(format!("unexpected pinned image output: {output:?}"));
+            }
+            Ok(())
         }
+        .await;
 
-        // Clean up
+        let _ = grill.kill(&id).await;
         let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        result.unwrap_or_else(|reason| panic!("{reason}"));
     }
 
     #[tokio::test]
@@ -577,7 +601,7 @@ mod tests {
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
@@ -613,7 +637,7 @@ mod tests {
             app_name: "apple-adopt".to_string(),
             replica_index: 0,
             is_job: false,
-            image: "alpine:latest".to_string(),
+            image: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
             runtime: crate::grill::records::RuntimeKind::Apple,
             pid: 0,
             pid_started_at: 0,

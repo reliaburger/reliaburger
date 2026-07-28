@@ -24,7 +24,7 @@ pub mod report;
 pub mod runner;
 pub mod safety;
 
-pub use context::TestContext;
+pub use context::{PINNED_TEST_WORKLOAD_IMAGE, TestContext};
 pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select, unknown};
 pub use report::{
     CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,

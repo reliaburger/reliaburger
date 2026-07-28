@@ -1699,8 +1699,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
-    async fn runc_captures_exit_code_and_logs() {
+    #[ignore = "requires runc, network access to the pinned OCI workload, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_runs_pinned_multiarchitecture_test_workload() {
         assert!(
             runc_tests_enabled(),
             "set RELIABURGER_RUNC_TESTS=1 after provisioning runc"
@@ -1713,21 +1713,15 @@ mod tests {
             true,
             tmp.path().join("state"),
         );
-        let id = InstanceId("runc-capture".to_string());
+        let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
-                // Absolute path: a bare "sh" needs $PATH, which a hand-built
-                // spec doesn't set (real images set PATH via their image config).
-                args: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "echo captured-stdout; exit 7".to_string(),
-                ],
+                args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
@@ -1747,32 +1741,23 @@ mod tests {
             .await
             .expect("runc create should succeed in the provisioned Linux suite");
         grill.start(&id).await.expect("runc run should spawn");
-
-        // Wait for the container to exit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if matches!(grill.state(&id).await, Ok(ContainerState::Stopped)) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "container never exited"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-
-        // The log file holds the container's stdout+stderr (or runc's error if
-        // the run failed — surfaced in the assert messages).
-        let logs = grill.logs(&id).await.unwrap();
-        let code = grill.exit_code(&id).await;
-
-        // Exit code is captured (7), and stdout was written to the log file.
-        assert_eq!(code, Some(7), "exit code not captured (logs: {logs:?})");
-        assert!(
-            logs.contains("captured-stdout"),
-            "container stdout not captured, got: {logs:?}"
+        assert_eq!(grill.state(&id).await.ok(), Some(ContainerState::Running));
+        let output = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf reliaburger-pinned-workload".to_string(),
+                ],
+            )
+            .await
+            .expect("the pinned workload should support exec");
+        assert_eq!(
+            output, "reliaburger-pinned-workload",
+            "unexpected output from the selected platform manifest"
         );
 
-        grill.kill(&id).await.ok();
+        grill.kill(&id).await.unwrap();
     }
 }

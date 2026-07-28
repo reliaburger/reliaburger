@@ -28,10 +28,13 @@ pub const TEST_NAMESPACE_PREFIX: &str = "rbtest";
 /// on a process-runtime cluster without shipping a separate binary or image.
 pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 
-/// The stock public image container-workload cases deploy. Small, ubiquitous,
-/// and carries `sh`/`httpd`/`wget` — enough to exercise volumes, ingress and
-/// firewall without building an image.
-pub const BUSYBOX_IMAGE: &str = "busybox:latest";
+/// Immutable multi-architecture OCI workload for container-profile cases.
+///
+/// This is the official BusyBox 1.37.0 OCI index, resolved on 28 July 2026.
+/// The index contains both `linux/amd64` and `linux/arm64`; pinning the index
+/// rather than a tag makes runc and Apple Container execute identical content
+/// on repeated acceptance runs.
+pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "docker.io/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
 /// One test case's handle on the cluster.
 #[derive(Clone)]
@@ -204,15 +207,15 @@ impl TestContext {
 
     /// A TOML spec for an idle container workload in this test's namespace.
     ///
-    /// Runs a stock `busybox` image (pulled from Docker Hub by the runc
-    /// runtime) doing nothing but staying up, so a case can `exec` into it —
-    /// the workload for volume and firewall-source cases. No health check, so
-    /// it reaches Running as soon as the container starts. Needs
+    /// Runs the digest-pinned multi-architecture test workload doing nothing
+    /// but staying up, so a case can `exec` into it. This is the workload for
+    /// volume and firewall-source cases. No health check, so it reaches
+    /// Running as soon as the container starts. Needs
     /// [`Capability::ContainerRuntime`](crate::bun::capabilities::Capability::ContainerRuntime).
     pub fn container_idle_spec(&self, app: &str) -> String {
         format!(
             "[app.{app}]\n\
-             image = \"{BUSYBOX_IMAGE}\"\n\
+             image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
              command = [\"sleep\", \"infinity\"]\n\
              namespace = \"{ns}\"\n",
             ns = self.namespace,
@@ -221,14 +224,15 @@ impl TestContext {
 
     /// A TOML spec for an HTTP container workload in this test's namespace.
     ///
-    /// Runs `busybox httpd` serving `/etc`, health-checked on `/hostname`
-    /// (which maps to `/etc/hostname`, always present). The workload for
-    /// ingress and firewall-target cases. Port is derived from the app name.
+    /// Runs the pinned workload's `httpd` serving `/etc`, health-checked on
+    /// `/hostname` (which maps to `/etc/hostname`, always present). This is the
+    /// workload for ingress and firewall-target cases. Port derives from the
+    /// app name.
     pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
         let port = testapp_port(app);
         format!(
             "[app.{app}]\n\
-             image = \"{BUSYBOX_IMAGE}\"\n\
+             image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
              command = [\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]\n\
              port = {port}\n\
              replicas = {replicas}\n\
@@ -618,7 +622,12 @@ mod tests {
         let http = Config::parse(&ctx.container_http_spec("web", 1)).unwrap();
         let web = http.app.get("web").expect("app web");
         assert_eq!(web.namespace.as_deref(), Some("rbtest-abc-00"));
-        assert_eq!(web.image.as_deref(), Some(BUSYBOX_IMAGE));
+        assert_eq!(web.image.as_deref(), Some(PINNED_TEST_WORKLOAD_IMAGE));
+        let (_, digest) = PINNED_TEST_WORKLOAD_IMAGE
+            .split_once("@sha256:")
+            .expect("test workload must use a digest-pinned reference");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(web.health.is_some());
         assert_eq!(web.port, Some(ctx.container_port("web")));
 

@@ -119,7 +119,9 @@ make pickle-test-macos       # push/pull a Docker image through the Pickle regis
 
 The Phase 15 runner and 39-case catalogue are live. Bun also exposes durable,
 server-owned app/namespace leases, and the runner now uses one for every case.
-The portable runc/Apple Container test image is the next ownership milestone.
+Container cases use one digest-pinned BusyBox 1.37.0 OCI index, accepted through
+both runc and Apple Container. Real node and pressure primitives are the next
+Phase 15 prerequisite.
 
 ## Licence
 

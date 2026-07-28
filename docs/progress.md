@@ -1257,7 +1257,8 @@ whole theme lands.
     (eBPF/runc/netns/Btrfs/Buildah/cgroups) — **green** on the merge commit. (A local Lima
     run was redundant and only tripped a guest `~/.cargo` permission quirk, not code.)
   - [x] Apple platform gate: `make test-apple` **2/2 passed on real Apple silicon**
-    (`apple_container_grill_creates_instance`, `adopt_re_tracks_a_running_apple_container`),
+    (`pinned_test_workload_runs_under_apple_container`,
+    `adopt_re_tracks_a_running_apple_container`),
     run twice back-to-back (idempotent). The gate caught the inspect-schema bug fixed in
     #118 — a green unit test had hidden it.
   - Gate findings fixed before close: DnsNxdomain userspace no-op (#117) and Apple
@@ -1424,8 +1425,10 @@ convergence and adoption" theme under 12b.6).
     - [x] Runner lease adoption: one sufficient-lifetime lease per case;
       leased applies and confirmed release after pass, failure, panic or
       timeout; server reaping after client death.
-    - [ ] Pinned multi-architecture OCI workload accepted on runc and Apple
-      Container. Keep the ProcessGrill helper as a separate profile.
+    - [x] Pinned multi-architecture OCI workload: BusyBox 1.37.0's immutable
+      OCI index is used by every container case and accepted on real runc
+      (`linux/amd64`) and Apple Container (`linux/arm64`). ProcessGrill keeps
+      the installed Bun helper as a separate profile.
   - [x] Ordinary 39-case catalogue and `relish test`
   - [ ] Real node and pressure primitives before the chaos catalogue
 

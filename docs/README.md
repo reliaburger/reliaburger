@@ -797,8 +797,11 @@ apply carries `X-Reliaburger-Test-Lease: <id>` and may contain apps plus the
 lease's own namespace quota declaration. Bun reserves every `rbtest-*`
 namespace for this path, persists ownership across a standalone restart or in
 Raft, and retries interrupted cleanup. The runner releases the lease after a
-pass, failure, panic or timeout. The portable multi-architecture OCI test
-workload is still pending.
+pass, failure, panic or timeout. Container cases use the official BusyBox
+1.37.0 multi-architecture OCI index pinned at
+`sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
+The same immutable reference is accepted by the provisioned runc and Apple
+Container gates; ProcessGrill cases keep using the node's installed Bun.
 
 Standalone apply streams an `Accepted` SSE event before progress, containing
 the operation ID used by these endpoints. Active records report `accepted`,

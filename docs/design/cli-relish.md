@@ -1179,8 +1179,15 @@ cluster ownership and desired state share one Raft entry. The runner asks for
 the case timeout plus its cleanup budget and refuses to start when the server's
 maximum is shorter. Pass, failure, panic and timeout release through the same
 path. Namespace quota declarations use the same lease. This does not yet make
-the catalogue hermetic: the portable OCI workload and other resource types
-remain prerequisites.
+every resource hermetic: app and namespace ownership is complete, but jobs,
+faults, tokens, images, mounts and node state need resource variants.
+
+Container-profile cases use the official BusyBox 1.37.0 OCI index pinned by
+digest, not `latest`. The index resolves to `linux/amd64` under runc and
+`linux/arm64` under Apple Container. Both runtime gates create, start and
+execute the pinned workload; a pull, platform-selection or exec failure fails
+the gate. ProcessGrill remains a separate profile and launches `bun testapp`
+from each node.
 
 Every case reports exactly one of `Pass`, `Fail`, `Skipped` or `Unknown`.
 `Pass` needs directly observed evidence. `Skipped` means a known missing
