@@ -847,7 +847,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 5/20 runner
 - [x] 6/20 `relish test` CLI + `CommandOutcome`
 - [x] 7/20 catalogue A
-- [~] 8/20 catalogue B — control-plane groups (service-discovery, cluster-coordination, workload-identity) + container-workload groups (firewall, ingress, volumes, secrets-config) now done via a `busybox` public-image workload gated on `Capability::ContainerRuntime` (mirror of `ProcessRuntime`; two acceptance runs, one per runtime). **12 of 13 groups, 36 cases.** Only **image-registry** remains — its cases must construct + push a synthetic OCI image to the on-node loopback `/v2` registry, a separate piece of plumbing
+- [x] 8/20 catalogue B — **all 13 groups, 39 cases.** Control-plane groups on `ProcessRuntime`; container-workload groups (firewall/ingress/volumes/secrets-config) on a `busybox` image gated on `Capability::ContainerRuntime`; image-registry builds + pushes a synthetic OCI image via the raw `/v2` protocol (`src/testkit/oci.rs`) to the on-node loopback registry (2 cases real, `deploy_from_cluster_registry` skips — synthetic image isn't runnable). Two acceptance runs, one per runtime; skips all name their reason
 - [x] 9/20 fault targeting flags + CLI fidelity
 - [x] 10/20 `[smoker]` duration config
 - [ ] 11/20 node-level faults
