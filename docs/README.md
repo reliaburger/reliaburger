@@ -788,16 +788,17 @@ curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
 ```
 
 Phase 15's command runner and ordinary 39-case catalogue are implemented. Its
-app ownership API has landed too, but the runner doesn't consume it yet.
-`[testing].allowed_operations` must include
+app ownership API has landed too, and the runner creates a separate lease for
+every case. `[testing].allowed_operations` must include
 `"provision_isolated_workloads"`; unknown and production safety classes also
 need `allow_protected_mutation = true`. Lease lifetimes default to a maximum of
 3,600 seconds and must stay in the validated 1-86,400 second range. A leased
-apply carries `X-Reliaburger-Test-Lease: <id>` and may contain apps only. Bun
-reserves every `rbtest-*` namespace for this path, persists ownership across a
-standalone restart or in Raft, and retries interrupted cleanup. The portable
-multi-architecture OCI test workload and runner lease adoption are still
-pending.
+apply carries `X-Reliaburger-Test-Lease: <id>` and may contain apps plus the
+lease's own namespace quota declaration. Bun reserves every `rbtest-*`
+namespace for this path, persists ownership across a standalone restart or in
+Raft, and retries interrupted cleanup. The runner releases the lease after a
+pass, failure, panic or timeout. The portable multi-architecture OCI test
+workload is still pending.
 
 Standalone apply streams an `Accepted` SSE event before progress, containing
 the operation ID used by these endpoints. Active records report `accepted`,

@@ -233,6 +233,13 @@ pub enum RaftRequest {
         app_id: AppId,
         spec: Box<AppSpec>,
     },
+    /// Atomically apply a namespace quota and attach it to an active lease.
+    TestLeaseNamespaceSpec {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        name: String,
+        spec: Box<crate::config::NamespaceSpec>,
+    },
     /// Extend an active lease. An expired lease cannot be revived.
     TestLeaseRenew {
         lease_id: String,

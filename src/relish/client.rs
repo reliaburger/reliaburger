@@ -326,6 +326,17 @@ impl BunClient {
         &self.base_url
     }
 
+    /// Address another node with the same authenticated, CA-pinned HTTP
+    /// client. Cluster fan-out must not silently lose the caller's bearer or
+    /// replace its trust roots while changing only the authority.
+    pub(crate) fn with_base_url(&self, base_url: &str) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: self.client.clone(),
+            token: self.token.clone(),
+        }
+    }
+
     /// The underlying HTTP client, pre-configured with the resolved bearer
     /// token and cluster-CA trust. Used for requests to an explicit URL that
     /// isn't relative to `base_url` — e.g. a Pickle registry `/v2` upload on a
@@ -1912,6 +1923,17 @@ mod tests {
         let client = BunClient::new_with_token(&url, None);
         client.health().await.unwrap();
         assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn changing_only_the_node_address_preserves_authentication() {
+        let (url, captured) = capture_server().await;
+        let entry = BunClient::new_with_token("http://127.0.0.1:1", Some("rbrg_cluster"));
+        entry.with_base_url(&url).health().await.unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("Bearer rbrg_cluster")
+        );
     }
 
     #[test]

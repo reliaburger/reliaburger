@@ -887,29 +887,34 @@ The cluster safety class and protected-cluster gate still apply.
 The server accepts at most 64 live lease records, at most 128 resources per
 lease, and a lifetime from one second up to the configured maximum (which has
 an absolute 86,400-second ceiling). An ordinary apply may never use an
-`rbtest-*` namespace. A leased app apply carries
-`X-Reliaburger-Test-Lease: <id>`; Bun fills an omitted namespace with the
+`rbtest-*` namespace. A leased apply carries
+`X-Reliaburger-Test-Lease: <id>` and may contain apps plus the lease's matching
+namespace quota declaration. Bun fills an omitted app namespace with the
 lease's namespace and rejects a different one.
 
 Standalone Bun writes `test-leases.json` under `[storage].data`, flushes it
 before asking the agent to deploy, and retains a `cleaning` record until the
-agent confirms every app stopped. Cluster Bun stores leases in `DesiredState`;
-one Raft entry adds both the app spec and its ownership, so a client cannot die
-between those actions. Lease mutations sent to a follower reach the leader
-with the original user's bearer/cookie credentials. The leader repeats normal
-authentication and policy checks. It never substitutes the internal service
-principal.
+agent confirms every app stopped. A per-lease operation guard also prevents
+expiry cleanup overtaking a deploy which the agent accepted but hasn't
+finished; unrelated leases still proceed concurrently. Cluster Bun stores
+leases in `DesiredState`; one Raft entry adds both the app spec and its
+ownership, so a client cannot die between those actions. Lease mutations sent
+to a follower reach the leader with the original user's bearer/cookie
+credentials. The leader repeats normal authentication and policy checks. It
+never substitutes the internal service principal.
 
 A one-second reaper resumes expired or interrupted cleanup. Every agent or
 consensus step has a ten-second bound. Failure leaves the record in `cleaning`
 with its resource list and bounded last error intact; restart and leadership
 transfer therefore retry instead of forgetting ownership. Standalone release confirms the runtime stop.
-Cluster release confirms removal from replicated desired state, after which
-ordinary reconciliation removes any remaining runtime instance.
+Cluster release removes apps and their owned namespace declaration from
+replicated desired state, after which ordinary reconciliation removes any
+remaining runtime instance. The runner separately polls every node for runtime
+absence before it calls cleanup confirmed.
 
-Version one owns apps only. Faults, credentials, images, mounts and node state
-need their own resource variants before their Phase 15 cases can use this
-contract.
+Version one owns apps and their namespace quota declaration. Jobs, faults,
+credentials, images, mounts and node state need their own resource variants
+before their Phase 15 cases can use this contract.
 
 ---
 

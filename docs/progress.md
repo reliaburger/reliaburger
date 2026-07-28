@@ -1417,12 +1417,15 @@ convergence and adoption" theme under 12b.6).
     deadline and an explicit evidence/unknown result for every expected node.
     Reports include build/runtime/topology fingerprints and server policy
   - [ ] Server resource leases and hermetic OCI workload
-    - [x] Durable, bounded app leases: authenticated creation/renewal/release;
-      lease-only `rbtest-*` namespaces; standalone fsync persistence and Raft
-      ownership; restart/leader-safe reapers; bounded cleanup steps.
-    - [ ] Runner lease adoption and a pinned multi-architecture OCI workload
-      accepted on runc and Apple Container. Keep the ProcessGrill helper as a
-      separate profile.
+    - [x] Durable, bounded app/namespace leases: authenticated
+      creation/renewal/release; lease-only `rbtest-*` namespaces; standalone
+      fsync persistence and Raft ownership; restart/leader-safe reapers;
+      bounded cleanup steps.
+    - [x] Runner lease adoption: one sufficient-lifetime lease per case;
+      leased applies and confirmed release after pass, failure, panic or
+      timeout; server reaping after client death.
+    - [ ] Pinned multi-architecture OCI workload accepted on runc and Apple
+      Container. Keep the ProcessGrill helper as a separate profile.
   - [x] Ordinary 39-case catalogue and `relish test`
   - [ ] Real node and pressure primitives before the chaos catalogue
 

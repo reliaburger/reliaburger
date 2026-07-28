@@ -35,6 +35,16 @@ use super::report::{
 /// must not disappear behind a green case result either.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Resource ownership mode. Production command wiring always requires server
+/// leases; the legacy variant exists only for runner unit tests whose tiny
+/// mock servers predate the lease API.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LeaseOwnership {
+    Required,
+    #[cfg(test)]
+    LegacyNamespaceCleanup,
+}
+
 /// Everything a run needs beyond the cases themselves.
 pub struct RunConfig {
     pub client: BunClient,
@@ -50,10 +60,11 @@ pub struct RunConfig {
     pub chaos: bool,
     /// Determines which known capability gaps may remain optional.
     pub profile: TestProfile,
-    /// `--namespace`: run every case in this one namespace instead of a fresh
-    /// one each. `None` keeps per-case isolation, which is the default and the
-    /// safer choice against a live cluster.
+    /// `--namespace`: readable base for the per-case namespace suffix.
+    /// `None` derives the base from the random run id. Both forms preserve
+    /// per-case isolation against a live cluster.
     pub fixed_namespace: Option<String>,
+    pub(crate) lease_ownership: LeaseOwnership,
 }
 
 /// A finished case tagged with its position in the catalogue, so results can
@@ -95,12 +106,14 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
         let client = config.client.clone();
         let namespace = config
             .fixed_namespace
-            .clone()
+            .as_ref()
+            .map(|base| format!("{base}-{index:02}"))
             .unwrap_or_else(|| TestContext::namespace_for(&config.run_id, index));
         let timeout = config.timeout;
         let profile = config.profile;
         let name = case.name.to_string();
         let group = case.group;
+        let lease_ownership = config.lease_ownership;
 
         let handle = set.spawn(async move {
             // Acquire *inside* the task, not before spawning: the semaphore is
@@ -116,6 +129,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
                 capabilities.as_ref(),
                 timeout,
                 profile,
+                lease_ownership,
             )
             .await;
             Indexed { index, result }
@@ -178,6 +192,7 @@ async fn run_one(
     capabilities: &ClusterCapabilities,
     timeout: Duration,
     profile: TestProfile,
+    lease_ownership: LeaseOwnership,
 ) -> TestCaseResult {
     let start = Instant::now();
     let started_at = now_rfc3339();
@@ -237,10 +252,87 @@ async fn run_one(
     }
 
     let deadline = Deadline::after(timeout).expect("CLI rejects a zero timeout");
+    let (namespace, lease_id) = match lease_ownership {
+        LeaseOwnership::Required => {
+            let lifetime = timeout.saturating_add(TEARDOWN_TIMEOUT);
+            let ttl_seconds = lifetime
+                .as_secs()
+                .saturating_add(u64::from(lifetime.subsec_nanos() != 0));
+            if ttl_seconds > capabilities.test_policy.max_lease_seconds {
+                return TestCaseResult {
+                    name: case.name.to_string(),
+                    group: case.group,
+                    required,
+                    started_at,
+                    finished_at: now_rfc3339(),
+                    deadline_at,
+                    outcome: TestOutcome::Unknown {
+                        kind: UnknownKind::MissingEvidence,
+                        reason: format!(
+                            "case and cleanup need a {ttl_seconds}s resource lease, but the server permits at most {}s",
+                            capabilities.test_policy.max_lease_seconds
+                        ),
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    evidence: Vec::new(),
+                    cleanup: CleanupOutcome::NotRequired,
+                };
+            }
+            match deadline
+                .run(
+                    "lease creation",
+                    client.create_test_lease(ttl_seconds, Some(&namespace)),
+                )
+                .await
+            {
+                Ok(Ok(lease)) => (lease.namespace, Some(lease.lease_id)),
+                Ok(Err(error)) => {
+                    return TestCaseResult {
+                        name: case.name.to_string(),
+                        group: case.group,
+                        required,
+                        started_at,
+                        finished_at: now_rfc3339(),
+                        deadline_at,
+                        outcome: TestOutcome::Unknown {
+                            kind: UnknownKind::CollectorFailed,
+                            reason: format!("server did not grant a resource lease: {error}"),
+                        },
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        evidence: Vec::new(),
+                        cleanup: CleanupOutcome::Unknown {
+                            reason: "lease creation returned no ownership evidence; the server TTL reaper must decide cleanup".to_string(),
+                        },
+                    };
+                }
+                Err(error) => {
+                    return TestCaseResult {
+                        name: case.name.to_string(),
+                        group: case.group,
+                        required,
+                        started_at,
+                        finished_at: now_rfc3339(),
+                        deadline_at,
+                        outcome: TestOutcome::timed_out("lease creation", deadline.budget_ms()),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        evidence: Vec::new(),
+                        cleanup: CleanupOutcome::Unknown {
+                            reason: format!(
+                                "{error}; the server TTL reaper must decide whether a late lease was created"
+                            ),
+                        },
+                    };
+                }
+            }
+        }
+        #[cfg(test)]
+        LeaseOwnership::LegacyNamespaceCleanup => (namespace, None),
+    };
 
     let context = TestContext {
         client,
         namespace,
+        lease_id,
         capabilities: capabilities.clone(),
         timeout,
         deadline,
@@ -248,8 +340,8 @@ async fn run_one(
 
     // The case body gets its own task so a panic is data and the outer owner
     // still reaches cleanup. Spawning `run_one` directly did the opposite.
-    let body = tokio::spawn((case.run)(context.clone()));
-    let outcome = match deadline.run("case", body).await {
+    let mut body = tokio::spawn((case.run)(context.clone()));
+    let outcome = match deadline.run("case", &mut body).await {
         Ok(Ok(Ok(()))) => TestOutcome::Pass,
         Ok(Ok(Err(message))) => match message.strip_prefix(super::registry::UNKNOWN_MARKER) {
             Some(reason) => TestOutcome::Unknown {
@@ -262,7 +354,14 @@ async fn run_one(
             kind: UnknownKind::Panicked,
             reason: format!("case panicked: {join_error}"),
         },
-        Err(_) => TestOutcome::timed_out("case", deadline.budget_ms()),
+        Err(_) => {
+            // Dropping a JoinHandle detaches its task. Abort and join it before
+            // cleanup so a timed-out body cannot recreate resources after the
+            // lease has been released.
+            body.abort();
+            let _ = body.await;
+            TestOutcome::timed_out("case", deadline.budget_ms())
+        }
     };
 
     let cleanup_deadline = Deadline::after(TEARDOWN_TIMEOUT).expect("non-zero cleanup timeout");
@@ -361,6 +460,10 @@ mod tests {
     use crate::bun::agent::InstanceStatus;
     use crate::bun::capabilities::{Capability, StaticCapabilities, WiredSubsystems};
     use crate::testkit_case;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::routing::{delete, post};
+    use axum::{Json, Router};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -402,6 +505,7 @@ mod tests {
             chaos: false,
             profile: TestProfile::Development,
             fixed_namespace: None,
+            lease_ownership: LeaseOwnership::LegacyNamespaceCleanup,
         }
     }
 
@@ -646,6 +750,165 @@ mod tests {
         let max = CONC_MAX.load(Ordering::SeqCst);
         assert!(max <= 2, "ran {max} at once with a limit of 2");
         assert!(max >= 2, "the two-wide limit was never actually reached");
+    }
+
+    #[derive(Clone)]
+    struct LeaseMockState {
+        records: Arc<tokio::sync::Mutex<Vec<String>>>,
+        next_id: Arc<AtomicUsize>,
+    }
+
+    async fn create_mock_lease(
+        State(state): State<LeaseMockState>,
+        Json(request): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<crate::testkit::lease::TestLease>) {
+        let namespace = request["namespace"].as_str().unwrap().to_string();
+        let ttl_seconds = request["ttl_seconds"].as_u64().unwrap();
+        let sequence = state.next_id.fetch_add(1, Ordering::SeqCst);
+        let lease_id = format!("lease-{sequence}");
+        state
+            .records
+            .lock()
+            .await
+            .push(format!("create:{namespace}:{ttl_seconds}"));
+        let lease = crate::testkit::lease::TestLease::new(
+            lease_id,
+            "token:runner".to_string(),
+            "runner".to_string(),
+            namespace,
+            1,
+            1 + ttl_seconds * 1_000,
+        )
+        .unwrap();
+        (StatusCode::CREATED, Json(lease))
+    }
+
+    async fn release_mock_lease(
+        State(state): State<LeaseMockState>,
+        Path(lease_id): Path<String>,
+    ) -> StatusCode {
+        state
+            .records
+            .lock()
+            .await
+            .push(format!("release:{lease_id}"));
+        StatusCode::NO_CONTENT
+    }
+
+    async fn empty_mock_list() -> Json<Vec<serde_json::Value>> {
+        Json(Vec::new())
+    }
+
+    async fn spawn_lease_server() -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let state = LeaseMockState {
+            records: Arc::clone(&records),
+            next_id: Arc::new(AtomicUsize::new(1)),
+        };
+        let app = Router::new()
+            .route("/v1/test/leases", post(create_mock_lease))
+            .route("/v1/test/leases/{id}", delete(release_mock_lease))
+            .route("/v1/cluster/nodes", axum::routing::get(empty_mock_list))
+            .route("/v1/status", axum::routing::get(empty_mock_list))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, records)
+    }
+
+    #[tokio::test]
+    async fn production_runner_releases_leases_after_pass_fail_and_timeout() {
+        static TIMED_OUT_BODY_COMPLETED: AtomicBool = AtomicBool::new(false);
+
+        async fn passes(_ctx: TestContext) -> Result<(), String> {
+            Ok(())
+        }
+        async fn fails(_ctx: TestContext) -> Result<(), String> {
+            Err("expected failure".to_string())
+        }
+        async fn times_out(_ctx: TestContext) -> Result<(), String> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            TIMED_OUT_BODY_COMPLETED.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        TIMED_OUT_BODY_COMPLETED.store(false, Ordering::SeqCst);
+        let (address, records) = spawn_lease_server().await;
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            3,
+        );
+        cfg.fixed_namespace = Some("rbtest-fixed".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+        cfg.timeout = Duration::from_millis(50);
+
+        let report = run(
+            vec![
+                case("passes", &[], testkit_case!(passes)),
+                case("fails", &[], testkit_case!(fails)),
+                case("times_out", &[], testkit_case!(times_out)),
+            ],
+            cfg,
+        )
+        .await;
+
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.unknown, 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !TIMED_OUT_BODY_COMPLETED.load(Ordering::SeqCst),
+            "timed-out case body kept running after cleanup"
+        );
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.cleanup == CleanupOutcome::Confirmed)
+        );
+        let mut observed = records.lock().await.clone();
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![
+                "create:rbtest-fixed-00:31".to_string(),
+                "create:rbtest-fixed-01:31".to_string(),
+                "create:rbtest-fixed-02:31".to_string(),
+                "release:lease-1".to_string(),
+                "release:lease-2".to_string(),
+                "release:lease-3".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_refuses_a_lease_shorter_than_case_plus_cleanup() {
+        async fn must_not_run(_ctx: TestContext) -> Result<(), String> {
+            panic!("case ran without a sufficient ownership lifetime");
+        }
+        let mut capabilities = full_capabilities();
+        capabilities.test_policy.max_lease_seconds = 30;
+        let mut cfg = config(dead_client(), capabilities, 1);
+        cfg.lease_ownership = LeaseOwnership::Required;
+        cfg.timeout = Duration::from_millis(1);
+
+        let report = run(
+            vec![case("must_not_run", &[], testkit_case!(must_not_run))],
+            cfg,
+        )
+        .await;
+
+        assert!(matches!(
+            report.results[0].outcome,
+            TestOutcome::Unknown {
+                kind: UnknownKind::MissingEvidence,
+                ..
+            }
+        ));
+        assert_eq!(report.results[0].cleanup, CleanupOutcome::NotRequired);
     }
 
     /// A minimal HTTP/1.1 mock that answers `GET /v1/status` with a fixed

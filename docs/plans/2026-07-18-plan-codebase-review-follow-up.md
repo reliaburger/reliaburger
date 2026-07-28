@@ -464,12 +464,14 @@ startup. M8 must add certificate expiry evidence and should not make
   old client-side production override no longer exists.
 - [x] Replace startup booleans with fresh expiring capability/evidence reports.
 - [ ] Add server-owned durable resource leases and a hermetic OCI workload.
-  - [x] App-resource lease API, standalone/Raft ownership and restart-safe
-    cleanup. Lease and resource counts, TTLs, forwarding and cleanup waits are
-    server-bounded; reserved namespaces cannot bypass ownership.
-  - [ ] Make the runner use those leases and add a pinned multi-architecture
-    OCI workload accepted through both runc and Apple Container. Keep the
-    ProcessGrill helper as a separate profile.
+  - [x] App/namespace-resource lease API, standalone/Raft ownership and
+    restart-safe cleanup. Lease and resource counts, TTLs, forwarding and
+    cleanup waits are server-bounded; reserved namespaces cannot bypass
+    ownership.
+  - [x] Make the runner use those leases for pass, failure, panic and timeout.
+  - [ ] Add a pinned multi-architecture OCI workload accepted through both
+    runc and Apple Container. Keep the ProcessGrill helper as a separate
+    profile.
 - [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
 - [ ] Add chaos primitives only after the safety, evidence and ownership gates.
 - [ ] Implement authenticated real drain/kill and node-scoped pressure before
@@ -498,22 +500,23 @@ volume semantics, telemetry freshness and certificate expiry remain honest
 unknown or unavailable prerequisites.
 
 **Resource-lease tranche delivered:** a Deployer may create, inspect, renew and
-release an app lease only when the server policy permits isolated workload
-provisioning. The server chooses a 128-bit identifier and an isolated
+release an app/namespace lease only when the server policy permits isolated
+workload provisioning. The server chooses a 128-bit identifier and an isolated
 `rbtest-*` namespace, clamps lifetime to the configured one-day hard ceiling,
 and limits one control plane to 64 leases with 128 resources each. The owner
-passes the lease id on `/v1/apply`; a standalone Bun persists ownership before
-deploying, while a cluster commits app desired state and ownership in one Raft
-entry. Followers forward mutations with the caller's credential, not the
-cluster service principal.
+passes the lease id on `/v1/apply`; a standalone Bun persists app ownership
+before deploying, while a cluster commits app or namespace desired state and
+ownership in one Raft entry. Followers forward mutations with the caller's
+credential, not the cluster service principal.
 
 Standalone cleanup waits for the agent's stop result. Cluster cleanup removes
 the owned desired state through Raft. Each step has a ten-second ceiling, and a
 failed, timed-out or interrupted attempt leaves the durable lease in
 `cleaning` for the one-second reaper to resume after process death or leadership
 change. The `rbtest-*` prefix is now lease-only, so an ordinary apply can't race
-ownership. This tranche owns apps only. The OCI workload and ownership models
-for faults, tokens, images, mounts and node state remain open work.
+ownership. This tranche owns apps and their namespace quota declaration. The
+OCI workload and ownership models for jobs, faults, tokens, images, mounts and
+node state remain open work.
 
 ## Optional
 

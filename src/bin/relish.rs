@@ -371,7 +371,7 @@ enum Command {
         /// Acceptance profile: development, full-runc, full-apple, process-grill.
         #[arg(long, default_value = "development")]
         profile: String,
-        /// Run all tests inside one fixed namespace instead of one per test.
+        /// Readable rbtest-* prefix; each case receives a unique suffix.
         #[arg(long)]
         namespace: Option<String>,
     },

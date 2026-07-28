@@ -30,7 +30,7 @@ pub struct TestArgs {
     pub chaos: bool,
     /// Acceptance policy for required cases and known skips.
     pub profile: String,
-    /// `--namespace`: run every case in one namespace instead of one each.
+    /// `--namespace`: readable base for each case's isolated namespace.
     pub namespace: Option<String>,
     /// `--output`: how to render the report.
     pub output: OutputFormat,
@@ -61,11 +61,14 @@ async fn run_with_client(
             reason,
         })?;
     if let Some(namespace) = &args.namespace
-        && !testkit::TestContext::is_test_namespace(namespace)
+        && (!testkit::TestContext::is_test_namespace(namespace)
+            || !testkit::lease::valid_test_namespace(&format!("{namespace}-00")))
     {
         return Err(RelishError::InvalidFlag {
             flag: "namespace".to_string(),
-            reason: "must use the reserved rbtest-* prefix".to_string(),
+            reason:
+                "must be a DNS-label prefix beginning rbtest- and leave room for a per-case suffix"
+                    .to_string(),
         });
     }
 
@@ -109,6 +112,7 @@ async fn run_with_client(
             chaos: args.chaos,
             profile,
             fixed_namespace: args.namespace.clone(),
+            lease_ownership: testkit::runner::LeaseOwnership::Required,
         },
     )
     .await;

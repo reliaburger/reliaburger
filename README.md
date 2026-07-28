@@ -118,8 +118,8 @@ make pickle-test-macos       # push/pull a Docker image through the Pickle regis
 ```
 
 The Phase 15 runner and 39-case catalogue are live. Bun also exposes durable,
-server-owned app leases; adopting those leases in the runner and adding the
-portable runc/Apple Container test image are the next ownership milestone.
+server-owned app/namespace leases, and the runner now uses one for every case.
+The portable runc/Apple Container test image is the next ownership milestone.
 
 ## Licence
 

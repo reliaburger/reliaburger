@@ -566,6 +566,12 @@ impl StateMachineInner {
                 }
             }
             RaftRequest::NamespaceSpec { name, spec } => {
+                if crate::testkit::lease::valid_test_namespace(name) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "test lease namespace requires a leased namespace write"
+                            .to_string(),
+                    });
+                }
                 self.state.namespaces.insert(name.clone(), *spec.clone());
             }
             RaftRequest::NamespaceDelete { name } => {
@@ -656,6 +662,47 @@ impl StateMachineInner {
                     lease.resources.insert(resource);
                 }
                 self.apply_app_spec(app_id, spec);
+            }
+            RaftRequest::TestLeaseNamespaceSpec {
+                lease_id,
+                observed_at_unix_ms,
+                name,
+                spec,
+            } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".to_string(),
+                    });
+                };
+                if !lease.is_active_at(*observed_at_unix_ms) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease is expired or cleanup has started".to_string(),
+                    });
+                }
+                if name != &lease.namespace {
+                    return Some(CouncilResponse::Refused {
+                        reason: "namespace does not match its lease".to_string(),
+                    });
+                }
+                let resource =
+                    crate::testkit::lease::LeasedResource::Namespace { name: name.clone() };
+                let already_owned = lease.resources.contains(&resource);
+                if !already_owned
+                    && lease.resources.len() >= crate::testkit::lease::MAX_LEASED_RESOURCES
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease resource limit reached".to_string(),
+                    });
+                }
+                if self.state.namespaces.contains_key(name) && !already_owned {
+                    return Some(CouncilResponse::Refused {
+                        reason: "namespace already exists outside this lease".to_string(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.resources.insert(resource);
+                }
+                self.state.namespaces.insert(name.clone(), *spec.clone());
             }
             RaftRequest::TestLeaseRenew {
                 lease_id,
@@ -3194,6 +3241,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leased_namespace_write_atomically_records_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let responses = sm
+            .apply(vec![
+                normal_entry(1, 1, RaftRequest::TestLeaseCreate(test_lease("run1", 100))),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::TestLeaseNamespaceSpec {
+                        lease_id: "run1".to_string(),
+                        observed_at_unix_ms: 20,
+                        name: "rbtest-run1".to_string(),
+                        spec: Box::new(crate::config::NamespaceSpec {
+                            cpu: None,
+                            memory: None,
+                            gpu: None,
+                            max_apps: Some(1),
+                            max_replicas: None,
+                        }),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|response| matches!(response, CouncilResponse::Applied { .. }))
+        );
+        let state = sm.desired_state().await;
+        assert_eq!(state.namespaces["rbtest-run1"].max_apps, Some(1));
+        assert!(state.test_leases["run1"].resources.contains(
+            &crate::testkit::lease::LeasedResource::Namespace {
+                name: "rbtest-run1".to_string(),
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn leased_app_refuses_expiry_namespace_mismatch_and_existing_app() {
         let mut sm = CouncilStateMachine::new();
         let existing = AppId::new("existing", "rbtest-run1");
@@ -3254,22 +3340,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_app_write_cannot_use_a_reserved_test_namespace() {
+    async fn ordinary_writes_cannot_use_a_reserved_test_namespace() {
         let mut sm = CouncilStateMachine::new();
         let app_id = AppId::new("probe", "rbtest-unleased");
         let responses = sm
-            .apply(vec![normal_entry(
-                1,
-                1,
-                RaftRequest::AppSpec {
-                    app_id: app_id.clone(),
-                    spec: Box::new(default_spec()),
-                },
-            )])
+            .apply(vec![
+                normal_entry(
+                    1,
+                    1,
+                    RaftRequest::NamespaceSpec {
+                        name: "rbtest-unleased".to_string(),
+                        spec: Box::new(crate::config::NamespaceSpec {
+                            cpu: None,
+                            memory: None,
+                            gpu: None,
+                            max_apps: Some(1),
+                            max_replicas: None,
+                        }),
+                    },
+                ),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::AppSpec {
+                        app_id: app_id.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ])
             .await
             .unwrap();
-        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
-        assert!(!sm.desired_state().await.apps.contains_key(&app_id));
+        assert!(
+            responses
+                .iter()
+                .all(|response| matches!(response, CouncilResponse::Refused { .. }))
+        );
+        let state = sm.desired_state().await;
+        assert!(!state.namespaces.contains_key("rbtest-unleased"));
+        assert!(!state.apps.contains_key(&app_id));
     }
 
     #[tokio::test]

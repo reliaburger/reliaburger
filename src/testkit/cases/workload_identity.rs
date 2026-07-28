@@ -52,10 +52,11 @@ async fn jwks_endpoint_serves_signing_keys(ctx: TestContext) -> Result<(), Strin
 async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Result<(), String> {
     // Mint a Deployer token confined to this test's namespace. (This needs the
     // harness itself to hold an admin token, which the dev cluster provides.)
+    let token_name = format!("rbtest-scope-{}", ctx.namespace);
     let token = ctx
         .client
         .token_create(
-            &format!("rbtest-scope-{}", ctx.namespace),
+            &token_name,
             "Deployer",
             None,
             Some(vec![ctx.namespace.clone()]),
@@ -65,7 +66,9 @@ async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Resul
         .map_err(|error| format!("could not mint a scoped token: {error}"))?;
 
     let scoped = BunClient::new_with_token(ctx.client.base_url(), Some(&token));
-    let other_namespace = format!("{}-elsewhere", ctx.namespace);
+    // Deliberately avoid rbtest-* here. Those names are lease-only, and a
+    // rejection at that boundary would not prove token-scope enforcement.
+    let other_namespace = format!("outside-{}", ctx.namespace.trim_start_matches("rbtest-"));
     let spec = format!(
         "[app.probe]\n\
          image = \"proc-grill:image-ignored\"\n\
@@ -75,14 +78,19 @@ async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Resul
     let config =
         Config::parse(&spec).map_err(|error| format!("probe spec does not parse: {error}"))?;
 
-    match scoped.apply(&config).await {
+    let verdict = match scoped.apply(&config).await {
         Err(_) => Ok(()),
         Ok(_) => {
             // It was wrongly allowed — clean up the leak, then fail.
             let _ = ctx.client.stop("probe", &other_namespace).await;
             Err("a namespace-scoped token was allowed to write to another namespace".to_string())
         }
-    }
+    };
+    ctx.client
+        .token_revoke(&token_name)
+        .await
+        .map_err(|error| format!("could not revoke scoped test token: {error}"))?;
+    verdict
 }
 
 pub fn cases() -> Vec<TestCase> {

@@ -28,6 +28,8 @@ const MAX_LOCAL_LEASE_STORE_BYTES: usize = 4 * 1024 * 1024;
 pub enum LeasedResource {
     /// A declarative or local application.
     App { app_id: AppId },
+    /// A declarative namespace created for an owned app.
+    Namespace { name: String },
 }
 
 /// Whether a lease accepts new resources or is being reclaimed.
@@ -130,6 +132,7 @@ impl TestLease {
         }
         if self.resources.iter().any(|resource| match resource {
             LeasedResource::App { app_id } => app_id.namespace != self.namespace,
+            LeasedResource::Namespace { name } => name != &self.namespace,
         }) {
             return Err(LeaseError::NamespaceMismatch);
         }
@@ -587,6 +590,10 @@ pub async fn cleanup_local_lease(
                     }
                 }
             }
+            LeasedResource::Namespace { .. } => {
+                // Standalone namespace specs are validation input rather than
+                // durable agent state. Cluster mode removes its Raft record.
+            }
         }
     }
     store.finish_cleanup(lease_id).await
@@ -634,6 +641,17 @@ pub async fn cleanup_cluster_lease(
                     crate::council::RaftRequest::AppDelete {
                         app_id: app_id.clone(),
                     },
+                )
+                .await
+                {
+                    record_cluster_cleanup_failure(council, lease_id, &error).await;
+                    return Err(error);
+                }
+            }
+            LeasedResource::Namespace { name } => {
+                if let Err(error) = write_cluster_lease_request(
+                    council,
+                    crate::council::RaftRequest::NamespaceDelete { name: name.clone() },
                 )
                 .await
                 {
@@ -780,6 +798,18 @@ mod tests {
         assert!(!valid_test_namespace("production"));
         assert!(!valid_test_namespace("rbtest-UPPER"));
         assert!(!valid_test_namespace("rbtest-trailing-"));
+    }
+
+    #[test]
+    fn namespace_resources_must_match_their_lease() {
+        let mut record = lease("abc", 10, 20);
+        record.resources.insert(LeasedResource::Namespace {
+            name: "rbtest-other".to_string(),
+        });
+        assert!(matches!(
+            record.validate(),
+            Err(LeaseError::NamespaceMismatch)
+        ));
     }
 
     #[tokio::test]

@@ -1699,14 +1699,10 @@ async fn apply_handler(
     };
     let mut lease_owner_id = None;
     if let Some(lease_id) = &lease_id {
-        if !config.job.is_empty()
-            || !config.namespace.is_empty()
-            || !config.permission.is_empty()
-            || !config.build.is_empty()
-        {
+        if !config.job.is_empty() || !config.permission.is_empty() || !config.build.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
-                "leased apply currently accepts apps only",
+                "leased apply currently accepts apps and their namespace declaration only",
             )
                 .into_response();
         }
@@ -1724,6 +1720,13 @@ async fn apply_handler(
         if !lease.is_active_at(crate::testkit::lease::now_unix_millis()) {
             return lease_error_response(crate::testkit::lease::LeaseError::NotActive);
         }
+        if config
+            .namespace
+            .keys()
+            .any(|namespace| namespace != &lease.namespace)
+        {
+            return lease_error_response(crate::testkit::lease::LeaseError::NamespaceMismatch);
+        }
         for spec in config.app.values_mut() {
             match &spec.namespace {
                 Some(namespace) if namespace != &lease.namespace => {
@@ -1737,6 +1740,17 @@ async fn apply_handler(
         }
         lease_owner_id = Some(lease.owner_id);
     } else {
+        if config
+            .namespace
+            .keys()
+            .any(|namespace| crate::testkit::lease::valid_test_namespace(namespace))
+        {
+            return (
+                StatusCode::CONFLICT,
+                "test lease namespace requires x-reliaburger-test-lease",
+            )
+                .into_response();
+        }
         for spec in config.app.values() {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
             if crate::testkit::lease::valid_test_namespace(namespace) {
@@ -1954,7 +1968,7 @@ async fn cluster_apply(
         // apply and GitOps can't diverge (12b.2 T6). A failed write is a
         // hard stop — half an apply leaves desired state inconsistent.
         let writes = match &lease_id {
-            Some(lease_id) => crate::council::config_to_leased_app_writes(
+            Some(lease_id) => crate::council::config_to_leased_writes(
                 &config,
                 lease_id,
                 crate::testkit::lease::now_unix_millis(),
@@ -2031,6 +2045,9 @@ fn describe_write(request: &crate::council::types::RaftRequest) -> String {
         RaftRequest::PermissionSpec { name, .. } => format!("permission {name}"),
         RaftRequest::TestLeaseAppSpec { app_id, .. } => {
             format!("leased app {}", app_id.name)
+        }
+        RaftRequest::TestLeaseNamespaceSpec { name, .. } => {
+            format!("leased namespace {name}")
         }
         _ => "resource".to_string(),
     }
@@ -5547,13 +5564,30 @@ mod tests {
         )
         .await;
         let (status, body) = post_authenticated(
-            app,
+            app.clone(),
             "/v1/apply",
             &plaintext,
             r#"
                 [app.probe]
                 image = "test:v1"
                 namespace = "rbtest-unleased"
+            "#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, body) = post_authenticated(
+            app,
+            "/v1/apply",
+            &plaintext,
+            r#"
+                [namespace.rbtest-unleased]
+                max_apps = 1
             "#,
             None,
         )

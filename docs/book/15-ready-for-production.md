@@ -1353,17 +1353,20 @@ of an ownership check.
 
 The resource collection is a `BTreeSet<LeasedResource>`. We met `BTreeSet` earlier for the
 safety allow-list. Here its second useful property matters: inserting the same app twice is
-idempotent. The enum currently has one variant:
+idempotent. The enum owns apps and the matching namespace quota declaration:
 
 ```rust
 pub enum LeasedResource {
     App { app_id: AppId },
+    Namespace { name: String },
 }
 ```
 
-That's deliberately honest. Faults, tokens, images, mounts and node state need different
-cleanup operations. Pretending a namespace owns them would produce green reports and leaked
-state, which is quite an achievement for a test system.
+Apps sort before namespaces, so cleanup removes every app before its quota
+record. That's deliberately honest. Jobs, faults, tokens, images, mounts and
+node state need different cleanup operations. Pretending a namespace owns them
+would produce green reports and leaked state, which is quite an achievement for
+a test system.
 
 Expiry moves a lease to `Cleaning`. Standalone cleanup waits for the agent to confirm the app
 stopped. Cluster cleanup removes each owned app from replicated desired state and lets the
@@ -1378,7 +1381,17 @@ again. Using the cluster service token here would be convenient, but it would
 also turn any compromised follower into the owner of every test lease.
 Convenience doesn't get a vote on authority.
 
-This gives the existing runner somewhere safe to stand. It still needs to
-adopt the API and use a pinned, multi-architecture OCI workload which behaves
+The runner now creates one lease after capability gating and before it runs a
+case. It asks for the case budget plus the fixed cleanup budget; if the server's
+maximum can't cover both, the case becomes `Unknown` without touching the
+cluster. Every app or namespace-quota apply carries the lease id. Pass,
+failure, panic and timeout all reach the same release path, and killing Relish
+merely leaves the server reaper to do the same job. `--namespace` is a readable
+base now, with a per-case suffix, because sharing one namespace between
+concurrent cases was never isolation. After release, Relish polls every node
+using the original authenticated and CA-pinned client. A missing Raft record
+isn't proof that a runtime has stopped.
+
+The runner still needs a pinned, multi-architecture OCI workload which behaves
 identically under runc and Apple Container. Until that image passes both
 runtimes, the resource-lease milestone remains only half done.

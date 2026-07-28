@@ -39,6 +39,9 @@ pub struct TestContext {
     pub client: BunClient,
     /// This case's own namespace, e.g. `rbtest-4f2a91-03`.
     pub namespace: String,
+    /// Server-owned app/resource lease. Production runners always set this;
+    /// `None` remains only for focused unit tests of the runner itself.
+    pub(crate) lease_id: Option<String>,
     pub capabilities: ClusterCapabilities,
     /// Per-case budget, from `--timeout`. Poll loops measure against it so a
     /// case fails with a useful message rather than being killed from
@@ -74,9 +77,25 @@ impl TestContext {
     pub async fn apply(&self, toml: &str) -> Result<(), String> {
         let config = crate::config::Config::parse(toml)
             .map_err(|error| format!("config does not parse: {error}"))?;
-        self.client
-            .apply(&config)
-            .await
+        let has_owned_declarative_resources =
+            !config.app.is_empty() || !config.namespace.is_empty();
+        let lease_compatible = config.job.is_empty()
+            && config.permission.is_empty()
+            && config.build.is_empty()
+            && has_owned_declarative_resources;
+        let result = match &self.lease_id {
+            Some(lease_id) if lease_compatible => {
+                self.client.apply_with_lease(&config, lease_id).await
+            }
+            Some(_) if has_owned_declarative_resources => {
+                return Err(
+                    "test manifest mixes lease-owned apps/namespaces with unsupported resource kinds"
+                        .to_string(),
+                );
+            }
+            _ => self.client.apply(&config).await,
+        };
+        result
             .map(|_| ())
             .map_err(|error| format!("apply failed: {error}"))
     }
@@ -254,7 +273,8 @@ impl TestContext {
                 let ip = node.address.rsplit_once(':').map(|(ip, _)| ip)?;
                 Some((
                     node.node_id,
-                    BunClient::new(&format!("{scheme}://{ip}:{port}")),
+                    self.client
+                        .with_base_url(&format!("{scheme}://{ip}:{port}")),
                 ))
             })
             .collect();
@@ -270,6 +290,22 @@ impl TestContext {
                     instance.app_name == app && instance.namespace == self.namespace
                 }));
             }
+        }
+        Ok(all)
+    }
+
+    async fn namespace_instances(&self) -> Result<Vec<InstanceStatus>, String> {
+        let mut all = Vec::new();
+        for (node, client) in self.node_clients().await? {
+            let statuses = client
+                .status()
+                .await
+                .map_err(|error| format!("could not inspect cleanup on node {node}: {error}"))?;
+            all.extend(
+                statuses
+                    .into_iter()
+                    .filter(|instance| instance.namespace == self.namespace),
+            );
         }
         Ok(all)
     }
@@ -398,6 +434,55 @@ impl TestContext {
     /// guard is a second lock on top of the name match: even a bug in
     /// namespace construction cannot make teardown stop an operator's app.
     pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
+        if let Some(lease_id) = &self.lease_id {
+            match deadline
+                .run("lease release", self.client.release_test_lease(lease_id))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(crate::relish::RelishError::ApiError { status: 404, .. })) => {
+                    // The expiry reaper may have completed first. Absence is
+                    // durable ownership evidence, but runtime absence still
+                    // needs the independent check below.
+                }
+                Ok(Err(crate::relish::RelishError::AgentUnreachable))
+                | Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
+                    return CleanupOutcome::Unknown {
+                        reason: "could not reach the lease owner to confirm cleanup".to_string(),
+                    };
+                }
+                Ok(Err(error)) => {
+                    return CleanupOutcome::Failed {
+                        reason: format!("server-owned lease cleanup failed: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return CleanupOutcome::Unknown {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+            loop {
+                match deadline
+                    .run("cleanup confirmation", self.namespace_instances())
+                    .await
+                {
+                    Ok(Ok(instances)) if instances.is_empty() => {
+                        return CleanupOutcome::Confirmed;
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return CleanupOutcome::Unknown { reason: error };
+                    }
+                    Err(error) => {
+                        return CleanupOutcome::Unknown {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         if !Self::is_test_namespace(&self.namespace) {
             return CleanupOutcome::Failed {
                 reason: format!("refused to clean unsafe namespace {}", self.namespace),
@@ -497,6 +582,7 @@ mod tests {
         TestContext {
             client: BunClient::new_with_token("http://127.0.0.1:9117", None),
             namespace: namespace.to_string(),
+            lease_id: None,
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
