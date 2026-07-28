@@ -9,6 +9,7 @@ mod cluster_coordination;
 mod deployments;
 mod firewall;
 mod health_checks;
+mod image_registry;
 mod ingress;
 mod jobs;
 mod process_workloads;
@@ -32,6 +33,7 @@ pub fn all() -> Vec<TestCase> {
     cases.extend(volumes::cases());
     cases.extend(process_workloads::cases());
     cases.extend(jobs::cases());
+    cases.extend(image_registry::cases());
     cases.extend(cluster_coordination::cases());
     cases
 }
@@ -65,9 +67,7 @@ mod tests {
         }
     }
 
-    /// Every group but image-registry is covered. That last one needs the
-    /// harness to construct and push an OCI image to the on-node loopback
-    /// registry — a separate piece of work.
+    /// The whole catalogue: every one of the thirteen groups is covered.
     #[test]
     fn the_expected_groups_are_covered() {
         let groups: HashSet<TestGroup> = all().iter().map(|case| case.group).collect();
@@ -83,6 +83,7 @@ mod tests {
             TestGroup::Volumes,
             TestGroup::ProcessWorkloads,
             TestGroup::Jobs,
+            TestGroup::ImageRegistry,
             TestGroup::ClusterCoordination,
         ]
         .into_iter()
@@ -118,7 +119,7 @@ mod tests {
 
     #[test]
     fn the_catalogue_is_the_expected_size() {
-        // Twelve groups, three cases each (image-registry pending).
-        assert_eq!(all().len(), 36);
+        // All thirteen groups, three cases each.
+        assert_eq!(all().len(), 39);
     }
 }

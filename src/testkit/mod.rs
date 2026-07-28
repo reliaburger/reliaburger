@@ -16,6 +16,7 @@
 pub mod cases;
 pub mod chaos;
 pub mod context;
+pub mod oci;
 pub mod registry;
 pub mod report;
 pub mod runner;

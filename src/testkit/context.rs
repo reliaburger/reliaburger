@@ -316,6 +316,25 @@ impl TestContext {
         }
     }
 
+    /// The Pickle registry base URL on the entry node.
+    ///
+    /// The dev registry is bound to loopback (`127.0.0.1:5050`), reachable only
+    /// from *on* the node — so the registry cases run only when the harness
+    /// itself runs on a cluster node. The host is taken from the client so a
+    /// loopback client yields a loopback registry.
+    pub fn registry_base(&self) -> String {
+        let scheme = self.client.scheme();
+        let host = self
+            .client
+            .base_url()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split(':')
+            .next()
+            .unwrap_or("127.0.0.1");
+        format!("{scheme}://{host}:5050")
+    }
+
     /// The API port the entry node serves on, reused for every node.
     fn api_port(&self) -> u16 {
         self.client

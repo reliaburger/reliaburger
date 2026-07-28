@@ -1096,3 +1096,43 @@ cases push a synthetic OCI image to the node's loopback registry, needs the
 harness to speak the raw `/v2` protocol from *on* a node — a genuinely different
 piece of plumbing, left for its own day. Twelve of thirteen groups, and the
 thirteenth's absence is written down rather than papered over.
+
+## The thirteenth group
+
+That last group — image-registry — is the one we said needed its own day. The
+day came. Its cases push an image to the cluster's Pickle registry and check it
+comes back, and the reason it was awkward is worth stating plainly: the harness
+has no image to push and no push method to call. `BunClient` can *list* images
+but not upload one, and the dev registry binds to loopback, reachable only from
+on a node. So the harness has to become, briefly, a registry client.
+
+Building the image is the interesting half. An OCI image is not a magic format;
+it's three blobs and a bit of JSON. A **config** blob describing the platform, a
+**layer** — a gzipped tar of a filesystem, here a single marker file — and a
+**manifest** that names the other two by their SHA-256 digests and sizes. The
+digest *is* the identity: content-addressed, so the same bytes always produce
+the same `sha256:...` name, which is exactly what lets a round-trip test assert
+"what I pulled is what I pushed" by comparing one string. Constructing all this
+is pure code with no cluster in sight, so it unit-tests directly — the digests
+are well-formed, the manifest references the blobs, the same salt gives the same
+digest and a different salt a different one.
+
+Pushing it is the raw `/v2` dance the OCI distribution spec defines and buildah
+speaks: POST to open an upload and read back a `Location`, PATCH the bytes to
+that location, PUT with `?digest=` to seal it — once per blob — then PUT the
+manifest under a tag. Reliaburger's own registry answers this protocol (that's
+how `buildah push` works against it), so the harness just plays the client side
+over `reqwest`. Two of the three cases run: push-and-pull-back-by-digest, and
+"does it show up in `relish images`". The third — actually *deploying* from the
+cluster registry — skips, honestly, because our synthetic image is one marker
+file with no binary in it; you can store it but you can't run it, and a deploy
+case that can't run its workload has nothing to prove. Staging a genuinely
+runnable image in Pickle is a job for another day, and it says so.
+
+That completes the catalogue: thirteen groups, thirty-nine cases. Not all of
+them run everywhere — the process-runtime cases skip on runc and the container
+cases skip on a process cluster; firewall wants eBPF, ingress wants the proxy,
+the registry cases want to be on a node. But every skip names its reason, every
+group that can be exercised is, and the shape of what the cluster promises is now
+written down as tests that either hold it to that promise or say, out loud, why
+they couldn't. Which was the whole point of the chapter.
