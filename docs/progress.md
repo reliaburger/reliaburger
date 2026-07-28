@@ -1411,7 +1411,11 @@ convergence and adoption" theme under 12b.6).
     panic-safe runner ownership, verified cleanup reporting and typed
     server-owned `[testing]` safety policy. Unknown clusters fail protected;
     the client-side production override was removed
-  - [ ] Fresh expiring capability/evidence API
+  - [x] Fresh expiring capability/evidence API — authenticated schema-v3 local
+    snapshots separate available, unavailable and unknown facts with 15-second
+    expiry. Authenticated cluster fan-out uses the service identity, one shared
+    deadline and an explicit evidence/unknown result for every expected node.
+    Reports include build/runtime/topology fingerprints and server policy
   - [ ] Server-owned durable resource leases
   - [ ] Hermetic multi-architecture OCI workload and catalogue migration
   - [ ] Real node and pressure primitives before the chaos catalogue

@@ -1173,6 +1173,13 @@ unknown evidence or unconfirmed cleanup. `--output json` emits the
 schema-versioned report for CI. `--timeout <duration>` sets one inherited
 deadline per case.
 
+Before a case runs, Relish fetches Bun's authenticated capability snapshot.
+Fresh `available` evidence permits the case, fresh `unavailable` evidence may
+produce a typed skip when the selected profile makes it optional, and
+`unknown` or expired evidence produces `Unknown` rather than a green skip.
+`GET /v1/capabilities/cluster` retains one result per expected node, including
+peers which failed authentication, timed out or returned stale evidence.
+
 **`relish test --chaos`**
 
 Combines integration tests with Smoker fault injection to verify cluster

@@ -462,7 +462,7 @@ startup. M8 must add certificate expiry evidence and should not make
   absolute deadline, panic-safe ownership, independently verified cleanup and
   a typed server-owned safety policy. Unknown clusters are protected and the
   old client-side production override no longer exists.
-- [ ] Replace startup booleans with fresh expiring capability/evidence reports.
+- [x] Replace startup booleans with fresh expiring capability/evidence reports.
 - [ ] Add server-owned durable resource leases and a hermetic OCI workload.
 - [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
 - [ ] Add chaos primitives only after the safety, evidence and ownership gates.
@@ -474,6 +474,22 @@ startup. M8 must add certificate expiry evidence and should not make
   source-namespace trace, documentation and real-cluster acceptance.
 - [ ] Add certificate expiry evidence and production rotation/renewal before
   treating the TLS-expiry diagnostic as an accepted capability.
+
+**Capability/evidence tranche delivered:** authenticated
+`GET /v1/capabilities` retains the v2 summary fields for compatibility and adds
+schema-v3, 15-second evidence. Each fact is `available`, `unavailable` or
+`unknown`; a stale snapshot is unknown, never absent. The report includes build
+target/profile, runtime/version, rootless mode, kernel, architecture, cluster
+identity, readiness, placement evidence and server-owned operation policy.
+Stores without a published freshness timestamp remain unknown.
+
+`GET /v1/capabilities/cluster` fans out concurrently to current members with
+one five-second absolute deadline. It presents the cluster service credential
+over the configured cluster HTTP client, refuses an anonymous fallback, caps
+responses at 1 MiB, checks schema, node identity and expiry, and retains every
+failed peer as an explicit unknown result. Node drain/kill, node pressure,
+volume semantics, telemetry freshness and certificate expiry remain honest
+unknown or unavailable prerequisites.
 
 ## Optional
 

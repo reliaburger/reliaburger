@@ -130,6 +130,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/exec/{app}/{namespace}", Deployer),
     // Cluster + upgrade.
     route(Get, "/v1/capabilities", AnyToken),
+    route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/cluster/nodes", AnyToken),
     route(Get, "/v1/cluster/council", AnyToken),
     route(Post, "/v1/upgrade/apply", Admin),

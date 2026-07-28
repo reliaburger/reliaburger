@@ -344,6 +344,10 @@ pub fn router_with_upgrade(
         )
         .route("/v1/exec/{app}/{namespace}", post(exec_handler))
         .route("/v1/capabilities", get(capabilities_handler))
+        .route(
+            "/v1/capabilities/cluster",
+            get(cluster_capabilities_handler),
+        )
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
         .route("/v1/upgrade/apply", post(upgrade_apply_handler))
@@ -459,6 +463,12 @@ async fn readiness_handler(State(state): State<ApiState>) -> Response {
 /// subsystems: a `None` there means the subsystem was never built, which is
 /// exactly what a caller needs to distinguish from "built but failing".
 async fn capabilities_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    Json(local_capability_report(&state).await)
+}
+
+async fn local_capability_report(
+    state: &ApiState,
+) -> crate::bun::capabilities::ClusterCapabilities {
     let wired = crate::bun::capabilities::WiredSubsystems {
         metrics: state.mayo.is_some(),
         logs: state.log_store.is_some(),
@@ -473,14 +483,150 @@ async fn capabilities_handler(State(state): State<ApiState>) -> impl IntoRespons
         },
     };
     let (readiness, placement) = state.readiness.snapshots().await;
-    Json(
-        crate::bun::capabilities::ClusterCapabilities::derive_with_evidence(
-            &state.static_capabilities,
-            &wired,
-            Some(readiness),
-            Some(placement),
-        ),
+    let gossip_fresh = readiness.subsystems.iter().any(|subsystem| {
+        subsystem.name == "cluster:gossip"
+            && subsystem.state == crate::bun::readiness::SubsystemState::Ready
+    });
+    let raft_fresh = readiness.subsystems.iter().any(|subsystem| {
+        subsystem.name == "cluster:raft-rpc"
+            && subsystem.state == crate::bun::readiness::SubsystemState::Ready
+    });
+    let members = match &state.membership {
+        Some(membership) if !state.static_capabilities.cluster_mode || gossip_fresh => {
+            Some(membership.read().await.clone())
+        }
+        Some(_) => None,
+        None if state.static_capabilities.cluster_mode => None,
+        None => Some(Vec::new()),
+    };
+    let membership_count = members.as_ref().map(|members| {
+        let includes_self = members
+            .iter()
+            .any(|member| member.node_id.0 == state.static_capabilities.node_id);
+        (members.len() + usize::from(!includes_self))
+            .try_into()
+            .unwrap_or(u32::MAX)
+    });
+    let council_quorum = match (&state.council, &members) {
+        (Some(council), Some(members)) if raft_fresh => Some(council_has_live_quorum(
+            council,
+            members,
+            &state.static_capabilities.node_id,
+        )),
+        (None, _) if !state.static_capabilities.cluster_mode => Some(false),
+        _ => None,
+    };
+    let cluster_id = match &state.council {
+        Some(council) => {
+            let security = council.security_state().await;
+            security
+                .get_ca(crate::sesame::types::CaRole::Root)
+                .map(|root| {
+                    let digest = ring::digest::digest(&ring::digest::SHA256, &root.certificate_der);
+                    format!("sha256:{}", hex::encode(digest.as_ref()))
+                })
+        }
+        None => None,
+    };
+    let mut wired = wired;
+    wired.member_count = membership_count;
+    crate::bun::capabilities::ClusterCapabilities::derive_with_observations(
+        &state.static_capabilities,
+        &wired,
+        crate::bun::capabilities::CapabilityObservations {
+            readiness: Some(readiness),
+            placement: Some(placement),
+            cluster_id,
+            council_quorum,
+        },
     )
+}
+
+fn council_has_live_quorum(
+    council: &crate::council::CouncilNode,
+    members: &[NodeMembershipInfo],
+    self_node_id: &str,
+) -> bool {
+    let metrics = council.metrics().borrow().clone();
+    let voters: std::collections::BTreeSet<u64> =
+        metrics.membership_config.membership().voter_ids().collect();
+    if voters.is_empty() || metrics.current_leader.is_none() {
+        return false;
+    }
+    let live: std::collections::BTreeSet<u64> = members
+        .iter()
+        .map(|member| crate::cluster::identity::raft_id_from_name(&member.node_id.0))
+        .chain(std::iter::once(
+            crate::cluster::identity::raft_id_from_name(self_node_id),
+        ))
+        .collect();
+    voters.iter().filter(|id| live.contains(id)).count() > voters.len() / 2
+}
+
+async fn cluster_capabilities_handler(
+    State(state): State<ApiState>,
+) -> Json<crate::bun::capabilities::ClusterCapabilityReport> {
+    let started = std::time::SystemTime::now();
+    let deadline =
+        tokio::time::Instant::now() + crate::bun::capabilities::CLUSTER_COLLECTION_TIMEOUT;
+    let local = local_capability_report(&state).await;
+    let mut nodes = vec![
+        crate::bun::capabilities::CollectedNodeCapability::Evidence {
+            node_id: local.node_id.clone(),
+            address: "local".to_string(),
+            report: Box::new(local),
+        },
+    ];
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => Vec::new(),
+    };
+    let peers = members
+        .into_iter()
+        .filter(|member| member.node_id.0 != state.static_capabilities.node_id)
+        .map(|member| {
+            let cluster_http = state.cluster_http.clone();
+            let service_token = state.service_token.clone();
+            async move {
+                crate::bun::capabilities::collect_peer_capability(
+                    &cluster_http,
+                    service_token.as_deref(),
+                    &member.node_id.0,
+                    member.address,
+                    deadline,
+                )
+                .await
+            }
+        });
+    nodes.extend(futures_util::future::join_all(peers).await);
+    nodes.sort_by(|left, right| {
+        collected_capability_node_id(left).cmp(collected_capability_node_id(right))
+    });
+
+    Json(crate::bun::capabilities::ClusterCapabilityReport {
+        schema_version: crate::bun::capabilities::CAPABILITY_SCHEMA_VERSION,
+        collected_by: state.static_capabilities.node_id.clone(),
+        observed_at_unix_ms: system_time_millis(started),
+        deadline_at_unix_ms: system_time_millis(
+            started + crate::bun::capabilities::CLUSTER_COLLECTION_TIMEOUT,
+        ),
+        nodes,
+    })
+}
+
+fn collected_capability_node_id(entry: &crate::bun::capabilities::CollectedNodeCapability) -> &str {
+    match entry {
+        crate::bun::capabilities::CollectedNodeCapability::Evidence { node_id, .. }
+        | crate::bun::capabilities::CollectedNodeCapability::Unknown { node_id, .. } => node_id,
+    }
+}
+
+fn system_time_millis(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
@@ -4562,6 +4708,10 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
+            get_status(app.clone(), "/v1/capabilities/cluster", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
             get_status(app.clone(), "/v1/readiness", Some(&plaintext)).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
@@ -5190,7 +5340,7 @@ mod tests {
             true,
         )
         .await;
-        let body = get_body(app, "/v1/capabilities").await;
+        let body = get_body(app.clone(), "/v1/capabilities").await;
         let capabilities: crate::bun::capabilities::ClusterCapabilities =
             serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
 
@@ -5206,6 +5356,15 @@ mod tests {
         assert!(capabilities.readiness.is_some());
         assert!(capabilities.placement.is_some());
         assert!(capabilities.expires_at_unix_ms > capabilities.observed_at_unix_ms);
+
+        let body = get_body(app, "/v1/capabilities/cluster").await;
+        let cluster: crate::bun::capabilities::ClusterCapabilityReport =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        assert_eq!(cluster.nodes.len(), 1);
+        assert!(matches!(
+            cluster.nodes[0],
+            crate::bun::capabilities::CollectedNodeCapability::Evidence { .. }
+        ));
         shutdown.cancel();
     }
 

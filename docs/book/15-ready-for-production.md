@@ -1286,3 +1286,45 @@ the registry cases want to be on a node. But every skip names its reason, every
 group that can be exercised is, and the shape of what the cluster promises is now
 written down as tests that either hold it to that promise or say, out loud, why
 they couldn't. Which was the whole point of the chapter.
+
+## Ask each node what it can prove
+
+A test runner shouldn't infer the data plane from a config file.
+`ebpf.enabled = true` says what the operator wanted. It doesn't prove that the
+hooks attached, that the workload entered its cgroup before it started, or that
+the observation is still current.
+
+Bun now exposes an authenticated `/v1/capabilities` snapshot which combines
+startup facts with live readiness and placement evidence. Each capability has
+one of three states: `Available`, `Unavailable` or `Unknown`. The snapshot
+expires after 15 seconds.
+
+Why three? Imagine that Bun opened its metrics store but doesn't publish the
+latest sample time. Calling metrics unavailable throws away a useful fact.
+Calling them fresh turns hope into evidence. `Unknown` says exactly what we
+know: the store exists, but we can't prove freshness yet. The future `wtf`
+check needs that timestamp before it earns a green result.
+
+This changes how the runner gates a case. A known absent capability can become
+a typed skip when the selected profile allows it. Unknown or expired evidence
+becomes `Unknown`, which fails acceptance. Silence isn't evidence of absence.
+
+The snapshot also fingerprints the build target and profile, runtime and
+version, rootless mode, kernel, architecture and cluster identity. It publishes
+the server's operation policy separately from the caller's role. These facts
+let us decide whether two reports describe comparable systems before we
+compare their outcomes.
+
+Cluster collection has another tempting trap: only returning nodes which
+answered. `/v1/capabilities/cluster` instead creates one future per expected
+peer and awaits them concurrently with `join_all`. A future represents work
+which may not have completed yet; `join_all` polls all of them rather than
+waiting for one slow peer before contacting the next. Every request shares one
+absolute five-second deadline.
+
+Peer calls present the internal service token through the same cluster HTTP
+client as the control plane, including mTLS where configured. There is no
+anonymous retry. Responses have a 1 MiB limit and must carry the expected
+schema, node id and an unexpired observation. Any failure creates an explicit
+`Unknown` entry for that node. Missing evidence stays visible. That's the
+point.

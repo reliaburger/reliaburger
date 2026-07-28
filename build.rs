@@ -7,6 +7,13 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // Cargo exposes TARGET only to build scripts. Re-export it so Phase 15
+    // evidence can distinguish otherwise identical cross-compiled binaries.
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=RELIABURGER_TARGET={target}");
+    }
+    println!("cargo:rerun-if-env-changed=RELIABURGER_GIT_SHA");
+
     // Only compile eBPF programs on Linux with the ebpf feature
     if cfg!(target_os = "linux") && cfg!(feature = "ebpf") {
         compile_ebpf();

@@ -615,6 +615,8 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
+    let runtime_version = runtime_version(runtime_kind).await;
+    let host_kernel = host_kernel().await;
     // Image-store handle for installing the cluster P2P image source
     // once the registry and catalog exist — the runtime is selected
     // long before them, so the source is injected late via a OnceLock
@@ -633,6 +635,7 @@ async fn main() -> anyhow::Result<()> {
     if config.dns.enabled {
         readiness.register("dns", true).await;
     }
+    let mut ingress_cluster_tls_ready = false;
     if config.ingress.enabled {
         readiness.register("ingress", true).await;
     }
@@ -1149,6 +1152,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(council) => build_ingress_cert_resolver(council).await,
                 None => None,
             };
+        ingress_cluster_tls_ready = ingress_resolver.is_some();
         let bound = reliaburger::wrapper::proxy::bind_proxy_with_tls(
             wrapper_config,
             routing_table,
@@ -1570,12 +1574,20 @@ async fn main() -> anyhow::Result<()> {
     // "this cluster can't" into "this test mysteriously fails".
     let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
         node_id: node_name.clone(),
+        cluster_name: config.cluster.name.clone(),
+        cluster_mode: cli.cluster,
         environment: config.cluster.environment.clone(),
         container_runtime: runtime_kind.to_string(),
+        runtime_version,
+        rootless,
+        kernel: host_kernel,
+        architecture: std::env::consts::ARCH.to_string(),
         // Whether the programs actually loaded and attached, not merely
         // whether the operator asked for them.
         ebpf: ebpf_loaded,
         ingress: config.ingress.enabled,
+        ingress_cluster_tls: ingress_cluster_tls_ready,
+        ingress_explicit_tls: config.ingress.tls_cert.is_some() && config.ingress.tls_key.is_some(),
         // The perimeter firewall is Linux-only and disabled in rootless
         // mode, matching `BunAgent`'s own `perimeter_config` decision.
         firewall: {
@@ -1597,8 +1609,18 @@ async fn main() -> anyhow::Result<()> {
         // Host execution is deny-by-default: an empty allowlist refuses
         // every process workload.
         process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
-        // CPU/memory/disk faults write cgroup v2 files.
-        cgroup_faults: cfg!(target_os = "linux"),
+        // CPU/memory/disk faults need writable cgroup v2 control files.
+        cgroup_faults: {
+            #[cfg(target_os = "linux")]
+            {
+                !rootless && std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        },
+        registry_signatures_required: config.images.trust_policy.require_signatures,
         test_policy: config.testing.clone(),
     };
 
@@ -2267,6 +2289,41 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
         }
         other => anyhow::bail!("unknown runtime: {other}"),
     }
+}
+
+async fn runtime_version(runtime: &str) -> Option<String> {
+    match runtime {
+        "process" => Some(env!("CARGO_PKG_VERSION").to_string()),
+        "runc" => bounded_version_command("runc", &["--version"]).await,
+        "apple" => bounded_version_command("container", &["--version"]).await,
+        _ => None,
+    }
+}
+
+async fn host_kernel() -> String {
+    bounded_version_command("uname", &["-sr"])
+        .await
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
+async fn bounded_version_command(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new(program)
+            .args(arguments)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
 }
 
 /// Bind and wire the `.internal` resolver for the selected runtime.

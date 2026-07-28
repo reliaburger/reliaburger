@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::bun::capabilities::ClusterCapabilities;
+use crate::bun::capabilities::{CapabilityState, ClusterCapabilities};
 use crate::relish::client::BunClient;
 
 use super::context::TestContext;
@@ -184,9 +184,14 @@ async fn run_one(
     let deadline_at = rfc3339_after(timeout);
     let required = profile_requires_case(profile, case.requires);
 
-    let missing = capabilities.missing(case.requires);
-    if let Some(capability) = missing.first().copied() {
-        let names: Vec<String> = missing.iter().map(|c| c.to_string()).collect();
+    let unavailable: Vec<_> = case
+        .requires
+        .iter()
+        .copied()
+        .filter(|capability| capabilities.state(*capability) == CapabilityState::Unavailable)
+        .collect();
+    if let Some(capability) = unavailable.first().copied() {
+        let names: Vec<String> = unavailable.iter().map(|c| c.to_string()).collect();
         return TestCaseResult {
             name: case.name.to_string(),
             group: case.group,
@@ -197,6 +202,33 @@ async fn run_one(
             outcome: TestOutcome::Skipped {
                 capability,
                 reason: format!("requires {}", names.join(", ")),
+            },
+            duration_ms: start.elapsed().as_millis() as u64,
+            evidence: Vec::new(),
+            cleanup: CleanupOutcome::NotRequired,
+        };
+    }
+    let unknown: Vec<_> = case
+        .requires
+        .iter()
+        .copied()
+        .filter(|capability| capabilities.state(*capability) == CapabilityState::Unknown)
+        .collect();
+    if !unknown.is_empty() {
+        let names: Vec<String> = unknown.iter().map(|c| c.to_string()).collect();
+        return TestCaseResult {
+            name: case.name.to_string(),
+            group: case.group,
+            required,
+            started_at,
+            finished_at: now_rfc3339(),
+            deadline_at,
+            outcome: TestOutcome::Unknown {
+                kind: UnknownKind::MissingEvidence,
+                reason: format!(
+                    "capability evidence is missing or stale: {}",
+                    names.join(", ")
+                ),
             },
             duration_ms: start.elapsed().as_millis() as u64,
             evidence: Vec::new(),
@@ -402,8 +434,14 @@ mod tests {
             Ok(())
         }
         // Capabilities with everything *except* eBPF; the case needs eBPF.
-        let mut caps = full_capabilities();
-        caps.ebpf = false;
+        let caps = ClusterCapabilities::derive(
+            &StaticCapabilities {
+                container_runtime: "process".to_string(),
+                process_workloads: true,
+                ..StaticCapabilities::default()
+            },
+            &WiredSubsystems::default(),
+        );
         let cases = vec![case("needs_ebpf", &[Capability::Ebpf], testkit_case!(body))];
 
         let report = run(cases, config(dead_client(), caps, 4)).await;
@@ -422,6 +460,35 @@ mod tests {
             }
             other => panic!("expected skip, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_stale_capability_is_unknown_not_skipped() {
+        SKIP_BODY_RAN.store(false, Ordering::SeqCst);
+        async fn body(_ctx: TestContext) -> Result<(), String> {
+            SKIP_BODY_RAN.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        let mut caps = full_capabilities();
+        caps.expires_at_unix_ms = 0;
+        let cases = vec![case(
+            "needs_fresh_ebpf",
+            &[Capability::Ebpf],
+            testkit_case!(body),
+        )];
+
+        let report = run(cases, config(dead_client(), caps, 4)).await;
+
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.unknown, 1);
+        assert!(!SKIP_BODY_RAN.load(Ordering::SeqCst));
+        assert!(matches!(
+            report.results[0].outcome,
+            TestOutcome::Unknown {
+                kind: UnknownKind::MissingEvidence,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

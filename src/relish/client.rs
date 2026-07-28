@@ -546,6 +546,13 @@ impl BunClient {
         self.get_typed_json("/v1/capabilities").await
     }
 
+    /// Fetch an authenticated, bounded collection from current cluster peers.
+    pub async fn cluster_capabilities(
+        &self,
+    ) -> Result<crate::bun::capabilities::ClusterCapabilityReport, RelishError> {
+        self.get_typed_json("/v1/capabilities/cluster").await
+    }
+
     /// Fetch deploy history for an app in a namespace.
     pub async fn deploy_history(
         &self,

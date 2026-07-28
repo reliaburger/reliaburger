@@ -839,14 +839,26 @@ pub struct UpgradeConfig {
 public because upgrade supervisors and local process managers need a cheap
 liveness probe. It does not claim that Bun can schedule safely.
 
-`GET /v1/readiness` and `GET /v1/capabilities` require an authenticated caller.
-The first returns 200 only when every registered critical owner is `Ready`; it
-returns 503 with the complete state evidence otherwise. The second exposes the
-same node-readiness decision beside live DNS and egress capabilities. Both are
-direct reads from a process-wide evidence tracker, so a dead agent command loop
-cannot make the endpoint hang or fabricate a healthy answer. The capability
-response carries a schema version, node id, observation time and 15-second
-expiry; callers treat evidence beyond that expiry as unknown.
+`GET /v1/readiness`, `GET /v1/capabilities` and
+`GET /v1/capabilities/cluster` require an authenticated caller. The first
+returns 200 only when every registered critical owner is `Ready`; it returns
+503 with the complete state evidence otherwise. The local capability endpoint
+combines that decision with live DNS, egress and registry state, build/runtime
+fingerprints, topology and server-owned test policy. Every capability is
+`available`, `unavailable` or `unknown`, and the snapshot expires after 15
+seconds. Merely wiring a metrics, logs or events store produces `unknown`
+freshness, not a green claim.
+
+The cluster endpoint calls the local endpoint concurrently on every current
+member with one five-second deadline. Peer calls use the cluster HTTP client
+(mTLS when configured) and internal service token. A missing token refuses the
+call rather than retrying anonymously. The collector checks the schema,
+expected node identity, expiry and a 1 MiB response bound, then retains failed
+or timed-out peers as explicit `unknown` results.
+
+Readiness and local capability inputs are direct reads from a process-wide
+evidence tracker, so a dead agent command loop cannot make the endpoint hang or
+fabricate a healthy answer.
 
 The reporting worker sends readiness in its own extension frame. The leader
 leases it by aggregator receive time and leadership epoch, independently of
