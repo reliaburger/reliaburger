@@ -396,9 +396,17 @@ regressions pass.
 
 ### M4. Carry the configured trust domain into workload identities
 
-- [ ] Pass immutable cluster identity into the agent instead of hard-coding
+- [x] Pass immutable cluster identity into the agent instead of hard-coding
   `default` (FUNC-4).
-- [ ] Add a non-default-cluster SPIFFE issuance and verification test.
+- [x] Add a non-default-cluster SPIFFE issuance and verification test.
+
+**Delivered:** `[cluster].name` is a validated DNS-style trust domain with a
+backwards-compatible `default`. All three config generators persist the requested
+cluster name. Bun passes it as immutable agent and API state, so app, job, OIDC
+and persistent build-signer identities use one domain. The acceptance test
+issues a `payments.prod` workload leaf, validates its CA chain and checks its
+URI SAN; focused config, generator and signer tests cover the surrounding data
+path.
 
 ### M5. Preserve rootless published ports through Bun replacement
 

@@ -94,8 +94,14 @@ async fn agent_nodes_returns_membership() {
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
-    let mut agent =
-        BunAgent::with_cluster(grill, port_allocator, cmd_rx, shutdown.clone(), cluster);
+    let mut agent = BunAgent::with_cluster(
+        grill,
+        port_allocator,
+        cmd_rx,
+        shutdown.clone(),
+        cluster,
+        "default".to_string(),
+    );
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
 
@@ -182,8 +188,14 @@ async fn agent_council_returns_raft_state() {
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
-    let mut agent =
-        BunAgent::with_cluster(grill, port_allocator, cmd_rx, shutdown.clone(), cluster);
+    let mut agent = BunAgent::with_cluster(
+        grill,
+        port_allocator,
+        cmd_rx,
+        shutdown.clone(),
+        cluster,
+        "default".to_string(),
+    );
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
 
@@ -339,8 +351,14 @@ async fn agent_snapshot_request_returns_instances() {
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
-    let mut agent =
-        BunAgent::with_cluster(grill, port_allocator, cmd_rx, shutdown.clone(), cluster);
+    let mut agent = BunAgent::with_cluster(
+        grill,
+        port_allocator,
+        cmd_rx,
+        shutdown.clone(),
+        cluster,
+        "default".to_string(),
+    );
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
 

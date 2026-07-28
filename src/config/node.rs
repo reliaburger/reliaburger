@@ -343,6 +343,8 @@ pub struct NodeSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterSection {
+    /// Stable cluster name and SPIFFE trust domain.
+    pub name: String,
     /// Addresses of existing cluster members to join. Empty for the first node.
     pub join: Vec<String>,
     /// Port for Mustard SWIM gossip protocol.
@@ -365,12 +367,38 @@ pub struct ClusterSection {
 impl Default for ClusterSection {
     fn default() -> Self {
         Self {
+            name: "default".to_string(),
             join: Vec::new(),
             gossip_port: 9443,
             raft_port: 9444,
             reporting_port: 9445,
             environment: None,
             backup: crate::council::backup::BackupConfig::default(),
+        }
+    }
+}
+
+impl ClusterSection {
+    /// Validate the cluster name used as the SPIFFE trust domain.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        let valid = !self.name.is_empty()
+            && self.name.len() <= 255
+            && self.name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(super::error::ConfigError::InvalidValue {
+                field: "cluster.name".to_string(),
+                value: self.name.clone(),
+            })
         }
     }
 }
@@ -910,6 +938,7 @@ mod tests {
             labels = { region = "us-east", ssd = "true" }
 
             [cluster]
+            name = "payments.prod"
             join = ["10.0.1.5:9443", "10.0.1.6:9443"]
 
             [storage]
@@ -931,6 +960,7 @@ mod tests {
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.node.name.as_deref(), Some("node-1"));
         assert_eq!(nc.node.labels.get("region").unwrap(), "us-east");
+        assert_eq!(nc.cluster.name, "payments.prod");
         assert_eq!(nc.cluster.join.len(), 2);
         assert_eq!(nc.storage.data, PathBuf::from("/mnt/fast/data"));
         assert_eq!(nc.resources.reserved_cpu, "1000m");
@@ -947,8 +977,21 @@ mod tests {
         "#;
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.cluster.join, vec!["10.0.1.5:9443"]);
+        assert_eq!(nc.cluster.name, "default");
         // All other sections have defaults
         assert_eq!(nc.storage, StorageSection::default());
+    }
+
+    #[test]
+    fn cluster_name_must_be_a_valid_spiffe_trust_domain() {
+        let valid = NodeConfig::parse("[cluster]\nname = \"payments.prod\"").unwrap();
+        valid.cluster.validate().unwrap();
+
+        for name in ["", "UPPER", "has/slash", "-leading", "trailing-"] {
+            let mut invalid = NodeConfig::default();
+            invalid.cluster.name = name.to_string();
+            assert!(invalid.cluster.validate().is_err(), "accepted {name:?}");
+        }
     }
 
     #[test]

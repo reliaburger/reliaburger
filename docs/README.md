@@ -317,6 +317,12 @@ the token hash and expiry to Raft, and prints the plaintext once. During an
 election, retry against the current leader: a follower returns an error and
 does not commit or disclose a usable token.
 
+Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
+and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
+The value is immutable for the life of the process and becomes the prefix of
+app, job and build-signer identities, for example
+`spiffe://prod/ns/default/app/api`.
+
 The generated security section contains the material paths and the secure
 mode:
 

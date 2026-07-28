@@ -1389,7 +1389,10 @@ convergence and adoption" theme under 12b.6).
   first boot and fail closed if the service token is absent; authenticated
   capabilities expose listener, TLS/P2P, membership and achieved redundancy
   evidence for future `wtf` checks.
-- [ ] Configured workload trust domain (M4)
+- [x] Configured workload trust domain (M4) — `[cluster].name` now flows from
+  generated config into immutable agent/API state and every app, job, JWT and
+  build-signer SPIFFE identity. Bun validates malformed domains at startup; a
+  non-default `payments.prod` acceptance issues and verifies a real leaf.
 - [ ] Rootless proxy adoption across Bun replacement (M5)
 - [ ] Real deployment operation state (M6)
 - [ ] Explicit v1 ingress/TLS contract (M7)

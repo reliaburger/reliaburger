@@ -1155,6 +1155,7 @@ All configuration is in `/etc/reliaburger/node.toml`. Every field has a default;
 
 ```toml
 [cluster]
+name = "default"
 join = ["10.0.1.5:9443"]
 ```
 
@@ -1164,6 +1165,7 @@ join = ["10.0.1.5:9443"]
 |---------|-----|---------|--------------------|-------------|
 | `[node]` | `name` | hostname | string | Human-readable node name. Must be unique in the cluster. |
 | `[node.labels]` | (any key) | (none) | string key-value pairs | Arbitrary labels for placement constraints. `zone`, `rack`, `storage`, `role` are common. |
+| `[cluster]` | `name` | `default` | DNS-style name | Stable cluster identity and SPIFFE trust domain. Must match on every node. |
 | `[cluster]` | `join` | `[]` | list of `"host:port"` strings | Addresses of existing cluster members. Empty for first node. |
 | `[storage]` | `data` | `/var/lib/reliaburger/data` | absolute path | Raft log, scheduling state. Small, critical. |
 | `[storage]` | `images` | `/var/lib/reliaburger/images` | absolute path | OCI image layers (Pickle). Large, read-heavy. |

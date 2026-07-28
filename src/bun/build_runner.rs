@@ -698,9 +698,9 @@ impl std::fmt::Debug for BuildSigner {
 
 /// The SPIFFE identity every build in a namespace signs under. Stable across
 /// builds so the persistent signer and IMG3's identity binding agree.
-pub fn build_signer_uri(namespace: &str) -> crate::sesame::types::SpiffeUri {
+pub fn build_signer_uri(trust_domain: &str, namespace: &str) -> crate::sesame::types::SpiffeUri {
     crate::sesame::types::SpiffeUri {
-        trust_domain: "default".to_string(),
+        trust_domain: trust_domain.to_string(),
         namespace: namespace.to_string(),
         workload_type: crate::sesame::types::WorkloadType::Job,
         name: "build-signer".to_string(),
@@ -714,6 +714,7 @@ pub fn build_signer_uri(namespace: &str) -> crate::sesame::types::SpiffeUri {
 pub async fn get_or_provision_build_signer(
     cache: &tokio::sync::Mutex<HashMap<String, BuildSigner>>,
     council: &crate::council::CouncilNode,
+    trust_domain: &str,
     namespace: &str,
     node_name: &str,
 ) -> Result<BuildSigner, String> {
@@ -722,7 +723,7 @@ pub async fn get_or_provision_build_signer(
         return Ok(existing.clone());
     }
 
-    let uri = build_signer_uri(namespace);
+    let uri = build_signer_uri(trust_domain, namespace);
     let (csr_der, key_der) = crate::sesame::identity::create_workload_csr(&uri)
         .map_err(|e| format!("csr generation failed: {e}"))?;
     // The leaf must carry the code-signing EKU so it can vouch for images.
@@ -731,7 +732,7 @@ pub async fn get_or_provision_build_signer(
             &csr_der,
             &uri,
             crate::sesame::identity::CertUsage::CodeSigning,
-            "default",
+            trust_domain,
             node_name,
             "build-signer",
         )
@@ -963,6 +964,7 @@ async fn run_build_inner(
             match get_or_provision_build_signer(
                 state.build_signers.as_ref(),
                 council,
+                &state.trust_domain,
                 namespace,
                 node_name,
             )
@@ -1485,12 +1487,14 @@ mod tests {
         let council = leader_with_security().await;
         let cache = tokio::sync::Mutex::new(HashMap::new());
 
-        let first = get_or_provision_build_signer(&cache, &council, "default", "node-1")
-            .await
-            .unwrap();
-        let second = get_or_provision_build_signer(&cache, &council, "default", "node-1")
-            .await
-            .unwrap();
+        let first =
+            get_or_provision_build_signer(&cache, &council, "test-cluster", "default", "node-1")
+                .await
+                .unwrap();
+        let second =
+            get_or_provision_build_signer(&cache, &council, "test-cluster", "default", "node-1")
+                .await
+                .unwrap();
 
         // Same identity, same key, same cert — not a fresh CSR each time.
         assert_eq!(first.spiffe_uri, second.spiffe_uri);
@@ -1502,14 +1506,15 @@ mod tests {
     async fn build_signer_leaf_carries_code_signing_and_the_expected_identity() {
         let council = leader_with_security().await;
         let cache = tokio::sync::Mutex::new(HashMap::new());
-        let signer = get_or_provision_build_signer(&cache, &council, "ci", "node-1")
-            .await
-            .unwrap();
+        let signer =
+            get_or_provision_build_signer(&cache, &council, "test-cluster", "ci", "node-1")
+                .await
+                .unwrap();
 
         // The council stamped the code-signing EKU onto the leaf.
         crate::sesame::cert::check_code_signing_eku(&signer.cert_der).unwrap();
         // And the leaf certifies the build-signer identity we expect.
-        let uri = build_signer_uri("ci").to_uri();
+        let uri = build_signer_uri("test-cluster", "ci").to_uri();
         let sans = crate::sesame::cert::subject_uri_sans(&signer.cert_der).unwrap();
         assert!(
             sans.contains(&uri),
@@ -1554,7 +1559,9 @@ mod tests {
         let council = Arc::new(node);
 
         let cache = tokio::sync::Mutex::new(HashMap::new());
-        let result = get_or_provision_build_signer(&cache, &council, "default", "node-1").await;
+        let result =
+            get_or_provision_build_signer(&cache, &council, "test-cluster", "default", "node-1")
+                .await;
         assert!(
             result.is_err(),
             "a signer must not be provisioned without a Workload CA: {result:?}"
@@ -1567,9 +1574,10 @@ mod tests {
         // deploy-time check enforcement runs (verify_image_signature path).
         let council = leader_with_security().await;
         let cache = tokio::sync::Mutex::new(HashMap::new());
-        let signer = get_or_provision_build_signer(&cache, &council, "default", "node-1")
-            .await
-            .unwrap();
+        let signer =
+            get_or_provision_build_signer(&cache, &council, "test-cluster", "default", "node-1")
+                .await
+                .unwrap();
 
         let digest = crate::pickle::types::Digest::from_sha256_hex(
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",

@@ -42,6 +42,8 @@ pub enum InstallDecision {
 pub struct SetupAnswers {
     /// Node name (`[node] name`).
     pub node_name: String,
+    /// Stable cluster name and SPIFFE trust domain (`[cluster] name`).
+    pub cluster_name: String,
     /// Address of an existing cluster member to join; `None` = single node.
     pub join_address: Option<String>,
     /// Root directory for node state; the storage paths live under it.
@@ -58,6 +60,7 @@ impl Default for SetupAnswers {
     fn default() -> Self {
         Self {
             node_name: "node-01".to_string(),
+            cluster_name: "default".to_string(),
             join_address: None,
             data_dir: default_data_dir(),
             enable_dns: false,
@@ -118,6 +121,7 @@ pub fn build_node_config(answers: &SetupAnswers) -> NodeConfig {
             ..NodeSection::default()
         },
         cluster: ClusterSection {
+            name: answers.cluster_name.clone(),
             join: answers.join_address.iter().cloned().collect(),
             ..ClusterSection::default()
         },
@@ -158,14 +162,18 @@ pub fn render_config(answers: &SetupAnswers) -> String {
     node.insert("name".to_string(), Value::String(answers.node_name.clone()));
     root.insert("node".to_string(), Value::Table(node));
 
+    let mut cluster = toml::Table::new();
+    cluster.insert(
+        "name".to_string(),
+        Value::String(answers.cluster_name.clone()),
+    );
     if let Some(address) = &answers.join_address {
-        let mut cluster = toml::Table::new();
         cluster.insert(
             "join".to_string(),
             Value::Array(vec![Value::String(address.clone())]),
         );
-        root.insert("cluster".to_string(), Value::Table(cluster));
     }
+    root.insert("cluster".to_string(), Value::Table(cluster));
 
     let mut storage = toml::Table::new();
     for key in ["data", "images", "logs", "metrics", "volumes"] {
@@ -413,6 +421,14 @@ fn collect_answers(yes: bool) -> Result<SetupAnswers, RelishError> {
         return Ok(defaults);
     }
     let node_name = ask_string("node name", &defaults.node_name)?;
+    let cluster_name = ask_string("cluster name", &defaults.cluster_name)?;
+    let cluster_identity = crate::config::node::ClusterSection {
+        name: cluster_name.clone(),
+        ..crate::config::node::ClusterSection::default()
+    };
+    cluster_identity
+        .validate()
+        .map_err(|error| RelishError::InitFailed(error.to_string()))?;
     let join = ask_string("cluster member to join (empty = single node)", "")?;
     let data_dir = ask_string("data directory", &defaults.data_dir.to_string_lossy())?;
     let enable_dns = ask_bool("enable .internal DNS (binds port 53, needs root)?", false)?;
@@ -420,6 +436,7 @@ fn collect_answers(yes: bool) -> Result<SetupAnswers, RelishError> {
     let enable_ingress = ask_bool("enable the ingress proxy (binds ports 80/443)?", false)?;
     Ok(SetupAnswers {
         node_name,
+        cluster_name,
         join_address: (!join.is_empty()).then_some(join),
         data_dir: PathBuf::from(data_dir),
         enable_dns,
@@ -541,6 +558,7 @@ mod tests {
     fn answers() -> SetupAnswers {
         SetupAnswers {
             node_name: "kitchen-01".to_string(),
+            cluster_name: "production".to_string(),
             join_address: None,
             data_dir: PathBuf::from("/srv/reliaburger"),
             enable_dns: false,
@@ -598,6 +616,7 @@ mod tests {
         let answers = answers();
         let parsed = NodeConfig::parse(&render_config(&answers)).unwrap();
         assert_eq!(parsed, build_node_config(&answers));
+        assert_eq!(parsed.cluster.name, "production");
     }
 
     #[test]
@@ -648,9 +667,10 @@ mod tests {
     #[test]
     fn rendered_config_stays_minimal() {
         let rendered = render_config(&answers());
-        // Single node, everything optional off: no cluster or feature
-        // sections, no unrelated defaults spelled out.
-        assert!(!rendered.contains("[cluster]"));
+        // Cluster identity is explicit even on a single node; optional feature
+        // sections and unrelated defaults stay absent.
+        assert!(rendered.contains("[cluster]"));
+        assert!(rendered.contains("name = \"production\""));
         assert!(!rendered.contains("[dns]"));
         assert!(!rendered.contains("[ebpf]"));
         assert!(!rendered.contains("[ingress]"));

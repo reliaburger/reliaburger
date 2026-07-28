@@ -109,6 +109,8 @@ pub struct ApiState {
         Option<tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>>,
     /// This node's gossip name, for batch self-dispatch short-circuits.
     pub node_name: Option<String>,
+    /// Immutable SPIFFE trust domain for build-signing identities.
+    pub trust_domain: String,
     /// Async build tracker (Phase 12 F2). Node-local: builds live
     /// where they were submitted; delegated builds proxy status reads.
     pub build_registry: Arc<tokio::sync::Mutex<super::build_runner::BuildRegistry>>,
@@ -187,6 +189,7 @@ pub fn router(
         events,
         None,
         None,
+        "default".to_string(),
         None,
         900,
         crate::cluster::ClusterHttp::plaintext(),
@@ -223,6 +226,7 @@ pub fn router_with_upgrade(
     aggregated_rx: Option<
         tokio::sync::watch::Receiver<crate::reporting::aggregator::AggregatedState>,
     >,
+    trust_domain: String,
     node_name: Option<String>,
     build_timeout_secs: u64,
     cluster_http: crate::cluster::ClusterHttp,
@@ -256,6 +260,7 @@ pub fn router_with_upgrade(
             crate::meat::batch_tracker::BatchTracker::new(),
         )),
         aggregated_rx,
+        trust_domain,
         node_name,
         build_registry: Arc::new(tokio::sync::Mutex::new(
             super::build_runner::BuildRegistry::default(),
@@ -4421,6 +4426,7 @@ mod tests {
             None,
             None,
             None,
+            "default".to_string(),
             None,
             900,
             crate::cluster::ClusterHttp::plaintext(),
@@ -5110,6 +5116,7 @@ mod tests {
             None,
             None,
             None,
+            "default".to_string(),
             None,
             900,
             crate::cluster::ClusterHttp::plaintext(),
@@ -6192,6 +6199,7 @@ mod tests {
             None,
             None,
             None,
+            "default".to_string(),
             None,
             900,
             crate::cluster::ClusterHttp::plaintext(),
@@ -6372,6 +6380,7 @@ mod tests {
             None,
             None,
             None,
+            "default".to_string(),
             None,
             900,
             crate::cluster::ClusterHttp::plaintext(),

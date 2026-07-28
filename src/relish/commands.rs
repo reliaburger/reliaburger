@@ -384,6 +384,13 @@ pub fn init_with_security(
     node_id: &str,
     security_mode: InitSecurityMode,
 ) -> Result<(), RelishError> {
+    let cluster_identity = crate::config::node::ClusterSection {
+        name: cluster_name.to_string(),
+        ..crate::config::node::ClusterSection::default()
+    };
+    cluster_identity
+        .validate()
+        .map_err(|error| RelishError::InitFailed(error.to_string()))?;
     fs::create_dir_all(dir)?;
     let node_path = dir.join("reliaburger.toml");
     let app_path = dir.join("app.toml");
@@ -442,6 +449,7 @@ pub fn init_with_security(
     eprintln!("  Joiners must see the same root CA fingerprint from `relish join`.");
 
     let mut node_config = crate::config::node::NodeConfig::default();
+    node_config.cluster.name = cluster_name.to_string();
     node_config.security.master_key_path = Some(secret_path.clone());
     node_config.security.bootstrap_path = Some(bootstrap_path.clone());
     node_config.security.identity_dir = Some(identity_dir.clone());
@@ -1968,6 +1976,14 @@ mod tests {
     }
 
     #[test]
+    fn init_rejects_an_invalid_spiffe_trust_domain_before_writing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = init(dir.path(), "Not/A/Domain", "node-01").unwrap_err();
+        assert!(matches!(err, RelishError::InitFailed(_)));
+        assert!(!dir.path().join("reliaburger.toml").exists());
+    }
+
+    #[test]
     fn init_persists_the_first_nodes_identity_next_to_the_master_key() {
         let dir = tempfile::tempdir().unwrap();
         init(dir.path(), "mycluster", "node-01").unwrap();
@@ -1992,6 +2008,7 @@ mod tests {
 
         let node_content = std::fs::read_to_string(dir.path().join("reliaburger.toml")).unwrap();
         let nc: crate::config::node::NodeConfig = toml::from_str(&node_content).unwrap();
+        assert_eq!(nc.cluster.name, "mycluster");
         assert_eq!(
             nc.security.master_key_path,
             Some(dir.path().join("mycluster-master.key"))

@@ -126,6 +126,7 @@ impl Harness {
             None,
             None,
             aggregated_rx,
+            "default".to_string(),
             options.node_name,
             900,
             reliaburger::cluster::ClusterHttp::plaintext(),

@@ -1117,6 +1117,8 @@ pub struct BunAgent<G: Grill> {
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
     volumes_dir: PathBuf,
     cluster: Option<ClusterHandle>,
+    /// Immutable cluster identity used as every workload SPIFFE trust domain.
+    trust_domain: String,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
@@ -1277,6 +1279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             readiness: None,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
+            trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1339,6 +1342,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         command_rx: mpsc::Receiver<AgentCommand>,
         shutdown: CancellationToken,
         cluster: ClusterHandle,
+        trust_domain: String,
     ) -> Self {
         let (deploy_ops_tx, deploy_ops_rx) = mpsc::channel(256);
         Self {
@@ -1348,6 +1352,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             readiness: None,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
+            trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -5749,14 +5754,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             crate::sesame::types::WorkloadType::App
         };
 
-        // TODO: get cluster_name from config rather than hardcoding
-        let cluster_name = "default";
-        let spiffe_uri = crate::sesame::types::SpiffeUri {
-            trust_domain: cluster_name.to_string(),
-            namespace: namespace.to_string(),
-            workload_type,
-            name: app_name.to_string(),
-        };
+        let spiffe_uri =
+            workload_spiffe_uri(&self.trust_domain, namespace, app_name, workload_type);
 
         // Generate CSR (keypair stays local)
         let (csr_der, private_key_der) =
@@ -5778,7 +5777,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 &csr_der,
                 &spiffe_uri,
                 crate::sesame::identity::CertUsage::Mtls,
-                cluster_name,
+                &self.trust_domain,
                 "local",
                 &instance_id.0,
             )
@@ -7374,6 +7373,24 @@ pub fn tail_lines(s: &str, n: usize) -> String {
         format!("{result}\n")
     } else {
         result
+    }
+}
+
+/// Construct the identity the agent requests for an app or job.
+///
+/// Keeping this in one function prevents certificate SANs and JWT claims from
+/// drifting onto different trust domains.
+pub fn workload_spiffe_uri(
+    trust_domain: &str,
+    namespace: &str,
+    name: &str,
+    workload_type: crate::sesame::types::WorkloadType,
+) -> crate::sesame::types::SpiffeUri {
+    crate::sesame::types::SpiffeUri {
+        trust_domain: trust_domain.to_string(),
+        namespace: namespace.to_string(),
+        workload_type,
+        name: name.to_string(),
     }
 }
 

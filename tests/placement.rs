@@ -111,6 +111,7 @@ async fn start_node(
         // by re-taking the pieces. Instead we move `handle` into the
         // agent and keep clones of the watch receivers above.
         handle,
+        "default".to_string(),
     );
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());

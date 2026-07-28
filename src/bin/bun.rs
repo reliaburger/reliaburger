@@ -506,6 +506,10 @@ async fn main() -> anyhow::Result<()> {
         .backup
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    config
+        .cluster
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
     // A zero alert interval would panic `tokio::time::interval` at startup
     // (OBS4); reject it here with a clear message.
     config
@@ -746,7 +750,14 @@ async fn main() -> anyhow::Result<()> {
             cluster_runtime.directory_rx.clone(),
         ));
         _cluster_runtime = Some(cluster_runtime);
-        BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
+        BunAgent::with_cluster(
+            runtime,
+            port_allocator,
+            cmd_rx,
+            agent_shutdown,
+            handle,
+            config.cluster.name.clone(),
+        )
     } else {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
@@ -1606,6 +1617,7 @@ async fn main() -> anyhow::Result<()> {
         upgrade_manager.clone().map(Arc::new),
         // Batch capacity (F1): the leader's aggregated worker reports.
         api_aggregated_rx.clone(),
+        config.cluster.name.clone(),
         Some(node_name.clone()),
         config.images.build_timeout_secs,
         cluster_http.clone(),
@@ -1660,11 +1672,7 @@ async fn main() -> anyhow::Result<()> {
         let eval_alerts = Arc::clone(alert_evaluator);
         let eval_shutdown = shutdown.clone();
         let eval_interval = config.alerts.evaluation_interval_secs;
-        let cluster_name = config
-            .node
-            .name
-            .clone()
-            .unwrap_or_else(|| "local".to_string());
+        let cluster_name = config.cluster.name.clone();
 
         let webhook_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))

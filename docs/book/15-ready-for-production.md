@@ -238,6 +238,13 @@ bind must be that IP or a wildcard. Otherwise Bun refuses to start. This is a us
 for configuration defaults: a safe standalone default can become a derived cluster value,
 but it must never survive into a mode where its guarantee is false.
 
+Identity evidence needs the same discipline. `[cluster].name` is the SPIFFE
+trust domain for app, job and build-signer certificates. Generated configs now
+persist it and Bun rejects malformed domains at startup. The acceptance test
+uses a non-default name, signs a real workload CSR with that cluster's Workload
+CA, validates the chain and checks the URI SAN. A string-format assertion alone
+would have missed the original wiring bug.
+
 ## Correctness is not a benchmark
 
 One test transferred 100 MB over the P2P path and asserted that it finished in under five

@@ -355,6 +355,13 @@ impl SpiffeUri {
 }
 ```
 
+The implementation reads the trust domain from `[cluster].name`. `relish init`,
+`relish setup` and `relish dev create` persist the requested cluster name into
+every generated node config; Bun validates the DNS-style value once at startup
+and passes it unchanged into app, job, OIDC and build-signing issuance. The
+historical hard-coded `default` domain remains only as the backwards-compatible
+config default.
+
 ### 4.4 API Token
 
 ```rust
