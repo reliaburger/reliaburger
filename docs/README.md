@@ -735,6 +735,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/health` | Agent liveness check |
+| `GET` | `/v1/readiness` | Authenticated critical-subsystem readiness evidence (200 ready, 503 fenced) |
+| `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
 | `GET` | `/v1/status` | List all instances |
 | `GET` | `/v1/status/{app}/{namespace}` | Status for a specific app |
@@ -752,5 +754,8 @@ The CLI uses this API internally. You can also call it directly:
 
 ```sh
 curl http://127.0.0.1:9117/v1/health
-curl http://127.0.0.1:9117/v1/status
+curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  http://127.0.0.1:9117/v1/readiness
+curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  http://127.0.0.1:9117/v1/capabilities
 ```

@@ -22,6 +22,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Current wire schema for `GET /v1/capabilities`.
+pub const CAPABILITY_SCHEMA_VERSION: u32 = 2;
+/// Maximum age a Phase 15 caller may trust one live snapshot.
+pub const CAPABILITY_TTL_MILLIS: u64 = 15_000;
+
 /// Capability facts only the node's startup path knows.
 ///
 /// These come from config and from what `bun` actually managed to wire up,
@@ -29,6 +34,8 @@ use serde::{Deserialize, Serialize};
 /// `src/bin/bun.rs` and handed to the router.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaticCapabilities {
+    /// Stable gossip/node identity.
+    pub node_id: String,
     /// Descriptive `[cluster] environment` metadata. Safety decisions use
     /// `test_policy`, never this free-form string.
     pub environment: Option<String>,
@@ -76,6 +83,18 @@ pub struct WiredSubsystems {
 /// What a node reports about itself at `GET /v1/capabilities`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterCapabilities {
+    /// Wire schema version.
+    pub schema_version: u32,
+    /// Stable identity of the node which assembled this report.
+    pub node_id: String,
+    /// Time the live evidence was assembled.
+    pub observed_at_unix_ms: u64,
+    /// Time after which a caller must treat the evidence as unknown.
+    pub expires_at_unix_ms: u64,
+    /// Critical long-lived task evidence, when collected by a live node.
+    pub readiness: Option<crate::bun::readiness::NodeReadinessEvidence>,
+    /// Live placement data-path evidence, when collected by a live node.
+    pub placement: Option<crate::bun::readiness::NodeCapabilityEvidence>,
     pub version: String,
     pub environment: Option<String>,
     pub container_runtime: String,
@@ -104,11 +123,28 @@ pub struct ClusterCapabilities {
 impl ClusterCapabilities {
     /// Derive the report. Pure: same inputs, same output, no I/O.
     pub fn derive(statics: &StaticCapabilities, wired: &WiredSubsystems) -> Self {
+        Self::derive_with_evidence(statics, wired, None, None)
+    }
+
+    /// Derive the report with one timestamped live evidence snapshot.
+    pub fn derive_with_evidence(
+        statics: &StaticCapabilities,
+        wired: &WiredSubsystems,
+        readiness: Option<crate::bun::readiness::NodeReadinessEvidence>,
+        placement: Option<crate::bun::readiness::NodeCapabilityEvidence>,
+    ) -> Self {
+        let observed_at_unix_ms = unix_millis(std::time::SystemTime::now());
         // A node is "in a cluster" if it has either half of the cluster
         // plane — a council seat or a membership table. A worker has the
         // second without the first, and it is emphatically clustered.
         let cluster = wired.council || wired.member_count.is_some();
         Self {
+            schema_version: CAPABILITY_SCHEMA_VERSION,
+            node_id: statics.node_id.clone(),
+            observed_at_unix_ms,
+            expires_at_unix_ms: observed_at_unix_ms.saturating_add(CAPABILITY_TTL_MILLIS),
+            readiness,
+            placement,
             version: crate::upgrade::version::compiled_version().to_string(),
             environment: statics.environment.clone(),
             container_runtime: statics.container_runtime.clone(),
@@ -182,6 +218,14 @@ impl ClusterCapabilities {
     }
 }
 
+fn unix_millis(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 /// A capability a test, bench suite or diagnostic requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,6 +292,21 @@ mod tests {
         assert!(capabilities.logs);
         assert!(!capabilities.council);
         assert!(!capabilities.registry);
+    }
+
+    #[test]
+    fn capability_report_identifies_its_node_and_expires() {
+        let statics = StaticCapabilities {
+            node_id: "node-a".to_string(),
+            ..statics()
+        };
+        let report = ClusterCapabilities::derive(&statics, &WiredSubsystems::default());
+        assert_eq!(report.schema_version, CAPABILITY_SCHEMA_VERSION);
+        assert_eq!(report.node_id, "node-a");
+        assert_eq!(
+            report.expires_at_unix_ms - report.observed_at_unix_ms,
+            CAPABILITY_TTL_MILLIS
+        );
     }
 
     #[test]

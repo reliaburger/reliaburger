@@ -26,7 +26,9 @@ use crate::meat::NodeId;
 use crate::mustard::membership::MembershipSnapshot;
 
 use super::transport::ReportingTransport;
-use super::types::{DnsCapabilityReport, NodeCapabilityReport, ReportingMessage, StateReport};
+use super::types::{
+    DnsCapabilityReport, NodeCapabilityReport, NodeReadinessReport, ReportingMessage, StateReport,
+};
 
 /// How many stale windows an entry may age before it is evicted outright
 /// (as opposed to merely listed in `stale_nodes`).
@@ -48,6 +50,8 @@ pub struct AggregatedState {
     /// Latest additive capability evidence from new-enough nodes. Absence
     /// means no schedulable security capabilities, never an optimistic guess.
     pub capabilities: HashMap<NodeId, NodeCapabilityReport>,
+    /// Fresh critical-subsystem evidence. Absence means unready.
+    pub readiness: HashMap<NodeId, NodeReadinessReport>,
 }
 
 /// A stored report plus the aggregator-side metadata that decides its fate.
@@ -76,12 +80,21 @@ struct DnsCapabilityEntry {
     epoch: u64,
 }
 
+/// Readiness uses an independent lease so another report type cannot keep a
+/// dead subsystem looking schedulable.
+struct ReadinessEntry {
+    report: NodeReadinessReport,
+    received_at: Instant,
+    epoch: u64,
+}
+
 /// Aggregates state reports from assigned worker nodes.
 pub struct ReportAggregator<T: ReportingTransport> {
     transport: T,
     entries: HashMap<NodeId, ReportEntry>,
     capability_entries: HashMap<NodeId, CapabilityEntry>,
     dns_capability_entries: HashMap<NodeId, DnsCapabilityEntry>,
+    readiness_entries: HashMap<NodeId, ReadinessEntry>,
     watch_tx: watch::Sender<AggregatedState>,
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
     config: ReportingTreeSection,
@@ -113,6 +126,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             entries: HashMap::new(),
             capability_entries: HashMap::new(),
             dns_capability_entries: HashMap::new(),
+            readiness_entries: HashMap::new(),
             watch_tx,
             rollup_store,
             config,
@@ -176,6 +190,12 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                         Some((_, peer, ReportingMessage::DnsCapabilityReport(report))) => {
                             if Self::report_identity_ok(&peer, &report.node_id) {
                                 self.store_dns_capability(report);
+                                self.publish();
+                            }
+                        }
+                        Some((_, peer, ReportingMessage::NodeReadinessReport(report))) => {
+                            if Self::report_identity_ok(&peer, &report.node_id) {
+                                self.store_readiness(report);
                                 self.publish();
                             }
                         }
@@ -290,6 +310,17 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         );
     }
 
+    fn store_readiness(&mut self, report: NodeReadinessReport) {
+        self.readiness_entries.insert(
+            report.node_id.clone(),
+            ReadinessEntry {
+                report,
+                received_at: Instant::now(),
+                epoch: self.current_epoch(),
+            },
+        );
+    }
+
     /// Remove entries whose receive age exceeds the eviction bound.
     fn evict_expired(&mut self, stale_timeout: Duration) {
         let bound = stale_timeout * EVICTION_MULTIPLIER;
@@ -299,6 +330,8 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         self.capability_entries
             .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
         self.dns_capability_entries
+            .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
+        self.readiness_entries
             .retain(|_, entry| now.duration_since(entry.received_at) <= bound);
     }
 
@@ -324,9 +357,13 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         let dns_before = self.dns_capability_entries.len();
         self.dns_capability_entries
             .retain(|node_id, _| active.contains(node_id));
+        let readiness_before = self.readiness_entries.len();
+        self.readiness_entries
+            .retain(|node_id, _| active.contains(node_id));
         self.entries.len() != before
             || self.capability_entries.len() != capability_before
             || self.dns_capability_entries.len() != dns_before
+            || self.readiness_entries.len() != readiness_before
     }
 
     fn publish(&self) {
@@ -377,10 +414,20 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                 .dns = entry.report.capability;
         }
 
+        let readiness = self
+            .readiness_entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.epoch == epoch && now.duration_since(entry.received_at) <= stale_timeout
+            })
+            .map(|(node_id, entry)| (node_id.clone(), entry.report.clone()))
+            .collect();
+
         AggregatedState {
             reports,
             stale_nodes,
             capabilities,
+            readiness,
         }
     }
 
@@ -442,6 +489,17 @@ mod tests {
         }
     }
 
+    fn readiness(name: &str) -> NodeReadinessReport {
+        NodeReadinessReport {
+            node_id: NodeId::new(name),
+            evidence: crate::bun::readiness::NodeReadinessEvidence {
+                ready: true,
+                observed_at_unix_ms: 1,
+                subsystems: Vec::new(),
+            },
+        }
+    }
+
     fn test_config() -> ReportingTreeSection {
         ReportingTreeSection {
             report_interval_secs: 1,
@@ -500,6 +558,20 @@ mod tests {
             .send(addr(2), &ReportingMessage::Report(report("honest")))
             .await
             .unwrap();
+        attacker
+            .send(
+                addr(2),
+                &ReportingMessage::NodeReadinessReport(readiness("victim")),
+            )
+            .await
+            .unwrap();
+        honest
+            .send(
+                addr(2),
+                &ReportingMessage::NodeReadinessReport(readiness("honest")),
+            )
+            .await
+            .unwrap();
 
         let handle = tokio::spawn(async move { aggregator.run().await });
 
@@ -507,8 +579,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
             let _ = tokio::time::timeout(Duration::from_millis(50), watch_rx.changed()).await;
-            let n = watch_rx.borrow().reports.len();
-            if n >= 2 || std::time::Instant::now() > deadline {
+            let state = watch_rx.borrow();
+            if (state.reports.len() >= 2 && state.readiness.contains_key(&NodeId::new("honest")))
+                || std::time::Instant::now() > deadline
+            {
                 break;
             }
         }
@@ -525,6 +599,11 @@ mod tests {
         assert!(
             !state.reports.contains_key(&NodeId::new("victim")),
             "a report spoofing another node's id must be dropped, not stored"
+        );
+        assert!(state.readiness.contains_key(&NodeId::new("honest")));
+        assert!(
+            !state.readiness.contains_key(&NodeId::new("victim")),
+            "readiness evidence must have the same mTLS identity binding"
         );
 
         shutdown.cancel();
@@ -688,6 +767,25 @@ mod tests {
             aggregator.build_aggregated_state().capabilities.is_empty(),
             "a stale hook report must never keep admitting protected workloads"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_readiness_is_withdrawn_fail_closed() {
+        let net = InMemoryReportingNetwork::new();
+        let council_transport = net.register(addr(1)).await;
+        let shutdown = CancellationToken::new();
+        let (mut aggregator, _watch_rx) =
+            ReportAggregator::new(council_transport, test_config(), shutdown, None, None, None);
+        aggregator.store_readiness(readiness("ready-node"));
+        assert!(
+            aggregator
+                .build_aggregated_state()
+                .readiness
+                .contains_key(&NodeId::new("ready-node"))
+        );
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(aggregator.build_aggregated_state().readiness.is_empty());
     }
 
     #[tokio::test]

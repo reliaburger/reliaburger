@@ -46,6 +46,7 @@ fn spawn_fake_agent(
                     let Some(req) = req else { break };
                     let snapshot = AgentSnapshot {
                         capabilities: Default::default(),
+                        readiness: None,
                         egress_degraded: false,
                         egress_affected_workloads: Vec::new(),
                         instances: vec![InstanceSnapshot {

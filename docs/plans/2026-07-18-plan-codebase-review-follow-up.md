@@ -346,11 +346,19 @@ doctests and the RustSec audit also pass.
 
 ### M1. Expose subsystem readiness and death as live evidence
 
-- [ ] Add `Starting`, `Ready`, `Degraded` and `Stopped` state with last error/time
+- [x] Add `Starting`, `Ready`, `Degraded` and `Stopped` state with last error/time
   for critical long-lived tasks (FUNC-3).
-- [ ] Keep `/v1/health` as liveness; add readiness and authenticated capability
+- [x] Keep `/v1/health` as liveness; add readiness and authenticated capability
   evidence for scheduling and Phase 15.
-- [ ] Restart only reconstructible tasks with explicit ownership and deadlines.
+- [x] Restart only reconstructible tasks with explicit ownership and deadlines.
+
+**Delivered:** one process-wide tracker pre-registers the complete critical
+owner set before startup and records state transitions, last failure/time and
+restart count. Authenticated `/v1/readiness` and `/v1/capabilities` expose it;
+an independent rolling-safe reporting frame gives the scheduler a
+receive-time/leadership-epoch lease whose absence fails closed. Unique
+socket/channel owners never respawn. The reconstructible security refresher
+uses explicit retry, recovery and shutdown bounds.
 
 ### M2. Repair cheap executable checks and platform lint
 

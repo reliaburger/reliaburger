@@ -1373,7 +1373,11 @@ convergence and adoption" theme under 12b.6).
 
 ### Medium-value
 
-- [ ] Live subsystem readiness/capability evidence and supervised failure (M1)
+- [x] Live subsystem readiness/capability evidence and supervised failure (M1)
+  — critical owners publish `Starting`, `Ready`, `Degraded` and `Stopped`
+  evidence with failure times; authenticated readiness/capability APIs and an
+  independently expiring report lease fence scheduling fail closed. Only the
+  reconstructible security refresher retries, within explicit budgets.
 - [ ] Executable examples, coherent cross-platform lint and advisory scanning (M2)
 - [ ] Peer-reachable clustered registry defaults (M3)
 - [ ] Configured workload trust domain (M4)

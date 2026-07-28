@@ -51,6 +51,19 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                     let Some(req) = req else { break };
                     let _ = req.response.send(AgentSnapshot {
                         capabilities: Default::default(),
+                        readiness: Some(reliaburger::bun::readiness::NodeReadinessEvidence {
+                            ready: true,
+                            observed_at_unix_ms: 1,
+                            subsystems: vec![reliaburger::bun::readiness::SubsystemEvidence {
+                                name: "fake-agent".to_string(),
+                                critical: true,
+                                state: reliaburger::bun::readiness::SubsystemState::Ready,
+                                state_since_unix_ms: 1,
+                                last_error: None,
+                                last_error_unix_ms: None,
+                                restart_count: 0,
+                            }],
+                        }),
                         egress_degraded: false,
                         egress_affected_workloads: Vec::new(),
                         instances: vec![InstanceSnapshot {
@@ -123,6 +136,7 @@ async fn start_node_with_mayo(
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
+            readiness: None,
         },
         shutdown.clone(),
     )
@@ -192,6 +206,7 @@ async fn start_mtls_node(
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
+            readiness: None,
         },
         shutdown.clone(),
     )

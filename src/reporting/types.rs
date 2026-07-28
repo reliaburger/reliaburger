@@ -94,6 +94,15 @@ pub struct DnsCapabilityReport {
     pub capability: crate::onion::dns::DnsCapability,
 }
 
+/// Additive critical-subsystem readiness lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeReadinessReport {
+    /// Node that observed the subsystem states.
+    pub node_id: NodeId,
+    /// Point-in-time critical-subsystem decision and supporting states.
+    pub evidence: crate::bun::readiness::NodeReadinessEvidence,
+}
+
 /// A workload fenced after its live egress security boundary disappeared.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EgressAffectedWorkload {
@@ -226,6 +235,9 @@ pub enum ReportingMessage {
     /// Live DNS readiness in its own rolling-upgrade-safe extension frame.
     /// Added at the end so every earlier discriminant stays unchanged.
     DnsCapabilityReport(DnsCapabilityReport),
+    /// Live critical-subsystem readiness in a rolling-upgrade-safe extension
+    /// frame. Absence or lease expiry is not ready.
+    NodeReadinessReport(NodeReadinessReport),
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +460,33 @@ mod tests {
         };
         assert_eq!(decoded.node_id, NodeId::new("node-1"));
         assert!(decoded.capability.can_resolve_internal());
+        assert!(bincode::deserialize::<H2ReportingMessage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn readiness_extension_round_trip() {
+        let message = ReportingMessage::NodeReadinessReport(NodeReadinessReport {
+            node_id: NodeId::new("node-1"),
+            evidence: crate::bun::readiness::NodeReadinessEvidence {
+                ready: true,
+                observed_at_unix_ms: 42,
+                subsystems: vec![crate::bun::readiness::SubsystemEvidence {
+                    name: "agent".to_string(),
+                    critical: true,
+                    state: crate::bun::readiness::SubsystemState::Ready,
+                    state_since_unix_ms: 41,
+                    last_error: None,
+                    last_error_unix_ms: None,
+                    restart_count: 0,
+                }],
+            },
+        });
+        let encoded = bincode::serialize(&message).unwrap();
+        let decoded: ReportingMessage = bincode::deserialize(&encoded).unwrap();
+        let ReportingMessage::NodeReadinessReport(decoded) = decoded else {
+            panic!("expected node readiness report");
+        };
+        assert!(decoded.evidence.ready);
         assert!(bincode::deserialize::<H2ReportingMessage>(&encoded).is_err());
     }
 

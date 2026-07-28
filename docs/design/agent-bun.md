@@ -814,10 +814,42 @@ pub struct UpgradeConfig {
 - `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
 - `EventStream` -- real-time events (starts, stops, health changes, OOMs)
 - `SchedulingDirective` -- from parent to Bun: start/stop/update workloads
+- `NodeReadinessReport` -- an additive, independently expiring lease carrying
+  the live `Starting`, `Ready`, `Degraded` or `Stopped` state of every critical
+  long-lived subsystem, with transition and last-error times
 
 **Bun <-> eBPF kernel maps:** Direct memory-mapped access via `libbpf` file descriptors. Map updates are atomic `bpf_map_update_elem()` calls. No serialisation protocol -- the map keys and values are C-compatible structs (`#[repr(C)]`).
 
 **Bun <-> nftables:** Netlink socket via the `nft` library or direct `nftnl` bindings. Rules are expressed as nftables objects and committed atomically.
+
+### 4.7 Liveness, Readiness and Task Ownership
+
+`GET /v1/health` answers one narrow question: is the HTTP process alive? It is
+public because upgrade supervisors and local process managers need a cheap
+liveness probe. It does not claim that Bun can schedule safely.
+
+`GET /v1/readiness` and `GET /v1/capabilities` require an authenticated caller.
+The first returns 200 only when every registered critical owner is `Ready`; it
+returns 503 with the complete state evidence otherwise. The second exposes the
+same node-readiness decision beside live DNS and egress capabilities. Both are
+direct reads from a process-wide evidence tracker, so a dead agent command loop
+cannot make the endpoint hang or fabricate a healthy answer. The capability
+response carries a schema version, node id, observation time and 15-second
+expiry; callers treat evidence beyond that expiry as unknown.
+
+The reporting worker sends readiness in its own extension frame. The leader
+leases it by aggregator receive time and leadership epoch, independently of
+ordinary state, DNS and egress frames. A missing or stale readiness lease makes
+the scheduler mark the node unready. One healthy heartbeat cannot keep another
+dead subsystem looking alive.
+
+Task ownership decides restart policy. Unique socket listeners and one-consumer
+channels are non-reconstructible owners: Bun records an unexpected exit as
+`Degraded` and never starts a second claimant. A task may restart only when a
+factory can recreate everything it owns. That path has an explicit retry count,
+recovery deadline, delay and shutdown deadline. The security-state/CRL refresh
+loop uses it; the agent, API, registry, DNS, ingress, gossip, Raft and reporting
+owners do not.
 
 ---
 

@@ -172,6 +172,7 @@ fn cluster_params_from_config(
         labels: config.node.labels.clone(),
         // Wired in by the caller (run) once the disk-pressure channel exists.
         self_disk_pressured_rx: None,
+        readiness: None,
     })
 }
 
@@ -589,6 +590,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Create shutdown token
     let shutdown = CancellationToken::new();
+    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
+    for name in ["agent", "api", "registry"] {
+        readiness.register(name, true).await;
+    }
+    if config.dns.enabled {
+        readiness.register("dns", true).await;
+    }
+    if config.ingress.enabled {
+        readiness.register("ingress", true).await;
+    }
 
     // Mayo store first: the cluster runtime's rollup worker reads it, so
     // it must exist before the runtime starts.
@@ -657,6 +668,7 @@ async fn main() -> anyhow::Result<()> {
         let mut params = cluster_params_from_config(&config)?;
         params.mayo = Some(Arc::clone(&mayo_store));
         params.self_disk_pressured_rx = Some(disk_pressured_rx.clone());
+        params.readiness = Some(readiness.clone());
         // Advertised via the gossip directory (12b.2): peers reach this
         // node's API at the port it actually listens on, not a derived one.
         params.api_port = api_port;
@@ -995,26 +1007,44 @@ async fn main() -> anyhow::Result<()> {
 
         let refresh_store = Arc::clone(&api_token_store);
         let refresh_council = Arc::clone(council);
-        let refresh_shutdown = shutdown.clone();
         let refresh_crl = crl_refresh.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    _ = refresh_shutdown.cancelled() => break,
-                    _ = ticker.tick() => {
-                        refresh_token_store(&refresh_store, &refresh_council).await;
-                        // Same tick refreshes the CRL so a revoked peer is
-                        // refused on its next handshake (≤5 s lag).
-                        if let Some(crl) = &refresh_crl {
-                            crl.update(refresh_council.security_state().await.crl);
+        reliaburger::bun::readiness::spawn_reconstructible(
+            "security-refresh",
+            false,
+            readiness.clone(),
+            shutdown.clone(),
+            reliaburger::bun::readiness::RestartBudget {
+                max_restarts: 3,
+                retry_delay: std::time::Duration::from_secs(1),
+                recovery_deadline: std::time::Duration::from_secs(30),
+                shutdown_deadline: std::time::Duration::from_secs(5),
+            },
+            move |attempt_shutdown| {
+                let refresh_store = Arc::clone(&refresh_store);
+                let refresh_council = Arc::clone(&refresh_council);
+                let refresh_crl = refresh_crl.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        tokio::select! {
+                            _ = attempt_shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                refresh_token_store(&refresh_store, &refresh_council).await;
+                                // Same tick refreshes the CRL so a revoked peer is
+                                // refused on its next handshake (≤5 s lag).
+                                if let Some(crl) = &refresh_crl {
+                                    crl.update(refresh_council.security_state().await.crl);
+                                }
+                            }
                         }
                     }
+                    Ok(())
                 }
-            }
-        });
+            },
+        );
     }
     agent.set_log_sink(log_tx);
+    agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
     if let Some(manager) = upgrade_manager.clone() {
@@ -1033,8 +1063,13 @@ async fn main() -> anyhow::Result<()> {
         let dns_shutdown = shutdown.clone();
         let dns_addr = bound_dns.local_addr()?;
         println!("bun: dns responder ready on {dns_addr}");
-        let server =
-            tokio::spawn(bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()));
+        let server = reliaburger::bun::readiness::spawn_owned(
+            "dns",
+            true,
+            readiness.clone(),
+            dns_shutdown.clone(),
+            bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()),
+        );
         tokio::spawn(async move {
             let outcome = server.await;
             if !dns_shutdown.is_cancelled() {
@@ -1081,16 +1116,28 @@ async fn main() -> anyhow::Result<()> {
             "bun: ingress listening on http {} / https {}",
             bound.http_addr, bound.https_addr
         );
-        tokio::spawn(async move {
-            if let Err(e) = bound.serve().await {
-                eprintln!("bun: ingress proxy exited with error: {e}");
-            }
-        });
+        reliaburger::bun::readiness::spawn_owned(
+            "ingress",
+            true,
+            readiness.clone(),
+            shutdown.clone(),
+            async move {
+                if let Err(e) = bound.serve().await {
+                    eprintln!("bun: ingress proxy exited with error: {e}");
+                }
+            },
+        );
     }
 
-    let agent_handle = tokio::spawn(async move {
-        agent.run().await;
-    });
+    let agent_handle = reliaburger::bun::readiness::spawn_owned(
+        "agent",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            agent.run().await;
+        },
+    );
 
     // Create observability stores (the Mayo store was created above,
     // before the cluster runtime that its rollup worker feeds from)
@@ -1476,6 +1523,7 @@ async fn main() -> anyhow::Result<()> {
     // capability report that overstates is worse than none, because it turns
     // "this cluster can't" into "this test mysteriously fails".
     let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+        node_id: node_name.clone(),
         environment: config.cluster.environment.clone(),
         container_runtime: runtime_kind.to_string(),
         // Whether the programs actually loaded and attached, not merely
@@ -1537,6 +1585,7 @@ async fn main() -> anyhow::Result<()> {
         // signature-requiring trust policy (12b.2 JOB7).
         config.images.trust_policy.require_signatures,
         static_capabilities,
+        readiness.clone(),
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener
@@ -1552,19 +1601,27 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let server_handle = tokio::spawn(async move {
-        match api_acceptor {
-            Some(acceptor) => serve_api_over_tls(listener, acceptor, app, server_shutdown).await,
-            None => {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        server_shutdown.cancelled().await;
-                    })
-                    .await
-                    .ok();
+    let server_handle = reliaburger::bun::readiness::spawn_owned(
+        "api",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            match api_acceptor {
+                Some(acceptor) => {
+                    serve_api_over_tls(listener, acceptor, app, server_shutdown).await
+                }
+                None => {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown.cancelled().await;
+                        })
+                        .await
+                        .ok();
+                }
             }
-        }
-    });
+        },
+    );
 
     // Spawn alert evaluation + webhook dispatch task
     if let Some(ref alert_evaluator) = alerts {
@@ -1794,21 +1851,27 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let pickle_shutdown = shutdown.clone();
-    let pickle_handle = tokio::spawn(async move {
-        match pickle_acceptor {
-            Some(acceptor) => {
-                serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+    let pickle_handle = reliaburger::bun::readiness::spawn_owned(
+        "registry",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            match pickle_acceptor {
+                Some(acceptor) => {
+                    serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+                }
+                None => {
+                    axum::serve(pickle_listener, pickle_app)
+                        .with_graceful_shutdown(async move {
+                            pickle_shutdown.cancelled().await;
+                        })
+                        .await
+                        .ok();
+                }
             }
-            None => {
-                axum::serve(pickle_listener, pickle_app)
-                    .with_graceful_shutdown(async move {
-                        pickle_shutdown.cancelled().await;
-                    })
-                    .await
-                    .ok();
-            }
-        }
-    });
+        },
+    );
 
     // Scheduled image GC (L10/M2): two-phase — nominate candidates,
     // let the arbiter (Raft in cluster mode, the local catalog's same

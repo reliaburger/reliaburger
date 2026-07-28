@@ -53,6 +53,8 @@ pub struct NodeMembershipInfo {
 #[derive(Clone)]
 pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
+    /// Live long-lived-task and placement-capability evidence.
+    pub readiness: super::readiness::ReadinessTracker,
     /// Shared metrics store (read-heavy, queries don't block the agent).
     pub mayo: Option<Arc<RwLock<MayoStore>>>,
     /// Shared log store (Arrow/DataFusion for SQL queries + `/v1/logs/entries`).
@@ -193,6 +195,7 @@ pub fn router(
         256 * 1024 * 1024,
         false,
         crate::bun::capabilities::StaticCapabilities::default(),
+        super::readiness::ReadinessTracker::new(),
     )
 }
 
@@ -228,9 +231,11 @@ pub fn router_with_upgrade(
     max_context_bytes: u64,
     require_signatures: bool,
     static_capabilities: crate::bun::capabilities::StaticCapabilities,
+    readiness: super::readiness::ReadinessTracker,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
+        readiness,
         mayo,
         log_store,
         alerts,
@@ -316,6 +321,7 @@ pub fn router_with_upgrade(
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
         .route("/v1/events", get(events_handler))
         .route("/v1/ws/events", get(ws_events_handler))
@@ -424,6 +430,18 @@ async fn health_handler() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Return live critical-subsystem evidence. Unlike `/v1/health`, this is an
+/// authenticated scheduling signal and returns 503 while the node is fenced.
+async fn readiness_handler(State(state): State<ApiState>) -> Response {
+    let evidence = state.readiness.snapshot().await;
+    let status = if evidence.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(evidence)).into_response()
+}
+
 /// Report the running binary version (public, dependency-free, fast).
 ///
 /// The upgrade orchestrator polls this to decide whether a node has
@@ -448,10 +466,15 @@ async fn capabilities_handler(State(state): State<ApiState>) -> impl IntoRespons
             None => None,
         },
     };
-    Json(crate::bun::capabilities::ClusterCapabilities::derive(
-        &state.static_capabilities,
-        &wired,
-    ))
+    let (readiness, placement) = state.readiness.snapshots().await;
+    Json(
+        crate::bun::capabilities::ClusterCapabilities::derive_with_evidence(
+            &state.static_capabilities,
+            &wired,
+            Some(readiness),
+            Some(placement),
+        ),
+    )
 }
 
 async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
@@ -4357,6 +4380,19 @@ mod tests {
         tokens: Vec<crate::sesame::types::ApiToken>,
         service_token: Option<String>,
     ) -> (Router, CancellationToken) {
+        setup_with_auth_and_readiness(
+            tokens,
+            service_token,
+            crate::bun::readiness::ReadinessTracker::new(),
+        )
+        .await
+    }
+
+    async fn setup_with_auth_and_readiness(
+        tokens: Vec<crate::sesame::types::ApiToken>,
+        service_token: Option<String>,
+        readiness: crate::bun::readiness::ReadinessTracker,
+    ) -> (Router, CancellationToken) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -4367,7 +4403,7 @@ mod tests {
         });
         let store = crate::sesame::auth::new_token_store();
         *store.write().await = tokens;
-        let app = router(
+        let app = router_with_upgrade(
             cmd_tx,
             None,
             None,
@@ -4380,8 +4416,20 @@ mod tests {
             None,
             None,
             None,
+            None,
             9117,
             None,
+            None,
+            None,
+            None,
+            900,
+            crate::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            crate::bun::capabilities::StaticCapabilities::default(),
+            readiness,
         );
         (app, shutdown)
     }
@@ -4445,6 +4493,51 @@ mod tests {
         let (token, _pt) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth(vec![token], None).await;
         assert_eq!(get_status(app, "/v1/health", None).await, StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn readiness_and_capability_evidence_require_a_token() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        assert_eq!(
+            get_status(app.clone(), "/v1/readiness", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(app.clone(), "/v1/capabilities", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(app.clone(), "/v1/readiness", Some(&plaintext)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            get_status(app, "/v1/capabilities", Some(&plaintext)).await,
+            StatusCode::OK
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_ok_only_after_every_critical_owner_is_ready() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        readiness.register("agent", true).await;
+        readiness.register("registry", true).await;
+        readiness.ready("agent").await;
+        let (app, shutdown) =
+            setup_with_auth_and_readiness(vec![token], None, readiness.clone()).await;
+        assert_eq!(
+            get_status(app.clone(), "/v1/readiness", Some(&plaintext)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        readiness.ready("registry").await;
+        assert_eq!(
+            get_status(app, "/v1/readiness", Some(&plaintext)).await,
+            StatusCode::OK
+        );
         shutdown.cancel();
     }
 
@@ -5025,6 +5118,7 @@ mod tests {
             256 * 1024 * 1024,
             false,
             statics,
+            crate::bun::readiness::ReadinessTracker::new(),
         );
         (app, shutdown, mayo_dir)
     }
@@ -5051,6 +5145,13 @@ mod tests {
         assert!(!capabilities.registry);
         assert_eq!(capabilities.container_runtime, "process");
         assert!(!capabilities.version.is_empty());
+        assert_eq!(
+            capabilities.schema_version,
+            crate::bun::capabilities::CAPABILITY_SCHEMA_VERSION
+        );
+        assert!(capabilities.readiness.is_some());
+        assert!(capabilities.placement.is_some());
+        assert!(capabilities.expires_at_unix_ms > capabilities.observed_at_unix_ms);
         shutdown.cancel();
     }
 
@@ -6099,6 +6200,7 @@ mod tests {
             256 * 1024 * 1024,
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
+            crate::bun::readiness::ReadinessTracker::new(),
         );
         (app, webhook_rx, shutdown)
     }
@@ -6278,6 +6380,7 @@ mod tests {
             256 * 1024 * 1024,
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
+            crate::bun::readiness::ReadinessTracker::new(),
         );
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

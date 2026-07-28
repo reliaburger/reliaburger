@@ -14,6 +14,7 @@ pub mod events;
 pub mod gpu;
 pub mod health;
 pub mod probe;
+pub mod readiness;
 pub mod restart;
 pub mod snapshot_worker;
 pub mod supervisor;

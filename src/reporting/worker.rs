@@ -17,8 +17,8 @@ use super::assignment::assign_parent;
 use super::transport::ReportingTransport;
 use super::types::{
     AppResourceUsage, DnsCapabilityReport, EgressAffectedWorkload, EgressEnforcementEvidence,
-    EgressEnforcementStatus, NodeCapabilityReport, ReportHealthStatus, ReportingMessage,
-    ResourceUsage, RunningApp, StateReport,
+    EgressEnforcementStatus, NodeCapabilityReport, NodeReadinessReport, ReportHealthStatus,
+    ReportingMessage, ResourceUsage, RunningApp, StateReport,
 };
 
 /// Snapshot of a single workload instance, provided by the agent.
@@ -65,6 +65,8 @@ pub struct AgentSnapshot {
     pub capacity_memory_mb: u32,
     /// Live capabilities used by the scheduler for placement.
     pub capabilities: crate::meat::cluster_state::NodeCapabilities,
+    /// Critical long-lived-task evidence, absent on pre-M1 nodes.
+    pub readiness: Option<crate::bun::readiness::NodeReadinessEvidence>,
     /// Whether a live egress enforcement incident is still active.
     pub egress_degraded: bool,
     /// Workloads fenced during the active incident.
@@ -209,6 +211,13 @@ impl<T: ReportingTransport> ReportWorker<T> {
             node_id: self.node_id.clone(),
             capability: snapshot.capabilities.dns,
         };
+        let readiness_report = snapshot
+            .readiness
+            .clone()
+            .map(|evidence| NodeReadinessReport {
+                node_id: self.node_id.clone(),
+                evidence,
+            });
         let report = self.build_report(snapshot);
         let _ = self
             .transport
@@ -225,6 +234,12 @@ impl<T: ReportingTransport> ReportWorker<T> {
             .transport
             .send(parent, &ReportingMessage::DnsCapabilityReport(dns_report))
             .await;
+        if let Some(report) = readiness_report {
+            let _ = self
+                .transport
+                .send(parent, &ReportingMessage::NodeReadinessReport(report))
+                .await;
+        }
     }
 
     /// Request a snapshot from the agent via the command channel.
@@ -386,6 +401,11 @@ mod tests {
                                     },
                                     ..Default::default()
                                 },
+                                readiness: Some(crate::bun::readiness::NodeReadinessEvidence {
+                                    ready: true,
+                                    observed_at_unix_ms: 1,
+                                    subsystems: Vec::new(),
+                                }),
                                 egress_degraded: true,
                                 egress_affected_workloads: vec![EgressAffectedWorkload {
                                     app_name: "web".to_string(),
@@ -492,6 +512,15 @@ mod tests {
         assert_eq!(dns.node_id, NodeId::new("w1"));
         assert!(dns.capability.can_resolve_internal());
 
+        let (_, _, msg) = tokio::time::timeout(Duration::from_secs(1), council_transport.recv())
+            .await
+            .expect("should receive readiness after capability evidence")
+            .unwrap();
+        let ReportingMessage::NodeReadinessReport(readiness) = msg else {
+            panic!("expected NodeReadinessReport");
+        };
+        assert!(readiness.evidence.ready);
+
         shutdown.cancel();
         let _ = handle.await;
     }
@@ -533,6 +562,7 @@ mod tests {
 
         let snapshot = AgentSnapshot {
             capabilities: Default::default(),
+            readiness: None,
             egress_degraded: false,
             egress_affected_workloads: Vec::new(),
             instances: vec![
@@ -578,6 +608,7 @@ mod tests {
 
         let snapshot = AgentSnapshot {
             capabilities: Default::default(),
+            readiness: None,
             egress_degraded: false,
             egress_affected_workloads: Vec::new(),
             instances: vec![instance("web", ContainerState::Stopping, 250, 128)],

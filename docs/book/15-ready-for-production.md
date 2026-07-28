@@ -168,6 +168,64 @@ tests and terminates a hung test after a bounded interval. Retries are zero. Aut
 rerunning a flaky distributed test makes the dashboard greener while preserving the race.
 We're trying to remove the race.
 
+## Alive isn't ready
+
+An HTTP listener can answer while the agent command loop is dead. It can also answer while
+DNS, Raft or the registry has fallen over. Returning `{"status":"ok"}` in those cases tells
+the truth about the process and lies about the node. Those are two different questions, so
+we now give them two different endpoints.
+
+`GET /v1/health` remains the public liveness probe. If it answers, a process manager knows
+the binary is alive and accepting HTTP. Authenticated callers use `/v1/readiness` for the
+stronger claim. It returns 200 only when every critical subsystem is `Ready`, and 503 with
+the evidence when any of them is still `Starting`, has become `Degraded`, or has `Stopped`.
+Each record includes when its state changed and the latest error and error time. No more
+searching the logs to discover that a green node lost half its control plane.
+The combined capability report names the node and gives the snapshot a 15-second expiry;
+after that, a diagnostic must call the state unknown rather than replaying an old green.
+
+The four states are a Rust `enum`:
+
+```rust
+pub enum SubsystemState {
+    Starting,
+    Ready,
+    Degraded,
+    Stopped,
+}
+```
+
+An enum is better than four booleans because only one variant can exist at a time, and a
+`match` must consider every variant. The tracker sits behind an `Arc<RwLock<_>>`. `Arc`
+gives the API, agent and task wrappers shared ownership; Tokio's asynchronous `RwLock`
+allows concurrent readers while serialising a transition. We copy a snapshot out before
+returning it, so a slow HTTP client never holds the lock.
+
+Readiness also travels to the leader in its own reporting message. Why another message?
+Reliaburger uses positional bincode frames between nodes. Adding a field to an existing
+frame would make an older binary run out of bytes while decoding it. Appending a new enum
+variant preserves every existing discriminant. An old node may reject the new extension,
+but it still decodes the ordinary report. The leader treats a missing or expired readiness
+extension as unready. Rolling compatibility doesn't mean optimistic guessing.
+
+There is one more trap here: “supervise” doesn't automatically mean “restart”. A gossip
+task owns a UDP socket. A report worker owns the receiving end of a channel. Starting a
+second copy may fail to bind, steal messages or leave two authorities alive. Those owners
+never auto-restart. Bun records their death and fences scheduling.
+
+The security-state refresher is different. Its factory owns only cloneable handles and can
+recreate its timer from scratch, so Bun may reconstruct it. Even then the policy names a
+maximum retry count, a delay, a recovery window and a shutdown deadline. The factory takes
+a child cancellation token for each attempt. Rust's ownership rules help us state the real
+question: can this closure build a completely new owner without borrowing the dead one? If
+the answer isn't obviously yes, we don't restart it.
+
+The scheduler consumes the same evidence under an independent receive-time lease. A fresh
+metrics report can't keep stale readiness alive, and a leader change starts with no inherited
+lease. Until the node proves every critical owner again, it receives no new work. Briefly
+under-scheduling is inconvenient. Scheduling onto a node whose control plane is half dead is
+worse.
+
 ## Correctness is not a benchmark
 
 One test transferred 100 MB over the P2P path and asserted that it finished in under five

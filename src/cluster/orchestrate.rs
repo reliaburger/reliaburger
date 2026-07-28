@@ -685,7 +685,11 @@ fn build_cluster_cache(
                 gpus: 0,
             },
             labels: member.labels.clone(),
-            ready: capability_report.is_none_or(|capability| !capability.egress_degraded),
+            ready: reports
+                .readiness
+                .get(&member.node_id)
+                .is_some_and(|report| report.evidence.ready)
+                && capability_report.is_none_or(|capability| !capability.egress_degraded),
             capabilities: capability_report
                 .map(|capability| capability.capabilities)
                 .unwrap_or_default(),
@@ -983,6 +987,29 @@ mod tests {
         }
     }
 
+    fn readiness(name: &str, ready: bool) -> crate::reporting::types::NodeReadinessReport {
+        crate::reporting::types::NodeReadinessReport {
+            node_id: NodeId::new(name),
+            evidence: crate::bun::readiness::NodeReadinessEvidence {
+                ready,
+                observed_at_unix_ms: 1,
+                subsystems: vec![crate::bun::readiness::SubsystemEvidence {
+                    name: "agent".to_string(),
+                    critical: true,
+                    state: if ready {
+                        crate::bun::readiness::SubsystemState::Ready
+                    } else {
+                        crate::bun::readiness::SubsystemState::Degraded
+                    },
+                    state_since_unix_ms: 1,
+                    last_error: None,
+                    last_error_unix_ms: None,
+                    restart_count: 0,
+                }],
+            },
+        }
+    }
+
     #[test]
     fn cache_includes_only_alive_nodes_with_reported_capacity() {
         let mut dead = member("dead", 2);
@@ -993,6 +1020,7 @@ mod tests {
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
+            readiness: HashMap::new(),
         };
         reports.reports.insert(NodeId::new("a"), report(4000, 250));
         // "dead" has a report but isn't alive; "unreported" is alive
@@ -1004,6 +1032,17 @@ mod tests {
         let node = cache.get_node(&NodeId::new("a")).unwrap();
         assert_eq!(node.allocatable.cpu_millicores, 4000);
         assert_eq!(node.allocated.cpu_millicores, 250);
+        assert!(!node.ready, "missing readiness evidence must fail closed");
+
+        reports
+            .readiness
+            .insert(NodeId::new("a"), readiness("a", true));
+        assert!(
+            build_cluster_cache(&members, &reports)
+                .get_node(&NodeId::new("a"))
+                .unwrap()
+                .ready
+        );
     }
 
     #[test]
@@ -1030,6 +1069,7 @@ mod tests {
             reports: HashMap::from([(NodeId::new("guarded"), guarded)]),
             stale_nodes: vec![],
             capabilities: HashMap::from([(NodeId::new("guarded"), capability)]),
+            readiness: HashMap::new(),
         };
 
         let cache = build_cluster_cache(&members, &reports);
@@ -1070,6 +1110,7 @@ mod tests {
             reports: HashMap::from([(NodeId::new("unsafe"), unsafe_report)]),
             stale_nodes: vec![],
             capabilities: HashMap::from([(NodeId::new("unsafe"), capability)]),
+            readiness: HashMap::new(),
         };
 
         let cache = build_cluster_cache(&members, &reports);
@@ -1084,6 +1125,7 @@ mod tests {
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
+            readiness: HashMap::new(),
         };
         reports.reports.insert(NodeId::new("zero"), report(0, 0));
 
@@ -1130,6 +1172,7 @@ mod tests {
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
+            readiness: HashMap::new(),
         };
         let mut ra = report(4000, 100);
         ra.running_apps = vec![running_app("default", "api", 30001, true)];
@@ -1170,6 +1213,7 @@ mod tests {
             reports: HashMap::new(),
             stale_nodes: vec![],
             capabilities: HashMap::new(),
+            readiness: HashMap::new(),
         };
         let mut ra = report(4000, 100);
         let mut portless = running_app("default", "batch", 0, true);

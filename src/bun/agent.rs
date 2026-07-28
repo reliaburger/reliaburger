@@ -1113,6 +1113,8 @@ pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
     command_rx: mpsc::Receiver<AgentCommand>,
     shutdown: CancellationToken,
+    /// Process-wide long-lived-task evidence shared with the API and reporter.
+    readiness: Option<crate::bun::readiness::ReadinessTracker>,
     volumes_dir: PathBuf,
     cluster: Option<ClusterHandle>,
     /// Smoker fault registry — active faults on this node.
@@ -1272,6 +1274,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             supervisor: WorkloadSupervisor::new(grill, port_allocator),
             command_rx,
             shutdown,
+            readiness: None,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
@@ -1342,6 +1345,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             supervisor: WorkloadSupervisor::new(grill, port_allocator),
             command_rx,
             shutdown,
+            readiness: None,
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
@@ -1427,6 +1431,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `relish logs` (which asks the runtime directly).
     pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
         self.log_tx = Some(log_tx);
+    }
+
+    /// Attach process-wide readiness and capability evidence.
+    pub fn set_readiness_tracker(&mut self, readiness: crate::bun::readiness::ReadinessTracker) {
+        self.readiness = Some(readiness);
     }
 
     /// Attach the cluster event store used by the TUI and events API.
@@ -2083,6 +2092,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub async fn run(&mut self) {
         let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
+        if let Some(readiness) = self.readiness.clone() {
+            let (capabilities, _) = self.live_egress_report_state().await;
+            readiness.set_capabilities(capabilities).await;
+        }
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -2100,6 +2114,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 _ = health_interval.tick() => {
                     self.enforce_live_egress_or_stop().await;
+                    if let Some(readiness) = self.readiness.clone() {
+                        let (capabilities, _) = self.live_egress_report_state().await;
+                        readiness.set_capabilities(capabilities).await;
+                    }
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.check_apps().await;
@@ -2211,6 +2229,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_cpu_millicores: self.capacity_cpu_millicores,
             capacity_memory_mb: self.capacity_memory_mb,
             capabilities,
+            readiness: match &self.readiness {
+                Some(readiness) => Some(readiness.snapshot().await),
+                None => None,
+            },
             egress_degraded: !egress_affected_workloads.is_empty(),
             egress_affected_workloads,
         };

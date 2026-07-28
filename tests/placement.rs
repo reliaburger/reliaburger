@@ -59,6 +59,8 @@ async fn start_node(
     let mayo = Arc::new(RwLock::new(reliaburger::mayo::store::MayoStore::new(
         data_dir.join("metrics"),
     )));
+    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
+    readiness.register("agent", true).await;
 
     let (handle, cluster_runtime) = runtime::start(
         ClusterParams {
@@ -82,6 +84,7 @@ async fn start_node(
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
+            readiness: Some(readiness.clone()),
         },
         shutdown.clone(),
     )
@@ -110,10 +113,17 @@ async fn start_node(
         handle,
     );
     agent.set_node_capacity(8000, 16384);
+    agent.set_readiness_tracker(readiness.clone());
     // Several agents share this host; don't spawn nft against the real
     // host firewall (`with_cluster` enables it by default on Linux).
     agent.set_perimeter_enabled(false);
-    let agent_task = tokio::spawn(async move { agent.run().await });
+    let agent_task = reliaburger::bun::readiness::spawn_owned(
+        "agent",
+        true,
+        readiness,
+        shutdown.clone(),
+        async move { agent.run().await },
+    );
     let mut tasks = vec![agent_task];
 
     // Membership table (peer API addresses = gossip IP + offset 3).
