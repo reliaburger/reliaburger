@@ -637,6 +637,7 @@ mod tests {
             host_port: None,
             app_spec: None,
             oci_spec: sleep_spec("60"),
+            rootless_network: None,
         }
     }
 

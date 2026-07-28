@@ -46,9 +46,9 @@ On Fedora:
 sudo dnf groupinstall "Development Tools"
 ```
 
-The rootless spec path (running without sudo) needs kernel 5.11 or later. That's where unprivileged user namespaces became stable enough for general use. Ubuntu 22.04+, Fedora 31+, and Debian 11+ all ship kernels that qualify. Check yours with `uname -r`. Reliaburger's declarative app specs currently request writable image roots, so those workloads still need root mode until Chapter 5's private-rootfs ownership has an unprivileged snapshotter.
+The rootless spec path (running without sudo) needs kernel 5.11 or later. That's where unprivileged user namespaces became stable enough for general use. Ubuntu 22.04+, Fedora 31+, and Debian 11+ all ship kernels that qualify. Check yours with `uname -r`. A kernel can support user namespaces and still deny them by policy: on Ubuntu, `kernel.apparmor_restrict_unprivileged_userns=1` needs an AppArmor profile for Bun (or an administrator must disable the restriction). Reliaburger's declarative app specs currently request writable image roots, so those workloads still need root mode until Chapter 5's private-rootfs ownership has an unprivileged snapshotter.
 
-You also need `runc` installed. Your package manager probably has it (`sudo apt install runc` on Debian/Ubuntu), or grab a binary from the [GitHub releases](https://github.com/opencontainers/runc/releases). Rootless mode requires cgroups v2 with systemd delegation, which is the default on any modern systemd-based distro. You can verify with:
+You also need `runc` installed. Your package manager probably has it (`sudo apt install runc` on Debian/Ubuntu), or grab a binary from the [GitHub releases](https://github.com/opencontainers/runc/releases). Rootful resource controls require cgroups v2. Rootless workloads which ask for limits fail admission until Reliaburger owns a delegated user cgroup; it doesn't pretend that removing the limits counts as enforcement. You can verify the host filesystem with:
 
 ```sh
 # Should print "cgroup2fs" — if it says "tmpfs", you're on cgroups v1
@@ -2722,30 +2722,32 @@ On Linux, runc normally requires root to create namespaces and set up cgroups. R
 The `rootless::make_rootless` function adjusts an OCI spec for this:
 
 ```rust
-pub fn make_rootless(spec: &mut OciSpec, instance_name: &str) {
+pub fn make_rootless(spec: &mut OciSpec, _instance_name: &str) {
     // Add user namespace
     spec.linux.namespaces.push(OciNamespace {
         ns_type: "user".to_string(),
         path: None,
     });
 
-    // Remove network namespace (share host network for Phase 1)
-    spec.linux.namespaces.retain(|ns| ns.ns_type != "network");
+    // Keep the network namespace; Chapter 3 attaches slirp4netns to it.
 
     // Map current user to container root
     let uid = nix::unistd::getuid().as_raw();
     spec.linux.uid_mappings = Some(vec![OciIdMapping {
         container_id: 0, host_id: uid, size: 1,
     }]);
-    // ... gid_mappings, /sys adjustments, cgroup path
+    // ... gid_mappings and /sys adjustments
+    spec.linux.cgroups_path = None; // no delegated user scope yet
+    spec.linux.resources = None;    // limited workloads failed admission
 }
 ```
 
 Three things change from the root spec:
 
 1. **User namespace added.** This is what makes rootless work. The kernel creates a new user namespace where UID 0 maps to your real UID.
-2. **Network namespace removed.** Creating a network namespace rootlessly requires tools like `slirp4netns` or `pasta`. We'll handle container networking properly in Phase 3. For now, containers share the host network.
+2. **Network namespace retained.** Chapter 3 attaches `slirp4netns` to the container PID. Removing the namespace would silently give the workload the host network instead.
 3. **`/sys` becomes a bind mount.** Mounting `sysfs` requires `CAP_SYS_ADMIN`, which we don't have outside the user namespace. A read-only bind mount of the host's `/sys` works instead.
+4. **The rootful cgroup path disappears.** Writing an invented `user.slice` path doesn't create delegation; it just makes runc fail with `permission denied`. Admission already rejects rootless workloads which request resource limits.
 
 The `OciIdMapping` type is new in our OCI spec:
 

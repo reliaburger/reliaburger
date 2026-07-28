@@ -70,7 +70,8 @@ sudo apt install runc
 Download the latest binary from [github.com/opencontainers/runc/releases](https://github.com/opencontainers/runc/releases) and place it in your `PATH`.
 
 Notes:
-- Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
+- Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. It uses `slirp4netns` for outbound networking and published ports, and restores that userspace network across Bun replacement. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
+- Rootless resource limits remain unsupported and fail admission because Reliaburger doesn't create a delegated user cgroup. Ubuntu hosts that set `kernel.apparmor_restrict_unprivileged_userns=1` also need an AppArmor policy permitting the installed Bun binary (or that restriction disabled) before runc can write UID/GID maps.
 - Rootless stores bundles/images in `~/.local/share/reliaburger/`; root mode uses `/var/lib/reliaburger/`
 - OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
 - Root-mode writable images use one private OverlayFS upper per workload over the shared content-addressed image generation. A restart or Bun adoption reuses that workload's upper; exit and kill unmount it.
@@ -118,6 +119,7 @@ make release     # compile (optimised)
 make test        # portable nextest suite
 make test-doc    # Rust documentation examples
 make test-linux  # provisioned Linux runtime/kernel suite
+make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
 make examples    # validate and dry-run every checked-in workload config
@@ -143,6 +145,7 @@ make test-no-default       # portable suite without default features
 make test-doc              # doctests (nextest does not run them)
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
+make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement

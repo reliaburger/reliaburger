@@ -101,9 +101,8 @@ impl PortMapHandle {
     /// Re-track a root-mode mapping installed by a previous bun
     /// process. Map elements live in the kernel and survive agent
     /// restarts, so adoption only needs a handle whose shutdown will
-    /// delete the element — nothing is added here. Rootless proxy
-    /// tasks die with the old process and are not respawned on
-    /// adoption. // TODO(Phase 15): respawn rootless proxies on adopt.
+    /// delete the element — nothing is added here. Rootless runc uses
+    /// slirp4netns and restores that owner through its own adoption record.
     pub fn for_adopted(host_port: u16, container_port: u16) -> Self {
         Self {
             shutdown: CancellationToken::new(),

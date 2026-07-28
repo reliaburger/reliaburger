@@ -598,6 +598,7 @@ mod tests {
             host_port: None,
             app_spec: None,
             oci_spec: spec.clone(),
+            rootless_network: None,
         };
 
         let fresh = AppleContainerGrill::new();

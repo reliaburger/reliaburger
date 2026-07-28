@@ -1872,8 +1872,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
         let runtime = self.supervisor.grill().runtime_kind();
+        let rootless_network = self
+            .supervisor
+            .grill()
+            .rootless_network_record(instance_id)
+            .await;
         let record = crate::grill::records::InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: instance_id.0.clone(),
             namespace: instance.namespace.clone(),
             app_name: instance.app_name.clone(),
@@ -1893,6 +1898,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .get(&(instance.app_name.clone(), instance.namespace.clone()))
                 .cloned(),
             oci_spec,
+            rootless_network,
         };
         if let Err(e) = crate::grill::records::write_record(dir, &record) {
             eprintln!("bun: warning: failed to write instance record for {instance_id}: {e}");
@@ -8817,7 +8823,40 @@ mod tests {
                     gid_mappings: None,
                 },
             },
+            rootless_network: None,
         }
+    }
+
+    #[tokio::test]
+    async fn started_rootless_instance_persists_network_recreation_state() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        grill.set_pid(std::process::id());
+        let rootless_network = crate::grill::records::RootlessNetworkRecord {
+            api_socket: records.path().join("slirp4netns.sock"),
+            owner_pid: 4243,
+            owner_pid_started_at: 1001,
+            container_pid: 4244,
+            port_mapping: Some(crate::grill::oci::PortMapping {
+                host_port: 30000,
+                container_port: 8080,
+            }),
+        };
+        grill.set_rootless_network(rootless_network.clone());
+
+        let (events, mut event_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &events).await;
+        drop(events);
+        while event_rx.recv().await.is_some() {}
+
+        let persisted = crate::grill::records::load_records(records.path());
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].schema, 2);
+        assert_eq!(persisted[0].rootless_network, Some(rootless_network));
     }
 
     #[tokio::test]

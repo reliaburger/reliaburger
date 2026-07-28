@@ -42,7 +42,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill) — **`H13` runc/apple return `None`; successful jobs there get retried then Failed**
 - [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container, volumes, multi-app, full-featured)
 - [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts) — **`C1` CRITICAL: whiteout path traversal deletes host files outside rootfs**
-- [x] Rootless runc (user namespaces, UID/GID mapping, rootless cgroups v2, no-sudo containers) — **`M22` resource limits ~~silently dropped~~ (12b.6: a rootless node now *refuses* a limit-requiring workload rather than dropping the limit); slirp4netns still unwired → empty netns, no connectivity (deferred to the runc-create seam)**
+- [x] Rootless runc (user namespaces, UID/GID mapping, no-sudo read-only containers) — resource-requiring workloads fail admission because delegated cgroup enforcement is not implemented; the spec omits an undelegated cgroup path rather than failing every start. `slirp4netns` now owns the network namespace and published ports, with persisted ownership and recreation across Bun replacement (M5).
 - [x] Streaming apply progress via SSE (real-time deploy feedback instead of blocking response)
 - [x] HostPath-style volumes (dual-mode: explicit source for hostPath, managed for auto-provisioned storage) — ~~`M21` managed mode half-wired~~ **fixed in Phase 12 E0**: the agent creates managed volume dirs (and loop mounts) before the OCI spec's bind mounts reference them; `[storage] volumes` config wired; volumes never deleted on Stop (reconciler rebalances would destroy data)
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
@@ -1139,10 +1139,11 @@ whole theme lands.
     the supervisor **rejects** a GPU-requesting workload when `gpu_enabled = false` or the
     detector found no device, instead of silently scheduling onto a node reporting zero GPUs.
     (OCI `/dev/nvidia*` device passthrough deferred; placement is now honest.)
-  - [x] M22 rootless: **reject** path chosen (runc.rs is out of this seam). A rootless node
+  - [x] M22 rootless: **reject** path chosen. A rootless node
     refuses a workload declaring cpu/memory limits (rather than silently dropping them via
     `make_rootless`'s `resources = None`), with a clear error naming the fix. slirp4netns
-    wiring remains deferred to the runc-create seam.
+    networking and published-port adoption landed later in M5; workload DNS and
+    delegated rootless cgroup limits remain unsupported.
   - [x] Reserved resources: `reserved_cpu`/`reserved_memory` were already wired
     (`bun.rs::node_capacity` → `set_node_capacity`); confirmed, nothing dead to remove. GPU
     capacity is not yet threaded through the reporting protocol (orchestrate seam) — the
@@ -1281,7 +1282,7 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 - [x] Dual-signature verification (embedded Ed25519 release key set + external operator key from node.toml; air-gapped `--binary` needs embedded only)
 - [x] Automatic rollback on failure (crash-loop boot budget reverts the symlink; nodes refuse previously-reverted upgrade ids; leader pauses the run; `upgrade resume` retries with a fresh id)
 - [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
-- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption + Apple `container inspect` adoption; pid+start-time fingerprinting for pid-based runtimes, container liveness for Apple VMs; file-backed process logs). `[runc adoption unverified on Linux; Apple adoption gated behind make test-apple]`
+- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption + Apple `container inspect` adoption; pid+start-time fingerprinting for pid-based runtimes, container liveness for Apple VMs; file-backed process logs). Rootless runc persists and restores its `slirp4netns` owner and host forward; `make test-rootless-runc` exercises a real non-root replacement. Apple adoption remains gated behind `make test-apple`.
 - [x] Book chapter 14: "Changing the Tyres at Full Speed"
 - [x] All Phase 14 tests green (unit tests in the portable suite; 5 single-node + 3 cluster real-binary integration tests are ignored by default and owned by the required `upgrade-node` and `upgrade-cluster` CI jobs). The jobs use nextest resource groups and no retries, so contention or convergence flakes remain visible.
 
@@ -1393,7 +1394,7 @@ convergence and adoption" theme under 12b.6).
   generated config into immutable agent/API state and every app, job, JWT and
   build-signer SPIFFE identity. Bun validates malformed domains at startup; a
   non-default `payments.prod` acceptance issues and verifies a real leaf.
-- [ ] Rootless proxy adoption across Bun replacement (M5)
+- [x] Rootless proxy adoption across Bun replacement (M5) — schema-v2 instance records own the slirp API socket, port mapping and PID/start-time fingerprint. Adoption reclaims a surviving proxy or recreates it before returning success; a real non-root runc test proves the host port before and after replacement.
 - [ ] Real deployment operation state (M6)
 - [ ] Explicit v1 ingress/TLS contract (M7)
 - [ ] Corrected Phase 15 prerequisites and catalogue (M8)

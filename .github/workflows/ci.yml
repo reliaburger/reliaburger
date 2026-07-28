@@ -89,7 +89,14 @@ jobs:
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs buildah clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns
+          sudo apt-get install -y -qq btrfs-progs buildah clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+      - name: Permit rootless runc on Ubuntu AppArmor hosts
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Prove rootless port adoption
+        run: make test-rootless-runc
       - name: Run only provisioned Linux tests
         run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
 

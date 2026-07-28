@@ -212,10 +212,13 @@ When `path` is `Some`, runc joins the pre-created namespace (where our veth is a
 For rootless containers, we use `slirp4netns`, the same tool Podman uses. It implements a userspace TCP/IP stack via a TAP device inside the user namespace:
 
 1. Runc creates a new network namespace (we no longer strip it from the spec)
-2. After `runc create`, we get the container's PID
-3. We spawn: `slirp4netns --configure --mtu=65520 --disable-host-loopback {pid} tap0`
+2. Grill starts `runc run` and polls `runc state` for the container init PID
+3. We spawn: `slirp4netns --configure --mtu=65520 --disable-host-loopback --api-socket {socket} {pid} tap0`
 4. The container gets IP `10.0.2.100` with gateway `10.0.2.2`
 5. Port forwarding uses slirp4netns's API socket — we send JSON commands to map ports
+6. The instance record stores the socket, mapping and owner PID/start time. A
+   replacement Bun either reclaims that exact process or recreates it before
+   declaring adoption successful.
 
 The `--disable-host-loopback` flag is important: it prevents the container from reaching services on the host's loopback. Without it, a compromised container could probe the host's `localhost`-only services.
 
@@ -575,7 +578,7 @@ The Rust-flavoured part is how the responder reads the service map. The agent *o
 
 Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`. Runc writes a per-instance file in the OCI bundle and bind-mounts it read-only at `/etc/resolv.conf`; it never edits the shared unpacked image rootfs. The file names the node-side veth gateway, not host loopback. `resolv.conf` has no port syntax, so only port 53 is valid.
 
-Rootful runc is the supported transparent path today. Rootless runc's promised slirp wiring isn't complete, ProcessGrill doesn't install a resolver into the host, and Apple Container has no DNS injection in its adapter. Enabling `[dns]` with any of those runtimes fails before adoption or workload creation. The live node capability records readiness, IPv4/IPv6 support and workload reachability; a DNS-enabled scheduling pass excludes nodes that can't prove all three.
+Rootful runc is the supported transparent DNS path today. Rootless runc now has supervised slirp networking and published ports, but it still has no route to the node's port-53 responder or resolver injection. ProcessGrill doesn't install a resolver into the host, and Apple Container has no DNS injection in its adapter. Enabling `[dns]` with any of those runtimes fails before adoption or workload creation. The live node capability records readiness, IPv4/IPv6 support and workload reachability; a DNS-enabled scheduling pass excludes nodes that can't prove all three.
 
 ### Testing service discovery
 

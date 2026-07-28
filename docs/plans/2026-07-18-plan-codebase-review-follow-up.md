@@ -410,8 +410,17 @@ path.
 
 ### M5. Preserve rootless published ports through Bun replacement
 
-- [ ] Persist rootless proxy parameters and ownership, respawn them during
+- [x] Persist rootless proxy parameters and ownership, respawn them during
   adoption, and test a real replacement (FUNC-5).
+
+**Delivered:** rootless runc now starts and owns `slirp4netns`, applies the OCI
+port mapping through its API socket, and persists the socket, container PID,
+mapping and owner PID/start-time fingerprint in schema-v2 instance records. An
+adopter reclaims a surviving owner or safely replaces a missing one before it
+reports the workload adopted. The real non-root Linux test kills the original
+proxy, creates a replacement Grill, and proves the same host port serves the
+same container afterwards. That test also exposed and removed an invented,
+undelegated systemd cgroup path which made rootless runc fail at startup.
 
 ### M6. Publish real deployment operation state
 

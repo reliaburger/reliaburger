@@ -82,6 +82,16 @@ before pull. Quietly pointing it at the shared writable tree would turn a
 missing capability into cross-workload filesystem access, which is worse than
 an honest refusal.
 
+Rootless networking is userspace state, not a durable nftables map. Grill
+starts one `slirp4netns` process against the container init PID and owns its API
+socket and optional host forward. Schema-v2 instance records persist those
+recreation parameters plus a PID/start-time fingerprint. During adoption Grill
+reclaims a matching live owner, or replaces a missing owner and reapplies the
+forward before returning success. It never signals a PID whose start time no
+longer matches. Rootless cgroup limits remain an admission-time refusal: Bun
+doesn't create a delegated user scope, so the OCI rewrite removes the rootful
+cgroup path rather than fabricating a path runc cannot write.
+
 ---
 
 ## 2. Dependencies

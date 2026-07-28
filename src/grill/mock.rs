@@ -22,6 +22,8 @@ pub struct MockGrill {
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
+    pid: Arc<Mutex<Option<u32>>>,
+    rootless_network: Arc<Mutex<Option<crate::grill::records::RootlessNetworkRecord>>>,
     /// Deterministic gate for tests that need `create()` to remain in flight.
     block_create: Arc<AtomicBool>,
     create_started: Arc<tokio::sync::Semaphore>,
@@ -42,6 +44,8 @@ impl Default for MockGrill {
             container_ip: Arc::default(),
             honours_cgroup_path: Arc::default(),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
+            pid: Arc::default(),
+            rootless_network: Arc::default(),
             block_create: Arc::new(AtomicBool::new(false)),
             create_started: Arc::new(tokio::sync::Semaphore::new(0)),
             create_release: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -110,6 +114,18 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_runtime_kind(&self, kind: crate::grill::records::RuntimeKind) {
         *self.runtime_kind.lock().unwrap() = kind;
+    }
+
+    /// Make `pid()` report a live test process so record-persistence paths run.
+    #[allow(dead_code)]
+    pub fn set_pid(&self, pid: u32) {
+        *self.pid.lock().unwrap() = Some(pid);
+    }
+
+    /// Make adoption records include rootless userspace-network ownership.
+    #[allow(dead_code)]
+    pub fn set_rootless_network(&self, network: crate::grill::records::RootlessNetworkRecord) {
+        *self.rootless_network.lock().unwrap() = Some(network);
     }
 
     /// Hold future `create()` calls until [`Self::release_creates`] is called.
@@ -227,6 +243,17 @@ impl super::Grill for MockGrill {
 
     fn honours_cgroup_path(&self) -> bool {
         *self.honours_cgroup_path.lock().unwrap()
+    }
+
+    async fn pid(&self, _instance: &InstanceId) -> Option<u32> {
+        *self.pid.lock().unwrap()
+    }
+
+    async fn rootless_network_record(
+        &self,
+        _instance: &InstanceId,
+    ) -> Option<crate::grill::records::RootlessNetworkRecord> {
+        self.rootless_network.lock().unwrap().clone()
     }
 
     async fn adopt(
