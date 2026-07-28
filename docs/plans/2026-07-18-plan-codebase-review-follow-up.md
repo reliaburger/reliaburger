@@ -362,11 +362,20 @@ uses explicit retry, recovery and shutdown bounds.
 
 ### M2. Repair cheap executable checks and platform lint
 
-- [ ] Make `make examples` pass `--dry-run`, preserve useful error output and fix
+- [x] Make `make examples` pass `--dry-run`, preserve useful error output and fix
   the two stale Phase 8 examples (FUNC-2).
-- [ ] Gate Linux/Aya modules at module boundaries so the advertised macOS
+- [x] Gate Linux/Aya modules at module boundaries so the advertised macOS
   all-feature lint contract is coherent.
-- [ ] Add dependency-advisory scanning with a pinned policy and CI ownership.
+- [x] Add dependency-advisory scanning with a pinned policy and CI ownership.
+
+**Delivered:** `make examples` now invokes the already-built Relish binary with
+`--dry-run`, prints the captured diagnostic for a failing file and validates all
+21 checked-in configs. The stale Phase 8 namespace and health durations are
+corrected, and portable Linux CI owns the target. Aya-dependent branches now
+require both the `ebpf` feature and Linux, while no-eBPF stubs remain available
+on macOS; hosted macOS runs the same all-target/all-feature Clippy gate as Linux.
+The merged RustSec policy remains change-, release- and weekly-gated with named,
+expiring exceptions. All three checks pass on this change.
 
 ### M3. Make clustered registry defaults peer-reachable
 

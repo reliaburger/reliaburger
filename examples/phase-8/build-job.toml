@@ -5,6 +5,8 @@
 #
 # Build: relish build examples/phase-8/build-job.toml
 
+[namespace.production]
+
 [build.my-api]
 context = "./src/api"
 dockerfile = "Dockerfile"

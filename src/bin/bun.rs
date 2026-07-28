@@ -815,12 +815,12 @@ async fn main() -> anyhow::Result<()> {
     // `mut` only matters on an `ebpf` build — the assignment below lives
     // inside a `#[cfg(feature = "ebpf")]` block, so a default build never
     // writes to it and would warn.
-    #[cfg_attr(not(feature = "ebpf"), allow(unused_mut))]
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(unused_mut))]
     let mut ebpf_loaded = false;
     if config.ebpf.enabled {
         match config.ebpf.resolve_program_dir() {
             Some(program_dir) => {
-                #[cfg(feature = "ebpf")]
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 match reliaburger::onion::ebpf::loader::OnionEbpf::load(
                     &program_dir,
                     &config.ebpf.cgroup_path,
@@ -842,7 +842,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
-                #[cfg(not(feature = "ebpf"))]
+                #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
                 {
                     let _ = program_dir;
                     eprintln!(

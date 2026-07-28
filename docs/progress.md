@@ -1378,7 +1378,11 @@ convergence and adoption" theme under 12b.6).
   evidence with failure times; authenticated readiness/capability APIs and an
   independently expiring report lease fence scheduling fail closed. Only the
   reconstructible security refresher retries, within explicit budgets.
-- [ ] Executable examples, coherent cross-platform lint and advisory scanning (M2)
+- [x] Executable examples, coherent cross-platform lint and advisory scanning (M2)
+  — all 21 repository configs pass the real Relish dry-run path, failures retain
+  their diagnostics, and hosted Linux owns the check. Aya code now compiles only
+  for Linux plus `ebpf`, so macOS enforces the advertised all-feature Clippy
+  contract. The existing pinned RustSec change/release/weekly gate passes.
 - [ ] Peer-reachable clustered registry defaults (M3)
 - [ ] Configured workload trust domain (M4)
 - [ ] Rootless proxy adoption across Bun replacement (M5)

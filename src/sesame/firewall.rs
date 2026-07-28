@@ -158,7 +158,7 @@ pub enum FirewallMapError {
     #[error("firewall eBPF maps require Linux with --features ebpf")]
     Unsupported,
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     #[error("firewall map operation failed: {0}")]
     MapError(#[from] aya::maps::MapError),
 
@@ -171,7 +171,7 @@ pub enum FirewallMapError {
 /// `cgroup_namespace_map` (cgroup → namespace, which makes the connect
 /// hook enforce cross-namespace isolation at all); without it they are
 /// absent. The connect hook is already implemented in `ebpf/onion_connect.bpf.c`.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod maps {
     use super::{FirewallKey, FirewallMapError, FirewallValue};
     use aya::maps::HashMap;
@@ -259,7 +259,7 @@ mod maps {
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub use maps::*;
 
 #[cfg(test)]

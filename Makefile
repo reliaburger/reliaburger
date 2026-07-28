@@ -67,13 +67,15 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 	$(CARGO) audit
 
 examples: build ## Dry-run every example config with relish
-	@failed=0; total=0; \
+	@failed=0; total=0; output=$$(mktemp); \
+	trap 'rm -f "$$output"' EXIT HUP INT TERM; \
 	for f in $$(find examples -name '*.toml' | sort); do \
 		total=$$((total + 1)); \
-		if $(CARGO) run --quiet --bin relish -- apply "$$f" >/dev/null 2>&1; then \
+		if target/debug/relish apply "$$f" --dry-run >"$$output" 2>&1; then \
 			printf "  ✓ %s\n" "$$f"; \
 		else \
 			printf "  ✗ %s\n" "$$f"; \
+			sed 's/^/    /' "$$output" >&2; \
 			failed=$$((failed + 1)); \
 		fi; \
 	done; \

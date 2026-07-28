@@ -356,6 +356,34 @@ webhook test accidentally exercised startup, or whether a five-second performanc
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
 lines, but read the covered tests too.
 
+## Examples are tests when we run them
+
+Twenty-one configuration files sat under `examples/`. The Make target labelled itself a
+dry-run, then called `relish apply` without `--dry-run`, discarded both output streams and
+reported every file as broken because no agent was running. It managed to test the absence
+of Bun 21 times. Two configs really were stale, but the useful errors went into the same
+bin.
+
+The repaired target builds Relish once, sends every file through the real parser, validator
+and planner, and keeps a failed command's diagnostic. Successful plans stay quiet. That
+makes `make examples` cheap enough for every pull request, and it catches the same drift a
+reader would hit after copying an example.
+
+We apply the same rule to platform promises. The `ebpf` Cargo feature can be selected on
+macOS even though Aya and the kernel hooks exist only on Linux. An Aya-using branch therefore
+needs both conditions:
+
+```rust
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod maps;
+```
+
+You have met `#[cfg]` already. `all(a, b)` is its Boolean AND: the compiler includes the
+item only when both predicates are true. The matching fallback uses
+`not(all(...))`, so an all-feature macOS build still gets the unsupported stub. Hosted macOS
+now runs the all-target, all-feature Clippy command. That's a compile-time check of the
+boundary, not a hopeful comment saying the code is portable.
+
 ## Dependencies are code too
 
 The lockfile is part of the programme. A perfectly tested call into a vulnerable archive

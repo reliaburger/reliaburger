@@ -12,7 +12,7 @@ pub enum BpfMapError {
     #[error("eBPF fault injection requires Linux with --features ebpf")]
     Unsupported,
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     #[error("BPF map operation failed: {0}")]
     MapError(#[from] aya::maps::MapError),
 
@@ -24,7 +24,7 @@ pub enum BpfMapError {
 // Real implementations (Linux + ebpf feature)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod inner {
     use super::*;
     use aya::maps::HashMap;
@@ -118,7 +118,7 @@ mod inner {
 // Stub implementations (non-Linux or no ebpf feature)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(feature = "ebpf"))]
+#[cfg(not(all(feature = "ebpf", target_os = "linux")))]
 mod inner {
     use super::*;
 
@@ -154,10 +154,10 @@ pub use inner::*;
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     use super::*;
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     #[test]
     fn stubs_return_unsupported() {
         let key = connect_fault_key(0x7F800003, 6379);
@@ -173,7 +173,7 @@ mod tests {
         assert!(matches!(result, Err(BpfMapError::Unsupported)));
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     #[test]
     fn bw_stub_returns_unsupported() {
         let key = bandwidth_fault_key(0x7F800003, 80);

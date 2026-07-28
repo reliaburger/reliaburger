@@ -1096,7 +1096,7 @@ pub struct PartitionBlocklists {
 }
 
 /// Egress enforcement bound to a running instance's cgroup (L16).
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 #[derive(Clone)]
 struct EgressBinding {
     /// The instance's cgroup id (key into the egress maps).
@@ -1123,38 +1123,38 @@ pub struct BunAgent<G: Grill> {
     smoker_config: crate::smoker::config::SmokerConfig,
     /// eBPF program handle for writing fault maps (Linux + ebpf feature only).
     /// `None` on macOS or when eBPF is not loaded.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
     /// Egress enforcement state per instance with an allowlist: its cgroup
     /// id, the raw allow list, and the last-resolved destinations — so
     /// enforcement can be lifted on stop and the allowlist re-resolved as
     /// DNS changes (L16).
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
     /// Workloads fenced by the current live-enforcement incident. Kept after
     /// stop so the next capability report records what happened; cleared only
     /// after every required hook and pre-start guarantee recovers.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_affected_workloads: std::collections::BTreeSet<(String, String)>,
     /// Ticks since the last egress re-resolution (the event loop runs at 1s).
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_reresolve_ticks: u32,
     /// Kernel-truth sweep interval in seconds (`[ebpf] sweep_interval_secs`,
     /// 0 disables). The sweep deletes egress/namespace map entries whose
     /// cgroup no longer maps to a live instance and reinstalls entries a
     /// live instance lost.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     ebpf_sweep_interval_secs: u64,
     /// Ticks since the last kernel-truth sweep.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     ebpf_sweep_ticks: u64,
     /// `firewall_map` keys last written to the kernel, so the next reconcile
     /// deletes entries for departed cgroups (NET5). eBPF only.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     firewall_bpf_keys: std::collections::HashSet<crate::onion::types::FirewallKey>,
     /// `cgroup_namespace_map` keys (cgroup ids) last written, for the same
     /// reconcile-and-prune reason (NET5). eBPF only.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
@@ -1279,21 +1279,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: None,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_reresolve_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_interval_secs: 60,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             firewall_bpf_keys: std::collections::HashSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
@@ -1350,21 +1350,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: Some(cluster),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_reresolve_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_interval_secs: 60,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             firewall_bpf_keys: std::collections::HashSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
@@ -1616,7 +1616,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Attach a loaded eBPF handle so the agent can write fault and
     /// egress map entries (L8). Only present with the `ebpf` feature;
     /// `bun` calls this at startup when `[ebpf] enabled`.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub async fn set_onion_ebpf(
         &mut self,
         ebpf: std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
@@ -1637,20 +1637,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Configure the kernel-truth sweep interval (`[ebpf]
     /// sweep_interval_secs`); 0 disables the sweep.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn set_ebpf_sweep_interval(&mut self, secs: u64) {
         self.ebpf_sweep_interval_secs = secs;
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
 
     /// Mirror an app's current service-map entry into the kernel
     /// `backend_map` so the eBPF connect hook rewrites its VIP to live
     /// backends (L8 completeness). Called after every service-map add /
     /// health change. A no-op without the eBPF data path loaded.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sync_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
@@ -1665,13 +1665,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn sync_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
 
     /// Drop an app's `backend_map` entry. Must be called *before* the app
     /// is unregistered from the service map, while its VIP/port are still
     /// known. A no-op without the eBPF data path loaded.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn remove_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
@@ -1689,7 +1689,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn remove_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
 
     /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
@@ -1701,7 +1701,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// cross-namespace `allow_from` rule. Both maps are rebuilt from scratch
     /// each call (a new instance of app A changes rules wherever A is a
     /// *source*), deleting keys no longer desired. A no-op without eBPF.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sync_firewall_ebpf(&mut self) {
         let Some(handle) = self.onion_ebpf.clone() else {
             return;
@@ -1777,7 +1777,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.firewall_bpf_keys = desired_fw_keys;
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn sync_firewall_ebpf(&mut self) {}
 
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
@@ -2145,7 +2145,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
 
         let (capabilities, enforced_instances) = self.live_egress_report_state().await;
-        #[cfg(feature = "ebpf")]
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
         let egress_affected_workloads: Vec<
             crate::reporting::types::EgressAffectedWorkload,
         > = self
@@ -2158,7 +2158,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 },
             )
             .collect();
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         let egress_affected_workloads = Vec::new();
 
         let instances = self.supervisor.list_instances();
@@ -2240,7 +2240,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Read the hooks and enforcement map as kernel truth for reporting.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn live_egress_report_state(
         &self,
     ) -> (
@@ -2279,7 +2279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// A portable build has no kernel enforcement to report.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn live_egress_report_state(
         &self,
     ) -> (
@@ -3261,7 +3261,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // data path. Apply via BPF maps when it's loaded;
                 // otherwise reject honestly rather than record fake
                 // success (the old stub recorded everything).
-                #[cfg(feature = "ebpf")]
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 {
                     if self.onion_ebpf.is_some() {
                         self.write_fault_bpf_entry(rule).await;
@@ -3392,7 +3392,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // no-op can go. The council-level transport partition
                 // (`relish chaos council-partition`) is a different mechanism
                 // and IS wired — see `InjectPartition`/`apply_partition`.
-                #[cfg(feature = "ebpf")]
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 if self.onion_ebpf.is_some() {
                     self.write_fault_bpf_entry(rule).await;
                 }
@@ -3701,7 +3701,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The network-byte-order VIP + port for a fault's target service, if
     /// it is registered. VIP is deterministic from the app name; the port
     /// comes from the service entry. Connect/bandwidth fault keys need both.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn fault_vip_port(&self, target_service: &str) -> Option<(u32, u16)> {
         // Smoker targets a service by bare name; match the first entry in
         // any namespace (PR 2 adds a namespace-qualified fault target).
@@ -3716,7 +3716,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// rejects network faults before we get here. `expires_ns` comes from
     /// the rule, which now uses CLOCK_MONOTONIC (P0) to match the kernel's
     /// `bpf_ktime_get_ns()`.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn write_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
         use crate::smoker::bpf_maps;
         use crate::smoker::bpf_types::*;
@@ -3824,7 +3824,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Best-effort: VIP is deterministic from the app name, but the port
     /// comes from the service entry — if the service is already gone we
     /// skip, since the kernel ignores the entry past its `expires_ns`.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn delete_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
         use crate::smoker::bpf_maps;
         use crate::smoker::bpf_types::*;
@@ -3869,7 +3869,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Delete is a no-op without the eBPF data path (nothing was written).
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn delete_fault_bpf_entry(&self, _rule: &crate::smoker::types::FaultRule) {}
 
     /// Enforce the image trust policy for a workload before deploying it.
@@ -4463,7 +4463,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Returns an error — failing the deploy closed — when enforcement is
     /// required but cannot be guaranteed (connect6 missing, cgroup id
     /// unresolvable, map programming failed).
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn apply_egress_pre_start(
         &mut self,
         instance_id: &InstanceId,
@@ -4513,7 +4513,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// A build without the eBPF data path cannot enforce an allowlist.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn apply_egress_pre_start(
         &mut self,
         _instance_id: &InstanceId,
@@ -4535,7 +4535,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// instance start (the re-resolve loop fills the allowlist in later),
     /// but a programming or representation error fails the deploy — a
     /// workload must never start ahead of a policy we could not install.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn program_egress_pre_start(
         &mut self,
         instance_id: &InstanceId,
@@ -4647,7 +4647,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Pre-start deny-all: enforcement on, no allow entries. Unlike the
     /// post-start variant, a failure here fails the deploy — the process
     /// has not started yet, so refusing is still possible.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn deny_all_pre_start(
         &mut self,
         handle: &std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
@@ -4698,7 +4698,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Goes through `reprogram_cgroup_egress` because instances can share a
     /// cgroup path — deleting one instance's entries directly would wipe a
     /// co-tenant's policy.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn clear_egress(&mut self, instance_id: &InstanceId) {
         let Some(binding) = self.egress_bindings.remove(instance_id) else {
             return;
@@ -4707,7 +4707,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
 
     /// Rebuild the kernel egress state for one cgroup id from the current
@@ -4715,7 +4715,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// of what the surviving bindings allow (and the enforcement flag).
     /// With no surviving binding the cgroup is scrubbed completely.
     /// Failures leave the cgroup denying more than intended, never less.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn reprogram_cgroup_egress(&mut self, cgroup_id: u64) {
         use crate::sesame::egress;
 
@@ -4774,7 +4774,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// read, or a repaired enforcement flag is still absent, stop every
     /// affected workload. Keeping it running would turn its allowlist into a
     /// label rather than a control.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn enforce_live_egress_or_stop(&mut self) {
         use crate::sesame::egress;
 
@@ -4858,7 +4858,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_instances_after_egress_loss(affected_ids).await;
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn stop_instances_after_egress_loss(
         &mut self,
         affected_ids: std::collections::HashSet<InstanceId>,
@@ -4886,14 +4886,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Portable builds cannot have live egress bindings.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn enforce_live_egress_or_stop(&mut self) {}
 
     /// Periodically re-resolve DNS-based egress allowlists and reprogram the
     /// eBPF egress maps when an app's destination IPs change (L16). Rate-
     /// limited to roughly once every five minutes; a no-op while nothing
     /// enforces egress.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn reresolve_egress(&mut self) {
         // ~5 minutes at the 1s event-loop tick.
         const RERESOLVE_EVERY_TICKS: u32 = 300;
@@ -4942,7 +4942,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn reresolve_egress(&mut self) {}
 
     /// Reconcile kernel truth against live instances (the sweep half of the
@@ -4951,7 +4951,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// and prune stale `cgroup_namespace_map` keys. The one-second live check
     /// fences adopted policy-bearing workloads with no trustworthy binding;
     /// the sweep never installs their policy after they have already run.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sweep_kernel_networking(&mut self) {
         use crate::sesame::egress;
 
@@ -5067,7 +5067,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn sweep_kernel_networking(&mut self) {}
 
     /// Run any due health checks.

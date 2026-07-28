@@ -112,6 +112,7 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 make test                    # run the portable nextest suite
 make audit                   # reject new RustSec dependency findings
 relish test --profile development # run the 39-case live-cluster catalogue
+make examples                # validate and dry-run every example config
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```

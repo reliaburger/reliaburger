@@ -127,17 +127,17 @@ pub struct BpfFaultStateValue {
 // SAFETY: All BPF map structs are #[repr(C)], Copy, 'static, and have
 // no padding holes (all padding is explicit via _pad fields). This makes
 // them safe to interpret as raw bytes for BPF map operations.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BpfConnectFaultKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BpfConnectFaultValue {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BpfBandwidthFaultKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BpfBandwidthFaultValue {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BpfFaultStateKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BpfFaultStateValue {}
 
 /// Build a connect fault key for a service VIP + port (all callers).
