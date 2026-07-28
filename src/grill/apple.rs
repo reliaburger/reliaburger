@@ -143,6 +143,16 @@ impl AppleContainerGrill {
                 reason: format!("failed to run container CLI: {e}"),
             })
     }
+
+    /// Build `container exec` arguments.
+    ///
+    /// Apple's CLI treats a Docker-style `--` after the container name as the
+    /// executable itself. The command therefore follows the name directly.
+    fn exec_command_args(instance: &InstanceId, command: &[String]) -> Vec<String> {
+        let mut args = vec!["exec".to_string(), instance.0.clone()];
+        args.extend(command.iter().cloned());
+        args
+    }
 }
 
 impl Default for AppleContainerGrill {
@@ -328,9 +338,8 @@ impl super::Grill for AppleContainerGrill {
             });
         }
 
-        let mut args = vec!["exec", &instance.0, "--"];
-        let cmd_refs: Vec<&str> = command.iter().map(|s| s.as_str()).collect();
-        args.extend(&cmd_refs);
+        let args = Self::exec_command_args(instance, command);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
         let output = Self::container_command(&args, instance).await?;
         let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -495,6 +504,21 @@ mod tests {
         let id = InstanceId("apple-0".to_string());
         let weird = serde_json::json!({ "State": { "Status": "banana" } });
         assert!(AppleContainerGrill::parse_state(&weird, &id).is_err());
+    }
+
+    #[test]
+    fn exec_command_does_not_insert_a_docker_style_separator() {
+        let id = InstanceId("apple-0".to_string());
+        let args = AppleContainerGrill::exec_command_args(
+            &id,
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf ok".to_string(),
+            ],
+        );
+        assert_eq!(args, ["exec", "apple-0", "/bin/sh", "-c", "printf ok"]);
+        assert!(!args.iter().any(|argument| argument == "--"));
     }
 
     #[tokio::test]
