@@ -117,6 +117,10 @@ make observability-demo      # start bun, collect metrics, query APIs, show dash
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
 
+The Phase 15 runner and 39-case catalogue are live. Bun also exposes durable,
+server-owned app leases; adopting those leases in the runner and adding the
+portable runc/Apple Container test image are the next ownership milestone.
+
 ## Licence
 
 [Apache 2.0](LICENSE)

@@ -1328,3 +1328,57 @@ anonymous retry. Responses have a 1 MiB limit and must carry the expected
 schema, node id and an unexpired observation. Any failure creates an explicit
 `Unknown` entry for that node. Missing evidence stays visible. That's the
 point.
+
+## Make the server own the mess
+
+Suppose the test runner creates an app, loses its network connection and gets killed by CI.
+Who deletes the app? If the answer is "the runner's `finally` block", nobody does. The code
+which should clean up is already dead.
+
+Bun now gives Phase 15 apps a server-owned lease. A Deployer asks for a
+lifetime and receives a random identifier plus an `rbtest-*` namespace. The
+lease records both the readable token name and a fingerprint of the exact
+credential, because two credentials may share a name. The server policy must
+permit isolated workloads, and the requested lifetime can't exceed the
+operator's configured maximum or the hard one-day ceiling. Bun also stops one
+caller filling the control plane with polite-looking garbage: at most 64 leases
+may exist, and each owns at most 128 resources.
+
+A leased apply sends the identifier in an HTTP header. In standalone mode Bun writes the app
+identity to `test-leases.json`, calls `sync_all`, and only then starts deployment. In cluster
+mode one Raft entry inserts both the desired app and its lease resource. There's no gap where
+the app exists but ownership doesn't. An ordinary apply can't use the reserved prefix, even
+when no matching lease exists, so two concurrent requests can't sneak through opposite sides
+of an ownership check.
+
+The resource collection is a `BTreeSet<LeasedResource>`. We met `BTreeSet` earlier for the
+safety allow-list. Here its second useful property matters: inserting the same app twice is
+idempotent. The enum currently has one variant:
+
+```rust
+pub enum LeasedResource {
+    App { app_id: AppId },
+}
+```
+
+That's deliberately honest. Faults, tokens, images, mounts and node state need different
+cleanup operations. Pretending a namespace owns them would produce green reports and leaked
+state, which is quite an achievement for a test system.
+
+Expiry moves a lease to `Cleaning`. Standalone cleanup waits for the agent to confirm the app
+stopped. Cluster cleanup removes each owned app from replicated desired state and lets the
+ordinary reconciler converge the runtimes. The record disappears only after those control
+plane operations succeed. Every cleanup step has a ten-second limit; a failure leaves the
+resource list and attempt count on disk or in Raft. A reaper checks once per second, so a Bun
+restart or Raft leadership change resumes the same cleanup instead of inventing a fresh one.
+
+Followers forward create, renew, release and leased apply requests to the
+leader. They preserve the user's credential, and the leader authenticates it
+again. Using the cluster service token here would be convenient, but it would
+also turn any compromised follower into the owner of every test lease.
+Convenience doesn't get a vote on authority.
+
+This gives the existing runner somewhere safe to stand. It still needs to
+adopt the API and use a pinned, multi-architecture OCI workload which behaves
+identically under runc and Apple Container. Until that image passes both
+runtimes, the resource-lease milestone remains only half done.

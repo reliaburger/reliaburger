@@ -754,6 +754,11 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/health` | Agent liveness check |
 | `GET` | `/v1/readiness` | Authenticated critical-subsystem readiness evidence (200 ready, 503 fenced) |
 | `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
+| `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
+| `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
+| `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as Admin) |
+| `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
+| `DELETE` | `/v1/test/leases/{id}` | Release a lease and start/confirm owned app cleanup |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
 | `GET` | `/v1/deploys/active` | Live accepted deploy operations, phases and current targets |
 | `GET` | `/v1/deploys/operations` | Live operations plus the newest 50 terminal outcomes |
@@ -781,6 +786,18 @@ curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
 curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
   http://127.0.0.1:9117/v1/deploys/active
 ```
+
+Phase 15's command runner and ordinary 39-case catalogue are implemented. Its
+app ownership API has landed too, but the runner doesn't consume it yet.
+`[testing].allowed_operations` must include
+`"provision_isolated_workloads"`; unknown and production safety classes also
+need `allow_protected_mutation = true`. Lease lifetimes default to a maximum of
+3,600 seconds and must stay in the validated 1-86,400 second range. A leased
+apply carries `X-Reliaburger-Test-Lease: <id>` and may contain apps only. Bun
+reserves every `rbtest-*` namespace for this path, persists ownership across a
+standalone restart or in Raft, and retries interrupted cleanup. The portable
+multi-architecture OCI test workload and runner lease adoption are still
+pending.
 
 Standalone apply streams an `Accepted` SSE event before progress, containing
 the operation ID used by these endpoints. Active records report `accepted`,

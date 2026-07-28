@@ -1162,7 +1162,29 @@ commands manage long-lived API bearer credentials, not node enrolment.
 
 **`relish test`**
 
-Runs the full integration test suite. Each test creates its own namespace, runs validation, and tears down. Tests are independent, idempotent, and safe to run against production clusters (they don't interfere with existing workloads). Test apps are compiled into the Bun binary.
+Runs the selected acceptance profile. Each case owns resources through a
+panic-safe runner and independently verifies cleanup. The delivered catalogue
+still removes app namespaces directly; the durable lease API described below
+is the next ownership step. Namespace isolation alone isn't enough: faults,
+tokens, images, mounts and node state aren't namespace-scoped. Unknown and
+production clusters are protected by default. The client can't make them
+writable with an override flag.
+
+The app-lease foundation is implemented. `BunClient::create_test_lease` calls
+`POST /v1/test/leases`; leased applies send the returned id in
+`X-Reliaburger-Test-Lease`; renew and release use
+`POST /v1/test/leases/{id}/renew` and `DELETE /v1/test/leases/{id}`. Bun owns
+the TTL and cleanup reaper. Standalone ownership is flushed before deploy;
+cluster ownership and desired state share one Raft entry. This does not yet
+make the catalogue hermetic: the runner still needs to adopt leases, and the
+portable OCI workload and non-app resource types remain prerequisites.
+
+Every case reports exactly one of `Pass`, `Fail`, `Skipped` or `Unknown`.
+`Pass` needs directly observed evidence. `Skipped` means a known missing
+capability which the selected profile marks optional. A timeout, stale source,
+collector error, ambiguous result or uncertain cleanup is `Unknown`, never a
+green skip. Full profiles fail on a skipped required case, any `Fail`, any
+`Unknown`, or unconfirmed cleanup.
 
 Subsystems tested: scheduling, service discovery, deployments, health checks, secrets & config, firewall, workload identity, ingress, volumes, process workloads, jobs, image registry (Pickle), cluster coordination.
 

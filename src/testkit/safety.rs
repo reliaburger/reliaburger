@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::sesame::types::ApiRole;
 
+/// Absolute ceiling for a Phase 15 resource lease.
+pub const MAX_TEST_LEASE_SECONDS: u64 = 24 * 60 * 60;
+
 /// Operator-declared cluster class. Unknown is protected, not development.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,9 +124,20 @@ pub enum SafetyError {
     ProtectedCluster,
     #[error("destructive operation requires acknowledgement")]
     AcknowledgementRequired,
+    /// A zero or effectively permanent lease limit is unsafe.
+    #[error("max lease lifetime must be between 1 and 86400 seconds")]
+    InvalidLeaseLimit,
 }
 
 impl ClusterTestPolicy {
+    /// Validate server-owned resource lifetime bounds.
+    pub fn validate(&self) -> Result<(), SafetyError> {
+        if self.max_lease_seconds == 0 || self.max_lease_seconds > MAX_TEST_LEASE_SECONDS {
+            return Err(SafetyError::InvalidLeaseLimit);
+        }
+        Ok(())
+    }
+
     /// Fail closed unless role, server policy, protection and consent agree.
     pub fn authorise(
         &self,

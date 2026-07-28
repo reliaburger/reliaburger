@@ -61,6 +61,30 @@ pub fn config_to_desired_writes(config: &Config) -> Vec<RaftRequest> {
     writes
 }
 
+/// Convert only the apps in a test manifest into ownership-checked writes.
+///
+/// The state machine inserts each app and its lease resource in one log entry.
+/// A client crash can therefore leave both or neither, never an unowned app.
+pub fn config_to_leased_app_writes(
+    config: &Config,
+    lease_id: &str,
+    observed_at_unix_ms: u64,
+) -> Vec<RaftRequest> {
+    config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+            RaftRequest::TestLeaseAppSpec {
+                lease_id: lease_id.to_string(),
+                observed_at_unix_ms,
+                app_id: AppId::new(name, namespace),
+                spec: Box::new(spec.clone()),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +119,31 @@ mod tests {
             .position(|w| matches!(w, RaftRequest::AppSpec { .. }))
             .unwrap();
         assert!(ns_pos < app_pos, "namespace quota must land before the app");
+    }
+
+    #[test]
+    fn leased_writes_atomically_pair_every_app_with_the_lease() {
+        let config = parse(
+            r#"
+            [app.web]
+            image = "web:v1"
+            namespace = "rbtest-run1"
+
+            [app.api]
+            image = "api:v1"
+            namespace = "rbtest-run1"
+        "#,
+        );
+        let writes = config_to_leased_app_writes(&config, "run1", 42);
+        assert_eq!(writes.len(), 2);
+        assert!(writes.iter().all(|write| matches!(
+            write,
+            RaftRequest::TestLeaseAppSpec {
+                lease_id,
+                observed_at_unix_ms: 42,
+                ..
+            } if lease_id == "run1"
+        )));
     }
 
     #[test]

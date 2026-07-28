@@ -874,6 +874,43 @@ recovery deadline, delay and shutdown deadline. The security-state/CRL refresh
 loop uses it; the agent, API, registry, DNS, ingress, gossip, Raft and reporting
 owners do not.
 
+### 4.8 Phase 15 resource leases
+
+Phase 15-created apps live under a server-owned lease, not the lifetime of a
+Relish process. `POST /v1/test/leases` creates a random 128-bit lease id and a
+dedicated `rbtest-*` namespace. `POST /v1/test/leases/{id}/renew` extends an
+active lease and `DELETE /v1/test/leases/{id}` starts cleanup. The owner may
+read, renew and release it; an Admin may inspect or release it. Creation and
+renewal also require the server's `provision_isolated_workloads` permission.
+The cluster safety class and protected-cluster gate still apply.
+
+The server accepts at most 64 live lease records, at most 128 resources per
+lease, and a lifetime from one second up to the configured maximum (which has
+an absolute 86,400-second ceiling). An ordinary apply may never use an
+`rbtest-*` namespace. A leased app apply carries
+`X-Reliaburger-Test-Lease: <id>`; Bun fills an omitted namespace with the
+lease's namespace and rejects a different one.
+
+Standalone Bun writes `test-leases.json` under `[storage].data`, flushes it
+before asking the agent to deploy, and retains a `cleaning` record until the
+agent confirms every app stopped. Cluster Bun stores leases in `DesiredState`;
+one Raft entry adds both the app spec and its ownership, so a client cannot die
+between those actions. Lease mutations sent to a follower reach the leader
+with the original user's bearer/cookie credentials. The leader repeats normal
+authentication and policy checks. It never substitutes the internal service
+principal.
+
+A one-second reaper resumes expired or interrupted cleanup. Every agent or
+consensus step has a ten-second bound. Failure leaves the record in `cleaning`
+with its resource list and bounded last error intact; restart and leadership
+transfer therefore retry instead of forgetting ownership. Standalone release confirms the runtime stop.
+Cluster release confirms removal from replicated desired state, after which
+ordinary reconciliation removes any remaining runtime instance.
+
+Version one owns apps only. Faults, credentials, images, mounts and node state
+need their own resource variants before their Phase 15 cases can use this
+contract.
+
 ---
 
 ## 5. Operations
@@ -1229,6 +1266,7 @@ join = ["10.0.1.5:9443"]
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
 | `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
 | `[upgrades]` | `release_url` | `"https://releases.reliaburger.dev/metadata.json"` | URL | Release metadata endpoint for version checks. |
+| `[testing]` | `external_probe_allowlist` | `[]` | host/CIDR strings | Exact future trace destinations; an empty list permits none. |
 
 ---
 

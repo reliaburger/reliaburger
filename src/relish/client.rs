@@ -94,6 +94,23 @@ fn classify_error(e: reqwest::Error) -> RelishError {
     }
 }
 
+async fn parse_typed_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, RelishError> {
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(RelishError::ApiError { status, body });
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {error}"),
+        })
+}
+
 /// The `--token` CLI override, set once from `main` before any client is built.
 static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
@@ -354,19 +371,34 @@ impl BunClient {
     /// stderr as they arrive; the final `Complete` event is returned
     /// as an `ApplyResult`.
     pub async fn apply(&self, config: &Config) -> Result<ApplyResult, RelishError> {
+        self.apply_request(config, None).await
+    }
+
+    /// Deploy apps under a server-owned Phase 15 resource lease.
+    pub async fn apply_with_lease(
+        &self,
+        config: &Config,
+        lease_id: &str,
+    ) -> Result<ApplyResult, RelishError> {
+        self.apply_request(config, Some(lease_id)).await
+    }
+
+    async fn apply_request(
+        &self,
+        config: &Config,
+        lease_id: Option<&str>,
+    ) -> Result<ApplyResult, RelishError> {
         let url = format!("{}/v1/apply", self.base_url);
         let toml_str = toml::to_string_pretty(config).map_err(|e| RelishError::ApiError {
             status: 0,
             body: format!("failed to serialise config: {e}"),
         })?;
 
-        let response = self
-            .client
-            .post(&url)
-            .body(toml_str)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.client.post(&url).body(toml_str);
+        if let Some(lease_id) = lease_id {
+            request = request.header("x-reliaburger-test-lease", lease_id);
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -577,6 +609,57 @@ impl BunClient {
         &self,
     ) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, RelishError> {
         self.get_typed_json("/v1/deploys/operations").await
+    }
+
+    /// Create a server-owned test resource lease.
+    pub async fn create_test_lease(
+        &self,
+        ttl_seconds: u64,
+        namespace: Option<&str>,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/test/leases", self.base_url))
+            .json(&serde_json::json!({
+                "ttl_seconds": ttl_seconds,
+                "namespace": namespace,
+            }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
+    /// Renew an active test resource lease.
+    pub async fn renew_test_lease(
+        &self,
+        lease_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/test/leases/{lease_id}/renew", self.base_url))
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
+    /// Release a lease and wait for server-confirmed cleanup.
+    pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
+        let response = self
+            .client
+            .delete(format!("{}/v1/test/leases/{lease_id}", self.base_url))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
     }
 
     /// Fetch metrics recorded for one app.

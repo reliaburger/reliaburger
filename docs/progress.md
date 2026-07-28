@@ -1416,8 +1416,14 @@ convergence and adoption" theme under 12b.6).
     expiry. Authenticated cluster fan-out uses the service identity, one shared
     deadline and an explicit evidence/unknown result for every expected node.
     Reports include build/runtime/topology fingerprints and server policy
-  - [ ] Server-owned durable resource leases
-  - [ ] Hermetic multi-architecture OCI workload and catalogue migration
+  - [ ] Server resource leases and hermetic OCI workload
+    - [x] Durable, bounded app leases: authenticated creation/renewal/release;
+      lease-only `rbtest-*` namespaces; standalone fsync persistence and Raft
+      ownership; restart/leader-safe reapers; bounded cleanup steps.
+    - [ ] Runner lease adoption and a pinned multi-architecture OCI workload
+      accepted on runc and Apple Container. Keep the ProcessGrill helper as a
+      separate profile.
+  - [x] Ordinary 39-case catalogue and `relish test`
   - [ ] Real node and pressure primitives before the chaos catalogue
 
 ### Optional

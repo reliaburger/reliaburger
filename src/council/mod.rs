@@ -21,7 +21,7 @@ pub mod selection;
 pub mod state_machine;
 pub mod types;
 
-pub use apply::config_to_desired_writes;
+pub use apply::{config_to_desired_writes, config_to_leased_app_writes};
 pub use node::CouncilNode;
 pub use selection::{CouncilSelectionConfig, select_council_candidates};
 pub use state_machine::SnapshotStoreError;

@@ -181,25 +181,12 @@ impl StateMachineInner {
     fn apply_request(&mut self, request: &RaftRequest) -> Option<CouncilResponse> {
         match request {
             RaftRequest::AppSpec { app_id, spec } => {
-                // A redeploy that changes the replica baseline invalidates any
-                // autoscale override: the operator has re-declared the desired
-                // count, so a stale override from a previous baseline must not
-                // survive and quietly resize the app (DEP8).
-                let baseline_changed = self
-                    .state
-                    .apps
-                    .get(app_id)
-                    .is_some_and(|old| old.replicas != spec.replicas);
-                if baseline_changed {
-                    let key = app_id.to_string();
-                    self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+                if crate::testkit::lease::valid_test_namespace(&app_id.namespace) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "test lease namespace requires a leased app write".to_string(),
+                    });
                 }
-                self.state.apps.insert(app_id.clone(), *spec.clone());
-                // Applying a spec is the moment its `ENC[AGE:...]` values
-                // were (re-)encrypted against the active key: record which
-                // generation seals each of them (PKI8). This is also how
-                // the operator's re-encrypt step unblocks finalise.
-                self.record_secret_seals(app_id, spec);
+                self.apply_app_spec(app_id, spec);
             }
             RaftRequest::AppDelete { app_id } => {
                 self.state.apps.remove(app_id);
@@ -595,8 +582,179 @@ impl StateMachineInner {
                 // truth for the catalogue, so a later publish always wins.
                 self.state.endpoint_catalog = *catalog.clone();
             }
+            RaftRequest::TestLeaseCreate(lease) => {
+                if let Err(error) = lease.validate() {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
+                if self.state.test_leases.contains_key(&lease.lease_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease already exists".to_string(),
+                    });
+                }
+                if self.state.test_leases.len() >= crate::testkit::lease::MAX_ACTIVE_TEST_LEASES {
+                    return Some(CouncilResponse::Refused {
+                        reason: "too many active test leases".to_string(),
+                    });
+                }
+                if self
+                    .state
+                    .test_leases
+                    .values()
+                    .any(|existing| existing.namespace == lease.namespace)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease namespace is already owned".to_string(),
+                    });
+                }
+                self.state
+                    .test_leases
+                    .insert(lease.lease_id.clone(), lease.clone());
+            }
+            RaftRequest::TestLeaseAppSpec {
+                lease_id,
+                observed_at_unix_ms,
+                app_id,
+                spec,
+            } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".to_string(),
+                    });
+                };
+                if !lease.is_active_at(*observed_at_unix_ms) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease is expired or cleanup has started".to_string(),
+                    });
+                }
+                if app_id.namespace != lease.namespace {
+                    return Some(CouncilResponse::Refused {
+                        reason: "app namespace does not match its lease".to_string(),
+                    });
+                }
+                let resource = crate::testkit::lease::LeasedResource::App {
+                    app_id: app_id.clone(),
+                };
+                let already_owned = lease.resources.contains(&resource);
+                if !already_owned
+                    && lease.resources.len() >= crate::testkit::lease::MAX_LEASED_RESOURCES
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease resource limit reached".to_string(),
+                    });
+                }
+                let owned_elsewhere = self.state.test_leases.iter().any(|(id, candidate)| {
+                    id != lease_id && candidate.resources.contains(&resource)
+                });
+                if owned_elsewhere || (self.state.apps.contains_key(app_id) && !already_owned) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "app already exists outside this lease".to_string(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.resources.insert(resource);
+                }
+                self.apply_app_spec(app_id, spec);
+            }
+            RaftRequest::TestLeaseRenew {
+                lease_id,
+                owner_id,
+                renewed_at_unix_ms,
+                expires_at_unix_ms,
+            } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".to_string(),
+                    });
+                };
+                if let Err(error) = lease.authorise_owner(owner_id, *renewed_at_unix_ms) {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
+                if expires_at_unix_ms <= renewed_at_unix_ms {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease expiry must be in the future".to_string(),
+                    });
+                }
+                lease.expires_at_unix_ms = *expires_at_unix_ms;
+            }
+            RaftRequest::TestLeaseBeginCleanup { lease_id } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".to_string(),
+                    });
+                };
+                let attempts = match lease.state {
+                    crate::testkit::lease::TestLeaseState::Active => 1,
+                    crate::testkit::lease::TestLeaseState::Cleaning { attempts, .. } => {
+                        attempts.saturating_add(1)
+                    }
+                };
+                lease.state = crate::testkit::lease::TestLeaseState::Cleaning {
+                    attempts,
+                    last_error: None,
+                };
+            }
+            RaftRequest::TestLeaseFinishCleanup { lease_id } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".to_string(),
+                    });
+                };
+                if !matches!(
+                    lease.state,
+                    crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease cleanup has not started".to_string(),
+                    });
+                }
+                self.state.test_leases.remove(lease_id);
+            }
+            RaftRequest::TestLeaseCleanupFailed { lease_id, reason } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".to_string(),
+                    });
+                };
+                let attempts = match lease.state {
+                    crate::testkit::lease::TestLeaseState::Cleaning { attempts, .. } => attempts,
+                    crate::testkit::lease::TestLeaseState::Active => {
+                        return Some(CouncilResponse::Refused {
+                            reason: "lease cleanup has not started".to_string(),
+                        });
+                    }
+                };
+                lease.state = crate::testkit::lease::TestLeaseState::Cleaning {
+                    attempts,
+                    last_error: Some(reason.chars().take(512).collect()),
+                };
+            }
         }
         None
+    }
+
+    fn apply_app_spec(
+        &mut self,
+        app_id: &crate::meat::types::AppId,
+        spec: &crate::config::app::AppSpec,
+    ) {
+        // A redeploy that changes the replica baseline invalidates any
+        // autoscale override: the operator has re-declared the desired count.
+        let baseline_changed = self
+            .state
+            .apps
+            .get(app_id)
+            .is_some_and(|old| old.replicas != spec.replicas);
+        if baseline_changed {
+            let key = app_id.to_string();
+            self.state.autoscale_overrides.retain(|(k, _)| k != &key);
+        }
+        self.state.apps.insert(app_id.clone(), spec.clone());
+        // Applying a spec is when encrypted values were re-sealed.
+        self.record_secret_seals(app_id, spec);
     }
 
     /// The scope whose key seals `app_id`'s secrets: its namespace's key
@@ -2989,6 +3147,208 @@ mod tests {
         );
     }
 
+    fn test_lease(id: &str, expires_at_unix_ms: u64) -> crate::testkit::lease::TestLease {
+        crate::testkit::lease::TestLease::new(
+            id.to_string(),
+            "token:ci".to_string(),
+            "ci".to_string(),
+            format!("rbtest-{id}"),
+            10,
+            expires_at_unix_ms,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn leased_app_write_atomically_records_ownership() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "rbtest-run1");
+        let responses = sm
+            .apply(vec![
+                normal_entry(1, 1, RaftRequest::TestLeaseCreate(test_lease("run1", 100))),
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::TestLeaseAppSpec {
+                        lease_id: "run1".to_string(),
+                        observed_at_unix_ms: 20,
+                        app_id: app_id.clone(),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|response| { matches!(response, CouncilResponse::Applied { .. }) })
+        );
+        let state = sm.desired_state().await;
+        assert!(state.apps.contains_key(&app_id));
+        assert!(state.test_leases["run1"].resources.contains(
+            &crate::testkit::lease::LeasedResource::App {
+                app_id: app_id.clone()
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn leased_app_refuses_expiry_namespace_mismatch_and_existing_app() {
+        let mut sm = CouncilStateMachine::new();
+        let existing = AppId::new("existing", "rbtest-run1");
+        // Model a pre-lease snapshot containing the now-reserved prefix.
+        sm.inner
+            .write()
+            .await
+            .state
+            .apps
+            .insert(existing.clone(), default_spec());
+        sm.apply(vec![normal_entry(
+            1,
+            2,
+            RaftRequest::TestLeaseCreate(test_lease("run1", 30)),
+        )])
+        .await
+        .unwrap();
+        let responses = sm
+            .apply(vec![
+                normal_entry(
+                    1,
+                    3,
+                    RaftRequest::TestLeaseAppSpec {
+                        lease_id: "run1".to_string(),
+                        observed_at_unix_ms: 30,
+                        app_id: AppId::new("late", "rbtest-run1"),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+                normal_entry(
+                    1,
+                    4,
+                    RaftRequest::TestLeaseAppSpec {
+                        lease_id: "run1".to_string(),
+                        observed_at_unix_ms: 20,
+                        app_id: AppId::new("wrong", "production"),
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+                normal_entry(
+                    1,
+                    5,
+                    RaftRequest::TestLeaseAppSpec {
+                        lease_id: "run1".to_string(),
+                        observed_at_unix_ms: 20,
+                        app_id: existing,
+                        spec: Box::new(default_spec()),
+                    },
+                ),
+            ])
+            .await
+            .unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|response| { matches!(response, CouncilResponse::Refused { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_app_write_cannot_use_a_reserved_test_namespace() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("probe", "rbtest-unleased");
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec()),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(!sm.desired_state().await.apps.contains_key(&app_id));
+    }
+
+    #[tokio::test]
+    async fn replicated_lease_count_is_bounded() {
+        let mut sm = CouncilStateMachine::new();
+        let entries: Vec<_> = (0..crate::testkit::lease::MAX_ACTIVE_TEST_LEASES)
+            .map(|index| {
+                normal_entry(
+                    1,
+                    index as u64 + 1,
+                    RaftRequest::TestLeaseCreate(test_lease(&format!("run{index}"), 100)),
+                )
+            })
+            .collect();
+        let responses = sm.apply(entries).await.unwrap();
+        assert!(
+            responses
+                .iter()
+                .all(|response| matches!(response, CouncilResponse::Applied { .. }))
+        );
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                100,
+                RaftRequest::TestLeaseCreate(test_lease("overflow", 100)),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+    }
+
+    #[tokio::test]
+    async fn interrupted_lease_cleanup_remains_replicated_until_finished() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::TestLeaseCreate(test_lease("run1", 100)),
+        )])
+        .await
+        .unwrap();
+        sm.apply(vec![normal_entry(
+            1,
+            2,
+            RaftRequest::TestLeaseBeginCleanup {
+                lease_id: "run1".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+        sm.apply(vec![normal_entry(
+            1,
+            3,
+            RaftRequest::TestLeaseCleanupFailed {
+                lease_id: "run1".to_string(),
+                reason: "worker unavailable".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(matches!(
+            sm.desired_state().await.test_leases["run1"].state,
+            crate::testkit::lease::TestLeaseState::Cleaning {
+                attempts: 1,
+                last_error: Some(ref error),
+            } if error == "worker unavailable"
+        ));
+        sm.apply(vec![normal_entry(
+            1,
+            4,
+            RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "run1".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+        assert!(sm.desired_state().await.test_leases.is_empty());
+    }
+
     /// The 12b.2 compatibility rule made executable: a snapshot written
     /// before the batch/build tracker fields existed must load cleanly,
     /// with both trackers defaulting to empty and counters at 1.
@@ -2999,12 +3359,14 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         assert!(object.remove("batch_state").is_some());
         assert!(object.remove("build_state").is_some());
+        assert!(object.remove("test_leases").is_some());
 
         let reloaded: DesiredState = serde_json::from_value(value).unwrap();
         assert_eq!(reloaded.batch_state.next_batch_id, 1);
         assert!(reloaded.batch_state.batches.is_empty());
         assert_eq!(reloaded.build_state.next_build_id, 1);
         assert!(reloaded.build_state.builds.is_empty());
+        assert!(reloaded.test_leases.is_empty());
     }
 
     /// The same rule end to end through the persisted store: a legacy
@@ -3025,6 +3387,7 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.remove("batch_state");
         object.remove("build_state");
+        object.remove("test_leases");
         let payload = serde_json::to_vec(&value).unwrap();
         {
             let db = Database::create(&path).unwrap();
@@ -3044,6 +3407,7 @@ mod tests {
         assert!(state.apps.contains_key(&app_id));
         assert_eq!(state.batch_state.next_batch_id, 1);
         assert_eq!(state.build_state.next_build_id, 1);
+        assert!(state.test_leases.is_empty());
     }
 
     /// O20: `AppDelete` cleared apps, scheduling, autoscale overrides and

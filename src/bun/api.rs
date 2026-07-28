@@ -13,7 +13,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -55,6 +55,8 @@ pub struct ApiState {
     pub cmd_tx: mpsc::Sender<AgentCommand>,
     /// Live long-lived-task and placement-capability evidence.
     pub readiness: super::readiness::ReadinessTracker,
+    /// Durable standalone resource leases. Cluster leases live in Raft.
+    pub local_test_leases: crate::testkit::lease::LocalLeaseStore,
     /// Shared metrics store (read-heavy, queries don't block the agent).
     pub mayo: Option<Arc<RwLock<MayoStore>>>,
     /// Shared log store (Arrow/DataFusion for SQL queries + `/v1/logs/entries`).
@@ -199,6 +201,7 @@ pub fn router(
         false,
         crate::bun::capabilities::StaticCapabilities::default(),
         super::readiness::ReadinessTracker::new(),
+        None,
     )
 }
 
@@ -236,10 +239,12 @@ pub fn router_with_upgrade(
     require_signatures: bool,
     static_capabilities: crate::bun::capabilities::StaticCapabilities,
     readiness: super::readiness::ReadinessTracker,
+    local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
         readiness,
+        local_test_leases: local_test_leases.unwrap_or_default(),
         mayo,
         log_store,
         alerts,
@@ -347,6 +352,13 @@ pub fn router_with_upgrade(
         .route(
             "/v1/capabilities/cluster",
             get(cluster_capabilities_handler),
+        )
+        .route("/v1/test/leases", post(test_lease_create_handler))
+        .route("/v1/test/leases/{id}", get(test_lease_get_handler))
+        .route("/v1/test/leases/{id}/renew", post(test_lease_renew_handler))
+        .route(
+            "/v1/test/leases/{id}",
+            axum::routing::delete(test_lease_release_handler),
         )
         .route("/v1/cluster/nodes", get(nodes_handler))
         .route("/v1/cluster/council", get(council_handler))
@@ -629,6 +641,453 @@ fn system_time_millis(time: std::time::SystemTime) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTestLeaseRequest {
+    ttl_seconds: u64,
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RenewTestLeaseRequest {
+    ttl_seconds: u64,
+}
+
+#[allow(clippy::result_large_err)]
+fn authenticated_test_user(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    required: crate::sesame::types::ApiRole,
+) -> Result<&crate::sesame::auth::AuthContext, Response> {
+    let Some(auth) = auth else {
+        return Err((StatusCode::UNAUTHORIZED, "authentication required").into_response());
+    };
+    crate::sesame::auth::authorize_user(Some(auth), required)?;
+    Ok(auth)
+}
+
+#[allow(clippy::result_large_err)]
+fn test_operation_authorisation(
+    state: &ApiState,
+    auth: &crate::sesame::auth::AuthContext,
+) -> Result<(), Response> {
+    state
+        .static_capabilities
+        .test_policy
+        .authorise(
+            crate::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
+            &crate::testkit::safety::OperationAuthorisation {
+                principal: &auth.token_name,
+                role: auth.role,
+                acknowledged: false,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()).into_response())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_lease_ttl(state: &ApiState, ttl_seconds: u64) -> Result<u64, Response> {
+    if ttl_seconds == 0 || ttl_seconds > state.static_capabilities.test_policy.max_lease_seconds {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "ttl_seconds must be between 1 and {}",
+                    state.static_capabilities.test_policy.max_lease_seconds
+                )
+            })),
+        )
+            .into_response());
+    }
+    Ok(ttl_seconds.saturating_mul(1_000))
+}
+
+async fn test_lease_create_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTestLeaseRequest>,
+) -> Response {
+    let auth =
+        match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::Deployer) {
+            Ok(auth) => auth,
+            Err(response) => return response,
+        };
+    if let Err(response) = test_operation_authorisation(&state, auth) {
+        return response;
+    }
+    let ttl_millis = match validate_lease_ttl(&state, request.ttl_seconds) {
+        Ok(ttl) => ttl,
+        Err(response) => return response,
+    };
+    if let Some(council) = &state.council
+        && !council.is_leader().await
+    {
+        return forward_test_lease_request(
+            &state,
+            council,
+            reqwest::Method::POST,
+            "/v1/test/leases",
+            &headers,
+            Some(&request),
+        )
+        .await;
+    }
+    let mut random = [0u8; 16];
+    if ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to generate lease id",
+        )
+            .into_response();
+    }
+    let lease_id = hex::encode(random);
+    let namespace = request
+        .namespace
+        .unwrap_or_else(|| format!("rbtest-{}", &lease_id[..12]));
+    if !crate::testkit::lease::valid_test_namespace(&namespace) {
+        return (
+            StatusCode::BAD_REQUEST,
+            crate::testkit::lease::LeaseError::InvalidNamespace.to_string(),
+        )
+            .into_response();
+    }
+    if auth
+        .scoped_namespaces
+        .as_ref()
+        .is_some_and(|namespaces| !namespaces.contains(&namespace))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "token scope does not allow the requested test namespace",
+        )
+            .into_response();
+    }
+    let now = crate::testkit::lease::now_unix_millis();
+    let lease = match crate::testkit::lease::TestLease::new(
+        lease_id,
+        auth.principal_id.clone(),
+        auth.token_name.clone(),
+        namespace,
+        now,
+        now.saturating_add(ttl_millis),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => return lease_error_response(error),
+    };
+
+    if let Some(council) = &state.council {
+        if let Err(response) = write_lease_request(
+            council,
+            crate::council::RaftRequest::TestLeaseCreate(lease.clone()),
+        )
+        .await
+        {
+            return response;
+        }
+    } else if let Err(error) = state.local_test_leases.create(lease.clone()).await {
+        return lease_error_response(error);
+    }
+    (StatusCode::CREATED, Json(lease)).into_response()
+}
+
+async fn test_lease_get_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+) -> Response {
+    let auth =
+        match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly) {
+            Ok(auth) => auth,
+            Err(response) => return response,
+        };
+    let Some(lease) = find_test_lease(&state, &lease_id).await else {
+        return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+    };
+    if lease.owner_id != auth.principal_id && auth.role != crate::sesame::types::ApiRole::Admin {
+        return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+    }
+    Json(lease).into_response()
+}
+
+async fn test_lease_renew_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<RenewTestLeaseRequest>,
+) -> Response {
+    let auth =
+        match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::Deployer) {
+            Ok(auth) => auth,
+            Err(response) => return response,
+        };
+    if let Err(response) = test_operation_authorisation(&state, auth) {
+        return response;
+    }
+    let ttl_millis = match validate_lease_ttl(&state, request.ttl_seconds) {
+        Ok(ttl) => ttl,
+        Err(response) => return response,
+    };
+    if let Some(council) = &state.council
+        && !council.is_leader().await
+    {
+        return forward_test_lease_request(
+            &state,
+            council,
+            reqwest::Method::POST,
+            &format!("/v1/test/leases/{lease_id}/renew"),
+            &headers,
+            Some(&request),
+        )
+        .await;
+    }
+    let now = crate::testkit::lease::now_unix_millis();
+    let expires = now.saturating_add(ttl_millis);
+    let Some(existing) = find_test_lease(&state, &lease_id).await else {
+        return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+    };
+    if let Err(error) = existing.authorise_owner(&auth.principal_id, now) {
+        return lease_error_response(error);
+    }
+
+    if let Some(council) = &state.council {
+        if let Err(response) = write_lease_request(
+            council,
+            crate::council::RaftRequest::TestLeaseRenew {
+                lease_id: lease_id.clone(),
+                owner_id: auth.principal_id.clone(),
+                renewed_at_unix_ms: now,
+                expires_at_unix_ms: expires,
+            },
+        )
+        .await
+        {
+            return response;
+        }
+        let Some(lease) = find_test_lease(&state, &lease_id).await else {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+        };
+        Json(lease).into_response()
+    } else {
+        match state
+            .local_test_leases
+            .renew(&lease_id, &auth.principal_id, now, expires)
+            .await
+        {
+            Ok(lease) => Json(lease).into_response(),
+            Err(error) => lease_error_response(error),
+        }
+    }
+}
+
+async fn test_lease_release_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let auth =
+        match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::Deployer) {
+            Ok(auth) => auth,
+            Err(response) => return response,
+        };
+    if let Some(council) = &state.council
+        && !council.is_leader().await
+    {
+        return forward_test_lease_request::<()>(
+            &state,
+            council,
+            reqwest::Method::DELETE,
+            &format!("/v1/test/leases/{lease_id}"),
+            &headers,
+            None,
+        )
+        .await;
+    }
+    let Some(lease) = find_test_lease(&state, &lease_id).await else {
+        return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+    };
+    let owner_id = if lease.owner_id == auth.principal_id {
+        Some(auth.principal_id.as_str())
+    } else if auth.role == crate::sesame::types::ApiRole::Admin {
+        None
+    } else {
+        return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+    };
+    let result = if let Some(council) = &state.council {
+        crate::testkit::lease::cleanup_cluster_lease(council, &lease_id, owner_id).await
+    } else {
+        crate::testkit::lease::cleanup_local_lease(
+            &state.local_test_leases,
+            &state.cmd_tx,
+            &lease_id,
+            owner_id,
+        )
+        .await
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::testkit::lease::LeaseError::NotFound) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => lease_error_response(error),
+    }
+}
+
+const MAX_LEASE_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Forward a lease mutation to the current leader while retaining the
+/// caller's own credentials. The leader repeats authentication and policy
+/// checks; a follower never replaces user authority with the service token.
+async fn forward_test_lease_request<T: Serialize + ?Sized>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    method: reqwest::Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Option<&T>,
+) -> Response {
+    let Some(leader_url) = leader_api_url(state, council).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no cluster leader known yet; retry shortly",
+        )
+            .into_response();
+    };
+    let mut request = state
+        .cluster_http
+        .client()
+        .request(method, format!("{leader_url}{path}"));
+    for name in [
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::COOKIE,
+    ] {
+        if let Some(value) = headers.get(&name) {
+            request = request.header(name.as_str(), value.as_bytes());
+        }
+    }
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut upstream = match tokio::time::timeout_at(deadline, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("failed to forward lease request to the leader: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (StatusCode::GATEWAY_TIMEOUT, "leader request timed out").into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .cloned();
+    let mut bytes = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, upstream.chunk()).await {
+            Ok(Ok(Some(chunk)))
+                if bytes.len().saturating_add(chunk.len()) <= MAX_LEASE_FORWARD_RESPONSE_BYTES =>
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Ok(Some(_))) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "leader lease response exceeded 64 KiB",
+                )
+                    .into_response();
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to read leader lease response: {error}"),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (StatusCode::GATEWAY_TIMEOUT, "leader response timed out").into_response();
+            }
+        }
+    }
+    let mut response = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        response = response.header(axum::http::header::CONTENT_TYPE, content_type.as_bytes());
+    }
+    response
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+async fn find_test_lease(
+    state: &ApiState,
+    lease_id: &str,
+) -> Option<crate::testkit::lease::TestLease> {
+    match &state.council {
+        Some(council) => council
+            .desired_state()
+            .await
+            .test_leases
+            .get(lease_id)
+            .cloned(),
+        None => state.local_test_leases.get(lease_id).await,
+    }
+}
+
+async fn write_lease_request(
+    council: &crate::council::CouncilNode,
+    request: crate::council::RaftRequest,
+) -> Result<(), Response> {
+    match council.write(request).await {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => {
+            Err((StatusCode::CONFLICT, reason).into_response())
+        }
+        Ok(_) => Ok(()),
+        Err(error) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()),
+    }
+}
+
+fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
+    let status = match error {
+        crate::testkit::lease::LeaseError::NotFound => StatusCode::NOT_FOUND,
+        crate::testkit::lease::LeaseError::WrongOwner => StatusCode::FORBIDDEN,
+        crate::testkit::lease::LeaseError::NotActive
+        | crate::testkit::lease::LeaseError::AlreadyExists
+        | crate::testkit::lease::LeaseError::NamespaceOwned
+        | crate::testkit::lease::LeaseError::NamespaceMismatch
+        | crate::testkit::lease::LeaseError::ResourceLimit => StatusCode::CONFLICT,
+        crate::testkit::lease::LeaseError::TooManyLeases => StatusCode::TOO_MANY_REQUESTS,
+        crate::testkit::lease::LeaseError::InvalidId
+        | crate::testkit::lease::LeaseError::InvalidOwner
+        | crate::testkit::lease::LeaseError::InvalidNamespace
+        | crate::testkit::lease::LeaseError::InvalidExpiry
+        | crate::testkit::lease::LeaseError::UnsupportedSchema { .. } => StatusCode::BAD_REQUEST,
+        crate::testkit::lease::LeaseError::Persistence(_)
+        | crate::testkit::lease::LeaseError::Malformed(_)
+        | crate::testkit::lease::LeaseError::StoreTooLarge
+        | crate::testkit::lease::LeaseError::Cleanup(_)
+        | crate::testkit::lease::LeaseError::Consensus(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+/// Report the running binary version (public, dependency-free, fast).
+///
+/// The upgrade orchestrator polls this to decide whether a node has
+/// reached its target version, so it must answer even when the agent
+/// loop is busy — hence direct manager access, not an AgentCommand.
 async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
     match &state.upgrade {
         Some(manager) => Json(serde_json::json!({
@@ -1198,6 +1657,7 @@ async fn cluster_elect_handler(
 async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) =
@@ -1205,7 +1665,7 @@ async fn apply_handler(
     {
         return resp;
     }
-    let config = match Config::parse(&body) {
+    let mut config = match Config::parse(&body) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -1222,6 +1682,71 @@ async fn apply_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    let lease_id = match headers.get("x-reliaburger-test-lease") {
+        Some(value) => match value.to_str() {
+            Ok(value) if !value.is_empty() => Some(value.to_string()),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "x-reliaburger-test-lease must contain a lease id",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+    let mut lease_owner_id = None;
+    if let Some(lease_id) = &lease_id {
+        if !config.job.is_empty()
+            || !config.namespace.is_empty()
+            || !config.permission.is_empty()
+            || !config.build.is_empty()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "leased apply currently accepts apps only",
+            )
+                .into_response();
+        }
+        let Some(auth) = auth.as_deref() else {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        };
+        let Some(lease) = find_test_lease(&state, lease_id).await else {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+        };
+        if auth.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
+            && lease.owner_id != auth.principal_id
+        {
+            return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+        }
+        if !lease.is_active_at(crate::testkit::lease::now_unix_millis()) {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotActive);
+        }
+        for spec in config.app.values_mut() {
+            match &spec.namespace {
+                Some(namespace) if namespace != &lease.namespace => {
+                    return lease_error_response(
+                        crate::testkit::lease::LeaseError::NamespaceMismatch,
+                    );
+                }
+                Some(_) => {}
+                None => spec.namespace = Some(lease.namespace.clone()),
+            }
+        }
+        lease_owner_id = Some(lease.owner_id);
+    } else {
+        for spec in config.app.values() {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if crate::testkit::lease::valid_test_namespace(namespace) {
+                return (
+                    StatusCode::CONFLICT,
+                    "test lease namespace requires x-reliaburger-test-lease",
+                )
+                    .into_response();
+            }
+        }
     }
 
     // AUTH1: a scoped token may only deploy apps its scope covers. Check
@@ -1244,15 +1769,46 @@ async fn apply_handler(
     if let Some(council) = &state.council
         && (!config.app.is_empty() || !config.namespace.is_empty() || !config.permission.is_empty())
     {
-        return cluster_apply(state.clone(), Arc::clone(council), config, body).await;
+        return cluster_apply(
+            state.clone(),
+            Arc::clone(council),
+            config,
+            body,
+            lease_id,
+            headers,
+        )
+        .await;
     }
 
-    let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    let lease_operation = if let (Some(lease_id), Some(owner_id)) =
+        (&lease_id, lease_owner_id.as_deref())
+    {
+        let now = crate::testkit::lease::now_unix_millis();
+        let app_ids = config
+            .app
+            .iter()
+            .map(|(app_name, spec)| {
+                crate::meat::AppId::new(app_name, spec.namespace.as_deref().unwrap_or("default"))
+            })
+            .collect();
+        match state
+            .local_test_leases
+            .begin_app_operation(lease_id, owner_id, app_ids, now)
+            .await
+        {
+            Ok(operation) => Some(operation),
+            Err(error) => return lease_error_response(error),
+        }
+    } else {
+        None
+    };
+
+    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32);
     if state
         .cmd_tx
         .send(AgentCommand::Deploy {
             config,
-            events: event_tx,
+            events: agent_event_tx,
         })
         .await
         .is_err()
@@ -1263,6 +1819,42 @@ async fn apply_handler(
         )
             .into_response();
     }
+
+    let event_rx = if let Some(operation) = lease_operation {
+        let (client_event_tx, client_event_rx) = mpsc::channel::<ApplyEvent>(32);
+        // Keep consuming agent progress even when the HTTP client disconnects.
+        // The per-lease guard prevents expiry cleanup from overtaking a deploy
+        // which the agent has accepted but not completed yet.
+        tokio::spawn(async move {
+            let mut operation = Some(operation);
+            while let Some(event) = agent_event_rx.recv().await {
+                let terminal = matches!(
+                    event,
+                    ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
+                );
+                match client_event_tx.try_send(event) {
+                    Ok(()) => {
+                        if terminal {
+                            operation.take();
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(event)) if terminal => {
+                        // The deploy is over, so cleanup may proceed even if a
+                        // slow client still needs time to accept its terminal
+                        // event. Progress events may be coalesced under this
+                        // backpressure, but the outcome is never dropped.
+                        operation.take();
+                        let _ = client_event_tx.send(event).await;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
+        });
+        client_event_rx
+    } else {
+        agent_event_rx
+    };
 
     let stream = ReceiverStream::new(event_rx).map(|apply_event| {
         let json = serde_json::to_string(&apply_event).unwrap_or_default();
@@ -1283,6 +1875,8 @@ async fn cluster_apply(
     council: Arc<crate::council::CouncilNode>,
     config: Config,
     raw_body: String,
+    lease_id: Option<String>,
+    caller_headers: HeaderMap,
 ) -> Response {
     // Follower? Forward to the leader rather than half-failing.
     if !council.is_leader().await {
@@ -1300,7 +1894,17 @@ async fn cluster_apply(
             .client()
             .post(format!("{leader_url}/v1/apply"))
             .body(raw_body);
-        if let Some(token) = &state.service_token {
+        if let Some(lease_id) = &lease_id {
+            request = request.header("x-reliaburger-test-lease", lease_id);
+            for name in [
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::COOKIE,
+            ] {
+                if let Some(value) = caller_headers.get(&name) {
+                    request = request.header(name.as_str(), value.as_bytes());
+                }
+            }
+        } else if let Some(token) = &state.service_token {
             request = request.bearer_auth(token);
         }
         return match request.send().await {
@@ -1349,7 +1953,15 @@ async fn cluster_apply(
         // Lettuce writes the exact same set for the same config, so manual
         // apply and GitOps can't diverge (12b.2 T6). A failed write is a
         // hard stop — half an apply leaves desired state inconsistent.
-        for request in crate::council::config_to_desired_writes(&config) {
+        let writes = match &lease_id {
+            Some(lease_id) => crate::council::config_to_leased_app_writes(
+                &config,
+                lease_id,
+                crate::testkit::lease::now_unix_millis(),
+            ),
+            None => crate::council::config_to_desired_writes(&config),
+        };
+        for request in writes {
             let describe = describe_write(&request);
             match council.write(request).await {
                 Ok(_) => {
@@ -1417,6 +2029,9 @@ fn describe_write(request: &crate::council::types::RaftRequest) -> String {
         RaftRequest::AppSpec { app_id, .. } => format!("app {}", app_id.name),
         RaftRequest::NamespaceSpec { name, .. } => format!("namespace {name}"),
         RaftRequest::PermissionSpec { name, .. } => format!("permission {name}"),
+        RaftRequest::TestLeaseAppSpec { app_id, .. } => {
+            format!("leased app {}", app_id.name)
+        }
         _ => "resource".to_string(),
     }
 }
@@ -3764,7 +4379,15 @@ async fn rollback_handler(
     let raw = toml::to_string(&config).unwrap_or_default();
 
     if let Some(council) = &state.council {
-        return cluster_apply(state.clone(), Arc::clone(council), config, raw).await;
+        return cluster_apply(
+            state.clone(),
+            Arc::clone(council),
+            config,
+            raw,
+            None,
+            HeaderMap::new(),
+        )
+        .await;
     }
 
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
@@ -4591,6 +5214,23 @@ mod tests {
         service_token: Option<String>,
         readiness: crate::bun::readiness::ReadinessTracker,
     ) -> (Router, CancellationToken) {
+        setup_with_auth_readiness_and_leases(
+            tokens,
+            service_token,
+            readiness,
+            crate::bun::capabilities::StaticCapabilities::default(),
+            None,
+        )
+        .await
+    }
+
+    async fn setup_with_auth_readiness_and_leases(
+        tokens: Vec<crate::sesame::types::ApiToken>,
+        service_token: Option<String>,
+        readiness: crate::bun::readiness::ReadinessTracker,
+        static_capabilities: crate::bun::capabilities::StaticCapabilities,
+        local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+    ) -> (Router, CancellationToken) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -4627,8 +5267,9 @@ mod tests {
             "http",
             256 * 1024 * 1024,
             false,
-            crate::bun::capabilities::StaticCapabilities::default(),
+            static_capabilities,
             readiness,
+            local_test_leases,
         );
         (app, shutdown)
     }
@@ -4636,8 +5277,15 @@ mod tests {
     fn a_user_token(
         role: crate::sesame::types::ApiRole,
     ) -> (crate::sesame::types::ApiToken, String) {
+        named_user_token("u", role)
+    }
+
+    fn named_user_token(
+        name: &str,
+        role: crate::sesame::types::ApiRole,
+    ) -> (crate::sesame::types::ApiToken, String) {
         let created = crate::sesame::token::create_token(
-            "u",
+            name,
             role,
             crate::sesame::types::TokenScope::default(),
             None,
@@ -4682,6 +5330,239 @@ mod tests {
         assert_eq!(
             get_status(app, "/v1/status", Some(&plaintext)).await,
             StatusCode::OK
+        );
+        shutdown.cancel();
+    }
+
+    fn lease_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+        crate::bun::capabilities::StaticCapabilities {
+            test_policy: crate::testkit::safety::ClusterTestPolicy {
+                safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    crate::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
+                ]),
+                max_lease_seconds: 60,
+                ..crate::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..crate::bun::capabilities::StaticCapabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_policy_denies_provisioning_by_default() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        let (status, _) = post_authenticated(
+            app,
+            "/v1/test/leases",
+            &plaintext,
+            r#"{"ttl_seconds":30}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn lease_owns_apply_and_release_confirms_cleanup() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+        )
+        .await;
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/test/leases",
+            &plaintext,
+            r#"{"ttl_seconds":30}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/apply",
+            &plaintext,
+            r#"
+                [app.probe]
+                image = "test:v1"
+            "#,
+            Some(&lease.lease_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let (status, body) = get_authenticated(
+            app.clone(),
+            &format!("/v1/test/leases/{}", lease.lease_id),
+            &plaintext,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let owned: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        assert_eq!(owned.resources.len(), 1);
+        assert!(
+            owned
+                .resources
+                .contains(&crate::testkit::lease::LeasedResource::App {
+                    app_id: crate::meat::AppId::new("probe", &lease.namespace),
+                })
+        );
+
+        assert_eq!(
+            delete_authenticated(
+                app.clone(),
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &plaintext,
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            get_authenticated(
+                app,
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &plaintext,
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn lease_ttl_is_server_bounded() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/test/leases",
+                &plaintext,
+                r#"{"ttl_seconds":0}"#,
+                None,
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_authenticated(
+                app,
+                "/v1/test/leases",
+                &plaintext,
+                r#"{"ttl_seconds":61}"#,
+                None,
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn lease_mutations_require_the_exact_credential_and_renew_active_records() {
+        let (owner_token, owner_plaintext) =
+            named_user_token("owner", crate::sesame::types::ApiRole::Deployer);
+        let (other_token, other_plaintext) =
+            named_user_token("owner", crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![owner_token, other_token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+        )
+        .await;
+        let (_, body) = post_authenticated(
+            app.clone(),
+            "/v1/test/leases",
+            &owner_plaintext,
+            r#"{"ttl_seconds":30}"#,
+            None,
+        )
+        .await;
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        let renew_path = format!("/v1/test/leases/{}/renew", lease.lease_id);
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                &renew_path,
+                &other_plaintext,
+                r#"{"ttl_seconds":40}"#,
+                None,
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, body) = post_authenticated(
+            app.clone(),
+            &renew_path,
+            &owner_plaintext,
+            r#"{"ttl_seconds":40}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let renewed: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        assert!(renewed.expires_at_unix_ms > lease.expires_at_unix_ms);
+        assert_eq!(
+            delete_authenticated(
+                app,
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &other_plaintext,
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn reserved_test_namespace_cannot_bypass_a_lease() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+        )
+        .await;
+        let (status, body) = post_authenticated(
+            app,
+            "/v1/apply",
+            &plaintext,
+            r#"
+                [app.probe]
+                image = "test:v1"
+                namespace = "rbtest-unleased"
+            "#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&body)
         );
         shutdown.cancel();
     }
@@ -5323,6 +6204,7 @@ mod tests {
             false,
             statics,
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
         );
         (app, shutdown, mayo_dir)
     }
@@ -6438,6 +7320,7 @@ mod tests {
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
         );
         (app, webhook_rx, shutdown)
     }
@@ -6461,6 +7344,62 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn post_authenticated(
+        app: Router,
+        uri: &str,
+        bearer: &str,
+        body: &str,
+        lease_id: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {bearer}"));
+        if uri != "/v1/apply" {
+            request = request.header("content-type", "application/json");
+        }
+        if let Some(lease_id) = lease_id {
+            request = request.header("x-reliaburger-test-lease", lease_id);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
+    async fn get_authenticated(app: Router, uri: &str, bearer: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
+    async fn delete_authenticated(app: Router, uri: &str, bearer: &str) -> StatusCode {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
     }
 
     #[tokio::test]
@@ -6619,6 +7558,7 @@ mod tests {
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
         );
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

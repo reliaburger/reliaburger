@@ -922,6 +922,36 @@ mod tests {
         complete.ingress.validate().unwrap();
     }
 
+    #[test]
+    fn phase15_policy_defaults_protected_and_parses_explicit_operations() {
+        let defaults = NodeConfig::parse("").unwrap();
+        assert!(defaults.testing.safety_class.is_protected());
+        assert!(defaults.testing.allowed_operations.is_empty());
+
+        let configured = NodeConfig::parse(
+            r#"
+            [testing]
+            safety_class = "staging"
+            allowed_operations = ["provision_isolated_workloads", "inject_workload_faults"]
+            max_lease_seconds = 900
+        "#,
+        )
+        .unwrap();
+        assert_eq!(configured.testing.max_lease_seconds, 900);
+        assert!(
+            configured
+                .testing
+                .allowed_operations
+                .contains(&crate::testkit::safety::OperationPermission::InjectWorkloadFaults)
+        );
+
+        let mut invalid = defaults;
+        invalid.testing.max_lease_seconds = 0;
+        assert!(invalid.validate().is_err());
+        invalid.testing.max_lease_seconds = crate::testkit::safety::MAX_TEST_LEASE_SECONDS + 1;
+        assert!(invalid.validate().is_err());
+    }
+
     /// L8: loading eBPF needs root + a recent kernel, so it is opt-in.
     #[test]
     fn ebpf_disabled_by_default() {

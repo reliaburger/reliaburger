@@ -17,6 +17,7 @@ pub mod cases;
 pub mod chaos;
 pub mod context;
 pub mod deadline;
+pub mod lease;
 pub mod oci;
 pub mod registry;
 pub mod report;
