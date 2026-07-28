@@ -391,11 +391,17 @@ doctests and the RustSec audit also pass.
 
 ### M8. Implement the corrected Phase 15 prerequisites and catalogue
 
-- [ ] Follow §8.9 of the review: contracts/safety, capability/evidence API,
-  leases/hermetic workload, ordinary catalogue, then chaos primitives.
+- [x] Land schema-versioned result/evidence/profile contracts, one inherited
+  absolute deadline, panic-safe ownership, independently verified cleanup and
+  a typed server-owned safety policy. Unknown clusters are protected and the
+  old client-side production override no longer exists.
+- [ ] Replace startup booleans with fresh expiring capability/evidence reports.
+- [ ] Add server-owned durable resource leases and a hermetic OCI workload.
+- [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
+- [ ] Add chaos primitives only after the safety, evidence and ownership gates.
 - [ ] Implement authenticated real drain/kill and node-scoped pressure before
   C1/C2/C4/C5. Unsupported scenarios must not become green skips.
-- [ ] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
+- [x] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
   source-namespace trace, documentation and real-cluster acceptance.

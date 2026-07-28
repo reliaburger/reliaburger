@@ -94,6 +94,7 @@ systems along the way, aimed at programmers coming from C, Python or Go:
 12. [Squeezing Every Drop](docs/book/12-squeezing-every-drop.md) *(in progress)*
 13. [A Room with a View](docs/book/13-a-room-with-a-view.md)
 14. [Changing the Tyres at Full Speed](docs/book/14-changing-the-tyres.md)
+15. [Ready for Production](docs/book/15-ready-for-production.md) *(in progress)*
 - [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
 
 ## What's inside
@@ -110,6 +111,7 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 ```sh
 make test                    # run the portable nextest suite
 make audit                   # reject new RustSec dependency findings
+relish test --profile development # run the 39-case live-cluster catalogue
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```

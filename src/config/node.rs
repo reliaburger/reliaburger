@@ -33,6 +33,8 @@ pub struct NodeConfig {
     pub ebpf: EbpfSection,
     pub upgrades: UpgradeSection,
     pub smoker: SmokerSection,
+    /// Server-owned permissions and limits for Phase 15 diagnostics.
+    pub testing: crate::testkit::safety::ClusterTestPolicy,
 }
 
 impl NodeConfig {
@@ -351,11 +353,9 @@ pub struct ClusterSection {
     pub reporting_port: u16,
     /// Free-form environment tag, e.g. `"production"`, `"staging"`.
     ///
-    /// Reported at `/v1/capabilities` and used as a safety interlock: the
-    /// chaos suite refuses to run against a cluster tagged `production`
-    /// unless explicitly overridden. Untagged clusters are assumed
-    /// non-production, because requiring a tag to *avoid* chaos would fail
-    /// in the wrong direction on a cluster nobody remembered to label.
+    /// This remains descriptive metadata for compatibility. Phase 15
+    /// authorisation uses the typed `[testing].safety_class` instead: an
+    /// absent or misspelt free-form tag must never weaken a safety gate.
     pub environment: Option<String>,
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2
     /// D21/CP12). Off by default; set `url` to enable.
@@ -1140,6 +1140,43 @@ mod tests {
         assert!(nc.security.bootstrap_path.is_none());
         assert!(nc.security.identity_dir.is_none());
         assert!(!nc.security.require_mtls);
+    }
+
+    #[test]
+    fn testing_policy_defaults_to_protected_and_denied() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(
+            nc.testing.safety_class,
+            crate::testkit::safety::ClusterSafetyClass::Unknown
+        );
+        assert!(nc.testing.allowed_operations.is_empty());
+        assert!(!nc.testing.allow_protected_mutation);
+    }
+
+    #[test]
+    fn testing_policy_parses_typed_permissions() {
+        let nc = NodeConfig::parse(
+            r#"
+            [testing]
+            safety_class = "development"
+            allowed_operations = [
+                "read_diagnostics",
+                "provision_isolated_workloads",
+            ]
+            max_lease_seconds = 900
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            nc.testing.safety_class,
+            crate::testkit::safety::ClusterSafetyClass::Development
+        );
+        assert!(
+            nc.testing
+                .allowed_operations
+                .contains(&crate::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads)
+        );
+        assert_eq!(nc.testing.max_lease_seconds, 900);
     }
 
     #[test]

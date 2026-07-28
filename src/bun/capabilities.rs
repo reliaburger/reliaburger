@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 /// `src/bin/bun.rs` and handed to the router.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaticCapabilities {
-    /// `[cluster] environment` — e.g. `"production"`. Chaos refuses to run
-    /// against a cluster tagged production unless explicitly overridden.
+    /// Descriptive `[cluster] environment` metadata. Safety decisions use
+    /// `test_policy`, never this free-form string.
     pub environment: Option<String>,
     /// `"process"`, `"runc"` or `"apple"`.
     pub container_runtime: String,
@@ -49,6 +49,8 @@ pub struct StaticCapabilities {
     /// with cgroup v2. Off elsewhere, which is why those faults refuse
     /// rather than pretend on macOS.
     pub cgroup_faults: bool,
+    /// Server-owned diagnostic policy. A client can inspect but not expand it.
+    pub test_policy: crate::testkit::safety::ClusterTestPolicy,
 }
 
 /// The subsystems whose presence shows up as `Some(..)` on `ApiState`.
@@ -95,6 +97,8 @@ pub struct ClusterCapabilities {
     pub firewall: bool,
     pub identity: bool,
     pub process_workloads: bool,
+    /// Permissions and limits the server will enforce for diagnostics.
+    pub test_policy: crate::testkit::safety::ClusterTestPolicy,
 }
 
 impl ClusterCapabilities {
@@ -131,6 +135,7 @@ impl ClusterCapabilities {
             firewall: statics.firewall,
             identity: statics.identity,
             process_workloads: statics.process_workloads,
+            test_policy: statics.test_policy.clone(),
         }
     }
 
@@ -165,11 +170,11 @@ impl ClusterCapabilities {
             .collect()
     }
 
-    /// Whether this cluster is tagged as production.
+    /// Whether the descriptive environment tag says production.
     ///
-    /// Compared case-insensitively: an operator who writes `"Production"`
-    /// means the same thing as one who writes `"production"`, and a chaos
-    /// guard that misses the difference is a guard that failed.
+    /// Retained for compatibility and display. It is not an authorisation
+    /// decision; [`ClusterTestPolicy`](crate::testkit::safety::ClusterTestPolicy)
+    /// owns that boundary.
     pub fn is_production(&self) -> bool {
         self.environment
             .as_deref()

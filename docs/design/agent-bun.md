@@ -1163,6 +1163,10 @@ join = ["10.0.1.5:9443"]
 | `[ingress]` | `https_port` | `443` | 1-65535 | HTTPS listen port for Wrapper. |
 | `[ingress]` | `tls_acme_email` | (none) | email string | ACME account email for Let's Encrypt certificates. |
 | `[process_workloads]` | `allowed_binaries` | `[]` | list of absolute path strings | Binaries permitted to run as process workloads. Empty = disabled. |
+| `[testing]` | `safety_class` | `"unknown"` | `unknown`, `development`, `staging`, `production` | Typed safety boundary for Phase 15 operations. Unknown is protected. |
+| `[testing]` | `allowed_operations` | `[]` | list of operation names | Server-owned permissions for diagnostics, isolated workloads, faults, node changes, capacity saturation and external probes. |
+| `[testing]` | `allow_protected_mutation` | `false` | bool | Additional server-side gate for mutation on unknown/production clusters. A client flag cannot change it. |
+| `[testing]` | `max_lease_seconds` | `3600` | positive integer seconds | Maximum lifetime of a server-owned test resource lease. |
 | `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
 | `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |

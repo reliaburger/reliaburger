@@ -8,7 +8,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
-use crate::testkit::registry::{TestCase, skip};
+use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
@@ -91,7 +91,7 @@ async fn volume_size_limit_is_enforced(ctx: TestContext) -> Result<(), String> {
     if result.contains("WRITE_FAILED") || result.contains("No space") {
         Ok(())
     } else {
-        skip("volume size enforcement is not active on this node (needs loop-mount)")
+        unknown("volume size enforcement is not active on this node (needs loop-mount)")
     }
 }
 

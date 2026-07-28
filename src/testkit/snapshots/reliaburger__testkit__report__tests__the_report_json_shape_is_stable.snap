@@ -3,41 +3,75 @@ source: src/testkit/report.rs
 expression: report
 ---
 {
-  "schema_version": 1,
-  "started_at": "2026-07-26T12:00:00Z",
+  "schema_version": 2,
+  "started_at": "2026-07-28T12:00:00Z",
   "duration_ms": 4321,
   "cluster_nodes": 3,
   "chaos": false,
+  "profile": "full-runc",
   "total": 3,
   "passed": 1,
   "failed": 1,
   "skipped": 1,
+  "unknown": 0,
   "results": [
     {
       "name": "passes",
       "group": "scheduling",
+      "required": true,
+      "started_at": "2026-07-28T10:00:00Z",
+      "finished_at": "2026-07-28T10:00:01Z",
+      "deadline_at": "2026-07-28T10:02:00Z",
       "outcome": {
-        "status": "passed"
+        "status": "pass"
       },
-      "duration_ms": 10
+      "duration_ms": 10,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "case",
+          "observed_at": "2026-07-28T10:00:00Z",
+          "detail": "live assertion completed"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
     },
     {
       "name": "skips",
-      "group": "ingress",
+      "group": "scheduling",
+      "required": false,
+      "started_at": "2026-07-28T10:00:00Z",
+      "finished_at": "2026-07-28T10:00:01Z",
+      "deadline_at": "2026-07-28T10:02:00Z",
       "outcome": {
         "status": "skipped",
+        "capability": "ingress",
         "reason": "capability ingress unavailable"
       },
-      "duration_ms": 10
+      "duration_ms": 10,
+      "evidence": [],
+      "cleanup": {
+        "status": "not_required"
+      }
     },
     {
       "name": "fails",
-      "group": "jobs",
+      "group": "scheduling",
+      "required": true,
+      "started_at": "2026-07-28T10:00:00Z",
+      "finished_at": "2026-07-28T10:00:01Z",
+      "deadline_at": "2026-07-28T10:02:00Z",
       "outcome": {
-        "status": "failed",
-        "message": "expected Succeeded, saw Failed"
+        "status": "fail",
+        "reason": "expected Succeeded, saw Failed"
       },
-      "duration_ms": 10
+      "duration_ms": 10,
+      "evidence": [],
+      "cleanup": {
+        "status": "confirmed"
+      }
     }
   ]
 }

@@ -7,14 +7,14 @@ use crate::bun::capabilities::Capability;
 use crate::config::Config;
 use crate::relish::client::BunClient;
 use crate::testkit::TestContext;
-use crate::testkit::registry::{TestCase, skip};
+use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
 /// A running workload's SPIFFE certificate isn't reachable through the API, so
 /// this can't be asserted end-to-end from the harness yet.
 async fn workload_receives_spiffe_certificate(_ctx: TestContext) -> Result<(), String> {
-    skip("a workload's SPIFFE certificate is not exposed via the orchestrator API")
+    unknown("a workload's SPIFFE certificate is not exposed via the orchestrator API")
 }
 
 /// The JWKS endpoint serves at least one well-formed signing key.

@@ -10,6 +10,6 @@ scheduling
 service-discovery
   FAIL  resolve_returns_vip_and_healthy_backends  (80 ms)  expected 2 backends, saw 1
 health-checks
-  TIME  hanging_health_check_marks_instance_unhealthy  (120000 ms)  timed out
+  UNKN  hanging_health_check_marks_instance_unhealthy  (120000 ms)  case exceeded its 120000 ms deadline
 
-4 tests: 1 passed, 2 failed, 1 skipped  (4.3s)
+4 tests: 1 passed, 1 failed, 1 skipped, 1 unknown  (4.3s)

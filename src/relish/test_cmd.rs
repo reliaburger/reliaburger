@@ -7,10 +7,11 @@
 //! The exit code is the point. A run with a failure exits non-zero so a
 //! pipeline can gate on it, and that "found problems" signal is distinct from
 //! "the tool couldn't run at all" (a `RelishError`, exit 1 via the usual
-//! path). Skips never fail a run: an unwired subsystem is reported, not
-//! punished.
+//! path). A development profile may accept a typed optional skip; a full
+//! profile rejects required skips, unknown evidence, timeouts and unconfirmed
+//! cleanup.
 
-use crate::testkit::{self, RunConfig, TestGroup, TestOutcome, TestReport};
+use crate::testkit::{self, RunConfig, TestGroup, TestOutcome, TestProfile, TestReport};
 
 use super::client::BunClient;
 use super::fault::parse_duration;
@@ -27,6 +28,8 @@ pub struct TestArgs {
     pub timeout: String,
     /// `--chaos`: run the chaos suite instead of the integration suite.
     pub chaos: bool,
+    /// Acceptance policy for required cases and known skips.
+    pub profile: String,
     /// `--namespace`: run every case in one namespace instead of one each.
     pub namespace: Option<String>,
     /// `--output`: how to render the report.
@@ -44,6 +47,27 @@ async fn run_with_client(
     client: &BunClient,
 ) -> Result<CommandOutcome, RelishError> {
     let timeout = parse_duration(&args.timeout)?;
+    if timeout.is_zero() {
+        return Err(RelishError::InvalidFlag {
+            flag: "timeout".to_string(),
+            reason: "must be greater than zero".to_string(),
+        });
+    }
+    let profile: TestProfile = args
+        .profile
+        .parse()
+        .map_err(|reason| RelishError::InvalidFlag {
+            flag: "profile".to_string(),
+            reason,
+        })?;
+    if let Some(namespace) = &args.namespace
+        && !testkit::TestContext::is_test_namespace(namespace)
+    {
+        return Err(RelishError::InvalidFlag {
+            flag: "namespace".to_string(),
+            reason: "must use the reserved rbtest-* prefix".to_string(),
+        });
+    }
 
     // The whole harness keys off capabilities, so a node we can't ask is a
     // hard error, not an empty run that looks like a pass.
@@ -83,6 +107,7 @@ async fn run_with_client(
             parallel: args.parallel,
             timeout,
             chaos: args.chaos,
+            profile,
             fixed_namespace: args.namespace.clone(),
         },
     )
@@ -153,10 +178,10 @@ fn render_human(report: &TestReport) -> String {
             last_group = Some(result.group);
         }
         let (mark, detail) = match &result.outcome {
-            TestOutcome::Passed => ("PASS", String::new()),
-            TestOutcome::Failed { message } => ("FAIL", format!("  {message}")),
-            TestOutcome::Skipped { reason } => ("SKIP", format!("  {reason}")),
-            TestOutcome::TimedOut => ("TIME", "  timed out".to_string()),
+            TestOutcome::Pass => ("PASS", String::new()),
+            TestOutcome::Fail { reason } => ("FAIL", format!("  {reason}")),
+            TestOutcome::Skipped { reason, .. } => ("SKIP", format!("  {reason}")),
+            TestOutcome::Unknown { reason, .. } => ("UNKN", format!("  {reason}")),
         };
         let _ = writeln!(
             out,
@@ -168,8 +193,8 @@ fn render_human(report: &TestReport) -> String {
     let seconds = report.duration_ms as f64 / 1000.0;
     let _ = writeln!(
         out,
-        "\n{} {suite}: {} passed, {} failed, {} skipped  ({:.1}s)",
-        report.total, report.passed, report.failed, report.skipped, seconds
+        "\n{} {suite}: {} passed, {} failed, {} skipped, {} unknown  ({:.1}s)",
+        report.total, report.passed, report.failed, report.skipped, report.unknown, seconds
     );
     out
 }
@@ -177,7 +202,10 @@ fn render_human(report: &TestReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::report::{TestCaseResult, TestGroup, TestOutcome};
+    use crate::testkit::report::{
+        CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
+        UnknownKind,
+    };
 
     fn result(
         name: &str,
@@ -185,11 +213,26 @@ mod tests {
         outcome: TestOutcome,
         duration_ms: u64,
     ) -> TestCaseResult {
+        let evidence = matches!(outcome, TestOutcome::Pass)
+            .then(|| TestEvidence {
+                kind: EvidenceKind::Observed,
+                source: name.to_string(),
+                observed_at: "2026-07-28T12:00:00Z".to_string(),
+                detail: "assertion observed".to_string(),
+            })
+            .into_iter()
+            .collect();
         TestCaseResult {
             name: name.to_string(),
             group,
+            required: false,
+            started_at: "2026-07-28T12:00:00Z".to_string(),
+            finished_at: "2026-07-28T12:00:01Z".to_string(),
+            deadline_at: "2026-07-28T12:02:00Z".to_string(),
             outcome,
             duration_ms,
+            evidence,
+            cleanup: CleanupOutcome::NotRequired,
         }
     }
 
@@ -199,13 +242,14 @@ mod tests {
                 result(
                     "schedule_fixed_replicas_across_nodes",
                     TestGroup::Scheduling,
-                    TestOutcome::Passed,
+                    TestOutcome::Pass,
                     120,
                 ),
                 result(
                     "schedule_respects_required_placement_label",
                     TestGroup::Scheduling,
                     TestOutcome::Skipped {
+                        capability: crate::bun::capabilities::Capability::MultiNode,
                         reason: "requires multi_node".to_string(),
                     },
                     0,
@@ -213,15 +257,18 @@ mod tests {
                 result(
                     "resolve_returns_vip_and_healthy_backends",
                     TestGroup::ServiceDiscovery,
-                    TestOutcome::Failed {
-                        message: "expected 2 backends, saw 1".to_string(),
+                    TestOutcome::Fail {
+                        reason: "expected 2 backends, saw 1".to_string(),
                     },
                     80,
                 ),
                 result(
                     "hanging_health_check_marks_instance_unhealthy",
                     TestGroup::HealthChecks,
-                    TestOutcome::TimedOut,
+                    TestOutcome::Unknown {
+                        kind: UnknownKind::TimedOut,
+                        reason: "case exceeded its 120000 ms deadline".to_string(),
+                    },
                     120_000,
                 ),
             ],
@@ -229,6 +276,7 @@ mod tests {
             4321,
             3,
             false,
+            TestProfile::Development,
         )
     }
 
@@ -256,11 +304,12 @@ mod tests {
         // Clean report: only a pass and a skip.
         let clean = TestReport::from_results(
             vec![
-                result("passes", TestGroup::Scheduling, TestOutcome::Passed, 10),
+                result("passes", TestGroup::Scheduling, TestOutcome::Pass, 10),
                 result(
                     "skips",
                     TestGroup::Ingress,
                     TestOutcome::Skipped {
+                        capability: crate::bun::capabilities::Capability::Ingress,
                         reason: "no ingress".to_string(),
                     },
                     0,
@@ -270,6 +319,7 @@ mod tests {
             10,
             1,
             false,
+            TestProfile::Development,
         );
         assert!(!clean.failed_any());
     }

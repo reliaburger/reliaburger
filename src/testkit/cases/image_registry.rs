@@ -10,7 +10,7 @@
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
 use crate::testkit::oci;
-use crate::testkit::registry::{TestCase, skip};
+use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
@@ -64,7 +64,7 @@ async fn manifest_catalog_lists_pushed_image(ctx: TestContext) -> Result<(), Str
 /// marker file, no binary). Skipped until the harness can stage a runnable
 /// image in Pickle.
 async fn deploy_from_cluster_registry(_ctx: TestContext) -> Result<(), String> {
-    skip("needs a runnable image in the cluster registry; the synthetic fixture isn't runnable")
+    unknown("needs a runnable image in the cluster registry; the synthetic fixture isn't runnable")
 }
 
 pub fn cases() -> Vec<TestCase> {

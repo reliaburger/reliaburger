@@ -1315,7 +1315,12 @@ convergence and adoption" theme under 12b.6).
 - [x] Required CI and release validation: portable Linux/macOS, privileged Linux, cluster,
   node/cluster upgrade, coverage and three benchmark/scale jobs; release publication waits
   for the same reusable workflow. Apple Container remains a documented manual exception
-- [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
+- [x] `relish test` ordinary catalogue: 39 cases across all 13 planned groups,
+  bounded parallel execution, filtering, human/JSON/YAML reports and four
+  acceptance profiles. Report schema v2 separates `Pass`, `Fail`, typed
+  `Skipped` and `Unknown`; timeouts, panics and untyped runtime skips are
+  unknown, cleanup has an independent verdict, and full profiles reject
+  required skips or missing observed evidence
 - [ ] `relish test --chaos` (integration tests + Smoker fault injection)
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
 - [ ] `relish wtf` (automated cluster health diagnosis)
@@ -1376,6 +1381,14 @@ convergence and adoption" theme under 12b.6).
 - [ ] Real deployment operation state (M6)
 - [ ] Explicit v1 ingress/TLS contract (M7)
 - [ ] Corrected Phase 15 prerequisites and catalogue (M8)
+  - [x] Result/evidence/profile contracts, inherited absolute deadlines,
+    panic-safe runner ownership, verified cleanup reporting and typed
+    server-owned `[testing]` safety policy. Unknown clusters fail protected;
+    the client-side production override was removed
+  - [ ] Fresh expiring capability/evidence API
+  - [ ] Server-owned durable resource leases
+  - [ ] Hermetic multi-architecture OCI workload and catalogue migration
+  - [ ] Real node and pressure primitives before the chaos catalogue
 
 ### Optional
 

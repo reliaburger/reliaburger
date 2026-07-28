@@ -6,11 +6,13 @@
 //! else — which is what makes it safe to point `relish test` at a cluster
 //! that has real work on it.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::bun::agent::InstanceStatus;
 use crate::bun::capabilities::ClusterCapabilities;
 use crate::relish::client::BunClient;
+use crate::testkit::deadline::Deadline;
+use crate::testkit::report::CleanupOutcome;
 
 /// Prefix for every namespace the test runner creates.
 ///
@@ -42,6 +44,8 @@ pub struct TestContext {
     /// case fails with a useful message rather than being killed from
     /// outside with none.
     pub timeout: Duration,
+    /// One absolute case deadline. Poll helpers must not start fresh budgets.
+    pub deadline: Deadline,
 }
 
 impl TestContext {
@@ -294,7 +298,6 @@ impl TestContext {
     where
         F: Fn(&[InstanceStatus]) -> bool,
     {
-        let deadline = Instant::now() + self.timeout;
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
             if let Ok(instances) = self.cluster_instances(app).await {
@@ -303,7 +306,7 @@ impl TestContext {
                     return Ok(());
                 }
             }
-            if Instant::now() >= deadline {
+            if self.deadline.remaining().is_zero() {
                 let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
                 return Err(format!(
                     "timed out after {:?} waiting for {app} to reach {what} cluster-wide; \
@@ -357,13 +360,10 @@ impl TestContext {
     where
         F: Fn(&[InstanceStatus]) -> bool,
     {
-        let deadline = Instant::now() + self.timeout;
         let poll = Duration::from_millis(500);
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
-            if let Ok(Ok(all)) =
-                tokio::time::timeout(Duration::from_secs(10), self.client.status()).await
-            {
+            if let Ok(Ok(all)) = self.deadline.run("status poll", self.client.status()).await {
                 last = all
                     .into_iter()
                     .filter(|instance| {
@@ -374,7 +374,7 @@ impl TestContext {
                     return Ok(());
                 }
             }
-            if Instant::now() >= deadline {
+            if self.deadline.remaining().is_zero() {
                 let seen: Vec<(&str, &str)> = last
                     .iter()
                     .map(|instance| (instance.app_name.as_str(), instance.state.as_str()))
@@ -390,32 +390,86 @@ impl TestContext {
         }
     }
 
-    /// Stop every app this case created. Best-effort: it never errors and
-    /// never returns anything the runner has to check.
+    /// Stop every app this case created and report whether removal was seen.
     ///
     /// The runner calls this after *every* case — pass, fail or timeout —
     /// because the case that failed halfway is exactly the one that left a
     /// workload running. The [`is_test_namespace`](Self::is_test_namespace)
     /// guard is a second lock on top of the name match: even a bug in
     /// namespace construction cannot make teardown stop an operator's app.
-    pub async fn teardown(&self) {
+    pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
         if !Self::is_test_namespace(&self.namespace) {
-            return;
+            return CleanupOutcome::Failed {
+                reason: format!("refused to clean unsafe namespace {}", self.namespace),
+            };
         }
-        let Ok(instances) = self.client.status().await else {
-            // A cluster we can't reach has nothing we can tear down. Not an
-            // error the caller can act on — swallow it.
-            return;
+        let instances = match deadline.run("cleanup status", self.client.status()).await {
+            Ok(Ok(instances)) => instances,
+            Ok(Err(error)) => {
+                return CleanupOutcome::Unknown {
+                    reason: format!("could not inspect owned resources: {error}"),
+                };
+            }
+            Err(error) => {
+                return CleanupOutcome::Unknown {
+                    reason: error.to_string(),
+                };
+            }
         };
-        let mut apps: Vec<&str> = instances
+        let mut apps: Vec<String> = instances
             .iter()
             .filter(|instance| instance.namespace == self.namespace)
-            .map(|instance| instance.app_name.as_str())
+            .map(|instance| instance.app_name.clone())
             .collect();
         apps.sort_unstable();
         apps.dedup();
-        for app in apps {
-            let _ = self.client.stop(app, &self.namespace).await;
+        if apps.is_empty() {
+            return CleanupOutcome::NotRequired;
+        }
+        for app in &apps {
+            match deadline
+                .run("cleanup stop", self.client.stop(app, &self.namespace))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return CleanupOutcome::Failed {
+                        reason: format!("failed to stop {app}: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return CleanupOutcome::Unknown {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+        }
+
+        loop {
+            match deadline
+                .run("cleanup confirmation", self.client.status())
+                .await
+            {
+                Ok(Ok(instances))
+                    if !instances.iter().any(|instance| {
+                        instance.namespace == self.namespace && apps.contains(&instance.app_name)
+                    }) =>
+                {
+                    return CleanupOutcome::Confirmed;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return CleanupOutcome::Unknown {
+                        reason: format!("could not confirm cleanup: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return CleanupOutcome::Unknown {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 }
@@ -445,6 +499,7 @@ mod tests {
             namespace: namespace.to_string(),
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
+            deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
         }
     }
 

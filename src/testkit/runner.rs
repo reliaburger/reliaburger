@@ -23,12 +23,16 @@ use crate::bun::capabilities::ClusterCapabilities;
 use crate::relish::client::BunClient;
 
 use super::context::TestContext;
+use super::deadline::Deadline;
 use super::registry::TestCase;
-use super::report::{TestCaseResult, TestGroup, TestOutcome, TestReport};
+use super::report::{
+    CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
+    TestProfile, TestReport, UnknownKind,
+};
 
-/// How long teardown gets before the runner gives up on it. Teardown is
-/// best-effort, but a hung agent must not wedge the whole run — timeout it
-/// like everything else.
+/// How long teardown gets before the runner records that cleanup is unknown.
+/// A hung agent must not wedge the whole run, but lack of cleanup evidence
+/// must not disappear behind a green case result either.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Everything a run needs beyond the cases themselves.
@@ -40,10 +44,12 @@ pub struct RunConfig {
     pub run_id: String,
     /// Maximum cases running at once.
     pub parallel: usize,
-    /// Per-case budget. A case that overruns it is [`TestOutcome::TimedOut`].
+    /// Per-case budget. A case that overruns it becomes `Unknown(TimedOut)`.
     pub timeout: Duration,
     /// Whether this is the chaos suite (recorded in the report, not behaviour).
     pub chaos: bool,
+    /// Determines which known capability gaps may remain optional.
+    pub profile: TestProfile,
     /// `--namespace`: run every case in this one namespace instead of a fresh
     /// one each. `None` keeps per-case isolation, which is the default and the
     /// safer choice against a live cluster.
@@ -60,15 +66,17 @@ struct Indexed {
 /// Run `cases` and aggregate a [`TestReport`].
 ///
 /// Cases run concurrently, capped at `config.parallel`. A case missing a
-/// required capability is skipped — never failed — with a reason. Each case
-/// gets its own namespace (unless `fixed_namespace` overrides) and is torn
-/// down afterwards regardless of outcome. Results come back in catalogue
-/// order even though cases complete out of order.
+/// capability records a typed skip; a full acceptance profile rejects that
+/// skip when the case is required. Each case gets its own namespace (unless a
+/// safe `rbtest-*` namespace was explicitly requested) and is torn down
+/// afterwards regardless of outcome. Results come back in catalogue order
+/// even though cases complete out of order.
 pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
     let started_at = now_rfc3339();
     let run_start = Instant::now();
     let cluster_nodes = config.capabilities.node_count;
     let chaos = config.chaos;
+    let profile = config.profile;
 
     // `max(1)` because a semaphore of zero permits would deadlock every case.
     let semaphore = Arc::new(Semaphore::new(config.parallel.max(1)));
@@ -90,6 +98,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
             .clone()
             .unwrap_or_else(|| TestContext::namespace_for(&config.run_id, index));
         let timeout = config.timeout;
+        let profile = config.profile;
         let name = case.name.to_string();
         let group = case.group;
 
@@ -100,7 +109,15 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
                 .acquire()
                 .await
                 .expect("runner semaphore is never closed");
-            let result = run_one(&case, client, namespace, capabilities.as_ref(), timeout).await;
+            let result = run_one(
+                &case,
+                client,
+                namespace,
+                capabilities.as_ref(),
+                timeout,
+                profile,
+            )
+            .await;
             Indexed { index, result }
         });
         identities.insert(handle.id(), (index, name, group));
@@ -121,10 +138,19 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
                     result: TestCaseResult {
                         name,
                         group,
-                        outcome: TestOutcome::Failed {
-                            message: format!("case panicked: {join_error}"),
+                        required: true,
+                        started_at: now_rfc3339(),
+                        finished_at: now_rfc3339(),
+                        deadline_at: now_rfc3339(),
+                        outcome: TestOutcome::Unknown {
+                            kind: UnknownKind::Panicked,
+                            reason: format!("runner task panicked: {join_error}"),
                         },
                         duration_ms: 0,
+                        evidence: Vec::new(),
+                        cleanup: CleanupOutcome::Unknown {
+                            reason: "runner task ended before cleanup evidence".to_string(),
+                        },
                     },
                 });
             }
@@ -140,6 +166,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
         run_start.elapsed().as_millis() as u64,
         cluster_nodes,
         chaos,
+        profile,
     )
 }
 
@@ -150,53 +177,117 @@ async fn run_one(
     namespace: String,
     capabilities: &ClusterCapabilities,
     timeout: Duration,
+    profile: TestProfile,
 ) -> TestCaseResult {
     let start = Instant::now();
+    let started_at = now_rfc3339();
+    let deadline_at = rfc3339_after(timeout);
+    let required = profile_requires_case(profile, case.requires);
 
     let missing = capabilities.missing(case.requires);
-    if !missing.is_empty() {
+    if let Some(capability) = missing.first().copied() {
         let names: Vec<String> = missing.iter().map(|c| c.to_string()).collect();
         return TestCaseResult {
             name: case.name.to_string(),
             group: case.group,
+            required,
+            started_at,
+            finished_at: now_rfc3339(),
+            deadline_at,
             outcome: TestOutcome::Skipped {
+                capability,
                 reason: format!("requires {}", names.join(", ")),
             },
             duration_ms: start.elapsed().as_millis() as u64,
+            evidence: Vec::new(),
+            cleanup: CleanupOutcome::NotRequired,
         };
     }
+
+    let deadline = Deadline::after(timeout).expect("CLI rejects a zero timeout");
 
     let context = TestContext {
         client,
         namespace,
         capabilities: capabilities.clone(),
         timeout,
+        deadline,
     };
 
-    let outcome = match tokio::time::timeout(timeout, (case.run)(context.clone())).await {
-        Ok(Ok(())) => TestOutcome::Passed,
-        // A case can skip itself at runtime for a condition `requires` can't
-        // express — it returns `skip(reason)`, which we translate here rather
-        // than count as a failure.
-        Ok(Err(message)) => match message.strip_prefix(super::registry::SKIP_MARKER) {
-            Some(reason) => TestOutcome::Skipped {
-                reason: reason.to_string(),
+    // The case body gets its own task so a panic is data and the outer owner
+    // still reaches cleanup. Spawning `run_one` directly did the opposite.
+    let body = tokio::spawn((case.run)(context.clone()));
+    let outcome = match deadline.run("case", body).await {
+        Ok(Ok(Ok(()))) => TestOutcome::Pass,
+        Ok(Ok(Err(message))) => match message.strip_prefix(super::registry::UNKNOWN_MARKER) {
+            Some(reason) => TestOutcome::Unknown {
+                kind: UnknownKind::MissingEvidence,
+                reason: format!("case could not establish a verdict: {reason}"),
             },
-            None => TestOutcome::Failed { message },
+            None => TestOutcome::Fail { reason: message },
         },
-        Err(_elapsed) => TestOutcome::TimedOut,
+        Ok(Err(join_error)) => TestOutcome::Unknown {
+            kind: UnknownKind::Panicked,
+            reason: format!("case panicked: {join_error}"),
+        },
+        Err(_) => TestOutcome::timed_out("case", deadline.budget_ms()),
     };
 
-    // Always, whatever happened above. A case that timed out is the one most
-    // likely to have left a workload running, so this is precisely when
-    // teardown matters most.
-    let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, context.teardown()).await;
+    let cleanup_deadline = Deadline::after(TEARDOWN_TIMEOUT).expect("non-zero cleanup timeout");
+    let cleanup = context.teardown(cleanup_deadline).await;
+    let finished_at = now_rfc3339();
+    let evidence = matches!(outcome, TestOutcome::Pass)
+        .then(|| TestEvidence {
+            kind: EvidenceKind::Observed,
+            source: case.name.to_string(),
+            observed_at: finished_at.clone(),
+            detail: "case completed its live assertions".to_string(),
+        })
+        .into_iter()
+        .collect();
 
     TestCaseResult {
         name: case.name.to_string(),
         group: case.group,
+        required,
+        started_at,
+        finished_at,
+        deadline_at,
         outcome,
         duration_ms: start.elapsed().as_millis() as u64,
+        evidence,
+        cleanup,
+    }
+}
+
+/// Whether a profile promises to exercise this case rather than merely list it.
+fn profile_requires_case(
+    profile: TestProfile,
+    requires: &[crate::bun::capabilities::Capability],
+) -> bool {
+    use crate::bun::capabilities::Capability;
+    match profile {
+        TestProfile::Development => false,
+        TestProfile::FullRunc => !requires.contains(&Capability::ProcessRuntime),
+        TestProfile::FullApple => !requires.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::ProcessRuntime
+                    | Capability::Ebpf
+                    | Capability::Firewall
+                    | Capability::CgroupFaults
+            )
+        }),
+        TestProfile::ProcessGrill => !requires.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::ContainerRuntime
+                    | Capability::Ebpf
+                    | Capability::Firewall
+                    | Capability::Ingress
+                    | Capability::CgroupFaults
+            )
+        }),
     }
 }
 
@@ -207,6 +298,20 @@ async fn run_one(
 /// always available, the format string is not.
 fn now_rfc3339() -> String {
     let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
+}
+
+fn rfc3339_after(duration: Duration) -> String {
+    let system_time = std::time::SystemTime::now() + duration;
+    let now = time::OffsetDateTime::from(system_time);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         now.year(),
@@ -263,6 +368,7 @@ mod tests {
             parallel,
             timeout: Duration::from_secs(5),
             chaos: false,
+            profile: TestProfile::Development,
             fixed_namespace: None,
         }
     }
@@ -310,7 +416,10 @@ mod tests {
             "a skipped case must not have run its body"
         );
         match &report.results[0].outcome {
-            TestOutcome::Skipped { reason } => assert!(reason.contains("ebpf"), "{reason}"),
+            TestOutcome::Skipped { reason, capability } => {
+                assert_eq!(*capability, Capability::Ebpf);
+                assert!(reason.contains("ebpf"), "{reason}");
+            }
             other => panic!("expected skip, got {other:?}"),
         }
     }
@@ -332,29 +441,30 @@ mod tests {
 
         assert_eq!(report.passed, 1);
         assert_eq!(report.failed, 1);
-        assert_eq!(report.results[0].outcome, TestOutcome::Passed);
+        assert_eq!(report.results[0].outcome, TestOutcome::Pass);
         match &report.results[1].outcome {
-            TestOutcome::Failed { message } => assert_eq!(message, "expected 3, saw 1"),
+            TestOutcome::Fail { reason } => assert_eq!(reason, "expected 3, saw 1"),
             other => panic!("expected failure, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn a_case_can_skip_itself_at_runtime() {
+    async fn a_case_without_runtime_evidence_becomes_unknown() {
         async fn body(_ctx: TestContext) -> Result<(), String> {
-            super::super::registry::skip("no labelled node to target")
+            super::super::registry::unknown("no labelled node to target")
         }
-        let cases = vec![case("runtime_skip", &[], testkit_case!(body))];
+        let cases = vec![case("missing_evidence", &[], testkit_case!(body))];
 
         let report = run(cases, config(dead_client(), full_capabilities(), 4)).await;
 
-        assert_eq!(report.skipped, 1);
+        assert_eq!(report.unknown, 1);
         assert_eq!(report.failed, 0);
         match &report.results[0].outcome {
-            TestOutcome::Skipped { reason } => {
-                assert_eq!(reason, "no labelled node to target");
+            TestOutcome::Unknown { kind, reason } => {
+                assert_eq!(*kind, UnknownKind::MissingEvidence);
+                assert!(reason.contains("no labelled node to target"));
             }
-            other => panic!("expected skip, got {other:?}"),
+            other => panic!("expected unknown, got {other:?}"),
         }
     }
 
@@ -370,12 +480,22 @@ mod tests {
 
         let report = run(cases, cfg).await;
 
-        assert_eq!(report.failed, 1, "a timeout counts as a failure");
-        assert_eq!(report.results[0].outcome, TestOutcome::TimedOut);
+        assert_eq!(
+            report.failed, 0,
+            "unknown is counted separately from failure"
+        );
+        assert_eq!(report.unknown, 1);
+        assert!(matches!(
+            report.results[0].outcome,
+            TestOutcome::Unknown {
+                kind: UnknownKind::TimedOut,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn a_panicking_case_becomes_a_failure_not_a_lost_run() {
+    async fn a_panicking_case_becomes_unknown_and_still_reaches_cleanup() {
         async fn boom(_ctx: TestContext) -> Result<(), String> {
             panic!("something unexpected");
         }
@@ -391,10 +511,17 @@ mod tests {
 
         assert_eq!(report.total, 2);
         assert_eq!(report.passed, 1);
-        assert_eq!(report.failed, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.unknown, 1);
         // The panicked case keeps its identity and its place.
         assert_eq!(report.results[0].name, "boom");
-        assert!(report.results[0].outcome.is_failure());
+        assert!(matches!(
+            report.results[0].outcome,
+            TestOutcome::Unknown {
+                kind: UnknownKind::Panicked,
+                ..
+            }
+        ));
         assert_eq!(report.results[1].name, "fine");
     }
 
@@ -464,14 +591,16 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().unwrap());
         let recorder = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let recorder_for_task = Arc::clone(&recorder);
+        let remaining: Vec<InstanceStatus> = serde_json::from_str(&status_body).unwrap();
+        let remaining = Arc::new(tokio::sync::Mutex::new(remaining));
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
                     break;
                 };
                 let recorder = Arc::clone(&recorder_for_task);
-                let body = status_body.clone();
-                tokio::spawn(handle_mock_conn(socket, recorder, body));
+                let remaining = Arc::clone(&remaining);
+                tokio::spawn(handle_mock_conn(socket, recorder, remaining));
             }
         });
         (address, recorder)
@@ -480,7 +609,7 @@ mod tests {
     async fn handle_mock_conn(
         mut socket: TcpStream,
         recorder: Arc<tokio::sync::Mutex<Vec<String>>>,
-        status_body: String,
+        remaining: Arc<tokio::sync::Mutex<Vec<InstanceStatus>>>,
     ) {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
@@ -499,6 +628,7 @@ mod tests {
         let request = String::from_utf8_lossy(&buf);
         let request_line = request.lines().next().unwrap_or("");
         let response = if request_line.starts_with("GET /v1/status") {
+            let status_body = serde_json::to_string(&*remaining.lock().await).unwrap();
             mock_response(200, &status_body)
         } else if request_line.starts_with("POST /v1/stop/") {
             let path = request_line
@@ -506,7 +636,15 @@ mod tests {
                 .nth(1)
                 .unwrap_or("")
                 .to_string();
-            recorder.lock().await.push(path);
+            recorder.lock().await.push(path.clone());
+            if let Some(target) = path.strip_prefix("/v1/stop/")
+                && let Some((app, namespace)) = target.split_once('/')
+            {
+                remaining
+                    .lock()
+                    .await
+                    .retain(|instance| instance.app_name != app || instance.namespace != namespace);
+            }
             mock_response(200, "")
         } else {
             mock_response(404, "")

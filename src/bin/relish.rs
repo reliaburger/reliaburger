@@ -368,12 +368,9 @@ enum Command {
         /// Run the chaos suite instead of the integration suite.
         #[arg(long)]
         chaos: bool,
-        /// Allow chaos against a cluster tagged environment = "production".
-        #[arg(long = "override")]
-        override_production: bool,
-        /// Skip the interactive chaos confirmation prompt (for CI).
-        #[arg(long)]
-        yes: bool,
+        /// Acceptance profile: development, full-runc, full-apple, process-grill.
+        #[arg(long, default_value = "development")]
+        profile: String,
         /// Run all tests inside one fixed namespace instead of one per test.
         #[arg(long)]
         namespace: Option<String>,
@@ -1336,11 +1333,7 @@ async fn main() -> ExitCode {
             parallel,
             timeout,
             chaos,
-            // The production/confirmation guards these two feed land with the
-            // chaos scenarios in a later Phase 15 step; parsed now so the flag
-            // surface is stable.
-            override_production: _,
-            yes: _,
+            profile,
             namespace,
         } => {
             // `relish test` reports pass/fail through its exit code, so it
@@ -1351,6 +1344,7 @@ async fn main() -> ExitCode {
                     parallel,
                     timeout,
                     chaos,
+                    profile,
                     namespace,
                     output: cli.output,
                 })
@@ -1483,11 +1477,10 @@ mod tests {
                 filter: None,
                 parallel: 4,
                 chaos: false,
-                override_production: false,
-                yes: false,
+                ref profile,
                 namespace: None,
                 ..
-            }
+            } if profile == "development"
         ));
 
         let full = parse(&[
@@ -1500,8 +1493,8 @@ mod tests {
             "--timeout",
             "5m",
             "--chaos",
-            "--override",
-            "--yes",
+            "--profile",
+            "full-runc",
             "--namespace",
             "rbtest-fixed",
         ])
@@ -1512,20 +1505,24 @@ mod tests {
                 parallel,
                 timeout,
                 chaos,
-                override_production,
-                yes,
+                profile,
                 namespace,
             } => {
                 assert_eq!(filter.as_deref(), Some("scheduling,firewall"));
                 assert_eq!(parallel, 8);
                 assert_eq!(timeout, "5m");
                 assert!(chaos);
-                assert!(override_production);
-                assert!(yes);
+                assert_eq!(profile, "full-runc");
                 assert_eq!(namespace.as_deref(), Some("rbtest-fixed"));
             }
             _ => panic!("expected a Test command"),
         }
+    }
+
+    #[test]
+    fn test_command_has_no_client_side_production_override() {
+        assert!(parse(&["relish", "test", "--override"]).is_err());
+        assert!(parse(&["relish", "test", "--yes"]).is_err());
     }
 
     #[test]

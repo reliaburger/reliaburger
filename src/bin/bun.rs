@@ -1505,6 +1505,7 @@ async fn main() -> anyhow::Result<()> {
         process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
         // CPU/memory/disk faults write cgroup v2 files.
         cgroup_faults: cfg!(target_os = "linux"),
+        test_policy: config.testing.clone(),
     };
 
     let app = api::router_with_upgrade(

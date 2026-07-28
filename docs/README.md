@@ -380,6 +380,7 @@ Commands:
 | `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
 | `join-token create --node-id <id> --ttl 15m` | Mint one Admin-authorised, single-use token that enrols exactly that node id |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
+| `test [--profile <profile>]` | Run the 39-case live-cluster catalogue; full profiles fail on required skips, unknown evidence or unconfirmed cleanup |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |
 | `top` | Show live resource usage (CPU, memory) for all apps |

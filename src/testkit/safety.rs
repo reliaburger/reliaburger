@@ -1,0 +1,204 @@
+//! Server-owned permission policy for Phase 15 operations.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::sesame::types::ApiRole;
+
+/// Operator-declared cluster class. Unknown is protected, not development.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterSafetyClass {
+    #[default]
+    Unknown,
+    Development,
+    Staging,
+    Production,
+}
+
+impl ClusterSafetyClass {
+    /// Whether mutation needs the explicit protected-cluster server gate.
+    pub fn is_protected(self) -> bool {
+        matches!(self, Self::Unknown | Self::Production)
+    }
+}
+
+/// Independently authorised Phase 15 operation classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationPermission {
+    ReadDiagnostics,
+    ProvisionIsolatedWorkloads,
+    InjectWorkloadFaults,
+    AlterNodeState,
+    SaturateCapacity,
+    ProbeExternalDestination,
+}
+
+impl OperationPermission {
+    /// Lowest API role which may request this operation.
+    pub fn minimum_role(self) -> ApiRole {
+        match self {
+            Self::ReadDiagnostics => ApiRole::ReadOnly,
+            Self::ProvisionIsolatedWorkloads | Self::InjectWorkloadFaults => ApiRole::Deployer,
+            Self::AlterNodeState | Self::SaturateCapacity | Self::ProbeExternalDestination => {
+                ApiRole::Admin
+            }
+        }
+    }
+
+    fn needs_acknowledgement(self) -> bool {
+        matches!(
+            self,
+            Self::InjectWorkloadFaults | Self::AlterNodeState | Self::SaturateCapacity
+        )
+    }
+
+    fn mutates_or_probes(self) -> bool {
+        self != Self::ReadDiagnostics
+    }
+}
+
+/// Server-side test policy. Client flags cannot expand it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClusterTestPolicy {
+    /// Typed operator declaration. Missing configuration remains `Unknown`.
+    pub safety_class: ClusterSafetyClass,
+    /// Operation classes this server will accept.
+    pub allowed_operations: BTreeSet<OperationPermission>,
+    /// Additional server-side gate for mutation on protected clusters.
+    pub allow_protected_mutation: bool,
+    /// Longest resource lease this server may issue.
+    pub max_lease_seconds: u64,
+    /// Destinations trace may probe when the caller also has permission.
+    pub external_probe_allowlist: Vec<String>,
+}
+
+impl Default for ClusterTestPolicy {
+    fn default() -> Self {
+        Self {
+            safety_class: ClusterSafetyClass::Unknown,
+            allowed_operations: BTreeSet::new(),
+            allow_protected_mutation: false,
+            max_lease_seconds: 3_600,
+            external_probe_allowlist: Vec::new(),
+        }
+    }
+}
+
+/// Authenticated caller facts. Acknowledgement records consent, not authority.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationAuthorisation<'a> {
+    /// Authenticated identity used in audit evidence.
+    pub principal: &'a str,
+    /// Role established by the API authentication layer.
+    pub role: ApiRole,
+    /// Explicit operator consent; this grants no authority on its own.
+    pub acknowledged: bool,
+}
+
+/// Auditable result of an accepted safety decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorisationDecision {
+    /// Authenticated caller.
+    pub principal: String,
+    /// Operation the server accepted.
+    pub operation: OperationPermission,
+    /// Safety class used for the decision.
+    pub safety_class: ClusterSafetyClass,
+}
+
+/// Why the server refused a Phase 15 operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SafetyError {
+    #[error("authenticated role is not permitted to perform this operation")]
+    InsufficientRole,
+    #[error("cluster policy does not allow this operation")]
+    OperationNotAllowed,
+    #[error("cluster is protected and protected-cluster mutation is disabled")]
+    ProtectedCluster,
+    #[error("destructive operation requires acknowledgement")]
+    AcknowledgementRequired,
+}
+
+impl ClusterTestPolicy {
+    /// Fail closed unless role, server policy, protection and consent agree.
+    pub fn authorise(
+        &self,
+        operation: OperationPermission,
+        caller: &OperationAuthorisation<'_>,
+    ) -> Result<AuthorisationDecision, SafetyError> {
+        crate::sesame::token::check_role(caller.role, operation.minimum_role())
+            .map_err(|_| SafetyError::InsufficientRole)?;
+        if operation.mutates_or_probes() && !self.allowed_operations.contains(&operation) {
+            return Err(SafetyError::OperationNotAllowed);
+        }
+        if operation.mutates_or_probes()
+            && self.safety_class.is_protected()
+            && !self.allow_protected_mutation
+        {
+            return Err(SafetyError::ProtectedCluster);
+        }
+        if operation.needs_acknowledgement() && !caller.acknowledged {
+            return Err(SafetyError::AcknowledgementRequired);
+        }
+        Ok(AuthorisationDecision {
+            principal: caller.principal.to_string(),
+            operation,
+            safety_class: self.safety_class,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caller(role: ApiRole, acknowledged: bool) -> OperationAuthorisation<'static> {
+        OperationAuthorisation {
+            principal: "ci",
+            role,
+            acknowledged,
+        }
+    }
+
+    #[test]
+    fn unknown_cluster_and_yes_flag_never_grant_mutation() {
+        let policy = ClusterTestPolicy::default();
+        assert_eq!(
+            policy.authorise(
+                OperationPermission::AlterNodeState,
+                &caller(ApiRole::Admin, true)
+            ),
+            Err(SafetyError::OperationNotAllowed)
+        );
+        assert!(policy.safety_class.is_protected());
+    }
+
+    #[test]
+    fn protected_mutation_needs_both_server_gates() {
+        let mut policy = ClusterTestPolicy {
+            safety_class: ClusterSafetyClass::Production,
+            allowed_operations: BTreeSet::from([OperationPermission::AlterNodeState]),
+            ..ClusterTestPolicy::default()
+        };
+        assert_eq!(
+            policy.authorise(
+                OperationPermission::AlterNodeState,
+                &caller(ApiRole::Admin, true)
+            ),
+            Err(SafetyError::ProtectedCluster)
+        );
+        policy.allow_protected_mutation = true;
+        assert!(
+            policy
+                .authorise(
+                    OperationPermission::AlterNodeState,
+                    &caller(ApiRole::Admin, true)
+                )
+                .is_ok()
+        );
+    }
+}

@@ -787,10 +787,10 @@ relish test --filter <groups>               # Run specific test groups
 relish test --parallel <n>                  # Set concurrency level
 relish test --chaos                         # Run chaos test suite
 relish test --chaos --filter <groups>       # Run specific chaos tests
-relish test --chaos --override              # Run against production clusters
+relish test --profile <profile>             # development/full-runc/full-apple/process-grill
 relish test --timeout <duration>            # Set test timeout
 relish test --output json                   # Machine-readable results
-relish test --namespace <name>              # Use specific namespace
+relish test --namespace <rbtest-name>        # Use a reserved test namespace
 
 # Benchmarks
 relish bench                                # Run full performance benchmark
@@ -1166,11 +1166,22 @@ Runs the full integration test suite. Each test creates its own namespace, runs 
 
 Subsystems tested: scheduling, service discovery, deployments, health checks, secrets & config, firewall, workload identity, ingress, volumes, process workloads, jobs, image registry (Pickle), cluster coordination.
 
-`--parallel <n>` controls concurrency. `--filter <groups>` selects specific subsystems. `--output json` for CI. `--timeout <duration>` for pipeline time limits.
+`--parallel <n>` controls concurrency. `--filter <groups>` selects specific
+subsystems. `--profile` selects `development`, `full-runc`, `full-apple` or
+`process-grill`; full profiles reject a missing required capability, timeout,
+unknown evidence or unconfirmed cleanup. `--output json` emits the
+schema-versioned report for CI. `--timeout <duration>` sets one inherited
+deadline per case.
 
 **`relish test --chaos`**
 
-Combines integration tests with Smoker fault injection to verify cluster recovery. Tests: leader failure, node failure, network partition, resource exhaustion, cascading failure. Requires at least 3 nodes. Includes a confirmation prompt and refuses to run against clusters tagged `environment = production` unless `--override` is passed.
+Combines integration tests with Smoker fault injection to verify cluster
+recovery. This command is not implemented yet. Before it lands, Bun must
+enforce the typed `[testing]` policy for every operation: authenticated role,
+operation allowlist, protected-cluster gate, bounded lease and operator
+acknowledgement. Unknown clusters are protected. A client flag cannot override
+server policy. Real leader/node failure, network partition, node-scoped resource
+exhaustion and cascading failure remain prerequisites rather than green skips.
 
 **`relish bench`**
 

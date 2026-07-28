@@ -413,23 +413,20 @@ fault_injection: statics.cgroup_faults || statics.ebpf || cluster,
 If a field would always be `true`, it isn't a capability. Either derive it from something
 real or delete it.
 
-### A tag that decides whether we're allowed to break things
+### Policy decides whether we're allowed to break things
 
-One field isn't about wiring at all. `[cluster] environment` is a free-form string —
-`"production"`, `"staging"`, whatever you like — and the chaos suite refuses to run
-against a cluster tagged production unless you pass `--override`.
+`[cluster] environment` remains useful descriptive metadata. It is a poor
+authorisation boundary. It's free-form, absent by default and easy to misspell.
+The first proposal treated an untagged cluster as non-production and let a
+client-side `--override` bypass the check. Both failures point towards doing
+more damage.
 
-Note which way the default fails. An *untagged* cluster counts as non-production. Requiring
-a tag to avoid chaos would mean the cluster nobody remembered to label is the one that gets
-its leader killed, and "we forgot to set a config field" is a bad reason to have an
-outage. The tag is a brake, not an accelerator, so absent means "no brake requested",
-and the operator who wants the brake is the one who has to say so.
-
-The comparison is case-insensitive, which sounds like a detail and is really a small
-lesson about guards. An operator who writes `environment = "Production"` means precisely
-what one who writes `"production"` means. A guard that only matches one spelling isn't a
-strict guard — it's a broken one, and it fails silently in the direction of *not*
-protecting you.
+The capabilities response now carries the server's typed `[testing]` policy.
+Its safety class defaults to `unknown`, and unknown is protected. Each operation
+class has its own allowlist entry and minimum authenticated role. Protected
+mutation needs a second server-side gate. A confirmation flag can record the
+operator's acknowledgement, but it cannot add a permission the server didn't
+grant. This is an interlock, not a warning label.
 
 ## A workload in your pocket
 
@@ -531,34 +528,39 @@ teach something about Rust.
 
 ### An outcome with data attached
 
-The tempting shape is a boolean, or `Result<(), Error>`. Both are wrong here,
-because a case can finish in four ways and only two of them are pass and fail:
+The tempting shape is a boolean, or `Result<(), Error>`. Both are wrong here.
+A case still has four top-level states, but a timeout is not a fifth verdict:
 
 ```rust
 pub enum TestOutcome {
-    Passed,
-    Failed { message: String },
-    Skipped { reason: String },
-    TimedOut,
+    Pass,
+    Fail { reason: String },
+    Skipped { capability: Capability, reason: String },
+    Unknown { kind: UnknownKind, reason: String },
 }
 ```
 
 This is a Rust enum — a *sum type*, not the integer constants C calls an enum.
-Each variant can carry different data: `Failed` has a message, `Skipped` has a
-reason, `Passed` and `TimedOut` carry nothing because there's nothing to say.
+Each variant can carry different data. `Fail` explains the assertion,
+`Skipped` names the capability which was proven absent, and `Unknown` says why
+the runner couldn't establish a verdict.
 Coming from Go you'd model this as `(bool, error)` and rely on a convention
 about which combinations are legal; coming from Python you'd raise different
 exception classes and hope every caller catches the right ones. Here the
-illegal states can't be written down: there is no `Passed` with a failure
+illegal states can't be written down: there is no `Pass` with a failure
 message.
 
-`Skipped` is the variant that earns its place, and it's the one a naive design
-omits. A case that needs eBPF, run against a cluster without it, has not
-passed and has not failed. Fold it into `Passed` and you have a green that
-never ran. Fold it into `Failed` and every partially-configured cluster is
-permanently red, which trains people to ignore red. The third state is the
-honest one, and it carries *why*, so the report says "skipped: capability
-`ebpf` unavailable" rather than leaving you to guess.
+`Skipped` only means one thing: fresh capability evidence says the requested
+facility isn't available. A timeout isn't a skip. A collector error isn't a
+skip. A case deciding at runtime that it would rather not run isn't a skip
+either. Those are all `Unknown`, because we don't have enough evidence to say
+pass or fail. This sounds fussy until a production gate turns green because
+the API was down. Then it sounds obvious.
+
+Cleanup gets an independent outcome (`Confirmed`, `NotRequired`, `Failed` or
+`Unknown`). A case can pass its assertion and still leave a workload running.
+Keeping cleanup outside `TestOutcome` records both facts instead of letting
+one overwrite the other.
 
 The serde attributes matter for the same reason:
 
@@ -566,27 +568,27 @@ The serde attributes matter for the same reason:
 #[serde(rename_all = "snake_case", tag = "status")]
 ```
 
-`tag = "status"` produces `{"status": "failed", "message": "..."}` rather than
+`tag = "status"` produces `{"status": "fail", "reason": "..."}` rather than
 serde's default nesting. It's the shape a `jq` one-liner in someone's CI
 expects, and once shipped it's an API — hence `schema_version` on the report
 and a snapshot test pinning the whole thing.
 
 ### Counters that can't lie
 
-`TestReport` carries `total`, `passed`, `failed` and `skipped` alongside the
-full results list. Two representations of the same facts is an invitation for
+`TestReport` carries `total`, `passed`, `failed`, `skipped` and `unknown`
+alongside the full results list. Two representations of the same facts is an invitation for
 them to disagree, and a summary line contradicting the list beneath it
 destroys trust in both.
 
 So the counters are *derived* in one place, from the results, at construction:
 
 ```rust
-let passed = results.iter().filter(|r| r.outcome == TestOutcome::Passed).count();
+let passed = results.iter().filter(|r| r.outcome == TestOutcome::Pass).count();
 ```
 
 Not incremented as tests finish. Incrementing works right up until an early
 return or a `?` skips one, and then the arithmetic is quietly wrong forever.
-A test asserts the parts sum to the whole.
+A test asserts the four parts sum to the whole.
 
 ### Why a test case can't just be an async fn
 
@@ -695,51 +697,60 @@ scope" rule quietly does the bookkeeping a Go `defer` would do by hand.
 
 Next, hanging. A health check that never returns, a deploy that never
 completes — a case can wedge, and one wedged case must not take the run with it.
-Every case runs inside a budget:
+Every case gets one absolute deadline. Polls, API calls and assertions inherit
+the remaining budget; they don't each start a fresh two-minute timeout:
 
 ```rust
-match tokio::time::timeout(timeout, (case.run)(context.clone())).await {
-    Ok(Ok(()))       => TestOutcome::Passed,
-    Ok(Err(message)) => TestOutcome::Failed { message },
-    Err(_elapsed)    => TestOutcome::TimedOut,
+match deadline.run("case", body).await {
+    Ok(Ok(Ok(())))      => TestOutcome::Pass,
+    Ok(Ok(Err(reason))) => TestOutcome::Fail { reason },
+    Ok(Err(panic))      => TestOutcome::Unknown {
+        kind: UnknownKind::Panicked,
+        reason: panic.to_string(),
+    },
+    Err(_)              => TestOutcome::Unknown {
+        kind: UnknownKind::TimedOut,
+        reason: "case exceeded its deadline".into(),
+    },
 }
 ```
 
-`TimedOut` is its own outcome, not a `Failed` with a "timed out" message,
-because a timeout and an assertion failure are different diagnoses: one says the
-system is stuck, the other says it did the wrong thing. Folding them together
-throws that away.
+The case body runs in a nested Tokio task. That detail is easy to miss. If the
+outer task owns both the body and cleanup, a panic kills the owner before it
+can clean anything. The nested task turns the panic into evidence and leaves
+the owner alive.
 
 Then teardown, which is the whole reason this is safe to point at a real
 cluster. It runs after every case:
 
 ```rust
-let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, context.teardown()).await;
+let cleanup = context.teardown(cleanup_deadline).await;
 ```
 
 Note "after every case" — pass, fail *or* timeout. It's tempting to only clean
 up after a pass, but that's exactly backwards: the case that failed halfway is
 the one that left a workload running. Teardown is the runner's job precisely so
 a case body can `return Err(...)` the moment something's wrong without a pile of
-cleanup code first. And teardown itself gets a timeout, because "clean up after
-a hung agent" must not become the new way to hang.
+cleanup code first. Teardown then asks `/v1/status` until the resources have
+actually gone. We record timeout, API failure and a workload which remains
+present as cleanup evidence. Discarding the result with `let _ =` would make
+the happy path shorter and the report less true.
 
 Two smaller decisions round it out. Cases finish whenever they finish — a
 250-millisecond case beats a 30-second one to the join — but a report where the
 rows jump around between runs is a report nobody trusts. So each case carries
-its catalogue index, and the results are sorted back into order at the end. And
-a case that *panics* (someone reached for `.unwrap()` where they should have
-returned an `Err`) is caught and turned into a failure at its right place,
-rather than vanishing from the report:
+its catalogue index, and the results are sorted back into order at the end.
+There are two panic boundaries. The nested body catches a case panic while the
+owner still has its context for cleanup. The outer join set keeps a second
+identity map in case the runner itself panics:
 
 ```rust
 let mut identities: HashMap<tokio::task::Id, (usize, String, TestGroup)> = ...;
 ```
 
-A panicked task aborts before it can return anything, so its name and index
-can't ride back on the return value — they have to be recorded out here, keyed
-by the task's id, and looked up when the join comes back an `Err`. One case
-mishandled shouldn't blank a forty-case run.
+An outer task which panics can't return its name and index, so we record them
+out here, keyed by task id, and look them up when the join comes back as an
+`Err`. One mishandled case shouldn't blank a forty-case run.
 
 One thing the runner deliberately does *not* do is pause the clock. Elsewhere in
 this book we drove time with `tokio::test(start_paused = true)` to make a
@@ -748,6 +759,39 @@ advance the virtual clock out from under the code driving it — a trap we've hi
 before in this codebase. So the runner is timed against the real clock, and its
 own tests use small real durations: a 50-millisecond timeout against a case that
 sleeps for 30 seconds proves the timeout fires without making anyone wait.
+
+## A green result needs a profile
+
+Should a missing eBPF capability fail the run? On a developer's Mac, no. On the
+rootful-runc acceptance job which promised to test the Linux data plane, yes.
+The result alone can't answer that question, so the report records one of four
+profiles: `development`, `full-runc`, `full-apple` or `process-grill`.
+
+The development profile may accept a typed skip for a facility the node proved
+absent. A full profile marks the cases it requires. A required skip, any
+`Unknown`, missing observed evidence, or failed/unknown cleanup makes the run
+non-zero. We keep the skipped row as `Skipped`; we don't rewrite history as
+`Fail` just because the profile rejects the run.
+
+Safety has a similar split. The old proposal used a free-form
+`[cluster].environment` and let `--override` weaken a production check from the
+client. A typo such as `prodution` was enough to make the cluster look safe.
+Now `node.toml` owns a typed policy:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = [
+  "read_diagnostics",
+  "provision_isolated_workloads",
+]
+max_lease_seconds = 900
+```
+
+The default safety class is `unknown`, and unknown is protected. The server
+checks the authenticated role, the operation allowlist, protected-cluster
+policy and explicit acknowledgement. Acknowledgement records consent; it
+doesn't grant permission. There is deliberately no `relish test --override`.
 
 ## The exit code is the message
 
@@ -774,10 +818,11 @@ pub enum CommandOutcome {
 }
 ```
 
-`relish test` maps a report with any failure to `Problems` and a clean one to
-`Clean`. (`Warnings` is for `wtf`, later — a cluster that's degraded but not
-broken.) The binary keeps a second little function next to the original
-`finish`:
+`relish test` maps a report rejected by its profile to `Problems` and a clean
+one to `Clean`. That includes assertion failures, unknown evidence, required
+skips and unconfirmed cleanup. (`Warnings` is for `wtf`, later — a cluster
+that's degraded but not broken.) The binary keeps a second little function
+next to the original `finish`:
 
 ```rust
 fn finish_outcome(result: Result<CommandOutcome, RelishError>) -> ExitCode {
@@ -810,8 +855,10 @@ scheduling
   SKIP  schedule_respects_required_placement_label  (0 ms)  requires multi_node
 service-discovery
   FAIL  resolve_returns_vip_and_healthy_backends  (80 ms)  expected 2 backends, saw 1
+health-checks
+  UNKN  hanging_health_check_marks_instance_unhealthy  (120000 ms)  case exceeded its deadline
 
-4 tests: 1 passed, 2 failed, 1 skipped  (4.3s)
+4 tests: 1 passed, 1 failed, 1 skipped, 1 unknown  (120.0s)
 ```
 
 No colour crate, no terminal detection — a report that reads identically in a
@@ -856,29 +903,26 @@ container-image supply chain the harness has no business owning. `testapp_spec`
 builds that TOML, deriving a per-app port (an FNV hash of the name) so two apps
 in one case don't fight over a socket.
 
-### Two ways to skip
+### One way to skip
 
 A case that needs the process runtime shouldn't *fail* on a runc cluster — it
 should skip, the same way a case needing eBPF skips where eBPF is off. That's the
 `requires` list from earlier, and every `testapp` case lists
 `Capability::ProcessRuntime`. The runner checks it before the case runs.
 
-But some cases can only discover whether they apply once they've *asked* the
-cluster. A placement case needs a node that advertises a label to pin to; if none
-does, there's nothing to test. The static `requires` list can't express "a node
-has a label" — that's a runtime fact. So a case can skip itself from inside its
-body:
+The first implementation also let a case skip itself after it started. That
+was convenient and ambiguous, so the current helper names the state honestly:
 
 ```rust
 let Some((node, key, value)) = labelled_node else {
-    return skip("no node advertises a label to target");
+    return unknown("no node advertises a label to target");
 };
 ```
 
-`skip` is just an `Err` carrying a marker prefix that the runner recognises and
-turns into `Skipped` rather than `Failed`. It's a small thing, but it's the
-difference between an honest "didn't apply here" and a red that scares someone at
-2 a.m.
+Was the label genuinely absent, was the collector stale, or did the API fail?
+A string can't prove which. The runner records
+`Unknown(MissingEvidence)`. If a case needs a dynamic prerequisite, the
+capability API must report it with fresh evidence before the case starts.
 
 ### Status is node-local
 
@@ -901,17 +945,18 @@ cluster.
 
 ### The cases are the tests
 
-The catalogue is fifteen cases across five groups — scheduling, deployments,
-health-checks, process-workloads and jobs — each a behaviour sentence
-(`rolling_deploy_keeps_the_app_running`, `failing_job_retries_then_fails`). They
-run against a live cluster, so they can't run in `make ci`; what `make ci` checks
-is the scaffolding around them — that the catalogue has no duplicate names, that
-every group is covered, that every `testapp` case remembered to require the
-process runtime, that `testapp_spec` produces TOML the config parser accepts. The
-cases themselves earn their keep at the acceptance milestone, on a real
-three-node cluster. That split — unit-test the harness, acceptance-test the
-cluster — is the same honesty this chapter opened with: a green check should mean
-something specific, and never more than it can back up.
+The ordinary catalogue is now 39 cases across 13 groups: scheduling, service
+discovery, deployments, health checks, secrets and config, firewall, workload
+identity, ingress, volumes, process workloads, jobs, image registry and cluster
+coordination. Each name is a behaviour sentence
+(`rolling_deploy_keeps_the_app_running`, `failing_job_retries_then_fails`).
+They run against a live cluster, so they can't run in `make ci`; what `make ci`
+checks is the scaffolding around them — unique names, group coverage, typed
+requirements, valid generated TOML, verdict aggregation and cleanup behaviour.
+The cases themselves earn their keep at the acceptance milestone, on a real
+cluster. That split — unit-test the harness, acceptance-test the cluster — is
+the same honesty this chapter opened with: a green check should mean something
+specific, and never more than it can back up.
 
 ## The line the workload draws
 
