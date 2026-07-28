@@ -428,7 +428,18 @@ The fix is a one-liner in spirit: read the authoritative catalogue. Both handler
 
 ### Authenticate the writes, serve over TLS
 
-The registry listener was plain HTTP with no auth — fine behind a firewall, a liability anywhere else. Rather than invent a registry-specific credential, it reuses the cluster's existing `sesame::auth`: the same bearer tokens and internal service token that guard the agent API. Reads stay open (peers and clients pull freely); writes require a principal with at least `Deployer` role, or the service token that node-to-node replication presents. A fresh, tokenless cluster keeps the same fail-open bootstrap window the API uses, so single-node push works before an operator mints the first token.
+The registry listener was plain HTTP with no auth — fine behind a firewall, a liability anywhere else. Rather than invent a registry-specific credential, it reuses the cluster's existing `sesame::auth`: the same bearer tokens and internal service token that guard the agent API. Loopback reads stay open, but a peer-reachable listener requires a valid user or service token. Writes require at least the `Deployer` role, or the service token that node-to-node replication presents. A tokenless *standalone* registry keeps a loopback-only bootstrap window so a first local push works. Clustered Bun normally derives a service token from its master key, so its peer-reachable registry requires that token from its first request. If the key is missing, reads and writes still fail closed instead of silently becoming anonymous.
+
+The listener follows the same address other nodes already know. Standalone Bun keeps the
+`127.0.0.1` default. In cluster mode that default becomes the gossip-advertised IP; a wildcard
+covers it, while an explicit different interface is rejected. Warning that P2P won't work
+wasn't enough. It left the cluster running with a feature the configuration claimed to
+provide.
+
+The authenticated capability response carries the selected socket, TLS and P2P state,
+configured redundancy, current member count and the number of under-replicated catalogue
+layers. Those are deliberately separate facts. Three live nodes make two copies *possible*;
+only the holder sets prove whether the catalogue has achieved it.
 
 TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
 

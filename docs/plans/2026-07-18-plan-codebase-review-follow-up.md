@@ -379,10 +379,20 @@ expiring exceptions. All three checks pass on this change.
 
 ### M3. Make clustered registry defaults peer-reachable
 
-- [ ] Derive a peer-reachable bind in cluster mode or reject an incomplete
+- [x] Derive a peer-reachable bind in cluster mode or reject an incomplete
   clustered registry configuration (FUNC-1).
-- [ ] Include replication/P2P reachability and redundancy in capability and
+- [x] Include replication/P2P reachability and redundancy in capability and
   `wtf` evidence.
+
+**Delivered:** standalone Bun retains the loopback registry default. Clustered
+Bun derives that default to its gossip-advertised IP, accepts a wildcard or the
+same explicit IP, and fails startup when an explicit listener excludes the
+address peers use. Cluster registry reads and writes fail closed from the first
+request, including when a misconfiguration leaves the service token absent.
+`/v1/capabilities` publishes the bound socket, readiness, TLS/P2P state,
+redundancy target, active membership and under-replicated layer count for Phase
+15 diagnostics. Seven bind/evidence tests plus both clustered-bootstrap auth
+regressions pass.
 
 ### M4. Carry the configured trust domain into workload identities
 

@@ -226,6 +226,18 @@ lease. Until the node proves every critical owner again, it receives no new work
 under-scheduling is inconvenient. Scheduling onto a node whose control plane is half dead is
 worse.
 
+Readiness isn't the whole capability story. Pickle can have a healthy TCP listener and still
+be useless to peers, or have enough members for two copies while one layer has only one. Its
+capability record therefore reports both inputs and outcomes: the actual `SocketAddr`, TLS
+and P2P state, target copy count, active members and under-replicated layers. The listener is
+an `Option<SocketAddr>` because an unbound registry has no honest address; `None` says that
+directly instead of smuggling absence through `0.0.0.0:0`.
+
+In cluster mode the default loopback setting derives the gossip-advertised IP. An explicit
+bind must be that IP or a wildcard. Otherwise Bun refuses to start. This is a useful pattern
+for configuration defaults: a safe standalone default can become a derived cluster value,
+but it must never survive into a mode where its guarantee is false.
+
 ## Correctness is not a benchmark
 
 One test transferred 100 MB over the P2P path and asserted that it finished in under five

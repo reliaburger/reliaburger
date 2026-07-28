@@ -580,9 +580,9 @@ pub struct ImagesSection {
     pub gc_interval_hours: u32,
     /// Port for the OCI Distribution API (Pickle registry).
     pub registry_port: u16,
-    /// Interface the registry binds to. Defaults to `127.0.0.1` (loopback) so
-    /// the registry is not exposed unauthenticated on all interfaces. Set to
-    /// `0.0.0.0` once cross-node replication (and auth) are wired.
+    /// Interface the registry binds to. Standalone Bun keeps the `127.0.0.1`
+    /// default. Clustered Bun derives its advertised gossip address from that
+    /// default; an explicit bind must cover the advertised address.
     pub registry_bind: String,
     /// Parallel layer fetches per P2P image pull.
     pub p2p_concurrency: usize,

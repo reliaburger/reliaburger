@@ -19,6 +19,25 @@ Core capabilities:
 - **Integrated image signing.** Keyless signing via workload identity (Sigstore/cosign compatible), with optional enforcement that unsigned images are unschedulable.
 - **Build job integration.** Build jobs push directly to Pickle via the `pickle://` URI scheme through a scoped Unix socket, eliminating the need for Docker-in-Docker or external CI registries.
 
+### 1.1 Current listener and evidence contract
+
+The implementation derives the registry listener from the cluster address contract. A
+standalone node keeps the loopback default. A clustered node replaces that default with its
+gossip-advertised IP; `0.0.0.0`/`::` covers the advertised address, and an explicit different
+interface fails startup. Peers therefore never receive a registry URL whose address Bun did
+not bind.
+
+Cluster reads and writes require authentication even before an operator creates the first
+user token. Normal nodes use the master-key-derived internal service token; a cluster missing
+that token still refuses anonymous requests. With a node identity the listener and peer client
+use cluster TLS. The tokenless bootstrap is limited to a standalone registry, which remains
+on loopback by default.
+
+`GET /v1/capabilities` exposes the actual listener, readiness, peer reachability, TLS/P2P
+state, redundancy target, active membership count and under-replicated layer count. Phase
+15 diagnostics must use those live fields. They must not infer redundancy from configuration
+or turn an impossible target into a green skip.
+
 ---
 
 ## 2. Dependencies

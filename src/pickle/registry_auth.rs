@@ -3,10 +3,10 @@
 //! The Pickle OCI registry reuses the cluster's existing authentication
 //! ([`crate::sesame::auth`]) rather than inventing a parallel scheme: the
 //! same bearer tokens and internal service token that guard the agent API
-//! guard registry writes. Reads (blob/manifest GET, tag list, `/v2/`) stay
-//! open so peers and clients can pull; writes (upload, manifest PUT) require
-//! a principal with at least `Deployer` role, or the internal service token
-//! that node-to-node replication presents.
+//! guard registry requests. Reads stay open only on the loopback listener;
+//! routable reads require any valid principal. Writes require a principal
+//! with at least `Deployer` role, or the internal service token that
+//! node-to-node replication presents.
 //!
 //! Two policy dimensions live here alongside the auth gate:
 //!
@@ -127,14 +127,18 @@ pub fn check_quota(
 ///
 /// Reuses [`AuthState`] exactly like the agent API: the internal service
 /// token (node-to-node replication) is accepted; a user bearer must resolve
-/// to at least `Deployer`. During the bootstrap window (no user tokens, no
-/// service token) writes are open, matching the agent API's fail-open
-/// bootstrap so a fresh single-node cluster can push before an operator
-/// mints the first token.
+/// to at least `Deployer`. During a standalone bootstrap window (no user
+/// tokens and no service token) writes may be open when the caller explicitly
+/// permits it. Clustered callers pass `false`, so a missing master key cannot
+/// turn a peer-reachable registry into an anonymous write endpoint.
 ///
 /// Returns `Ok(())` when the request may write, or `Err(reason)` — the
 /// caller maps that to a 401/403.
-pub async fn authorise_write(auth: &AuthState, bearer: Option<&str>) -> Result<(), WriteDenied> {
+pub async fn authorise_write(
+    auth: &AuthState,
+    bearer: Option<&str>,
+    allow_unauthenticated_bootstrap: bool,
+) -> Result<(), WriteDenied> {
     // The internal service token authenticates node-to-node replication.
     if let (Some(bearer), Some(service)) = (bearer, auth.service_token.as_deref())
         && crate::sesame::auth::tokens_equal(bearer, service)
@@ -143,8 +147,7 @@ pub async fn authorise_write(auth: &AuthState, bearer: Option<&str>) -> Result<(
     }
 
     let tokens = { auth.tokens.read().await.clone() };
-    // Bootstrap window: no user tokens configured yet. Open, like the API.
-    if tokens.is_empty() {
+    if allow_unauthenticated_bootstrap && tokens.is_empty() && auth.service_token.is_none() {
         return Ok(());
     }
 
@@ -184,16 +187,10 @@ pub async fn authorise_read(auth: &AuthState, bearer: Option<&str>) -> Result<()
         return Ok(());
     }
 
-    let tokens = { auth.tokens.read().await.clone() };
-    // Bootstrap window, as for writes: no tokens minted yet, nothing to
-    // check against. `bun` refuses a non-loopback bind in that state anyway.
-    if tokens.is_empty() {
-        return Ok(());
-    }
-
     let Some(bearer) = bearer else {
         return Err(WriteDenied::Unauthenticated);
     };
+    let tokens = { auth.tokens.read().await.clone() };
     match crate::sesame::auth::authenticate(bearer, &tokens) {
         Ok(_) => Ok(()),
         Err(_) => Err(WriteDenied::Unauthenticated),
@@ -367,7 +364,40 @@ mod tests {
     #[tokio::test]
     async fn write_is_open_during_the_bootstrap_window() {
         let auth = AuthState::new(new_token_store(), None);
-        assert!(authorise_write(&auth, None).await.is_ok());
+        assert!(authorise_write(&auth, None, true).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn clustered_bootstrap_requires_authentication_even_without_a_service_token() {
+        let auth = AuthState::new(new_token_store(), None);
+        assert_eq!(
+            authorise_write(&auth, None, false).await.unwrap_err(),
+            WriteDenied::Unauthenticated
+        );
+    }
+
+    #[tokio::test]
+    async fn clustered_service_token_authenticates_the_first_write() {
+        let auth = AuthState::new(new_token_store(), Some("rbrg_service".to_string()));
+        assert_eq!(
+            authorise_write(&auth, None, false).await.unwrap_err(),
+            WriteDenied::Unauthenticated
+        );
+        assert!(
+            authorise_write(&auth, Some("rbrg_service"), false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn routable_read_fails_closed_before_the_first_user_token() {
+        let auth = AuthState::new(new_token_store(), Some("rbrg_service".to_string()));
+        assert_eq!(
+            authorise_read(&auth, None).await.unwrap_err(),
+            WriteDenied::Unauthenticated
+        );
+        assert!(authorise_read(&auth, Some("rbrg_service")).await.is_ok());
     }
 
     #[tokio::test]
@@ -377,7 +407,7 @@ mod tests {
         store.write().await.push(user.token);
         let auth = AuthState::new(store, None);
         assert_eq!(
-            authorise_write(&auth, None).await.unwrap_err(),
+            authorise_write(&auth, None, false).await.unwrap_err(),
             WriteDenied::Unauthenticated
         );
     }
@@ -389,7 +419,7 @@ mod tests {
         store.write().await.push(user.token.clone());
         let auth = AuthState::new(store, None);
         assert_eq!(
-            authorise_write(&auth, Some(&user.plaintext))
+            authorise_write(&auth, Some(&user.plaintext), false)
                 .await
                 .unwrap_err(),
             WriteDenied::Forbidden
@@ -402,7 +432,11 @@ mod tests {
         let store = new_token_store();
         store.write().await.push(user.token.clone());
         let auth = AuthState::new(store, None);
-        assert!(authorise_write(&auth, Some(&user.plaintext)).await.is_ok());
+        assert!(
+            authorise_write(&auth, Some(&user.plaintext), false)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -411,7 +445,11 @@ mod tests {
         let store = new_token_store();
         store.write().await.push(user.token);
         let auth = AuthState::new(store, Some("rbrg_service".to_string()));
-        assert!(authorise_write(&auth, Some("rbrg_service")).await.is_ok());
+        assert!(
+            authorise_write(&auth, Some("rbrg_service"), false)
+                .await
+                .is_ok()
+        );
     }
 
     // --- upload session expiry (REG8) ---

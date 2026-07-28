@@ -642,13 +642,20 @@ parallel (rarest layer first). Two operational constraints to know:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each
   other's registry URLs from gossip IPs plus the local port setting.
-- **`registry_bind` defaults to loopback**, which disables peer replication
-  and P2P in cluster mode (bun warns at startup). Bind wider only behind the
-  perimeter firewall's cluster-node allowlist: the registry has no auth/TLS yet.
+- **`registry_bind` defaults to loopback for standalone Bun.** In cluster mode
+  Bun derives the gossip-advertised IP from that default, so the address peers
+  use is actually bound. An explicit different interface fails startup; an
+  explicit wildcard remains valid.
+- Cluster registry reads and writes require authentication from the first request and
+  normally use the master-key-derived service token plus the node's cluster TLS
+  identity. A misconfigured cluster without that token still fails closed. The
+  open, tokenless bootstrap window exists only for a loopback standalone registry.
+- Authenticated `GET /v1/capabilities` reports the selected listener, TLS/P2P
+  state, redundancy target, active node count and under-replicated layer count.
 
 ```toml
 [images]
-registry_bind = "0.0.0.0"   # cluster mode; keep firewalled
+registry_bind = "0.0.0.0"   # optional wildcard; default derives advertise IP
 pull_through = true          # cache external images in the cluster
 cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
 p2p_concurrency = 4          # parallel layer fetches per image pull

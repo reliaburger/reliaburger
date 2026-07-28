@@ -1383,7 +1383,12 @@ convergence and adoption" theme under 12b.6).
   their diagnostics, and hosted Linux owns the check. Aya code now compiles only
   for Linux plus `ebpf`, so macOS enforces the advertised all-feature Clippy
   contract. The existing pinned RustSec change/release/weekly gate passes.
-- [ ] Peer-reachable clustered registry defaults (M3)
+- [x] Peer-reachable clustered registry defaults (M3) — cluster mode derives
+  the safe standalone loopback default to the gossip-advertised IP and rejects
+  an explicit mismatched interface. Remote reads and writes require authentication from
+  first boot and fail closed if the service token is absent; authenticated
+  capabilities expose listener, TLS/P2P, membership and achieved redundancy
+  evidence for future `wtf` checks.
 - [ ] Configured workload trust domain (M4)
 - [ ] Rootless proxy adoption across Bun replacement (M5)
 - [ ] Real deployment operation state (M6)

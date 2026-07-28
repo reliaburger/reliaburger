@@ -64,6 +64,8 @@ pub struct NodeCapabilityEvidence {
     pub egress: crate::sesame::egress::EgressEnforcementCapability,
     /// Resolver transports and workload reachability.
     pub dns: crate::onion::dns::DnsCapability,
+    /// Pickle listener reachability and current redundancy evidence.
+    pub registry: crate::pickle::capability::RegistryCapabilityEvidence,
     /// Time this evidence snapshot was assembled.
     pub observed_at_unix_ms: u64,
 }
@@ -72,6 +74,7 @@ pub struct NodeCapabilityEvidence {
 struct ReadinessInner {
     subsystems: BTreeMap<String, SubsystemEvidence>,
     capabilities: crate::meat::cluster_state::NodeCapabilities,
+    registry: crate::pickle::capability::RegistryCapabilityEvidence,
 }
 
 /// Shared live evidence store for the Bun process.
@@ -158,6 +161,14 @@ impl ReadinessTracker {
         self.inner.write().await.capabilities = capabilities;
     }
 
+    /// Replace the node's latest Pickle reachability and redundancy evidence.
+    pub async fn set_registry(
+        &self,
+        registry: crate::pickle::capability::RegistryCapabilityEvidence,
+    ) {
+        self.inner.write().await.registry = registry;
+    }
+
     /// Snapshot readiness without holding the tracker lock across callers.
     pub async fn snapshot(&self) -> NodeReadinessEvidence {
         self.snapshots().await.0
@@ -183,6 +194,7 @@ impl ReadinessTracker {
             ready,
             egress: inner.capabilities.egress,
             dns: inner.capabilities.dns,
+            registry: inner.registry,
             observed_at_unix_ms,
         };
         (readiness, placement)
@@ -358,6 +370,27 @@ mod tests {
             evidence.snapshot().await.subsystems[0].state,
             SubsystemState::Stopped
         );
+    }
+
+    #[tokio::test]
+    async fn capability_snapshot_includes_live_registry_evidence() {
+        let evidence = ReadinessTracker::new();
+        evidence.register("registry", true).await;
+        evidence.ready("registry").await;
+        let registry = crate::pickle::capability::RegistryCapabilityEvidence {
+            ready: true,
+            listen_addr: Some("10.0.0.4:5050".parse().unwrap()),
+            peer_reachable: true,
+            tls: true,
+            p2p_enabled: true,
+            redundancy_target: 2,
+            known_nodes: 3,
+            redundancy_possible: true,
+            under_replicated_layers: 1,
+        };
+        evidence.set_registry(registry).await;
+
+        assert_eq!(evidence.capability_snapshot().await.registry, registry);
     }
 
     #[tokio::test]

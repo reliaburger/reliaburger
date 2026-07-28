@@ -176,6 +176,48 @@ fn cluster_params_from_config(
     })
 }
 
+/// Assemble Pickle's live listener, membership and catalogue evidence.
+async fn current_registry_capability(
+    bind: reliaburger::pickle::capability::RegistryBindPlan,
+    tls: bool,
+    p2p_enabled: bool,
+    redundancy_target: u32,
+    membership: Option<
+        &tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
+    >,
+    council: Option<&Arc<reliaburger::council::CouncilNode>>,
+    catalog: &Arc<RwLock<ManifestCatalog>>,
+) -> reliaburger::pickle::capability::RegistryCapabilityEvidence {
+    let known_nodes = membership
+        .map(|receiver| {
+            receiver
+                .borrow()
+                .iter()
+                .filter(|member| member.state == reliaburger::mustard::state::NodeState::Alive)
+                .count()
+        })
+        .unwrap_or(1)
+        .max(1);
+    let authoritative;
+    let local;
+    let catalog = if let Some(council) = council {
+        authoritative = council.manifest_catalog().await;
+        &authoritative
+    } else {
+        local = catalog.read().await;
+        &local
+    };
+    reliaburger::pickle::capability::registry_capability_evidence(
+        bind,
+        true,
+        tls,
+        p2p_enabled,
+        redundancy_target,
+        known_nodes,
+        catalog,
+    )
+}
+
 /// The directory this node reads/writes its identity from: the configured
 /// `[security] identity_dir`, or `{storage.data}/identity` by default.
 fn node_identity_dir(config: &NodeConfig) -> std::path::PathBuf {
@@ -345,20 +387,6 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
          or [::1]:9117; initialise an authenticated cluster and create the first \
          admin token before using a non-loopback --listen address"
     )
-}
-
-/// Whether the Pickle registry's bind address is reachable only from this
-/// host (O1).
-///
-/// `[images] registry_bind` is a bare host, not a `host:port`, so it's parsed
-/// as an `IpAddr`. Anything that isn't an IP literal — a hostname, or the
-/// unspecified `0.0.0.0`/`[::]` — counts as routable: we can't prove nobody
-/// else can reach it, and the failure we'd rather have is "you needed a token
-/// and didn't expect to".
-fn registry_bind_is_loopback(bind: &str) -> bool {
-    bind.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
 }
 
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
@@ -658,6 +686,8 @@ async fn main() -> anyhow::Result<()> {
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
     let mut replication_membership = None;
+    // Address peers use for this node, captured before ClusterParams moves.
+    let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
     let mut api_membership: Option<Arc<RwLock<Vec<api::NodeMembershipInfo>>>> = None;
     // Handles the orchestration tasks need, captured before the
@@ -666,6 +696,7 @@ async fn main() -> anyhow::Result<()> {
     let mut orchestration = None;
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
+        registry_cluster_advertise = Some(params.gossip_addr.ip());
         params.mayo = Some(Arc::clone(&mayo_store));
         params.self_disk_pressured_rx = Some(disk_pressured_rx.clone());
         params.readiness = Some(readiness.clone());
@@ -1681,10 +1712,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start the Pickle OCI registry server
-    let registry_addr = format!(
-        "{}:{}",
-        config.images.registry_bind, config.images.registry_port
-    );
+    let mut registry_bind = reliaburger::pickle::capability::plan_registry_bind(
+        &config.images.registry_bind,
+        config.images.registry_port,
+        registry_cluster_advertise,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
     let pickle_dir = if std::fs::create_dir_all(&config.storage.images).is_ok() {
         config.storage.images.clone()
     } else {
@@ -1733,9 +1766,12 @@ async fn main() -> anyhow::Result<()> {
         auth: registry_auth,
         // O1: reads stay open on the loopback default (a local pull needs no
         // token) and require a principal anywhere a stranger could reach the
-        // port. A hostname we can't resolve to a literal is treated as
-        // routable — the safe way to be wrong.
-        require_read_auth: !registry_bind_is_loopback(&config.images.registry_bind),
+        // actual selected listener.
+        require_read_auth: !registry_bind.listen_addr.ip().is_loopback(),
+        // Only the literal loopback standalone listener gets an open first-push
+        // window. Cluster mode fails closed even when its master key is absent.
+        allow_unauthenticated_bootstrap: registry_cluster_advertise.is_none()
+            && registry_bind.listen_addr.ip().is_loopback(),
         quota: registry_quota,
         sessions: upload_sessions.clone(),
     };
@@ -1789,7 +1825,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
-    let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
+    let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
+    registry_bind.listen_addr = pickle_listener.local_addr()?;
+    let registry_addr = registry_bind.listen_addr;
     println!(
         "bun: Pickle registry listening on {registry_addr} ({})",
         if registry_over_tls {
@@ -1799,17 +1837,62 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
-    // In cluster mode a loopback-bound registry silently disables peer
-    // replication, healing, and P2P image pulls — peers address us as
-    // <scheme>://<gossip-ip>:<registry_port>. Warn loudly rather than
-    // fail: single-node-with-council setups are legitimate.
-    if api_council.is_some() && config.images.registry_bind == "127.0.0.1" {
-        eprintln!(
-            "bun: WARNING: [images] registry_bind is 127.0.0.1 in cluster mode — \
-             image replication and P2P pulls between nodes will not work; \
-             set registry_bind to a peer-reachable address"
+    if registry_cluster_advertise.is_some()
+        && registry_addr.ip().to_string() != config.images.registry_bind
+    {
+        println!(
+            "bun: Pickle registry derived peer-reachable bind {registry_addr} from cluster advertise address"
         );
     }
+
+    let registry_p2p_enabled =
+        replication_membership.is_some() && config.images.p2p_concurrency > 0;
+    readiness
+        .set_registry(
+            current_registry_capability(
+                registry_bind,
+                registry_over_tls,
+                registry_p2p_enabled,
+                config.images.redundancy,
+                replication_membership.as_ref(),
+                api_council.as_ref(),
+                &pickle_catalog,
+            )
+            .await,
+        )
+        .await;
+    let registry_evidence_readiness = readiness.clone();
+    let registry_evidence_catalog = Arc::clone(&pickle_catalog);
+    let registry_evidence_membership = replication_membership.clone();
+    let registry_evidence_council = api_council.clone();
+    let registry_evidence_shutdown = shutdown.clone();
+    let registry_redundancy = config.images.redundancy;
+    let registry_evidence_handle = reliaburger::bun::readiness::spawn_owned(
+        "registry-evidence",
+        false,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = registry_evidence_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let evidence = current_registry_capability(
+                            registry_bind,
+                            registry_over_tls,
+                            registry_p2p_enabled,
+                            registry_redundancy,
+                            registry_evidence_membership.as_ref(),
+                            registry_evidence_council.as_ref(),
+                            &registry_evidence_catalog,
+                        ).await;
+                        registry_evidence_readiness.set_registry(evidence).await;
+                    }
+                }
+            }
+        },
+    );
 
     // Sweep expired upload sessions and their temp files (REG8) so an
     // abandoned push doesn't leak a temp forever.
@@ -2079,7 +2162,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Wait for everything to finish
-    let _ = tokio::join!(agent_handle, server_handle, pickle_handle);
+    let _ = tokio::join!(
+        agent_handle,
+        server_handle,
+        pickle_handle,
+        registry_evidence_handle
+    );
 
     // OBS7: the flush loops break on cancellation and drop whatever they'd
     // buffered since their last tick. Force one final flush of both stores so
@@ -2296,23 +2384,6 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-
-    /// O1: only an IP literal that *is* loopback keeps registry reads open.
-    /// `0.0.0.0` is the interesting case — it reads like a local default and
-    /// is the most exposed bind there is.
-    #[test]
-    fn only_loopback_literals_keep_registry_reads_open() {
-        assert!(registry_bind_is_loopback("127.0.0.1"));
-        assert!(registry_bind_is_loopback("::1"));
-
-        assert!(!registry_bind_is_loopback("0.0.0.0"));
-        assert!(!registry_bind_is_loopback("::"));
-        assert!(!registry_bind_is_loopback("10.0.1.5"));
-        // A hostname could resolve anywhere, and could resolve somewhere else
-        // tomorrow, so it counts as routable.
-        assert!(!registry_bind_is_loopback("localhost"));
-        assert!(!registry_bind_is_loopback(""));
-    }
 
     #[test]
     fn process_runtime_refuses_dns_before_workload_creation() {
