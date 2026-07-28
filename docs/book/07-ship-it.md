@@ -594,7 +594,24 @@ tokio::spawn(async move {
 });
 ```
 
-`tokio::spawn` hands a future to the runtime to run concurrently, the way you'd start a goroutine in Go or a thread in C — except it's cooperative, not pre-emptive, so it only ever yields at an `.await`. The command loop spawns the worker and returns to its `select!` immediately. The image pull now happens on the worker's task, and while it's parked at that `.await`, the loop is free to answer health checks, restarts, status, and further deploys. Two deploys land at once? Two tasks, both making progress. They interleave instead of queuing.
+`tokio::spawn` hands a future to the runtime to run concurrently, the way you'd start a goroutine in Go or a thread in C — except it's cooperative, not pre-emptive, so it only ever yields at an `.await`. The command loop spawns the worker and returns to its `select!` immediately. The image pull now happens on the worker's task, and while it's parked at that `.await`, the loop is free to answer health checks, restarts, status, and further deploys. Two deploys for different apps land at once? Two tasks, both making progress. A second deploy for the same namespace/name is refused before either worker can race the same supervisor rows.
+
+Spawning fixed responsiveness but created another observability problem: the SSE
+stream used to be the only place an in-flight deploy existed. Close your terminal
+and the evidence vanished. Now the agent registers a `DeployOperation` before it
+spawns the worker. The first standalone SSE item is `Accepted { operation_id }`;
+the worker advances the shared record through app, job and route-rebuild phases,
+including its current target. `GET /v1/deploys/active` reads those records and
+`GET /v1/deploys/operations` adds the newest fifty terminal results.
+
+The forwarding task keeps consuming worker events even after the client drops.
+`Complete` records `completed`, `Error` records `failed`, and a channel which
+closes without either records `unknown`. Why not assume the worker succeeded?
+Because absence of evidence is the exact condition diagnostics need to flag.
+The operation history is local runtime evidence; the per-app spec history used
+by rollback is a different structure, and the library-side `DeployState` model
+doesn't magically become the binary's execution path just because both contain
+the word “deploy”.
 
 But here's the catch, and it's the whole design problem. The blocking I/O — `grill.create`, `grill.start`, the init and health polls — can move to the worker, because the grill and the port allocator are cheap to clone (both wrap their real state in an `Arc`, so a clone shares it). The *supervisor state machine* cannot. There is exactly one supervisor, it lives on the command loop behind `&mut self`, and it must stay that way: it's the single source of truth for which instances exist and what state each is in. Health checks read it. Crash restarts mutate it. If a deploy task held its own copy, the two would drift, and drift in a state machine is how you get an instance the health checker thinks is running and the supervisor thinks was never born.
 

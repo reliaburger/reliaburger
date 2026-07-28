@@ -169,6 +169,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/alerts", AnyToken),
     route(Get, "/v1/logs/sql", AnyToken),
     route(Get, "/v1/deploys/active", AnyToken),
+    route(Get, "/v1/deploys/operations", AnyToken),
     route(Get, "/v1/deploys/history/{app}", AnyToken),
     route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
     route(Get, "/v1/placements/{node_id}", AnyToken),

@@ -391,6 +391,7 @@ pub fn router_with_upgrade(
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
+        .route("/v1/deploys/operations", get(deploys_operations_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
@@ -3469,10 +3470,56 @@ async fn metrics_app_handler(
 // ---------------------------------------------------------------------------
 
 /// `GET /v1/deploys/active` — list active deploys.
-async fn deploys_active_handler() -> impl IntoResponse {
-    // Deploys run synchronously in the agent task, so there's no
-    // persistent "active" state outside the SSE stream.
-    Json(serde_json::json!({"active_deploys": []}))
+async fn deploys_active_handler(State(state): State<ApiState>) -> Response {
+    match deploy_operation_snapshot(&state).await {
+        Ok(snapshot) => Json(crate::bun::deploy_operations::ActiveDeployOperations {
+            active_deploys: snapshot.active_deploys,
+        })
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `GET /v1/deploys/operations` — active operations and bounded recent
+/// terminal history, using the same stable record shape for both.
+async fn deploys_operations_handler(State(state): State<ApiState>) -> Response {
+    match deploy_operation_snapshot(&state).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn deploy_operation_snapshot(
+    state: &ApiState,
+) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, Response> {
+    let (response, result) = oneshot::channel();
+    state
+        .cmd_tx
+        .send(AgentCommand::DeployOperations { response })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "agent unavailable"})),
+            )
+                .into_response()
+        })?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), result)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({"error": "agent deploy-state query timed out"})),
+            )
+                .into_response()
+        })?
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "agent unavailable"})),
+            )
+                .into_response()
+        })
 }
 
 #[derive(Deserialize)]
@@ -5720,6 +5767,7 @@ mod tests {
         "#;
 
         let response = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
@@ -5735,12 +5783,34 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let events = parse_sse_events(&body);
 
+        let operation_id = match events.first().expect("no SSE events in response") {
+            super::ApplyEvent::Accepted { operation_id } => operation_id.clone(),
+            other => panic!("expected Accepted event first, got {other:?}"),
+        };
+
         // Should end with a Complete event
         let last = events.last().expect("no SSE events in response");
         match last {
             super::ApplyEvent::Complete { created, .. } => assert_eq!(*created, 1),
             other => panic!("expected Complete event, got {other:?}"),
         }
+
+        let (status, body) = get(app.clone(), "/v1/deploys/active").await;
+        assert_eq!(status, StatusCode::OK);
+        let active: crate::bun::deploy_operations::ActiveDeployOperations =
+            serde_json::from_slice(&body).unwrap();
+        assert!(active.active_deploys.is_empty());
+
+        let (status, body) = get(app, "/v1/deploys/operations").await;
+        assert_eq!(status, StatusCode::OK);
+        let operations: crate::bun::deploy_operations::DeployOperationSnapshot =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(operations.history.len(), 1);
+        assert_eq!(operations.history[0].id.as_str(), operation_id);
+        assert_eq!(
+            operations.history[0].outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Completed)
+        );
 
         shutdown.cancel();
     }

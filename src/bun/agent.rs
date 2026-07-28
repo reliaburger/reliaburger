@@ -75,6 +75,8 @@ fn probe_host(container_ip: Option<std::net::Ipv4Addr>) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ApplyEvent {
+    /// The agent accepted the deploy and assigned its queryable operation ID.
+    Accepted { operation_id: String },
     /// Informational progress update.
     Progress { message: String },
     /// A single instance was created and started.
@@ -116,6 +118,10 @@ pub enum AgentCommand {
     /// protection: actively deployed images must not be collected).
     ActiveImages {
         response: oneshot::Sender<std::collections::HashSet<String>>,
+    },
+    /// Snapshot active and recent real deploy operations.
+    DeployOperations {
+        response: oneshot::Sender<crate::bun::deploy_operations::DeployOperationSnapshot>,
     },
     /// Get logs for an app.
     Logs {
@@ -1189,6 +1195,8 @@ pub struct BunAgent<G: Grill> {
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
+    /// Real apply-worker activity and bounded terminal outcomes for the API.
+    deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -1317,6 +1325,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -1396,6 +1405,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -2417,7 +2427,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
+                let operation = match self.deploy_operations.start(&config).await {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        let message = format!("deploy refused: {error}");
+                        self.record_event(
+                            crate::bun::events::EventKind::Deploy,
+                            crate::bun::events::EventSeverity::Critical,
+                            None,
+                            None,
+                            message.clone(),
+                        )
+                        .await;
+                        let _ = events.send(ApplyEvent::Error { message }).await;
+                        return;
+                    }
+                };
+                let _ = events
+                    .send(ApplyEvent::Accepted {
+                        operation_id: operation.id().to_string(),
+                    })
+                    .await;
                 if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    let message =
+                        "node is draining for a binary upgrade; retry shortly".to_string();
                     self.record_event(
                         crate::bun::events::EventKind::Deploy,
                         crate::bun::events::EventSeverity::Critical,
@@ -2426,12 +2459,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         "deploy refused while node is draining".to_string(),
                     )
                     .await;
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: "node is draining for a binary upgrade; retry shortly"
-                                .to_string(),
-                        })
+                    operation
+                        .finish(
+                            crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                            message.clone(),
+                        )
                         .await;
+                    let _ = events.send(ApplyEvent::Error { message }).await;
                     return;
                 }
                 // Forward deploy events to the caller, mirroring errors into the
@@ -2441,29 +2475,54 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // through `deploy_ops_tx`.
                 let (forward_tx, mut forward_rx) = mpsc::channel(64);
                 let event_store = self.events.clone();
+                let observed_operation = operation.clone();
                 tokio::spawn(async move {
                     while let Some(event) = forward_rx.recv().await {
-                        if let ApplyEvent::Error { message } = &event
-                            && let Some(store) = &event_store
-                        {
-                            let timestamp = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            store.write().await.record(
-                                timestamp,
-                                crate::bun::events::EventKind::Deploy,
-                                crate::bun::events::EventSeverity::Critical,
-                                None,
-                                None,
-                                None,
-                                message.clone(),
-                            );
+                        match &event {
+                            ApplyEvent::Complete { created, .. } => {
+                                observed_operation
+                                    .finish(
+                                        crate::bun::deploy_operations::DeployOperationOutcome::Completed,
+                                        format!("deploy completed ({created} instances)"),
+                                    )
+                                    .await;
+                            }
+                            ApplyEvent::Error { message } => {
+                                observed_operation
+                                    .finish(
+                                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                                        message.clone(),
+                                    )
+                                    .await;
+                                if let Some(store) = &event_store {
+                                    let timestamp = SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    store.write().await.record(
+                                        timestamp,
+                                        crate::bun::events::EventKind::Deploy,
+                                        crate::bun::events::EventSeverity::Critical,
+                                        None,
+                                        None,
+                                        None,
+                                        message.clone(),
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
-                        if events.send(event).await.is_err() {
-                            return;
-                        }
+                        // A disconnected SSE client doesn't cancel the deploy or
+                        // its evidence. Keep draining the worker to a terminal
+                        // outcome even when this send fails.
+                        let _ = events.send(event).await;
                     }
+                    observed_operation
+                        .finish(
+                            crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
+                            "deploy worker ended without a terminal event",
+                        )
+                        .await;
                 });
                 let worker = DeployWorker {
                     grill: self.supervisor.grill().clone(),
@@ -2471,6 +2530,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     ops: DeployOps {
                         tx: self.deploy_ops_tx.clone(),
                     },
+                    operation: Some(operation),
                 };
                 tokio::spawn(async move {
                     worker.run_deploy(config, forward_tx).await;
@@ -2501,6 +2561,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .filter(|image| !image.is_empty())
                     .collect();
                 let _ = response.send(images);
+            }
+            AgentCommand::DeployOperations { response } => {
+                let _ = response.send(self.deploy_operations.snapshot().await);
             }
             AgentCommand::Logs {
                 app_name,
@@ -6695,6 +6758,7 @@ struct DeployWorker<G: Grill> {
     grill: G,
     port_allocator: PortAllocator,
     ops: DeployOps,
+    operation: Option<crate::bun::deploy_operations::DeployOperationHandle>,
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
@@ -6716,8 +6780,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             })
             .collect();
 
+        if !config.app.is_empty()
+            && let Some(operation) = &self.operation
+        {
+            operation
+                .advance(
+                    crate::bun::deploy_operations::DeployOperationPhase::DeployingApps,
+                    None,
+                    format!("deploying {} app(s)", config.app.len()),
+                )
+                .await;
+        }
+
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if let Some(operation) = &self.operation {
+                operation
+                    .advance(
+                        crate::bun::deploy_operations::DeployOperationPhase::DeployingApps,
+                        Some(crate::bun::deploy_operations::DeployTarget {
+                            kind: crate::bun::deploy_operations::DeployTargetKind::App,
+                            name: app_name.clone(),
+                            namespace: namespace.to_string(),
+                        }),
+                        format!("deploying app {namespace}/{app_name}"),
+                    )
+                    .await;
+            }
 
             // Gate on image signature first (IMG1). A verified image comes back
             // pinned to its manifest digest; the pinned spec shadows the
@@ -6733,7 +6822,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(reason) => {
                     let _ = events.send(ApplyEvent::Error { message: reason }).await;
-                    continue;
+                    return;
                 }
             };
 
@@ -6854,8 +6943,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if !config.job.is_empty()
+            && let Some(operation) = &self.operation
+        {
+            operation
+                .advance(
+                    crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
+                    None,
+                    format!("deploying {} job(s)", config.job.len()),
+                )
+                .await;
+        }
+
         for (job_name, spec) in &config.job {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if let Some(operation) = &self.operation {
+                operation
+                    .advance(
+                        crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
+                        Some(crate::bun::deploy_operations::DeployTarget {
+                            kind: crate::bun::deploy_operations::DeployTargetKind::Job,
+                            name: job_name.clone(),
+                            namespace: namespace.to_string(),
+                        }),
+                        format!("deploying job {namespace}/{job_name}"),
+                    )
+                    .await;
+            }
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("deploying job {job_name}"),
@@ -6905,6 +7019,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if let Some(operation) = &self.operation {
+            operation
+                .advance(
+                    crate::bun::deploy_operations::DeployOperationPhase::RebuildingRoutes,
+                    None,
+                    "rebuilding service and ingress routes",
+                )
+                .await;
+        }
         self.ops.rebuild_routing_table().await;
 
         let _ = events
@@ -7442,6 +7565,7 @@ mod tests {
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
                 },
+                operation: None,
             };
             let events = events.clone();
             let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -7687,6 +7811,19 @@ mod tests {
             _ => None,
         });
         assert_ne!(created, Some(1), "no instance should be created");
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations {
+            response: snapshot_tx,
+        })
+        .await
+        .unwrap();
+        let snapshot = snapshot_rx.await.unwrap();
+        assert!(snapshot.active_deploys.is_empty());
+        assert_eq!(snapshot.history.len(), 1);
+        assert_eq!(
+            snapshot.history[0].outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Failed)
+        );
 
         shutdown.cancel();
         let _ = handle.await;
@@ -7783,6 +7920,8 @@ mod tests {
         let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
         let handle = tokio::spawn(async move { agent.run().await });
 
         // Hold create() at a deterministic barrier, simulating a slow image
@@ -7817,6 +7956,109 @@ mod tests {
         );
 
         grill_handle.release_creates(1);
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn deploy_operations_track_live_phase_conflicts_and_disconnected_clients() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let grill_handle = grill.clone();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        grill_handle.block_creates();
+        let (events, mut event_rx) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let operation_id = match event_rx.recv().await.unwrap() {
+            ApplyEvent::Accepted { operation_id } => operation_id,
+            event => panic!("first event was not acceptance: {event:?}"),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            grill_handle.wait_for_creates(1),
+        )
+        .await
+        .expect("deploy never entered create");
+
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations {
+            response: snapshot_tx,
+        })
+        .await
+        .unwrap();
+        let snapshot = snapshot_rx.await.unwrap();
+        assert_eq!(snapshot.active_deploys.len(), 1);
+        let active = &snapshot.active_deploys[0];
+        assert_eq!(active.id.as_str(), operation_id);
+        assert_eq!(
+            active.phase,
+            crate::bun::deploy_operations::DeployOperationPhase::DeployingApps
+        );
+        assert_eq!(
+            active
+                .current_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("web")
+        );
+
+        let (conflict_events, mut conflict_rx) = mpsc::channel(8);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events: conflict_events,
+        })
+        .await
+        .unwrap();
+        match conflict_rx.recv().await.unwrap() {
+            ApplyEvent::Error { message } => {
+                assert!(message.contains(&operation_id));
+                assert!(message.contains("already being changed"));
+            }
+            event => panic!("overlapping deploy was not refused: {event:?}"),
+        }
+
+        // Losing the SSE consumer must not lose the operation outcome.
+        drop(event_rx);
+        grill_handle.release_creates(1);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (snapshot_tx, snapshot_rx) = oneshot::channel();
+                tx.send(AgentCommand::DeployOperations {
+                    response: snapshot_tx,
+                })
+                .await
+                .unwrap();
+                let snapshot = snapshot_rx.await.unwrap();
+                if let Some(operation) = snapshot
+                    .history
+                    .into_iter()
+                    .find(|operation| operation.id.as_str() == operation_id)
+                {
+                    break operation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deploy never reached terminal operation history");
+        assert_eq!(
+            terminal.outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Completed)
+        );
+        assert!(terminal.finished_at.is_some());
+        assert!(terminal.finished_at.unwrap() >= terminal.started_at);
+
         shutdown.cancel();
         let _ = handle.await;
     }

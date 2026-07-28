@@ -180,9 +180,9 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Rolling deploy orchestrator (DeployDriver trait, per-step health-gated replacement) — **`[lib-only]` `L2` orchestrator/`DeployDriver` only in tests; the wired path is the agent's inline redeploy (`H2`/`H3` bugs)**
 - [x] Automatic rollback (revert upgraded instances on health failure) — **`M16` rollback leaks the failed step's new instance**
 - [x] Dependency ordering (`run_before` jobs complete before rolling)
-- [x] Deploy Raft persistence (active deploys + history capped at 50 per app) — **`[lib-only]` state-machine support only; the binary never writes deploy requests; history is a local `Vec` and only records on redeploy (empty until the 2nd deploy)**
+- [x] Deploy state models and history — the library-side `DeployState` Raft commands remain separate from the binary's desired-state reconciler. The real Bun path records every accepted worker with a stable operation ID, live phase/target and bounded 50-entry outcome history (M6); per-app rollback history records fresh and rolling deploys locally.
 - [x] CLI: `relish deploy`, `relish history`, `relish rollback`, `relish lint` — **`X3` `rollback` calls no endpoint (prints advice); `X5` dry-run fallback makes `apply`/`deploy` exit 0 when the agent is down**
-- [x] API: `/v1/deploys/active`, `/v1/deploys/history/{app}` — **`/v1/deploys/active` hardcoded empty**
+- [x] API: `/v1/deploys/active`, `/v1/deploys/operations`, `/v1/deploys/history/{app}` — active operations now come from the running worker path; operation history and per-app rollback history are explicit separate contracts.
 - [x] `make deploy-demo` for local testing
 - [x] Book chapter 7: "Ship It"
 - Autoscaling, Lettuce GitOps, blue-green, K8s migration — see Phase 9
@@ -1395,7 +1395,7 @@ convergence and adoption" theme under 12b.6).
   build-signer SPIFFE identity. Bun validates malformed domains at startup; a
   non-default `payments.prod` acceptance issues and verifies a real leaf.
 - [x] Rootless proxy adoption across Bun replacement (M5) — schema-v2 instance records own the slirp API socket, port mapping and PID/start-time fingerprint. Adoption reclaims a surviving proxy or recreates it before returning success; a real non-root runc test proves the host port before and after replacement.
-- [ ] Real deployment operation state (M6)
+- [x] Real deployment operation state (M6) — accepted SSE events carry stable IDs; live phase/current-target/start evidence and newest-first bounded outcomes are exposed by authenticated APIs. Overlapping same-target workers are refused, disconnected clients don't erase outcomes and missing terminal evidence records `unknown`.
 - [ ] Explicit v1 ingress/TLS contract (M7)
 - [ ] Corrected Phase 15 prerequisites and catalogue (M8)
   - [x] Result/evidence/profile contracts, inherited absolute deadlines,

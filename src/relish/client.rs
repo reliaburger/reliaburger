@@ -394,6 +394,9 @@ impl BunClient {
                     && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
                 {
                     match &event {
+                        ApplyEvent::Accepted { operation_id } => {
+                            eprintln!("  operation {operation_id}");
+                        }
                         ApplyEvent::Progress { message } => {
                             eprintln!("  {message}");
                         }
@@ -560,6 +563,13 @@ impl BunClient {
             ))
             .await?;
         Ok(value["history"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Fetch live deploy operations and bounded terminal history.
+    pub async fn deploy_operations(
+        &self,
+    ) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, RelishError> {
+        self.get_typed_json("/v1/deploys/operations").await
     }
 
     /// Fetch metrics recorded for one app.

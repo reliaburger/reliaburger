@@ -755,6 +755,9 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/readiness` | Authenticated critical-subsystem readiness evidence (200 ready, 503 fenced) |
 | `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
+| `GET` | `/v1/deploys/active` | Live accepted deploy operations, phases and current targets |
+| `GET` | `/v1/deploys/operations` | Live operations plus the newest 50 terminal outcomes |
+| `GET` | `/v1/deploys/history/{app}` | Per-app version/spec history used by rollback |
 | `GET` | `/v1/status` | List all instances |
 | `GET` | `/v1/status/{app}/{namespace}` | Status for a specific app |
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
@@ -775,4 +778,14 @@ curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
   http://127.0.0.1:9117/v1/readiness
 curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
   http://127.0.0.1:9117/v1/capabilities
+curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  http://127.0.0.1:9117/v1/deploys/active
 ```
+
+Standalone apply streams an `Accepted` SSE event before progress, containing
+the operation ID used by these endpoints. Active records report `accepted`,
+`deploying_apps`, `deploying_jobs` or `rebuilding_routes`; terminal records use
+the `finished` phase plus an explicit `completed`, `failed`, `cancelled` or
+`unknown` outcome. `unknown` means the worker ended without terminal evidence.
+It is not treated as a green deploy. Concurrent operations may target different
+apps, but Bun refuses a second operation for the same namespace/name.

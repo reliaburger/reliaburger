@@ -424,9 +424,18 @@ undelegated systemd cgroup path which made rootless runc fail at startup.
 
 ### M6. Publish real deployment operation state
 
-- [ ] Give deploys stable operation IDs, phases, start times and outcomes; expose
+- [x] Give deploys stable operation IDs, phases, start times and outcomes; expose
   active state plus bounded history (FUNC-6).
-- [ ] Build `wtf` deploy-stuck logic only after this evidence exists.
+- [ ] M8: build `wtf` deploy-stuck logic from this evidence.
+
+**Delivered:** every real Bun deploy worker receives a time-based monotonic ID
+which appears as the first standalone SSE event. Its accepted, app, job and
+routing phases, current target, timestamps and terminal outcome are queryable
+through `/v1/deploys/active`; `/v1/deploys/operations` adds the newest 50
+terminal records. Same-target concurrent deploys fail before mutation, a lost
+SSE client doesn't lose the outcome, and a worker which disappears without a
+terminal event becomes `unknown`. The existing per-app rollback history remains
+a separate contract. Phase 15 `wtf` will consume this evidence in M8.
 
 ### M7. Decide and document the v1 ingress/TLS contract
 
