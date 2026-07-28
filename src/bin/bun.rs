@@ -516,6 +516,10 @@ async fn main() -> anyhow::Result<()> {
         .alerts
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    config
+        .ingress
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
     // Create port allocator from config
     let port_allocator = PortAllocator::new(

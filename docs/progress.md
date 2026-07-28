@@ -998,9 +998,11 @@ whole theme lands.
     (`Disabled`/`Cluster`/`Explicit`) parsed from `IngressSpec.tls`, carried into
     `PathRoute`. Unsupported modes (`auto`/`acme`) are rejected at routing rebuild rather
     than silently served plaintext; a TLS-marked route reached over plain HTTP gets a 308
-    to HTTPS (ACME challenge paths excepted). Cluster-CA path: `tls::issue_ingress_cert`
+    to HTTPS on every path. Cluster-CA path: `tls::issue_ingress_cert`
     issues a server-auth ingress cert from the Sesame Ingress CA (reuses the existing CA
     hierarchy, no parallel scheme). Explicit certs keep the existing disk-file contract.
+    Every plaintext path now redirects for TLS routes: the old ACME challenge
+    exception was removed because v1 has no challenge responder.
   - [x] **ING2 — connection permits through the full lifetime.** TLS handshakes are bounded
     by a semaphore and a per-handshake deadline (`tokio::time::timeout`), so a slow-handshake
     flood can't exhaust tasks. The proxy holds a connection permit for the whole request; for
@@ -1396,7 +1398,14 @@ convergence and adoption" theme under 12b.6).
   non-default `payments.prod` acceptance issues and verifies a real leaf.
 - [x] Rootless proxy adoption across Bun replacement (M5) — schema-v2 instance records own the slirp API socket, port mapping and PID/start-time fingerprint. Adoption reclaims a surviving proxy or recreates it before returning success; a real non-root runc test proves the host port before and after replacement.
 - [x] Real deployment operation state (M6) — accepted SSE events carry stable IDs; live phase/current-target/start evidence and newest-first bounded outcomes are exposed by authenticated APIs. Overlapping same-target workers are refused, disconnected clients don't erase outcomes and missing terminal evidence records `unknown`.
-- [ ] Explicit v1 ingress/TLS contract (M7)
+- [x] Explicit v1 ingress/TLS contract (M7) — `cluster`, `explicit`, and
+  deliberate plain HTTP are the complete v1 set; `auto`/`acme` remain rejected.
+  The whitepaper, component designs, book and examples now say so. Kubernetes
+  imports translate a TLS stanza to `cluster` and warn that the referenced
+  Secret wasn't imported. TLS routes redirect every plaintext path, including
+  the unused ACME challenge prefix. The audit also records certificate renewal,
+  hot reload and expiry evidence as Phase 15 prerequisites rather than claiming
+  they already work.
 - [ ] Corrected Phase 15 prerequisites and catalogue (M8)
   - [x] Result/evidence/profile contracts, inherited absolute deadlines,
     panic-safe runner ownership, verified cleanup reporting and typed

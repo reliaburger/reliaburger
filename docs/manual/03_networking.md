@@ -37,15 +37,20 @@ port = 80
 
 [app.web.ingress]
 host = "web.example.com"
+# tls = "cluster"         # or "explicit" with node certificate files
 ```
 
 ```sh
 relish routes             # the live routing table
 ```
 
-TLS uses the configured certificate, or a self-signed one at startup if you
-haven't provided any. WebSockets and streaming responses pass through;
-draining connections finish before an instance stops.
+Omitting `tls` makes the route deliberately plain HTTP. `cluster` uses the
+Sesame Ingress CA on a cluster-capable ingress node. `explicit` uses the
+`tls_cert` and `tls_key` PEM files from this node's `[ingress]` section; Bun
+rejects a half-configured pair. `auto` and `acme` aren't implemented and fail
+route validation. The listener's self-signed fallback is for development, not
+a substitute for either production mode. WebSockets and streaming responses
+pass through; draining connections finish before an instance stops.
 
 ## Fault injection lives nearby
 

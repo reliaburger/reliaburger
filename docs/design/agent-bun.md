@@ -741,10 +741,11 @@ pub struct MetricsConfig {
 
 #[derive(Debug, Clone)]
 pub struct IngressConfig {
-    pub enabled: bool,                    // default: true
+    pub enabled: bool,                    // default: false
     pub http_port: u16,                   // default: 80
     pub https_port: u16,                  // default: 443
-    pub tls_acme_email: Option<String>,
+    pub tls_cert: Option<PathBuf>,         // operator-supplied PEM chain
+    pub tls_key: Option<PathBuf>,          // operator-supplied PEM key
 }
 
 #[derive(Debug, Clone)]
@@ -1202,10 +1203,11 @@ join = ["10.0.1.5:9443"]
 | `[metrics]` | `retention_1m` | `"7d"` | duration, 1d-365d | Retention for 1-minute downsampled metrics. |
 | `[metrics]` | `retention_1h` | `"90d"` | duration, 7d-3650d | Retention for 1-hour downsampled metrics. |
 | `[metrics]` | `max_storage` | `"5Gi"` | resource string (bytes) | Maximum disk space for metrics. |
-| `[ingress]` | `enabled` | `true` | bool | Whether this node serves external ingress traffic. |
+| `[ingress]` | `enabled` | `false` | bool | Whether this node serves external ingress traffic. |
 | `[ingress]` | `http_port` | `80` | 1-65535 | HTTP listen port for Wrapper. |
 | `[ingress]` | `https_port` | `443` | 1-65535 | HTTPS listen port for Wrapper. |
-| `[ingress]` | `tls_acme_email` | (none) | email string | ACME account email for Let's Encrypt certificates. |
+| `[ingress]` | `tls_cert` | (none) | path | Operator-supplied TLS certificate chain. Set with `tls_key`. |
+| `[ingress]` | `tls_key` | (none) | path | Operator-supplied TLS private key. Set with `tls_cert`. |
 | `[process_workloads]` | `allowed_binaries` | `[]` | list of absolute path strings | Binaries permitted to run as process workloads. Empty = disabled. |
 | `[testing]` | `safety_class` | `"unknown"` | `unknown`, `development`, `staging`, `production` | Typed safety boundary for Phase 15 operations. Unknown is protected. |
 | `[testing]` | `allowed_operations` | `[]` | list of operation names | Server-owned permissions for diagnostics, isolated workloads, faults, node changes, capacity saturation and external probes. |

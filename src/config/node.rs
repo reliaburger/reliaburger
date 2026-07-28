@@ -238,6 +238,22 @@ impl Default for IngressSection {
 }
 
 impl IngressSection {
+    /// Validate the operator-supplied TLS material as one atomic setting.
+    ///
+    /// Supplying only one half would otherwise make Wrapper silently ignore
+    /// it and generate its development certificate.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        if self.tls_cert.is_some() == self.tls_key.is_some() {
+            Ok(())
+        } else {
+            Err(super::error::ConfigError::Validation {
+                field: "tls_cert/tls_key".to_string(),
+                context: "ingress".to_string(),
+                reason: "must either both be set or both be omitted".to_string(),
+            })
+        }
+    }
+
     /// Convert into the Wrapper subsystem's config type.
     pub fn to_wrapper_config(&self) -> crate::wrapper::types::WrapperConfig {
         crate::wrapper::types::WrapperConfig {
@@ -886,6 +902,24 @@ mod tests {
         assert_eq!(wc.https_port, 8443);
         assert_eq!(wc.max_connections, 500);
         assert!(wc.tls_cert_path.is_none());
+    }
+
+    #[test]
+    fn ingress_rejects_incomplete_explicit_certificate_pair() {
+        for toml in [
+            "[ingress]\ntls_cert = \"/cert.pem\"",
+            "[ingress]\ntls_key = \"/key.pem\"",
+        ] {
+            let config = NodeConfig::parse(toml).unwrap();
+            let error = config.ingress.validate().unwrap_err().to_string();
+            assert!(error.contains("tls_cert"), "unexpected error: {error}");
+            assert!(error.contains("tls_key"), "unexpected error: {error}");
+        }
+
+        let complete =
+            NodeConfig::parse("[ingress]\ntls_cert = \"/cert.pem\"\ntls_key = \"/key.pem\"")
+                .unwrap();
+        complete.ingress.validate().unwrap();
     }
 
     /// L8: loading eBPF needs root + a recent kernel, so it is opt-in.

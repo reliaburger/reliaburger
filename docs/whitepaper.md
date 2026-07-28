@@ -138,7 +138,7 @@ The unit of deployment is an **App**, not a Pod/Deployment/Service triple. At it
 
 ### 3.3 Convention Over Configuration
 
-Sensible defaults everywhere. TLS is automatic: when an App declares an ingress block, TLS defaults to `"auto"` without needing to be specified (Let's Encrypt for public services when the cluster has internet access, or the cluster's Ingress CA for air-gapped environments). Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
+Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is a post-v1 feature: `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
 
 ### 3.4 Homogeneous Nodes
 
@@ -518,12 +518,12 @@ This eliminates a large proportion of Kubernetes debugging pain: encapsulation o
 
 ### 9.2 Built-In Ingress (Wrapper)
 
-Wrapper runs on every node by default and handles TLS termination (automatic via Let's Encrypt or the cluster's Ingress CA), host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support.
+Wrapper can run on every node and handles TLS termination, host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support. It is opt-in in `node.toml`. The v1 TLS sources are the cluster's Ingress CA and an operator-supplied certificate/key pair. Automatic ACME/Let's Encrypt provisioning is deferred.
 
 ```toml
 [app.web.ingress]
 host = "myapp.com"
-tls = "acme"        # or "cluster" for air-gapped environments
+tls = "cluster"     # clients must trust the cluster root CA
 ```
 
 There's no IngressClass, no annotations, no separate cert-manager installation. External traffic reaches the cluster via a standard TCP/UDP load balancer (or DNS round-robin) pointing to any set of nodes. Wrapper on each node can route traffic for any app, so you don't need application-aware routing at the load balancer layer.
@@ -911,7 +911,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **Binary count** | Many (apiserver, scheduler, controller-manager, etcd, kubelet, kube-proxy) | 1 | 1 | 1 | **1** |
 | **Networking** | Overlay (CNI required) | Overlay (CNI required) | Host or overlay | Host (bridge) | **Per-container namespaces + port mapping (no overlay)** |
 | **Ingress** | Separate install | Bundled (Traefik) | Separate | N/A | **Built-in (Wrapper)** |
-| **TLS certificates** | Separate (cert-manager) | Separate | Separate | N/A | **Built-in (ACME or Ingress CA)** |
+| **TLS certificates** | Separate (cert-manager) | Separate | Separate | N/A | **Built-in Ingress CA or operator-supplied; ACME deferred** |
 | **Metrics** | Separate (Prometheus) | Separate | Separate | N/A | **Built-in (Mayo + app scraping)** |
 | **Alerting** | Separate (Alertmanager) | Separate | Separate | N/A | **Built-in (5 default alerts)** |
 | **Logs** | Separate (Loki/EFK) | Separate | Built-in (alloc logs) | `docker logs` | **Built-in (Ketchup)** |

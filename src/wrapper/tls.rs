@@ -1,8 +1,9 @@
 /// TLS termination for the Wrapper ingress proxy.
 ///
-/// Phase 3: self-signed cert generated on startup, or load from disk.
-/// Phase 4 (Sesame): replaces with ACME (Let's Encrypt) or cluster
-/// CA certificates.
+/// Wrapper uses a cluster Ingress CA certificate resolver or an
+/// operator-supplied certificate and key. It generates a self-signed
+/// certificate only for development and listener bootstrap. Automatic ACME
+/// provisioning is not part of the current contract.
 ///
 /// TLS 1.0 and 1.1 are rejected. Only 1.2 and 1.3 are accepted.
 use std::path::Path;
@@ -27,8 +28,8 @@ pub enum TlsError {
 /// Generate a self-signed certificate for development/testing.
 ///
 /// Creates an ECDSA P-256 certificate valid for `localhost` and
-/// `127.0.0.1`. Not suitable for production — Phase 4 Sesame
-/// provides real certificate management.
+/// `127.0.0.1`. Not suitable for production; use the cluster Ingress CA or
+/// configure an operator-supplied certificate and key.
 pub fn generate_self_signed_cert()
 -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>), TlsError> {
     let cert =

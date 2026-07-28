@@ -439,8 +439,22 @@ a separate contract. Phase 15 `wtf` will consume this evidence in M8.
 
 ### M7. Decide and document the v1 ingress/TLS contract
 
-- [ ] Either implement and accept-test automatic ACME with production-safe
+- [x] Either implement and accept-test automatic ACME with production-safe
   defaults, or mark it deferred and correct the whitepaper/examples now.
+
+**Decision:** ACME is deferred. The v1 route contract is deliberate plain HTTP,
+`tls = "cluster"`, or `tls = "explicit"`; `auto`, `acme` and unknown values fail
+route rebuild. Every plaintext request to a TLS route now gets a 308, including
+the ACME challenge prefix which previously bypassed the redirect despite there
+being no responder. Kubernetes Ingress TLS imports use the cluster CA and emit
+a review warning because Kubernetes TLS Secret material isn't imported. The
+whitepaper, Wrapper/Sesame/Bun/Brioche designs, Chapter 3 and Rust API comments
+now distinguish this shipped contract from the deferred issuer design.
+
+The same audit found a prerequisite for Phase 15: cluster leaves stay in an
+in-memory cache until process replacement and explicit files load only at
+startup. M8 must add certificate expiry evidence and should not make
+`wtf certificate-expiry` green until renewal or hot reload is real.
 
 ### M8. Implement the corrected Phase 15 prerequisites and catalogue
 
@@ -458,6 +472,8 @@ a separate contract. Phase 15 `wtf` will consume this evidence in M8.
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
   source-namespace trace, documentation and real-cluster acceptance.
+- [ ] Add certificate expiry evidence and production rotation/renewal before
+  treating the TLS-expiry diagnostic as an accepted capability.
 
 ## Optional
 
