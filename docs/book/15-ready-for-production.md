@@ -1462,5 +1462,73 @@ and timers still live in the target process, though. If peers have already
 removed the failed node from their live directory, the operator must point
 Relish at that node's still-open API to clear it; expiry needs no route and
 will restore it automatically. Durable lease ownership for node state remains
-unfinished, as does node-scoped resource pressure. The chaos catalogue must
-wait for those rather than turning them into cheerful skips.
+unfinished. The chaos catalogue must account for that rather than turning
+cleanup uncertainty into a cheerful skip.
+
+## Pressuring a node without pressuring Bun
+
+A workload CPU fault edits that workload's cgroup. Useful, but it doesn't test
+what happens when one whole node runs short of capacity. C4 in the chaos
+catalogue needs the latter: consume a bounded share of one worker's CPU, bring
+the node towards a memory-usage target, and check that the rest of the cluster
+stays healthy.
+
+The tempting implementation is to start a burn loop inside Bun. That would put
+the control plane in the experiment's blast radius and make the process
+responsible for cleaning up the resource starvation it is suffering. A fine
+way to create a memorable afternoon, but not a useful primitive.
+
+Bun now owns `/sys/fs/cgroup/reliaburger-chaos` instead. Each pressure fault
+gets one child cgroup and one hidden helper process. Bun stays in its original
+cgroup. The child writes its PID to `cgroup.procs`, allocates the required
+resident memory and starts one burn thread per available core. The cgroup's
+`cpu.max` limits those threads to the requested percentage of total machine
+capacity:
+
+```text
+quota = period × cores × percentage / 100
+```
+
+Memory needs a more careful definition. `--memory 90%` means "bring total node
+usage to 90%", not "allocate another 90%". The helper reads Linux `MemTotal`
+and `MemAvailable` *after* joining its cgroup, then allocates only the
+difference. The kernel-enforced `memory.max` is the requested percentage of
+physical memory. That ceiling doesn't depend on a momentary usage reading, so
+the parent's setup and the child's later calculation can't race into an
+accidental OOM. `memory.swap.max = 0` also keeps the evidence about resident
+pressure rather than swap throughput.
+
+This helper runs before Bun constructs Tokio's runtime. We replaced
+`#[tokio::main]` with an ordinary `main` which handles the hidden synchronous
+subcommand first and explicitly builds the normal multi-thread runtime for the
+agent path. Otherwise Tokio's worker threads would exist before the helper
+joined its cgroup, muddying process ownership and wasting memory in a programme
+which only needs to park.
+
+Linux gives us one more safety net: `prctl(PR_SET_PDEATHSIG, SIGKILL)` asks the
+kernel to kill the helper when its Bun parent dies. `prctl` is a C system call,
+so Rust requires an `unsafe` block. The block's safety comment explains the
+invariant: the call changes process metadata and doesn't dereference Rust
+memory. We then read `getppid()` to close the small race where Bun could die
+before the parent-death signal was installed. A fresh Bun sweeps any empty
+`fault-*` cgroups left by a hard crash.
+
+None of this is enabled by merely running as root. The server policy needs the
+independent `saturate_capacity` operation plus non-zero CPU or memory ceilings;
+both ceilings have a hard 90% maximum. The caller needs an authenticated Admin
+role and explicit acknowledgement, and the target repeats those checks after
+cross-node forwarding. Only one helper may run on a node, so two individually
+safe requests can't add up past the configured bound.
+
+Clearing pressure is deliberately less privileged than creating it. A
+Deployer may terminate an owned helper, but that routing permission doesn't
+let the same caller reverse a drain or node kill. Clear, expiry and graceful
+shutdown kill the child and remove its cgroup. Parent death and startup sweep
+cover the paths where normal cleanup code never gets a turn.
+
+The privileged acceptance test checks the real hierarchy rather than a mock.
+It verifies `cpu.max`, observes the helper PID inside the fault cgroup and the
+test/Bun process outside it, confirms the total-memory target, clears the
+fault, then drops the controller and proves a restarted owner removes the
+stale cgroup. On macOS, rootless Linux or a cgroup hierarchy without both
+controllers, capability evidence says `Unavailable`. Honest again.

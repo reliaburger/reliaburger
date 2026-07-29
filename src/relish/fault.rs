@@ -406,6 +406,40 @@ pub async fn node_kill(
     inject_and_print(&request).await
 }
 
+/// Consume bounded CPU and memory capacity on one node.
+#[allow(clippy::too_many_arguments)]
+pub async fn node_pressure(
+    target: &str,
+    cpu: &str,
+    memory: &str,
+    duration: &Option<String>,
+    include_leader: bool,
+    reason: Option<&str>,
+    override_safety: bool,
+    acknowledged: bool,
+) -> Result<(), RelishError> {
+    let cpu_percentage = parse_percentage(cpu)?;
+    let memory_percentage = parse_percentage(memory)?;
+    let targeting = FaultTargeting {
+        node: Some(target.into()),
+        reason: reason.map(str::to_string),
+        override_safety,
+        ..FaultTargeting::default()
+    };
+    let mut request = make_request(
+        FaultType::NodePressure {
+            cpu_percentage,
+            memory_percentage,
+        },
+        String::new(),
+        get_duration(duration)?,
+        &targeting,
+    );
+    request.include_leader = include_leader;
+    request.acknowledged = acknowledged;
+    inject_and_print(&request).await
+}
+
 /// List all active faults.
 pub async fn list() -> Result<(), RelishError> {
     let client = BunClient::default_local();
@@ -425,7 +459,7 @@ pub async fn list() -> Result<(), RelishError> {
             "{:<6} {:<22} {:<15} {:<15} {:<10} {}",
             f.id,
             f.fault_type,
-            f.target_service,
+            f.target_node.as_deref().unwrap_or(&f.target_service),
             f.target_instance.as_deref().unwrap_or("-"),
             format!("{}s", f.remaining_secs),
             f.injected_by,

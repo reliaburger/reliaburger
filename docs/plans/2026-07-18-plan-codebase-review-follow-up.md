@@ -475,7 +475,7 @@ startup. M8 must add certificate expiry evidence and should not make
 - [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
 - [ ] Add chaos primitives only after the safety, evidence and ownership gates.
 - [x] Implement authenticated real drain/kill before C1/C2/C5.
-- [ ] Implement node-scoped pressure before C4. Unsupported scenarios must
+- [x] Implement node-scoped pressure before C4. Unsupported scenarios must
   not become green skips.
 - [x] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
   on missing required capabilities, timeout or unknown evidence.
@@ -491,16 +491,17 @@ schema-v3, 15-second evidence. Each fact is `available`, `unavailable` or
 target/profile, runtime/version, rootless mode, kernel, architecture, cluster
 identity, readiness, placement evidence and server-owned operation policy.
 Stores without a published freshness timestamp remain unknown. Cluster-mode
-nodes now advertise drain and kill as available; node pressure remains
-unavailable.
+nodes advertise drain and kill as available. Rootful Linux nodes advertise
+node pressure only after the owned cgroup/controller startup probe succeeds and
+the server has non-zero pressure ceilings.
 
 `GET /v1/capabilities/cluster` fans out concurrently to current members with
 one five-second absolute deadline. It presents the cluster service credential
 over the configured cluster HTTP client, refuses an anonymous fallback, caps
 responses at 1 MiB, checks schema, node identity and expiry, and retains every
-failed peer as an explicit unknown result. Node pressure, volume semantics,
-telemetry freshness and certificate expiry remain honest unknown or
-unavailable prerequisites.
+failed peer as an explicit unknown result. Volume semantics, telemetry
+freshness and certificate expiry remain honest unknown or unavailable
+prerequisites.
 
 **Node-failure tranche delivered:** `node-drain` publishes degraded critical
 readiness while leaving gossip, Raft and reporting open. The scheduler
@@ -522,6 +523,17 @@ directly. A three-node acceptance observes a follower leave and rejoin through
 the real transports, and proves a second voter failure is refused while the
 first remains down. Durable lease ownership for node state is still open and
 the chaos catalogue must not claim it yet.
+
+**Node-pressure tranche delivered:** `relish fault node-pressure` routes to a
+named node and requires Admin, the independent `saturate_capacity` operation,
+explicit acknowledgement and server-owned CPU/memory ceilings. Both ceilings
+default to zero and validate at or below 90%. A rootful Linux node creates one
+dedicated cgroup and helper outside Bun, applies a whole-node CPU quota and
+allocates only enough resident memory to reach the requested total-node usage.
+Clear, TTL and graceful shutdown remove the helper and cgroup;
+`PR_SET_PDEATHSIG` plus startup sweeping cover process death. Rootless,
+non-Linux and missing-controller nodes publish unavailable evidence. A
+privileged cgroup-v2 acceptance proves the effect, isolation and cleanup.
 
 **Resource-lease tranche delivered:** a Deployer may create, inspect, renew and
 release an app/namespace lease only when the server policy permits isolated

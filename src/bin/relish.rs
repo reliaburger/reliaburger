@@ -879,6 +879,32 @@ enum FaultAction {
         #[arg(long)]
         acknowledge: bool,
     },
+    /// Consume bounded CPU and memory capacity on one node.
+    NodePressure {
+        /// Target node name.
+        target: String,
+        /// Total-node CPU percentage to consume (e.g. "80%").
+        #[arg(long, default_value = "0%")]
+        cpu: String,
+        /// Total-node memory-usage target (e.g. "90%").
+        #[arg(long, default_value = "0%")]
+        memory: String,
+        /// Pressure duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+        /// Allow targeting the cluster leader.
+        #[arg(long)]
+        include_leader: bool,
+        /// A human reason recorded alongside the fault.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Override the node-percentage safety rail.
+        #[arg(long)]
+        override_safety: bool,
+        /// Confirm that capacity saturation is intentional.
+        #[arg(long)]
+        acknowledge: bool,
+    },
     /// List all active faults.
     List,
     /// Clear faults — all, by numeric id, or by service name.
@@ -1153,6 +1179,28 @@ async fn main() -> ExitCode {
                     target,
                     duration,
                     *containers,
+                    *include_leader,
+                    reason.as_deref(),
+                    *override_safety,
+                    *acknowledge,
+                )
+                .await
+            }
+            FaultAction::NodePressure {
+                target,
+                cpu,
+                memory,
+                duration,
+                include_leader,
+                reason,
+                override_safety,
+                acknowledge,
+            } => {
+                reliaburger::relish::fault::node_pressure(
+                    target,
+                    cpu,
+                    memory,
+                    duration,
                     *include_leader,
                     reason.as_deref(),
                     *override_safety,
@@ -2182,6 +2230,44 @@ mod tests {
                 assert_eq!(duration.as_deref(), Some("30s"));
             }
             _ => panic!("expected Fault NodeKill"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_node_pressure_with_server_gated_targets() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "node-pressure",
+            "worker-2",
+            "--cpu",
+            "80%",
+            "--memory",
+            "90%",
+            "--duration",
+            "30s",
+            "--acknowledge",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action:
+                    FaultAction::NodePressure {
+                        target,
+                        cpu,
+                        memory,
+                        duration,
+                        acknowledge,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, "worker-2");
+                assert_eq!(cpu, "80%");
+                assert_eq!(memory, "90%");
+                assert_eq!(duration.as_deref(), Some("30s"));
+                assert!(acknowledge);
+            }
+            _ => panic!("expected Fault NodePressure"),
         }
     }
 

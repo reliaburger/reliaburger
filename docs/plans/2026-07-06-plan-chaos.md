@@ -1,7 +1,10 @@
 # Phase 15 Implementation Plan — Testing, Benchmarking, Diagnostics & Chaos
 
 **Originally written:** 6 July 2026
-**Revised:** 26 July 2026 — re-verified against `main` after the 12b programme, both codebase reviews (2026-07-17 posture, 2026-07-19 code-logic) and PRs #133–#142. **Scope extended** to complete the `relish fault`/`relish chaos` surface, which the original plan assumed was finished.
+**Revised:** 29 July 2026 — re-verified after the 12b programme, both codebase
+reviews and the first Phase 15 implementation tranche. **Scope extended** to
+complete the `relish fault`/`relish chaos` surface, which the original plan
+assumed was finished.
 
 **Audience:** the implementing model. Deliberately prescriptive: exact paths, type names, signatures, test names, commit boundaries. Where this plan and the source disagree, the source wins — then fix this file and say so in the commit.
 
@@ -58,7 +61,7 @@ The old plan's five chaos scenarios (§6 there, stream D here) are:
 | C1 leader failure | `node-kill` | ❌ hard error |
 | C2 dead worker rescheduled | `node-kill` | ❌ hard error |
 | C3 minority partition | `/v1/chaos/partition` | ✅ real (blocks gossip + Raft transports) |
-| C4 resource exhaustion | `cpu` + `memory` | ✅ on Linux |
+| C4 resource exhaustion | `node-pressure` | ✅ on opted-in rootful Linux |
 | C5 node death during deploy | `node-kill` | ❌ hard error |
 
 `apply_fault`'s `NodeDrain | NodeKill` arm returns *"is a cluster-level operation and cannot be applied as a node-local fault"* (`agent.rs:3299-3312`). That refusal is correct and honest — CHAOS1 made it so rather than let it lie — but it means **60 % of the chaos suite is unimplementable until node-level faults exist**.
@@ -136,6 +139,7 @@ src/
     bench/ mod.rs report.rs compare.rs suites.rs
   smoker/
     node_fault.rs                # NEW — node-kill/drain: transport quiesce + restore
+    node_pressure.rs             # NEW — bounded node CPU/memory helper ownership
     types.rs                     # MODIFIED — SmokerConfig limits
   relish/
     test_cmd.rs bench_cmd.rs wtf.rs trace.rs   # NEW command bodies
@@ -243,6 +247,17 @@ Book: §"Every fault must expire".
 Tests: unit — `node_kill_quiesces_all_cluster_transports`, `node_kill_restores_on_expiry`, `node_drain_stops_scheduling_but_keeps_gossip`, `node_fault_refuses_without_a_duration`; gated cluster (`tests/chaos_node.rs`, `RELIABURGER_CLUSTER_TESTS=1`) — `killed_leader_is_replaced_and_rejoins`.
 Implement: `src/smoker/node_fault.rs` — a reversible quiesce that blocks gossip, Raft and reporting transports (the mechanism `/v1/chaos/partition` already uses at `agent.rs:2505`, generalised), with `FaultReversal::NodeQuiesce`; replace the `NodeDrain | NodeKill` refusal arm; `node-drain` additionally cordons the node (the scheduler's `apply_upgrade_cordon` seam from Phase 14 already exists).
 Book: §"Killing a node without killing the process".
+
+**11b/20 — Node-scoped pressure prerequisite**
+Tests: pure request/ceiling/quota and policy tests; API role, permission and
+acknowledgement tests; privileged rootful-Linux cgroup-v2 acceptance proving
+effect, Bun isolation, clear and restart cleanup.
+Implement: `src/smoker/node_pressure.rs`; a dedicated helper cgroup outside
+Bun, one concurrent helper per node, total-node CPU quota and memory-usage
+target, 90% hard ceilings, `PR_SET_PDEATHSIG`, startup sweeping and live
+capability evidence. Route by target node under `saturate_capacity`; clearing
+is de-escalating and must not grant `alter_node_state`.
+Book: §"Pressuring a node without pressuring Bun".
 
 **12/20 — Partition stops lying; memory-oom decision**
 Tests: `partition_without_ebpf_is_refused_not_silently_dropped`; move the quorum-rail acceptance test onto an eBPF node or a mock so the `TODO(Phase 15)` no-op can go; `memory_oom_is_implemented_or_refused_consistently`.
@@ -658,7 +673,12 @@ Scenarios (whitepaper SLA: full operability after leader loss < 20 s — assert 
 - **C1 `leader_failure_elects_new_leader_and_cluster_recovers`** — identify leader via `/v1/cluster/council`; `node-kill` it (duration 60 s, auto-recover); assert a *different* leader within 30 s; deploy a canary app during the outage window and see it Running; after recovery the old node rejoins Alive.
 - **C2 `dead_worker_node_has_workloads_rescheduled`** — deploy 3-replica app spread over workers; `node-kill` a worker hosting ≥1 replica; assert membership marks it Suspect→Dead (guards H4–H7) and desired replica count is restored on surviving nodes within 90 s.
 - **C3 `minority_partition_degrades_and_heals`** — partition one node away (`/v1/chaos/partition`); majority still accepts a deploy; partitioned node either serves stale reads or refuses writes, but never a second leader (guards C3-review); heal; membership reconverges, no duplicate instances left behind.
-- **C4 `resource_exhaustion_degrades_gracefully`** — inject `memory 90%` + `cpu 80%` on one worker; assert cluster-level API stays responsive, health checks on *other* nodes don't flap, and (if scheduler pressure-awareness exists) new replicas avoid the pressured node — otherwise just assert no false Dead; clear faults; node returns to normal.
+- **C4 `resource_exhaustion_degrades_gracefully`** — inject
+  `node-pressure --memory 90% --cpu 80%` on one worker; assert cluster-level
+  API stays responsive, health checks on *other* nodes don't flap, and new
+  replicas avoid the pressured node when live scheduler evidence supports that
+  assertion; always assert no false Dead, clear the owned fault and prove the
+  helper/cgroup disappeared.
 - **C5 `node_death_during_deploy_ends_clean`** — start a rolling deploy of a 4-replica app, `node-kill` a worker mid-roll; assert the deploy terminates in a defined state (Complete or RolledBack, not stuck), replica count eventually correct, no orphaned instances in `/v1/status` (guards M16/H1).
 
 Report: chaos results are ordinary `TestCaseResult`s inside a `TestReport` with `chaos: true`.
@@ -850,10 +870,11 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 8/20 catalogue B — **all 13 groups, 39 cases.** Control-plane groups on `ProcessRuntime`; container-workload groups (firewall/ingress/volumes/secrets-config) on a `busybox` image gated on `Capability::ContainerRuntime`; image-registry builds + pushes a synthetic OCI image via the raw `/v2` protocol (`src/testkit/oci.rs`) to the on-node loopback registry (2 cases real, `deploy_from_cluster_registry` skips — synthetic image isn't runnable). Two acceptance runs, one per runtime; skips all name their reason
 - [x] 9/20 fault targeting flags + CLI fidelity
 - [x] 10/20 `[smoker]` duration config
-- [ ] 11/20 node-level faults
+- [x] 11/20 node-level faults
+- [x] 11b/20 node-scoped pressure prerequisite
 - [ ] 12/20 partition honesty + memory-oom decision
 - [ ] 13/20 fault authorisation + audit
-- [ ] 13b/20 leader-mediated distribution *(in scope — D1 resolved)*
+- [x] 13b/20 authenticated target-node distribution
 - [ ] 14/20 chaos suite
 - [ ] 15/20 bench schema + comparison
 - [ ] 16/20 bench suites

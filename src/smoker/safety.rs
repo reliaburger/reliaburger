@@ -146,7 +146,7 @@ fn check_leader_targeted(
 ) -> Option<SafetyViolation> {
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::NodeDrain
+        FaultType::NodeKill { .. } | FaultType::NodeDrain | FaultType::NodePressure { .. }
     );
     if !targets_node {
         return None;
@@ -168,7 +168,7 @@ fn check_node_percentage(
 ) -> Option<SafetyViolation> {
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::NodeDrain
+        FaultType::NodeKill { .. } | FaultType::NodeDrain | FaultType::NodePressure { .. }
     );
     if !targets_node {
         return None;
@@ -214,6 +214,24 @@ mod tests {
                 kill_containers: false,
             },
             target_service: "".into(),
+            target_instance: None,
+            target_node: Some(target_node.into()),
+            duration: Duration::from_secs(30),
+            injected_by: "test".into(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: false,
+        }
+    }
+
+    fn node_pressure_request(target_node: &str) -> FaultRequest {
+        FaultRequest {
+            fault_type: FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
+            },
+            target_service: String::new(),
             target_instance: None,
             target_node: Some(target_node.into()),
             duration: Duration::from_secs(30),
@@ -442,6 +460,23 @@ mod tests {
         let req = node_kill_request("node-3"); // not the leader
         let check = evaluate_safety(&req, &ctx);
         assert!(check.approved);
+    }
+
+    #[test]
+    fn node_pressure_protects_the_leader_but_not_raft_quorum() {
+        let mut ctx = default_context();
+        ctx.council_nodes_with_active_faults = 2;
+        let leader = node_pressure_request("node-1");
+        assert!(matches!(
+            evaluate_safety(&leader, &ctx).violation,
+            Some(SafetyViolation::LeaderTargeted)
+        ));
+
+        let worker = node_pressure_request("node-4");
+        assert!(
+            evaluate_safety(&worker, &ctx).approved,
+            "pressure keeps cluster transports open and must not consume a voter"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -8,6 +8,10 @@ use crate::sesame::types::ApiRole;
 
 /// Absolute ceiling for a Phase 15 resource lease.
 pub const MAX_TEST_LEASE_SECONDS: u64 = 24 * 60 * 60;
+/// Hard CPU ceiling for a node-pressure helper.
+pub const MAX_NODE_PRESSURE_CPU_PERCENT: u8 = 90;
+/// Hard memory-usage target ceiling for a node-pressure helper.
+pub const MAX_NODE_PRESSURE_MEMORY_PERCENT: u8 = 90;
 
 /// Operator-declared cluster class. Unknown is protected, not development.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +79,16 @@ pub struct ClusterTestPolicy {
     pub allow_protected_mutation: bool,
     /// Longest resource lease this server may issue.
     pub max_lease_seconds: u64,
+    /// Largest total-node CPU percentage a pressure fault may consume.
+    ///
+    /// Zero disables CPU pressure. The default is zero, so capacity
+    /// saturation is opt-in even when the operation permission is present.
+    pub max_node_pressure_cpu_percent: u8,
+    /// Largest total-node memory-usage target a pressure fault may request.
+    ///
+    /// Zero disables memory pressure. The 90% hard ceiling preserves a
+    /// control-plane and kernel headroom band.
+    pub max_node_pressure_memory_percent: u8,
     /// Destinations trace may probe when the caller also has permission.
     pub external_probe_allowlist: Vec<String>,
 }
@@ -86,6 +100,8 @@ impl Default for ClusterTestPolicy {
             allowed_operations: BTreeSet::new(),
             allow_protected_mutation: false,
             max_lease_seconds: 3_600,
+            max_node_pressure_cpu_percent: 0,
+            max_node_pressure_memory_percent: 0,
             external_probe_allowlist: Vec::new(),
         }
     }
@@ -127,6 +143,10 @@ pub enum SafetyError {
     /// A zero or effectively permanent lease limit is unsafe.
     #[error("max lease lifetime must be between 1 and 86400 seconds")]
     InvalidLeaseLimit,
+    #[error("max node-pressure CPU must be between 0 and 90 percent")]
+    InvalidNodePressureCpuLimit,
+    #[error("max node-pressure memory must be between 0 and 90 percent")]
+    InvalidNodePressureMemoryLimit,
 }
 
 impl ClusterTestPolicy {
@@ -134,6 +154,12 @@ impl ClusterTestPolicy {
     pub fn validate(&self) -> Result<(), SafetyError> {
         if self.max_lease_seconds == 0 || self.max_lease_seconds > MAX_TEST_LEASE_SECONDS {
             return Err(SafetyError::InvalidLeaseLimit);
+        }
+        if self.max_node_pressure_cpu_percent > MAX_NODE_PRESSURE_CPU_PERCENT {
+            return Err(SafetyError::InvalidNodePressureCpuLimit);
+        }
+        if self.max_node_pressure_memory_percent > MAX_NODE_PRESSURE_MEMORY_PERCENT {
+            return Err(SafetyError::InvalidNodePressureMemoryLimit);
         }
         Ok(())
     }
@@ -213,6 +239,25 @@ mod tests {
                     &caller(ApiRole::Admin, true)
                 )
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn node_pressure_is_disabled_by_default_and_hard_capped() {
+        let mut policy = ClusterTestPolicy::default();
+        assert_eq!(policy.max_node_pressure_cpu_percent, 0);
+        assert_eq!(policy.max_node_pressure_memory_percent, 0);
+
+        policy.max_node_pressure_cpu_percent = MAX_NODE_PRESSURE_CPU_PERCENT + 1;
+        assert_eq!(
+            policy.validate(),
+            Err(SafetyError::InvalidNodePressureCpuLimit)
+        );
+        policy.max_node_pressure_cpu_percent = MAX_NODE_PRESSURE_CPU_PERCENT;
+        policy.max_node_pressure_memory_percent = MAX_NODE_PRESSURE_MEMORY_PERCENT + 1;
+        assert_eq!(
+            policy.validate(),
+            Err(SafetyError::InvalidNodePressureMemoryLimit)
         );
     }
 }

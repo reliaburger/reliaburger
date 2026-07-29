@@ -74,6 +74,22 @@ enum Command {
         #[arg(long, default_value = "64")]
         alloc_mib: usize,
     },
+    /// Internal node-pressure worker. Not part of Bun's public CLI.
+    #[command(name = "__node-pressure-helper", hide = true)]
+    NodePressureHelper {
+        /// Dedicated cgroup prepared by the parent Bun.
+        #[arg(long)]
+        cgroup: PathBuf,
+        /// Bun PID used to close the parent-death-signal race.
+        #[arg(long)]
+        parent_pid: u32,
+        /// Total-node memory-usage target, recomputed after joining the cgroup.
+        #[arg(long)]
+        memory_percentage: u8,
+        /// Number of CPU-burning worker threads.
+        #[arg(long)]
+        cpu_workers: usize,
+    },
 }
 
 /// Build cluster startup parameters from node config.
@@ -452,10 +468,36 @@ async fn run_testapp(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // The helper must not construct Tokio's multi-thread runtime: those
+    // threads would join the pressure cgroup too and blur ownership. Handle
+    // this internal mode synchronously, then build the normal agent runtime.
+    if let Some(Command::NodePressureHelper {
+        cgroup,
+        parent_pid,
+        memory_percentage,
+        cpu_workers,
+    }) = &cli.command
+    {
+        return reliaburger::smoker::node_pressure::run_helper(
+            cgroup,
+            *parent_pid,
+            *memory_percentage,
+            *cpu_workers,
+        )
+        .map_err(anyhow::Error::msg);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to construct Tokio runtime: {error}"))?;
+    runtime.block_on(run_agent(cli))
+}
+
+async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // `bun testapp` never becomes an agent — it's the workload, not the
     // orchestrator. Handle it before any node config is touched.
     if let Some(Command::Testapp {
@@ -817,6 +859,13 @@ async fn main() -> anyhow::Result<()> {
     agent.set_process_config(config.process_workloads.clone());
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.set_smoker_config(config.smoker.to_smoker_config());
+    let node_pressure_available = agent.configure_node_pressure(
+        reliaburger::smoker::node_pressure::NodePressureLimits {
+            max_cpu_percentage: config.testing.max_node_pressure_cpu_percent,
+            max_memory_percentage: config.testing.max_node_pressure_memory_percent,
+        },
+        exe_path.clone(),
+    );
 
     // Detect GPUs and record what this node can enforce, so the supervisor
     // refuses a GPU request or rootless resource limit it can't back (D15/M22)
@@ -1643,6 +1692,7 @@ async fn main() -> anyhow::Result<()> {
                 false
             }
         },
+        node_pressure: node_pressure_available,
         registry_signatures_required: config.images.trust_policy.require_signatures,
         test_policy: config.testing.clone(),
     };

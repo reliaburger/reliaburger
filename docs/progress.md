@@ -1434,7 +1434,14 @@ convergence and adoption" theme under 12b.6).
     authorisation; scheduler withdrawal for drain; shared gossip/Raft/reporting
     quiesce for kill; TTL and privileged manual reversal. A three-node acceptance
     observes a follower fail and rejoin, and rejects a second voter failure.
-  - [ ] Node-scoped pressure before the chaos catalogue
+  - [x] Node-scoped pressure before the chaos catalogue: Admin plus the
+    independent `saturate_capacity` grant and explicit acknowledgement;
+    zero-by-default server CPU/memory ceilings capped at 90%; target-side
+    authorisation; one dedicated rootful-Linux cgroup/helper outside Bun;
+    total-node CPU quota and memory-usage target; clear/TTL/shutdown,
+    parent-death and startup-sweep cleanup. A privileged cgroup-v2 acceptance
+    proves the effect, isolation and restart cleanup. Unsupported platforms
+    publish unavailable evidence instead of claiming a green primitive.
 
 ### Optional
 

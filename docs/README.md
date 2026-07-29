@@ -417,6 +417,7 @@ Commands:
 | `fault pause <target>` | Freeze instances of a service (SIGSTOP) |
 | `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
 | `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
+| `fault node-pressure <node> --cpu 80% --memory 90% --acknowledge` | Consume server-bounded Linux node capacity in an owned cgroup |
 | `fault list` | List all active faults |
 | `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
 | `fault clear <id> --node <node> --acknowledge` | Reverse a node fault on its owning node |
@@ -814,6 +815,31 @@ clear needs the owning node because fault IDs are node-local:
 `relish fault clear <id> --node <node> --acknowledge`. Once peers have removed
 the failed node from their live directory, point `--endpoint` at that node's
 still-running management API. An ordinary clear never removes node faults.
+
+Node pressure uses an independent `"saturate_capacity"` permission and two
+server-owned ceilings. Both default to zero, so installing Bun doesn't enable
+capacity saturation by accident:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["saturate_capacity"]
+max_node_pressure_cpu_percent = 80
+max_node_pressure_memory_percent = 90
+```
+
+The caller must still be an Admin and pass `--acknowledge`. Linux cgroup v2
+must expose the CPU and memory controllers; rootless and non-Linux nodes report
+the capability as unavailable. `relish fault node-pressure worker-2 --cpu
+80% --memory 90% --duration 60s --acknowledge` creates a dedicated helper
+cgroup, never moves Bun into it, and permits only one pressure helper per node.
+The CPU limit applies across all cores. Memory is a target for total node
+usage, not an extra percentage, and the helper cgroup has a hard ceiling at the
+requested share of physical memory. Bun kills the helper and removes the
+cgroup on clear, expiry and graceful shutdown; Linux parent-death signalling
+plus a startup sweep cover process death. Pressure is de-escalating, so a
+Deployer may clear it, including through `--node`, without receiving authority
+to reverse drain or kill.
 
 Standalone apply streams an `Accepted` SSE event before progress, containing
 the operation ID used by these endpoints. Active records report `accepted`,

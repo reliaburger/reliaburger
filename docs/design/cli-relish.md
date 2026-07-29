@@ -774,6 +774,7 @@ relish fault pause <app> --resume           # SIGCONT (unfreeze)
 relish fault node-drain <node> --acknowledge # Withdraw from scheduling, keep transports
 relish fault node-kill <node> --acknowledge  # Quiesce gossip, Raft and reporting
 relish fault node-kill <node> --duration <d> --acknowledge # Auto-recover after duration
+relish fault node-pressure <node> --cpu 80% --memory 90% --acknowledge
 relish fault run <file>                     # Run scripted chaos scenario
 relish fault run <file> --dry-run           # Preview scenario timing
 relish fault run <file> --speed <multiplier> # Run at adjusted speed
@@ -1228,8 +1229,12 @@ repeats authorisation after forwarding, and general fault clearing cannot
 reverse node state. Node fault IDs remain target-local; a manual clear names
 the owning node and, after failure detection removes it from live routing, the
 operator addresses that node's management endpoint directly. Real node-scoped
-resource exhaustion and cascading failure remain prerequisites rather than
-green skips.
+resource exhaustion is available only when a rootful Linux node advertises
+`NodePressure` and the server policy grants `saturate_capacity` with non-zero
+CPU/memory ceilings. The helper runs in an owned cgroup outside Bun and only
+one may run per node. Rootless, Apple and missing-controller cases remain
+unavailable rather than green skips. Cascading failure remains a catalogue
+scenario, not a primitive.
 
 **`relish bench`**
 

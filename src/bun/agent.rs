@@ -1135,6 +1135,8 @@ pub struct BunAgent<G: Grill> {
     smoker_config: crate::smoker::config::SmokerConfig,
     /// Reference-counted node drains, independent from binary-upgrade drains.
     node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
+    /// Owned helper processes and cgroups for node-scoped capacity pressure.
+    node_pressure: crate::smoker::node_pressure::NodePressureController,
     /// eBPF program handle for writing fault maps (Linux + ebpf feature only).
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1297,6 +1299,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
+            node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1372,6 +1375,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
+            node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1550,6 +1554,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// by config rather than only the hardcoded 24h backstop.
     pub fn set_smoker_config(&mut self, config: crate::smoker::config::SmokerConfig) {
         self.smoker_config = config;
+    }
+
+    /// Configure the opt-in node-pressure helper and clean owned crash
+    /// leftovers. The result feeds capability evidence.
+    pub fn configure_node_pressure(
+        &mut self,
+        limits: crate::smoker::node_pressure::NodePressureLimits,
+        executable: std::path::PathBuf,
+    ) -> bool {
+        self.node_pressure.configure(limits, executable)
     }
 
     /// Record detected platform capabilities (GPUs, rootless mode) so the
@@ -2793,10 +2807,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 allow_node_fault,
                 response,
             } => {
+                let fault_id = crate::smoker::types::FaultId(fault_id);
                 if !allow_node_fault
                     && self
                         .fault_registry
-                        .get(crate::smoker::types::FaultId(fault_id))
+                        .get(fault_id)
                         .is_some_and(|rule| rule.fault_type.is_node_operation())
                 {
                     let _ = response.send(Err(BunError::FaultRejected {
@@ -2805,20 +2820,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }));
                     return;
                 }
-                let msg = match self
-                    .fault_registry
-                    .remove(crate::smoker::types::FaultId(fault_id))
-                {
+                let msg = match self.fault_registry.get(fault_id).cloned() {
                     Some(rule) => {
                         self.delete_fault_bpf_entry(&rule).await;
-                        self.reverse_fault(&rule).await;
+                        let node_pressure = matches!(
+                            &rule.fault_type,
+                            crate::smoker::types::FaultType::NodePressure { .. }
+                        );
+                        if node_pressure {
+                            if let Err(reason) = self.node_pressure.clear(rule.id).await {
+                                let _ = response.send(Err(BunError::FaultRejected { reason }));
+                                return;
+                            }
+                        } else {
+                            self.reverse_fault(&rule).await;
+                        }
+                        self.fault_registry.remove(fault_id);
                         // A DnsNxdomain fault lives in the published set, not a
                         // BPF map, so republish so the responder stops faulting
                         // the target.
                         self.publish_dns_faults();
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
-                    None => format!("fault {fault_id} not found"),
+                    None => format!("fault {} not found", fault_id.0),
                 };
                 let _ = response.send(Ok(msg));
             }
@@ -3205,6 +3229,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     f.fault_type,
                     crate::smoker::types::FaultType::NodeKill { .. }
                         | crate::smoker::types::FaultType::NodeDrain
+                        | crate::smoker::types::FaultType::NodePressure { .. }
                         | crate::smoker::types::FaultType::Partition { .. }
                 )
             })
@@ -3508,6 +3533,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodeQuiesce);
                 Ok(())
             }
+            FaultType::NodePressure {
+                cpu_percentage,
+                memory_percentage,
+            } => {
+                if rule.duration_ns == 0 {
+                    return Err("node pressure requires a non-zero duration".to_string());
+                }
+                self.node_pressure
+                    .apply(rule.id, *cpu_percentage, *memory_percentage)
+                    .await?;
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodePressure);
+                Ok(())
+            }
             FaultType::Partition { .. } => {
                 // A service-to-service partition is an eBPF connect-map fault
                 // (`write_fault_bpf_entry` writes a `FAULT_ACTION_PARTITION`
@@ -3692,7 +3730,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// it), a capped `cpu.max`, a squeezed `memory.high` or an `io.max`
     /// throttle (restore the saved value). Best-effort: an instance that has
     /// since exited simply has nothing left to restore.
-    async fn reverse_fault(&self, rule: &crate::smoker::types::FaultRule) {
+    async fn reverse_fault(&mut self, rule: &crate::smoker::types::FaultRule) {
         use crate::smoker::types::FaultReversal;
         match &rule.reversal {
             FaultReversal::None => {}
@@ -3748,6 +3786,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FaultReversal::NodeQuiesce => {
                 if let Some(cluster) = &self.cluster {
                     cluster.partition_blocklists.node_gate.restore();
+                }
+            }
+            FaultReversal::NodePressure => {
+                if let Err(error) = self.node_pressure.clear(rule.id).await {
+                    eprintln!(
+                        "smoker: clear node pressure for {} failed: {error}",
+                        rule.id
+                    );
                 }
             }
         }
@@ -6440,6 +6486,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Gracefully stop all instances.
     async fn shutdown_all(&mut self) {
+        // Reverse every owned fault before the process goes away. The
+        // node-pressure helper also has PR_SET_PDEATHSIG and startup sweeping
+        // for crash recovery, but graceful shutdown should leave no helper or
+        // cgroup behind in the first place.
+        let faults = self.fault_registry.clear();
+        for rule in &faults {
+            self.delete_fault_bpf_entry(rule).await;
+            self.reverse_fault(rule).await;
+        }
+        self.publish_dns_faults();
+
         let ids: Vec<InstanceId> = self
             .supervisor
             .list_instances()
@@ -9919,6 +9976,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_pressure_refuses_when_server_limits_are_disabled() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
+            },
+            std::time::Duration::from_secs(30),
+        );
+        let error = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("pressure must not claim success while server limits are zero");
+        assert!(error.contains("configured maximum of 0%"), "{error}");
+    }
+
+    #[tokio::test]
     async fn node_fault_clear_needs_explicit_node_authorisation() {
         let (mut agent, gate, _readiness) = test_cluster_fault_agent().await;
         let rule = register_fault(
@@ -10019,7 +10094,7 @@ mod tests {
         let mut rule = fault_rule(crate::smoker::types::FaultType::Pause);
         rule.reversal = crate::smoker::types::FaultReversal::Pause(vec![pid]);
 
-        let (agent, _tx, _shutdown) = test_agent();
+        let (mut agent, _tx, _shutdown) = test_agent();
         agent.reverse_fault(&rule).await;
 
         // Bounded observable wait: poll waitpid until the resumed child exits.
@@ -10047,7 +10122,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reversing_a_pause_without_state_is_a_noop() {
-        let (agent, _tx, _shutdown) = test_agent();
+        let (mut agent, _tx, _shutdown) = test_agent();
         let rule = fault_rule(crate::smoker::types::FaultType::Pause);
         // reversal defaults to None; must not panic or error.
         agent.reverse_fault(&rule).await;

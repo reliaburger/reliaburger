@@ -37,8 +37,9 @@ impl fmt::Display for FaultId {
 /// acts in the userspace DNS responder (Onion's `.internal` resolver),
 /// not the kernel, so it works wherever the responder runs. Resource
 /// faults (CpuStress, MemoryPressure, DiskIoThrottle) require cgroups on
-/// Linux. Process faults (Kill, Pause, Resume) and node faults
-/// (NodeDrain, NodeKill) work on all platforms.
+/// Linux. Process faults (Kill, Pause, Resume) work on all platforms.
+/// NodeDrain and NodeKill need a cluster runtime; NodePressure additionally
+/// needs an explicitly enabled Linux cgroup-v2 pressure controller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum FaultType {
@@ -122,6 +123,14 @@ pub enum FaultType {
         #[serde(default)]
         kill_containers: bool,
     },
+
+    /// Consume bounded CPU and memory capacity on one node.
+    NodePressure {
+        /// Percentage of total node CPU capacity to consume (0 disables CPU).
+        cpu_percentage: u8,
+        /// Target percentage of total node memory usage (0 disables memory).
+        memory_percentage: u8,
+    },
 }
 
 impl FaultType {
@@ -136,6 +145,14 @@ impl FaultType {
     /// state and therefore needs the `alter_node_state` permission.
     pub fn is_node_operation(&self) -> bool {
         matches!(self, Self::NodeDrain | Self::NodeKill { .. })
+    }
+
+    /// Whether the fault must be routed to a named node.
+    pub fn is_node_targeted(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeDrain | Self::NodeKill { .. } | Self::NodePressure { .. }
+        )
     }
 }
 
@@ -213,6 +230,13 @@ impl fmt::Display for FaultType {
                     write!(f, "node-kill")
                 }
             }
+            Self::NodePressure {
+                cpu_percentage,
+                memory_percentage,
+            } => write!(
+                f,
+                "node-pressure (cpu {cpu_percentage}%, memory {memory_percentage}%)"
+            ),
         }
     }
 }
@@ -282,6 +306,8 @@ pub enum FaultReversal {
     NodeDrain,
     /// A simulated node failure: reopen gossip, Raft and reporting transports.
     NodeQuiesce,
+    /// Bounded node-capacity consumers: terminate the owned helper and cgroup.
+    NodePressure,
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +609,9 @@ pub struct FaultSummary {
     pub target_service: String,
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
+    /// Target node, for routed node faults.
+    #[serde(default)]
+    pub target_node: Option<String>,
     /// Seconds remaining before auto-expiry.
     pub remaining_secs: u64,
     /// Who injected it.
@@ -596,6 +625,7 @@ impl From<&FaultRule> for FaultSummary {
             fault_type: rule.fault_type.to_string(),
             target_service: rule.target_service.clone(),
             target_instance: rule.target_instance.clone(),
+            target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),
             injected_by: rule.injected_by.clone(),
         }
@@ -727,6 +757,18 @@ mod tests {
     }
 
     #[test]
+    fn pressure_routes_to_a_node_but_clear_is_not_node_state_mutation() {
+        let pressure = FaultType::NodePressure {
+            cpu_percentage: 80,
+            memory_percentage: 90,
+        };
+        assert!(pressure.is_node_targeted());
+        assert!(!pressure.is_node_operation());
+        assert!(FaultType::NodeDrain.is_node_targeted());
+        assert!(FaultType::NodeDrain.is_node_operation());
+    }
+
+    #[test]
     fn fault_type_serialization_round_trip() {
         let types = vec![
             FaultType::Delay {
@@ -760,6 +802,10 @@ mod tests {
             FaultType::NodeDrain,
             FaultType::NodeKill {
                 kill_containers: true,
+            },
+            FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
             },
         ];
         for ft in &types {

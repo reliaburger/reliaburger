@@ -121,8 +121,10 @@ The Phase 15 runner and 39-case catalogue are live. Bun also exposes durable,
 server-owned app/namespace leases, and the runner now uses one for every case.
 Container cases use one digest-pinned BusyBox 1.37.0 OCI index, accepted through
 both runc and Apple Container. Authenticated, TTL-bounded node drain and node
-kill now exercise the real scheduler and cluster transports. Node-scoped
-pressure is the next Phase 15 prerequisite.
+kill now exercise the real scheduler and cluster transports. Opt-in,
+server-bounded Linux node pressure runs outside Bun in an owned cgroup and
+cleans up on clear, expiry, graceful shutdown, parent death or restart. The
+five-scenario chaos catalogue is the next Phase 15 block.
 
 ## Licence
 

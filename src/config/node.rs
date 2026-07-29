@@ -934,10 +934,14 @@ mod tests {
             safety_class = "staging"
             allowed_operations = ["provision_isolated_workloads", "inject_workload_faults"]
             max_lease_seconds = 900
+            max_node_pressure_cpu_percent = 80
+            max_node_pressure_memory_percent = 90
         "#,
         )
         .unwrap();
         assert_eq!(configured.testing.max_lease_seconds, 900);
+        assert_eq!(configured.testing.max_node_pressure_cpu_percent, 80);
+        assert_eq!(configured.testing.max_node_pressure_memory_percent, 90);
         assert!(
             configured
                 .testing

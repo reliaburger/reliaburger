@@ -41,6 +41,7 @@ relish fault pause payment-service
 # Node-level faults
 relish fault node-drain node-05
 relish fault node-kill node-05
+relish fault node-pressure node-05 --cpu 80% --memory 90% --acknowledge
 
 # Management
 relish fault list
@@ -78,6 +79,10 @@ Bun is the userspace agent that manages containers on each node. Smoker uses Bun
 
 - **BPF map writes.** Bun writes fault rules into the kernel BPF maps via the `bpf()` syscall (through libbpf-rs or aya).
 - **Cgroup control.** Resource faults (CPU stress, memory pressure, disk I/O throttle) use the same cgroup hierarchy that Bun already manages for container isolation.
+- **Node-pressure control.** Whole-node CPU/memory pressure uses a separate,
+  Bun-owned cgroup and child helper. Bun itself never joins the pressured
+  cgroup. The operator must opt in with the server's `saturate_capacity`
+  permission and zero-by-default CPU/memory ceilings.
 - **Process signals.** Process faults (SIGKILL, SIGSTOP, SIGCONT) are sent by Bun to the container's PID namespace via `kill(2)`.
 - **Fault lifecycle.** Bun tracks active faults, enforces expiry timers, and cleans up fault state on expiry, crash recovery, or explicit `relish fault clear`.
 

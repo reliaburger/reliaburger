@@ -394,7 +394,7 @@ impl NodeConfig {
         self.testing
             .validate()
             .map_err(|error| ConfigError::Validation {
-                field: "testing.max_lease_seconds".to_string(),
+                field: "testing".to_string(),
                 context: "node config".to_string(),
                 reason: error.to_string(),
             })?;

@@ -80,6 +80,8 @@ pub struct StaticCapabilities {
     /// with cgroup v2. Off elsewhere, which is why those faults refuse
     /// rather than pretend on macOS.
     pub cgroup_faults: bool,
+    /// A dedicated, bounded node-pressure helper can run on this node.
+    pub node_pressure: bool,
     /// Registry image policy requires trusted signatures.
     pub registry_signatures_required: bool,
     /// Server-owned diagnostic policy. A client can inspect but not expand it.
@@ -719,8 +721,16 @@ impl ClusterCapabilities {
         );
         add(
             Capability::NodePressure,
-            CapabilityState::Unavailable,
-            "node-scoped pressure primitive is not implemented".to_string(),
+            known(statics.node_pressure),
+            if statics.node_pressure {
+                format!(
+                    "dedicated cgroup helper; CPU ceiling {}%, memory target ceiling {}%",
+                    statics.test_policy.max_node_pressure_cpu_percent,
+                    statics.test_policy.max_node_pressure_memory_percent
+                )
+            } else {
+                "requires rootful Linux cgroup v2 and non-zero server pressure ceilings".to_string()
+            },
         );
 
         evidence
@@ -1141,6 +1151,36 @@ mod tests {
         assert_eq!(
             capabilities.state(Capability::NodePressure),
             CapabilityState::Unavailable
+        );
+    }
+
+    #[test]
+    fn node_pressure_needs_a_successful_startup_probe() {
+        let mut statics = statics();
+        statics.node_pressure = true;
+        statics.test_policy.max_node_pressure_cpu_percent = 80;
+        statics.test_policy.max_node_pressure_memory_percent = 90;
+        let capabilities = ClusterCapabilities::derive(&statics, &WiredSubsystems::default());
+        assert_eq!(
+            capabilities.state(Capability::NodePressure),
+            CapabilityState::Available
+        );
+        let evidence = capabilities
+            .capabilities
+            .iter()
+            .find(|evidence| evidence.capability == Capability::NodePressure)
+            .unwrap();
+        assert!(
+            evidence
+                .details
+                .iter()
+                .any(|detail| detail.contains("CPU ceiling 80%"))
+        );
+        assert!(
+            evidence
+                .details
+                .iter()
+                .any(|detail| detail.contains("memory target ceiling 90%"))
         );
     }
 

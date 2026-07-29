@@ -3336,17 +3336,20 @@ async fn fault_inject_handler(
     ) {
         return resp;
     }
-    let is_node_operation = matches!(
-        request.fault_type,
-        crate::smoker::types::FaultType::NodeDrain
-            | crate::smoker::types::FaultType::NodeKill { .. }
-    );
-    if is_node_operation {
+    if request.fault_type.is_node_targeted() {
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
+        let operation = if matches!(
+            request.fault_type,
+            crate::smoker::types::FaultType::NodePressure { .. }
+        ) {
+            crate::testkit::safety::OperationPermission::SaturateCapacity
+        } else {
+            crate::testkit::safety::OperationPermission::AlterNodeState
+        };
         if let Err(response) = state.static_capabilities.test_policy.authorise(
-            crate::testkit::safety::OperationPermission::AlterNodeState,
+            operation,
             &crate::testkit::safety::OperationAuthorisation {
                 principal: &auth.principal_id,
                 role: auth.role,
@@ -3360,7 +3363,11 @@ async fn fault_inject_handler(
             .as_deref()
             .filter(|target| !target.is_empty())
         else {
-            return (StatusCode::BAD_REQUEST, "node faults require target_node").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                "node-targeted faults require target_node",
+            )
+                .into_response();
         };
         if let Err(response) = check_node_fault_cluster_safety(&state, &request).await {
             return response;
@@ -3688,16 +3695,23 @@ async fn fault_clear_handler(
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
-        if let Err(response) = state.static_capabilities.test_policy.authorise(
-            crate::testkit::safety::OperationPermission::AlterNodeState,
-            &crate::testkit::safety::OperationAuthorisation {
-                principal: &auth.principal_id,
-                role: auth.role,
-                acknowledged: query.acknowledged,
-            },
-        ) {
-            return (StatusCode::FORBIDDEN, response.to_string()).into_response();
-        }
+        // Node routing is not itself authority to alter node state. Preserve
+        // whether the caller passed that stronger boundary and let the owning
+        // agent inspect the actual fault before it removes anything. This
+        // permits a Deployer to de-escalate node pressure while still
+        // protecting drain/kill reversal.
+        let allow_node_fault = state
+            .static_capabilities
+            .test_policy
+            .authorise(
+                crate::testkit::safety::OperationPermission::AlterNodeState,
+                &crate::testkit::safety::OperationAuthorisation {
+                    principal: &auth.principal_id,
+                    role: auth.role,
+                    acknowledged: query.acknowledged,
+                },
+            )
+            .is_ok();
         if state
             .node_name
             .as_deref()
@@ -3706,7 +3720,7 @@ async fn fault_clear_handler(
             return forward_node_fault_clear(&state, target_node, &headers, id, query.acknowledged)
                 .await;
         }
-        true
+        allow_node_fault
     } else {
         false
     };
@@ -5735,6 +5749,21 @@ mod tests {
         }
     }
 
+    fn node_pressure_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+        crate::bun::capabilities::StaticCapabilities {
+            test_policy: crate::testkit::safety::ClusterTestPolicy {
+                safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    crate::testkit::safety::OperationPermission::SaturateCapacity,
+                ]),
+                max_node_pressure_cpu_percent: 80,
+                max_node_pressure_memory_percent: 90,
+                ..crate::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..crate::bun::capabilities::StaticCapabilities::default()
+        }
+    }
+
     fn node_kill_body(acknowledged: bool) -> String {
         serde_json::to_string(&crate::smoker::types::FaultRequest {
             fault_type: crate::smoker::types::FaultType::NodeKill {
@@ -5746,6 +5775,25 @@ mod tests {
             duration: std::time::Duration::from_secs(30),
             injected_by: "untrusted-client-value".to_string(),
             reason: Some("api policy test".to_string()),
+            include_leader: false,
+            override_safety: false,
+            acknowledged,
+        })
+        .unwrap()
+    }
+
+    fn node_pressure_body(acknowledged: bool) -> String {
+        serde_json::to_string(&crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
+            },
+            target_service: String::new(),
+            target_instance: None,
+            target_node: Some("node-a".to_string()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "untrusted-client-value".to_string(),
+            reason: Some("api pressure policy test".to_string()),
             include_leader: false,
             override_safety: false,
             acknowledged,
@@ -5819,7 +5867,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deployer_cannot_reverse_a_node_fault() {
+    async fn node_pressure_uses_capacity_permission_and_explicit_acknowledgement() {
+        let (deployer, deployer_plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (admin, admin_plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![deployer, admin],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_pressure_static_capabilities(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            post_status(
+                app.clone(),
+                "/v1/fault",
+                &deployer_plaintext,
+                &node_pressure_body(true)
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/fault",
+            &admin_plaintext,
+            &node_pressure_body(false),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&body).contains("acknowledgement"));
+
+        // Authorisation now succeeds; this unit router then fails closed
+        // because it has no live council evidence for the target node.
+        assert_eq!(
+            post_status(
+                app,
+                "/v1/fault",
+                &admin_plaintext,
+                &node_pressure_body(true)
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deployer_can_route_a_deescalating_clear_without_node_state_authority() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -5833,13 +5930,13 @@ mod tests {
         assert_eq!(
             delete_authenticated(app, "/v1/fault/1?node=node-a&acknowledged=true", &plaintext,)
                 .await,
-            StatusCode::FORBIDDEN
+            StatusCode::OK
         );
         shutdown.cancel();
     }
 
     #[tokio::test]
-    async fn node_fault_reversal_requires_acknowledgement() {
+    async fn node_routing_does_not_require_destructive_acknowledgement() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -5852,7 +5949,7 @@ mod tests {
 
         assert_eq!(
             delete_authenticated(app, "/v1/fault/1?node=node-a", &plaintext).await,
-            StatusCode::FORBIDDEN
+            StatusCode::OK
         );
         shutdown.cancel();
     }
