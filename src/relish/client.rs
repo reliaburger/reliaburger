@@ -1214,14 +1214,21 @@ impl BunClient {
     }
 
     /// Clear a specific fault by ID.
-    pub async fn clear_fault(&self, id: u64) -> Result<String, RelishError> {
+    pub async fn clear_fault(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/fault/{id}", self.base_url);
-        let response = self
-            .client
-            .delete(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.client.delete(&url);
+        if let Some(node) = node {
+            request = request.query(&[
+                ("node", node),
+                ("acknowledged", if acknowledged { "true" } else { "false" }),
+            ]);
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {

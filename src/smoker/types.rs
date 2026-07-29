@@ -131,6 +131,12 @@ impl FaultType {
     pub fn is_instantaneous(&self) -> bool {
         matches!(self, FaultType::Kill { .. } | FaultType::Resume)
     }
+
+    /// Whether applying or reversing this fault changes node-level cluster
+    /// state and therefore needs the `alter_node_state` permission.
+    pub fn is_node_operation(&self) -> bool {
+        matches!(self, Self::NodeDrain | Self::NodeKill { .. })
+    }
 }
 
 impl fmt::Display for FaultType {
@@ -272,6 +278,10 @@ pub enum FaultReversal {
     /// Stored as peer node ids (resolved to addresses at reversal time so a
     /// peer that changed address is still cleared correctly).
     Partition { peers: Vec<String> },
+    /// A scheduler drain: restore readiness when the final drain owner clears.
+    NodeDrain,
+    /// A simulated node failure: reopen gossip, Raft and reporting transports.
+    NodeQuiesce,
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +432,12 @@ pub struct FaultRequest {
     /// Override the >50% node safety check.
     #[serde(default)]
     pub override_safety: bool,
+    /// Explicit operator acknowledgement for destructive server operations.
+    ///
+    /// This records consent only. Authentication, role and server policy still
+    /// decide whether the operation is allowed.
+    #[serde(default)]
+    pub acknowledged: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -909,11 +925,30 @@ mod tests {
             reason: Some("testing latency tolerance".into()),
             include_leader: false,
             override_safety: false,
+            acknowledged: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: FaultRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.target_service, "redis");
         assert_eq!(back.target_instance.as_deref(), Some("redis-1"));
         assert_eq!(back.duration, Duration::from_secs(300));
+        assert!(back.acknowledged);
+    }
+
+    #[test]
+    fn old_fault_request_without_acknowledgement_defaults_to_false() {
+        let request: FaultRequest = serde_json::from_value(serde_json::json!({
+            "fault_type": { "type": "NodeDrain" },
+            "target_service": "",
+            "target_instance": null,
+            "target_node": "node-a",
+            "duration": { "secs": 30, "nanos": 0 },
+            "injected_by": "old-client",
+            "reason": null,
+            "include_leader": false,
+            "override_safety": false
+        }))
+        .unwrap();
+        assert!(!request.acknowledged);
     }
 }

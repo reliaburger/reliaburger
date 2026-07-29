@@ -1413,3 +1413,54 @@ the command shape Apple's CLI actually accepts.
 That closes the app/namespace and portable-workload part of the milestone.
 Jobs, faults, tokens, registry images, mounts and node state still need explicit
 ownership before the chaos catalogue can rely on them.
+
+## Make a node disappear without killing Bun
+
+What does a node failure mean in an in-process test? Killing Bun would
+certainly look realistic, but the process which owns the timer and cleanup
+would be gone too. It also makes a portable acceptance test responsible for
+restarting an external service manager. That's a different test.
+
+The node-kill primitive instead closes the three channels which make a Bun
+process part of a cluster: gossip, Raft and the reporting tree. The local
+management API stays open. Peers stop receiving SWIM acknowledgements, Raft
+traffic fails, reports stop, and the normal failure machinery reacts. From the
+cluster's point of view the node has gone. From the test runner's point of view
+there is still a narrow recovery path.
+
+All three transports share a `NodeTransportGate`. It uses an `AtomicUsize`,
+which is Rust's lock-free integer for state touched by several tasks. Each
+fault increments the count and each reversal decrements it. The transports
+open only when the count reaches zero, so clearing one of two overlapping
+faults can't accidentally heal the other one. A three-node acceptance sends
+the request through one node, watches another disappear from SWIM, clears it
+through the target's management API, and watches it rejoin. Before healing, it
+also tries to fail a second voter and proves the quorum rail says no.
+
+Drain is gentler. It adds a critical degraded entry to the node's live
+readiness report but keeps every transport open. The leader sees the node as
+alive but ineligible, re-plans placements elsewhere, and admits it again when
+the final overlapping drain reverses.
+
+These are deliberately privileged operations. The JSON field
+`acknowledged: true` records intent, but it grants nothing. Bun also requires
+an authenticated Admin and the server-owned `alter_node_state` permission.
+When one node forwards a request, it preserves the user's credential; the
+target authenticates and authorises it again. It also replaces the
+client-supplied `injected_by` value with the authenticated principal before
+recording the event.
+
+Every node fault needs a non-zero TTL. Clearing one manually uses:
+
+```sh
+relish fault clear 7 --node worker-2 --acknowledge
+```
+
+The same Admin and policy checks apply to reversal. A Deployer's general
+`fault clear` removes workload faults and leaves node faults alone. Fault IDs
+and timers still live in the target process, though. If peers have already
+removed the failed node from their live directory, the operator must point
+Relish at that node's still-open API to clear it; expiry needs no route and
+will restore it automatically. Durable lease ownership for node state remains
+unfinished, as does node-scoped resource pressure. The chaos catalogue must
+wait for those rather than turning them into cheerful skips.

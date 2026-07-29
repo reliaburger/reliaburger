@@ -164,6 +164,7 @@ pub fn step_to_fault_request(
         reason: Some(step.description.clone()),
         include_leader: false,
         override_safety: false,
+        acknowledged: false,
     })
 }
 

@@ -707,17 +707,21 @@ impl ClusterCapabilities {
         ] {
             add(capability, CapabilityState::Unknown, detail.to_string());
         }
-        for capability in [
+        add(
             Capability::NodeDrain,
+            known(self.cluster),
+            "cluster scheduler withdrawal with automatic reversal".to_string(),
+        );
+        add(
             Capability::NodeKill,
+            known(self.cluster),
+            "reversible gossip, Raft and reporting transport quiesce".to_string(),
+        );
+        add(
             Capability::NodePressure,
-        ] {
-            add(
-                capability,
-                CapabilityState::Unavailable,
-                "primitive is not implemented".to_string(),
-            );
-        }
+            CapabilityState::Unavailable,
+            "node-scoped pressure primitive is not implemented".to_string(),
+        );
 
         evidence
     }
@@ -1128,6 +1132,14 @@ mod tests {
         );
         assert_eq!(
             capabilities.state(Capability::NodeKill),
+            CapabilityState::Available
+        );
+        assert_eq!(
+            capabilities.state(Capability::NodeDrain),
+            CapabilityState::Available
+        );
+        assert_eq!(
+            capabilities.state(Capability::NodePressure),
             CapabilityState::Unavailable
         );
     }

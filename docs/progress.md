@@ -1166,9 +1166,8 @@ whole theme lands.
     device; the throttle is lifted on clear/expiry.
   - [x] Pause auto-resumes: the frozen PIDs are recorded and SIGCONT'd on clear/expiry
     (`expire_faults` and both clear paths), so a paused workload never stays frozen.
-  - [x] Node drain / node kill return an honest rejection (a cluster-level operation, not a
-    node-local fault) instead of a fake Ok; the real effect lands with the self-healing/
-    upgrade themes that own the cluster machinery.
+  - [x] Node drain / node kill initially returned an honest rejection instead of a fake Ok.
+    Phase 15 M8 now supplies their authenticated cluster-level effects and reversal.
   - [x] `DnsNxdomain` acts in the userspace `.internal` resolver (was: wrote a `fault_dns_map`
     entry into a never-loaded eBPF object, so it did nothing on any config — caught by the
     12b.6 gate). The agent publishes the faulted-service set on a `watch` channel
@@ -1430,7 +1429,12 @@ convergence and adoption" theme under 12b.6).
       (`linux/amd64`) and Apple Container (`linux/arm64`). ProcessGrill keeps
       the installed Bun helper as a separate profile.
   - [x] Ordinary 39-case catalogue and `relish test`
-  - [ ] Real node and pressure primitives before the chaos catalogue
+  - [x] Authenticated real node drain/kill: Admin plus the server-owned
+    `alter_node_state` grant and explicit acknowledgement; target-side repeated
+    authorisation; scheduler withdrawal for drain; shared gossip/Raft/reporting
+    quiesce for kill; TTL and privileged manual reversal. A three-node acceptance
+    observes a follower fail and rejoin, and rejects a second voter failure.
+  - [ ] Node-scoped pressure before the chaos catalogue
 
 ### Optional
 

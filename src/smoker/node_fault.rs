@@ -42,9 +42,52 @@ impl NodeTransportGate {
     }
 }
 
+/// Reference-counted scheduler drain state.
+///
+/// The first owner withdraws readiness. The last owner restores it, so
+/// overlapping experiments cannot accidentally make a still-draining node
+/// eligible for placement.
+#[derive(Clone, Default)]
+pub struct NodeDrainGate {
+    active_faults: Arc<AtomicUsize>,
+}
+
+impl NodeDrainGate {
+    /// Create a node which is not draining.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Begin one drain and return whether this is the first owner.
+    pub fn begin(&self) -> bool {
+        self.active_faults.fetch_add(1, Ordering::AcqRel) == 0
+    }
+
+    /// Finish one drain and return whether the final owner just left.
+    pub fn finish(&self) -> bool {
+        let mut final_owner = false;
+        let _ = self
+            .active_faults
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                if count == 0 {
+                    None
+                } else {
+                    final_owner = count == 1;
+                    Some(count - 1)
+                }
+            });
+        final_owner
+    }
+
+    /// Whether at least one experiment is draining the node.
+    pub fn is_draining(&self) -> bool {
+        self.active_faults.load(Ordering::Acquire) > 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::NodeTransportGate;
+    use super::{NodeDrainGate, NodeTransportGate};
 
     #[test]
     fn transport_quiesce_is_reference_counted() {
@@ -65,5 +108,18 @@ mod tests {
 
         gate.restore();
         assert!(!gate.is_quiesced(), "an extra restore must not underflow");
+    }
+
+    #[test]
+    fn drain_gate_is_reference_counted() {
+        let gate = NodeDrainGate::new();
+        assert!(gate.begin());
+        assert!(!gate.begin(), "only the first drain changes readiness");
+        assert!(gate.is_draining());
+
+        assert!(!gate.finish(), "one owner is still draining");
+        assert!(gate.finish(), "the final owner restores readiness");
+        assert!(!gate.is_draining());
+        assert!(!gate.finish(), "an unmatched finish is harmless");
     }
 }

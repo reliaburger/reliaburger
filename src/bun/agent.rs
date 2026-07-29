@@ -238,6 +238,8 @@ pub enum AgentCommand {
     /// Clear a specific fault by ID.
     ClearFault {
         fault_id: u64,
+        /// Whether the authenticated API caller may reverse node state.
+        allow_node_fault: bool,
         response: oneshot::Sender<Result<String, BunError>>,
     },
     /// Clear all active faults.
@@ -1131,6 +1133,8 @@ pub struct BunAgent<G: Grill> {
     fault_registry: crate::smoker::registry::FaultRegistry,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
+    /// Reference-counted node drains, independent from binary-upgrade drains.
+    node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
     /// eBPF program handle for writing fault maps (Linux + ebpf feature only).
     /// `None` on macOS or when eBPF is not loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1292,6 +1296,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1366,6 +1371,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -2634,6 +2640,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     reason: Some("legacy chaos partition".into()),
                     include_leader: false,
                     override_safety: false,
+                    acknowledged: false,
                 };
                 // Safety rails apply to the legacy path too (M1): a partition
                 // that would strand quorum must be refused, not waved through
@@ -2781,7 +2788,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
             }
-            AgentCommand::ClearFault { fault_id, response } => {
+            AgentCommand::ClearFault {
+                fault_id,
+                allow_node_fault,
+                response,
+            } => {
+                if !allow_node_fault
+                    && self
+                        .fault_registry
+                        .get(crate::smoker::types::FaultId(fault_id))
+                        .is_some_and(|rule| rule.fault_type.is_node_operation())
+                {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "node fault reversal requires alter_node_state authorisation"
+                            .to_string(),
+                    }));
+                    return;
+                }
                 let msg = match self
                     .fault_registry
                     .remove(crate::smoker::types::FaultId(fault_id))
@@ -2800,7 +2823,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::ClearAllFaults { response } => {
-                let removed = self.fault_registry.clear();
+                let removed = self.fault_registry.clear_workload_faults();
                 for rule in &removed {
                     self.delete_fault_bpf_entry(rule).await;
                     self.reverse_fault(rule).await;
@@ -3437,19 +3460,53 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 })
             }
-            FaultType::NodeDrain | FaultType::NodeKill { .. } => {
-                // Honest rejection (CHAOS1). A node drain/kill is a
-                // cluster-level operation — cordon + evict local replicas, or
-                // terminate the node's workloads — driven by the scheduler and
-                // membership machinery, not a per-instance action here. Rather
-                // than record a fake success that changes nothing (the old
-                // behaviour), refuse the fault so the operator gets a clear
-                // 4xx instead of a lie. The real effect lands with the
-                // upgrade/self-healing themes that own that machinery.
-                Err(format!(
-                    "{} is a cluster-level operation and cannot be applied as a node-local fault; drain or stop the node through the scheduler instead",
-                    rule.fault_type
-                ))
+            FaultType::NodeDrain => {
+                if rule.duration_ns == 0 {
+                    return Err("node faults require a non-zero duration".to_string());
+                }
+                if self.cluster.is_none() {
+                    return Err("node drain requires an active cluster runtime".to_string());
+                }
+                let Some(readiness) = self.readiness.clone() else {
+                    return Err(
+                        "node drain requires live readiness evidence for scheduler fencing"
+                            .to_string(),
+                    );
+                };
+
+                if self.node_drain_gate.begin() {
+                    readiness.register("node:chaos-drain", true).await;
+                }
+                readiness
+                    .degraded("node:chaos-drain", "node drain fault is active")
+                    .await;
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodeDrain);
+                Ok(())
+            }
+            FaultType::NodeKill { kill_containers } => {
+                if rule.duration_ns == 0 {
+                    return Err("node faults require a non-zero duration".to_string());
+                }
+                let Some(cluster) = &self.cluster else {
+                    return Err("node kill requires an active cluster runtime".to_string());
+                };
+
+                cluster.partition_blocklists.node_gate.quiesce();
+                if *kill_containers {
+                    let ids: Vec<_> = self
+                        .supervisor
+                        .list_instances()
+                        .iter()
+                        .map(|instance| instance.id.clone())
+                        .collect();
+                    for id in ids {
+                        if let Err(error) = self.supervisor.grill().kill(&id).await {
+                            eprintln!("smoker: node-kill container {} failed: {error}", id.0);
+                        }
+                    }
+                }
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodeQuiesce);
+                Ok(())
             }
             FaultType::Partition { .. } => {
                 // A service-to-service partition is an eBPF connect-map fault
@@ -3680,6 +3737,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultReversal::Partition { peers } => {
                 self.remove_partition(peers).await;
+            }
+            FaultReversal::NodeDrain => {
+                if self.node_drain_gate.finish()
+                    && let Some(readiness) = self.readiness.clone()
+                {
+                    readiness.ready("node:chaos-drain").await;
+                }
+            }
+            FaultReversal::NodeQuiesce => {
+                if let Some(cluster) = &self.cluster {
+                    cluster.partition_blocklists.node_gate.restore();
+                }
             }
         }
     }
@@ -7554,6 +7623,42 @@ mod tests {
         (agent, tx, shutdown, grill_handle)
     }
 
+    async fn test_cluster_fault_agent() -> (
+        BunAgent<MockGrill>,
+        crate::smoker::node_fault::NodeTransportGate,
+        crate::bun::readiness::ReadinessTracker,
+    ) {
+        let (_membership_tx, membership_rx) = tokio::sync::watch::channel(Vec::new());
+        let (_snapshot_tx, snapshot_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(8);
+        let node_gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let cluster = ClusterHandle {
+            membership_rx,
+            raft_metrics_rx: None,
+            council: None,
+            snapshot_rx,
+            wrapping_ikm: None,
+            partition_blocklists: PartitionBlocklists {
+                node_gate: node_gate.clone(),
+                ..PartitionBlocklists::default()
+            },
+            crl_handle: Default::default(),
+        };
+        let mut agent = BunAgent::with_cluster(
+            MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            command_rx,
+            CancellationToken::new(),
+            cluster,
+            "test".to_string(),
+        );
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        readiness.register("agent:test", true).await;
+        readiness.ready("agent:test").await;
+        agent.set_readiness_tracker(readiness.clone());
+        (agent, node_gate, readiness)
+    }
+
     impl<G: Grill + Clone + 'static> BunAgent<G> {
         /// Test-only: run a deploy to completion against an agent that is not
         /// yet on its `run` loop. Deploys now execute on a spawned task that
@@ -9734,32 +9839,120 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn node_drain_is_rejected_not_faked() {
-        // CHAOS1: a node-drain fault used to return Ok while doing nothing.
-        // It's a cluster-level operation, so a node-local fault must refuse
-        // honestly rather than lie about applying it.
-        let (mut agent, _tx, _shutdown) = test_agent();
-        let rule = fault_rule(crate::smoker::types::FaultType::NodeDrain);
-        let result = agent.apply_fault(&rule).await;
-        let err = result.expect_err("node drain must be rejected, not silently accepted");
-        assert!(
-            err.contains("cluster-level"),
-            "unexpected rejection reason: {err}"
-        );
+    fn register_fault(
+        agent: &mut BunAgent<MockGrill>,
+        fault_type: crate::smoker::types::FaultType,
+        duration: std::time::Duration,
+    ) -> crate::smoker::types::FaultRule {
+        agent
+            .fault_registry
+            .insert(&crate::smoker::types::FaultRequest {
+                fault_type,
+                target_service: String::new(),
+                target_instance: None,
+                target_node: Some("node-a".to_string()),
+                duration,
+                injected_by: "test".to_string(),
+                reason: Some("node fault test".to_string()),
+                include_leader: false,
+                override_safety: false,
+                acknowledged: true,
+            })
     }
 
     #[tokio::test]
-    async fn node_kill_is_rejected_not_faked() {
-        let (mut agent, _tx, _shutdown) = test_agent();
-        let rule = fault_rule(crate::smoker::types::FaultType::NodeKill {
-            kill_containers: true,
-        });
-        let result = agent.apply_fault(&rule).await;
-        assert!(
-            result.is_err(),
-            "node kill must be rejected as a node-local fault"
+    async fn node_drain_stops_scheduling_but_keeps_cluster_transports() {
+        let (mut agent, gate, readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeDrain,
+            std::time::Duration::from_secs(30),
         );
+
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(!gate.is_quiesced(), "drain must keep gossip and Raft alive");
+        assert!(
+            !readiness.snapshot().await.ready,
+            "drain must withdraw scheduler readiness"
+        );
+
+        let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
+        agent.reverse_fault(&stored).await;
+        assert!(readiness.snapshot().await.ready);
+    }
+
+    #[tokio::test]
+    async fn node_kill_quiesces_all_cluster_transports_and_restores() {
+        let (mut agent, gate, _readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_secs(30),
+        );
+
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(gate.is_quiesced());
+
+        let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
+        agent.reverse_fault(&stored).await;
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
+    async fn node_fault_refuses_without_a_duration() {
+        let (mut agent, _gate, _readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::ZERO,
+        );
+
+        let error = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("node faults must always be reversible by a deadline");
+        assert!(error.contains("duration"));
+    }
+
+    #[tokio::test]
+    async fn node_fault_clear_needs_explicit_node_authorisation() {
+        let (mut agent, gate, _readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_secs(30),
+        );
+        agent.apply_fault(&rule).await.unwrap();
+
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::ClearFault {
+                fault_id: rule.id.0,
+                allow_node_fault: false,
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(agent.fault_registry.get(rule.id).is_some());
+        assert!(gate.is_quiesced());
+
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::ClearFault {
+                fault_id: rule.id.0,
+                allow_node_fault: true,
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_ok());
+        assert!(agent.fault_registry.get(rule.id).is_none());
+        assert!(!gate.is_quiesced());
     }
 
     #[tokio::test]
@@ -9889,6 +10082,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let context = agent.build_safety_context(&request).await;
         let check = crate::smoker::safety::evaluate_safety(&request, &context);

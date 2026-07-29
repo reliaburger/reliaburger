@@ -64,10 +64,11 @@ pub fn evaluate_safety(request: &FaultRequest, context: &SafetyContext) -> Safet
 /// number of affected council nodes stays at or below
 /// `(council_size - 1) / 2`. This preserves a strict majority.
 fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<SafetyViolation> {
-    // Only node-level and partition faults affect council membership
+    // Drain only withdraws scheduler readiness; Raft stays open. Abrupt node
+    // failure and transport partitions can remove a voter from quorum.
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::NodeDrain | FaultType::Partition { .. }
+        FaultType::NodeKill { .. } | FaultType::Partition { .. }
     );
     if !targets_node {
         return None;
@@ -178,9 +179,8 @@ fn check_node_percentage(
     }
 
     let would_be_affected = context.nodes_with_active_faults + 1;
-    let threshold = context.total_nodes.div_ceil(2); // >50%, i.e. majority
 
-    if would_be_affected > threshold {
+    if would_be_affected.saturating_mul(2) > context.total_nodes {
         Some(SafetyViolation::NodePercentageExceeded {
             affected_nodes: would_be_affected,
             total_nodes: context.total_nodes,
@@ -221,6 +221,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         }
     }
 
@@ -235,6 +236,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         }
     }
 
@@ -358,6 +360,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         // Pause affects all replicas → 0 survive
         let check = evaluate_safety(&req, &ctx);
@@ -380,6 +383,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(!check.approved);
@@ -401,6 +405,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(check.approved);
@@ -453,6 +458,24 @@ mod tests {
         assert!(matches!(
             check.violation,
             Some(SafetyViolation::NodePercentageExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn node_percentage_rejects_two_of_three_nodes() {
+        let mut ctx = default_context();
+        ctx.total_nodes = 3;
+        ctx.nodes_with_active_faults = 1;
+        let req = node_kill_request("node-3");
+
+        let check = evaluate_safety(&req, &ctx);
+
+        assert!(matches!(
+            check.violation,
+            Some(SafetyViolation::NodePercentageExceeded {
+                affected_nodes: 2,
+                total_nodes: 3,
+            })
         ));
     }
 
@@ -510,6 +533,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(check.approved);

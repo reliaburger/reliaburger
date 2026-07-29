@@ -588,6 +588,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
                 reason: None,
                 include_leader: false,
                 override_safety: false,
+                acknowledged: false,
             },
             response: resp_tx,
         })

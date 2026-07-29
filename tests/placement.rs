@@ -40,6 +40,12 @@ struct Node {
     _tasks: TestTasks,
 }
 
+#[derive(Clone)]
+struct NodeFaultAuth {
+    token: reliaburger::sesame::types::ApiToken,
+    plaintext: String,
+}
+
 use tokio::sync::watch;
 
 async fn start_node(
@@ -47,6 +53,16 @@ async fn start_node(
     gossip_port: u16,
     seeds: Vec<SocketAddr>,
     shutdown: &CancellationToken,
+) -> Node {
+    start_node_with_auth(name, gossip_port, seeds, shutdown, None).await
+}
+
+async fn start_node_with_auth(
+    name: &str,
+    gossip_port: u16,
+    seeds: Vec<SocketAddr>,
+    shutdown: &CancellationToken,
+    auth: Option<NodeFaultAuth>,
 ) -> Node {
     let raft_port = gossip_port + 1;
     let reporting_port = gossip_port + 2;
@@ -121,7 +137,7 @@ async fn start_node(
     let agent_task = reliaburger::bun::readiness::spawn_owned(
         "agent",
         true,
-        readiness,
+        readiness.clone(),
         shutdown.clone(),
         async move { agent.run().await },
     );
@@ -197,22 +213,67 @@ async fn start_node(
     let listener = tokio::net::TcpListener::bind(local(api_port))
         .await
         .unwrap();
-    let app = api::router(
-        cmd_tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        council.clone(),
-        None,
-        None,
-        None,
-        Some(Arc::clone(&membership_table)),
-        None,
-        api_port,
-        None,
-    );
+    let app = if let Some(auth) = &auth {
+        let token_store = Arc::new(RwLock::new(vec![auth.token.clone()]));
+        let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+            cluster_mode: true,
+            test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
+                safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    reliaburger::testkit::safety::OperationPermission::AlterNodeState,
+                ]),
+                ..reliaburger::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..reliaburger::bun::capabilities::StaticCapabilities::default()
+        };
+        api::router_with_upgrade(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            council.clone(),
+            Some(token_store),
+            None,
+            None,
+            Some(Arc::clone(&membership_table)),
+            None,
+            None,
+            api_port,
+            None,
+            None,
+            None,
+            "default".to_string(),
+            Some(name.to_string()),
+            900,
+            reliaburger::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            static_capabilities,
+            readiness,
+            None,
+        )
+    } else {
+        api::router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            council.clone(),
+            None,
+            None,
+            None,
+            Some(Arc::clone(&membership_table)),
+            None,
+            api_port,
+            None,
+        )
+    };
     let sd = shutdown.clone();
     let api_task = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -240,7 +301,10 @@ async fn start_node(
         tasks.push(leadership_task);
     }
 
-    let client = BunClient::new(&format!("http://127.0.0.1:{api_port}"));
+    let client = BunClient::new_with_token(
+        &format!("http://127.0.0.1:{api_port}"),
+        auth.as_ref().map(|auth| auth.plaintext.as_str()),
+    );
     for _ in 0..40 {
         if client.health().await.is_ok() {
             break;
@@ -726,6 +790,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
         reason: None,
         include_leader: false,
         override_safety: false,
+        acknowledged: false,
     };
 
     // First node-level fault: within the quorum budget, accepted.
@@ -836,6 +901,149 @@ async fn partition_isolates_a_node_for_real() {
     for n in nodes {
         if let Some(c) = &n.handle.council {
             c.shutdown().await.ok();
+        }
+    }
+}
+
+/// Phase 15 M8: an authenticated node-kill request reaches the named node,
+/// closes all three cluster transports, becomes externally observable as
+/// node failure, and is manually reversible through that node's still-live
+/// management API.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node node-failure acceptance; run with make test-cluster"]
+async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
+    use reliaburger::mustard::state::NodeState;
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let created = reliaburger::sesame::token::create_token(
+        "chaos-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("f1", 18941, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "f2",
+        18945,
+        vec![local(18941)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth("f3", 18949, vec![local(18941)], &shutdown, Some(auth)).await;
+    let nodes = [&n1, &n2, &n3];
+
+    let converged = wait_until(Duration::from_secs(30), || {
+        nodes.iter().all(|observer| {
+            ["f1", "f2", "f3"]
+                .iter()
+                .all(|target| peer_state(observer, target) == Some(NodeState::Alive))
+        })
+    })
+    .await;
+    assert!(converged, "cluster never fully converged to Alive");
+    let voters_ready = wait_until(Duration::from_secs(60), || {
+        nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                council
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .count()
+                    == 3
+            })
+        })
+    })
+    .await;
+    assert!(voters_ready, "council never grew to three voters");
+
+    let source = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .copied()
+        .expect("leader exists");
+    let target = nodes
+        .iter()
+        .find(|node| node.name != source.name)
+        .copied()
+        .expect("follower exists");
+    let request = FaultRequest {
+        fault_type: FaultType::NodeKill {
+            kill_containers: false,
+        },
+        target_service: String::new(),
+        target_instance: None,
+        target_node: Some(target.name.clone()),
+        duration: Duration::from_secs(60),
+        injected_by: "untrusted-body".to_string(),
+        reason: Some("node failure acceptance".to_string()),
+        include_leader: false,
+        override_safety: false,
+        acknowledged: true,
+    };
+    let summary = source
+        .client
+        .inject_fault(&request)
+        .await
+        .expect("authorised node fault should reach its target");
+
+    let failed = wait_until(Duration::from_secs(30), || {
+        nodes
+            .iter()
+            .filter(|observer| observer.name != target.name)
+            .all(|observer| peer_state(observer, &target.name) != Some(NodeState::Alive))
+    })
+    .await;
+    assert!(
+        failed,
+        "{} still sees {} Alive after node kill",
+        source.name, target.name
+    );
+
+    let other = nodes
+        .iter()
+        .find(|node| node.name != source.name && node.name != target.name)
+        .copied()
+        .expect("second follower exists");
+    let mut unsafe_second_kill = request.clone();
+    unsafe_second_kill.target_node = Some(other.name.clone());
+    let refused = other.client.inject_fault(&unsafe_second_kill).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|error| error.to_string().to_lowercase().contains("quorum")),
+        "second voter failure must be refused after {target_name} is down: {refused:?}",
+        target_name = target.name
+    );
+
+    target
+        .client
+        .clear_fault(summary.id, Some(&target.name), true)
+        .await
+        .expect("authorised manual reversal should reopen target transports");
+    let recovered = wait_until(Duration::from_secs(30), || {
+        peer_state(source, &target.name) == Some(NodeState::Alive)
+    })
+    .await;
+    assert!(
+        recovered,
+        "{} did not rejoin after node fault reversal",
+        target.name
+    );
+
+    shutdown.cancel();
+    for node in nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
         }
     }
 }

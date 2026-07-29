@@ -3327,7 +3327,8 @@ async fn snapshot_delete_handler(
 async fn fault_inject_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
-    Json(request): Json<crate::smoker::types::FaultRequest>,
+    headers: HeaderMap,
+    Json(mut request): Json<crate::smoker::types::FaultRequest>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::authorize_user(
         auth.as_deref(),
@@ -3335,6 +3336,56 @@ async fn fault_inject_handler(
     ) {
         return resp;
     }
+    let is_node_operation = matches!(
+        request.fault_type,
+        crate::smoker::types::FaultType::NodeDrain
+            | crate::smoker::types::FaultType::NodeKill { .. }
+    );
+    if is_node_operation {
+        let Some(auth) = auth.as_deref() else {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        };
+        if let Err(response) = state.static_capabilities.test_policy.authorise(
+            crate::testkit::safety::OperationPermission::AlterNodeState,
+            &crate::testkit::safety::OperationAuthorisation {
+                principal: &auth.principal_id,
+                role: auth.role,
+                acknowledged: request.acknowledged,
+            },
+        ) {
+            return (StatusCode::FORBIDDEN, response.to_string()).into_response();
+        }
+        let Some(target_node) = request
+            .target_node
+            .as_deref()
+            .filter(|target| !target.is_empty())
+        else {
+            return (StatusCode::BAD_REQUEST, "node faults require target_node").into_response();
+        };
+        if let Err(response) = check_node_fault_cluster_safety(&state, &request).await {
+            return response;
+        }
+        if state
+            .node_name
+            .as_deref()
+            .is_some_and(|name| name != target_node)
+        {
+            return forward_node_fault(&state, target_node, &headers, &request).await;
+        }
+    }
+
+    // The caller controls the JSON body, so it cannot be the audit identity.
+    // Token names are already authenticated by the middleware.
+    request.injected_by = auth
+        .as_deref()
+        .map(|auth| auth.token_name.clone())
+        .unwrap_or_else(|| "local-bootstrap".to_string());
+    let audit_principal = auth
+        .as_deref()
+        .map(|auth| auth.principal_id.clone())
+        .unwrap_or_else(|| "local-bootstrap".to_string());
+    let audit_target_node = request.target_node.clone();
+    let audit_target_service = request.target_service.clone();
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -3353,7 +3404,27 @@ async fn fault_inject_handler(
     }
 
     match resp_rx.await {
-        Ok(Ok(summary)) => Json(serde_json::json!(summary)).into_response(),
+        Ok(Ok(summary)) => {
+            if let Some(events) = &state.events {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                events.write().await.record(
+                    timestamp,
+                    crate::bun::events::EventKind::Fault,
+                    crate::bun::events::EventSeverity::Warning,
+                    (!audit_target_service.is_empty()).then_some(audit_target_service),
+                    None,
+                    audit_target_node,
+                    format!(
+                        "fault {} ({}) injected by principal {}",
+                        summary.id, summary.fault_type, audit_principal
+                    ),
+                );
+            }
+            Json(serde_json::json!(summary)).into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -3367,11 +3438,243 @@ async fn fault_inject_handler(
     }
 }
 
+/// Re-evaluate node safety from API-owned live cluster state before routing.
+///
+/// Fault registries are node-local. A killed voter is therefore counted from
+/// the replicated voter set minus live SWIM members, so a request reaching a
+/// different node cannot silently exceed quorum. The target agent repeats its
+/// local checks immediately before applying the effect.
+async fn check_node_fault_cluster_safety(
+    state: &ApiState,
+    request: &crate::smoker::types::FaultRequest,
+) -> Result<(), Response> {
+    let Some(council) = &state.council else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires live council evidence",
+        )
+            .into_response());
+    };
+    let metrics = council.metrics().borrow().clone();
+    let raft_membership = metrics.membership_config.membership();
+    let council_voters: std::collections::BTreeSet<_> = raft_membership.voter_ids().collect();
+    if council_voters.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires a known council membership",
+        )
+            .into_response());
+    }
+    let Some(membership) = &state.membership else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires live membership evidence",
+        )
+            .into_response());
+    };
+    let members = membership.read().await;
+    let alive_voters: std::collections::BTreeSet<_> = members
+        .iter()
+        .map(|member| crate::cluster::identity::raft_id_from_name(&member.node_id.0))
+        .collect();
+    let unavailable_council_nodes = council_voters.difference(&alive_voters).count() as u32;
+    let Some(leader) = metrics.current_leader else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires a known council leader",
+        )
+            .into_response());
+    };
+    let Some(leader_node_id) = members
+        .iter()
+        .find(|member| crate::cluster::identity::raft_id_from_name(&member.node_id.0) == leader)
+        .map(|member| member.node_id.0.clone())
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety cannot map the council leader to live membership",
+        )
+            .into_response());
+    };
+    let context = crate::smoker::types::SafetyContext {
+        council_size: council_voters.len() as u32,
+        council_nodes_with_active_faults: unavailable_council_nodes,
+        leader_node_id,
+        total_nodes: members.len().max(council_voters.len()) as u32,
+        nodes_with_active_faults: unavailable_council_nodes,
+        target_service_replicas: 0,
+        target_service_faulted_replicas: 0,
+    };
+    let decision = crate::smoker::safety::evaluate_safety(request, &context);
+    if decision.approved {
+        Ok(())
+    } else {
+        let reason = decision
+            .violation
+            .map(|violation| violation.to_string())
+            .unwrap_or_else(|| "node fault safety check failed".to_string());
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response())
+    }
+}
+
+const MAX_FAULT_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Send a node-level operation to the named node while preserving the caller's
+/// credential. The target repeats role, policy and acknowledgement checks.
+async fn forward_node_fault(
+    state: &ApiState,
+    target_node: &str,
+    headers: &HeaderMap,
+    request: &crate::smoker::types::FaultRequest,
+) -> Response {
+    let url = match target_node_api_url(state, target_node, "/v1/fault").await {
+        Ok(url) => url,
+        Err(response) => return response,
+    };
+    let forwarded = state.cluster_http.client().post(url).json(request);
+    send_node_request(
+        target_node,
+        copy_forwarded_auth(forwarded, headers),
+        "fault",
+    )
+    .await
+}
+
+/// Resolve a live cluster member to one of its API URLs.
+async fn target_node_api_url(
+    state: &ApiState,
+    target_node: &str,
+    path: &str,
+) -> Result<String, Response> {
+    let Some(membership) = &state.membership else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster membership is unavailable",
+        )
+            .into_response());
+    };
+    let address = {
+        let members = membership.read().await;
+        members
+            .iter()
+            .find(|member| member.node_id == crate::meat::NodeId::new(target_node))
+            .map(|member| member.address)
+    };
+    let Some(address) = address else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("target node {target_node} is not alive or is unknown"),
+        )
+            .into_response());
+    };
+    Ok(state.cluster_http.url(&address.to_string(), path))
+}
+
+/// Preserve the end user's credential so the target node repeats every
+/// authentication and server-policy check.
+fn copy_forwarded_auth(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    for name in [
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::COOKIE,
+    ] {
+        if let Some(value) = headers.get(&name) {
+            request = request.header(name.as_str(), value.as_bytes());
+        }
+    }
+    request
+}
+
+/// Complete a forwarded node request with one deadline and a bounded body.
+async fn send_node_request(
+    target_node: &str,
+    request: reqwest::RequestBuilder,
+    operation: &str,
+) -> Response {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let response = match tokio::time::timeout_at(deadline, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("failed to forward node {operation} to {target_node}: {error}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("node {operation} request to {target_node} timed out"),
+            )
+                .into_response();
+        }
+    };
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_FAULT_FORWARD_RESPONSE_BYTES as u64)
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "target node response exceeded the 64 KiB limit",
+        )
+            .into_response();
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = match tokio::time::timeout_at(deadline, stream.next()).await {
+        Ok(chunk) => chunk,
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("node {operation} response from {target_node} timed out"),
+            )
+                .into_response();
+        }
+    } {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to read node {operation} response from {target_node}: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_FAULT_FORWARD_RESPONSE_BYTES {
+            return (
+                StatusCode::BAD_GATEWAY,
+                "target node response exceeded the 64 KiB limit",
+            )
+                .into_response();
+        }
+        body.extend_from_slice(&chunk);
+    }
+    (status, body).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FaultClearQuery {
+    node: Option<String>,
+    #[serde(default)]
+    acknowledged: bool,
+}
+
 /// Clear a specific fault by ID.
 async fn fault_clear_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(id): Path<u64>,
+    Query(query): Query<FaultClearQuery>,
 ) -> Response {
     if let Err(resp) = crate::sesame::auth::authorize_user(
         auth.as_deref(),
@@ -3379,11 +3682,40 @@ async fn fault_clear_handler(
     ) {
         return resp;
     }
+    let allow_node_fault = if let Some(target_node) =
+        query.node.as_deref().filter(|target| !target.is_empty())
+    {
+        let Some(auth) = auth.as_deref() else {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        };
+        if let Err(response) = state.static_capabilities.test_policy.authorise(
+            crate::testkit::safety::OperationPermission::AlterNodeState,
+            &crate::testkit::safety::OperationAuthorisation {
+                principal: &auth.principal_id,
+                role: auth.role,
+                acknowledged: query.acknowledged,
+            },
+        ) {
+            return (StatusCode::FORBIDDEN, response.to_string()).into_response();
+        }
+        if state
+            .node_name
+            .as_deref()
+            .is_some_and(|name| name != target_node)
+        {
+            return forward_node_fault_clear(&state, target_node, &headers, id, query.acknowledged)
+                .await;
+        }
+        true
+    } else {
+        false
+    };
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::ClearFault {
             fault_id: id,
+            allow_node_fault,
             response: resp_tx,
         })
         .await
@@ -3409,6 +3741,31 @@ async fn fault_clear_handler(
         )
             .into_response(),
     }
+}
+
+/// Route manual reversal to the node which owns the local fault id.
+async fn forward_node_fault_clear(
+    state: &ApiState,
+    target_node: &str,
+    headers: &HeaderMap,
+    fault_id: u64,
+    acknowledged: bool,
+) -> Response {
+    let path = format!("/v1/fault/{fault_id}");
+    let url = match target_node_api_url(state, target_node, &path).await {
+        Ok(url) => url,
+        Err(response) => return response,
+    };
+    let forwarded = state.cluster_http.client().delete(url).query(&[
+        ("node", target_node),
+        ("acknowledged", if acknowledged { "true" } else { "false" }),
+    ]);
+    send_node_request(
+        target_node,
+        copy_forwarded_auth(forwarded, headers),
+        "fault reversal",
+    )
+    .await
 }
 
 /// Clear all active faults.
@@ -5363,6 +5720,191 @@ mod tests {
             },
             ..crate::bun::capabilities::StaticCapabilities::default()
         }
+    }
+
+    fn node_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+        crate::bun::capabilities::StaticCapabilities {
+            test_policy: crate::testkit::safety::ClusterTestPolicy {
+                safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    crate::testkit::safety::OperationPermission::AlterNodeState,
+                ]),
+                ..crate::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..crate::bun::capabilities::StaticCapabilities::default()
+        }
+    }
+
+    fn node_kill_body(acknowledged: bool) -> String {
+        serde_json::to_string(&crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            target_service: String::new(),
+            target_instance: None,
+            target_node: Some("node-a".to_string()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "untrusted-client-value".to_string(),
+            reason: Some("api policy test".to_string()),
+            include_leader: false,
+            override_safety: false,
+            acknowledged,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deployer_cannot_alter_node_state_even_with_grant_and_acknowledgement() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        let status = post_status(app, "/v1/fault", &plaintext, &node_kill_body(true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_alter_node_state_without_the_server_grant() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+
+        let status = post_status(app, "/v1/fault", &plaintext, &node_kill_body(true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn admin_node_fault_requires_explicit_acknowledgement() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        let (status, body) =
+            post_authenticated(app, "/v1/fault", &plaintext, &node_kill_body(false), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&body).contains("acknowledgement"));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn admin_with_node_grant_and_acknowledgement_needs_cluster_evidence() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        let (status, body) =
+            post_authenticated(app, "/v1/fault", &plaintext, &node_kill_body(true), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("council evidence"));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deployer_cannot_reverse_a_node_fault() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            delete_authenticated(app, "/v1/fault/1?node=node-a&acknowledged=true", &plaintext,)
+                .await,
+            StatusCode::FORBIDDEN
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn node_fault_reversal_requires_acknowledgement() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            delete_authenticated(app, "/v1/fault/1?node=node-a", &plaintext).await,
+            StatusCode::FORBIDDEN
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn authorised_node_fault_reversal_reaches_the_owning_agent() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            delete_authenticated(app, "/v1/fault/1?node=node-a&acknowledged=true", &plaintext,)
+                .await,
+            StatusCode::OK
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn fault_principal_comes_from_authentication_not_the_request_body() {
+        let (token, plaintext) = named_user_token("alice", crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        let body = serde_json::to_string(&crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+            target_service: "web".to_string(),
+            target_instance: None,
+            target_node: None,
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "mallory".to_string(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: false,
+        })
+        .unwrap();
+        assert_eq!(
+            post_status(app.clone(), "/v1/fault", &plaintext, &body).await,
+            StatusCode::OK
+        );
+
+        let (status, body) = get_authenticated(app, "/v1/fault", &plaintext).await;
+        assert_eq!(status, StatusCode::OK);
+        let faults: Vec<crate::smoker::types::FaultSummary> =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(faults[0].injected_by, "alice");
+        shutdown.cancel();
     }
 
     #[tokio::test]

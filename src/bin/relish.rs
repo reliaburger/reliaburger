@@ -852,6 +852,9 @@ enum FaultAction {
         /// Override the node-percentage safety rail.
         #[arg(long)]
         override_safety: bool,
+        /// Confirm that this destructive node operation is intentional.
+        #[arg(long)]
+        acknowledge: bool,
     },
     /// Simulate abrupt node failure.
     NodeKill {
@@ -872,6 +875,9 @@ enum FaultAction {
         /// Override the node-percentage safety rail.
         #[arg(long)]
         override_safety: bool,
+        /// Confirm that this destructive node operation is intentional.
+        #[arg(long)]
+        acknowledge: bool,
     },
     /// List all active faults.
     List,
@@ -879,6 +885,12 @@ enum FaultAction {
     Clear {
         /// Fault id or service name to clear (omit to clear all).
         target: Option<String>,
+        /// Node which owns a node-level fault id.
+        #[arg(long, requires = "target")]
+        node: Option<String>,
+        /// Confirm that reversing a node-level fault is intentional.
+        #[arg(long, requires = "node")]
+        acknowledge: bool,
     },
     /// Run a scripted chaos scenario from a TOML file.
     #[command(visible_alias = "run")]
@@ -1116,6 +1128,7 @@ async fn main() -> ExitCode {
                 include_leader,
                 reason,
                 override_safety,
+                acknowledge,
             } => {
                 reliaburger::relish::fault::node_drain(
                     target,
@@ -1123,6 +1136,7 @@ async fn main() -> ExitCode {
                     *include_leader,
                     reason.as_deref(),
                     *override_safety,
+                    *acknowledge,
                 )
                 .await
             }
@@ -1133,6 +1147,7 @@ async fn main() -> ExitCode {
                 include_leader,
                 reason,
                 override_safety,
+                acknowledge,
             } => {
                 reliaburger::relish::fault::node_kill(
                     target,
@@ -1141,12 +1156,18 @@ async fn main() -> ExitCode {
                     *include_leader,
                     reason.as_deref(),
                     *override_safety,
+                    *acknowledge,
                 )
                 .await
             }
             FaultAction::List => reliaburger::relish::fault::list().await,
-            FaultAction::Clear { target } => {
-                reliaburger::relish::fault::clear(target.clone()).await
+            FaultAction::Clear {
+                target,
+                node,
+                acknowledge,
+            } => {
+                reliaburger::relish::fault::clear(target.clone(), node.as_deref(), *acknowledge)
+                    .await
             }
             FaultAction::Scenario {
                 path,
@@ -1456,7 +1477,10 @@ mod tests {
         assert!(matches!(
             clear_by_name.command,
             Command::Fault {
-                action: FaultAction::Clear { target: Some(ref t) }
+                action: FaultAction::Clear {
+                    target: Some(ref t),
+                    ..
+                }
             } if t == "redis"
         ));
         let resume = parse(&["relish", "fault", "resume", "redis"]).unwrap();
@@ -2136,6 +2160,7 @@ mod tests {
             "--include-leader",
             "--duration",
             "30s",
+            "--acknowledge",
         ])
         .unwrap();
         match cli.command {
@@ -2145,6 +2170,7 @@ mod tests {
                         target,
                         containers,
                         include_leader,
+                        acknowledge,
                         duration,
                         ..
                     },
@@ -2152,6 +2178,7 @@ mod tests {
                 assert_eq!(target, "node-05");
                 assert!(containers);
                 assert!(include_leader);
+                assert!(acknowledge);
                 assert_eq!(duration.as_deref(), Some("30s"));
             }
             _ => panic!("expected Fault NodeKill"),
@@ -2174,7 +2201,7 @@ mod tests {
         let cli = parse(&["relish", "fault", "clear"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Clear { target },
+                action: FaultAction::Clear { target, .. },
             } => assert!(target.is_none()),
             _ => panic!("expected Fault Clear"),
         }
@@ -2185,7 +2212,27 @@ mod tests {
         let cli = parse(&["relish", "fault", "clear", "42"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Clear { target },
+                action: FaultAction::Clear { target, .. },
+            } => assert_eq!(target.as_deref(), Some("42")),
+            _ => panic!("expected Fault Clear"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_clear_on_node_requires_explicit_targeting() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "clear",
+            "42",
+            "--node",
+            "node-05",
+            "--acknowledge",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Clear { target, .. },
             } => assert_eq!(target.as_deref(), Some("42")),
             _ => panic!("expected Fault Clear"),
         }

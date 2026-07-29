@@ -150,6 +150,7 @@ fn make_request(
         reason: targeting.reason.clone(),
         include_leader: false,
         override_safety: targeting.override_safety,
+        acknowledged: false,
     }
 }
 
@@ -359,6 +360,7 @@ pub async fn node_drain(
     include_leader: bool,
     reason: Option<&str>,
     override_safety: bool,
+    acknowledged: bool,
 ) -> Result<(), RelishError> {
     let targeting = FaultTargeting {
         node: Some(target.into()),
@@ -373,6 +375,7 @@ pub async fn node_drain(
         &targeting,
     );
     request.include_leader = include_leader;
+    request.acknowledged = acknowledged;
     inject_and_print(&request).await
 }
 
@@ -384,6 +387,7 @@ pub async fn node_kill(
     include_leader: bool,
     reason: Option<&str>,
     override_safety: bool,
+    acknowledged: bool,
 ) -> Result<(), RelishError> {
     let targeting = FaultTargeting {
         node: Some(target.into()),
@@ -398,6 +402,7 @@ pub async fn node_kill(
         &targeting,
     );
     request.include_leader = include_leader;
+    request.acknowledged = acknowledged;
     inject_and_print(&request).await
 }
 
@@ -435,12 +440,22 @@ pub async fn list() -> Result<(), RelishError> {
 ///
 /// A bare number is a fault id; anything else is a service name (its first
 /// caller for the registry's `clear_by_service`). No argument clears all.
-pub async fn clear(target: Option<String>) -> Result<(), RelishError> {
+pub async fn clear(
+    target: Option<String>,
+    node: Option<&str>,
+    acknowledged: bool,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let msg = match target {
         None => client.clear_all_faults().await?,
         Some(arg) => match arg.parse::<u64>() {
-            Ok(id) => client.clear_fault(id).await?,
+            Ok(id) => client.clear_fault(id, node, acknowledged).await?,
+            Err(_) if node.is_some() => {
+                return Err(RelishError::ApiError {
+                    status: 0,
+                    body: "--node can only be used when clearing a numeric fault id".to_string(),
+                });
+            }
             Err(_) => client.clear_faults_by_service(&arg).await?,
         },
     };

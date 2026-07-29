@@ -474,8 +474,9 @@ startup. M8 must add certificate expiry evidence and should not make
     profile.
 - [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
 - [ ] Add chaos primitives only after the safety, evidence and ownership gates.
-- [ ] Implement authenticated real drain/kill and node-scoped pressure before
-  C1/C2/C4/C5. Unsupported scenarios must not become green skips.
+- [x] Implement authenticated real drain/kill before C1/C2/C5.
+- [ ] Implement node-scoped pressure before C4. Unsupported scenarios must
+  not become green skips.
 - [x] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
@@ -489,15 +490,38 @@ schema-v3, 15-second evidence. Each fact is `available`, `unavailable` or
 `unknown`; a stale snapshot is unknown, never absent. The report includes build
 target/profile, runtime/version, rootless mode, kernel, architecture, cluster
 identity, readiness, placement evidence and server-owned operation policy.
-Stores without a published freshness timestamp remain unknown.
+Stores without a published freshness timestamp remain unknown. Cluster-mode
+nodes now advertise drain and kill as available; node pressure remains
+unavailable.
 
 `GET /v1/capabilities/cluster` fans out concurrently to current members with
 one five-second absolute deadline. It presents the cluster service credential
 over the configured cluster HTTP client, refuses an anonymous fallback, caps
 responses at 1 MiB, checks schema, node identity and expiry, and retains every
-failed peer as an explicit unknown result. Node drain/kill, node pressure,
-volume semantics, telemetry freshness and certificate expiry remain honest
-unknown or unavailable prerequisites.
+failed peer as an explicit unknown result. Node pressure, volume semantics,
+telemetry freshness and certificate expiry remain honest unknown or
+unavailable prerequisites.
+
+**Node-failure tranche delivered:** `node-drain` publishes degraded critical
+readiness while leaving gossip, Raft and reporting open. The scheduler
+therefore withdraws the node and re-plans its placements, then admits it again
+after reversal. `node-kill` reference-counts a shared transport gate across
+inbound and outbound gossip, Raft and reporting; peers observe a genuine failed
+member and ordinary failover runs. `--containers` additionally kills every
+local workload instance.
+
+Both operations require a real Admin credential, the server-owned
+`alter_node_state` grant, an explicit `--acknowledge`, a named target and a
+non-zero TTL. A source node forwards the caller's credential and the target
+repeats the checks. Clearing a node fault has the same boundary:
+`relish fault clear <id> --node <name> --acknowledge`. A general Deployer clear
+leaves node faults intact. Automatic expiry is target-local and always remains
+available; if gossip has already dropped the target from its live routing
+table, manual reversal must address that node's still-live management endpoint
+directly. A three-node acceptance observes a follower leave and rejoin through
+the real transports, and proves a second voter failure is refused while the
+first remains down. Durable lease ownership for node state is still open and
+the chaos catalogue must not claim it yet.
 
 **Resource-lease tranche delivered:** a Deployer may create, inspect, renew and
 release an app/namespace lease only when the server policy permits isolated

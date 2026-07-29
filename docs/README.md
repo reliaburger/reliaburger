@@ -415,10 +415,11 @@ Commands:
 | `fault partition <target>` | Block traffic between services |
 | `fault kill <target>` | Kill instances of a service (SIGKILL) |
 | `fault pause <target>` | Freeze instances of a service (SIGSTOP) |
-| `fault node-drain <node>` | Simulate graceful node departure |
-| `fault node-kill <node>` | Simulate abrupt node failure |
+| `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
+| `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
 | `fault list` | List all active faults |
-| `fault clear [id]` | Clear all faults (or a specific one by ID) |
+| `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
+| `fault clear <id> --node <node> --acknowledge` | Reverse a node fault on its owning node |
 | `fault scenario <file>` | Run a scripted chaos scenario from a TOML file |
 | `dev create` | Create a local dev cluster (Lima VMs with rootless runc) |
 | `dev status` | Show dev cluster status |
@@ -802,6 +803,17 @@ pass, failure, panic or timeout. Container cases use the official BusyBox
 `sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
 The same immutable reference is accepted by the provisioned runc and Apple
 Container gates; ProcessGrill cases keep using the node's installed Bun.
+
+Node-level faults have a separate privilege boundary. The caller must be an
+Admin, `[testing].allowed_operations` must contain `"alter_node_state"`, and
+the command must include `--acknowledge` and a non-zero duration. `node-drain`
+publishes not-ready evidence so the scheduler moves placements while cluster
+traffic stays live. `node-kill` closes gossip, Raft and reporting traffic;
+`--containers` also kills local workloads. Both reverse on expiry. A manual
+clear needs the owning node because fault IDs are node-local:
+`relish fault clear <id> --node <node> --acknowledge`. Once peers have removed
+the failed node from their live directory, point `--endpoint` at that node's
+still-running management API. An ordinary clear never removes node faults.
 
 Standalone apply streams an `Accepted` SSE event before progress, containing
 the operation ID used by these endpoints. Active records report `accepted`,

@@ -771,15 +771,16 @@ relish fault kill <app> --count <n>         # Kill N random instances
 relish fault pause <app>                    # SIGSTOP all instances
 relish fault pause <app> --instance <id>    # SIGSTOP one instance
 relish fault pause <app> --resume           # SIGCONT (unfreeze)
-relish fault node-drain <node>              # Simulate graceful node departure
-relish fault node-kill <node>               # Simulate abrupt node failure
-relish fault node-kill <node> --duration <d> # Auto-recover after duration
+relish fault node-drain <node> --acknowledge # Withdraw from scheduling, keep transports
+relish fault node-kill <node> --acknowledge  # Quiesce gossip, Raft and reporting
+relish fault node-kill <node> --duration <d> --acknowledge # Auto-recover after duration
 relish fault run <file>                     # Run scripted chaos scenario
 relish fault run <file> --dry-run           # Preview scenario timing
 relish fault run <file> --speed <multiplier> # Run at adjusted speed
 relish fault list                           # Show all active faults
-relish fault clear                          # Remove ALL faults
+relish fault clear                          # Remove all workload faults
 relish fault clear <app>                    # Remove faults targeting app
+relish fault clear <id> --node <node> --acknowledge # Reverse a node fault
 
 # Testing
 relish test                                 # Run full integration test suite
@@ -1219,8 +1220,16 @@ recovery. This command is not implemented yet. Before it lands, Bun must
 enforce the typed `[testing]` policy for every operation: authenticated role,
 operation allowlist, protected-cluster gate, bounded lease and operator
 acknowledgement. Unknown clusters are protected. A client flag cannot override
-server policy. Real leader/node failure, network partition, node-scoped resource
-exhaustion and cascading failure remain prerequisites rather than green skips.
+server policy. Node drain and kill now meet this boundary: an Admin with the
+server's `alter_node_state` grant and explicit acknowledgement can withdraw
+scheduler readiness or reference-count a shared gossip/Raft/reporting
+transport gate. Both require a TTL and reverse automatically. The target node
+repeats authorisation after forwarding, and general fault clearing cannot
+reverse node state. Node fault IDs remain target-local; a manual clear names
+the owning node and, after failure detection removes it from live routing, the
+operator addresses that node's management endpoint directly. Real node-scoped
+resource exhaustion and cascading failure remain prerequisites rather than
+green skips.
 
 **`relish bench`**
 
