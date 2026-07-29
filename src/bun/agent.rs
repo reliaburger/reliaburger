@@ -170,7 +170,8 @@ pub enum AgentCommand {
     InjectPartition {
         peers: Vec<String>,
         duration_secs: u64,
-        response: oneshot::Sender<Result<String, BunError>>,
+        injected_by: String,
+        response: oneshot::Sender<Result<(String, crate::smoker::types::FaultSummary), BunError>>,
     },
     /// Remove all network partitions (chaos testing).
     HealPartition {
@@ -2642,6 +2643,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::InjectPartition {
                 peers,
                 duration_secs,
+                injected_by,
                 response,
             } => {
                 // Legacy chaos API — create a partition fault in the registry
@@ -2651,7 +2653,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     target_instance: None,
                     target_node: None,
                     duration: std::time::Duration::from_secs(duration_secs),
-                    injected_by: "relish chaos".into(),
+                    injected_by,
                     reason: Some("legacy chaos partition".into()),
                     include_leader: false,
                     override_safety: false,
@@ -2687,7 +2689,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 );
                 let msg =
                     format!("partition injected: blocking {blocked} peer(s) for {duration_secs}s");
-                let _ = response.send(Ok(msg));
+                let summary = crate::smoker::types::FaultSummary::from(&rule);
+                let _ = response.send(Ok((msg, summary)));
             }
             AgentCommand::HealPartition { response } => {
                 // Legacy chaos API — clear all faults, reversing each so no

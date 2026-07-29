@@ -787,8 +787,8 @@ relish fault clear <id> --node <node>       # Reverse a node fault
 relish test                                 # Run full integration test suite
 relish test --filter <groups>               # Run specific test groups
 relish test --parallel <n>                  # Set concurrency level
-relish test --chaos                         # Run chaos test suite
-relish test --chaos --filter <groups>       # Run specific chaos tests
+relish test --chaos                         # Run chaos suite (interactive confirmation)
+relish test --chaos --yes                   # Non-interactive consent for CI
 relish test --profile <profile>             # development/full-runc/full-apple/process-grill
 relish test --timeout <duration>            # Set test timeout
 relish test --output json                   # Machine-readable results
@@ -1226,25 +1226,44 @@ peers which failed authentication, timed out or returned stale evidence.
 
 **`relish test --chaos`**
 
-Combines integration tests with Smoker fault injection to verify cluster
-recovery. This command is not implemented yet. Before it lands, Bun must
-enforce the typed `[testing]` policy for every operation: authenticated role,
-operation allowlist, protected-cluster gate, bounded lease and operator
-acknowledgement. Unknown clusters are protected. A client flag cannot override
-server policy. Node drain and kill now meet this boundary: an Admin with the
-server's `alter_node_state` grant and explicit acknowledgement can withdraw
-scheduler readiness or reference-count a shared gossip/Raft/reporting
-transport gate. Both require a TTL and reverse automatically. The target node
-repeats authorisation after forwarding, and general fault clearing cannot
-reverse node state. Node fault IDs remain target-local; a manual clear names
-the owning node and, after failure detection removes it from live routing, the
-operator addresses that node's management endpoint directly. Real node-scoped
-resource exhaustion is available only when a rootful Linux node advertises
-`NodePressure` and the server policy grants `saturate_capacity` with non-zero
-CPU/memory ceilings. The helper runs in an owned cgroup outside Bun and only
-one may run per node. Rootless, Apple and missing-controller cases remain
-unavailable rather than green skips. Cascading failure remains a catalogue
-scenario, not a primitive.
+Runs five serial recovery scenarios: council leader failure, a dead worker
+with live replicas, a minority council partition, bounded whole-node pressure,
+and a node death during an active rolling deploy. Each scenario uses the
+digest-pinned BusyBox workload on runc or Apple Container. ProcessGrill remains
+a separate acceptance profile because its host-port model can't restore the
+same replica count on two surviving nodes.
+
+This suite refuses before creating a lease unless fresh evidence proves at
+least three nodes, the container runtime, node kill and node pressure. Server
+policy must grant `provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`; protected clusters must explicitly enable protected
+mutation. An interactive invocation requires the operator to type exactly
+`yes`; automation passes `--yes`. Consent grants no role or server operation,
+and there is deliberately no client override. Missing destructive
+prerequisites fail the invocation rather than becoming green skips.
+
+Chaos cases always run one at a time. The runner refreshes the 15-second
+capability evidence after each case enters that serial queue, creates its
+server-owned workload lease, and records every injected fault by exact
+target-local id, owning node and direct client. Teardown clears those exact
+faults newest first, then releases the workload lease. It takes the same path
+after failure, timeout or panic; any unconfirmed reversal makes cleanup
+`Unknown`. Blanket `fault clear` and `chaos heal` aren't used as ownership
+substitutes.
+
+Node drain and kill use an Admin with the server's `alter_node_state` grant
+and explicit acknowledgement to withdraw scheduler readiness or
+reference-count a shared gossip/Raft/reporting transport gate. Both require a
+TTL and reverse automatically. The target node repeats authorisation after
+forwarding, and general fault clearing cannot reverse node state. Node fault
+IDs remain target-local; a manual clear names the owning node and, after
+failure detection removes it from live routing, the operator addresses that
+node's management endpoint directly. Real node-scoped resource exhaustion is
+available only when a rootful Linux node advertises `NodePressure` and the
+server policy grants `saturate_capacity` with non-zero CPU/memory ceilings.
+The helper runs in an owned cgroup outside Bun and only one may run per node.
+Rootless, Apple and missing-controller cases remain unavailable rather than
+green skips.
 
 Ordinary workload faults use a separate gate. The caller needs at least the
 Deployer role, `[testing].allowed_operations` must contain

@@ -28,6 +28,8 @@ pub struct TestArgs {
     pub timeout: String,
     /// `--chaos`: run the chaos suite instead of the integration suite.
     pub chaos: bool,
+    /// `--yes`: acknowledge real fault injection without expanding authority.
+    pub yes: bool,
     /// Acceptance policy for required cases and known skips.
     pub profile: String,
     /// `--namespace`: readable base for each case's isolated namespace.
@@ -82,15 +84,8 @@ async fn run_with_client(
             body: format!("could not read cluster capabilities (is the agent running?): {error}"),
         })?;
 
-    if args.chaos && testkit::chaos_cases().is_empty() {
-        // The scenarios and their production safety guards land in a later
-        // Phase 15 step. Refuse rather than run an empty, unguarded suite —
-        // an unguarded chaos path that does nothing today is exactly the sort
-        // of latent surprise this project keeps out of the tree.
-        return Err(RelishError::ApiError {
-            status: 0,
-            body: "the chaos suite is not available yet (arrives later in Phase 15)".to_string(),
-        });
+    if args.chaos {
+        confirm_chaos(&capabilities, args.yes)?;
     }
 
     let cases = if args.chaos {
@@ -107,7 +102,8 @@ async fn run_with_client(
             client: client.clone(),
             capabilities,
             run_id: generate_run_id(),
-            parallel: args.parallel,
+            // Two individually safe node faults can be unsafe together.
+            parallel: if args.chaos { 1 } else { args.parallel },
             timeout,
             chaos: args.chaos,
             profile,
@@ -124,6 +120,42 @@ async fn run_with_client(
     } else {
         CommandOutcome::Clean
     })
+}
+
+fn confirm_chaos(
+    capabilities: &crate::bun::capabilities::ClusterCapabilities,
+    yes: bool,
+) -> Result<(), RelishError> {
+    use std::io::{IsTerminal, Write};
+
+    let is_tty = std::io::stdin().is_terminal();
+    match testkit::chaos::chaos_preflight(capabilities, testkit::chaos::ChaosFlags { yes }, is_tty)
+    {
+        Ok(()) => Ok(()),
+        Err(testkit::chaos::RefusalReason::InteractiveConfirmation) => {
+            eprint!(
+                "This will inject real faults into cluster '{}'. Type 'yes' to continue: ",
+                capabilities.cluster_name
+            );
+            std::io::stderr().flush().map_err(RelishError::Io)?;
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(RelishError::Io)?;
+            if answer.trim() == "yes" {
+                Ok(())
+            } else {
+                Err(RelishError::ApiError {
+                    status: 0,
+                    body: "chaos cancelled; confirmation was not exactly 'yes'".to_string(),
+                })
+            }
+        }
+        Err(reason) => Err(RelishError::ApiError {
+            status: 0,
+            body: reason.to_string(),
+        }),
+    }
 }
 
 /// A short lowercase-hex tag, unique enough per invocation to keep two
@@ -210,6 +242,8 @@ mod tests {
         CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
         UnknownKind,
     };
+    use axum::routing::get;
+    use axum::{Json, Router};
 
     fn result(
         name: &str,
@@ -333,5 +367,48 @@ mod tests {
         assert_eq!(CommandOutcome::Clean.exit_code(), 0);
         assert_eq!(CommandOutcome::Problems.exit_code(), 1);
         assert_eq!(CommandOutcome::Warnings.exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn chaos_against_a_one_node_harness_refuses_before_running_cases() {
+        let capabilities = crate::bun::capabilities::ClusterCapabilities {
+            node_count: 1,
+            cluster_name: "one-node".to_string(),
+            ..crate::bun::capabilities::ClusterCapabilities::default()
+        };
+        let app = Router::new().route(
+            "/v1/capabilities",
+            get(move || {
+                let capabilities = capabilities.clone();
+                async move { Json(capabilities) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = run_with_client(
+            TestArgs {
+                filter: None,
+                parallel: 4,
+                timeout: "120s".to_string(),
+                chaos: true,
+                yes: true,
+                profile: "development".to_string(),
+                namespace: None,
+                output: OutputFormat::Human,
+            },
+            &BunClient::new(&format!("http://{address}")),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("chaos suite requires at least 3 nodes (found 1)"),
+            "{error}"
+        );
     }
 }

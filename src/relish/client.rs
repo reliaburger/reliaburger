@@ -1124,7 +1124,7 @@ impl BunClient {
         peers: &[String],
         duration_secs: u64,
         acknowledged: bool,
-    ) -> Result<String, RelishError> {
+    ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
         let url = format!("{}/v1/chaos/partition", self.base_url);
         let response = self
             .client
@@ -1148,7 +1148,10 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })?;
-        Ok(json["message"].as_str().unwrap_or("ok").to_string())
+        serde_json::from_value(json["fault"].clone()).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("partition response omitted its owned fault: {error}"),
+        })
     }
 
     /// Remove all network partitions (chaos testing).

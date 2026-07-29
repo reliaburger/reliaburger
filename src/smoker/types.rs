@@ -151,7 +151,10 @@ impl FaultType {
     /// Whether applying or reversing this fault changes node-level cluster
     /// state and therefore needs the `alter_node_state` permission.
     pub fn is_node_operation(&self) -> bool {
-        matches!(self, Self::NodeDrain | Self::NodeKill { .. })
+        matches!(
+            self,
+            Self::NodeDrain | Self::NodeKill { .. } | Self::CouncilPartition
+        )
     }
 
     /// Whether the fault must be routed to a named node.
@@ -778,6 +781,7 @@ mod tests {
         assert!(!pressure.is_node_operation());
         assert!(FaultType::NodeDrain.is_node_targeted());
         assert!(FaultType::NodeDrain.is_node_operation());
+        assert!(FaultType::CouncilPartition.is_node_operation());
     }
 
     #[test]

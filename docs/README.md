@@ -774,7 +774,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership) |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join a cluster (JSON body: `{"token":"...","addr":"..."}`) |
-| `POST` | `/v1/chaos/partition` | Inject network partition (JSON: `{"peers":[...],"duration_secs":N}`) |
+| `POST` | `/v1/chaos/partition` | Inject an acknowledged council partition and return its exact fault id |
 | `POST` | `/v1/chaos/heal` | Remove all active partitions |
 | `GET` | `/v1/chaos/status` | Query active chaos state |
 
@@ -805,6 +805,17 @@ pass, failure, panic or timeout. Container cases use the official BusyBox
 `sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
 The same immutable reference is accepted by the provisioned runc and Apple
 Container gates; ProcessGrill cases keep using the node's installed Bun.
+
+`relish test --chaos` adds five serial recovery scenarios: council leader
+failure, worker death with live replicas, a minority council partition,
+bounded node pressure, and node death during a rolling deploy. Run it
+interactively and type `yes`, or pass `--yes` in automation. It refuses rather
+than skipping when the cluster has fewer than three nodes, fresh node-kill or
+node-pressure evidence is absent, the container workload can't run, or server
+policy doesn't grant `provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`. There is no client override. Every case refreshes
+capability evidence after entering the serial queue and records exact fault
+ids for panic- and timeout-safe reversal; uncertain cleanup is `Unknown`.
 
 Workload faults are opt-in too. Injection needs a Deployer-or-higher
 credential, explicit `--acknowledge`, and this server policy:

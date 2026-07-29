@@ -43,6 +43,19 @@ pub enum OperationPermission {
     ProbeExternalDestination,
 }
 
+impl std::fmt::Display for OperationPermission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ReadDiagnostics => "read_diagnostics",
+            Self::ProvisionIsolatedWorkloads => "provision_isolated_workloads",
+            Self::InjectWorkloadFaults => "inject_workload_faults",
+            Self::AlterNodeState => "alter_node_state",
+            Self::SaturateCapacity => "saturate_capacity",
+            Self::ProbeExternalDestination => "probe_external_destination",
+        })
+    }
+}
+
 impl OperationPermission {
     /// Lowest API role which may request this operation.
     pub fn minimum_role(self) -> ApiRole {

@@ -793,9 +793,22 @@ authenticated credential rather than a client-supplied name.
 
 ## 19. Testing & Benchmarks
 
-Reliaburger compiles its test and benchmark suite into the binary. `relish test` runs 39 integration tests across 13 subsystems (scheduling, service discovery, deployments, health checks, secrets, firewall, workload identity, ingress, volumes, process workloads, jobs, image registry, cluster coordination). Tests are independent, idempotent, and safe to run against production clusters.
+Reliaburger compiles its test suite into the binary. `relish test` runs 39
+integration tests across 13 subsystems (scheduling, service discovery,
+deployments, health checks, secrets, firewall, workload identity, ingress,
+volumes, process workloads, jobs, image registry, cluster coordination).
+Every case uses a server-owned workload lease and reports `Pass`, `Fail`,
+`Skipped` or `Unknown`; timeouts and uncertain cleanup never become green.
 
-`relish test --chaos` combines the integration suite with Smoker fault injection to verify recovery from leader failure, node failure, network partitions, and resource exhaustion.
+`relish test --chaos` runs five serial recovery scenarios covering leader
+failure, worker failure with live replicas, minority council partition,
+bounded whole-node pressure, and node death during a rolling deploy. This
+suite is deliberately destructive. It refuses without three nodes, fresh
+primitive evidence, the required server policy, a digest-pinned runc or Apple
+Container workload, and exact operator consent (`--yes` for automation).
+Consent can't override server policy. Each case owns exact fault ids and
+reverses them after failure, timeout or panic; unconfirmed reversal is
+`Unknown`.
 
 `relish bench` measures performance against the design goals (Section 2) and produces a report with regression detection when compared against a baseline.
 

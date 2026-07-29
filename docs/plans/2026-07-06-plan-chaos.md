@@ -27,7 +27,7 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 | `[cluster] environment` needs adding | Still true — `ClusterSection` (`src/config/node.rs:308`) has no `environment` |
 | Smoker is library-only (review L14/L15) | **Mostly wired.** `apply_fault` has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, eBPF Drop and source-scoped eBPF Partition. Delay and Bandwidth now refuse honestly because no TC packet program is attached. |
 | Graceful-skip is needed for most subsystems | Still the right stance, but **far fewer skips**: ingress, rollups, GitOps, egress, eBPF sync, identity are all wired now |
-| `relish test --chaos` scenarios use `node-kill` | **At review time:** `node-kill`/`node-drain` always returned an error. **Now:** step 11 implements and proves both; the catalogue remains step 14. |
+| `relish test --chaos` scenarios use `node-kill` | **At review time:** `node-kill`/`node-drain` always returned an error. **Now:** step 11 implements and proves both; step 14 consumes them in the guarded catalogue. |
 | Faults apply cluster-wide | **At review time:** `target_node` was dead. **Now:** step 13b authenticates and authorises target-node distribution. |
 | `deployer` is the right role for faults | **At review time:** plain Deployer could inject. **Now:** step 13 requires Deployer plus `inject_workload_faults` and acknowledgement. |
 
@@ -40,7 +40,7 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 | Deliverable | Status today | Work |
 |---|---|---|
 | `relish test` | absent | build (§6 stream B) |
-| `relish test --chaos` | absent | build (stream D) — **blocked on stream C** |
+| `relish test --chaos` | **Shipped in step 14.** Five serial scenarios with server-owned guards and exact fault-id cleanup. |
 | `relish bench` | absent | build (stream E) |
 | `relish wtf` | absent | build (stream F) |
 | `relish trace` | absent | build (stream G) |
@@ -308,8 +308,28 @@ Book: §"Who may break production".
 ### Stream D — `relish test --chaos` (step 14)
 
 **14/20 — Chaos suite with production guards**
-Tests: pure `chaos_preflight(caps, flags, is_tty) -> Result<(), RefusalReason>` — `refuses_fewer_than_three_nodes`, `refuses_production_without_override`, `allows_production_with_override`, `requires_yes_when_not_a_tty`; integration — `--chaos` against the 1-node harness exits 1 naming the 3-node requirement.
-Implement: the five scenarios (now genuinely runnable), `ChaosGuard` that always clears the faults **it injected** (track ids — never a blanket clear), `--chaos`/`--override`/`--yes`.
+Tests: shipped. Pure preflight tests cover fewer than three nodes,
+non-interactive consent, protected server policy, missing operation grants and
+unavailable node pressure. A one-node HTTP harness proves refusal before any
+lease is created. Runner tests inject through a mock API, then prove timeout
+and panic both clear only the exact returned fault ids. The 22-test real
+cluster gate exercises the additive council-partition id contract.
+Implement: shipped. Five serial scenarios cover leader loss, worker
+rescheduling, minority council partition, bounded node pressure and node death
+during a live deploy. The suite uses the digest-pinned runc/Apple workload;
+ProcessGrill remains a separate ordinary-test profile. `ChaosGuard` is shared
+between the case task and runner, stores each id with its direct owner client
+and never sends a blanket clear. `/v1/chaos/partition` now returns its
+node-local id additively so the legacy council effect obeys the same ownership
+rule. Each destructive case refreshes its 15-second capability snapshot after
+acquiring the serial permit.
+
+There is no `--override`. Unknown and production clusters need
+`allow_protected_mutation = true` in server policy. `--yes` or the exact
+interactive answer `yes` records consent only; it cannot add role or
+operation authority. Missing node failure, node pressure, container workload
+or required operation evidence refuses the suite instead of producing a green
+skip.
 Book: §"Chaos with a safety catch".
 
 ### Stream E — `relish bench` (steps 15–16)
@@ -909,7 +929,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 12/20 partition honesty + memory-oom decision
 - [x] 13/20 fault authorisation + audit
 - [x] 13b/20 authenticated target-node distribution
-- [ ] 14/20 chaos suite
+- [x] 14/20 chaos suite
 - [ ] 15/20 bench schema + comparison
 - [ ] 16/20 bench suites
 - [ ] 17/20 wtf engine
@@ -926,7 +946,8 @@ Carried from the 6 July plan (all still apply): don't assert broken behaviour; `
 
 New for this revision:
 
-12. **Chaos work touches the cluster plane.** Run `make test-cluster` (21 tests) on every stream-C/D commit, not just `make ci`.
+12. **Chaos work touches the cluster plane.** Run `make test-cluster` (currently
+    22 tests) on every stream-C/D commit, not just `make ci`.
 13. **`ROUTE_MATRIX` is enforced by a test.** Every new route (`/v1/capabilities`, `/v1/trace`) needs a matrix entry or `matrix_covers_every_mounted_route` fails. Routes naming `{app}` additionally need `authorize_scoped` (the C3 drift guard).
 14. **Don't reintroduce a silent no-op.** Step 12 fixed `Partition` and exposed that
     Delay/Bandwidth had the same problem behind a loaded eBPF handle. Any new fault arm
@@ -936,3 +957,21 @@ New for this revision:
     authenticated token name may remain readable in `FaultSummary.injected_by`,
     but audit events use the stable `principal_id` (`token:<hash>`). Never copy
     identity from a request body or `$USER`.
+
+---
+
+## 12. Validation record
+
+**29 July 2026, step 14 implementation.** `make ci` passed 3,076
+default-feature tests, doctests, and 3,052 no-default-feature tests; both
+nextest runs reported 41 intentionally skipped tests. `make test-cluster`
+passed all 22 real multi-node cluster tests with no skips. The focused Phase
+15 testkit slice passed all 67 tests, including exact cleanup after timeout and
+panic and capability refresh after serial queueing.
+
+The full five-case `relish test --chaos --yes` run remains unchecked in the
+runbook. The available Lima environment is one rootful Linux VM, not three
+independent runc nodes; pretending three Bun processes sharing one host cgroup
+are three node-pressure domains would weaken C4 rather than validate it. Run
+the catalogue on three real nodes (or three independent VMs) before checking
+the final acceptance item.

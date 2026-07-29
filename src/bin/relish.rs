@@ -371,6 +371,9 @@ enum Command {
         /// Run the chaos suite instead of the integration suite.
         #[arg(long)]
         chaos: bool,
+        /// Confirm real fault injection without granting server authority.
+        #[arg(long, requires = "chaos")]
+        yes: bool,
         /// Acceptance profile: development, full-runc, full-apple, process-grill.
         #[arg(long, default_value = "development")]
         profile: String,
@@ -1412,6 +1415,7 @@ async fn main() -> ExitCode {
             parallel,
             timeout,
             chaos,
+            yes,
             profile,
             namespace,
         } => {
@@ -1423,6 +1427,7 @@ async fn main() -> ExitCode {
                     parallel,
                     timeout,
                     chaos,
+                    yes,
                     profile,
                     namespace,
                     output: cli.output,
@@ -1589,6 +1594,7 @@ mod tests {
                 parallel,
                 timeout,
                 chaos,
+                yes,
                 profile,
                 namespace,
             } => {
@@ -1596,6 +1602,7 @@ mod tests {
                 assert_eq!(parallel, 8);
                 assert_eq!(timeout, "5m");
                 assert!(chaos);
+                assert!(!yes);
                 assert_eq!(profile, "full-runc");
                 assert_eq!(namespace.as_deref(), Some("rbtest-fixed"));
             }
@@ -1604,9 +1611,17 @@ mod tests {
     }
 
     #[test]
-    fn test_command_has_no_client_side_production_override() {
+    fn test_command_has_no_client_side_production_override_but_accepts_consent() {
         assert!(parse(&["relish", "test", "--override"]).is_err());
-        assert!(parse(&["relish", "test", "--yes"]).is_err());
+        let parsed = parse(&["relish", "test", "--chaos", "--yes"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Test {
+                chaos: true,
+                yes: true,
+                ..
+            }
+        ));
     }
 
     #[test]

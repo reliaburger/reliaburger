@@ -1673,3 +1673,80 @@ test/Bun process outside it, confirms the total-memory target, clears the
 fault, then drops the controller and proves a restarted owner removes the
 stale cgroup. On macOS, rootless Linux or a cgroup hierarchy without both
 controllers, capability evidence says `Unavailable`. Honest again.
+
+## Chaos with a safety catch
+
+We had five recovery scenarios on paper. Running them wasn't the difficult
+part. The difficult part was making sure a failed test didn't leave the
+cluster in a worse state than the failure it had found.
+
+`relish test --chaos` now checks these five claims, in this order:
+
+1. another council member becomes leader after the leader fails;
+2. three live replicas recover after their worker fails;
+3. the council majority keeps serving while its minority is isolated;
+4. the cluster stays observable under bounded whole-node pressure; and
+5. a rolling deployment reaches a real terminal outcome when a node dies
+   during an observed active operation.
+
+Each case also reverses its fault and proves the affected node rejoins or the
+expected replicas return. The fifth case is worth spelling out. If the deploy
+finishes before the runner observes an active operation, we haven't tested
+"node death during a deploy". The result is `Unknown`, not an optimistic pass.
+
+Could we run the five in parallel to save time? Individually acceptable blast
+radii don't compose. Failing one worker while another case isolates a council
+minority can turn two tidy experiments into one accidental outage. The chaos
+suite therefore ignores the ordinary parallel width and uses one permit.
+After a case gets that permit, it fetches capability evidence again. The
+evidence expires after 15 seconds; checking it before waiting in the queue
+would let a destructive decision outlive the facts behind it.
+
+The preflight is equally blunt. It requires at least three nodes, an available
+container runtime, node kill, node pressure and the server operations
+`provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`. Protected clusters need their server-owned mutation gate.
+The interactive command asks the operator to type exactly `yes`; automation
+uses `--yes`. This records consent. It doesn't invent authority, and there is
+no `--override`.
+
+Why fail the invocation instead of skipping the pressure case on a rootless
+machine? Because "five chaos tests passed" must mean we ran five chaos tests.
+A catalogue without the destructive primitive it claims to validate isn't a
+smaller success. It's a different test. ProcessGrill stays separate for the
+same reason: fixed host ports can't restore three replicas onto two surviving
+nodes. The catalogue uses the digest-pinned BusyBox OCI workload which runs
+under both runc and Apple Container, although the full pressure scenario still
+needs rootful Linux cgroup v2.
+
+Now, cleanup. A `TestContext` is cloned into the case task. When that task
+times out, the runner aborts it before cleanup; when it panics, Tokio returns a
+`JoinError`. In both cases the outer context must still know which faults the
+inner task created. The guard holds:
+
+```rust
+Arc<Mutex<Vec<OwnedFault>>>
+```
+
+`Arc<T>` is an atomically reference-counted shared owner. Unlike an ordinary
+borrow, it can cross a spawned task boundary and outlive the stack frame which
+created it. `Mutex<T>` permits one task at a time to mutate the vector. We use
+Tokio's asynchronous mutex because waiting for it must not block a runtime
+thread. Cloning the guard clones the `Arc`, not the vector, so the runner and
+case always see the same ownership ledger.
+
+Every ledger entry contains the target-local fault id, owning node and the
+direct client which created it. Teardown removes entries newest first and
+calls the specific delete endpoint. If a delete fails, the entry stays in the
+ledger for a retry and cleanup becomes `Unknown`. We never call blanket
+`fault clear` or `chaos heal`: those could reverse an operator's unrelated
+experiment. The older council-partition endpoint now returns its exact fault
+summary as an additive response field, which gives legacy callers the same
+ownership evidence without breaking their existing `message` field.
+
+The regression tests drive that guard through both timeout and panic, observe
+two exact injections and two exact reversals, and require confirmed cleanup.
+Another test starts with deliberately expired evidence, serves a fresh
+snapshot from Bun, and proves a chaos case receives the fresh one. These are
+small tests for an unpleasant class of failure. That's exactly why they're
+there.

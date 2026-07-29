@@ -1593,7 +1593,8 @@ Safety rails must be tested to verify they correctly prevent dangerous faults:
 - Attempt to partition a majority of council nodes. Verify rejection with QuorumRisk error.
 - Attempt to kill all replicas of a service. Verify rejection with ReplicaMinimum error.
 - Attempt to fault the leader node. Verify rejection unless `--include-leader` is present.
-- Attempt to fault >50% of nodes. Verify rejection unless `--override-safety` is present.
+- Attempt to fault >50% of nodes. Verify rejection; a client safety override
+  must not widen server policy.
 - Verify that `relish fault clear` works via Unix socket even when the cluster API is unavailable.
 
 ### 10.3 Chaos Test for Smoker Itself
@@ -1603,6 +1604,38 @@ Smoker should be tested under its own fault conditions:
 - Inject a fault, then crash and restart Bun. Verify startup cleanup removes all BPF map entries.
 - Inject a fault, then kill the leader. Verify the fault continues to operate (BPF maps are on the target node, not the leader) and that `relish fault clear` still works via the local Unix socket.
 - Inject multiple overlapping faults on the same service. Verify all are applied correctly and cleaned up independently.
+
+### 10.4 Built-in recovery catalogue
+
+The shipped `relish test --chaos` catalogue is intentionally smaller than the
+fault matrix above. It tests five recovery claims which the current primitives
+can make honestly:
+
+1. council leader failure, a different elected leader, a live canary, then
+   rejoin;
+2. worker death while three replicas are live, all three restored on
+   survivors, then rejoin;
+3. minority council isolation, a live majority canary, then exact healing;
+4. bounded whole-node CPU/memory pressure while the API and membership remain
+   observable, then exact clearing; and
+5. node death during an observed rolling deploy, a terminal non-`Unknown`
+   deployment outcome, and restored replicas.
+
+The suite runs serially. Before it creates anything, it requires three nodes,
+the digest-pinned runc/Apple workload, fresh `NodeKill` and `NodePressure`
+evidence, the three server operations `provision_isolated_workloads`,
+`alter_node_state` and `saturate_capacity`, protected-cluster permission where
+applicable, and explicit operator consent. A missing destructive prerequisite
+refuses the suite rather than skipping a scenario. ProcessGrill remains a
+separate profile; fixed host ports can't prove three replicas reschedule onto
+two survivors.
+
+Each case refreshes capability evidence after entering the one-wide execution
+queue. Its shared `ChaosGuard` records the exact target-local fault id, owning
+node and direct API client. Runner teardown reverses those ids newest first
+after pass, failure, timeout or panic, then releases the workload lease.
+Cleanup failure remains recorded for retry and produces `Unknown`. The
+catalogue never uses blanket clear or heal as a substitute for ownership.
 
 ---
 

@@ -45,6 +45,9 @@ pub struct TestContext {
     /// Server-owned app/resource lease. Production runners always set this;
     /// `None` remains only for focused unit tests of the runner itself.
     pub(crate) lease_id: Option<String>,
+    /// Exact chaos faults owned by this case. The runner retains a clone so a
+    /// timed-out or panicking body cannot lose reversal ownership.
+    pub(crate) chaos_guard: crate::testkit::chaos::ChaosGuard,
     pub capabilities: ClusterCapabilities,
     /// Per-case budget, from `--timeout`. Poll loops measure against it so a
     /// case fails with a useful message rather than being killed from
@@ -101,6 +104,11 @@ impl TestContext {
         result
             .map(|_| ())
             .map_err(|error| format!("apply failed: {error}"))
+    }
+
+    /// Fault owner shared with the runner's unconditional teardown path.
+    pub fn chaos(&self) -> &crate::testkit::chaos::ChaosGuard {
+        &self.chaos_guard
     }
 
     /// Wait until `app` has at least `replicas` instances in the `running`
@@ -438,6 +446,12 @@ impl TestContext {
     /// guard is a second lock on top of the name match: even a bug in
     /// namespace construction cannot make teardown stop an operator's app.
     pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
+        let faults = self.chaos_guard.cleanup(deadline).await;
+        let resources = self.teardown_resources(deadline).await;
+        merge_cleanup(faults, resources)
+    }
+
+    async fn teardown_resources(&self, deadline: Deadline) -> CleanupOutcome {
         if let Some(lease_id) = &self.lease_id {
             match deadline
                 .run("lease release", self.client.release_test_lease(lease_id))
@@ -563,6 +577,23 @@ impl TestContext {
     }
 }
 
+fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome {
+    use CleanupOutcome::{Confirmed, Failed, NotRequired, Unknown};
+
+    match (left, right) {
+        (Failed { reason: left }, Failed { reason: right }) => Failed {
+            reason: format!("{left}; {right}"),
+        },
+        (Failed { reason }, _) | (_, Failed { reason }) => Failed { reason },
+        (Unknown { reason: left }, Unknown { reason: right }) => Unknown {
+            reason: format!("{left}; {right}"),
+        },
+        (Unknown { reason }, _) | (_, Unknown { reason }) => Unknown { reason },
+        (NotRequired, NotRequired) => NotRequired,
+        (Confirmed | NotRequired, Confirmed | NotRequired) => Confirmed,
+    }
+}
+
 /// A stable, per-app port in the ephemeral range, so two apps in one case
 /// don't collide. Deterministic (an FNV-1a hash of the name) so a case's
 /// spec is reproducible between runs.
@@ -587,6 +618,7 @@ mod tests {
             client: BunClient::new_with_token("http://127.0.0.1:9117", None),
             namespace: namespace.to_string(),
             lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),

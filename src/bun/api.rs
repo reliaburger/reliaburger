@@ -3036,12 +3036,17 @@ async fn chaos_partition_handler(
     }
     let audit_peers = body.peers.clone();
     let audit_duration_seconds = body.duration_secs;
+    let injected_by = auth
+        .as_deref()
+        .map(|auth| auth.token_name.clone())
+        .unwrap_or_else(|| "local-bootstrap".to_string());
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::InjectPartition {
             peers: body.peers,
             duration_secs: body.duration_secs,
+            injected_by,
             response: resp_tx,
         })
         .await
@@ -3055,7 +3060,7 @@ async fn chaos_partition_handler(
     }
 
     match resp_rx.await {
-        Ok(Ok(msg)) => {
+        Ok(Ok((msg, summary))) => {
             record_fault_audit(
                 &state,
                 FaultAudit {
@@ -3071,12 +3076,13 @@ async fn chaos_partition_handler(
                             audit_duration_seconds.to_string(),
                         ),
                         ("peers".to_string(), audit_peers.join(",")),
+                        ("fault_id".to_string(), summary.id.to_string()),
                     ]),
                     message: format!("{msg} by principal {principal}"),
                 },
             )
             .await;
-            Json(serde_json::json!({ "message": msg })).into_response()
+            Json(serde_json::json!({ "message": msg, "fault": summary })).into_response()
         }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
@@ -6154,6 +6160,36 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(String::from_utf8_lossy(&body).contains("acknowledgement"));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn legacy_partition_response_exposes_the_exact_owned_fault_id() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        let (status, body) = post_authenticated(
+            app,
+            "/v1/chaos/partition",
+            &plaintext,
+            &council_partition_body(true),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(response["fault"]["id"].as_u64().is_some(), "{response}");
+        assert_eq!(
+            response["fault"]["fault_type"].as_str(),
+            Some("council-partition")
+        );
         shutdown.cancel();
     }
 

@@ -37,6 +37,40 @@ Clearing remains possible with the same role and grant without a destructive
 acknowledgement. Bun gets audit identity from the authenticated credential,
 not `$USER` or the request body.
 
+## Recovery catalogue
+
+`relish test --chaos` runs five destructive recovery checks, one at a time:
+
+1. fail the council leader, elect another leader, run a canary, then recover;
+2. fail a worker with three live replicas, restore all three on survivors,
+   then admit the worker again;
+3. isolate a minority of the council, prove the majority still serves a
+   canary, then heal the exact partition;
+4. apply bounded whole-node CPU and memory pressure while the API and
+   membership remain observable, then clear it; and
+5. fail a node during an observed rolling deploy and require a terminal,
+   non-`Unknown` deployment result plus restored replicas.
+
+The full catalogue needs at least three nodes, a digest-pinned BusyBox
+container workload, fresh node-kill and node-pressure evidence, and server
+grants for `provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`. Missing destructive prerequisites refuse the suite. They
+don't turn into green skips. Rootless Linux and Apple Container can exercise
+the workload, but the full catalogue currently needs rootful Linux cgroup v2
+for node pressure. ProcessGrill remains a separate profile.
+
+An interactive run asks you to type exactly `yes`; CI uses:
+
+```sh
+relish test --chaos --yes
+```
+
+`--yes` records consent. It doesn't grant permission and there is no
+`--override`. The runner refreshes short-lived capability evidence before
+each serial case, records every fault's exact id and owning node, and reverses
+those exact faults after pass, failure, timeout or panic. If it can't prove
+cleanup, the case is `Unknown`, not green.
+
 ## Scripted scenarios
 
 Describe a whole experiment in TOML — steps, durations, checks — and run it:

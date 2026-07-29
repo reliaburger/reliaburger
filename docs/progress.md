@@ -1324,7 +1324,14 @@ convergence and adoption" theme under 12b.6).
   `Skipped` and `Unknown`; timeouts, panics and untyped runtime skips are
   unknown, cleanup has an independent verdict, and full profiles reject
   required skips or missing observed evidence
-- [ ] `relish test --chaos` (integration tests + Smoker fault injection)
+- [x] `relish test --chaos`: five serial live scenarios for leader loss,
+  worker rescheduling, minority partition, bounded node pressure and node death
+  during deploy. Pure preflight refuses fewer than three nodes, protected
+  server policy, missing operation grants, missing container/node-failure
+  evidence and non-interactive runs without `--yes`; there is no client-side
+  production override. The runner and case task share exact fault-id ownership,
+  refresh capability evidence before each destructive case and reverse only
+  their own faults after pass, failure, timeout or panic
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
 - [ ] `relish wtf` (automated cluster health diagnosis)
 - [ ] `relish trace` (end-to-end connectivity debugging)
@@ -1451,6 +1458,13 @@ convergence and adoption" theme under 12b.6).
     additive `action`, stable authenticated `principal` and machine-readable
     `details` fields for every successful inject and clear path. The deprecated
     council API cannot bypass this boundary.
+  - [x] Guarded five-scenario chaos catalogue: serial execution on the
+    digest-pinned runc/Apple workload; server policy and consent preflight;
+    missing node kill/pressure prerequisites refuse rather than green-skip;
+    fresh per-case capability snapshots; and runner-owned exact-id reversal
+    after pass, failure, timeout or panic. The legacy council-partition
+    response now exposes its node-local fault id additively, so catalogue
+    cleanup never needs the blanket heal endpoint.
 
 ### Optional
 

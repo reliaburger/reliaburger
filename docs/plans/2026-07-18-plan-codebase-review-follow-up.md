@@ -473,7 +473,11 @@ startup. M8 must add certificate expiry evidence and should not make
     runc and Apple Container. Keep the ProcessGrill helper as a separate
     profile.
 - [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
-- [ ] Add chaos primitives only after the safety, evidence and ownership gates.
+- [x] Add the guarded five-scenario chaos catalogue after the safety, evidence
+  and ownership gates. It runs serially, refuses missing node-kill/pressure or
+  server-operation prerequisites, refreshes short-lived capability evidence
+  before each case and reverses only exact fault ids retained outside the case
+  task. ProcessGrill stays separate from the pinned runc/Apple workload.
 - [x] Implement authenticated real drain/kill before C1/C2/C5.
 - [x] Implement node-scoped pressure before C4. Unsupported scenarios must
   not become green skips.

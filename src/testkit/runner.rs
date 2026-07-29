@@ -198,6 +198,55 @@ async fn run_one(
     let started_at = now_rfc3339();
     let deadline_at = rfc3339_after(timeout);
     let required = profile_requires_case(profile, case.requires);
+    let refresh_capabilities = case.group == TestGroup::Chaos;
+    let refreshed;
+    let capabilities = if refresh_capabilities {
+        match tokio::time::timeout(timeout.min(Duration::from_secs(5)), client.capabilities()).await
+        {
+            Ok(Ok(report)) => {
+                refreshed = report;
+                &refreshed
+            }
+            Ok(Err(error)) => {
+                return TestCaseResult {
+                    name: case.name.to_string(),
+                    group: case.group,
+                    required,
+                    started_at,
+                    finished_at: now_rfc3339(),
+                    deadline_at,
+                    outcome: TestOutcome::Unknown {
+                        kind: UnknownKind::CollectorFailed,
+                        reason: format!(
+                            "could not refresh capability evidence before destructive case: {error}"
+                        ),
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    evidence: Vec::new(),
+                    cleanup: CleanupOutcome::NotRequired,
+                };
+            }
+            Err(_) => {
+                return TestCaseResult {
+                    name: case.name.to_string(),
+                    group: case.group,
+                    required,
+                    started_at,
+                    finished_at: now_rfc3339(),
+                    deadline_at,
+                    outcome: TestOutcome::timed_out(
+                        "capability refresh",
+                        timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    ),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    evidence: Vec::new(),
+                    cleanup: CleanupOutcome::NotRequired,
+                };
+            }
+        }
+    } else {
+        capabilities
+    };
 
     let unavailable: Vec<_> = case
         .requires
@@ -333,6 +382,7 @@ async fn run_one(
         client,
         namespace,
         lease_id,
+        chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
         capabilities: capabilities.clone(),
         timeout,
         deadline,
@@ -462,7 +512,7 @@ mod tests {
     use crate::testkit_case;
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
-    use axum::routing::{delete, post};
+    use axum::routing::{delete, get, post};
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -523,6 +573,19 @@ mod tests {
         TestCase {
             name,
             group: TestGroup::Scheduling,
+            requires,
+            run,
+        }
+    }
+
+    fn chaos_case(
+        name: &'static str,
+        requires: &'static [Capability],
+        run: super::super::registry::TestFn,
+    ) -> TestCase {
+        TestCase {
+            name,
+            group: TestGroup::Chaos,
             requires,
             run,
         }
@@ -593,6 +656,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn chaos_case_refreshes_capabilities_after_entering_the_serial_queue() {
+        static CHAOS_BODY_RAN: AtomicBool = AtomicBool::new(false);
+
+        async fn body(ctx: TestContext) -> Result<(), String> {
+            assert_eq!(
+                ctx.capabilities.state(Capability::Ebpf),
+                CapabilityState::Available
+            );
+            CHAOS_BODY_RAN.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        CHAOS_BODY_RAN.store(false, Ordering::SeqCst);
+        let fresh = full_capabilities();
+        let app = Router::new()
+            .route(
+                "/v1/capabilities",
+                get(move || {
+                    let fresh = fresh.clone();
+                    async move { Json(fresh) }
+                }),
+            )
+            .route("/v1/status", get(empty_mock_list));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut stale = full_capabilities();
+        stale.expires_at_unix_ms = 0;
+        let report = run(
+            vec![chaos_case(
+                "fresh_destructive_evidence",
+                &[Capability::Ebpf],
+                testkit_case!(body),
+            )],
+            config(BunClient::new_with_token(&address, None), stale, 1),
+        )
+        .await;
+
+        assert_eq!(report.passed, 1, "{:?}", report.results);
+        assert!(CHAOS_BODY_RAN.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -799,6 +908,35 @@ mod tests {
         Json(Vec::new())
     }
 
+    async fn inject_mock_fault(
+        State(state): State<LeaseMockState>,
+        Json(request): Json<crate::smoker::types::FaultRequest>,
+    ) -> Json<crate::smoker::types::FaultSummary> {
+        let id = state.next_id.fetch_add(1, Ordering::SeqCst) as u64;
+        state
+            .records
+            .lock()
+            .await
+            .push(format!("fault-inject:{id}"));
+        Json(crate::smoker::types::FaultSummary {
+            id,
+            fault_type: request.fault_type.to_string(),
+            target_service: request.target_service,
+            target_instance: request.target_instance,
+            target_node: request.target_node,
+            remaining_secs: request.duration.as_secs(),
+            injected_by: "runner-test".to_string(),
+        })
+    }
+
+    async fn clear_mock_fault(
+        State(state): State<LeaseMockState>,
+        Path(id): Path<u64>,
+    ) -> Json<serde_json::Value> {
+        state.records.lock().await.push(format!("fault-clear:{id}"));
+        Json(serde_json::json!({ "message": "cleared" }))
+    }
+
     async fn spawn_lease_server() -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -810,6 +948,8 @@ mod tests {
         let app = Router::new()
             .route("/v1/test/leases", post(create_mock_lease))
             .route("/v1/test/leases/{id}", delete(release_mock_lease))
+            .route("/v1/fault", post(inject_mock_fault))
+            .route("/v1/fault/{id}", delete(clear_mock_fault))
             .route("/v1/cluster/nodes", axum::routing::get(empty_mock_list))
             .route("/v1/status", axum::routing::get(empty_mock_list))
             .with_state(state);
@@ -881,6 +1021,84 @@ mod tests {
                 "release:lease-2".to_string(),
                 "release:lease-3".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_reverses_exact_owned_faults_after_timeout_and_panic() {
+        fn request() -> crate::smoker::types::FaultRequest {
+            crate::smoker::types::FaultRequest {
+                fault_type: crate::smoker::types::FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_service: String::new(),
+                target_instance: None,
+                target_node: Some("node-a".to_string()),
+                duration: Duration::from_secs(30),
+                injected_by: String::new(),
+                reason: Some("runner ownership test".to_string()),
+                include_leader: false,
+                override_safety: false,
+                acknowledged: true,
+            }
+        }
+
+        async fn times_out(ctx: TestContext) -> Result<(), String> {
+            ctx.chaos()
+                .inject_fault(ctx.client.clone(), &request())
+                .await?;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        }
+        async fn panics(ctx: TestContext) -> Result<(), String> {
+            ctx.chaos()
+                .inject_fault(ctx.client.clone(), &request())
+                .await?;
+            panic!("after fault injection");
+        }
+
+        let (address, records) = spawn_lease_server().await;
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            2,
+        );
+        cfg.fixed_namespace = Some("rbtest-chaos-owner".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+        cfg.timeout = Duration::from_millis(100);
+
+        let report = run(
+            vec![
+                case("times_out", &[], testkit_case!(times_out)),
+                case("panics", &[], testkit_case!(panics)),
+            ],
+            cfg,
+        )
+        .await;
+
+        assert_eq!(report.unknown, 2);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.cleanup == CleanupOutcome::Confirmed),
+            "{:?}",
+            report.results
+        );
+        let observed = records.lock().await;
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|record| record.starts_with("fault-inject:"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|record| record.starts_with("fault-clear:"))
+                .count(),
+            2
         );
     }
 

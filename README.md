@@ -126,12 +126,15 @@ server-bounded Linux node pressure runs outside Bun in an owned cgroup and
 cleans up on clear, expiry, graceful shutdown, parent death or restart. The
 service partition now has a root-only, source-cgroup eBPF effect proof and is
 separate from the Raft/gossip quorum operation; unsupported delay and bandwidth
-faults refuse instead of claiming success. The five-scenario chaos catalogue is
-the next Phase 15 block. Workload injection is now opt-in through the
-server-owned `inject_workload_faults` operation, needs explicit operator
-acknowledgement, and records structured audit events attributed to the
-authenticated credential. Reversal keeps the matching role and grant but
-doesn't require a destructive acknowledgement.
+faults refuse instead of claiming success. `relish test --chaos` now runs five
+serial recovery scenarios with fresh destructive-capability evidence, exact
+fault ownership, and panic- and timeout-safe reversal. Missing node-failure,
+node-pressure, policy or three-node prerequisites refuse instead of becoming
+green skips. Workload injection is opt-in through the server-owned
+`inject_workload_faults` operation, needs explicit operator acknowledgement,
+and records structured audit events attributed to the authenticated
+credential. Reversal keeps the matching role and grant but doesn't require a
+destructive acknowledgement. The benchmark harness is the next Phase 15 block.
 
 ## Licence
 
