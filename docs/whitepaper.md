@@ -765,15 +765,20 @@ Process Apps use `exec` instead of `image`; process Jobs use `exec` or `script` 
 Smoker is Reliaburger's built-in chaos engineering system. Because Onion's eBPF programs already intercept every DNS resolution and `connect()` call, and Bun already manages cgroups for every container, fault injection is a natural extension of existing infrastructure. No new binaries, processes, or sidecars.
 
 ```bash
-relish fault delay redis 200ms          # add 200ms latency
-relish fault drop api 10%               # fail 10% of connections
-relish fault dns redis nxdomain         # DNS failure
-relish fault cpu inference 50%          # CPU stress in cgroup
-relish fault kill web-3                 # kill an instance
-relish fault run chaos/scenario.toml    # scripted multi-step scenario
+relish fault delay redis 200ms --acknowledge       # reserved until TC ships
+relish fault drop api 10% --acknowledge            # fail 10% of connections
+relish fault dns redis nxdomain --acknowledge      # DNS failure
+relish fault cpu inference 50% --acknowledge       # CPU stress in cgroup
+relish fault kill web-3 --acknowledge              # kill an instance
+relish fault run chaos/scenario.toml --acknowledge # scripted multi-step scenario
 ```
 
-Safety rails enforce permission requirements, duration limits (default 10 min), no persistence across restarts, and blast radius protection (quorum, replica, and leader guards).
+Safety rails require an authenticated role, the matching server-owned
+`[testing].allowed_operations` grant and explicit acknowledgement. They also
+enforce duration limits (default 10 min), no persistence across restarts and
+blast-radius protection (quorum, replica and leader guards). Admin doesn't
+override a disabled operation, and Bun attributes audit events to the
+authenticated credential rather than a client-supplied name.
 
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|

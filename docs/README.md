@@ -410,19 +410,19 @@ Commands:
 | `secret pubkey [dir]` | Print the cluster's age public key |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
 | `fault delay <target> <delay>` | Reserved contract; currently refused until the TC packet path ships |
-| `fault drop <target> <pct>` | Fail a percentage of connections (ECONNREFUSED) |
-| `fault dns <target> nxdomain` | Return NXDOMAIN for DNS resolution |
-| `fault partition <target> [--from <app>]` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
+| `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
+| `fault dns <target> nxdomain --acknowledge` | Return NXDOMAIN for DNS resolution |
+| `fault partition <target> [--from <app>] --acknowledge` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
 | `fault bandwidth <target> <rate>` | Reserved contract; currently refused until the TC packet path ships |
-| `fault kill <target>` | Kill instances of a service (SIGKILL) |
-| `fault pause <target>` | Freeze instances of a service (SIGSTOP) |
+| `fault kill <target> --acknowledge` | Kill instances of a service (SIGKILL) |
+| `fault pause <target> --acknowledge` | Freeze instances of a service (SIGSTOP) |
 | `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
 | `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
 | `fault node-pressure <node> --cpu 80% --memory 90% --acknowledge` | Consume server-bounded Linux node capacity in an owned cgroup |
 | `fault list` | List all active faults |
 | `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
-| `fault clear <id> --node <node> --acknowledge` | Reverse a node fault on its owning node |
-| `fault scenario <file>` | Run a scripted chaos scenario from a TOML file |
+| `fault clear <id> --node <node>` | Reverse a node fault on its owning node |
+| `fault scenario <file> --acknowledge` | Run a scripted chaos scenario from a TOML file |
 | `dev create` | Create a local dev cluster (Lima VMs with rootless runc) |
 | `dev status` | Show dev cluster status |
 | `dev shell <node>` | Open a shell on a dev cluster node |
@@ -806,6 +806,23 @@ pass, failure, panic or timeout. Container cases use the official BusyBox
 The same immutable reference is accepted by the provisioned runc and Apple
 Container gates; ProcessGrill cases keep using the node's installed Bun.
 
+Workload faults are opt-in too. Injection needs a Deployer-or-higher
+credential, explicit `--acknowledge`, and this server policy:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults"]
+```
+
+An Admin role does not replace the operation grant. Production and unknown
+clusters additionally need the server-owned `allow_protected_mutation = true`
+gate. Bun ignores the request body's audit identity, derives the readable
+fault owner and stable credential principal from authentication, and emits
+machine-readable `fault.injected` and clear events. Reversal needs the same
+role and operation grant, but not destructive acknowledgement or the
+protected-cluster mutation switch.
+
 Node-level faults have a separate privilege boundary. The caller must be an
 Admin, `[testing].allowed_operations` must contain `"alter_node_state"`, and
 the command must include `--acknowledge` and a non-zero duration. `node-drain`
@@ -813,7 +830,7 @@ publishes not-ready evidence so the scheduler moves placements while cluster
 traffic stays live. `node-kill` closes gossip, Raft and reporting traffic;
 `--containers` also kills local workloads. Both reverse on expiry. A manual
 clear needs the owning node because fault IDs are node-local:
-`relish fault clear <id> --node <node> --acknowledge`. Once peers have removed
+`relish fault clear <id> --node <node>`. Once peers have removed
 the failed node from their live directory, point `--endpoint` at that node's
 still-running management API. An ordinary clear never removes node faults.
 
@@ -838,9 +855,11 @@ The CPU limit applies across all cores. Memory is a target for total node
 usage, not an extra percentage, and the helper cgroup has a hard ceiling at the
 requested share of physical memory. Bun kills the helper and removes the
 cgroup on clear, expiry and graceful shutdown; Linux parent-death signalling
-plus a startup sweep cover process death. Pressure is de-escalating, so a
-Deployer may clear it, including through `--node`, without receiving authority
-to reverse drain or kill.
+plus a startup sweep cover process death. Pressure reversal is de-escalating,
+so it does not need acknowledgement or the protected-cluster mutation switch.
+It still needs an Admin credential and the server's `"saturate_capacity"`
+grant, including through `--node`; it never inherits authority to reverse
+drain or kill from an unrelated operation.
 
 Standalone apply streams an `Accepted` SSE event before progress, containing
 the operation ID used by these endpoints. Active records report `accepted`,

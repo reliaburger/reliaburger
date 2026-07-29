@@ -238,8 +238,12 @@ pub enum AgentCommand {
     /// Clear a specific fault by ID.
     ClearFault {
         fault_id: u64,
+        /// Whether the authenticated API caller may reverse a workload fault.
+        allow_workload_fault: bool,
         /// Whether the authenticated API caller may reverse node state.
         allow_node_fault: bool,
+        /// Whether the authenticated API caller may remove node pressure.
+        allow_node_pressure: bool,
         response: oneshot::Sender<Result<String, BunError>>,
     },
     /// Clear all active faults.
@@ -2801,21 +2805,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             AgentCommand::ClearFault {
                 fault_id,
+                allow_workload_fault,
                 allow_node_fault,
+                allow_node_pressure,
                 response,
             } => {
                 let fault_id = crate::smoker::types::FaultId(fault_id);
-                if !allow_node_fault
-                    && self
-                        .fault_registry
-                        .get(fault_id)
-                        .is_some_and(|rule| rule.fault_type.is_node_operation())
-                {
-                    let _ = response.send(Err(BunError::FaultRejected {
-                        reason: "node fault reversal requires alter_node_state authorisation"
-                            .to_string(),
-                    }));
-                    return;
+                if let Some(rule) = self.fault_registry.get(fault_id) {
+                    let denied = if rule.fault_type.is_node_operation() {
+                        (!allow_node_fault).then_some(
+                            "node fault reversal requires alter_node_state authorisation",
+                        )
+                    } else if matches!(
+                        rule.fault_type,
+                        crate::smoker::types::FaultType::NodePressure { .. }
+                    ) {
+                        (!allow_node_pressure).then_some(
+                            "node pressure reversal requires saturate_capacity authorisation",
+                        )
+                    } else {
+                        (!allow_workload_fault).then_some(
+                            "workload fault reversal requires inject_workload_faults authorisation",
+                        )
+                    };
+                    if let Some(reason) = denied {
+                        let _ = response.send(Err(BunError::FaultRejected {
+                            reason: reason.to_string(),
+                        }));
+                        return;
+                    }
                 }
                 let msg = match self.fault_registry.get(fault_id).cloned() {
                     Some(rule) => {
@@ -10028,7 +10046,9 @@ mod tests {
         agent
             .handle_command(AgentCommand::ClearFault {
                 fault_id: rule.id.0,
+                allow_workload_fault: false,
                 allow_node_fault: false,
+                allow_node_pressure: false,
                 response,
             })
             .await;
@@ -10040,7 +10060,9 @@ mod tests {
         agent
             .handle_command(AgentCommand::ClearFault {
                 fault_id: rule.id.0,
+                allow_workload_fault: false,
                 allow_node_fault: true,
+                allow_node_pressure: false,
                 response,
             })
             .await;

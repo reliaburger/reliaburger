@@ -1442,6 +1442,15 @@ convergence and adoption" theme under 12b.6).
     parent-death and startup-sweep cleanup. A privileged cgroup-v2 acceptance
     proves the effect, isolation and restart cleanup. Unsupported platforms
     publish unavailable evidence instead of claiming a green primitive.
+  - [x] Fault authorisation and structured audit: ordinary workload injection
+    requires a Deployer-or-higher credential, the server-owned
+    `inject_workload_faults` grant and explicit acknowledgement. Node/council
+    and pressure paths retain their stricter matching operations. Reversal
+    requires the same role and server grant but never destructive
+    acknowledgement. Bun ignores client-supplied audit identity and emits
+    additive `action`, stable authenticated `principal` and machine-readable
+    `details` fields for every successful inject and clear path. The deprecated
+    council API cannot bypass this boundary.
 
 ### Optional
 

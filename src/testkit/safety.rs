@@ -190,6 +190,29 @@ impl ClusterTestPolicy {
             safety_class: self.safety_class,
         })
     }
+
+    /// Authorise reversal of an already-active destructive operation.
+    ///
+    /// Reversal still needs the operation's role and explicit server grant,
+    /// but never needs acknowledgement or the protected-cluster mutation
+    /// switch. Those gates exist to stop escalation. Requiring them to remove
+    /// an active fault could trap the cluster in the dangerous state.
+    pub fn authorise_reversal(
+        &self,
+        operation: OperationPermission,
+        caller: &OperationAuthorisation<'_>,
+    ) -> Result<AuthorisationDecision, SafetyError> {
+        crate::sesame::token::check_role(caller.role, operation.minimum_role())
+            .map_err(|_| SafetyError::InsufficientRole)?;
+        if !self.allowed_operations.contains(&operation) {
+            return Err(SafetyError::OperationNotAllowed);
+        }
+        Ok(AuthorisationDecision {
+            principal: caller.principal.to_string(),
+            operation,
+            safety_class: self.safety_class,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +262,38 @@ mod tests {
                     &caller(ApiRole::Admin, true)
                 )
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn reversal_needs_the_original_grant_but_not_escalation_consent() {
+        let policy = ClusterTestPolicy {
+            safety_class: ClusterSafetyClass::Production,
+            allowed_operations: BTreeSet::from([OperationPermission::InjectWorkloadFaults]),
+            allow_protected_mutation: false,
+            ..ClusterTestPolicy::default()
+        };
+        assert!(
+            policy
+                .authorise_reversal(
+                    OperationPermission::InjectWorkloadFaults,
+                    &caller(ApiRole::Deployer, false),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            policy.authorise_reversal(
+                OperationPermission::AlterNodeState,
+                &caller(ApiRole::Admin, true),
+            ),
+            Err(SafetyError::OperationNotAllowed)
+        );
+        assert_eq!(
+            policy.authorise_reversal(
+                OperationPermission::InjectWorkloadFaults,
+                &caller(ApiRole::ReadOnly, true),
+            ),
+            Err(SafetyError::InsufficientRole)
         );
     }
 

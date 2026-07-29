@@ -416,7 +416,9 @@ Chaos tests (via Smoker):
 
 Design docs: [chaos-smoker.md](design/chaos-smoker.md), [agent-bun.md](design/agent-bun.md), [security-sesame.md](design/security-sesame.md), [discovery-onion.md](design/discovery-onion.md)
 
-**Milestone:** `relish fault delay redis 200ms` works, process jobs run with full isolation, batch scheduling meets throughput targets. All Phase 8 tests pass, including chaos suite.
+**Milestone:** `relish fault delay redis 200ms --acknowledge` works, process
+jobs run with full isolation, batch scheduling meets throughput targets. All
+Phase 8 tests pass, including chaos suite.
 
 ---
 

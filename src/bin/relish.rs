@@ -178,6 +178,9 @@ enum Command {
     Chaos {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
+        /// Confirm that a partition action is intentional.
+        #[arg(long)]
+        acknowledge: bool,
     },
     /// Inject faults for chaos testing (Smoker).
     Fault {
@@ -929,6 +932,9 @@ enum FaultAction {
         /// Speed multiplier (e.g. 2.0 = double speed).
         #[arg(long, default_value = "1.0")]
         speed: f64,
+        /// Confirm that this scenario may inject its workload faults.
+        #[arg(long)]
+        acknowledge: bool,
     },
 }
 
@@ -1038,7 +1044,10 @@ async fn main() -> ExitCode {
         }
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
-        Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Chaos {
+            ref action,
+            acknowledge,
+        } => commands::chaos(action, acknowledge).await,
         Command::Snapshot { ref action } => match action {
             SnapshotAction::Create {
                 app,
@@ -1221,7 +1230,8 @@ async fn main() -> ExitCode {
                 path,
                 dry_run,
                 speed,
-            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed).await,
+                acknowledge,
+            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed, *acknowledge).await,
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, dry_run).await,
         Command::History {
@@ -1504,6 +1514,7 @@ mod tests {
             "--reason",
             "game-day",
             "--override-safety",
+            "--acknowledge",
         ])
         .unwrap();
         match cli.command {
@@ -1514,6 +1525,7 @@ mod tests {
                 assert_eq!(targeting.node.as_deref(), Some("node-2"));
                 assert_eq!(targeting.reason.as_deref(), Some("game-day"));
                 assert!(targeting.override_safety);
+                assert!(targeting.acknowledge);
             }
             _ => panic!("expected a fault delay command"),
         }

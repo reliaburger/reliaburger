@@ -58,7 +58,17 @@ impl TestHarness {
         // Bind API to ephemeral port
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = api::router(
+        let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+            test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
+                safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    reliaburger::testkit::safety::OperationPermission::InjectWorkloadFaults,
+                ]),
+                ..reliaburger::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..reliaburger::bun::capabilities::StaticCapabilities::default()
+        };
+        let app = api::router_with_upgrade(
             cmd_tx.clone(),
             None,
             None,
@@ -71,8 +81,22 @@ impl TestHarness {
             None,
             None,
             None,
+            None,
             9117,
             Some(event_store),
+            None,
+            None,
+            "default".to_string(),
+            None,
+            900,
+            reliaburger::cluster::ClusterHttp::plaintext(),
+            5050,
+            "http",
+            256 * 1024 * 1024,
+            false,
+            static_capabilities,
+            reliaburger::bun::readiness::ReadinessTracker::new(),
+            None,
         );
         let server_shutdown = shutdown.clone();
 

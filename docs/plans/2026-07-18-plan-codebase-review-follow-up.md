@@ -480,6 +480,12 @@ startup. M8 must add certificate expiry evidence and should not make
 - [x] Separate service-data-plane and council transport partitions; make the
   former prove a real source-cgroup/VIP/port eBPF effect and refuse delay or
   bandwidth until a TC packet path exists.
+- [x] Enforce fault authority at the server: workload faults require
+  `inject_workload_faults` plus acknowledgement, node/council and pressure
+  faults keep their matching Admin operations, and reversal requires the
+  matching grant without a destructive acknowledgement. Attribute structured
+  inject/clear audit events to the authenticated credential rather than
+  client-supplied `$USER`.
 - [x] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
@@ -518,11 +524,14 @@ Both operations require a real Admin credential, the server-owned
 `alter_node_state` grant, an explicit `--acknowledge`, a named target and a
 non-zero TTL. A source node forwards the caller's credential and the target
 repeats the checks. Clearing a node fault has the same boundary:
-`relish fault clear <id> --node <name> --acknowledge`. A general Deployer clear
-leaves node faults intact. Automatic expiry is target-local and always remains
-available; if gossip has already dropped the target from its live routing
-table, manual reversal must address that node's still-live management endpoint
-directly. A three-node acceptance observes a follower leave and rejoin through
+the caller remains Admin and the server keeps the `alter_node_state` grant,
+but a de-escalating `relish fault clear <id> --node <name>` needs neither
+destructive acknowledgement nor the protected-cluster mutation switch. A
+general Deployer clear leaves node faults intact. Automatic expiry is
+target-local and always remains available; if gossip has already dropped the
+target from its live routing table, manual reversal must address that node's
+still-live management endpoint directly. A three-node acceptance observes a
+follower leave and rejoin through
 the real transports, and proves a second voter failure is refused while the
 first remains down. Durable lease ownership for node state is still open and
 the chaos catalogue must not claim it yet.

@@ -740,10 +740,28 @@ async fn autoscaler_scales_up_on_high_metric() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn fault_injection_rejected_when_quorum_at_risk() {
+    let created = reliaburger::sesame::token::create_token(
+        "partition-admin",
+        reliaburger::sesame::types::ApiRole::Admin,
+        reliaburger::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
     let shutdown = CancellationToken::new();
-    let n1 = start_node("r1", 18741, vec![], &shutdown).await;
-    let n2 = start_node("r2", 18745, vec![local(18741)], &shutdown).await;
-    let n3 = start_node("r3", 18749, vec![local(18741)], &shutdown).await;
+    let n1 = start_node_with_auth("r1", 18741, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "r2",
+        18745,
+        vec![local(18741)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth("r3", 18749, vec![local(18741)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     // Wait for a 3-member council so `council_size == 3`.
@@ -786,7 +804,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     // First node-level fault: within the quorum budget, accepted.
     leader
         .client
-        .inject_partition(std::slice::from_ref(&peer), 60)
+        .inject_partition(std::slice::from_ref(&peer), 60, true)
         .await
         .expect("first partition should be within the quorum budget");
 
@@ -794,7 +812,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     // council at risk, so the rail must reject it.
     let rejected = leader
         .client
-        .inject_partition(std::slice::from_ref(&peer), 60)
+        .inject_partition(std::slice::from_ref(&peer), 60, true)
         .await;
     assert!(
         rejected.is_err(),
@@ -835,10 +853,28 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 async fn partition_isolates_a_node_for_real() {
     use reliaburger::mustard::state::NodeState;
 
+    let created = reliaburger::sesame::token::create_token(
+        "partition-admin",
+        reliaburger::sesame::types::ApiRole::Admin,
+        reliaburger::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
     let shutdown = CancellationToken::new();
-    let n1 = start_node("q1", 18641, vec![], &shutdown).await;
-    let n2 = start_node("q2", 18645, vec![local(18641)], &shutdown).await;
-    let n3 = start_node("q3", 18649, vec![local(18641)], &shutdown).await;
+    let n1 = start_node_with_auth("q1", 18641, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "q2",
+        18645,
+        vec![local(18641)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth("q3", 18649, vec![local(18641)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
     // Everyone sees everyone Alive before we cut the wire.
@@ -856,7 +892,7 @@ async fn partition_isolates_a_node_for_real() {
     // agent holds the real blocklist handles; the transport drops traffic
     // both to and from the blocked peers, so detection is symmetric.
     n3.client
-        .inject_partition(&["q1".to_string(), "q2".to_string()], 60)
+        .inject_partition(&["q1".to_string(), "q2".to_string()], 60, true)
         .await
         .expect("partition injection should succeed");
 

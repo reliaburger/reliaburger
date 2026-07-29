@@ -27,9 +27,9 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 | `[cluster] environment` needs adding | Still true — `ClusterSection` (`src/config/node.rs:308`) has no `environment` |
 | Smoker is library-only (review L14/L15) | **Mostly wired.** `apply_fault` has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, eBPF Drop and source-scoped eBPF Partition. Delay and Bandwidth now refuse honestly because no TC packet program is attached. |
 | Graceful-skip is needed for most subsystems | Still the right stance, but **far fewer skips**: ingress, rollups, GitOps, egress, eBPF sync, identity are all wired now |
-| `relish test --chaos` scenarios use `node-kill` | **`node-kill`/`node-drain` always return an error** (`agent.rs:3299`). Three of the five scenarios cannot work until this is implemented — see §2 |
-| Faults apply cluster-wide | **Node-local only.** The CLI POSTs to one agent; `target_node` is never used to route (`src/relish/fault.rs:512`) |
-| `deployer` is the right role for faults | Design says **admin or an explicit `fault-injection` grant** (`chaos-smoker.md:88,1429`). Today plain `Deployer` (`src/bun/authz.rs:152`) |
+| `relish test --chaos` scenarios use `node-kill` | **At review time:** `node-kill`/`node-drain` always returned an error. **Now:** step 11 implements and proves both; the catalogue remains step 14. |
+| Faults apply cluster-wide | **At review time:** `target_node` was dead. **Now:** step 13b authenticates and authorises target-node distribution. |
+| `deployer` is the right role for faults | **At review time:** plain Deployer could inject. **Now:** step 13 requires Deployer plus `inject_workload_faults` and acknowledgement. |
 
 **Still true and load-bearing:** `main() -> ExitCode` (`relish.rs:833`) but every dispatched command returns `Result<(), RelishError>`, so `wtf`'s 0/1/2 contract still needs a richer return; `insta` is a dev-dependency with existing snapshot dirs; `src/relish/fault.rs` has the duration/percentage/bandwidth parsers to reuse (`:16,:61,:81`); there is no `src/testkit/`, no `/v1/capabilities`, no `/v1/trace`, no `src/firewall/evaluate.rs`.
 
@@ -105,9 +105,13 @@ From `docs/design/chaos-smoker.md`, `docs/design/cli-relish.md:760-782`, `docs/w
 ### 3.4 Design features absent
 
 - **`[smoker]` config section** (`default_duration`, `max_duration`) — doesn't exist. Default 10m is hardcoded CLI-side (`fault.rs:13`); the only ceiling is a hardcoded 24h clamp (`types.rs:302`), not the designed 1h with a rejection message.
-- **`fault-injection` permission** — absent. `Deployer` can inject; the design explicitly forbids it.
-- **Leader-mediated distribution** — the design routes faults leader → target nodes via the reporting tree (`chaos-smoker.md:84-91`). Implementation is node-local.
-- **Audit event `fault.injected`** — absent. `injected_by` comes from client-side `$USER` (`fault.rs:139`), i.e. spoofable; `source_ip` isn't even a field.
+- **Fault operation permission** — absent at review time; step 13 shipped the
+  typed `inject_workload_faults` server grant plus acknowledgement.
+- **Leader-mediated distribution** — absent at review time; step 13b shipped
+  authenticated target-node routing with target-side authorisation.
+- **Audit event `fault.injected`** — absent at review time; step 13 now ignores
+  client identity and emits structured authenticated inject/clear events.
+  Source address remains absent.
 - **Unix-socket `relish fault clear` fallback** for a degraded API — absent.
 - Startup sweep of stale kernel fault maps — absent (relies on the in-kernel `expires_ns`).
 
@@ -120,13 +124,17 @@ From `docs/design/chaos-smoker.md`, `docs/design/cli-relish.md:760-782`, `docs/w
 ## 4. Decisions — all four settled (26 July 2026)
 
 **Resolved: option (a) on every one.** The recommendations below are now the
-plan of record; step 13b is in scope, and `--node` routing, the
-`fault-injection` permission, the `relish chaos` deprecation and
+plan of record; step 13b is in scope, and `--node` routing, the typed
+`inject_workload_faults` operation, the `relish chaos` deprecation and
 transport-quiesce node kills all get built.
 
 **D1. Cluster-wide fault routing.** Faults are node-local. Options: (a) **implement `--node` routing via the leader's reporting tree, as designed** — makes `node-kill` meaningful and is what "inject into the live cluster" implies; (b) keep node-local and document the deviation. (a) is more work (~1 extra step) but (b) leaves `target_node` dead and the chaos suite weak.
 
-**D2. Fault authorisation.** Design says admin-or-`fault-injection`-grant; today any Deployer. Options: (a) **add the `fault-injection` permission and require it**, a small security fix in the same family as C3; (b) leave as Deployer and amend the design doc. (a).
+**D2. Fault authorisation.** Workload injection requires both the Deployer
+role and the server-owned `inject_workload_faults` operation grant. Admin is a
+role, not an implicit override of a server which disabled faults. Injection
+also needs explicit acknowledgement. Node/council and pressure faults keep
+their stricter Admin plus `alter_node_state`/`saturate_capacity` boundaries.
 
 **D3. `relish chaos` fate.** It's undesigned, stringly-typed, and overlaps `fault`. Options: (a) **promote `council-partition`/`worker-isolation` to typed subcommands under `relish fault` and keep `relish chaos` as a deprecated alias for one release**; (b) delete it; (c) leave it. (a) — it's used by existing chaos tests.
 
@@ -279,8 +287,20 @@ exercise restart behaviour.
 Book: §"The last fault that lied".
 
 **13/20 — Fault authorisation and audit (D2)**
-Tests: `deployer_cannot_inject_without_the_grant`; `admin_can_inject`; `fault_injection_permission_grants_a_deployer`; `injected_faults_emit_an_audit_event_with_the_authenticated_principal`.
-Implement: `fault-injection` permission; `require_fault_injection` in the inject/clear handlers; `ROUTE_MATRIX` updated; `injected_by` taken from the **authenticated principal server-side**, not the client's `$USER`; emit `fault.injected` into the event store with principal, target, type, duration.
+Tests: shipped. API tests prove a Deployer cannot inject without the grant,
+the grant cannot replace acknowledgement, an acknowledging Deployer can
+inject, clear needs the grant but not destructive acknowledgement, and the
+deprecated council route cannot bypass Admin or acknowledgement. Structured
+event tests pin authenticated attribution.
+Implement: shipped. `InjectWorkloadFaults` is a typed server-owned operation;
+ordinary inject/clear handlers enforce it, and node/council/pressure reversal
+uses its matching operation. Relish no longer supplies `$USER` as authority.
+Bun replaces the compatibility field from the authenticated token name and
+records the stable credential principal in additive `action`, `principal` and
+`details` event fields. `fault.injected` includes target, type and duration;
+all clear paths emit a stable audit action. Reversal still needs the matching
+grant and role, but deliberately needs neither destructive acknowledgement
+nor the protected-cluster mutation switch.
 Book: §"Who may break production".
 
 *(If D1 = implement routing, insert **13b/20 — leader-mediated fault distribution**: `--node` routes through the leader's reporting tree; `target_node` stops being dead.)*
@@ -856,14 +876,14 @@ After step 14 and again after step 20, on macOS with Lima:
 relish dev create --nodes 3
 relish test --output json | tee /tmp/test-report.json   # 0 failed; skips carry reasons
 relish test --filter scheduling
-relish fault kill web --count 1 --reason "runbook"      # new flags land in `fault list`
+relish fault kill web --count 1 --reason "runbook" --acknowledge
 relish fault clear web                                  # clear-by-app
-relish fault node-kill <node> --duration 60s            # real now
+relish fault node-kill <node> --duration 60s --acknowledge
 relish test --chaos --yes                               # 5 scenarios; `fault list` empty after
 relish bench --quick --output json > /tmp/base.json
 relish bench --quick --compare /tmp/base.json           # ~0 regressions against itself
 relish wtf                                              # exit 0 healthy
-relish fault kill <app> --count 1 && relish wtf         # finding appears; exit non-zero
+relish fault kill <app> --count 1 --acknowledge && relish wtf
 relish trace <appA> --to <appB>
 relish dev destroy
 ```
@@ -887,7 +907,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 11/20 node-level faults
 - [x] 11b/20 node-scoped pressure prerequisite
 - [x] 12/20 partition honesty + memory-oom decision
-- [ ] 13/20 fault authorisation + audit
+- [x] 13/20 fault authorisation + audit
 - [x] 13b/20 authenticated target-node distribution
 - [ ] 14/20 chaos suite
 - [ ] 15/20 bench schema + comparison
@@ -912,4 +932,7 @@ New for this revision:
     Delay/Bandwidth had the same problem behind a loaded eBPF handle. Any new fault arm
     either works and has effect evidence, or returns an error saying why. Never
     `Ok(())` with no effect.
-15. **`injected_by` is currently spoofable.** Until step 13, treat it as a hint, not an audit record.
+15. **Audit identity and display names are different contracts.** The
+    authenticated token name may remain readable in `FaultSummary.injected_by`,
+    but audit events use the stable `principal_id` (`token:<hash>`). Never copy
+    identity from a request body or `$USER`.

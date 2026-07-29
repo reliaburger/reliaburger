@@ -130,6 +130,9 @@ impl TestScenario {
                     app: Some("web".into()),
                     namespace: Some("default".into()),
                     node: None,
+                    action: None,
+                    principal: None,
+                    details: std::collections::BTreeMap::new(),
                     message: format!("fixture event {}", index + 1),
                 });
             }

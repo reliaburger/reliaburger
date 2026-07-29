@@ -758,30 +758,30 @@ relish upgrade rollback <version>   # Roll back to specific version
 relish upgrade resume               # Resume a paused upgrade
 
 # Fault injection (Smoker)
-relish fault delay <app> <duration>         # Reserved; rejected until TC ships
-relish fault drop <app> <percent>           # Fail percentage of connections
-relish fault partition <app> --from <app>   # Block traffic between apps
-relish fault dns <app> nxdomain             # DNS resolution failure
-relish fault bandwidth <app> <rate>         # Reserved; rejected until TC ships
-relish fault cpu <app> <percent>            # Consume CPU allocation
-relish fault memory <app> <percent>         # Push memory toward memory.high
-relish fault disk-io <app> <rate>           # Throttle disk I/O
-relish fault kill <instance>                # Kill specific instance
-relish fault kill <app> --count <n>         # Kill N random instances
-relish fault pause <app>                    # SIGSTOP all instances
-relish fault pause <app> --instance <id>    # SIGSTOP one instance
+relish fault delay <app> <duration> --acknowledge       # Reserved; rejected until TC ships
+relish fault drop <app> <percent> --acknowledge         # Fail percentage of connections
+relish fault partition <app> --from <app> --acknowledge # Block traffic between apps
+relish fault dns <app> nxdomain --acknowledge           # DNS resolution failure
+relish fault bandwidth <app> <rate> --acknowledge       # Reserved; rejected until TC ships
+relish fault cpu <app> <percent> --acknowledge          # Consume CPU allocation
+relish fault memory <app> <percent> --acknowledge       # Push memory toward memory.high
+relish fault disk-io <app> <rate> --acknowledge         # Throttle disk I/O
+relish fault kill <instance> --acknowledge              # Kill specific instance
+relish fault kill <app> --count <n> --acknowledge       # Kill N random instances
+relish fault pause <app> --acknowledge                  # SIGSTOP all instances
+relish fault pause <app> --instance <id> --acknowledge  # SIGSTOP one instance
 relish fault pause <app> --resume           # SIGCONT (unfreeze)
 relish fault node-drain <node> --acknowledge # Withdraw from scheduling, keep transports
 relish fault node-kill <node> --acknowledge  # Quiesce gossip, Raft and reporting
 relish fault node-kill <node> --duration <d> --acknowledge # Auto-recover after duration
 relish fault node-pressure <node> --cpu 80% --memory 90% --acknowledge
-relish fault run <file>                     # Run scripted chaos scenario
+relish fault run <file> --acknowledge       # Run scripted chaos scenario
 relish fault run <file> --dry-run           # Preview scenario timing
-relish fault run <file> --speed <multiplier> # Run at adjusted speed
+relish fault run <file> --speed <multiplier> --acknowledge # Run at adjusted speed
 relish fault list                           # Show all active faults
 relish fault clear                          # Remove all workload faults
 relish fault clear <app>                    # Remove faults targeting app
-relish fault clear <id> --node <node> --acknowledge # Reverse a node fault
+relish fault clear <id> --node <node>       # Reverse a node fault
 
 # Testing
 relish test                                 # Run full integration test suite
@@ -1245,6 +1245,16 @@ CPU/memory ceilings. The helper runs in an owned cgroup outside Bun and only
 one may run per node. Rootless, Apple and missing-controller cases remain
 unavailable rather than green skips. Cascading failure remains a catalogue
 scenario, not a primitive.
+
+Ordinary workload faults use a separate gate. The caller needs at least the
+Deployer role, `[testing].allowed_operations` must contain
+`"inject_workload_faults"`, and every injection command or non-dry-run scenario
+needs `--acknowledge`. Admin doesn't override a disabled server operation.
+Clearing a workload fault still needs that role and grant, but no destructive
+acknowledgement or protected-cluster mutation switch. Bun derives audit
+identity from the bearer token, ignores the client body's compatibility value,
+and emits stable `fault.injected`/clear actions with credential principal,
+target, type and duration.
 
 **`relish bench`**
 

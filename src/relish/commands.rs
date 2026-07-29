@@ -572,11 +572,11 @@ async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(
 }
 
 /// Run a chaos testing scenario or action.
-pub async fn chaos(action: &str) -> Result<(), RelishError> {
+pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     match action {
-        "council-partition" => super::chaos::council_partition(&client).await,
-        "worker-isolation" => super::chaos::worker_isolation(&client).await,
+        "council-partition" => super::chaos::council_partition(&client, acknowledged).await,
+        "worker-isolation" => super::chaos::worker_isolation(&client, acknowledged).await,
         "status" => super::chaos::status(&client).await,
         "heal" => super::chaos::heal(&client).await,
         other => {

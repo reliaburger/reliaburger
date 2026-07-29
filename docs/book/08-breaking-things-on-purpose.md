@@ -9,7 +9,8 @@ Most chaos engineering tools are separate systems. Chaos Mesh needs CRDs, an ope
 Smoker takes a different approach. It's built into Reliaburger. No extra
 binaries, no sidecars, no CRDs. When no connect-time fault is active, the
 loaded eBPF hook does one empty hash-map lookup and continues. When you want to
-break a connection, it's one command: `relish fault drop redis 100%`.
+break a connection, it's one command:
+`relish fault drop redis 100% --acknowledge`.
 
 ## Safety first
 
@@ -40,7 +41,9 @@ Four variants. The `match` in `evaluate_safety` handles every one. The compiler 
 
 **Quorum protection** is the hard limit. In a 5-member council, you can fault at most 2 members — `(5 - 1) / 2 = 2`. A third would break Raft quorum, and the cluster would stop accepting writes. This rail cannot be overridden. No `--force`, no `--yes-i-really-mean-it`. If you need to test what happens when quorum breaks, you use the in-memory test infrastructure, not production.
 
-**Replica minimum** prevents you from killing all instances of a service. `relish fault kill web --count 0` (kill all) is rejected if it would leave zero surviving replicas. At least one must survive.
+**Replica minimum** prevents you from killing all instances of a service.
+`relish fault kill web --count 0 --acknowledge` (kill all) is rejected if it
+would leave zero surviving replicas. At least one must survive.
 
 **Leader protection** blocks faults targeting the cluster leader unless you explicitly pass `--include-leader`. This is overridable because sometimes you *want* to test leader failover — but you should know you're doing it.
 
@@ -74,7 +77,11 @@ The registry is wrapped in `Arc<tokio::sync::Mutex<FaultRegistry>>` because the 
 
 ## Process faults: the easy ones
 
-The simplest faults are process signals. `relish fault kill web-3` sends SIGKILL to the container's main process. `relish fault pause web` sends SIGSTOP, which freezes the process. Health checks fail after the configured timeout, triggering the restart logic.
+The simplest faults are process signals.
+`relish fault kill web-3 --acknowledge` sends SIGKILL to the container's main
+process. `relish fault pause web --acknowledge` sends SIGSTOP, which freezes
+the process. Health checks fail after the configured timeout, triggering the
+restart logic.
 
 A pause used to be a trap. SIGSTOP froze the process, but nothing ever un-froze it — expiry deleted the registry entry and left the workload wedged. You had to remember to send a separate `--resume` (SIGCONT) fault by hand. That's exactly the kind of "cleanup that doesn't clean up" a chaos tool must not have. Now a pause records the PIDs it froze, and when the fault clears or expires the agent SIGCONTs them automatically. The manual resume still exists, but you no longer *need* it: the process comes back on its own when the fault's time is up.
 
@@ -304,7 +311,7 @@ duration = "3m"
 The executor builds a timeline, sorts by activation time, and runs each step at the right moment. A speed multiplier lets you run scenarios faster for CI:
 
 ```bash
-relish fault scenario payment-cascade.toml --speed 10.0
+relish fault scenario payment-cascade.toml --speed 10.0 --acknowledge
 ```
 
 Dry-run mode prints the timeline without executing:
@@ -383,7 +390,14 @@ The safety context had the subtlest gap. It was built "every time a fault arrive
 
 Last, a partial failure. A resource fault writes a cgroup limit to each replica in turn; if the third write failed, the caller dropped the fault from the registry — discarding the reversal state for the two replicas already throttled, which stayed throttled forever. The apply loop now rolls back the replicas it already changed before returning the error, so a fault that can't be applied to all of its targets is applied to none of them.
 
-One gap we've left deliberately, with its edges marked. The service-to-service `Partition` fault (`relish fault partition web --from api`) is an eBPF connect-map entry, like delay and drop — and on a node without the data path its apply arm is still an accepted no-op rather than an honest rejection. The reason is a test: the quorum-rail acceptance suite injects a `Partition` precisely to exercise the safety context on a cluster built without eBPF, and tightening the arm to reject would break that path. Folding `Partition` in with the other eBPF faults, and moving that test onto an eBPF-loaded node, is a Phase 15 job — flagged in the code so it isn't mistaken for finished.
+Phase 15 closed one gap we had left deliberately. A service-to-service
+`Partition` fault
+(`relish fault partition web --from api --acknowledge`) now refuses unless Bun
+has loaded the eBPF connect path. Bun resolves the source app's live cgroup ids
+itself, writes one exact source/VIP/port key per cgroup, owns those keys for
+reversal and rolls back a partial write. The old quorum test moved onto the
+separate `CouncilPartition` transport operation, so an eBPF-free cluster no
+longer needs a pretend service partition to test Raft safety.
 
 ## Process workloads
 
@@ -661,7 +675,14 @@ No prefix means the build can push anywhere — fine for shared infrastructure i
 
 Every chapter is supposed to end with what was tricky, what clicked, and what we'd do differently. This chapter had more of those moments than most.
 
-**Safety rails must be non-overridable.** We initially considered making all four rails overridable with `--force`. Then we thought about what happens when someone runs `relish fault kill web --count 0 --force` at 3am and takes down every replica of the payments service. Quorum protection and replica minimum are now hard limits. No flag, no escape hatch, no "but I really need to". If you want to test total failure, use the in-memory test harness where there's nothing real to break.
+**Safety rails must be non-overridable.** We initially considered making all
+four rails overridable with `--force`. Then we thought about what happens when
+someone runs
+`relish fault kill web --count 0 --override-safety --acknowledge` at 3am and
+takes down every replica of the payments service. Quorum protection and
+replica minimum are now hard limits. No flag, no escape hatch, no "but I
+really need to". If you want to test total failure, use the in-memory test
+harness where there's nothing real to break.
 
 **`#[repr(C)]` alignment is invisible until it isn't.** We wrote the BPF map structs, ran the size assertions, and three of them failed. The issue: a `u8` field followed by a `u64` field gets 7 bytes of implicit padding that the C compiler inserts for alignment. The Rust compiler does the same thing with `#[repr(C)]`, but if you don't add explicit `_pad` fields, the size assertion catches the mismatch. We reorganised the structs to pack small fields together (action + probability as two adjacent `u8`s, followed by `_pad: [u8; 6]`, then the `u64`s). The size assertion pattern — test it on every platform, catch it before any BPF code runs — saved us from a class of bugs that would have been hellish to debug at runtime.
 

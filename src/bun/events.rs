@@ -1,6 +1,6 @@
 //! Bounded, in-memory cluster events for the Relish TUI.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -25,6 +25,39 @@ pub struct ClusterEvent {
     pub namespace: Option<String>,
     /// Related node, when applicable.
     pub node: Option<String>,
+    /// Stable audit action, for example `fault.injected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Authenticated principal responsible for an audited action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Stable action-specific facts for machine consumers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub details: BTreeMap<String, String>,
+    /// Human-readable description.
+    pub message: String,
+}
+
+/// Named input for a structured, authenticated audit event.
+pub struct AuditEvent {
+    /// Unix timestamp in seconds.
+    pub timestamp: u64,
+    /// Event category.
+    pub kind: EventKind,
+    /// Event importance.
+    pub severity: EventSeverity,
+    /// Stable machine-readable action.
+    pub action: String,
+    /// Stable authenticated credential principal.
+    pub principal: String,
+    /// Related app, when applicable.
+    pub app: Option<String>,
+    /// Related namespace, when applicable.
+    pub namespace: Option<String>,
+    /// Related node, when applicable.
+    pub node: Option<String>,
+    /// Stable action-specific facts.
+    pub details: BTreeMap<String, String>,
     /// Human-readable description.
     pub message: String,
 }
@@ -109,7 +142,35 @@ impl EventStore {
             app,
             namespace,
             node,
+            action: None,
+            principal: None,
+            details: BTreeMap::new(),
             message,
+        };
+        if self.buffer.len() == EVENT_BUFFER_CAP {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(event.clone());
+        let _ = self.live.send(event);
+        sequence
+    }
+
+    /// Record a machine-readable audit event with authenticated attribution.
+    pub fn record_audit(&mut self, audit: AuditEvent) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let event = ClusterEvent {
+            sequence,
+            timestamp: audit.timestamp,
+            kind: audit.kind,
+            severity: audit.severity,
+            app: audit.app,
+            namespace: audit.namespace,
+            node: audit.node,
+            action: Some(audit.action),
+            principal: Some(audit.principal),
+            details: audit.details,
+            message: audit.message,
         };
         if self.buffer.len() == EVENT_BUFFER_CAP {
             self.buffer.pop_front();

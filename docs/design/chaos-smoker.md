@@ -30,24 +30,24 @@ Fault injection is exposed through the `relish fault` CLI subcommand. Every faul
 
 ```bash
 # Network faults
-relish fault delay redis 200ms              # reserved: rejected until TC ships
-relish fault drop api 10%
-relish fault partition web --from payment-service
-relish fault dns redis nxdomain
-relish fault bandwidth api 1mbps            # reserved: rejected until TC ships
+relish fault delay redis 200ms --acknowledge              # reserved: rejected until TC ships
+relish fault drop api 10% --acknowledge
+relish fault partition web --from payment-service --acknowledge
+relish fault dns redis nxdomain --acknowledge
+relish fault bandwidth api 1mbps --acknowledge            # reserved: rejected until TC ships
 
 # Resource faults
-relish fault cpu inference 50%
-relish fault memory redis 90%
-relish fault disk-io web 10mbps
+relish fault cpu inference 50% --acknowledge
+relish fault memory redis 90% --acknowledge
+relish fault disk-io web 10mbps --acknowledge
 
 # Process faults
-relish fault kill web-3
-relish fault pause payment-service
+relish fault kill web-3 --acknowledge
+relish fault pause payment-service --acknowledge
 
 # Node-level faults
-relish fault node-drain node-05
-relish fault node-kill node-05
+relish fault node-drain node-05 --acknowledge
+relish fault node-kill node-05 --acknowledge
 relish fault node-pressure node-05 --cpu 80% --memory 90% --acknowledge
 
 # Management
@@ -62,7 +62,8 @@ Every fault accepts common options:
 relish fault drop redis 10% \
   --duration 5m \
   --instance redis-1 \
-  --node node-03
+  --node node-03 \
+  --acknowledge
 ```
 
 If `--duration` is omitted, the fault defaults to 10 minutes and prints a warning. Faults never persist across Bun restarts.
@@ -103,10 +104,16 @@ Bun is the userspace agent that manages containers on each node. Smoker uses Bun
 
 All fault injection requests flow through the cluster API on the leader node:
 
-- **Permission checks.** The leader validates that the requesting user has the `admin` role or an explicit `fault-injection` Permission grant.
+- **Permission checks.** Bun combines the authenticated role with a typed
+  server-owned operation grant. Workload faults use Deployer plus
+  `inject_workload_faults`; node/council faults use Admin plus
+  `alter_node_state`; node pressure uses Admin plus `saturate_capacity`.
+  Injection also needs explicit acknowledgement.
 - **Safety rail enforcement.** The leader evaluates blast radius protection rules (quorum, replica, leader guards) before approving a fault.
 - **Distribution.** The leader instructs target node(s) via the reporting tree to activate the fault.
-- **Audit logging.** Every fault injection is logged as a cluster event with full attribution (who, what, when, source IP).
+- **Audit logging.** Every successful injection and reversal is logged as a
+  structured cluster event with the authenticated credential principal,
+  action, target, type and duration. Source address is not yet an event field.
 
 ---
 
@@ -166,7 +173,7 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 +---------------------------------------------------------------+
 |  Userspace (Bun agent)                                        |
 |                                                               |
-|  relish fault delay redis 200ms                               |
+|  relish fault delay redis 200ms --acknowledge                 |
 |    -> API call to leader                                      |
 |    -> leader validates (permissions, safety rails)            |
 |    -> leader instructs target node(s) via reporting tree      |
@@ -196,7 +203,7 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 ### 3.3 Request Flow
 
 ```
-relish fault delay redis 200ms --duration 5m
+relish fault delay redis 200ms --duration 5m --acknowledge
   |
   v
 Relish CLI -> Unix socket or cluster API
@@ -1043,7 +1050,9 @@ fn process_fault(
 }
 ```
 
-For `relish fault kill web --count 2`, Bun selects `count` instances randomly from all healthy instances of the service and sends SIGKILL to each.
+For `relish fault kill web --count 2 --acknowledge`, Bun selects `count`
+instances randomly from all healthy instances of the service and sends SIGKILL
+to each.
 
 ### 5.4 Node-Level Faults
 
@@ -1420,27 +1429,54 @@ if (val->probability > 100 || val->action > FAULT_ACTION_MAX) {
 
 ### 8.1 Permission Model
 
-Fault injection requires the `admin` role or an explicit `fault-injection` Permission grant. The default `deployer` role cannot inject faults. All fault injections are logged as events with full attribution:
+Workload fault injection requires two independent server-side decisions: the
+credential has at least the `deployer` role, and `[testing].allowed_operations`
+contains `inject_workload_faults`. The request must also carry explicit
+acknowledgement. An Admin role doesn't override a missing operation grant.
+Council/node faults instead require Admin plus `alter_node_state`; node
+pressure requires Admin plus `saturate_capacity`.
 
-```
-Event: fault.injected
-  who:    alice@myorg
-  what:   delay redis 200ms --duration 5m
-  when:   2026-02-16T14:32:00Z
-  from:   10.0.1.42
-  node:   node-03
+Every successful injection and reversal records a structured event:
+
+```json
+{
+  "kind": "fault",
+  "severity": "warning",
+  "action": "fault.injected",
+  "principal": "token:4f5c…",
+  "app": "redis",
+  "node": "node-03",
+  "details": {
+    "fault_id": "7",
+    "fault_type": "DnsNxdomain",
+    "duration_seconds": "300"
+  }
+}
 ```
 
 Permission evaluation flow:
 
 ```
-relish fault delay redis 200ms
-  -> Relish CLI sends request with user identity (from auth token)
+relish fault dns redis nxdomain --acknowledge
+  -> Relish sends its bearer token; the request body carries no audit identity
   -> Leader receives request
-  -> Leader checks: does user have 'admin' role OR 'fault-injection' permission?
+  -> Bun authenticates the token and derives the stable credential principal
+  -> Bun checks: role >= Deployer, operation grant, protected-cluster policy,
+     and explicit acknowledgement
   -> If no: reject with 403 Forbidden
   -> If yes: proceed to safety rail evaluation
 ```
+
+Reversal is de-escalating. It still requires the role and operation which owns
+that class of fault, but it deliberately doesn't require destructive
+acknowledgement or `allow_protected_mutation`. Removing an active fault must
+remain possible after policy is tightened. The deprecated `/v1/chaos` council
+route applies the same Admin/operation boundary and cannot bypass this model.
+
+`FaultSummary.injected_by` is a human-readable authenticated token name for
+compatibility. It is not the audit key. The event's `principal` is the stable
+authenticated credential id, and Bun never accepts either value from `$USER`
+or a client-supplied JSON field.
 
 ### 8.2 Blast Radius Protection
 
@@ -1465,7 +1501,8 @@ Fault rules exist only in BPF maps (kernel memory) and Bun's in-process state. T
 `relish fault clear` is designed to always work, even if the cluster API is degraded. It is processed locally by the Bun agent via a Unix socket. This socket:
 
 - Is **not** mounted into any workload's namespace. Containers cannot invoke it.
-- Is only accessible from the host filesystem or via the cluster API (which requires `admin` or `fault-injection` permission).
+- Is only accessible from the host filesystem or via the cluster API (which
+  enforces the same role plus typed operation grant).
 - Uses standard Unix file permissions (owned by root, mode 0600 or group-readable for the Bun group).
 
 This ensures that even during a fault injection gone wrong, an operator with host access can always clear all faults.
@@ -1631,7 +1668,11 @@ Netflix pioneered chaos engineering with [Chaos Monkey](https://netflix.github.i
 - **Built-in, not bolted-on.** Smoker is part of the orchestrator binary. No CRDs, no operators, no DaemonSets, no sidecars. Fault injection is a natural extension of the eBPF programs and cgroup controls already in use.
 - **Automatic safety rails.** Quorum protection, replica minimums, and leader guarding are enforced by default. Other systems require manual annotation or configuration to prevent dangerous faults.
 - **No persistence.** BPF maps and in-process state only. No CRDs to orphan, no iptables rules to leak, no config files to corrupt. A restart always produces a clean state.
-- **Imperative CLI, not declarative CRDs.** `relish fault delay redis 200ms` is simpler than writing a YAML manifest, applying it, waiting for reconciliation, and then deleting it to clean up. For repeatable tests, TOML scenario files provide declarative scripting without the reconciliation complexity.
+- **Imperative CLI, not declarative CRDs.**
+  `relish fault delay redis 200ms --acknowledge` is simpler than writing a YAML
+  manifest, applying it, waiting for reconciliation, and then deleting it to
+  clean up. For repeatable tests, TOML scenario files provide declarative
+  scripting without the reconciliation complexity.
 
 ---
 

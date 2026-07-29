@@ -127,7 +127,11 @@ cleans up on clear, expiry, graceful shutdown, parent death or restart. The
 service partition now has a root-only, source-cgroup eBPF effect proof and is
 separate from the Raft/gossip quorum operation; unsupported delay and bandwidth
 faults refuse instead of claiming success. The five-scenario chaos catalogue is
-the next Phase 15 block.
+the next Phase 15 block. Workload injection is now opt-in through the
+server-owned `inject_workload_faults` operation, needs explicit operator
+acknowledgement, and records structured audit events attributed to the
+authenticated credential. Reversal keeps the matching role and grant but
+doesn't require a destructive acknowledgement.
 
 ## Licence
 

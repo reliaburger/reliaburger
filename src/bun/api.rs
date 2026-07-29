@@ -3004,6 +3004,8 @@ async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinReques
 struct ChaosPartitionRequest {
     peers: Vec<String>,
     duration_secs: u64,
+    #[serde(default)]
+    acknowledged: bool,
 }
 
 /// Inject a network partition.
@@ -3013,12 +3015,27 @@ async fn chaos_partition_handler(
     Json(body): Json<ChaosPartitionRequest>,
 ) -> Response {
     // AUTH4: fault injection is an operator action, not a node-to-node one.
-    if let Err(resp) = crate::sesame::auth::authorize_user(
-        auth.as_deref(),
-        crate::sesame::types::ApiRole::Deployer,
-    ) {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
         return resp;
     }
+    let (principal, role) = auth
+        .as_deref()
+        .map(|auth| (auth.principal_id.as_str(), auth.role))
+        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
+    if let Err(error) = state.static_capabilities.test_policy.authorise(
+        crate::testkit::safety::OperationPermission::AlterNodeState,
+        &crate::testkit::safety::OperationAuthorisation {
+            principal,
+            role,
+            acknowledged: body.acknowledged,
+        },
+    ) {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+    }
+    let audit_peers = body.peers.clone();
+    let audit_duration_seconds = body.duration_secs;
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -3038,7 +3055,29 @@ async fn chaos_partition_handler(
     }
 
     match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Ok(msg)) => {
+            record_fault_audit(
+                &state,
+                FaultAudit {
+                    action: "fault.injected",
+                    principal,
+                    severity: crate::bun::events::EventSeverity::Warning,
+                    app: None,
+                    node: None,
+                    details: std::collections::BTreeMap::from([
+                        ("fault_type".to_string(), "CouncilPartition".to_string()),
+                        (
+                            "duration_seconds".to_string(),
+                            audit_duration_seconds.to_string(),
+                        ),
+                        ("peers".to_string(), audit_peers.join(",")),
+                    ]),
+                    message: format!("{msg} by principal {principal}"),
+                },
+            )
+            .await;
+            Json(serde_json::json!({ "message": msg })).into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -3057,11 +3096,24 @@ async fn chaos_heal_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Err(resp) = crate::sesame::auth::authorize_user(
-        auth.as_deref(),
-        crate::sesame::types::ApiRole::Deployer,
-    ) {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
         return resp;
+    }
+    let (principal, role) = auth
+        .as_deref()
+        .map(|auth| (auth.principal_id.as_str(), auth.role))
+        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
+    if let Err(error) = state.static_capabilities.test_policy.authorise_reversal(
+        crate::testkit::safety::OperationPermission::AlterNodeState,
+        &crate::testkit::safety::OperationAuthorisation {
+            principal,
+            role,
+            acknowledged: false,
+        },
+    ) {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
     }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
@@ -3078,7 +3130,22 @@ async fn chaos_heal_handler(
     }
 
     match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Ok(msg)) => {
+            record_fault_audit(
+                &state,
+                FaultAudit {
+                    action: "fault.cleared-council-partition",
+                    principal,
+                    severity: crate::bun::events::EventSeverity::Info,
+                    app: None,
+                    node: None,
+                    details: std::collections::BTreeMap::new(),
+                    message: format!("{msg} by principal {principal}"),
+                },
+            )
+            .await;
+            Json(serde_json::json!({ "message": msg })).into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -3379,6 +3446,21 @@ async fn fault_inject_handler(
         {
             return forward_node_fault(&state, target_node, &headers, &request).await;
         }
+    } else {
+        let (principal, role) = auth
+            .as_deref()
+            .map(|auth| (auth.principal_id.as_str(), auth.role))
+            .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
+        if let Err(response) = state.static_capabilities.test_policy.authorise(
+            crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+            &crate::testkit::safety::OperationAuthorisation {
+                principal,
+                role,
+                acknowledged: request.acknowledged,
+            },
+        ) {
+            return (StatusCode::FORBIDDEN, response.to_string()).into_response();
+        }
     }
 
     // The caller controls the JSON body, so it cannot be the audit identity.
@@ -3393,6 +3475,13 @@ async fn fault_inject_handler(
         .unwrap_or_else(|| "local-bootstrap".to_string());
     let audit_target_node = request.target_node.clone();
     let audit_target_service = request.target_service.clone();
+    let audit_target_instance = request.target_instance.clone();
+    let audit_fault_type = serde_json::to_value(&request.fault_type)
+        .ok()
+        .and_then(|value| value.get("type")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| request.fault_type.to_string());
+    let audit_duration_seconds = request.duration.as_secs();
+    let audit_reason = request.reason.clone();
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -3417,18 +3506,38 @@ async fn fault_inject_handler(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                events.write().await.record(
-                    timestamp,
-                    crate::bun::events::EventKind::Fault,
-                    crate::bun::events::EventSeverity::Warning,
-                    (!audit_target_service.is_empty()).then_some(audit_target_service),
-                    None,
-                    audit_target_node,
-                    format!(
-                        "fault {} ({}) injected by principal {}",
-                        summary.id, summary.fault_type, audit_principal
+                let mut details = std::collections::BTreeMap::from([
+                    ("fault_id".to_string(), summary.id.to_string()),
+                    ("fault_type".to_string(), audit_fault_type.clone()),
+                    (
+                        "duration_seconds".to_string(),
+                        audit_duration_seconds.to_string(),
                     ),
-                );
+                ]);
+                if let Some(instance) = audit_target_instance {
+                    details.insert("target_instance".to_string(), instance);
+                }
+                if let Some(reason) = audit_reason {
+                    details.insert("reason".to_string(), reason);
+                }
+                events
+                    .write()
+                    .await
+                    .record_audit(crate::bun::events::AuditEvent {
+                        timestamp,
+                        kind: crate::bun::events::EventKind::Fault,
+                        severity: crate::bun::events::EventSeverity::Warning,
+                        action: "fault.injected".to_string(),
+                        principal: audit_principal.clone(),
+                        app: (!audit_target_service.is_empty()).then_some(audit_target_service),
+                        namespace: None,
+                        node: audit_target_node,
+                        details,
+                        message: format!(
+                            "fault {} ({}) injected for {}s by principal {}",
+                            summary.id, summary.fault_type, audit_duration_seconds, audit_principal
+                        ),
+                    });
             }
             Json(serde_json::json!(summary)).into_response()
         }
@@ -3443,6 +3552,41 @@ async fn fault_inject_handler(
         )
             .into_response(),
     }
+}
+
+struct FaultAudit<'a> {
+    action: &'a str,
+    principal: &'a str,
+    severity: crate::bun::events::EventSeverity,
+    app: Option<String>,
+    node: Option<String>,
+    details: std::collections::BTreeMap<String, String>,
+    message: String,
+}
+
+async fn record_fault_audit(state: &ApiState, audit: FaultAudit<'_>) {
+    let Some(events) = &state.events else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    events
+        .write()
+        .await
+        .record_audit(crate::bun::events::AuditEvent {
+            timestamp,
+            kind: crate::bun::events::EventKind::Fault,
+            severity: audit.severity,
+            action: audit.action.to_string(),
+            principal: audit.principal.to_string(),
+            app: audit.app,
+            namespace: None,
+            node: audit.node,
+            details: audit.details,
+            message: audit.message,
+        });
 }
 
 /// Re-evaluate node safety from API-owned live cluster state before routing.
@@ -3689,27 +3833,43 @@ async fn fault_clear_handler(
     ) {
         return resp;
     }
+    let (principal, role) = auth
+        .as_deref()
+        .map(|auth| (auth.principal_id.as_str(), auth.role))
+        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
+    let caller = crate::testkit::safety::OperationAuthorisation {
+        principal,
+        role,
+        acknowledged: query.acknowledged,
+    };
+    let allow_workload_fault = state
+        .static_capabilities
+        .test_policy
+        .authorise_reversal(
+            crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+            &caller,
+        )
+        .is_ok();
+    let allow_node_pressure = state
+        .static_capabilities
+        .test_policy
+        .authorise_reversal(
+            crate::testkit::safety::OperationPermission::SaturateCapacity,
+            &caller,
+        )
+        .is_ok();
     let allow_node_fault = if let Some(target_node) =
         query.node.as_deref().filter(|target| !target.is_empty())
     {
-        let Some(auth) = auth.as_deref() else {
-            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
-        };
-        // Node routing is not itself authority to alter node state. Preserve
-        // whether the caller passed that stronger boundary and let the owning
-        // agent inspect the actual fault before it removes anything. This
-        // permits a Deployer to de-escalate node pressure while still
-        // protecting drain/kill reversal.
+        // Node routing is not itself authority. Preserve the three independent
+        // reversal grants and let the owning agent inspect the actual fault
+        // before it removes anything.
         let allow_node_fault = state
             .static_capabilities
             .test_policy
-            .authorise(
+            .authorise_reversal(
                 crate::testkit::safety::OperationPermission::AlterNodeState,
-                &crate::testkit::safety::OperationAuthorisation {
-                    principal: &auth.principal_id,
-                    role: auth.role,
-                    acknowledged: query.acknowledged,
-                },
+                &caller,
             )
             .is_ok();
         if state
@@ -3724,12 +3884,29 @@ async fn fault_clear_handler(
     } else {
         false
     };
+    let has_any_reversal_grant = allow_workload_fault || allow_node_fault || allow_node_pressure;
+    if query.node.is_some() && !has_any_reversal_grant {
+        return (
+            StatusCode::FORBIDDEN,
+            "cluster policy does not allow reversal of this fault class",
+        )
+            .into_response();
+    }
+    if query.node.is_none() && !allow_workload_fault {
+        return (
+            StatusCode::FORBIDDEN,
+            "workload fault reversal requires inject_workload_faults authorisation",
+        )
+            .into_response();
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::ClearFault {
             fault_id: id,
+            allow_workload_fault,
             allow_node_fault,
+            allow_node_pressure,
             response: resp_tx,
         })
         .await
@@ -3743,7 +3920,25 @@ async fn fault_clear_handler(
     }
 
     match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Ok(msg)) => {
+            record_fault_audit(
+                &state,
+                FaultAudit {
+                    action: "fault.cleared",
+                    principal,
+                    severity: crate::bun::events::EventSeverity::Info,
+                    app: None,
+                    node: query.node,
+                    details: std::collections::BTreeMap::from([(
+                        "fault_id".to_string(),
+                        id.to_string(),
+                    )]),
+                    message: format!("fault {id} cleared by principal {principal}"),
+                },
+            )
+            .await;
+            Json(serde_json::json!({ "message": msg })).into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -3794,6 +3989,20 @@ async fn fault_clear_all_handler(
     ) {
         return resp;
     }
+    let (principal, role) = auth
+        .as_deref()
+        .map(|auth| (auth.principal_id.as_str(), auth.role))
+        .unwrap_or(("local-bootstrap", crate::sesame::types::ApiRole::Admin));
+    if let Err(error) = state.static_capabilities.test_policy.authorise_reversal(
+        crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+        &crate::testkit::safety::OperationAuthorisation {
+            principal,
+            role,
+            acknowledged: false,
+        },
+    ) {
+        return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     // `?service=NAME` clears only that service's faults; no query clears all.
     let command = match params.get("service") {
@@ -3812,7 +4021,30 @@ async fn fault_clear_all_handler(
     }
 
     match resp_rx.await {
-        Ok(Ok(msg)) => Json(serde_json::json!({ "message": msg })).into_response(),
+        Ok(Ok(msg)) => {
+            let service = params.get("service").cloned();
+            let mut details = std::collections::BTreeMap::new();
+            let action = if let Some(service) = &service {
+                details.insert("target_service".to_string(), service.clone());
+                "fault.cleared-by-service"
+            } else {
+                "fault.cleared-all-workload"
+            };
+            record_fault_audit(
+                &state,
+                FaultAudit {
+                    action,
+                    principal,
+                    severity: crate::bun::events::EventSeverity::Info,
+                    app: service,
+                    node: None,
+                    details,
+                    message: format!("{msg} by principal {principal}"),
+                },
+            )
+            .await;
+            Json(serde_json::json!({ "message": msg })).into_response()
+        }
         Ok(Err(e)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -5619,6 +5851,25 @@ mod tests {
         static_capabilities: crate::bun::capabilities::StaticCapabilities,
         local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
     ) -> (Router, CancellationToken) {
+        setup_with_auth_readiness_leases_and_events(
+            tokens,
+            service_token,
+            readiness,
+            static_capabilities,
+            local_test_leases,
+            None,
+        )
+        .await
+    }
+
+    async fn setup_with_auth_readiness_leases_and_events(
+        tokens: Vec<crate::sesame::types::ApiToken>,
+        service_token: Option<String>,
+        readiness: crate::bun::readiness::ReadinessTracker,
+        static_capabilities: crate::bun::capabilities::StaticCapabilities,
+        local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+        events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
+    ) -> (Router, CancellationToken) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -5644,7 +5895,7 @@ mod tests {
             None,
             None,
             9117,
-            None,
+            events,
             None,
             None,
             "default".to_string(),
@@ -5764,6 +6015,44 @@ mod tests {
         }
     }
 
+    fn workload_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+        crate::bun::capabilities::StaticCapabilities {
+            test_policy: crate::testkit::safety::ClusterTestPolicy {
+                safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+                ]),
+                ..crate::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..crate::bun::capabilities::StaticCapabilities::default()
+        }
+    }
+
+    fn workload_fault_body(acknowledged: bool, injected_by: &str) -> String {
+        serde_json::to_string(&crate::smoker::types::FaultRequest {
+            fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+            target_service: "web".to_string(),
+            target_instance: None,
+            target_node: None,
+            duration: std::time::Duration::from_secs(30),
+            injected_by: injected_by.to_string(),
+            reason: Some("fault authorisation test".to_string()),
+            include_leader: false,
+            override_safety: false,
+            acknowledged,
+        })
+        .unwrap()
+    }
+
+    fn council_partition_body(acknowledged: bool) -> String {
+        serde_json::json!({
+            "peers": ["node-b"],
+            "duration_secs": 30,
+            "acknowledged": acknowledged,
+        })
+        .to_string()
+    }
+
     fn node_kill_body(acknowledged: bool) -> String {
         serde_json::to_string(&crate::smoker::types::FaultRequest {
             fault_type: crate::smoker::types::FaultType::NodeKill {
@@ -5815,6 +6104,56 @@ mod tests {
 
         let status = post_status(app, "/v1/fault", &plaintext, &node_kill_body(true)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn legacy_partition_route_does_not_bypass_the_admin_role() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            post_status(
+                app,
+                "/v1/chaos/partition",
+                &plaintext,
+                &council_partition_body(true),
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn legacy_partition_route_requires_explicit_acknowledgement() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            node_fault_static_capabilities(),
+            None,
+        )
+        .await;
+
+        let (status, body) = post_authenticated(
+            app,
+            "/v1/chaos/partition",
+            &plaintext,
+            &council_partition_body(false),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(String::from_utf8_lossy(&body).contains("acknowledgement"));
         shutdown.cancel();
     }
 
@@ -5916,7 +6255,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deployer_can_route_a_deescalating_clear_without_node_state_authority() {
+    async fn deployer_cannot_route_a_clear_without_any_reversal_grant() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -5930,7 +6269,7 @@ mod tests {
         assert_eq!(
             delete_authenticated(app, "/v1/fault/1?node=node-a&acknowledged=true", &plaintext,)
                 .await,
-            StatusCode::OK
+            StatusCode::FORBIDDEN
         );
         shutdown.cancel();
     }
@@ -5977,20 +6316,15 @@ mod tests {
     #[tokio::test]
     async fn fault_principal_comes_from_authentication_not_the_request_body() {
         let (token, plaintext) = named_user_token("alice", crate::sesame::types::ApiRole::Deployer);
-        let (app, shutdown) = setup_with_auth(vec![token], None).await;
-        let body = serde_json::to_string(&crate::smoker::types::FaultRequest {
-            fault_type: crate::smoker::types::FaultType::DnsNxdomain,
-            target_service: "web".to_string(),
-            target_instance: None,
-            target_node: None,
-            duration: std::time::Duration::from_secs(30),
-            injected_by: "mallory".to_string(),
-            reason: None,
-            include_leader: false,
-            override_safety: false,
-            acknowledged: false,
-        })
-        .unwrap();
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            workload_fault_static_capabilities(),
+            None,
+        )
+        .await;
+        let body = workload_fault_body(true, "mallory");
         assert_eq!(
             post_status(app.clone(), "/v1/fault", &plaintext, &body).await,
             StatusCode::OK
@@ -6001,6 +6335,149 @@ mod tests {
         let faults: Vec<crate::smoker::types::FaultSummary> =
             serde_json::from_slice(&body).unwrap();
         assert_eq!(faults[0].injected_by, "alice");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deployer_cannot_inject_a_workload_fault_without_the_server_grant() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        let status = post_status(
+            app,
+            "/v1/fault",
+            &plaintext,
+            &workload_fault_body(true, "untrusted"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn workload_fault_grant_still_requires_explicit_acknowledgement() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            workload_fault_static_capabilities(),
+            None,
+        )
+        .await;
+        let status = post_status(
+            app,
+            "/v1/fault",
+            &plaintext,
+            &workload_fault_body(false, "untrusted"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn workload_fault_grant_allows_an_acknowledging_deployer() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            workload_fault_static_capabilities(),
+            None,
+        )
+        .await;
+        let status = post_status(
+            app,
+            "/v1/fault",
+            &plaintext,
+            &workload_fault_body(true, "untrusted"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn workload_fault_clear_needs_the_grant_but_not_injection_acknowledgement() {
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth(vec![token], None).await;
+        assert_eq!(
+            delete_authenticated(app, "/v1/fault/999", &plaintext).await,
+            StatusCode::FORBIDDEN
+        );
+        shutdown.cancel();
+
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            workload_fault_static_capabilities(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            delete_authenticated(app, "/v1/fault/999", &plaintext).await,
+            StatusCode::OK
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn injected_and_cleared_faults_emit_authenticated_structured_audit_events() {
+        let (token, plaintext) = named_user_token("alice", crate::sesame::types::ApiRole::Deployer);
+        let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+        let (app, shutdown) = setup_with_auth_readiness_leases_and_events(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            workload_fault_static_capabilities(),
+            None,
+            Some(Arc::clone(&events)),
+        )
+        .await;
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/fault",
+            &plaintext,
+            &workload_fault_body(true, "mallory"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let summary: crate::smoker::types::FaultSummary = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            delete_authenticated(app, &format!("/v1/fault/{}", summary.id), &plaintext).await,
+            StatusCode::OK
+        );
+
+        let recorded = events.read().await.recent(10, None, None);
+        assert_eq!(recorded.len(), 2);
+        let injected = &recorded[0];
+        assert_eq!(injected.action.as_deref(), Some("fault.injected"));
+        assert!(
+            injected
+                .principal
+                .as_deref()
+                .is_some_and(|principal| principal.starts_with("token:")),
+            "audit principal must identify the authenticated credential"
+        );
+        assert_eq!(
+            injected.details.get("fault_type").map(String::as_str),
+            Some("DnsNxdomain")
+        );
+        assert_eq!(
+            injected.details.get("duration_seconds").map(String::as_str),
+            Some("30")
+        );
+        assert!(!injected.message.contains("mallory"));
+        let cleared = &recorded[1];
+        assert_eq!(cleared.action.as_deref(), Some("fault.cleared"));
+        assert_eq!(cleared.principal, injected.principal);
+        assert_eq!(
+            cleared.details.get("fault_id"),
+            Some(&summary.id.to_string())
+        );
         shutdown.cancel();
     }
 

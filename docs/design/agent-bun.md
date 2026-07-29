@@ -1393,7 +1393,7 @@ join = ["10.0.1.5:9443"]
 | **Secret decryption in Bun's memory** | Bun process memory contains plaintext secrets | Secrets are decrypted in memory only, never written to disk. `mlock()` the decryption buffer to prevent swapping. Zero the buffer after injection. |
 | **eBPF programs run in kernel space** | A malicious eBPF program could compromise the kernel | eBPF programs are compiled into the Bun binary (not loaded from external files). The kernel's BPF verifier rejects unsafe programs. |
 | **containerd socket access** | Access to the containerd socket allows arbitrary container operations | The socket is owned by root and the `reliaburger` group. Only Bun has access. It is NOT mounted into any workload's namespace. |
-| **Smoker fault injection** | Faults could disrupt production | `admin` or `fault-injection` role required. Duration limits. No persistence across restarts. Blast radius protection (quorum, replica guards). |
+| **Smoker fault injection** | Faults could disrupt production | Workload faults require Deployer plus the server's `inject_workload_faults` grant and acknowledgement; node/council and pressure faults require Admin plus their matching server grants. Duration limits, no persistence across restarts and blast-radius guards still apply. |
 | **`node.toml` contains external signing key** | Compromise of `node.toml` reveals the external key | File permissions 0600, owned by root. The external key is a public-key-like verification key, not a signing private key -- it verifies signatures, it cannot create them. |
 | **Inline script execution** | Arbitrary code execution via git push | Lettuce enforces `require_signed_commits` for any config containing `script` fields. Scripts must be signed by a trusted key. |
 

@@ -1123,12 +1123,17 @@ impl BunClient {
         &self,
         peers: &[String],
         duration_secs: u64,
+        acknowledged: bool,
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/chaos/partition", self.base_url);
         let response = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "peers": peers, "duration_secs": duration_secs }))
+            .json(&serde_json::json!({
+                "peers": peers,
+                "duration_secs": duration_secs,
+                "acknowledged": acknowledged,
+            }))
             .send()
             .await
             .map_err(classify_error)?;

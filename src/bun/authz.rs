@@ -146,8 +146,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/upgrade/cluster-rollback", Admin),
     route(Post, "/v1/cluster/elect", Admin),
     // Chaos.
-    route(Post, "/v1/chaos/partition", Deployer),
-    route(Post, "/v1/chaos/heal", Deployer),
+    route(Post, "/v1/chaos/partition", Admin),
+    route(Post, "/v1/chaos/heal", Admin),
     route(Get, "/v1/chaos/status", AnyToken),
     // Snapshots. Reads need any token, mutations a Deployer; both are
     // additionally held to the token's app/namespace scope in the handlers.

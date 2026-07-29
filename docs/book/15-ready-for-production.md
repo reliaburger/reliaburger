@@ -1489,6 +1489,69 @@ That closes the app/namespace and portable-workload part of the milestone.
 Jobs, faults, tokens, registry images, mounts and node state still need explicit
 ownership before the chaos catalogue can rely on them.
 
+## Who may break production
+
+Before this tranche, `/v1/fault` checked only that the caller was a Deployer.
+Relish also copied `$USER` into `injected_by`. That environment variable tells
+you which local account launched the client. It says nothing about the bearer
+token Bun authenticated, and a raw HTTP caller could put any name in the JSON
+body. Useful display hint, terrible audit trail.
+
+The corrected decision has independent gates:
+
+```text
+authenticated role
+  + server operation allowlist
+  + protected-cluster policy
+  + explicit acknowledgement
+  = permission to inject
+```
+
+For ordinary workload faults the minimum role is Deployer and the operation is
+`inject_workload_faults`. An Admin still needs the operation grant. Otherwise
+changing a role would silently enable an operation which the server owner
+disabled. Unknown and production clusters also require the server's
+`allow_protected_mutation` switch. Finally, `--acknowledge` records the
+operator's intent. It grants nothing by itself.
+
+Node drain, node kill and the deprecated council-partition route remain
+stricter: Admin plus `alter_node_state`. Node pressure uses Admin plus
+`saturate_capacity`. The target node repeats these checks after forwarding, so
+a permissive source can't confer authority on a stricter target.
+
+Reversal has a deliberately different method:
+
+```rust
+policy.authorise_reversal(operation, &caller)?;
+```
+
+It still checks the operation's minimum role and server grant. It doesn't
+require acknowledgement or the protected-cluster mutation switch. Those
+checks stop escalation. Requiring either before removing an active fault could
+trap the cluster in the dangerous state after an operator tightened policy.
+The agent receives separate booleans for workload, node and pressure reversal,
+then checks the actual stored fault type. Authority to remove one class never
+leaks into another.
+
+Bun now replaces the compatibility `injected_by` field with the authenticated
+token's readable name. Audit events use the credential's stable principal id
+instead. `ClusterEvent` gained three backwards-compatible fields:
+
+```rust
+pub action: Option<String>,
+pub principal: Option<String>,
+pub details: BTreeMap<String, String>,
+```
+
+`Option<String>` lets old non-audit events omit the two scalar fields.
+`BTreeMap` keeps action-specific facts deterministic when serialised. Serde
+defaults all three while deserialising older events and skips empty values
+while serialising, so existing consumers keep working. A successful injection
+records `fault.injected` with fault id, type, duration and target. Every
+specific, service-wide, all-workload and council clear path records its own
+stable action. The human message remains for people; automation reads the
+fields.
+
 ## Make a node disappear without killing Bun
 
 What does a node failure mean in an in-process test? Killing Bun would
@@ -1522,18 +1585,20 @@ These are deliberately privileged operations. The JSON field
 an authenticated Admin and the server-owned `alter_node_state` permission.
 When one node forwards a request, it preserves the user's credential; the
 target authenticates and authorises it again. It also replaces the
-client-supplied `injected_by` value with the authenticated principal before
-recording the event.
+client-supplied `injected_by` value with the authenticated token name before
+recording the fault; the event uses the stable credential principal.
 
 Every node fault needs a non-zero TTL. Clearing one manually uses:
 
 ```sh
-relish fault clear 7 --node worker-2 --acknowledge
+relish fault clear 7 --node worker-2
 ```
 
-The same Admin and policy checks apply to reversal. A Deployer's general
-`fault clear` removes workload faults and leaves node faults alone. Fault IDs
-and timers still live in the target process, though. If peers have already
+Reversal still needs Admin plus `alter_node_state`, but it needs neither
+destructive acknowledgement nor the protected-cluster mutation switch. A
+Deployer with `inject_workload_faults` may clear workload faults and leaves
+node faults alone. Fault IDs and timers still live in the target process,
+though. If peers have already
 removed the failed node from their live directory, the operator must point
 Relish at that node's still-open API to clear it; expiry needs no route and
 will restore it automatically. Durable lease ownership for node state remains
@@ -1595,11 +1660,12 @@ role and explicit acknowledgement, and the target repeats those checks after
 cross-node forwarding. Only one helper may run on a node, so two individually
 safe requests can't add up past the configured bound.
 
-Clearing pressure is deliberately less privileged than creating it. A
-Deployer may terminate an owned helper, but that routing permission doesn't
-let the same caller reverse a drain or node kill. Clear, expiry and graceful
-shutdown kill the child and remove its cgroup. Parent death and startup sweep
-cover the paths where normal cleanup code never gets a turn.
+Clearing pressure is deliberately easier than creating it, but not a role
+shortcut. It still needs Admin plus `saturate_capacity`; it doesn't need
+acknowledgement or the protected-cluster mutation switch. That operation
+doesn't let the same caller reverse a drain or node kill. Clear, expiry and
+graceful shutdown kill the child and remove its cgroup. Parent death and
+startup sweep cover the paths where normal cleanup code never gets a turn.
 
 The privileged acceptance test checks the real hierarchy rather than a mock.
 It verifies `cpu.max`, observes the helper PID inside the fault cgroup and the

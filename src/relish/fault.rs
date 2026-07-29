@@ -131,6 +131,9 @@ pub struct FaultTargeting {
     /// overridable).
     #[arg(long)]
     pub override_safety: bool,
+    /// Confirm that injecting this workload fault is intentional.
+    #[arg(long)]
+    pub acknowledge: bool,
 }
 
 /// Build a `FaultRequest`, filling the common fields from `targeting`.
@@ -146,11 +149,13 @@ fn make_request(
         target_instance: targeting.instance.clone(),
         target_node: targeting.node.clone(),
         duration,
-        injected_by: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
+        // Compatibility wire field only. Bun replaces it with the
+        // authenticated token name before recording the fault.
+        injected_by: String::new(),
         reason: targeting.reason.clone(),
         include_leader: false,
         override_safety: targeting.override_safety,
-        acknowledged: false,
+        acknowledged: targeting.acknowledge,
     }
 }
 
@@ -502,6 +507,7 @@ pub async fn scenario(
     path: &std::path::Path,
     dry_run: bool,
     speed: f64,
+    acknowledged: bool,
 ) -> Result<(), RelishError> {
     use crate::smoker::scenario;
 
@@ -535,7 +541,8 @@ pub async fn scenario(
             entry.step.value,
         );
 
-        let req = scenario::step_to_fault_request(&entry.step, speed)?;
+        let mut req = scenario::step_to_fault_request(&entry.step, speed)?;
+        req.acknowledged = acknowledged;
         match client.inject_fault(&req).await {
             Ok(summary) => {
                 println!(
@@ -657,6 +664,7 @@ mod tests {
             node: Some("node-2".into()),
             reason: Some("game day".into()),
             override_safety: true,
+            acknowledge: true,
         };
         let request = make_request(
             FaultType::Pause,
@@ -669,6 +677,7 @@ mod tests {
         assert_eq!(request.target_node.as_deref(), Some("node-2"));
         assert_eq!(request.reason.as_deref(), Some("game day"));
         assert!(request.override_safety);
+        assert!(request.acknowledged);
     }
 
     /// `dns redis banana` used to silently inject NXDOMAIN; now the positional
