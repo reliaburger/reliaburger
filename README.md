@@ -124,7 +124,10 @@ both runc and Apple Container. Authenticated, TTL-bounded node drain and node
 kill now exercise the real scheduler and cluster transports. Opt-in,
 server-bounded Linux node pressure runs outside Bun in an owned cgroup and
 cleans up on clear, expiry, graceful shutdown, parent death or restart. The
-five-scenario chaos catalogue is the next Phase 15 block.
+service partition now has a root-only, source-cgroup eBPF effect proof and is
+separate from the Raft/gossip quorum operation; unsupported delay and bandwidth
+faults refuse instead of claiming success. The five-scenario chaos catalogue is
+the next Phase 15 block.
 
 ## Licence
 

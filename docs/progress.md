@@ -1299,9 +1299,9 @@ convergence and adoption" theme under 12b.6).
 > Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
 > (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
 >
-> The harness half is done; the five diagnostic commands are the largest block of genuinely
-> unbuilt feature work left in the project. Two `TODO(Phase 15)` deferrals from Phase 15b land
-> here as well (Smoker's service-to-service `Partition` arm, Pickle push-side body streaming).
+> The harness half is done; the diagnostic commands are the largest block of genuinely
+> unbuilt feature work left in the project. Smoker's service-to-service `Partition` deferral
+> is closed below; Pickle push-side body streaming remains open.
 
 - [x] Test harness audit and suite taxonomy: nextest local/CI profiles, JUnit, timeouts,
   zero retries, serial resources and no-tests-selected failures; portable, wall-clock,
@@ -1651,9 +1651,15 @@ work, not by `M1`.
   derived from its current `cpu.max` via a new pure `baseline_cores` (unlimited → host cores;
   a quota → quota/period; unparseable → 1, since under-reading makes the fault weaker than
   asked, which is the wrong way to be wrong)
-- [ ] `TODO(Phase 15)` — Smoker's service-to-service `Partition` apply arm stays an accepted
-  no-op without eBPF; tightening it needs the quorum-rail acceptance test moved onto an eBPF
-  node first
+- [x] `TODO(Phase 15)` — Smoker's service-to-service `Partition` no longer reports success
+  without an eBPF data path. Bun resolves every running source-app instance to its cgroup-v2
+  id server-side, installs one exact source-cgroup/VIP/port key per instance, rolls partial
+  writes back, records those keys for clear/expiry/shutdown, and propagates map failures. A
+  root-only Linux acceptance test proves the key blocks only the selected source cgroup and
+  that deleting it restores the connection. The old Raft/gossip transport partition now has
+  a distinct `CouncilPartition` variant and a real three-node quorum-rail test, so it can no
+  longer borrow the service fault's safety semantics. Delay and bandwidth commands now
+  refuse honestly until a TC packet hook exists; the connect hook cannot implement either.
 - [ ] `TODO(Phase 15)` — Pickle push-side request-body streaming (`MAX_REQUEST_BYTES`)
 
 ### Open — Optional list

@@ -4,6 +4,13 @@ Design document for the Smoker subsystem of Reliaburger. Smoker provides built-i
 
 Sourced from whitepaper section 18 (Fault Injection).
 
+> **Implementation status (29 July 2026).** Drop and directional service
+> partition faults run in the loaded cgroup `connect4` hook. DNS NXDOMAIN runs
+> in the userspace resolver. Delay and bandwidth remain design work: no TC
+> packet program is attached, so Bun rejects both instead of recording a fault
+> that can't affect traffic. The pseudocode below describes the intended TC
+> implementation where it says so; it is not evidence that the code ships.
+
 ---
 
 ## 1. Overview
@@ -23,11 +30,11 @@ Fault injection is exposed through the `relish fault` CLI subcommand. Every faul
 
 ```bash
 # Network faults
-relish fault delay redis 200ms
+relish fault delay redis 200ms              # reserved: rejected until TC ships
 relish fault drop api 10%
 relish fault partition web --from payment-service
 relish fault dns redis nxdomain
-relish fault bandwidth api 1mbps
+relish fault bandwidth api 1mbps            # reserved: rejected until TC ships
 
 # Resource faults
 relish fault cpu inference 50%
@@ -52,11 +59,10 @@ relish fault clear redis
 Every fault accepts common options:
 
 ```bash
-relish fault delay redis 200ms \
+relish fault drop redis 10% \
   --duration 5m \
   --instance redis-1 \
-  --node node-03 \
-  --jitter 50ms
+  --node node-03
 ```
 
 If `--duration` is omitted, the fault defaults to 10 minutes and prints a warning. Faults never persist across Bun restarts.
@@ -69,9 +75,16 @@ Smoker is not a standalone subsystem. It extends three existing components:
 
 ### 2.1 Onion (eBPF Service Mesh)
 
-Smoker's network faults are implemented by extending the same eBPF programs that Onion uses for service discovery. The DNS interception hook (attached to `sock_ops` for UDP+TCP port 53) and the connect interception hook (attached to `connect4` / `sock_ops`) already intercept every relevant system call. Smoker adds fault map lookups to these existing programs -- it does not load new eBPF programs.
+The shipped network path extends Onion's cgroup `connect4` program with one
+`fault_connect_map` lookup. That implements connect-time drop and directional
+service partition. DNS does not use an eBPF DNS hook: the supervised userspace
+responder applies NXDOMAIN (see §5.1.3). Delay and bandwidth need packet-time
+control, so they require a TC program that is not loaded today.
 
-The existing Onion maps (`dns_map`, `backend_map`, `firewall_map`) are unmodified. Smoker adds three BPF maps (`fault_connect_map`, `fault_bw_map`, `fault_state_map`) that the eBPF programs check around the normal service map lookup. (The DNS fault is the exception: DNS resolution runs in userspace, so `DnsNxdomain` is applied there rather than through a BPF map — see §5.1.3.)
+The existing Onion maps (`backend_map`, `firewall_map`) are unmodified.
+`fault_connect_map` is the only fault map consumed by a loaded program.
+`fault_bw_map` and the delay/TC design below are reserved contracts, not live
+map ownership.
 
 ### 2.2 Bun (Node Agent)
 
@@ -263,9 +276,9 @@ pub enum FaultType {
         cores: Option<u32>,
     },
 
-    /// Push memory usage toward the target's memory limit.
-    /// If `oom` is true, trigger an immediate OOM kill.
-    /// Otherwise `percentage` specifies how full to push memory (0-100).
+    /// Squeeze the workload's memory.high toward memory.max.
+    /// `oom` is a compatibility flag which Bun rejects because an OOM kill is
+    /// not reversible; use Kill to exercise restart after abrupt termination.
     MemoryPressure {
         percentage: u8,
         oom: bool,
@@ -548,11 +561,22 @@ pub struct BpfFaultStateValue {
 
 ### 5.1 Network Faults
 
-Network faults are implemented in eBPF. Each fault type extends the existing Onion interception hooks with a fault map lookup.
+Drop and service partition are implemented at connect time. DNS NXDOMAIN is
+implemented in userspace. Delay and bandwidth are deliberately unavailable
+until Reliaburger owns a TC packet hook and can prove effect and cleanup.
 
 #### 5.1.1 Delay (via sock_ops TCP_BPF_DELACK)
 
-The eBPF program attached to the `connect4` hook cannot sleep -- eBPF programs must be non-blocking. Delay is therefore implemented using a `sock_ops` program that intercepts the TCP state machine. When a SYN-ACK is received (connection established), the program checks the fault map. If a delay is configured, it sets the socket's `TCP_BPF_DELACK` timer to defer the application-visible connection completion by the specified duration.
+> **Status: unimplemented.** The loaded `connect4` hook cannot sleep and no
+> `sock_ops`, `sk_msg` or TC delay program is attached. `relish fault delay`
+> still parses the intended contract, but Bun rejects activation. The sketch
+> below is retained as design work only; a production implementation should
+> prefer a TC/netem-style packet path and must prove TCP and UDP semantics,
+> jitter, expiry, detach and concurrent ownership.
+
+The original design proposed a `sock_ops` program that intercepts the TCP state
+machine after the connect hook. If a delay is configured, it would defer
+traffic by the specified duration.
 
 From the application's perspective, `connect()` takes 200ms longer than usual. For HTTP-level delays on established connections, the `sk_msg` program can hold data in a BPF ring buffer before releasing it to the socket.
 
@@ -749,7 +773,20 @@ normal_resolution:
 
 #### 5.1.4 Partition (via source cgroup check)
 
-A partition between service A and service B is implemented as a directional rule in `fault_connect_map`. The key includes a source cgroup ID (identifying the calling app) and a destination virtual IP. Bidirectional partitions require two rules.
+A partition between service A and service B is implemented as a directional
+rule in `fault_connect_map`. Bun ignores client authority over cgroup ids: it
+resolves every running instance of `--from` to the cgroup-v2 inode id observed
+by `bpf_get_current_cgroup_id()`, then installs one
+source-cgroup/destination-VIP/port key per instance. It rolls back a partial
+multi-key write and records the exact keys so clear, expiry and shutdown delete
+what that fault owns. Omitting `--from` installs the explicit wildcard key.
+Bidirectional partitions require two rules.
+
+This service-data-plane operation is separate from
+`relish chaos council-partition`, which blocks gossip and Raft transports and
+therefore consumes the quorum safety budget. Conflating the two used to make a
+service partition look like a node failure while allowing the service operation
+to report success without eBPF.
 
 ```c
 // eBPF pseudocode: partition fault in connect4 program
@@ -783,10 +820,9 @@ int smoker_partition_connect4(struct bpf_sock_addr *ctx) {
         return CGROUP_SOCK_ADDR_ALLOW;
 
     if (val->action == FAULT_ACTION_PARTITION) {
-        // Return ENETUNREACH -- application sees a network
-        // unreachable error, as if the destination network
-        // has been physically partitioned.
-        return CGROUP_SOCK_ADDR_REJECT_UNREACH;  // maps to -ENETUNREACH
+        // A cgroup socket-address hook denies by returning zero. Linux exposes
+        // that to connect(2) as EPERM; no packet reaches the backend.
+        return 0;
     }
 
     // Handle other fault types (drop, delay) as shown above
@@ -798,7 +834,17 @@ int smoker_partition_connect4(struct bpf_sock_addr *ctx) {
 
 #### 5.1.5 Bandwidth Throttle (via tc eBPF + token bucket)
 
-Bandwidth throttling is implemented using a `tc` (traffic control) eBPF program attached to the container's network interface, combined with a token bucket rate limiter stored in `fault_bw_map`. Packets exceeding the configured rate are queued in a BPF ring buffer and released at the throttled rate. This operates at the packet level, giving accurate bandwidth shaping.
+> **Status: unimplemented.** No TC classifier, qdisc or bandwidth map is
+> attached to workload interfaces. The cgroup connect hook sees connection
+> setup, not packet flow, so it cannot enforce a byte rate. Bun rejects
+> `relish fault bandwidth` instead of swallowing a `MapNotFound` error.
+
+The intended implementation uses a `tc` (traffic control) eBPF program attached
+to the workload interface, combined with a token bucket or a kernel qdisc.
+This sketch is a starting point, not shipped behaviour. In particular, merely
+dropping packets above a token rate is loss injection rather than faithful
+bandwidth shaping; production work should use pacing and document burst
+semantics.
 
 ```c
 // eBPF pseudocode: bandwidth throttle in tc program
@@ -903,68 +949,18 @@ fn cpu_burn_loop(target_percent: u8, cores: Option<u32>) {
 }
 ```
 
-#### 5.2.2 Memory Pressure via mlock
+#### 5.2.2 Memory Pressure via `memory.high`
 
-Bun spawns a process inside the target container's memory cgroup that allocates and `mlock()`s pages, pushing the container toward its memory limit. At 90%, the application has only 10% of its memory headroom remaining. This triggers the same kernel memory pressure signals (PSI, `memory.high` events) as real contention.
+Bun reads the target workload's hard `memory.max` and saves its current
+`memory.high`. A 90% fault writes 90% of the hard limit to `memory.high`, so the
+kernel forces reclaim and allocation stalls as the workload crosses that soft
+boundary. Clear and expiry restore the exact saved value. A cgroup with no hard
+limit is refused because there is no meaningful percentage to calculate.
 
-```rust
-/// Allocate and mlock memory inside the target cgroup to create pressure.
-/// `target_percent` is 0-100 (percentage of cgroup memory limit to consume).
-/// `oom` if true, allocate beyond limit to trigger OOM kill.
-fn memory_pressure(
-    cgroup_memory_limit: u64,
-    target_percent: u8,
-    oom: bool,
-) {
-    let target_bytes = if oom {
-        // Allocate more than the limit to trigger OOM
-        cgroup_memory_limit + (64 * 1024 * 1024)  // limit + 64MB
-    } else {
-        // Calculate current usage, then allocate the difference
-        let current_usage = read_cgroup_memory_current();
-        let target_usage = (cgroup_memory_limit * target_percent as u64) / 100;
-        if target_usage <= current_usage {
-            return;  // already at or above target
-        }
-        target_usage - current_usage
-    };
-
-    // Allocate in 4KB page chunks to avoid a single giant allocation
-    let page_size = 4096_usize;
-    let num_pages = (target_bytes as usize) / page_size;
-    let mut pages: Vec<*mut u8> = Vec::with_capacity(num_pages);
-
-    for _ in 0..num_pages {
-        let page = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if page == libc::MAP_FAILED {
-            break;  // OOM killer will handle the rest
-        }
-
-        // Touch the page to ensure it is physically allocated
-        unsafe { std::ptr::write_volatile(page as *mut u8, 0xAA) };
-
-        // mlock to prevent kernel from reclaiming it
-        unsafe { libc::mlock(page, page_size) };
-
-        pages.push(page as *mut u8);
-    }
-
-    // Hold allocations until fault is cleared or expires.
-    // The parent Bun process will kill this child to release memory.
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-```
+The `oom` spelling remains in the compatibility wire type, but Bun rejects it.
+Lowering `memory.max` or allocating past it kills a process and can't be
+reversed. Use a Kill fault when the hypothesis concerns restart after an abrupt
+termination.
 
 #### 5.2.3 Disk I/O Throttle via blkio cgroup
 
@@ -1145,11 +1141,10 @@ For multi-step fault injection (chaos game days, automated resilience tests, CI 
 name = "Payment cascade failure"
 
 [[step]]
-description = "Database latency spike"
-fault = "delay"
+description = "Database CPU contention"
+fault = "cpu"
 target = "pg"
-value = "500ms"
-jitter = "200ms"
+value = "50%"
 duration = "2m"
 
 [[step]]
@@ -1168,12 +1163,6 @@ value = "95%"
 start_after = "4m"
 duration = "2m"
 
-[[step]]
-description = "Payment service OOM"
-fault = "memory"
-target = "payment-service"
-value = "oom"
-start_after = "6m"
 ```
 
 Scenario execution:
@@ -1487,15 +1476,18 @@ This ensures that even during a fault injection gone wrong, an operator with hos
 
 ### 9.1 Zero Overhead When Inactive
 
-When no faults are active, all four fault BPF maps are empty. The eBPF programs perform one additional hash lookup per interception (for each relevant map). An empty BPF hash map lookup is approximately 20-50 nanoseconds, which is negligible compared to the cost of a `connect()` syscall (~1 microsecond) or DNS resolution (~10 microseconds).
+When no connect fault is active, `fault_connect_map` is empty and the loaded
+program performs one additional hash lookup per intercepted VIP connection.
+DNS faults run in userspace; no TC bandwidth program runs.
 
-Measured overhead with empty fault maps:
+The original design used the following estimates. They are not current
+benchmark evidence and must not be quoted as measured Reliaburger performance:
 
 | Operation | Baseline (Onion only) | With Smoker maps (empty) | Overhead |
 |---|---|---|---|
 | `connect()` to VIP | ~1.2 us | ~1.25 us | ~50 ns (+4%) |
-| DNS `.internal` resolution | ~8 us | ~8.05 us | ~50 ns (<1%) |
-| TCP throughput (sustained) | 9.4 Gbps | 9.4 Gbps | unmeasurable |
+| DNS `.internal` resolution | n/a (userspace) | n/a (userspace) | not measured |
+| TCP throughput (sustained) | not measured | not measured | not measured |
 
 ### 9.2 Fault Activation Latency
 

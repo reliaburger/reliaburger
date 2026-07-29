@@ -409,10 +409,11 @@ Commands:
 | `snapshot delete <app> <name>` | Delete a snapshot |
 | `secret pubkey [dir]` | Print the cluster's age public key |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
-| `fault delay <target> <delay>` | Add latency to connections to a service |
+| `fault delay <target> <delay>` | Reserved contract; currently refused until the TC packet path ships |
 | `fault drop <target> <pct>` | Fail a percentage of connections (ECONNREFUSED) |
 | `fault dns <target> nxdomain` | Return NXDOMAIN for DNS resolution |
-| `fault partition <target>` | Block traffic between services |
+| `fault partition <target> [--from <app>]` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
+| `fault bandwidth <target> <rate>` | Reserved contract; currently refused until the TC packet path ships |
 | `fault kill <target>` | Kill instances of a service (SIGKILL) |
 | `fault pause <target>` | Freeze instances of a service (SIGSTOP) |
 | `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |

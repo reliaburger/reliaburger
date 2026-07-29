@@ -477,6 +477,9 @@ startup. M8 must add certificate expiry evidence and should not make
 - [x] Implement authenticated real drain/kill before C1/C2/C5.
 - [x] Implement node-scoped pressure before C4. Unsupported scenarios must
   not become green skips.
+- [x] Separate service-data-plane and council transport partitions; make the
+  former prove a real source-cgroup/VIP/port eBPF effect and refuse delay or
+  bandwidth until a TC packet path exists.
 - [x] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
@@ -534,6 +537,17 @@ Clear, TTL and graceful shutdown remove the helper and cgroup;
 `PR_SET_PDEATHSIG` plus startup sweeping cover process death. Rootless,
 non-Linux and missing-controller nodes publish unavailable evidence. A
 privileged cgroup-v2 acceptance proves the effect, isolation and cleanup.
+
+**Network-fault honesty tranche delivered:** service `Partition` and
+gossip/Raft `CouncilPartition` are distinct variants with distinct safety
+semantics. Bun rejects a service partition without a loaded eBPF path, resolves
+the source app's live cgroup ids server-side, rolls back partial map writes and
+records the exact keys for reversal. A root-only Linux acceptance proves a
+source-scoped key returns `EPERM` before any packet reaches the backend and
+that deleting the key restores the connection. The 22-test cluster gate proves
+the real transport endpoint still enforces the voter quorum budget. Delay and
+bandwidth now fail explicitly even on eBPF-capable nodes: the connect hook
+cannot delay or pace packets and no TC program owns those contracts.
 
 **Resource-lease tranche delivered:** a Deployer may create, inspect, renew and
 release an app/namespace lease only when the server policy permits isolated

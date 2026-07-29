@@ -1156,6 +1156,81 @@ check your work. Inverting the parser's own arithmetic — `bytes_per_sec * 8 /
 just move the tool a little closer to meaning what it says, which is the whole
 job before we start breaking things on purpose.
 
+## The last fault that lied
+
+The service partition arm was the last obvious silent success. Ask Bun to block
+`web` from `payments` on a node without eBPF and it added a registry row,
+returned `200 OK`, and changed no connection. The excuse was a test: the
+three-node quorum test used that same `Partition` value as shorthand for a Raft
+transport partition. Tightening the service path would break the test.
+
+That's not a reason to keep the lie. It's evidence that we'd put two different
+operations in one enum variant.
+
+A control-plane partition blocks gossip and Raft addresses between nodes. It
+can remove a council voter, so the quorum rail must count it. A service
+partition blocks `connect()` from a workload cgroup to a service VIP. It can't
+remove a Raft voter and should never consume the quorum budget. The fix starts
+by naming them separately:
+
+```rust
+pub enum FaultType {
+    Partition {
+        source_app: Option<String>,
+        source_cgroup_id: u64,
+    },
+    CouncilPartition,
+    // ...
+}
+```
+
+Why leave `source_cgroup_id` on the wire at all? Compatibility. Why refuse a
+non-zero value from a client? Authority. The kernel compares the key against
+`bpf_get_current_cgroup_id()`, and only Bun can reliably tie that number to the
+instances it supervises. Trusting an arbitrary integer from a caller would let
+the caller fault some other cgroup or create a convincing no-op with a made-up
+one.
+
+For a named source app, Bun finds every running local instance, asks the runtime
+for its PID, resolves `/proc/<pid>/cgroup` to the cgroup-v2 inode id, and writes
+one key per instance. The important bit isn't the loop. It's the ownership
+record:
+
+```rust
+pub enum FaultReversal {
+    BpfConnectKeys(Vec<(u32, u16, u64)>),
+    // ...
+}
+```
+
+That `Vec` (Rust's growable array) is the exact set this fault installed:
+network-order VIP, network-order port and source cgroup id. If the third map
+write fails, Bun deletes the first two before it reports the injection failure.
+If activation succeeds, clear and expiry delete those same keys rather than
+trying to reconstruct them from whatever the service map looks like later. The
+service may have been redeployed or removed by then. Cleanup must own facts,
+not guesses.
+
+The Linux acceptance test loads the real cgroup connect program, publishes a
+VIP backed by a local listener, and resolves the test process's own cgroup id.
+The control connection succeeds. After inserting the source-scoped partition
+key, the kernel returns `EPERM` and the backend sees no connection. Delete the
+key and the connection succeeds again. The three-node quorum test now drives
+the actual `/v1/chaos/partition` transport operation, so neither mechanism
+borrows credibility from the other.
+
+That pass uncovered two more lies hiding behind the phrase "requires eBPF".
+Delay wrote an action that the connect program explicitly ignores: a cgroup
+socket-address hook can't sleep. Bandwidth wrote a map no loaded program
+defines or reads, and discarded the resulting `MapNotFound`. Both commands now
+return an error even on an eBPF-capable node. They need a TC packet hook,
+lifecycle ownership and effect tests before they can claim success. Parsing a
+future contract is fine. Pretending it ran isn't.
+
+The memory `oom` form follows the same rule from the other direction. It
+doesn't pretend to be reversible: Bun refuses it and points the experiment at a
+Kill fault when the goal is to test restart after abrupt termination.
+
 ## Every fault must expire
 
 There's one rail that matters more than the rest: a fault has to end. A chaos

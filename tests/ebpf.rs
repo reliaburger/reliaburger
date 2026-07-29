@@ -621,6 +621,111 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     shutdown.cancel();
 }
 
+/// A service partition is keyed by the source cgroup, not merely by the
+/// destination VIP. Program the current test cgroup as the source and prove
+/// the connect hook refuses the VIP, then delete the exact key and prove the
+/// refusal disappears.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn partition_fault_blocks_its_source_cgroup_and_clears() {
+    use reliaburger::sesame::egress::cgroup_id_of_pid;
+    use reliaburger::smoker::bpf_maps;
+    use reliaburger::smoker::bpf_types::{
+        BpfConnectFaultValue, FAULT_ACTION_PARTITION, partition_fault_key,
+    };
+    use std::io::ErrorKind;
+
+    assert!(
+        ebpf_tests_enabled(),
+        "set RELIABURGER_EBPF_TESTS=1 after provisioning eBPF prerequisites"
+    );
+
+    let obj_dir = find_bpf_obj_dir();
+    let mut ebpf =
+        OnionEbpf::load(&obj_dir, CGROUP_PATH.as_ref()).expect("failed to load eBPF program");
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "partition-target"));
+    let port = 18_080u16;
+    let address = SocketAddr::new(vip.0.into(), port);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test backend");
+    let mut service_map = ServiceMap::new();
+    service_map
+        .register_app("partition-target", "default", port, None)
+        .expect("register partition target");
+    service_map
+        .add_backend(
+            &ServiceId::new("default", "partition-target"),
+            BackendInstance {
+                instance_id: "partition-target-0".to_string(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: listener.local_addr().expect("backend address").port(),
+                healthy: true,
+            },
+        )
+        .expect("register test backend");
+    BpfServiceMap::new()
+        .sync_from_service_map(&service_map, &mut ebpf)
+        .expect("publish partition target");
+    let source_cgroup_id =
+        cgroup_id_of_pid(std::process::id()).expect("resolve the test source cgroup");
+    let key = partition_fault_key(vip.to_network_byte_order(), port.to_be(), source_cgroup_id);
+    let value = BpfConnectFaultValue {
+        action: FAULT_ACTION_PARTITION,
+        probability: 100,
+        _pad: [0; 6],
+        delay_ns: 0,
+        jitter_ns: 0,
+        expires_ns: 0,
+    };
+
+    assert_ne!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .as_ref()
+            .err()
+            .map(std::io::Error::kind),
+        Some(ErrorKind::PermissionDenied),
+        "VIP must not be denied before the partition key exists"
+    );
+    let other_source_key = partition_fault_key(
+        vip.to_network_byte_order(),
+        port.to_be(),
+        source_cgroup_id.wrapping_add(1),
+    );
+    bpf_maps::write_connect_fault(&mut ebpf.bpf, other_source_key, value)
+        .expect("install a key for a different source cgroup");
+    assert_ne!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .as_ref()
+            .err()
+            .map(std::io::Error::kind),
+        Some(ErrorKind::PermissionDenied),
+        "a partition for another source cgroup blocked this caller"
+    );
+    bpf_maps::delete_connect_fault(&mut ebpf.bpf, &other_source_key)
+        .expect("delete the different-source control key");
+
+    bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value)
+        .expect("install source-scoped partition key");
+    assert_eq!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .as_ref()
+            .err()
+            .map(std::io::Error::kind),
+        Some(ErrorKind::PermissionDenied),
+        "partition key did not block its source cgroup"
+    );
+
+    bpf_maps::delete_connect_fault(&mut ebpf.bpf, &key).expect("delete partition key");
+    assert_ne!(
+        TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .as_ref()
+            .err()
+            .map(std::io::Error::kind),
+        Some(ErrorKind::PermissionDenied),
+        "source remained partitioned after deleting the owned key"
+    );
+    ebpf.detach();
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2b: Egress allowlist (L16)
 // ---------------------------------------------------------------------------

@@ -758,13 +758,13 @@ relish upgrade rollback <version>   # Roll back to specific version
 relish upgrade resume               # Resume a paused upgrade
 
 # Fault injection (Smoker)
-relish fault delay <app> <duration>         # Add latency to connections
+relish fault delay <app> <duration>         # Reserved; rejected until TC ships
 relish fault drop <app> <percent>           # Fail percentage of connections
 relish fault partition <app> --from <app>   # Block traffic between apps
 relish fault dns <app> nxdomain             # DNS resolution failure
-relish fault bandwidth <app> <rate>         # Throttle bandwidth
+relish fault bandwidth <app> <rate>         # Reserved; rejected until TC ships
 relish fault cpu <app> <percent>            # Consume CPU allocation
-relish fault memory <app> <percent|oom>     # Push memory usage / trigger OOM
+relish fault memory <app> <percent>         # Push memory toward memory.high
 relish fault disk-io <app> <rate>           # Throttle disk I/O
 relish fault kill <instance>                # Kill specific instance
 relish fault kill <app> --count <n>         # Kill N random instances
@@ -816,6 +816,16 @@ relish export --format kubernetes -f <path> # Export to Kubernetes manifests
   --token <token>           # API token / RELIABURGER_TOKEN
   --ca-cert <path>          # Cluster root CA / RELIABURGER_CA_CERT
 ```
+
+The delay and bandwidth subcommands deliberately remain parseable so the CLI
+contract does not need another migration when the TC data path lands. Today the
+server rejects both: the loaded cgroup connect hook can refuse a connection but
+cannot sleep or pace packets. Service partition is different. Bun resolves the
+named source app to its live cgroup ids, writes exact source/VIP/port keys into
+the connect map, and refuses the request when eBPF is unavailable. The numeric
+cgroup id in the wire type is server-owned and clients must leave it as zero.
+`memory oom` is also refused because a kill cannot be reversed; use a Kill
+fault when the experiment needs to exercise restart after abrupt termination.
 
 ### Detailed Command Behaviour
 

@@ -68,7 +68,7 @@ fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<
     // failure and transport partitions can remove a voter from quorum.
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::Partition { .. }
+        FaultType::NodeKill { .. } | FaultType::CouncilPartition
     );
     if !targets_node {
         return None;
@@ -317,6 +317,31 @@ mod tests {
         let check = evaluate_safety(&req, &ctx);
         // Kill doesn't target nodes, so quorum check doesn't apply
         assert!(check.approved);
+    }
+
+    #[test]
+    fn service_partition_does_not_consume_raft_quorum() {
+        let mut ctx = default_context();
+        ctx.council_nodes_with_active_faults = ctx.council_size;
+        let req = FaultRequest {
+            fault_type: FaultType::Partition {
+                source_app: Some("web".to_string()),
+                source_cgroup_id: 0,
+            },
+            target_service: "payments".to_string(),
+            target_instance: None,
+            target_node: None,
+            duration: Duration::from_secs(30),
+            injected_by: "test".to_string(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: false,
+        };
+        assert!(
+            evaluate_safety(&req, &ctx).approved,
+            "an application data-plane partition cannot remove a Raft voter"
+        );
     }
 
     // -----------------------------------------------------------------------

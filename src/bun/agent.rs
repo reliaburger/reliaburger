@@ -2642,10 +2642,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 // Legacy chaos API — create a partition fault in the registry
                 let request = crate::smoker::types::FaultRequest {
-                    fault_type: crate::smoker::types::FaultType::Partition {
-                        source_app: None,
-                        source_cgroup_id: 0,
-                    },
+                    fault_type: crate::smoker::types::FaultType::CouncilPartition,
                     target_service: peers.join(","),
                     target_instance: None,
                     target_node: None,
@@ -3230,7 +3227,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::smoker::types::FaultType::NodeKill { .. }
                         | crate::smoker::types::FaultType::NodeDrain
                         | crate::smoker::types::FaultType::NodePressure { .. }
-                        | crate::smoker::types::FaultType::Partition { .. }
+                        | crate::smoker::types::FaultType::CouncilPartition
                 )
             })
             .count() as u32;
@@ -3380,15 +3377,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.publish_dns_faults();
                 Ok(())
             }
-            FaultType::Delay { .. } | FaultType::Drop { .. } | FaultType::Bandwidth { .. } => {
-                // Packet-level network faults genuinely need the eBPF
-                // data path. Apply via BPF maps when it's loaded;
-                // otherwise reject honestly rather than record fake
-                // success (the old stub recorded everything).
+            FaultType::Drop { .. } | FaultType::Partition { .. } => {
+                // Connect-time drop and partition faults have a real cgroup
+                // eBPF implementation. Record the exact keys only after every
+                // requested map write succeeds.
                 #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 {
                     if self.onion_ebpf.is_some() {
-                        self.write_fault_bpf_entry(rule).await;
+                        let reversal = self.write_fault_bpf_entry(rule).await?;
+                        self.record_reversal(rule.id, reversal);
                         return Ok(());
                     }
                 }
@@ -3397,6 +3394,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.fault_type
                 ))
             }
+            FaultType::Delay { .. } => Err(
+                "delay faults need a TC packet hook; the current cgroup connect hook cannot delay packets"
+                    .to_string(),
+            ),
+            FaultType::Bandwidth { .. } => Err(
+                "bandwidth faults need a TC packet hook; no bandwidth program is attached"
+                    .to_string(),
+            ),
             FaultType::MemoryPressure { percentage, oom } => {
                 // Squeeze the TARGET instance's `memory.high` toward its hard
                 // limit so the kernel forces reclaim/allocation stalls on the
@@ -3546,29 +3551,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodePressure);
                 Ok(())
             }
-            FaultType::Partition { .. } => {
-                // A service-to-service partition is an eBPF connect-map fault
-                // (`write_fault_bpf_entry` writes a `FAULT_ACTION_PARTITION`
-                // entry keyed by target VIP + source cgroup). It is reached
-                // through this arm only when the data path is loaded; the
-                // Delay/Drop/Bandwidth branch above already routes the other
-                // eBPF network faults. This arm is left as an accepted no-op
-                // because the quorum-rail acceptance test injects a Partition
-                // to exercise the safety context on a node with no eBPF, and
-                // an honest eBPF-or-reject here would fail that path.
-                //
-                // TODO(Phase 15): fold Partition into the eBPF network-fault
-                // arm (honest-reject without the data path) and move the
-                // quorum-rail acceptance test onto an eBPF-loaded node so the
-                // no-op can go. The council-level transport partition
-                // (`relish chaos council-partition`) is a different mechanism
-                // and IS wired — see `InjectPartition`/`apply_partition`.
-                #[cfg(all(feature = "ebpf", target_os = "linux"))]
-                if self.onion_ebpf.is_some() {
-                    self.write_fault_bpf_entry(rule).await;
-                }
-                Ok(())
-            }
+            FaultType::CouncilPartition => Err(
+                "council partitions must use the authenticated /v1/chaos/partition operation"
+                    .to_string(),
+            ),
         }
     }
 
@@ -3776,6 +3762,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FaultReversal::Partition { peers } => {
                 self.remove_partition(peers).await;
             }
+            FaultReversal::BpfConnectKeys(_) => {
+                // `delete_fault_bpf_entry` owns map cleanup before this
+                // generic non-eBPF reversal path runs.
+            }
             FaultReversal::NodeDrain => {
                 if self.node_drain_gate.finish()
                     && let Some(readiness) = self.readiness.clone()
@@ -3832,7 +3822,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .find(|f| {
                 matches!(
                     f.fault_type,
-                    crate::smoker::types::FaultType::Partition { .. }
+                    crate::smoker::types::FaultType::CouncilPartition
                 )
             })
             .map(|f| {
@@ -3901,6 +3891,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|e| (e.vip.to_network_byte_order(), e.port.to_be()))
     }
 
+    /// Resolve every running instance of a partition's source app to the
+    /// cgroup id observed by `bpf_get_current_cgroup_id()`.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn partition_source_cgroup_ids(
+        &self,
+        source_app: Option<&str>,
+        client_supplied_id: u64,
+    ) -> Result<Vec<u64>, String> {
+        if client_supplied_id != 0 {
+            return Err(
+                "source_cgroup_id is server-resolved and must be zero in fault requests"
+                    .to_string(),
+            );
+        }
+        let Some(source_app) = source_app else {
+            return Ok(vec![0]);
+        };
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| instance.app_name == source_app)
+            .map(|instance| instance.id.clone())
+            .collect();
+        if instances.is_empty() {
+            return Err(format!("no running instances of source app {source_app}"));
+        }
+
+        let mut cgroup_ids = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let pid = self
+                .supervisor
+                .grill()
+                .pid(&instance)
+                .await
+                .ok_or_else(|| format!("source instance {} has no running PID", instance.0))?;
+            let cgroup_id = crate::sesame::egress::cgroup_id_of_pid(pid).ok_or_else(|| {
+                format!(
+                    "could not resolve the cgroup id for source instance {}",
+                    instance.0
+                )
+            })?;
+            cgroup_ids.push(cgroup_id);
+        }
+        cgroup_ids.sort_unstable();
+        cgroup_ids.dedup();
+        Ok(cgroup_ids)
+    }
+
     /// Write the eBPF map entry for a newly injected network fault (P2).
     ///
     /// Only reachable with the `ebpf` feature: without it, `apply_fault`
@@ -3908,35 +3947,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// the rule, which now uses CLOCK_MONOTONIC (P0) to match the kernel's
     /// `bpf_ktime_get_ns()`.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn write_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
+    async fn write_fault_bpf_entry(
+        &self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Result<crate::smoker::types::FaultReversal, String> {
         use crate::smoker::bpf_maps;
         use crate::smoker::bpf_types::*;
-        use crate::smoker::types::FaultType;
+        use crate::smoker::types::{FaultReversal, FaultType};
 
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
+        let source_cgroup_ids = match &rule.fault_type {
+            FaultType::Partition {
+                source_app,
+                source_cgroup_id,
+            } => {
+                self.partition_source_cgroup_ids(source_app.as_deref(), *source_cgroup_id)
+                    .await?
+            }
+            _ => vec![0],
         };
-        let vip_port = self.fault_vip_port(&rule.target_service);
+        let (vip, port) = self
+            .fault_vip_port(&rule.target_service)
+            .ok_or_else(|| format!("no service VIP exists for {}", rule.target_service))?;
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Err("the eBPF data path is not loaded on this node".to_string());
+        };
         let expires = rule.expires_at_ns;
         let mut ebpf = handle.lock().await;
 
-        // Connect/bandwidth faults need the target VIP; DNS is keyed by name.
-        let require_vip = || match vip_port {
-            Some(vp) => Some(vp),
-            None => {
-                eprintln!(
-                    "smoker: no VIP for {} — {} fault not applied",
-                    rule.target_service, rule.fault_type
-                );
-                None
-            }
-        };
-
         match &rule.fault_type {
             FaultType::Drop { probability } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
+                let key = connect_fault_key(vip, port);
                 let value = BpfConnectFaultValue {
                     action: FAULT_ACTION_DROP,
                     probability: *probability,
@@ -3945,39 +3985,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     jitter_ns: 0,
                     expires_ns: expires,
                 };
-                let _ = bpf_maps::write_connect_fault(
-                    &mut ebpf.bpf,
-                    connect_fault_key(vip, port),
-                    value,
-                );
-            }
-            FaultType::Delay {
-                delay_ns,
-                jitter_ns,
-            } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
-                let value = BpfConnectFaultValue {
-                    action: FAULT_ACTION_DELAY,
-                    probability: 100,
-                    _pad: [0; 6],
-                    delay_ns: *delay_ns,
-                    jitter_ns: *jitter_ns,
-                    expires_ns: expires,
-                };
-                let _ = bpf_maps::write_connect_fault(
-                    &mut ebpf.bpf,
-                    connect_fault_key(vip, port),
-                    value,
-                );
+                bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value)
+                    .map_err(|error| format!("failed to install drop fault: {error}"))?;
+                Ok(FaultReversal::BpfConnectKeys(vec![(
+                    key.virtual_ip,
+                    key.port,
+                    key.source_cgroup_id,
+                )]))
             }
             FaultType::Partition {
-                source_cgroup_id, ..
+                source_app: _,
+                source_cgroup_id: _,
             } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
                 let value = BpfConnectFaultValue {
                     action: FAULT_ACTION_PARTITION,
                     probability: 100,
@@ -3986,27 +4005,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     jitter_ns: 0,
                     expires_ns: expires,
                 };
-                let _ = bpf_maps::write_connect_fault(
-                    &mut ebpf.bpf,
-                    partition_fault_key(vip, port, *source_cgroup_id),
-                    value,
-                );
+                let mut installed = Vec::with_capacity(source_cgroup_ids.len());
+                for source_cgroup_id in source_cgroup_ids {
+                    let key = partition_fault_key(vip, port, source_cgroup_id);
+                    if let Err(error) = bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value) {
+                        for installed_key in installed.iter().rev() {
+                            let _ = bpf_maps::delete_connect_fault(&mut ebpf.bpf, installed_key);
+                        }
+                        return Err(format!("failed to install partition fault: {error}"));
+                    }
+                    installed.push(key);
+                }
+                Ok(FaultReversal::BpfConnectKeys(
+                    installed
+                        .iter()
+                        .map(|key| (key.virtual_ip, key.port, key.source_cgroup_id))
+                        .collect(),
+                ))
             }
-            FaultType::Bandwidth { bytes_per_sec } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
-                let value = BpfBandwidthFaultValue {
-                    rate_bytes_per_sec: *bytes_per_sec,
-                    tokens: *bytes_per_sec, // start with a full bucket
-                    last_refill_ns: crate::smoker::types::monotonic_now_ns(),
-                    expires_ns: expires,
-                };
-                let _ =
-                    bpf_maps::write_bw_fault(&mut ebpf.bpf, bandwidth_fault_key(vip, port), value);
-            }
-            // Non-network faults never reach here (apply_fault handles them).
-            _ => {}
+            _ => Err(format!(
+                "{} has no connect-map implementation",
+                rule.fault_type
+            )),
         }
     }
 
@@ -4027,35 +4047,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
         };
-        let vip_port = self.fault_vip_port(&rule.target_service);
         let mut ebpf = handle.lock().await;
 
-        match &rule.fault_type {
-            FaultType::Drop { .. } | FaultType::Delay { .. } => {
-                if let Some((vip, port)) = vip_port {
-                    let _ = bpf_maps::delete_connect_fault(
-                        &mut ebpf.bpf,
-                        &connect_fault_key(vip, port),
+        if let crate::smoker::types::FaultReversal::BpfConnectKeys(keys) = &rule.reversal {
+            for (vip, port, source_cgroup_id) in keys {
+                if let Err(error) = bpf_maps::delete_connect_fault(
+                    &mut ebpf.bpf,
+                    &partition_fault_key(*vip, *port, *source_cgroup_id),
+                ) {
+                    eprintln!(
+                        "smoker: delete connect fault key for {} failed: {error}",
+                        rule.id
                     );
                 }
             }
-            FaultType::Partition {
-                source_cgroup_id, ..
-            } => {
-                if let Some((vip, port)) = vip_port {
-                    let _ = bpf_maps::delete_connect_fault(
-                        &mut ebpf.bpf,
-                        &partition_fault_key(vip, port, *source_cgroup_id),
-                    );
-                }
-            }
-            FaultType::Bandwidth { .. } => {
-                if let Some((vip, port)) = vip_port {
-                    let _ =
-                        bpf_maps::delete_bw_fault(&mut ebpf.bpf, &bandwidth_fault_key(vip, port));
-                }
-            }
-            _ => {}
+            return;
+        }
+
+        // Compatibility fallback for a rule created before exact key
+        // ownership was recorded.
+        if let Some((vip, port)) = self.fault_vip_port(&rule.target_service)
+            && matches!(rule.fault_type, FaultType::Drop { .. })
+            && let Err(error) =
+                bpf_maps::delete_connect_fault(&mut ebpf.bpf, &connect_fault_key(vip, port))
+        {
+            eprintln!(
+                "smoker: delete legacy connect fault key for {} failed: {error}",
+                rule.id
+            );
         }
     }
 
@@ -10044,6 +10063,37 @@ mod tests {
             .await
             .expect_err("memory oom must be rejected");
         assert!(err.contains("reversible"), "unexpected reason: {err}");
+    }
+
+    #[tokio::test]
+    async fn service_partition_without_ebpf_is_refused_not_recorded_as_success() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::Partition {
+            source_app: Some("web".to_string()),
+            source_cgroup_id: 0,
+        });
+        let error = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("partition must not claim success without a loaded eBPF path");
+        assert!(error.contains("eBPF data path"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unimplemented_packet_faults_are_refused_even_if_the_cli_can_describe_them() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let delay = fault_rule(crate::smoker::types::FaultType::Delay {
+            delay_ns: 10_000_000,
+            jitter_ns: 0,
+        });
+        let error = agent.apply_fault(&delay).await.unwrap_err();
+        assert!(error.contains("TC packet hook"), "{error}");
+
+        let bandwidth = fault_rule(crate::smoker::types::FaultType::Bandwidth {
+            bytes_per_sec: 125_000,
+        });
+        let error = agent.apply_fault(&bandwidth).await.unwrap_err();
+        assert!(error.contains("no bandwidth program"), "{error}");
     }
 
     #[cfg(not(target_os = "linux"))]

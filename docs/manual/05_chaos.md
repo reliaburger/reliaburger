@@ -6,7 +6,7 @@ tested is a guess.
 ## One-shot faults
 
 ```sh
-relish fault delay redis 200ms --jitter 50ms   # latency
+relish fault delay redis 200ms --jitter 50ms   # reserved; currently refused (TC pending)
 relish fault drop api 10%                      # failed connections
 relish fault dns redis nxdomain                # DNS misery
 relish fault partition web --from payment      # block traffic between apps
@@ -14,8 +14,8 @@ relish fault kill web --count 1                # SIGKILL an instance
 relish fault pause web                         # SIGSTOP (freeze)
 relish fault cpu web 50%                       # burn CPU in the cgroup
 relish fault memory web 90%                    # push toward the limit
-relish fault node-drain node-03                # graceful departure
-relish fault node-kill node-03 --containers    # abrupt failure
+relish fault node-drain node-03 --acknowledge  # stop new scheduling
+relish fault node-kill node-03 --acknowledge   # bounded cluster-plane failure
 ```
 
 Every fault has a duration (default 10 minutes) and cleans up after itself:
@@ -24,6 +24,11 @@ Every fault has a duration (default 10 minutes) and cleans up after itself:
 relish fault list
 relish fault clear          # or: relish fault clear <id>
 ```
+
+`drop` and `partition` need the Linux eBPF connect hook. `delay` and
+`bandwidth` are accepted by the parser as forward-compatible contracts, but Bun
+refuses to activate them until a TC packet program can provide real delay and
+pacing. A rejected command hasn't injected a fault.
 
 ## Scripted scenarios
 

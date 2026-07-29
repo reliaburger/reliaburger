@@ -64,10 +64,17 @@ pub enum FaultType {
     Partition {
         /// Source app name (the caller that gets blocked).
         source_app: Option<String>,
-        /// Source cgroup ID (resolved at activation time, 0 = all callers).
+        /// Legacy wire field. Bun resolves source cgroups server-side; API
+        /// requests must leave this as zero.
         #[serde(default)]
         source_cgroup_id: u64,
     },
+
+    /// Legacy gossip/Raft transport partition used by `relish chaos`.
+    ///
+    /// This is distinct from a service-to-service eBPF partition: only this
+    /// variant can remove a council voter from quorum.
+    CouncilPartition,
 
     /// Throttle bandwidth to the target service.
     Bandwidth {
@@ -180,6 +187,7 @@ impl fmt::Display for FaultType {
                     write!(f, "partition (all callers)")
                 }
             }
+            Self::CouncilPartition => write!(f, "council-partition"),
             Self::Bandwidth { bytes_per_sec } => {
                 // The parser reads megabits/s (`1mbps` = 125_000 bytes/s), so
                 // invert that here rather than dividing by 1024² — otherwise
@@ -276,15 +284,15 @@ impl FaultType {
 /// State captured when a persistent fault is applied, so clearing or expiring
 /// it can put the target back exactly as it was.
 ///
-/// eBPF network faults reverse themselves through the BPF maps and process
-/// Kill has nothing to undo, so those carry `None`. Resource faults and Pause,
-/// which leave a durable change on the target instance's cgroup or process,
-/// record what to restore here. The field is runtime-only: it never crosses
-/// the wire (`#[serde(skip)]` on the rule), because a Bun restart already
-/// drops every active fault and starts clean.
+/// eBPF service faults record their exact map keys. Process Kill has nothing
+/// to undo, so it carries `None`. Resource faults and Pause, which leave a
+/// durable change on the target instance's cgroup or process, record what to
+/// restore here. The field is runtime-only: it never crosses the wire
+/// (`#[serde(skip)]` on the rule), because a Bun restart already drops every
+/// active fault and starts clean.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum FaultReversal {
-    /// Nothing to undo (network faults, Kill, honest-rejection faults).
+    /// Nothing to undo (Kill and honest-rejection faults).
     #[default]
     None,
     /// A CPU-stress cap: restore each instance's saved `cpu.max`.
@@ -302,6 +310,10 @@ pub enum FaultReversal {
     /// Stored as peer node ids (resolved to addresses at reversal time so a
     /// peer that changed address is still cleared correctly).
     Partition { peers: Vec<String> },
+    /// Exact eBPF connect-map keys installed for a service network fault.
+    ///
+    /// Tuple fields are `(virtual IP, network-order port, source cgroup id)`.
+    BpfConnectKeys(Vec<(u32, u16, u64)>),
     /// A scheduler drain: restore readiness when the final drain owner clears.
     NodeDrain,
     /// A simulated node failure: reopen gossip, Raft and reporting transports.
@@ -781,6 +793,7 @@ mod tests {
                 source_app: Some("web".into()),
                 source_cgroup_id: 123,
             },
+            FaultType::CouncilPartition,
             FaultType::Bandwidth {
                 bytes_per_sec: 1_000_000,
             },

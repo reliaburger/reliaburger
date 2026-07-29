@@ -733,14 +733,13 @@ async fn autoscaler_scales_up_on_high_metric() {
 
 /// W11 (L14): the quorum safety rail rejects a node-level fault that
 /// would risk Raft majority. On a 3-member council `max_allowed = 1`, so
-/// the first partition fault is accepted but a second one — which would
+/// the first transport partition is accepted but a second one — which would
 /// put two council members at risk — is rejected with a 4xx. Drives the
-/// binary path through `/v1/fault`.
+/// real transport-blocklist path through `/v1/chaos/partition`; a
+/// service-to-service eBPF partition does not affect Raft quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn fault_injection_rejected_when_quorum_at_risk() {
-    use reliaburger::smoker::types::{FaultRequest, FaultType};
-
     let shutdown = CancellationToken::new();
     let n1 = start_node("r1", 18741, vec![], &shutdown).await;
     let n2 = start_node("r2", 18745, vec![local(18741)], &shutdown).await;
@@ -777,32 +776,26 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
         .find(|n| *n.thinks_leader.borrow())
         .expect("leader exists");
 
-    let partition_fault = |by: &str| FaultRequest {
-        fault_type: FaultType::Partition {
-            source_app: None,
-            source_cgroup_id: 0,
-        },
-        target_service: String::new(),
-        target_instance: None,
-        target_node: None,
-        duration: Duration::from_secs(60),
-        injected_by: by.into(),
-        reason: None,
-        include_leader: false,
-        override_safety: false,
-        acknowledged: false,
-    };
+    let peer = nodes
+        .iter()
+        .find(|node| node.name != leader.name)
+        .expect("leader has a peer")
+        .name
+        .clone();
 
     // First node-level fault: within the quorum budget, accepted.
     leader
         .client
-        .inject_fault(&partition_fault("first"))
+        .inject_partition(std::slice::from_ref(&peer), 60)
         .await
         .expect("first partition should be within the quorum budget");
 
     // Second node-level fault: would put a majority of the 3-member
     // council at risk, so the rail must reject it.
-    let rejected = leader.client.inject_fault(&partition_fault("second")).await;
+    let rejected = leader
+        .client
+        .inject_partition(std::slice::from_ref(&peer), 60)
+        .await;
     assert!(
         rejected.is_err(),
         "second node fault should be rejected to protect quorum, got {rejected:?}"

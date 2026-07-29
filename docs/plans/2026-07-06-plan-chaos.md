@@ -25,7 +25,7 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 | `TestHarness` in `tests/integration.rs` is reusable | It's **private** (`tests/integration.rs:29`) and there's now a `tests/support/` directory. Needs promoting or duplicating |
 | Reuse `Capabilities` as a fresh name | **Name collision**: `NodeCapabilities` (`src/meat/cluster_state.rs:15`) and `PlatformCapabilities` (`src/bun/supervisor.rs:74`) exist. Use **`ClusterCapabilities`** |
 | `[cluster] environment` needs adding | Still true — `ClusterSection` (`src/config/node.rs:308`) has no `environment` |
-| Smoker is library-only (review L14/L15) | **Wired.** `apply_fault` (`src/bun/agent.rs:3102`) has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, and eBPF Delay/Drop/Bandwidth |
+| Smoker is library-only (review L14/L15) | **Mostly wired.** `apply_fault` has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, eBPF Drop and source-scoped eBPF Partition. Delay and Bandwidth now refuse honestly because no TC packet program is attached. |
 | Graceful-skip is needed for most subsystems | Still the right stance, but **far fewer skips**: ingress, rollups, GitOps, egress, eBPF sync, identity are all wired now |
 | `relish test --chaos` scenarios use `node-kill` | **`node-kill`/`node-drain` always return an error** (`agent.rs:3299`). Three of the five scenarios cannot work until this is implemented — see §2 |
 | Faults apply cluster-wide | **Node-local only.** The CLI POSTs to one agent; `target_node` is never used to route (`src/relish/fault.rs:512`) |
@@ -92,9 +92,15 @@ From `docs/design/chaos-smoker.md`, `docs/design/cli-relish.md:760-782`, `docs/w
 ### 3.3 Faults that can't take effect
 
 - **`node-drain` / `node-kill`** — always error. Needed by C1/C2/C5.
-- **`memory <app> oom`** — always rejected (`agent.rs:3219`), though the design's own example scenario uses it (`chaos-smoker.md:1170`).
-- **`partition`** — the last *silent* no-op: succeeds and does nothing without eBPF (`agent.rs:3313-3335`), with an explicit `TODO(Phase 15)` to fix here.
-- `delay`/`drop`/`bandwidth` honestly reject without eBPF; `cpu`/`memory`/`disk-io` reject off Linux. Both fine — capability-gate and skip.
+- **`memory <app> oom`** — deliberately rejected because it is irreversible; the current
+  documentation points operators at `kill` for the restart path.
+- **`partition`** — fixed in 12/20. The service fault requires the loaded connect hook,
+  resolves source cgroups server-side and owns the exact map keys it installs. The
+  gossip/Raft transport operation is now a distinct `CouncilPartition`.
+- **`delay` / `bandwidth`** — honestly rejected even with eBPF. The loaded cgroup
+  connect hook cannot delay or pace packets; both need a production TC data path.
+- `drop` honestly rejects without eBPF; `cpu`/`memory`/`disk-io` reject off Linux. Both
+  are capability-gated.
 
 ### 3.4 Design features absent
 
@@ -260,8 +266,16 @@ is de-escalating and must not grant `alter_node_state`.
 Book: §"Pressuring a node without pressuring Bun".
 
 **12/20 — Partition stops lying; memory-oom decision**
-Tests: `partition_without_ebpf_is_refused_not_silently_dropped`; move the quorum-rail acceptance test onto an eBPF node or a mock so the `TODO(Phase 15)` no-op can go; `memory_oom_is_implemented_or_refused_consistently`.
-Implement: remove the silent-success `Partition` arm — honest error without eBPF, like `delay`/`drop`. Decide `memory oom`: implement via `memory.max` squeeze **or** remove it from the docs; don't leave documented-but-rejected.
+Tests: `service_partition_without_ebpf_is_refused_not_recorded_as_success`;
+`service_partition_does_not_consume_raft_quorum`; root-only Linux
+`partition_fault_blocks_its_source_cgroup_and_clears`; the real three-node
+quorum acceptance now uses `/v1/chaos/partition`.
+Implement: shipped. Service partitions resolve cgroup ids on Bun, install and
+own exact connect-map keys, roll back partial writes and propagate failures.
+`CouncilPartition` carries the separate Raft/gossip transport operation.
+Delay/bandwidth reject until TC exists. `memory oom` remains an explicit,
+documented refusal because an OOM kill is not reversible; use a Kill fault to
+exercise restart behaviour.
 Book: §"The last fault that lied".
 
 **13/20 — Fault authorisation and audit (D2)**
@@ -872,7 +886,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 10/20 `[smoker]` duration config
 - [x] 11/20 node-level faults
 - [x] 11b/20 node-scoped pressure prerequisite
-- [ ] 12/20 partition honesty + memory-oom decision
+- [x] 12/20 partition honesty + memory-oom decision
 - [ ] 13/20 fault authorisation + audit
 - [x] 13b/20 authenticated target-node distribution
 - [ ] 14/20 chaos suite
@@ -894,5 +908,8 @@ New for this revision:
 
 12. **Chaos work touches the cluster plane.** Run `make test-cluster` (21 tests) on every stream-C/D commit, not just `make ci`.
 13. **`ROUTE_MATRIX` is enforced by a test.** Every new route (`/v1/capabilities`, `/v1/trace`) needs a matrix entry or `matrix_covers_every_mounted_route` fails. Routes naming `{app}` additionally need `authorize_scoped` (the C3 drift guard).
-14. **Don't reintroduce a silent no-op.** Step 12 exists because `Partition` still succeeds while doing nothing. Any new fault arm either works, or returns an error saying why — never `Ok(())` with no effect.
+14. **Don't reintroduce a silent no-op.** Step 12 fixed `Partition` and exposed that
+    Delay/Bandwidth had the same problem behind a loaded eBPF handle. Any new fault arm
+    either works and has effect evidence, or returns an error saying why. Never
+    `Ok(())` with no effect.
 15. **`injected_by` is currently spoofable.** Until step 13, treat it as a hint, not an audit record.
