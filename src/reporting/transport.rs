@@ -188,6 +188,7 @@ pub struct TcpReportingTransport {
     address: SocketAddr,
     inbound_rx: Mutex<mpsc::Receiver<InboundReport>>,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
     /// When set, peers are dialled over mTLS. `None` keeps plaintext TCP.
     tls_connector: Option<tokio_rustls::TlsConnector>,
 }
@@ -201,6 +202,15 @@ impl TcpReportingTransport {
         Self::bind_tls(addr, shutdown, None, None).await
     }
 
+    /// Create a plaintext transport sharing a reversible node-fault gate.
+    pub async fn bind_with_node_gate(
+        addr: SocketAddr,
+        shutdown: tokio_util::sync::CancellationToken,
+        node_gate: crate::smoker::node_fault::NodeTransportGate,
+    ) -> Result<Self, ReportingError> {
+        Self::bind_tls_with_node_gate(addr, shutdown, None, None, node_gate).await
+    }
+
     /// Create a TCP reporting transport, optionally over mTLS.
     ///
     /// When `acceptor` is set the accept loop requires a client certificate;
@@ -211,6 +221,24 @@ impl TcpReportingTransport {
         shutdown: tokio_util::sync::CancellationToken,
         acceptor: Option<tokio_rustls::TlsAcceptor>,
         connector: Option<tokio_rustls::TlsConnector>,
+    ) -> Result<Self, ReportingError> {
+        Self::bind_tls_with_node_gate(
+            addr,
+            shutdown,
+            acceptor,
+            connector,
+            crate::smoker::node_fault::NodeTransportGate::new(),
+        )
+        .await
+    }
+
+    /// Create a TCP reporting transport sharing the cluster-wide node gate.
+    pub async fn bind_tls_with_node_gate(
+        addr: SocketAddr,
+        shutdown: tokio_util::sync::CancellationToken,
+        acceptor: Option<tokio_rustls::TlsAcceptor>,
+        connector: Option<tokio_rustls::TlsConnector>,
+        node_gate: crate::smoker::node_fault::NodeTransportGate,
     ) -> Result<Self, ReportingError> {
         let listener =
             tokio::net::TcpListener::bind(addr)
@@ -227,7 +255,13 @@ impl TcpReportingTransport {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
 
         // Spawn accept loop
-        tokio::spawn(Self::accept_loop(listener, inbound_tx, shutdown, acceptor));
+        tokio::spawn(Self::accept_loop(
+            listener,
+            inbound_tx,
+            shutdown,
+            acceptor,
+            node_gate.clone(),
+        ));
 
         Ok(Self {
             address: bound_addr,
@@ -235,6 +269,7 @@ impl TcpReportingTransport {
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            node_gate,
             tls_connector: connector,
         })
     }
@@ -257,6 +292,7 @@ impl TcpReportingTransport {
         tx: mpsc::Sender<InboundReport>,
         shutdown: tokio_util::sync::CancellationToken,
         acceptor: Option<tokio_rustls::TlsAcceptor>,
+        node_gate: crate::smoker::node_fault::NodeTransportGate,
     ) {
         loop {
             tokio::select! {
@@ -264,7 +300,11 @@ impl TcpReportingTransport {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer)) => {
+                            if node_gate.is_quiesced() {
+                                continue;
+                            }
                             let tx = tx.clone();
+                            let connection_gate = node_gate.clone();
                             match acceptor.clone() {
                                 Some(acceptor) => {
                                     tokio::spawn(async move {
@@ -276,7 +316,9 @@ impl TcpReportingTransport {
                                         let _ = tokio::time::timeout(
                                             REPORT_ACCEPT_DEADLINE,
                                             async {
-                                                if let Ok(tls) = acceptor.accept(stream).await {
+                                                if let Ok(tls) = acceptor.accept(stream).await
+                                                    && !connection_gate.is_quiesced()
+                                                {
                                                     // The verified client cert
                                                     // binds the peer's identity
                                                     // (C6); extract it before
@@ -292,11 +334,13 @@ impl TcpReportingTransport {
                                 }
                                 None => {
                                     tokio::spawn(async move {
-                                        let _ = tokio::time::timeout(
-                                            REPORT_ACCEPT_DEADLINE,
-                                            Self::handle_connection(stream, peer, None, tx),
-                                        )
-                                        .await;
+                                        if !connection_gate.is_quiesced() {
+                                            let _ = tokio::time::timeout(
+                                                REPORT_ACCEPT_DEADLINE,
+                                                Self::handle_connection(stream, peer, None, tx),
+                                            )
+                                            .await;
+                                        }
                                     });
                                 }
                             }
@@ -432,6 +476,9 @@ impl ReportingTransport for TcpReportingTransport {
         target: SocketAddr,
         message: &ReportingMessage,
     ) -> Result<(), ReportingError> {
+        if self.node_gate.is_quiesced() {
+            return Ok(());
+        }
         if self.blocklist.read().await.contains(&target) {
             return Ok(()); // silently drop for chaos testing
         }
@@ -440,7 +487,12 @@ impl ReportingTransport for TcpReportingTransport {
 
     async fn recv(&self) -> Option<InboundReport> {
         let mut rx = self.inbound_rx.lock().await;
-        rx.recv().await
+        loop {
+            let report = rx.recv().await?;
+            if !self.node_gate.is_quiesced() {
+                return Some(report);
+            }
+        }
     }
 }
 
@@ -561,5 +613,35 @@ mod tests {
         t1.send(addr(2), &sample_msg("w1")).await.unwrap();
         let (from, _, _) = t2.recv().await.unwrap();
         assert_eq!(from, addr(1));
+    }
+
+    #[tokio::test]
+    async fn node_transport_gate_drops_and_then_restores_reports() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let t1 =
+            TcpReportingTransport::bind_with_node_gate(addr(0), shutdown.clone(), gate.clone())
+                .await
+                .unwrap();
+        let t2 = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+
+        gate.quiesce();
+        t1.send(t2.local_addr(), &sample_msg("w1")).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), t2.recv())
+                .await
+                .is_err()
+        );
+
+        gate.restore();
+        t1.send(t2.local_addr(), &sample_msg("w1")).await.unwrap();
+        let (_, _, message) = tokio::time::timeout(Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(message, ReportingMessage::Report(_)));
+        shutdown.cancel();
     }
 }

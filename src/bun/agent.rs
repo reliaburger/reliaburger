@@ -1099,6 +1099,8 @@ pub struct PartitionBlocklists {
     pub raft: Option<Arc<tokio::sync::RwLock<std::collections::HashSet<std::net::SocketAddr>>>>,
     /// raft_port - gossip_port, to map a peer's gossip addr → raft addr.
     pub raft_port_offset: i32,
+    /// Shared all-transport gate used by reversible node-failure faults.
+    pub node_gate: crate::smoker::node_fault::NodeTransportGate,
 }
 
 /// Egress enforcement bound to a running instance's cgroup (L16).

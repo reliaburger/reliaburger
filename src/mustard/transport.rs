@@ -170,6 +170,7 @@ const MAX_UDP_PAYLOAD: usize = 1400;
 pub struct UdpMustardTransport {
     socket: tokio::net::UdpSocket,
     blocklist: Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
     /// Shared gossip HMAC key. When set, outgoing datagrams are signed and
     /// incoming ones whose tag doesn't verify are dropped. `None` disables HMAC
     /// (single-node / no master key), preserving the plaintext behaviour.
@@ -188,6 +189,7 @@ impl UdpMustardTransport {
         Ok(Self {
             socket,
             blocklist: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             hmac_key: None,
         })
     }
@@ -195,6 +197,15 @@ impl UdpMustardTransport {
     /// Attach a gossip HMAC key (or `None` to leave datagrams unauthenticated).
     pub fn with_key(mut self, key: Option<ring::hmac::Key>) -> Self {
         self.hmac_key = key;
+        self
+    }
+
+    /// Share the reversible node-fault gate used by every cluster transport.
+    pub fn with_node_gate(
+        mut self,
+        node_gate: crate::smoker::node_fault::NodeTransportGate,
+    ) -> Self {
+        self.node_gate = node_gate;
         self
     }
 
@@ -213,6 +224,9 @@ impl UdpMustardTransport {
 
 impl MustardTransport for UdpMustardTransport {
     async fn send(&self, target: SocketAddr, message: &GossipMessage) -> Result<(), MustardError> {
+        if self.node_gate.is_quiesced() {
+            return Ok(());
+        }
         // Check blocklist for chaos testing
         if self.blocklist.read().await.contains(&target) {
             return Ok(()); // silently drop
@@ -267,6 +281,9 @@ impl MustardTransport for UdpMustardTransport {
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((len, from)) => {
+                    if self.node_gate.is_quiesced() {
+                        continue;
+                    }
                     // Check blocklist for chaos testing
                     if self.blocklist.read().await.contains(&from) {
                         continue; // silently drop
@@ -470,6 +487,33 @@ mod tests {
         t1.send(dst, &ping_msg("node-1")).await.unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), t2.recv()).await;
         assert!(result.is_err(), "a wrong-key datagram must be dropped");
+    }
+
+    #[tokio::test]
+    async fn node_transport_gate_drops_and_then_restores_gossip() {
+        let gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let t1 = UdpMustardTransport::bind(addr(0))
+            .await
+            .unwrap()
+            .with_node_gate(gate.clone());
+        let t2 = UdpMustardTransport::bind(addr(0)).await.unwrap();
+        let dst = t2.local_addr();
+
+        gate.quiesce();
+        t1.send(dst, &ping_msg("node-1")).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), t2.recv())
+                .await
+                .is_err()
+        );
+
+        gate.restore();
+        t1.send(dst, &ping_msg("node-1")).await.unwrap();
+        let (_, received) = tokio::time::timeout(std::time::Duration::from_millis(500), t2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.sender, NodeId::new("node-1"));
     }
 
     fn an_extension() -> crate::mustard::message::DirectoryExtension {

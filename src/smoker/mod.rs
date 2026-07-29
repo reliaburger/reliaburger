@@ -19,6 +19,7 @@
 pub mod bpf_maps;
 pub mod bpf_types;
 pub mod config;
+pub mod node_fault;
 pub mod process;
 pub mod registry;
 pub mod resource;

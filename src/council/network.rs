@@ -336,13 +336,35 @@ pub async fn serve_raft_rpc(
     tls: Option<tokio_rustls::TlsAcceptor>,
     local_recovery_epoch: u64,
 ) {
-    serve_raft_rpc_with_limit(
+    serve_raft_rpc_with_limit_and_node_gate(
         listener,
         raft,
         shutdown,
         tls,
         local_recovery_epoch,
         MAX_RAFT_CONNECTIONS,
+        crate::smoker::node_fault::NodeTransportGate::new(),
+    )
+    .await
+}
+
+/// Serve Raft RPCs while observing the reversible node-level fault gate.
+pub async fn serve_raft_rpc_with_node_gate(
+    listener: tokio::net::TcpListener,
+    raft: Raft<TypeConfig>,
+    shutdown: tokio_util::sync::CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    local_recovery_epoch: u64,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
+) {
+    serve_raft_rpc_with_limit_and_node_gate(
+        listener,
+        raft,
+        shutdown,
+        tls,
+        local_recovery_epoch,
+        MAX_RAFT_CONNECTIONS,
+        node_gate,
     )
     .await
 }
@@ -356,6 +378,28 @@ pub async fn serve_raft_rpc_with_limit(
     tls: Option<tokio_rustls::TlsAcceptor>,
     local_recovery_epoch: u64,
     max_connections: usize,
+) {
+    serve_raft_rpc_with_limit_and_node_gate(
+        listener,
+        raft,
+        shutdown,
+        tls,
+        local_recovery_epoch,
+        max_connections,
+        crate::smoker::node_fault::NodeTransportGate::new(),
+    )
+    .await
+}
+
+/// Connection-limited Raft server with a shared node-level fault gate.
+pub async fn serve_raft_rpc_with_limit_and_node_gate(
+    listener: tokio::net::TcpListener,
+    raft: Raft<TypeConfig>,
+    shutdown: tokio_util::sync::CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    local_recovery_epoch: u64,
+    max_connections: usize,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
 ) {
     // O6: hold a permit for the whole lifetime of a connection. Acquiring
     // *before* accepting means excess peers queue in the kernel's backlog
@@ -376,7 +420,11 @@ pub async fn serve_raft_rpc_with_limit(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _peer)) => {
+                        if node_gate.is_quiesced() {
+                            continue;
+                        }
                         let raft = raft.clone();
+                        let connection_gate = node_gate.clone();
                         match tls.clone() {
                             Some(acceptor) => {
                                 tokio::spawn(async move {
@@ -388,7 +436,9 @@ pub async fn serve_raft_rpc_with_limit(
                                     // one deadline so a stalled peer can't pin
                                     // the task (CP11).
                                     let _ = tokio::time::timeout(RAFT_ACCEPT_DEADLINE, async {
-                                        if let Ok(tls_stream) = acceptor.accept(stream).await {
+                                        if let Ok(tls_stream) = acceptor.accept(stream).await
+                                            && !connection_gate.is_quiesced()
+                                        {
                                             handle_raft_rpc(tls_stream, raft, local_recovery_epoch)
                                                 .await;
                                         }
@@ -399,11 +449,13 @@ pub async fn serve_raft_rpc_with_limit(
                             None => {
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    let _ = tokio::time::timeout(
-                                        RAFT_ACCEPT_DEADLINE,
-                                        handle_raft_rpc(stream, raft, local_recovery_epoch),
-                                    )
-                                    .await;
+                                    if !connection_gate.is_quiesced() {
+                                        let _ = tokio::time::timeout(
+                                            RAFT_ACCEPT_DEADLINE,
+                                            handle_raft_rpc(stream, raft, local_recovery_epoch),
+                                        )
+                                        .await;
+                                    }
                                 });
                             }
                         }
@@ -500,6 +552,7 @@ pub struct TcpRaftNetworkFactory {
     #[allow(dead_code)]
     source_id: u64,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
     /// When set, peers are dialled over mTLS with an unbound connector (CA-pin
     /// + CRL only). Kept for callers that don't thread an identity through.
     tls: Option<tokio_rustls::TlsConnector>,
@@ -529,6 +582,7 @@ impl TcpRaftNetworkFactory {
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             tls: None,
             tls_material: None,
             recovery_epoch: 0,
@@ -543,6 +597,7 @@ impl TcpRaftNetworkFactory {
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             tls: Some(connector),
             tls_material: None,
             recovery_epoch: 0,
@@ -557,6 +612,7 @@ impl TcpRaftNetworkFactory {
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
+            node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             tls: None,
             tls_material: Some(material),
             recovery_epoch: 0,
@@ -567,6 +623,15 @@ impl TcpRaftNetworkFactory {
     /// clients send, so peers at a different epoch fence it off.
     pub fn with_recovery_epoch(mut self, recovery_epoch: u64) -> Self {
         self.recovery_epoch = recovery_epoch;
+        self
+    }
+
+    /// Share the reversible node-fault gate used by every cluster transport.
+    pub fn with_node_gate(
+        mut self,
+        node_gate: crate::smoker::node_fault::NodeTransportGate,
+    ) -> Self {
+        self.node_gate = node_gate;
         self
     }
 
@@ -591,6 +656,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
         TcpRaftNetwork {
             target_addr: node.addr,
             blocklist: std::sync::Arc::clone(&self.blocklist),
+            node_gate: self.node_gate.clone(),
             tls,
             recovery_epoch: self.recovery_epoch,
         }
@@ -601,6 +667,7 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
 pub struct TcpRaftNetwork {
     target_addr: SocketAddr,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
     tls: Option<tokio_rustls::TlsConnector>,
     /// This node's recovery epoch, stamped on each outgoing RPC (C5).
     recovery_epoch: u64,
@@ -620,6 +687,11 @@ impl TcpRaftNetwork {
     /// The entire operation (connect + write + read) is wrapped in a
     /// 10-second timeout to prevent hangs from slow or stalled peers.
     async fn rpc(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
+        if self.node_gate.is_quiesced() {
+            return Err(Unreachable::new(&RouterError(
+                "node transport quiesced".into(),
+            )));
+        }
         // Check blocklist for chaos testing
         if self.blocklist.read().await.contains(&self.target_addr) {
             return Err(Unreachable::new(&RouterError(
@@ -769,6 +841,28 @@ mod tests {
         router.heal().await;
         assert!(!router.is_partitioned(1, 2).await);
         assert!(!router.is_partitioned(2, 1).await);
+    }
+
+    #[tokio::test]
+    async fn node_transport_gate_refuses_outbound_raft_rpc() {
+        let gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let network = TcpRaftNetwork {
+            target_addr: "127.0.0.1:9".parse().unwrap(),
+            blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashSet::new(),
+            )),
+            node_gate: gate.clone(),
+            tls: None,
+            recovery_epoch: 0,
+        };
+        gate.quiesce();
+        let request = VoteRequest::new(openraft::Vote::new(1, 7), None);
+
+        let error = match network.rpc(RaftRpc::Vote(request)).await {
+            Ok(_) => panic!("quiesced node must not dial Raft peers"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("node transport quiesced"));
     }
 
     #[tokio::test]
