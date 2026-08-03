@@ -566,6 +566,16 @@ before calculating a regression verdict.
 
 ### 7.5 Wtf types — `src/relish/wtf.rs` (structs match `docs/design/cli-relish.md` §4, with one deviation)
 
+> **Deviation recorded during step 17.** The report is schema-versioned and
+> adds a first-class `unknown` list and `unknown_count`. Inputs group cluster
+> and application evidence, and every source is an `Evidence<T>` tagged as
+> `available`, `unavailable`, or `unsupported`. Available evidence carries an
+> observation timestamp. This implements the review rule that an absent source
+> can never produce an OK row. Crashloops use timestamped restart events;
+> throttling uses throttled-time deltas; disk and certificate checks require
+> capacity and public lifecycle metadata rather than guessing from adjacent
+> metrics. Collection may honestly leave those newer contracts unsupported.
+
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WtfReport {
@@ -970,7 +980,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 14/20 chaos suite
 - [x] 15/20 bench schema + comparison
 - [x] 16/20 bench suites
-- [ ] 17/20 wtf engine
+- [x] 17/20 wtf engine
 - [ ] 18/20 `relish wtf` CLI
 - [ ] 19/20 trace endpoint
 - [ ] 20/20 `relish trace` + close-out
@@ -1021,3 +1031,11 @@ nearest-rank p99, medians, strict hosted/topology fingerprints, explicit risk
 gates, timeout-as-failure and retained cleanup errors. A real multi-node
 `relish bench --quick` and disruptive/capacity acceptance run remains open in
 the final runbook.
+
+**3 August 2026, step 17 implementation.** The pure `diagnose()` engine has a
+schema-v1 output contract and 12 focused catalogue tests. Tests cover node and
+council failure, restart-window crashloops, deploy and log correlation,
+deduplicated no-backend advice, active deploys, alerts, faults, attributed
+disk capacity, cgroup throttled time, certificate lifecycle, Pickle redundancy
+and app scoping. Unavailable and unsupported inputs produce `Unknown`; the
+engine never emits the corresponding OK result.

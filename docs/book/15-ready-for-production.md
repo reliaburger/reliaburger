@@ -1871,3 +1871,62 @@ the current metric deploys the pinned multi-architecture image once per node
 and records `cache_state = uncontrolled`. That measures current image
 availability, not a clean cold-cache replication experiment. The report says
 so. We can build the stronger benchmark after we can clean up its evidence.
+
+## Diagnosis starts with what we actually know
+
+Imagine `relish wtf` says every certificate is healthy. Good news. Except it
+never managed to read certificate metadata. That's not healthy. It's a blank
+space wearing a green hat.
+
+The diagnosis engine therefore accepts an evidence snapshot rather than a
+pile of convenient values. Each source has one of three states:
+
+```rust
+enum Evidence<T> {
+    Available { observed_at: u64, value: T },
+    Unavailable { reason: String },
+    Unsupported { reason: String },
+}
+```
+
+The angle brackets make `Evidence` a generic enum: `T` stands for the type of
+value a particular source returns. `Evidence<Vec<NodeObservation>>` and
+`Evidence<CouncilObservation>` share the same availability rules without
+turning their very different data into untyped JSON. The compiler still knows
+which value belongs where.
+
+`Unavailable` means the source should work but didn't answer. `Unsupported`
+means we don't yet expose the fact needed for an honest verdict. Both produce
+an `Unknown` report entry. Neither produces OK. This sounds fussy until a
+diagnostic command is the thing you reach for during an outage. Then it's the
+whole point.
+
+The snapshot also supplies `collected_at`. The pure function
+`diagnose(&WtfInputs)` never reads the wall clock or makes a network request.
+The same captured evidence always produces the same report, which makes every
+time window deterministic in a unit test.
+
+Take crashloops. A workload with a lifetime restart count of 30 may have run
+perfectly for six months since its last failure. Calling that a current
+crashloop is nonsense. We require three timestamped restart events inside the
+last 15 minutes. When that pattern fires, the engine looks for a deploy of the
+same application and namespace in the preceding 30 minutes, then attaches the
+first recent error log. One finding now answers three questions: what failed,
+what changed, and what did the process say?
+
+The same rule keeps the other checks honest. Disk pressure needs used capacity
+with a node and storage-domain attribution. CPU throttling needs an increase in
+cgroup throttled time, not high CPU usage. Certificate expiry needs public
+`not_after` and rotation state, never private key material. If Bun can't expose
+one of those facts yet, `wtf` says so.
+
+Output uses four separate lists: `critical`, `warnings`, `unknown`, and `ok`.
+The report carries schema version 1 and rejects unknown top-level fields while
+deserialising. This is less forgiving than Serde's default. That's useful for
+an automation contract: adding a field requires us to decide whether an older
+consumer can understand it, instead of silently pretending that it can.
+
+Finally, application scope is structural. `relish wtf --app api` runs app
+checks and filters alerts, restarts, services and deploys to `api`; it doesn't
+manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
+Unknown means missing required evidence. It doesn't mean "we chose not to ask".

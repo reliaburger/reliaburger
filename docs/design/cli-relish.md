@@ -987,13 +987,23 @@ Automated diagnosis. Checks the entire cluster and produces a categorised report
 
 - **CRITICAL:** Crashlooping apps, unresponsive nodes, quorum loss, broken Raft.
 - **WARNING:** High disk usage, expiring TLS certificates, CPU throttling, active faults.
+- **UNKNOWN:** A required source was unavailable, stale, or cannot expose the
+  necessary fact in the current API.
 - **OK:** Healthy nodes, healthy quorum, normal eBPF maps, image redundancy met, certificates valid, gossip convergence.
+
+An OK row always rests on an available, timestamped observation. The command
+doesn't turn a missing source into success. For example, it diagnoses a
+crashloop from restart events inside a 15-minute window rather than a lifetime
+restart counter, and reports CPU throttling only from a cgroup throttled-time
+delta rather than ordinary CPU usage. JSON and YAML use a versioned report
+contract with separate `critical`, `warnings`, `unknown`, and `ok` lists.
 
 The key differentiator: `wtf` doesn't just enumerate problems. It correlates them with recent events, identifies likely root causes, and suggests specific remediation. For example, it links a crashlooping app to a recent deploy and shows the relevant log line, saving the operator from running `logs`, `events`, and `history` separately.
 
 `--app <app>` scopes the check to a single app for deeper, faster diagnosis. `--watch` runs continuously with 30-second refresh -- useful during deploys or incidents.
 
-Exit codes: 0 (all OK), 1 (criticals found), 2 (warnings only).
+Exit codes: 0 (all observed checks OK), 1 (criticals found), 2 (warnings or
+unknown evidence only).
 
 #### Forensics Commands
 

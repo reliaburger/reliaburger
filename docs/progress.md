@@ -1351,6 +1351,10 @@ convergence and adoption" theme under 12b.6).
     Bun independently marks and authorises every capacity apply: durable lease,
     Admin, `saturate_capacity` and protected-cluster policy all have to agree.
 - [ ] `relish wtf` (automated cluster health diagnosis)
+  - [x] Schema-v1 pure diagnosis engine with separate critical, warning,
+    unknown and OK outcomes; timestamped crashloop detection, deploy/log
+    correlation and honest evidence requirements for all catalogue checks
+  - [ ] Authenticated cross-node collection, rendering and CLI exit contract
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage

@@ -426,7 +426,7 @@ undelegated systemd cgroup path which made rootless runc fail at startup.
 
 - [x] Give deploys stable operation IDs, phases, start times and outcomes; expose
   active state plus bounded history (FUNC-6).
-- [ ] M8: build `wtf` deploy-stuck logic from this evidence.
+- [x] M8: build `wtf` deploy-stuck logic from this evidence.
 
 **Delivered:** every real Bun deploy worker receives a time-based monotonic ID
 which appears as the first standalone SSE event. Its accepted, app, job and
@@ -502,6 +502,9 @@ startup. M8 must add certificate expiry evidence and should not make
     real `.internal`/service-VIP path; destructive and saturating probes are
     separately acknowledged; timeout, panic and cleanup uncertainty are
     failures rather than skips.
+  - [x] Pure `wtf` diagnosis engine. Timestamped restart events and real active
+    deploy operations drive its crashloop/deploy correlation; every unavailable
+    or unsupported source produces `Unknown` and can never produce an OK row.
 - [ ] Add certificate expiry evidence and production rotation/renewal before
   treating the TLS-expiry diagnostic as an accepted capability.
 
