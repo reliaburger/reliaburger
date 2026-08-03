@@ -36,6 +36,7 @@ pub mod test_cmd;
 pub mod tui;
 pub mod upgrade;
 pub mod wtf;
+pub mod wtf_cmd;
 
 pub use output::OutputFormat;
 pub use plan::{ApplyPlan, PlanAction, PlanEntry};

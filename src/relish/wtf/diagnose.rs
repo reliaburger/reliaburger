@@ -154,6 +154,13 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(council) = inputs.cluster.council.value() else {
         return;
     };
+    if !council.enabled {
+        report.ok.push(WtfOk {
+            id: "council".to_string(),
+            description: "standalone mode does not require a council".to_string(),
+        });
+        return;
+    }
     let mut healthy = true;
     if council.leader.is_none() {
         healthy = false;
@@ -537,12 +544,16 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
         let finding = WtfFinding {
             id: "disk-high".to_string(),
             title: format!(
-                "node {} {} storage is {:.1}% full",
-                disk.node_id, disk.storage_domain, disk.used_percent
+                "node {} filesystem for {} is {:.1}% full",
+                disk.node_id,
+                disk.storage_domains.join(", "),
+                disk.used_percent
             ),
             details: vec![format!(
-                "capacity attribution: {} storage domain",
-                disk.storage_domain
+                "{} of {} bytes used; configured domains: {}",
+                disk.used_bytes,
+                disk.total_bytes,
+                disk.storage_domains.join(", ")
             )],
             suggestion: format!(
                 "node {} disk is at {:.1}%; prune images (`relish pickle gc`) or logs",
@@ -674,8 +685,8 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
     let mut found = false;
     for registry in registries.iter().filter(|registry| {
         !registry.ready
-            || !registry.peer_reachable
-            || !registry.redundancy_possible
+            || (registry.clustered && !registry.peer_reachable)
+            || (registry.clustered && !registry.redundancy_possible)
             || registry.under_replicated_layers > 0
     }) {
         found = true;
@@ -734,6 +745,7 @@ mod tests {
                     agent_reachable: true,
                 }]),
                 council: available(CouncilObservation {
+                    enabled: true,
                     member_count: 1,
                     reachable_members: 1,
                     leader: Some("node-1".to_string()),
@@ -741,7 +753,9 @@ mod tests {
                 faults: available(Vec::new()),
                 disks: available(vec![DiskObservation {
                     node_id: "node-1".to_string(),
-                    storage_domain: "images".to_string(),
+                    storage_domains: vec!["images".to_string()],
+                    used_bytes: 20,
+                    total_bytes: 100,
                     used_percent: 20.0,
                 }]),
                 certificates: available(vec![CertificateObservation {
@@ -755,6 +769,7 @@ mod tests {
                 }]),
                 registry: available(vec![RegistryObservation {
                     node_id: "node-1".to_string(),
+                    clustered: true,
                     ready: true,
                     peer_reachable: true,
                     redundancy_possible: true,
@@ -838,6 +853,7 @@ mod tests {
     fn missing_leader_and_quorum_are_separate_critical_findings() {
         let mut inputs = healthy_inputs();
         inputs.cluster.council = available(CouncilObservation {
+            enabled: true,
             member_count: 3,
             reachable_members: 1,
             leader: None,
@@ -999,7 +1015,9 @@ mod tests {
         }]);
         inputs.cluster.disks = available(vec![DiskObservation {
             node_id: "node-1".to_string(),
-            storage_domain: "logs".to_string(),
+            storage_domains: vec!["logs".to_string()],
+            used_bytes: 96,
+            total_bytes: 100,
             used_percent: 96.0,
         }]);
         inputs.applications.cpu_throttling = available(vec![CpuThrottleObservation {
@@ -1019,6 +1037,7 @@ mod tests {
         }]);
         inputs.cluster.registry = available(vec![RegistryObservation {
             node_id: "node-1".to_string(),
+            clustered: true,
             ready: true,
             peer_reachable: false,
             redundancy_possible: false,
@@ -1071,6 +1090,29 @@ mod tests {
             1
         );
         assert!(report.warnings.iter().any(|item| item.title == "api alert"));
+    }
+
+    #[test]
+    fn standalone_registry_does_not_require_peer_reachability() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.registry = available(vec![RegistryObservation {
+            node_id: "node-1".to_string(),
+            clustered: false,
+            ready: true,
+            peer_reachable: false,
+            redundancy_possible: false,
+            under_replicated_layers: 0,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        assert!(report.ok.iter().any(|ok| ok.id == "registry"));
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy")
+        );
     }
 
     #[test]

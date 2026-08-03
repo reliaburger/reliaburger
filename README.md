@@ -113,6 +113,7 @@ make test                    # run the portable nextest suite
 make audit                   # reject new RustSec dependency findings
 relish test --profile development # run the 39-case live-cluster catalogue
 relish bench --quick --output json # benchmark real DNS and service data paths
+relish wtf                       # diagnose live cluster evidence (0/1/2 exit)
 make examples                # validate and dry-run every example config
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
@@ -140,6 +141,11 @@ under server-owned leases. Its DNS and throughput measurements originate
 inside a source workload, strict environment fingerprints prevent unlike
 comparisons, and hosted-runner changes stay informational. Started-suite
 timeouts and uncertain cleanup fail instead of becoming green skips.
+`relish wtf` now fans authenticated requests across the expected nodes, keeps
+unavailable and inherently incomplete evidence as `Unknown`, and correlates
+timestamped restarts with recent deploys and error logs. It returns 0 only when
+every selected check is observed and healthy, 1 for critical findings, and 2
+for warnings or unknown evidence.
 
 ## Licence
 

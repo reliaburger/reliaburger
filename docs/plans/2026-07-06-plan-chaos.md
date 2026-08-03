@@ -342,7 +342,7 @@ per-node platform fingerprints and informational hosted runs.
 ### Stream F — `relish wtf` (steps 17–18)
 
 **17/20 — pure `diagnose()` + pattern catalogue** (13 patterns, one `check_*` fn each, crashloop→deploy correlation)
-**18/20 — `collect()` fan-out + CLI** (parallel, 10s per-request timeouts, `--app`, `--watch`, exit 0/1/2)
+**18/20 — `collect()` fan-out + CLI** — shipped (parallel, 10s per-request timeouts, `--app`, `--watch`, exit 0/1/2)
 
 The step-18 prerequisite now includes authenticated schema-v1 local diagnostic
 evidence. Disk capacity is attributed to configured storage domains and CPU
@@ -987,7 +987,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 15/20 bench schema + comparison
 - [x] 16/20 bench suites
 - [x] 17/20 wtf engine
-- [ ] 18/20 `relish wtf` CLI
+- [x] 18/20 `relish wtf` CLI
 - [ ] 19/20 trace endpoint
 - [ ] 20/20 `relish trace` + close-out
 - [ ] acceptance runbook on a 3-node dev cluster
@@ -1045,3 +1045,14 @@ deduplicated no-backend advice, active deploys, alerts, faults, attributed
 disk capacity, cgroup throttled time, certificate lifecycle, Pickle redundancy
 and app scoping. Unavailable and unsupported inputs produce `Unknown`; the
 engine never emits the corresponding OK result.
+
+**3 August 2026, step 18 implementation.** The authenticated collector fans
+bounded requests across expected nodes and retains partial facts as degraded
+evidence. Desired application state comes from a new read-only diagnostic view
+and is compared with scheduled instances and the live resolver, so a service
+with no resolver entry remains diagnosable. Restart/deploy history limitations,
+app-unlabelled alerts and incomplete certificate inventory are explicit
+Unknown results. Twenty-two focused engine, collector and command tests pass.
+A live standalone ProcessGrill run produced one correctly coalesced shared-disk
+warning, four honest Unknown sources and exit status 2; no false clustered
+registry warning appeared. The full three-node acceptance run remains open.

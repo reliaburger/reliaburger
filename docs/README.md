@@ -758,6 +758,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/readiness` | Authenticated critical-subsystem readiness evidence (200 ready, 503 fenced) |
 | `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
+| `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
+| `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
@@ -825,6 +827,17 @@ baseline and `--compare <file>` for a strict direction-aware comparison.
 Leader reconstruction needs `--disruptive --yes`; capacity saturation needs
 `--capacity --yes`. Server policy still decides whether either operation may
 run.
+
+`relish wtf` collects bounded evidence from every expected node using the same
+authenticated client identity. It diagnoses node and council health,
+crashloops, stalled deploys, missing service backends, active faults and alerts,
+disk pressure, actual cgroup throttling, certificate lifecycle and Pickle
+redundancy. Use `--app <name>` for application scope or `--watch` for a
+30-second human refresh. JSON and YAML use schema version 1. Exit status 0 means
+all selected evidence was observed and healthy, 1 means a critical finding,
+and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
+history is deliberately reported as degraded, not silently accepted as a
+complete historical record.
 
 Workload faults are opt-in too. Injection needs a Deployer-or-higher
 credential, explicit `--acknowledge`, and this server policy:

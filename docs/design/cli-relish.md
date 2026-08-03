@@ -1005,6 +1005,30 @@ The key differentiator: `wtf` doesn't just enumerate problems. It correlates the
 Exit codes: 0 (all observed checks OK), 1 (criticals found), 2 (warnings or
 unknown evidence only).
 
+Collection starts with the configured Bun endpoint. If that node isn't
+healthy, the command fails because it has no trustworthy cluster view. It then
+uses `/v1/cluster/nodes` and the entry node's API port, transport and
+credentials to query every expected node concurrently. Each node request has a
+ten-second bound. One failed peer degrades the relevant source and produces an
+Unknown row; it doesn't discard facts returned by the other peers.
+
+Desired replicas come from the authenticated `/v1/diagnostics/apps` view, not
+from whichever instances happened to answer. The collector compares that
+intent with scheduled replicas and the entry node's live resolver state. This
+means a service with zero backends stays visible instead of disappearing from
+the input. Restart and terminal deploy histories currently come from bounded,
+process-local rings, so the collector labels them degraded even when the
+current window is empty. Alert status doesn't yet carry application and
+namespace labels; an app-scoped alert verdict is therefore Unknown rather than
+a cluster result presented as an app result.
+
+Recent logs are not a cluster-wide fishing expedition. The collector fetches
+them only for applications with enough timestamped restarts to be crashloop
+candidates, caps the number of candidates and lines, and accepts structured
+`level=error` or stderr evidence rather than matching the word "error"
+anywhere in ordinary output. `--watch` supports human output only; JSON and
+YAML are exact single-report contracts.
+
 The authenticated `GET /v1/diagnostics` endpoint supplies local evidence that
 doesn't belong in the general metrics summary. It samples cgroup v2
 `throttled_usec` twice over a bounded 1–10 second window, attributes configured

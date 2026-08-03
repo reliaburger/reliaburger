@@ -1949,8 +1949,7 @@ resets its counter during the window, the source becomes degraded or
 unavailable. Churn isn't zero throttling.
 
 The endpoint also resolves each configured storage domain to its containing
-filesystem. That gives us separate `images`, `logs`, `metrics`, `volumes` and
-`data` rows even when several happen to share one disk. It returns byte counts
+filesystem. It returns the domain attribution with byte counts
 and a percentage, but never the configured host path. The distinction matters:
 "disk is full" is less useful than "the filesystem holding image layers is
 full", and an API response doesn't need to publish the server's directory
@@ -1969,3 +1968,44 @@ local facts with a schema version and collection state. Relish will fan those
 facts out across the cluster and the pure engine will decide what they mean.
 Keeping observation and judgement separate lets us test both halves without
 teaching the API handler a second, subtly different diagnostic catalogue.
+
+## Asking the whole cluster
+
+The pure function is useful, but operators can't diagnose a cluster by writing
+a Rust value by hand. Relish now builds that value from live APIs.
+
+It starts with the configured Bun node. That first health check is special: if
+it fails, Relish stops. Without an entry node it can't know which peers should
+exist, so a partial report would look more authoritative than it is. Once the
+entry answers, Relish reads the membership view and fans requests out to every
+expected node concurrently. Each peer gets the same transport, credentials and
+certificate authority as the entry client, and every request has a ten-second
+limit.
+
+This introduces another useful Rust pattern. We can create a `Vec` of futures
+and pass it to `join_all`. The futures run concurrently, but the returned
+results retain their input order. Each result is a `Result`, so one dead node
+doesn't cancel evidence from the healthy ones. The collector turns the failed
+part into `Evidence::Unavailable` or `Evidence::Degraded` and carries on.
+
+The collector asks a separate question for services: what *should* exist? Bun's
+authenticated `/v1/diagnostics/apps` view supplies desired and scheduled
+replica counts. Relish compares those with the live resolver table. If we only
+walked the resolver, a service with no entry would vanish from the diagnosis.
+That is precisely the broken service we wanted to find. Absence is evidence
+only when you also have the intended state.
+
+We put bounds on correlation too. Relish fetches recent logs only for
+applications that already have enough timestamped restart events to be
+crashloop candidates. It caps the number of candidates and lines, and accepts
+stderr or structured error levels rather than matching an alarming word in a
+perfectly ordinary sentence. The restart and terminal deploy stores remain
+bounded and process-local. Even an empty response therefore arrives as
+`Degraded`, because restarting Bun can erase relevant history. Honest, if a
+little annoying. That's better than green.
+
+Finally, the shell contract is small enough to remember. `relish wtf` returns
+0 only when every selected source was observed and healthy, 1 for a critical
+finding, and 2 for warnings or unknown evidence. `--app` removes unrelated
+cluster checks structurally. `--watch` repeats the human report every 30
+seconds, while JSON and YAML remain one schema-versioned report per process.

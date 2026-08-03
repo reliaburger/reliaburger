@@ -4,9 +4,11 @@
 //! what it observed, including unavailable and unsupported sources, while the
 //! pure engine turns that evidence into a stable report.
 
+mod collect;
 mod diagnose;
 mod model;
 
+pub use collect::collect;
 pub use diagnose::diagnose;
 pub use model::{
     AlertObservation, ApplicationEvidence, CertificateObservation, ClusterEvidence,

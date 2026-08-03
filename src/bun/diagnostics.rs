@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
 
 use crate::bun::agent::InstanceStatus;
+use crate::config::Replicas;
 
 const MAX_DIAGNOSTIC_INSTANCES: usize = 4096;
 
@@ -165,8 +166,33 @@ pub struct LocalDiagnosticSnapshot {
     pub certificates: DiagnosticSource<Vec<PublicCertificateMetadata>>,
 }
 
+/// Desired service state used to distinguish an intentionally empty service
+/// from a service which lost all of its backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesiredAppEvidence {
+    /// Application name.
+    pub app: String,
+    /// Application namespace.
+    pub namespace: String,
+    /// Desired replicas after resolving fixed versus daemon mode.
+    pub desired_replicas: u32,
+    /// Placements currently recorded by the scheduler.
+    pub scheduled_replicas: u32,
+    /// Declared service port. `None` means this app is not a service.
+    pub service_port: Option<u16>,
+}
+
 /// Current diagnostics wire schema.
 pub const LOCAL_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
+
+/// Resolve a fixed or daemon-set replica declaration for current membership.
+pub fn desired_replica_count(replicas: Replicas, live_nodes: usize) -> u32 {
+    match replicas {
+        Replicas::Fixed(count) => count,
+        Replicas::DaemonSet => u32::try_from(live_nodes.max(1)).unwrap_or(u32::MAX),
+    }
+}
 
 /// Extract safe public metadata from a DER certificate.
 pub fn public_certificate_metadata(
@@ -554,6 +580,13 @@ mod tests {
         assert!(!json.contains("certificate_der"));
         assert!(!json.contains("private"));
         assert!(json.contains("not_after"));
+    }
+
+    #[test]
+    fn daemon_desire_tracks_live_membership_without_becoming_zero() {
+        assert_eq!(desired_replica_count(Replicas::Fixed(3), 9), 3);
+        assert_eq!(desired_replica_count(Replicas::DaemonSet, 4), 4);
+        assert_eq!(desired_replica_count(Replicas::DaemonSet, 0), 1);
     }
 
     fn cpu_total(instance: &str, throttled_microseconds: u64) -> CpuThrottleTotal {

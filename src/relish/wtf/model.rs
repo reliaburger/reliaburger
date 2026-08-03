@@ -74,6 +74,8 @@ pub struct NodeObservation {
 /// Current council composition and liveness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CouncilObservation {
+    /// Whether this deployment uses a Raft council.
+    pub enabled: bool,
     /// Configured council member count.
     pub member_count: usize,
     /// Council members whose Bun API answered collection.
@@ -162,8 +164,12 @@ pub struct AlertObservation {
 pub struct DiskObservation {
     /// Node identifier.
     pub node_id: String,
-    /// Storage domain, for example `images`, `logs` or `volumes`.
-    pub storage_domain: String,
+    /// Configured storage domains sharing this filesystem.
+    pub storage_domains: Vec<String>,
+    /// Bytes currently consumed on the filesystem.
+    pub used_bytes: u64,
+    /// Total usable filesystem capacity in bytes.
+    pub total_bytes: u64,
     /// Percentage of usable capacity currently consumed.
     pub used_percent: f64,
 }
@@ -205,6 +211,8 @@ pub struct CertificateObservation {
 pub struct RegistryObservation {
     /// Node identifier which supplied the evidence.
     pub node_id: String,
+    /// Whether peer reachability and redundancy apply to this node.
+    pub clustered: bool,
     /// Whether the registry listener entered its serving loop.
     pub ready: bool,
     /// Whether peers can reach the selected listener.

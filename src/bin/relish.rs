@@ -399,6 +399,15 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Diagnose cluster health and correlate likely causes.
+    Wtf {
+        /// Scope application checks and log correlation to one app.
+        #[arg(long)]
+        app: Option<String>,
+        /// Re-run diagnosis every 30 seconds until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1472,6 +1481,16 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
+        Command::Wtf { app, watch } => {
+            return finish_outcome(
+                reliaburger::relish::wtf_cmd::run(reliaburger::relish::wtf_cmd::WtfArgs {
+                    app,
+                    watch,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
     };
 
     finish(result)
@@ -1683,6 +1702,31 @@ mod tests {
                 disruptive: true,
                 yes: true,
             } if path == std::path::Path::new("base.json")
+        ));
+    }
+
+    #[test]
+    fn parse_wtf_scope_watch_and_machine_output() {
+        let bare = parse(&["relish", "wtf"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Command::Wtf {
+                app: None,
+                watch: false
+            }
+        ));
+
+        let scoped = parse(&[
+            "relish", "--output", "json", "wtf", "--app", "payments", "--watch",
+        ])
+        .unwrap();
+        assert_eq!(scoped.output, OutputFormat::Json);
+        assert!(matches!(
+            scoped.command,
+            Command::Wtf {
+                app: Some(ref app),
+                watch: true
+            } if app == "payments"
         ));
     }
 

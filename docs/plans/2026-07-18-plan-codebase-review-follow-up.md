@@ -509,6 +509,10 @@ startup. M8 must add certificate expiry evidence and should not make
     capacity, actual cgroup throttled-time deltas and safe public node-leaf
     metadata. Partial inventories are degraded rather than green; host paths,
     certificate bodies and private material aren't serialised.
+  - [x] Authenticated cross-node `wtf` collection and CLI. Desired application
+    state prevents absent services from disappearing; bounded restart/deploy
+    stores remain degraded evidence; app scope, watch mode and the exact 0/1/2
+    exit contract are implemented.
 - [ ] Add certificate expiry evidence and production rotation/renewal before
   treating the TLS-expiry diagnostic as an accepted capability.
 

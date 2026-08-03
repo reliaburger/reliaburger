@@ -354,6 +354,7 @@ pub fn router_with_upgrade(
             get(cluster_capabilities_handler),
         )
         .route("/v1/diagnostics", get(diagnostics_handler))
+        .route("/v1/diagnostics/apps", get(desired_apps_handler))
         .route("/v1/test/leases", post(test_lease_create_handler))
         .route("/v1/test/leases/{id}", get(test_lease_get_handler))
         .route("/v1/test/leases/{id}/renew", post(test_lease_renew_handler))
@@ -712,6 +713,77 @@ async fn diagnostics_handler(
         cpu_throttling,
         certificates,
     })
+}
+
+/// `GET /v1/diagnostics/apps` — desired replicas and scheduler coverage.
+async fn desired_apps_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    let apps = if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        let live_nodes = match &state.membership {
+            Some(membership) => membership.read().await.len().max(1),
+            None => 1,
+        };
+        let mut apps = desired
+            .apps
+            .iter()
+            .map(
+                |(app_id, spec)| crate::bun::diagnostics::DesiredAppEvidence {
+                    app: app_id.name.clone(),
+                    namespace: app_id.namespace.clone(),
+                    desired_replicas: crate::bun::diagnostics::desired_replica_count(
+                        spec.replicas,
+                        live_nodes,
+                    ),
+                    scheduled_replicas: desired.scheduling.get(app_id).map_or(0, |placements| {
+                        placements.len().try_into().unwrap_or(u32::MAX)
+                    }),
+                    service_port: spec.port,
+                },
+            )
+            .collect::<Vec<_>>();
+        apps.sort_by(|left, right| {
+            (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app))
+        });
+        apps
+    } else {
+        let (response, receiver) = oneshot::channel();
+        if state
+            .cmd_tx
+            .send(AgentCommand::DesiredApps { response })
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "agent unavailable"})),
+            )
+                .into_response();
+        }
+        match receiver.await {
+            Ok(apps) => apps,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "agent dropped response"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response()
+}
+
+fn filter_desired_apps_for_scope(
+    mut apps: Vec<crate::bun::diagnostics::DesiredAppEvidence>,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> Vec<crate::bun::diagnostics::DesiredAppEvidence> {
+    apps.retain(|app| {
+        crate::sesame::auth::authorize_scoped(auth, &app.app, &app.namespace).is_ok()
+    });
+    apps
 }
 
 fn collected_capability_node_id(entry: &crate::bun::capabilities::CollectedNodeCapability) -> &str {
@@ -5811,6 +5883,35 @@ mod tests {
     use crate::grill::mock::MockGrill;
     use crate::grill::port::PortAllocator;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn desired_app_diagnostics_filter_to_the_token_scope() {
+        let auth = crate::sesame::auth::AuthContext {
+            token_name: "tenant-a".to_string(),
+            principal_id: "token:test".to_string(),
+            role: crate::sesame::types::ApiRole::ReadOnly,
+            scoped_apps: Some(vec!["api".to_string()]),
+            scoped_namespaces: Some(vec!["tenant-a".to_string()]),
+        };
+        let evidence = |app: &str, namespace: &str| crate::bun::diagnostics::DesiredAppEvidence {
+            app: app.to_string(),
+            namespace: namespace.to_string(),
+            desired_replicas: 1,
+            scheduled_replicas: 1,
+            service_port: Some(8080),
+        };
+
+        let visible = filter_desired_apps_for_scope(
+            vec![
+                evidence("api", "tenant-a"),
+                evidence("worker", "tenant-a"),
+                evidence("api", "tenant-b"),
+            ],
+            Some(&auth),
+        );
+
+        assert_eq!(visible, vec![evidence("api", "tenant-a")]);
+    }
 
     /// Start a test agent and return the router and shutdown handle.
     fn test_setup() -> (Router, CancellationToken) {

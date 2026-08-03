@@ -110,6 +110,10 @@ pub enum AgentCommand {
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
     },
+    /// Get the local desired application specs for standalone diagnostics.
+    DesiredApps {
+        response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
+    },
     /// Get status of run-to-completion workload instances.
     JobStatus {
         response: oneshot::Sender<Vec<JobStatus>>,
@@ -2574,6 +2578,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::Status { response } => {
                 let statuses = self.get_status().await;
                 let _ = response.send(statuses);
+            }
+            AgentCommand::DesiredApps { response } => {
+                let mut apps = self
+                    .deployed_specs
+                    .iter()
+                    .map(
+                        |((app, namespace), spec)| crate::bun::diagnostics::DesiredAppEvidence {
+                            app: app.clone(),
+                            namespace: namespace.clone(),
+                            desired_replicas: crate::bun::diagnostics::desired_replica_count(
+                                spec.replicas,
+                                1,
+                            ),
+                            scheduled_replicas: self
+                                .supervisor
+                                .list_instances()
+                                .iter()
+                                .filter(|instance| {
+                                    instance.app_name == *app && instance.namespace == *namespace
+                                })
+                                .count()
+                                .try_into()
+                                .unwrap_or(u32::MAX),
+                            service_port: spec.port,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                apps.sort_by(|left, right| {
+                    (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app))
+                });
+                let _ = response.send(apps);
             }
             AgentCommand::JobStatus { response } => {
                 let statuses = self.get_job_status();

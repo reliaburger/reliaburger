@@ -621,6 +621,27 @@ impl BunClient {
         .await
     }
 
+    /// Fetch desired application replicas and current scheduler coverage.
+    pub async fn desired_apps(
+        &self,
+    ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, RelishError> {
+        self.get_typed_json("/v1/diagnostics/apps").await
+    }
+
+    /// Fetch structured, cluster-aware recent log entries for one application.
+    pub async fn log_entries(
+        &self,
+        app: &str,
+        namespace: &str,
+        tail: usize,
+        start: u64,
+    ) -> Result<crate::ketchup::types::LogQueryResult, RelishError> {
+        self.get_typed_json(&format!(
+            "/v1/logs/query/{app}/{namespace}?tail={tail}&start={start}"
+        ))
+        .await
+    }
+
     /// Fetch deploy history for an app in a namespace.
     pub async fn deploy_history(
         &self,

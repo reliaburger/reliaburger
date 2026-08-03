@@ -1350,14 +1350,15 @@ convergence and adoption" theme under 12b.6).
     deletion/eviction ownership.
     Bun independently marks and authorises every capacity apply: durable lease,
     Admin, `saturate_capacity` and protected-cluster policy all have to agree.
-- [ ] `relish wtf` (automated cluster health diagnosis)
+- [x] `relish wtf` (automated cluster health diagnosis)
   - [x] Schema-v1 pure diagnosis engine with separate critical, warning,
     unknown and OK outcomes; timestamped crashloop detection, deploy/log
     correlation and honest evidence requirements for all catalogue checks
   - [x] Authenticated schema-v1 local telemetry: configured storage-domain
     capacity, bounded cgroup throttled-time deltas and public node-certificate
     metadata without paths, certificate bodies or key material
-  - [ ] Authenticated cross-node collection, rendering and CLI exit contract
+  - [x] Authenticated cross-node collection with ten-second bounds, desired-app
+    and service evidence, rendering, app scope, watch mode and 0/1/2 exit contract
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
