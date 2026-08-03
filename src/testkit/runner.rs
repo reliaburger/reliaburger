@@ -477,7 +477,7 @@ fn profile_requires_case(
 /// Built from `OffsetDateTime`'s accessors rather than the `formatting`
 /// feature, which the `time` dependency doesn't enable — the accessors are
 /// always available, the format string is not.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let now = time::OffsetDateTime::now_utc();
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",

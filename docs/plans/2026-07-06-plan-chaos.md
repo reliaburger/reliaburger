@@ -438,7 +438,7 @@ pub struct TestCaseResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestReport {
-    pub schema_version: u32,             // 1
+    pub schema_version: u32,             // 2
     pub started_at: String,              // RFC 3339
     pub duration_ms: u64,
     pub cluster_nodes: u32,
@@ -524,13 +524,14 @@ Polling helpers use a 500 ms interval and the context deadline; every HTTP call 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchReport {
-    pub schema_version: u32,             // 1
+    pub schema_version: u32,             // 2
     pub started_at: String,
     pub duration_ms: u64,
     pub cluster_nodes: u32,
     pub quick: bool,
     pub metrics: Vec<BenchMetric>,
     pub skipped: Vec<SkippedSuite>,      // { name, reason }
+    pub failed: Vec<FailedSuite>,        // { name, reason }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -557,7 +558,11 @@ pub struct Comparison {
 pub fn compare(baseline: &BenchReport, current: &BenchReport, threshold: f64) -> Comparison;
 ```
 
-Baseline file = a previous `relish bench --output json` capture, verbatim. Reject `schema_version != 1` with a clear error.
+Baseline file = a previous `relish bench --output json` capture, verbatim.
+Schema 2 adds a first-class `failed` list: a suite which started and timed out,
+panicked, hit an API error or lost cleanup evidence is not a preflight skip.
+Reject any other schema, unknown field or report containing failed suites
+before calculating a regression verdict.
 
 ### 7.5 Wtf types — `src/relish/wtf.rs` (structs match `docs/design/cli-relish.md` §4, with one deviation)
 
@@ -754,6 +759,26 @@ Report: chaos results are ordinary `TestCaseResult`s inside a `TestReport` with 
 
 ### 7.9 The bench suites
 
+> **Deviation recorded during step 16.** The implementation reserves
+> `rbtest-bench-*` namespaces because the durable lease boundary deliberately
+> rejects the old unowned `rbbench-*` prefix. Every suite gets a separate
+> lease; capacity allocates additional leases before the 128-resource ceiling,
+> and the runner retains every id outside the abortable suite task. A timeout
+> is `failed`, never `skipped`.
+>
+> The discovery sample is an actual `nslookup` executed in the source
+> workload, not `GET /v1/resolve`. Network throughput executes `wget` there
+> against `target.namespace.internal`, so both DNS and the service VIP stay in
+> the measured path. Reconstruction is omitted unless the operator supplies
+> `--disruptive --yes`; capacity requires `--capacity --yes`.
+>
+> Pickle still has no leased image-delete or cache-eviction API. Pushing a
+> fresh 16 MiB repository on every run would leak durable catalogue data, so
+> `image_distribution` instead times the digest-pinned multi-architecture OCI
+> daemonset to Running on every node and fingerprints its uncontrolled current
+> cache state. A deterministic cold-cache Pickle replication benchmark remains
+> blocked on that ownership API; the metric doesn't pretend otherwise.
+
 Client-side orchestration in `src/testkit/bench/suites.rs`, all through public APIs, each suite returning `Vec<BenchMetric>` or a skip reason. Namespace `rbbench-{run_id}`; teardown always.
 
 | # | Metric name | Unit | higher_is_better | How | `--quick` |
@@ -766,7 +791,7 @@ Client-side orchestration in `src/testkit/bench/suites.rs`, all through public A
 | 6 | `image_distribution` | s | no | Requires `Registry` (+replication wired): push ~16 MiB synthetic image, time until N nodes hold it. Skip until review L10 lands. | skipped |
 | 7 | `cluster_capacity` | apps | yes | Only with explicit `--capacity` flag (deviation from design doc — deliberately saturating a cluster must be opt-in; note it in cli-relish.md): deploy minimal apps until scheduling fails; count; tear down. | never |
 
-Rules: p-quantiles computed on sorted samples (no interpolation needed at these sizes); every suite has a hard `tokio::time::timeout` budget (5 min full, 60 s quick) — a suite that overruns reports itself skipped with reason "timed out", the harness moves on.
+Rules: p-quantiles computed on sorted samples (no interpolation needed at these sizes); every suite has a hard `tokio::time::timeout` budget (5 min full, 60 s quick). A suite that overruns records a failure, the harness aborts its task, reverses exact owned faults, releases all leases, then moves on.
 
 ---
 
@@ -944,7 +969,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 13b/20 authenticated target-node distribution
 - [x] 14/20 chaos suite
 - [x] 15/20 bench schema + comparison
-- [ ] 16/20 bench suites
+- [x] 16/20 bench suites
 - [ ] 17/20 wtf engine
 - [ ] 18/20 `relish wtf` CLI
 - [ ] 19/20 trace endpoint
@@ -988,3 +1013,11 @@ independent runc nodes; pretending three Bun processes sharing one host cgroup
 are three node-pressure domains would weaken C4 rather than validate it. Run
 the catalogue on three real nodes (or three independent VMs) before checking
 the final acceptance item.
+
+**3 August 2026, step 16 implementation.** The 19 focused benchmark library
+tests pass with default and no-default features; the Relish parser test and
+all-target/all-feature Clippy pass. The runner's unit evidence covers
+nearest-rank p99, medians, strict hosted/topology fingerprints, explicit risk
+gates, timeout-as-failure and retained cleanup errors. A real multi-node
+`relish bench --quick` and disruptive/capacity acceptance run remains open in
+the final runbook.

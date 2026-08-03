@@ -800,6 +800,8 @@ relish bench --quick                        # Abbreviated suite for CI (~2 min)
 relish bench --compare <file>               # Compare against baseline
 relish bench --quick --compare <file>       # Quick bench with regression check
 relish bench --output json                  # Machine-readable results
+relish bench --disruptive --yes              # Include real leader failure
+relish bench --capacity --yes                # Saturate with leased minimal apps
 
 # Kubernetes migration
 relish import -f <path>                     # Convert K8s YAML to Reliaburger TOML
@@ -1277,8 +1279,8 @@ target, type and duration.
 
 **`relish bench`**
 
-Deploys owned benchmark workloads, measures the public data plane, tears down,
-and produces a schema-versioned report. Measures: scheduler throughput,
+Deploys leased benchmark workloads, measures the public data plane, confirms
+teardown, and produces a schema-versioned report. Measures: scheduler throughput,
 service discovery latency, network throughput, deploy speed, state
 reconstruction time, image distribution speed and, only when explicitly
 requested, cluster capacity.
@@ -1292,10 +1294,25 @@ greater than 10%. It lists missing metrics rather than inventing a comparison.
 Comparison deliberately permits different binary versions and Git SHAs: that
 is usually what we are measuring. It refuses unlike topology, target/profile,
 runtime, rootless mode, kernel, architecture, quick/capacity mode, units,
-direction or workload parameters. Schema 1 rejects unknown fields instead of
+direction or workload parameters. Schema 2 rejects unknown fields instead of
 silently misreading them. If either report identifies a hosted environment,
 the changes remain visible but the verdict is informational; noisy shared
 workers must not turn a release red.
+
+Preflight omissions such as a missing optional capability remain typed skips.
+Once a suite starts, a timeout, panic, API error or unconfirmed cleanup is a
+failure and makes the command exit 1. DNS latency comes from `nslookup` inside
+a source workload. Network throughput runs `wget` there against the
+destination's fully-qualified `.internal` name, crossing the service VIP
+rather than a backend host port.
+
+The reconstruction suite kills the observed council leader, so it runs only
+with `--disruptive --yes` and available server-owned node-failure authority.
+The capacity suite needs `--capacity --yes`. Those flags record intent; they
+don't expand server policy or API roles. Relish marks each saturating apply
+with a dedicated acknowledgement header; Bun requires a durable lease, Admin,
+`saturate_capacity` and the protected-cluster mutation gate before accepting
+it. A plain leased apply cannot accidentally enter the capacity path.
 
 #### Kubernetes Migration
 

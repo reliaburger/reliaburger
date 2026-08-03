@@ -1332,13 +1332,24 @@ convergence and adoption" theme under 12b.6).
   production override. The runner and case task share exact fault-id ownership,
   refresh capability evidence before each destructive case and reverse only
   their own faults after pass, failure, timeout or panic
-- [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
+- [x] `relish bench` (scheduler, service data plane, network, deploy, state reconstruction benchmarks)
   - [x] Versioned report and comparison contract: topology and per-node
     build/runtime/kernel fingerprints, metric-method parameters, strict schema
     parsing, direction-aware >10% changes, explicit missing metrics and
     compatibility refusal. Different version/Git SHA is comparable; noisy
     hosted runs are marked informational.
-  - [ ] Public-API benchmark suites and CLI orchestration.
+  - [x] Public-API benchmark suites and CLI orchestration: one durable lease
+    per suite (and additional bounded leases for capacity), 60/300-second
+    inherited deadlines, panic/timeout-safe fault and resource cleanup, and
+    schema-v2 failed-suite evidence. Discovery runs `nslookup` inside a source
+    workload; throughput runs `wget` from there through `.internal` DNS and
+    the service VIP. Leader reconstruction requires `--disruptive --yes`;
+    capacity requires `--capacity --yes`. The image metric honestly records
+    the current cache state of the pinned multi-architecture OCI daemonset;
+    deterministic cold-cache Pickle replication still needs leased image
+    deletion/eviction ownership.
+    Bun independently marks and authorises every capacity apply: durable lease,
+    Admin, `saturate_capacity` and protected-cluster policy all have to agree.
 - [ ] `relish wtf` (automated cluster health diagnosis)
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
@@ -1474,6 +1485,9 @@ convergence and adoption" theme under 12b.6).
   - [x] Fingerprinted benchmark report and comparison contract: exact schema,
     topology and per-node build/runtime/kernel evidence, direction-aware
     thresholds, metric-method compatibility and informational hosted results.
+  - [x] Seven-suite benchmark runner and CLI: real source-workload DNS/service
+    paths, strict failed-versus-skipped outcomes, fresh preflight evidence,
+    explicit destructive consent and unconditional server-owned cleanup.
 
 ### Optional
 

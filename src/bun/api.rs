@@ -1654,6 +1654,8 @@ async fn cluster_elect_handler(
 /// Returns a Server-Sent Events stream. Each event's `data` field
 /// contains a JSON-serialised `ApplyEvent`. The stream ends after
 /// the `Complete` or `Error` event.
+const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
+
 async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -1697,6 +1699,39 @@ async fn apply_handler(
         },
         None => None,
     };
+    let capacity_probe = match headers.get(CAPACITY_PROBE_HEADER) {
+        Some(value) if value.as_bytes() == b"acknowledged" => true,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "x-reliaburger-capacity-probe must equal acknowledged",
+            )
+                .into_response();
+        }
+        None => false,
+    };
+    if capacity_probe && lease_id.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "capacity probe requires x-reliaburger-test-lease",
+        )
+            .into_response();
+    }
+    if capacity_probe {
+        let Some(auth) = auth.as_deref() else {
+            return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+        };
+        if let Err(error) = state.static_capabilities.test_policy.authorise(
+            crate::testkit::safety::OperationPermission::SaturateCapacity,
+            &crate::testkit::safety::OperationAuthorisation {
+                principal: &auth.token_name,
+                role: auth.role,
+                acknowledged: true,
+            },
+        ) {
+            return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+        }
+    }
     let mut lease_owner_id = None;
     if let Some(lease_id) = &lease_id {
         if !config.job.is_empty() || !config.permission.is_empty() || !config.build.is_empty() {
@@ -1910,6 +1945,9 @@ async fn cluster_apply(
             .body(raw_body);
         if let Some(lease_id) = &lease_id {
             request = request.header("x-reliaburger-test-lease", lease_id);
+            if let Some(value) = caller_headers.get(CAPACITY_PROBE_HEADER) {
+                request = request.header(CAPACITY_PROBE_HEADER, value.as_bytes());
+            }
             for name in [
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::COOKIE,
@@ -5993,6 +6031,21 @@ mod tests {
         }
     }
 
+    fn capacity_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
+        crate::bun::capabilities::StaticCapabilities {
+            test_policy: crate::testkit::safety::ClusterTestPolicy {
+                safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+                allowed_operations: std::collections::BTreeSet::from([
+                    crate::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
+                    crate::testkit::safety::OperationPermission::SaturateCapacity,
+                ]),
+                max_lease_seconds: 60,
+                ..crate::testkit::safety::ClusterTestPolicy::default()
+            },
+            ..crate::bun::capabilities::StaticCapabilities::default()
+        }
+    }
+
     fn node_fault_static_capabilities() -> crate::bun::capabilities::StaticCapabilities {
         crate::bun::capabilities::StaticCapabilities {
             test_policy: crate::testkit::safety::ClusterTestPolicy {
@@ -6605,6 +6658,95 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn capacity_apply_requires_admin_and_server_capacity_grant() {
+        let (deployer_token, deployer_plaintext) =
+            a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (deployer_app, deployer_shutdown) = setup_with_auth_readiness_and_leases(
+            vec![deployer_token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            capacity_static_capabilities(),
+            None,
+        )
+        .await;
+        let (_, body) = post_authenticated(
+            deployer_app.clone(),
+            "/v1/test/leases",
+            &deployer_plaintext,
+            r#"{"ttl_seconds":30}"#,
+            None,
+        )
+        .await;
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        let (status, _) = post_capacity_apply(
+            deployer_app,
+            &deployer_plaintext,
+            &lease.lease_id,
+            &lease.namespace,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        deployer_shutdown.cancel();
+
+        let (ungranted_token, ungranted_plaintext) =
+            a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (ungranted_app, ungranted_shutdown) = setup_with_auth_readiness_and_leases(
+            vec![ungranted_token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+        )
+        .await;
+        let (_, body) = post_authenticated(
+            ungranted_app.clone(),
+            "/v1/test/leases",
+            &ungranted_plaintext,
+            r#"{"ttl_seconds":30}"#,
+            None,
+        )
+        .await;
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        let (status, _) = post_capacity_apply(
+            ungranted_app,
+            &ungranted_plaintext,
+            &lease.lease_id,
+            &lease.namespace,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        ungranted_shutdown.cancel();
+
+        let (admin_token, admin_plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (admin_app, admin_shutdown) = setup_with_auth_readiness_and_leases(
+            vec![admin_token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            capacity_static_capabilities(),
+            None,
+        )
+        .await;
+        let (_, body) = post_authenticated(
+            admin_app.clone(),
+            "/v1/test/leases",
+            &admin_plaintext,
+            r#"{"ttl_seconds":30}"#,
+            None,
+        )
+        .await;
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        let (status, body) = post_capacity_apply(
+            admin_app,
+            &admin_plaintext,
+            &lease.lease_id,
+            &lease.namespace,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        admin_shutdown.cancel();
     }
 
     #[tokio::test]
@@ -8551,6 +8693,32 @@ mod tests {
         }
         let response = app
             .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, body.to_vec())
+    }
+
+    async fn post_capacity_apply(
+        app: Router,
+        bearer: &str,
+        lease_id: &str,
+        namespace: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/apply")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("x-reliaburger-test-lease", lease_id)
+                    .header("x-reliaburger-capacity-probe", "acknowledged")
+                    .body(Body::from(format!(
+                        "[app.capacity]\nimage = \"test:v1\"\nnamespace = \"{namespace}\"\n"
+                    )))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = response.status();

@@ -817,6 +817,15 @@ policy doesn't grant `provision_isolated_workloads`, `alter_node_state` and
 capability evidence after entering the serial queue and records exact fault
 ids for panic- and timeout-safe reversal; uncertain cleanup is `Unknown`.
 
+`relish bench` is implemented too. It creates a separate durable lease per
+suite, measures deployment and scheduling through public APIs, executes real
+DNS queries and service-VIP transfers from a source container, and cleans up
+after success, error, panic or timeout. Use `--quick --output json` for a
+baseline and `--compare <file>` for a strict direction-aware comparison.
+Leader reconstruction needs `--disruptive --yes`; capacity saturation needs
+`--capacity --yes`. Server policy still decides whether either operation may
+run.
+
 Workload faults are opt-in too. Injection needs a Deployer-or-higher
 credential, explicit `--acknowledge`, and this server policy:
 

@@ -154,6 +154,9 @@ fn validate_report(which: &'static str, report: &BenchReport) -> Result<(), Benc
     if report.environment.topology.node_count == 0 {
         return invalid(which, "topology has zero nodes");
     }
+    if !report.failed.is_empty() {
+        return invalid(which, "one or more benchmark suites failed");
+    }
     let mut names = BTreeSet::new();
     for metric in &report.metrics {
         if metric.name.is_empty() {
@@ -337,6 +340,7 @@ mod tests {
             },
             metrics,
             skipped: Vec::new(),
+            failed: Vec::new(),
         }
     }
 
@@ -473,5 +477,13 @@ mod tests {
         unknown.environment.unknown_nodes.push("node-b".to_string());
         let error = compare(&baseline, &unknown, 0.10).unwrap_err();
         assert!(error.to_string().contains("unknown node"), "{error}");
+
+        let mut failed = report(vec![metric("latency", 100.0, false)]);
+        failed.failed.push(crate::testkit::bench::FailedSuite {
+            name: "network_throughput".to_string(),
+            reason: "timed out".to_string(),
+        });
+        let error = compare(&failed, &baseline, 0.10).unwrap_err();
+        assert!(error.to_string().contains("suites failed"), "{error}");
     }
 }

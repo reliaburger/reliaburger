@@ -381,6 +381,24 @@ enum Command {
         #[arg(long)]
         namespace: Option<String>,
     },
+    /// Run reproducible performance benchmarks against the real data plane.
+    Bench {
+        /// Abbreviated suite for development and CI.
+        #[arg(long)]
+        quick: bool,
+        /// Compare with a previous JSON benchmark report.
+        #[arg(long)]
+        compare: Option<PathBuf>,
+        /// Deliberately schedule minimal workloads until the cluster is full.
+        #[arg(long, requires = "yes")]
+        capacity: bool,
+        /// Include the leader-failure reconstruction benchmark.
+        #[arg(long, requires = "yes")]
+        disruptive: bool,
+        /// Acknowledge capacity saturation and disruptive benchmark effects.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1435,6 +1453,25 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
+        Command::Bench {
+            quick,
+            compare,
+            capacity,
+            disruptive,
+            yes,
+        } => {
+            return finish_outcome(
+                reliaburger::relish::bench_cmd::run(reliaburger::relish::bench_cmd::BenchArgs {
+                    quick,
+                    compare,
+                    capacity,
+                    disruptive,
+                    yes,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
     };
 
     finish(result)
@@ -1608,6 +1645,45 @@ mod tests {
             }
             _ => panic!("expected a Test command"),
         }
+    }
+
+    #[test]
+    fn parse_bench_command_defaults_and_explicit_risk_flags() {
+        let bare = parse(&["relish", "bench"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Command::Bench {
+                quick: false,
+                compare: None,
+                capacity: false,
+                disruptive: false,
+                yes: false,
+            }
+        ));
+        assert!(parse(&["relish", "bench", "--capacity"]).is_err());
+        assert!(parse(&["relish", "bench", "--disruptive"]).is_err());
+
+        let full = parse(&[
+            "relish",
+            "bench",
+            "--quick",
+            "--compare",
+            "base.json",
+            "--capacity",
+            "--disruptive",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            full.command,
+            Command::Bench {
+                quick: true,
+                compare: Some(ref path),
+                capacity: true,
+                disruptive: true,
+                yes: true,
+            } if path == std::path::Path::new("base.json")
+        ));
     }
 
     #[test]

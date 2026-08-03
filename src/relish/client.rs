@@ -382,7 +382,7 @@ impl BunClient {
     /// stderr as they arrive; the final `Complete` event is returned
     /// as an `ApplyResult`.
     pub async fn apply(&self, config: &Config) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, None).await
+        self.apply_request(config, None, false).await
     }
 
     /// Deploy apps under a server-owned Phase 15 resource lease.
@@ -391,13 +391,23 @@ impl BunClient {
         config: &Config,
         lease_id: &str,
     ) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, Some(lease_id)).await
+        self.apply_request(config, Some(lease_id), false).await
+    }
+
+    /// Deploy a deliberately saturating app under both lease and capacity policy.
+    pub async fn apply_capacity_with_lease(
+        &self,
+        config: &Config,
+        lease_id: &str,
+    ) -> Result<ApplyResult, RelishError> {
+        self.apply_request(config, Some(lease_id), true).await
     }
 
     async fn apply_request(
         &self,
         config: &Config,
         lease_id: Option<&str>,
+        capacity_probe: bool,
     ) -> Result<ApplyResult, RelishError> {
         let url = format!("{}/v1/apply", self.base_url);
         let toml_str = toml::to_string_pretty(config).map_err(|e| RelishError::ApiError {
@@ -408,6 +418,9 @@ impl BunClient {
         let mut request = self.client.post(&url).body(toml_str);
         if let Some(lease_id) = lease_id {
             request = request.header("x-reliaburger-test-lease", lease_id);
+        }
+        if capacity_probe {
+            request = request.header("x-reliaburger-capacity-probe", "acknowledged");
         }
         let response = request.send().await.map_err(classify_error)?;
 

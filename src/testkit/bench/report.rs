@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::bun::capabilities::{BuildFingerprint, RuntimeFingerprint};
 
 /// Current `relish bench --output json` schema.
-pub const BENCH_SCHEMA_VERSION: u32 = 1;
+pub const BENCH_SCHEMA_VERSION: u32 = 2;
 
 /// One node's reproducibility identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,19 @@ pub struct SkippedSuite {
     pub reason: String,
 }
 
+/// A suite which started but did not produce trustworthy evidence.
+///
+/// Unlike [`SkippedSuite`], this is a failed run: timeouts, API errors and
+/// unconfirmed cleanup belong here and must make `relish bench` exit non-zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedSuite {
+    /// Stable suite name, matching the metric it would have produced.
+    pub name: String,
+    /// Execution or cleanup failure which made a metric untrustworthy.
+    pub reason: String,
+}
+
 /// Complete benchmark result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,6 +93,7 @@ pub struct BenchReport {
     pub environment: BenchEnvironment,
     pub metrics: Vec<BenchMetric>,
     pub skipped: Vec<SkippedSuite>,
+    pub failed: Vec<FailedSuite>,
 }
 
 #[cfg(test)]
@@ -119,6 +133,10 @@ mod tests {
                 name: "cluster_capacity".to_string(),
                 reason: "requires --capacity".to_string(),
             }],
+            failed: vec![FailedSuite {
+                name: "reconstruction_time".to_string(),
+                reason: "timed out after 60s".to_string(),
+            }],
         }
     }
 
@@ -135,6 +153,14 @@ mod tests {
             serde_json::json!("50")
         );
         assert_eq!(serde_json::from_value::<BenchReport>(json).unwrap(), report);
+    }
+
+    #[test]
+    fn failed_suites_are_distinct_from_preflight_skips() {
+        let json = serde_json::to_value(report()).unwrap();
+
+        assert_eq!(json["skipped"][0]["name"], "cluster_capacity");
+        assert_eq!(json["failed"][0]["name"], "reconstruction_time");
     }
 
     #[test]

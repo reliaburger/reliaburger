@@ -1,3 +1,4 @@
+pub mod bench_cmd;
 /// Relish CLI library.
 ///
 /// Separates CLI logic from the binary so it can be tested as a library.

@@ -112,6 +112,7 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 make test                    # run the portable nextest suite
 make audit                   # reject new RustSec dependency findings
 relish test --profile development # run the 39-case live-cluster catalogue
+relish bench --quick --output json # benchmark real DNS and service data paths
 make examples                # validate and dry-run every example config
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
@@ -134,7 +135,11 @@ green skips. Workload injection is opt-in through the server-owned
 `inject_workload_faults` operation, needs explicit operator acknowledgement,
 and records structured audit events attributed to the authenticated
 credential. Reversal keeps the matching role and grant but doesn't require a
-destructive acknowledgement. The benchmark harness is the next Phase 15 block.
+destructive acknowledgement. `relish bench` now runs seven public-API suites
+under server-owned leases. Its DNS and throughput measurements originate
+inside a source workload, strict environment fingerprints prevent unlike
+comparisons, and hosted-runner changes stay informational. Started-suite
+timeouts and uncertain cleanup fail instead of becoming green skips.
 
 ## Licence
 

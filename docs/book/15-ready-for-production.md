@@ -1787,7 +1787,7 @@ hosted environment, we still calculate and show regressions, but mark the
 whole comparison informational. A shared CI worker shouldn't veto a release
 because somebody else's job woke up at the wrong moment.
 
-The JSON parser is deliberately strict. `schema_version` is 1 and every report
+The JSON parser is deliberately strict. `schema_version` is 2 and every report
 type rejects unknown fields. An additive change therefore needs a schema bump
 instead of being silently ignored by an older Relish. Duplicate metric names,
 zero samples, negative or non-finite values and unknown node fingerprints also
@@ -1805,3 +1805,69 @@ representation for infinity, so `change_percent` is `Option<f64>`: `Some(x)`
 for a finite percentage and `None` (JSON `null`) for a zero baseline. The
 directional result still works from the raw values. We keep the evidence
 without producing invalid JSON. Tiny type, useful constraint.
+
+## Measure the journey, not the shortcut
+
+Our first benchmark sketch timed service discovery with the resolve API. It
+timed an HTTP handler and a map lookup. Useful perhaps, but it didn't answer
+the question an application cares about: how long does a DNS query from my
+container take?
+
+The same shortcut appeared in the network test. Fetching a backend's published
+host port bypasses the service name, VIP and packet redirection. A wonderfully
+fast result would merely prove that we hadn't measured Reliaburger.
+
+The implemented paths are more prosaic:
+
+1. deploy a source BusyBox container under a server-owned lease;
+2. execute `nslookup target.namespace.internal` inside it for discovery;
+3. execute `wget` against that name for throughput; and
+4. let the request cross Onion's service VIP before it reaches a backend.
+
+The number includes process-exec overhead. That's deliberate and recorded in
+the metric's `parameters` map, so it can't be compared with a future raw-socket
+method by accident. If exec overhead dominates the result, the next honest
+step is a small benchmark client inside the pinned image. Switching back to
+the control API isn't.
+
+Every suite has a 60-second quick deadline or a five-minute full deadline. The
+runner starts the suite with `tokio::spawn`, then waits with
+`tokio::time::timeout`. A `JoinHandle<T>` is Tokio's owned reference to a
+spawned task. Awaiting it produces either the task's value or a `JoinError`
+(for example, when the task panics).
+
+Dropping a `JoinHandle` does not cancel its task. That catches people coming
+from ordinary scoped threads, and it would be dangerous here: a timed-out
+capacity probe could keep creating workloads in the background. The runner
+calls `abort()` and then awaits the handle so cancellation has actually
+settled.
+
+Now, the awkward bit. Aborting the suite also prevents its local cleanup code
+from running. We keep lease IDs and chaos fault IDs in cloned guards outside
+the task. The server persists each lease, while the client guard uses an
+`Arc<Mutex<Vec<_>>>` for IDs added during the run. After success, error, panic
+or timeout, the runner reverses exact owned faults and asks Bun to release
+every lease. It accepts a metric only after both cleanup paths are confirmed.
+
+This is why schema 2 has both `skipped` and `failed`. A missing optional
+capability discovered before provisioning is a skip. Once a suite starts, a
+timeout, API error, panic or uncertain cleanup is a failure. Calling the latter
+a skip would make the report look healthier as the system became less
+responsive. That's quite a trick, but not a useful one.
+
+Two probes need another lock. State reconstruction really kills the observed
+council leader, so it needs `--disruptive --yes`. Capacity deliberately fills
+the scheduler with one-millicore, one-mebibyte workloads and needs
+`--capacity --yes`. These flags record the operator's intent. The authenticated
+role and server-owned operation policy still decide whether anything happens.
+Relish adds a dedicated capacity-probe header to each saturating apply. Bun
+accepts it only with a live lease, Admin role, `saturate_capacity` and the
+protected-cluster mutation gate. The client isn't its own safety authority.
+
+Image distribution has one remaining caveat. Pickle doesn't yet provide
+lease-owned manifest deletion or deterministic cache eviction. Pushing a
+fresh 16 MiB image per run would leave permanent catalogue entries. Instead,
+the current metric deploys the pinned multi-architecture image once per node
+and records `cache_state = uncontrolled`. That measures current image
+availability, not a clean cold-cache replication experiment. The report says
+so. We can build the stronger benchmark after we can clean up its evidence.
