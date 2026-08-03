@@ -505,6 +505,10 @@ startup. M8 must add certificate expiry evidence and should not make
   - [x] Pure `wtf` diagnosis engine. Timestamped restart events and real active
     deploy operations drive its crashloop/deploy correlation; every unavailable
     or unsupported source produces `Unknown` and can never produce an OK row.
+  - [x] Authenticated local diagnostic telemetry for attributed storage
+    capacity, actual cgroup throttled-time deltas and safe public node-leaf
+    metadata. Partial inventories are degraded rather than green; host paths,
+    certificate bodies and private material aren't serialised.
 - [ ] Add certificate expiry evidence and production rotation/renewal before
   treating the TLS-expiry diagnostic as an accepted capability.
 

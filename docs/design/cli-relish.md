@@ -1005,6 +1005,17 @@ The key differentiator: `wtf` doesn't just enumerate problems. It correlates the
 Exit codes: 0 (all observed checks OK), 1 (criticals found), 2 (warnings or
 unknown evidence only).
 
+The authenticated `GET /v1/diagnostics` endpoint supplies local evidence that
+doesn't belong in the general metrics summary. It samples cgroup v2
+`throttled_usec` twice over a bounded 1–10 second window, attributes configured
+data, image, log, metric and volume paths to their containing filesystems, and
+returns public X.509 identity, issuer, serial and expiry metadata. Host paths,
+certificate bodies and key material never cross the API. A partial inventory
+uses `degraded`, carrying both the safe facts and the reason they can't support
+an OK verdict. Node leaves currently require a Bun restart to reload, so
+certificate rotation remains Unknown even when the leaf itself has plenty of
+validity left.
+
 #### Forensics Commands
 
 **`relish history <app>`**

@@ -10,6 +10,7 @@ pub mod batch;
 pub mod build_runner;
 pub mod capabilities;
 pub mod deploy_operations;
+pub mod diagnostics;
 pub mod disk_pressure;
 pub mod events;
 pub mod gpu;

@@ -610,17 +610,32 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
         .collected_at
         .saturating_add(CERTIFICATE_WARNING_SECONDS);
     let mut found = false;
-    for certificate in certificates
-        .iter()
-        .filter(|certificate| certificate.not_after <= warning_at)
-    {
+    let mut rotation_complete = true;
+    for certificate in certificates {
+        if !certificate.automatic_rotation {
+            rotation_complete = false;
+        }
+        let rotation_unhealthy = matches!(
+            certificate.rotation_state.as_str(),
+            "needs_rotation" | "grace_period" | "expired"
+        );
+        // Short-lived workload leaves are expected to have less than 14 days
+        // remaining. Warn only when their automatic rotation is unhealthy.
+        if certificate.not_after > warning_at
+            || (certificate.automatic_rotation && !rotation_unhealthy)
+        {
+            continue;
+        }
         found = true;
         let remaining = certificate.not_after.saturating_sub(inputs.collected_at);
         report.warnings.push(WtfFinding {
             id: "cert-expiring".to_string(),
             title: format!("certificate for {} expires soon", certificate.identity),
             details: vec![format!(
-                "expires in {} days; rotation state: {}",
+                "{} certificate from {} (serial {}) expires in {} days; rotation state: {}",
+                certificate.certificate_kind,
+                certificate.issuer,
+                certificate.serial,
                 remaining / (24 * 60 * 60),
                 certificate.rotation_state
             )],
@@ -632,7 +647,19 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
             affected_resource: format!("identity.{}", certificate.identity),
         });
     }
-    if !found {
+    if !rotation_complete
+        && !report
+            .unknown
+            .iter()
+            .any(|unknown| unknown.source == "certificates")
+    {
+        report.unknown.push(WtfUnknown {
+            source: "certificate_rotation".to_string(),
+            reason: "at least one certificate consumer cannot hot-rotate its leaf".to_string(),
+            affected_resource: "cluster".to_string(),
+        });
+    }
+    if !found && rotation_complete {
         report.ok.push(WtfOk {
             id: "certificates".to_string(),
             description: "all observed certificates are valid for at least 14 days".to_string(),
@@ -718,9 +745,13 @@ mod tests {
                     used_percent: 20.0,
                 }]),
                 certificates: available(vec![CertificateObservation {
+                    certificate_kind: "node".to_string(),
                     identity: "node-1".to_string(),
+                    issuer: "CN=node-ca".to_string(),
+                    serial: "01".to_string(),
                     not_after: NOW + 30 * 24 * 60 * 60,
-                    rotation_state: "current".to_string(),
+                    rotation_state: "valid".to_string(),
+                    automatic_rotation: true,
                 }]),
                 registry: available(vec![RegistryObservation {
                     node_id: "node-1".to_string(),
@@ -978,9 +1009,13 @@ mod tests {
             window_seconds: 60,
         }]);
         inputs.cluster.certificates = available(vec![CertificateObservation {
+            certificate_kind: "node".to_string(),
             identity: "node-1".to_string(),
+            issuer: "CN=node-ca".to_string(),
+            serial: "01".to_string(),
             not_after: NOW + 2 * 24 * 60 * 60,
             rotation_state: "retrying".to_string(),
+            automatic_rotation: false,
         }]);
         inputs.cluster.registry = available(vec![RegistryObservation {
             node_id: "node-1".to_string(),

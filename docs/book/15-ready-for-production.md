@@ -1879,11 +1879,12 @@ never managed to read certificate metadata. That's not healthy. It's a blank
 space wearing a green hat.
 
 The diagnosis engine therefore accepts an evidence snapshot rather than a
-pile of convenient values. Each source has one of three states:
+pile of convenient values. Each source has one of four states:
 
 ```rust
 enum Evidence<T> {
     Available { observed_at: u64, value: T },
+    Degraded { observed_at: u64, value: T, reason: String },
     Unavailable { reason: String },
     Unsupported { reason: String },
 }
@@ -1895,11 +1896,12 @@ value a particular source returns. `Evidence<Vec<NodeObservation>>` and
 turning their very different data into untyped JSON. The compiler still knows
 which value belongs where.
 
-`Unavailable` means the source should work but didn't answer. `Unsupported`
-means we don't yet expose the fact needed for an honest verdict. Both produce
-an `Unknown` report entry. Neither produces OK. This sounds fussy until a
-diagnostic command is the thing you reach for during an outage. Then it's the
-whole point.
+`Degraded` carries facts we can still use, plus the reason the inventory isn't
+complete. `Unavailable` means the source should work but didn't answer.
+`Unsupported` means we don't yet expose the fact needed for an honest verdict.
+All three produce an `Unknown` report entry. None produces OK. This sounds
+fussy until a diagnostic command is the thing you reach for during an outage.
+Then it's the whole point.
 
 The snapshot also supplies `collected_at`. The pure function
 `diagnose(&WtfInputs)` never reads the wall clock or makes a network request.
@@ -1930,3 +1932,40 @@ Finally, application scope is structural. `relish wtf --app api` runs app
 checks and filters alerts, restarts, services and deploys to `api`; it doesn't
 manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
 Unknown means missing required evidence. It doesn't mean "we chose not to ask".
+
+## A small diagnostic surface
+
+Mayo already records CPU usage. Could `wtf` call an application throttled when
+that number reaches its configured limit? No. A busy process can use its full
+entitlement without the kernel ever delaying it, while a bursty process can
+accumulate throttled time between ordinary usage samples. They are different
+facts.
+
+Bun's authenticated `/v1/diagnostics` endpoint reads the cgroup v2 `cpu.stat`
+counter twice. The window defaults to one second and the server clamps it to
+ten. We subtract the first cumulative `throttled_usec` value from the second
+and report seconds of actual throttling. If an instance appears, disappears or
+resets its counter during the window, the source becomes degraded or
+unavailable. Churn isn't zero throttling.
+
+The endpoint also resolves each configured storage domain to its containing
+filesystem. That gives us separate `images`, `logs`, `metrics`, `volumes` and
+`data` rows even when several happen to share one disk. It returns byte counts
+and a percentage, but never the configured host path. The distinction matters:
+"disk is full" is less useful than "the filesystem holding image layers is
+full", and an API response doesn't need to publish the server's directory
+layout to say either.
+
+Certificates get the same treatment. The wire carries only the certificate
+kind, identity, issuer, serial, expiry time and rotation state. It does not
+carry DER, PEM or private keys. Right now Bun can safely expose its node leaf,
+but it doesn't expose a complete workload inventory and it can't hot-reload a
+new node leaf into every cluster transport. The source therefore says
+`degraded`. `wtf` can still warn if that known leaf approaches expiry, but it
+won't claim that certificate rotation is healthy.
+
+Notice what the endpoint doesn't do. It doesn't diagnose anything. It records
+local facts with a schema version and collection state. Relish will fan those
+facts out across the cluster and the pure engine will decide what they mean.
+Keeping observation and judgement separate lets us test both halves without
+teaching the API handler a second, subtly different diagnostic catalogue.

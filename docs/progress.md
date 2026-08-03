@@ -1354,6 +1354,9 @@ convergence and adoption" theme under 12b.6).
   - [x] Schema-v1 pure diagnosis engine with separate critical, warning,
     unknown and OK outcomes; timestamped crashloop detection, deploy/log
     correlation and honest evidence requirements for all catalogue checks
+  - [x] Authenticated schema-v1 local telemetry: configured storage-domain
+    capacity, bounded cgroup throttled-time deltas and public node-certificate
+    metadata without paths, certificate bodies or key material
   - [ ] Authenticated cross-node collection, rendering and CLI exit contract
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored

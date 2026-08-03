@@ -1644,6 +1644,44 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Everything here is observed at startup rather than assumed: a
     // capability report that overstates is worse than none, because it turns
     // "this cluster can't" into "this test mysteriously fails".
+    let node_certificate = api_identity.as_ref().and_then(|identity| {
+        let rotation_state = if std::time::SystemTime::now() >= identity.not_after {
+            "expired"
+        } else {
+            // Node leaves are loaded at process start. We expose that fact
+            // rather than claiming the workload identity rotation loop also
+            // hot-reloads the API and cluster transports.
+            "restart_required"
+        };
+        match reliaburger::bun::diagnostics::public_certificate_metadata(
+            "node",
+            &identity.node_id,
+            &identity.certificate_der,
+            rotation_state,
+            false,
+        ) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                eprintln!("bun: node certificate diagnostics unavailable: {error}");
+                None
+            }
+        }
+    });
+    let diagnostic_storage_paths = [
+        ("data", &config.storage.data),
+        ("images", &config.storage.images),
+        ("logs", &config.storage.logs),
+        ("metrics", &config.storage.metrics),
+        ("volumes", &config.storage.volumes),
+    ]
+    .into_iter()
+    .map(
+        |(domain, path)| reliaburger::bun::diagnostics::DiagnosticStoragePath {
+            domain: domain.to_string(),
+            path: path.clone(),
+        },
+    )
+    .collect();
     let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
         node_id: node_name.clone(),
         cluster_name: config.cluster.name.clone(),
@@ -1694,6 +1732,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
         node_pressure: node_pressure_available,
         registry_signatures_required: config.images.trust_policy.require_signatures,
+        diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
+            storage_paths: diagnostic_storage_paths,
+            node_certificate,
+        },
         test_policy: config.testing.clone(),
     };
 

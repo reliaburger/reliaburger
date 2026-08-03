@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 /// Evidence collected from one diagnostic source.
 ///
-/// `Unavailable` means the source should have answered but did not.
-/// `Unsupported` means the current API cannot make the observation honestly.
+/// `Degraded` retains usable partial facts. `Unavailable` means the source
+/// should have answered but did not. `Unsupported` means the current API
+/// cannot make the observation honestly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Evidence<T> {
@@ -13,6 +14,15 @@ pub enum Evidence<T> {
         observed_at: u64,
         /// The value returned by the source.
         value: T,
+    },
+    /// Usable observations whose inventory or freshness is incomplete.
+    Degraded {
+        /// Unix timestamp, in seconds, when the source was read.
+        observed_at: u64,
+        /// Facts which remain safe to diagnose.
+        value: T,
+        /// Why the source cannot support an unconditional OK result.
+        reason: String,
     },
     /// A source which exists but could not be read.
     Unavailable {
@@ -35,7 +45,7 @@ impl<T> Evidence<T> {
     /// Return the observed value, when one exists.
     pub fn value(&self) -> Option<&T> {
         match self {
-            Self::Available { value, .. } => Some(value),
+            Self::Available { value, .. } | Self::Degraded { value, .. } => Some(value),
             Self::Unavailable { .. } | Self::Unsupported { .. } => None,
         }
     }
@@ -43,7 +53,9 @@ impl<T> Evidence<T> {
     pub(crate) fn unknown_reason(&self) -> Option<&str> {
         match self {
             Self::Available { .. } => None,
-            Self::Unavailable { reason } | Self::Unsupported { reason } => Some(reason),
+            Self::Degraded { reason, .. }
+            | Self::Unavailable { reason }
+            | Self::Unsupported { reason } => Some(reason),
         }
     }
 }
@@ -172,12 +184,20 @@ pub struct CpuThrottleObservation {
 /// Public certificate lifecycle metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertificateObservation {
+    /// `node` or `workload`.
+    pub certificate_kind: String,
     /// Certificate subject, SPIFFE ID or node identity.
     pub identity: String,
+    /// X.509 issuer distinguished name.
+    pub issuer: String,
+    /// X.509 serial number in hexadecimal.
+    pub serial: String,
     /// Unix timestamp, in seconds, when the certificate expires.
     pub not_after: u64,
     /// Current automatic rotation state.
     pub rotation_state: String,
+    /// Whether Bun can rotate this leaf without restarting its consumer.
+    pub automatic_rotation: bool,
 }
 
 /// Pickle listener and redundancy evidence for one node.

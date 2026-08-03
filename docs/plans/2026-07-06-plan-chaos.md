@@ -344,6 +344,12 @@ per-node platform fingerprints and informational hosted runs.
 **17/20 — pure `diagnose()` + pattern catalogue** (13 patterns, one `check_*` fn each, crashloop→deploy correlation)
 **18/20 — `collect()` fan-out + CLI** (parallel, 10s per-request timeouts, `--app`, `--watch`, exit 0/1/2)
 
+The step-18 prerequisite now includes authenticated schema-v1 local diagnostic
+evidence. Disk capacity is attributed to configured storage domains and CPU
+throttling comes from a bounded cgroup counter delta. Public node-certificate
+metadata is deliberately degraded until workload inventory and node hot reload
+exist; no private material or host path appears on the wire.
+
 ### Stream G — `relish trace` (steps 19–20)
 
 **19/20 — `/v1/trace` endpoint + pure firewall evaluator**
@@ -569,8 +575,8 @@ before calculating a regression verdict.
 > **Deviation recorded during step 17.** The report is schema-versioned and
 > adds a first-class `unknown` list and `unknown_count`. Inputs group cluster
 > and application evidence, and every source is an `Evidence<T>` tagged as
-> `available`, `unavailable`, or `unsupported`. Available evidence carries an
-> observation timestamp. This implements the review rule that an absent source
+> `available`, `degraded`, `unavailable`, or `unsupported`. Available and
+> degraded evidence carries an observation timestamp. This implements the review rule that an absent source
 > can never produce an OK row. Crashloops use timestamped restart events;
 > throttling uses throttled-time deltas; disk and certificate checks require
 > capacity and public lifecycle metadata rather than guessing from adjacent

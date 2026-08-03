@@ -353,6 +353,7 @@ pub fn router_with_upgrade(
             "/v1/capabilities/cluster",
             get(cluster_capabilities_handler),
         )
+        .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/test/leases", post(test_lease_create_handler))
         .route("/v1/test/leases/{id}", get(test_lease_get_handler))
         .route("/v1/test/leases/{id}/renew", post(test_lease_renew_handler))
@@ -623,6 +624,93 @@ async fn cluster_capabilities_handler(
             started + crate::bun::capabilities::CLUSTER_COLLECTION_TIMEOUT,
         ),
         nodes,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticsQuery {
+    window_seconds: Option<u64>,
+}
+
+/// `GET /v1/diagnostics` — bounded local evidence for `relish wtf`.
+///
+/// CPU throttling is a delta between two cumulative cgroup samples. The
+/// caller can request a 1–10 second window; one second is the default so the
+/// endpoint cannot be turned into an arbitrarily long-lived request.
+async fn diagnostics_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<DiagnosticsQuery>,
+) -> Json<crate::bun::diagnostics::LocalDiagnosticSnapshot> {
+    use crate::bun::diagnostics::{DiagnosticSource, LocalDiagnosticSnapshot};
+
+    let window_seconds = query.window_seconds.unwrap_or(1).clamp(1, 10);
+    let first_observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let storage_paths = state.static_capabilities.diagnostics.storage_paths.clone();
+    let disk_task = tokio::task::spawn_blocking(move || {
+        crate::bun::diagnostics::collect_disk_usage(&storage_paths, first_observed_at)
+    });
+
+    let cpu_throttling = if state.static_capabilities.cgroup_faults {
+        let first_statuses = gather_statuses(&state).await;
+        let first = crate::bun::diagnostics::collect_cpu_throttle_totals(
+            &first_statuses,
+            first_observed_at,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_secs(window_seconds)).await;
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let second_statuses = gather_statuses(&state).await;
+        let second =
+            crate::bun::diagnostics::collect_cpu_throttle_totals(&second_statuses, observed_at)
+                .await;
+        crate::bun::diagnostics::cpu_throttle_window(first, second, window_seconds, observed_at)
+    } else {
+        DiagnosticSource::Unsupported {
+            reason: "actual CPU throttled time requires rootful Linux cgroup v2".to_string(),
+        }
+    };
+
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let disks = match disk_task.await {
+        Ok(disks) => disks,
+        Err(error) => DiagnosticSource::Unavailable {
+            reason: format!("disk capacity collector failed: {error}"),
+        },
+    };
+    let certificates = match &state.static_capabilities.diagnostics.node_certificate {
+        Some(certificate) => DiagnosticSource::Degraded {
+            observed_at,
+            value: vec![certificate.clone()],
+            reason: "node certificate metadata is available, but workload certificate inventory and node hot-reload state are not yet exposed".to_string(),
+        },
+        None if !state.static_capabilities.identity => DiagnosticSource::Unsupported {
+            reason: "workload identity issuance is disabled and no node mTLS leaf is loaded"
+                .to_string(),
+        },
+        None => DiagnosticSource::Unavailable {
+            reason: "identity issuance is enabled but no safe certificate inventory is available"
+                .to_string(),
+        },
+    };
+
+    Json(LocalDiagnosticSnapshot {
+        schema_version: crate::bun::diagnostics::LOCAL_DIAGNOSTIC_SCHEMA_VERSION,
+        node_id: state.static_capabilities.node_id.clone(),
+        observed_at,
+        disks,
+        cpu_throttling,
+        certificates,
     })
 }
 

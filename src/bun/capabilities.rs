@@ -84,6 +84,9 @@ pub struct StaticCapabilities {
     pub node_pressure: bool,
     /// Registry image policy requires trusted signatures.
     pub registry_signatures_required: bool,
+    /// Authenticated diagnostics facts and server-side storage paths. Paths
+    /// are never copied into the public capability or diagnostic response.
+    pub diagnostics: crate::bun::diagnostics::DiagnosticStaticEvidence,
     /// Server-owned diagnostic policy. A client can inspect but not expand it.
     pub test_policy: crate::testkit::safety::ClusterTestPolicy,
 }

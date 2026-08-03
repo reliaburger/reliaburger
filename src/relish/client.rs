@@ -609,6 +609,18 @@ impl BunClient {
         self.get_typed_json("/v1/capabilities/cluster").await
     }
 
+    /// Fetch bounded local disk, cgroup and public certificate evidence.
+    pub async fn diagnostics(
+        &self,
+        cpu_window_seconds: u64,
+    ) -> Result<crate::bun::diagnostics::LocalDiagnosticSnapshot, RelishError> {
+        self.get_typed_json(&format!(
+            "/v1/diagnostics?window_seconds={}",
+            cpu_window_seconds.clamp(1, 10)
+        ))
+        .await
+    }
+
     /// Fetch deploy history for an app in a namespace.
     pub async fn deploy_history(
         &self,
