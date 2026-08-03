@@ -494,6 +494,10 @@ startup. M8 must add certificate expiry evidence and should not make
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
   source-namespace trace, documentation and real-cluster acceptance.
+  - [x] Benchmark schema and comparison semantics: strict versioned JSON,
+    topology and per-node platform fingerprints, workload-method compatibility,
+    direction-aware thresholds and informational hosted runs.
+  - [ ] Public-API benchmark suites and `relish bench` orchestration.
 - [ ] Add certificate expiry evidence and production rotation/renewal before
   treating the TLS-expiry diagnostic as an accepted capability.
 

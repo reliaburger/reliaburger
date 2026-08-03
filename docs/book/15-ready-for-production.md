@@ -1750,3 +1750,58 @@ Another test starts with deliberately expired evidence, serves a fresh
 snapshot from Bun, and proves a chaos case receives the fresh one. These are
 small tests for an unpleasant class of failure. That's exactly why they're
 there.
+
+## When faster is worse
+
+Suppose one benchmark falls from 100 ms to 80 ms and another falls from 100
+requests per second to 80. The arithmetic is identical. The verdict isn't.
+
+Every benchmark metric therefore carries `higher_is_better`. Comparison uses
+that field rather than guessing from the unit. Latency rising by more than 10%
+is a regression; throughput falling by more than 10% is a regression. Exactly
+10% is the boundary, not a failure. Metrics missing from either report get
+listed separately because absence isn't performance data.
+
+The value alone still isn't enough. Fifty resolver requests and two hundred
+resolver requests don't describe the same experiment, even if both results say
+`ms`. Each metric carries a sorted map of parameters such as request count and
+payload bytes. Rust's `BTreeMap` keeps keys ordered, which makes JSON output
+and compatibility diagnostics deterministic. Different units, direction or
+parameters refuse comparison.
+
+The report also fingerprints the environment:
+
+- cluster node and council-member counts;
+- every node's compilation target and profile;
+- runtime name, version and rootless mode; and
+- kernel and architecture.
+
+What isn't a compatibility check? The binary version and Git SHA. Comparing
+two different builds is the point. We record both, then permit them to differ.
+Node names and cluster identity may differ too; two otherwise identical
+clusters can provide a useful comparison.
+
+Hosted workers are a special case. Their neighbours, CPU allocation and noisy
+storage can change underneath a run. If either report says it came from a
+hosted environment, we still calculate and show regressions, but mark the
+whole comparison informational. A shared CI worker shouldn't veto a release
+because somebody else's job woke up at the wrong moment.
+
+The JSON parser is deliberately strict. `schema_version` is 1 and every report
+type rejects unknown fields. An additive change therefore needs a schema bump
+instead of being silently ignored by an older Relish. Duplicate metric names,
+zero samples, negative or non-finite values and unknown node fingerprints also
+refuse a verdict.
+
+One small Rust detail prevents a surprisingly awkward bug. Percentage change
+usually looks like this:
+
+```text
+(current - baseline) / abs(baseline) × 100
+```
+
+A zero baseline makes that percentage undefined. JSON has no portable
+representation for infinity, so `change_percent` is `Option<f64>`: `Some(x)`
+for a finite percentage and `None` (JSON `null`) for a zero baseline. The
+directional result still works from the raw values. We keep the evidence
+without producing invalid JSON. Tiny type, useful constraint.

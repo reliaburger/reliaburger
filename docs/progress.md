@@ -1333,6 +1333,12 @@ convergence and adoption" theme under 12b.6).
   refresh capability evidence before each destructive case and reverse only
   their own faults after pass, failure, timeout or panic
 - [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
+  - [x] Versioned report and comparison contract: topology and per-node
+    build/runtime/kernel fingerprints, metric-method parameters, strict schema
+    parsing, direction-aware >10% changes, explicit missing metrics and
+    compatibility refusal. Different version/Git SHA is comparable; noisy
+    hosted runs are marked informational.
+  - [ ] Public-API benchmark suites and CLI orchestration.
 - [ ] `relish wtf` (automated cluster health diagnosis)
 - [ ] `relish trace` (end-to-end connectivity debugging)
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
@@ -1465,6 +1471,9 @@ convergence and adoption" theme under 12b.6).
     after pass, failure, timeout or panic. The legacy council-partition
     response now exposes its node-local fault id additively, so catalogue
     cleanup never needs the blanket heal endpoint.
+  - [x] Fingerprinted benchmark report and comparison contract: exact schema,
+    topology and per-node build/runtime/kernel evidence, direction-aware
+    thresholds, metric-method compatibility and informational hosted results.
 
 ### Optional
 

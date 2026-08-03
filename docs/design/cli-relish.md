@@ -1277,9 +1277,25 @@ target, type and duration.
 
 **`relish bench`**
 
-Deploys stress-generation workloads (compiled into Bun), saturates the cluster, collects measurements, tears down, and produces a report. Measures: scheduler throughput, service discovery latency, network throughput, deploy speed, state reconstruction time, image distribution speed, cluster capacity.
+Deploys owned benchmark workloads, measures the public data plane, tears down,
+and produces a schema-versioned report. Measures: scheduler throughput,
+service discovery latency, network throughput, deploy speed, state
+reconstruction time, image distribution speed and, only when explicitly
+requested, cluster capacity.
 
-`--quick` runs an abbreviated suite (~2 min) for CI. `--compare <file>` detects regressions against a baseline JSON report (flags any metric regressing >10%).
+Each report records topology, hosted-CI evidence and every node's build target,
+profile, runtime version, rootless mode, kernel and architecture. Metrics also
+record their workload size and method. `--quick` runs an abbreviated suite.
+`--compare <file>` flags a direction-aware regression only when it is strictly
+greater than 10%. It lists missing metrics rather than inventing a comparison.
+
+Comparison deliberately permits different binary versions and Git SHAs: that
+is usually what we are measuring. It refuses unlike topology, target/profile,
+runtime, rootless mode, kernel, architecture, quick/capacity mode, units,
+direction or workload parameters. Schema 1 rejects unknown fields instead of
+silently misreading them. If either report identifies a hosted environment,
+the changes remain visible but the verdict is informational; noisy shared
+workers must not turn a release red.
 
 #### Kubernetes Migration
 

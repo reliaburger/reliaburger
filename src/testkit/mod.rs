@@ -13,6 +13,7 @@
 //! - [`cases`] — the integration catalogue.
 //! - [`chaos`] — the chaos scenarios, selected by `--chaos`.
 
+pub mod bench;
 pub mod cases;
 pub mod chaos;
 pub mod context;

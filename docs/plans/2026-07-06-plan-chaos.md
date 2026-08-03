@@ -334,7 +334,9 @@ Book: §"Chaos with a safety catch".
 
 ### Stream E — `relish bench` (steps 15–16)
 
-**15/20 — bench schema + regression comparison** (direction-aware, 10 % threshold, `schema_version` guard)
+**15/20 — bench schema + regression comparison** — shipped. Direction-aware,
+strictly greater than 10% threshold, schema guard, workload-parameter checks,
+per-node platform fingerprints and informational hosted runs.
 **16/20 — the seven suites** (`--quick` scaling, per-suite timeout, skip plumbing, `--capacity` opt-in)
 
 ### Stream F — `relish wtf` (steps 17–18)
@@ -507,6 +509,17 @@ impl TestContext {
 Polling helpers use a 500 ms interval and the context deadline; every HTTP call goes through `tokio::time::timeout`.
 
 ### 7.4 Bench types — `src/testkit/bench/report.rs`, `compare.rs`
+
+> **Deviation recorded during step 15.** `BenchReport` now carries a
+> `BenchEnvironment` rather than only `cluster_nodes`. It records topology,
+> every node's build and runtime/kernel/architecture fingerprints, explicit
+> unknown nodes and hosted-CI evidence. `BenchMetric.parameters` fingerprints
+> workload size and method. Comparison permits version and Git SHA changes
+> (those are normally the subject of the experiment) but refuses different
+> targets, profiles, runtime versions, rootless modes, kernels, architectures,
+> topology, quick/capacity mode or metric method. A zero baseline uses
+> `change_percent: null`, never non-finite JSON. Hosted results retain the
+> measured changes but make the verdict informational.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -930,7 +943,7 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 13/20 fault authorisation + audit
 - [x] 13b/20 authenticated target-node distribution
 - [x] 14/20 chaos suite
-- [ ] 15/20 bench schema + comparison
+- [x] 15/20 bench schema + comparison
 - [ ] 16/20 bench suites
 - [ ] 17/20 wtf engine
 - [ ] 18/20 `relish wtf` CLI
