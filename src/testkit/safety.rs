@@ -177,6 +177,19 @@ impl ClusterTestPolicy {
         Ok(())
     }
 
+    /// Whether an external trace destination is explicitly allowlisted.
+    /// Matching is exact and includes the port; there are no wildcards or DNS
+    /// suffix rules that could silently expand probe authority.
+    pub fn permits_external_probe(&self, host: &str, port: u16) -> bool {
+        let authority = match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(address)) => format!("[{address}]:{port}"),
+            _ => format!("{host}:{port}"),
+        };
+        self.external_probe_allowlist
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&authority))
+    }
+
     /// Fail closed unless role, server policy, protection and consent agree.
     pub fn authorise(
         &self,
@@ -327,5 +340,19 @@ mod tests {
             policy.validate(),
             Err(SafetyError::InvalidNodePressureMemoryLimit)
         );
+    }
+
+    #[test]
+    fn external_probe_allowlist_is_exact_and_port_scoped() {
+        let mut policy = ClusterTestPolicy::default();
+        assert!(!policy.permits_external_probe("example.com", 443));
+        policy.external_probe_allowlist = vec![
+            "example.com:443".to_string(),
+            "[2001:db8::1]:8443".to_string(),
+        ];
+        assert!(policy.permits_external_probe("EXAMPLE.COM", 443));
+        assert!(!policy.permits_external_probe("example.com", 80));
+        assert!(!policy.permits_external_probe("sub.example.com", 443));
+        assert!(policy.permits_external_probe("2001:db8::1", 8443));
     }
 }

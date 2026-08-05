@@ -621,6 +621,22 @@ impl BunClient {
         .await
     }
 
+    /// Run the fixed server-side connectivity trace on the node hosting the
+    /// source workload.
+    pub async fn trace(
+        &self,
+        request: &crate::onion::trace::TraceRequest,
+    ) -> Result<crate::onion::trace::TraceResult, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/trace", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
     /// Fetch desired application replicas and current scheduler coverage.
     pub async fn desired_apps(
         &self,

@@ -46,6 +46,11 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 /// before it escalates to SIGKILL (DEP6).
 const STOP_GRACE_SECS: u64 = 10;
 
+/// A trace starts processes inside a workload and may remain in flight for two
+/// eight-second probe bounds. Refuse excess work instead of building an
+/// unbounded queue of authenticated diagnostic tasks.
+const MAX_CONCURRENT_TRACES: usize = 8;
+
 /// Build a shared drain tracker for a new agent. The completion channel's
 /// receiver is dropped because the retire path polls `wait_drained` rather
 /// than consuming the notification stream.
@@ -147,6 +152,13 @@ pub enum AgentCommand {
         namespace: String,
         command: Vec<String>,
         response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Run the fixed Phase 15 connectivity probe from a local workload.
+    Trace {
+        request: crate::onion::trace::TraceRequest,
+        internal_destination: bool,
+        source_node: String,
+        response: oneshot::Sender<Result<crate::onion::trace::TraceResult, BunError>>,
     },
     /// Get cluster node membership from the gossip layer.
     Nodes {
@@ -1127,6 +1139,25 @@ struct EgressBinding {
     resolved: Vec<crate::sesame::egress::EgressDestination>,
 }
 
+/// An immutable, owned connectivity trace that can run outside the agent
+/// command loop. Workload probes have explicit timeouts, but even a bounded
+/// probe must not delay status, shutdown or another control-plane command.
+struct PreparedTrace<G> {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    shutdown: CancellationToken,
+    grill: G,
+    source_instance: InstanceId,
+    request: crate::onion::trace::TraceRequest,
+    internal_destination: bool,
+    source_node: String,
+    service: Option<crate::onion::types::ServiceEntry>,
+    destination_port: u16,
+    dns_name: String,
+    expected_vip: Option<String>,
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -1134,6 +1165,8 @@ pub struct BunAgent<G: Grill> {
     shutdown: CancellationToken,
     /// Process-wide long-lived-task evidence shared with the API and reporter.
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    /// Hard per-node concurrency bound for workload connectivity traces.
+    trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
     cluster: Option<ClusterHandle>,
     /// Immutable cluster identity used as every workload SPIFFE trust domain.
@@ -1302,6 +1335,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             trust_domain: "default".to_string(),
@@ -1378,6 +1412,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             trust_domain,
@@ -2658,6 +2693,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self.exec_app(&app_name, &namespace, &command).await;
                 let _ = response.send(result);
             }
+            AgentCommand::Trace {
+                request,
+                internal_destination,
+                source_node,
+                response,
+            } => match self.prepare_trace(request, internal_destination, source_node) {
+                Ok(trace) => {
+                    tokio::spawn(async move {
+                        let _ = response.send(trace.run().await);
+                    });
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                }
+            },
             AgentCommand::Nodes { response } => {
                 let nodes = self.get_cluster_nodes();
                 let _ = response.send(nodes);
@@ -6460,6 +6510,373 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(output)
     }
 
+    /// Capture the immutable state needed by a connectivity trace. The slow
+    /// workload and kernel observations run later on a spawned task.
+    fn prepare_trace(
+        &self,
+        request: crate::onion::trace::TraceRequest,
+        internal_destination: bool,
+        source_node: String,
+    ) -> Result<PreparedTrace<G>, BunError> {
+        if request.port == Some(0) {
+            return Err(BunError::SecurityError {
+                reason: "trace destination port must be between 1 and 65535".to_string(),
+            });
+        }
+        let source_instance = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|instance| {
+                instance.app_name == request.source
+                    && instance.namespace == request.source_namespace
+                    && instance.state == ContainerState::Running
+            })
+            .map(|instance| instance.id.clone())
+            .ok_or_else(|| BunError::AppNotFound {
+                app_name: request.source.clone(),
+                namespace: request.source_namespace.clone(),
+            })?;
+
+        let service_id = crate::onion::service_id::ServiceId::new(
+            &request.destination_namespace,
+            &request.destination,
+        );
+        let merged_services = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+        let service = internal_destination
+            .then(|| merged_services.resolve(&service_id).cloned())
+            .flatten();
+        let destination_port = request
+            .port
+            .or_else(|| service.as_ref().map(|entry| entry.port))
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "external trace destination requires an explicit port".to_string(),
+            })?;
+        let dns_name = if internal_destination {
+            format!(
+                "{}.{}.internal",
+                request.destination, request.destination_namespace
+            )
+        } else {
+            request.destination.clone()
+        };
+        let expected_vip = service.as_ref().map(|entry| entry.vip.to_string());
+        let permit = self
+            .trace_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| BunError::TraceBusy)?;
+
+        Ok(PreparedTrace {
+            _permit: permit,
+            shutdown: self.shutdown.clone(),
+            grill: self.supervisor.grill().clone(),
+            source_instance,
+            request,
+            internal_destination,
+            source_node,
+            service,
+            destination_port,
+            dns_name,
+            expected_vip,
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            onion_ebpf: self.onion_ebpf.clone(),
+        })
+    }
+}
+
+impl<G: Grill + Clone + 'static> PreparedTrace<G> {
+    /// Trace DNS, live service/firewall state and a TCP connection from one
+    /// running workload. The command strings are fixed; request values are
+    /// positional shell arguments and can never become shell syntax.
+    async fn run(self) -> Result<crate::onion::trace::TraceResult, BunError> {
+        use crate::onion::trace::TraceResult;
+
+        let dns_probe = self
+            .run_workload_trace_probe(
+                &self.source_instance,
+                trace_dns_command(&self.dns_name),
+                "__RB_TRACE_DNS_STATUS__",
+            )
+            .await;
+        let dns_step = trace_probe_step(
+            1,
+            "DNS query",
+            &self.dns_name,
+            dns_probe,
+            self.expected_vip.as_deref(),
+        );
+
+        let service_step = self
+            .trace_service_state(self.service.as_ref(), self.internal_destination)
+            .await;
+        let firewall_step = self
+            .trace_firewall_state(
+                &self.source_instance,
+                self.service.as_ref(),
+                self.internal_destination,
+            )
+            .await;
+
+        let connect_host = self
+            .expected_vip
+            .as_deref()
+            .unwrap_or(self.request.destination.as_str());
+        let started = std::time::Instant::now();
+        let tcp_probe = self
+            .run_workload_trace_probe(
+                &self.source_instance,
+                trace_tcp_command(connect_host, self.destination_port),
+                "__RB_TRACE_TCP_STATUS__",
+            )
+            .await;
+        let tcp_succeeded = tcp_probe.as_ref().is_ok_and(|probe| probe.status == 0);
+        let tcp_step = trace_probe_step(
+            4,
+            "TCP probe",
+            &format!("{connect_host}:{}", self.destination_port),
+            tcp_probe,
+            None,
+        );
+        let latency_ms = tcp_succeeded.then(|| started.elapsed().as_secs_f64() * 1000.0);
+
+        let steps = vec![dns_step, service_step, firewall_step, tcp_step];
+        let overall_result = crate::onion::trace::overall_verdict(&steps);
+        Ok(TraceResult {
+            schema_version: crate::onion::trace::TRACE_SCHEMA_VERSION,
+            source: format!("{}/{}", self.request.source_namespace, self.request.source),
+            destination: if self.internal_destination {
+                format!(
+                    "{}/{}",
+                    self.request.destination_namespace, self.request.destination
+                )
+            } else {
+                self.request.destination.clone()
+            },
+            destination_port: self.destination_port,
+            source_node: self.source_node,
+            steps,
+            overall_result,
+            latency_ms,
+        })
+    }
+
+    async fn run_workload_trace_probe(
+        &self,
+        source_instance: &InstanceId,
+        command: Vec<String>,
+        marker: &str,
+    ) -> Result<crate::onion::trace::ProbeOutput, String> {
+        let future = self.grill.exec(source_instance, &command);
+        let result = tokio::select! {
+            _ = self.shutdown.cancelled() => {
+                return Err("workload probe cancelled because the agent is shutting down".to_string());
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(8), future) => result,
+        };
+        match result {
+            Ok(Ok(output)) => crate::onion::trace::parse_probe_output(&output, marker)
+                .ok_or_else(|| "source image lacks a usable POSIX shell or probe tool".to_string()),
+            Ok(Err(error)) => Err(format!("workload probe could not start: {error}")),
+            Err(_) => Err("workload probe timed out after 8 seconds".to_string()),
+        }
+    }
+
+    async fn trace_service_state(
+        &self,
+        service: Option<&crate::onion::types::ServiceEntry>,
+        internal_destination: bool,
+    ) -> crate::onion::trace::TraceStep {
+        use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+        if !internal_destination {
+            return TraceStep {
+                step_number: 2,
+                name: "Service and eBPF state".to_string(),
+                evidence: TraceEvidence::Inferred,
+                details: vec![
+                    "external destinations bypass the internal service and backend maps"
+                        .to_string(),
+                ],
+                verdict: TraceVerdict::Pass,
+            };
+        }
+        let Some(service) = service else {
+            return TraceStep {
+                step_number: 2,
+                name: "Service and eBPF state".to_string(),
+                evidence: TraceEvidence::Observed,
+                details: Vec::new(),
+                verdict: TraceVerdict::Fail {
+                    reason: "destination is absent from the live userspace service map".to_string(),
+                },
+            };
+        };
+        let healthy = service
+            .backends
+            .iter()
+            .filter(|backend| backend.healthy)
+            .count();
+        let mut details = vec![format!(
+            "userspace service map: VIP {}, {} of {} backends healthy",
+            service.vip,
+            healthy,
+            service.backends.len()
+        )];
+        if healthy == 0 {
+            return TraceStep {
+                step_number: 2,
+                name: "Service and eBPF state".to_string(),
+                evidence: TraceEvidence::Observed,
+                details,
+                verdict: TraceVerdict::Fail {
+                    reason: "live service state has no healthy backend".to_string(),
+                },
+            };
+        }
+
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Some(handle) = &self.onion_ebpf {
+            let bpf_map = crate::onion::ebpf::maps::BpfServiceMap::new();
+            let mut ebpf = handle.lock().await;
+            return match bpf_map.read_backends(&mut ebpf, service.vip, service.port) {
+                Ok(Some(value)) => {
+                    let kernel_healthy = value
+                        .backends
+                        .iter()
+                        .take(value.count as usize)
+                        .filter(|backend| backend.healthy == 1)
+                        .count();
+                    details.push(format!(
+                        "live backend_map: {} entries, {kernel_healthy} healthy",
+                        value.count
+                    ));
+                    let verdict = if value.count == 0 || kernel_healthy == 0 {
+                        TraceVerdict::Fail {
+                            reason: "live eBPF backend map has no healthy backend".to_string(),
+                        }
+                    } else {
+                        TraceVerdict::Pass
+                    };
+                    TraceStep {
+                        step_number: 2,
+                        name: "Service and eBPF state".to_string(),
+                        evidence: TraceEvidence::Observed,
+                        details,
+                        verdict,
+                    }
+                }
+                Ok(None) => TraceStep {
+                    step_number: 2,
+                    name: "Service and eBPF state".to_string(),
+                    evidence: TraceEvidence::Observed,
+                    details,
+                    verdict: TraceVerdict::Fail {
+                        reason: "service exists in userspace but is absent from live backend_map"
+                            .to_string(),
+                    },
+                },
+                Err(error) => TraceStep {
+                    step_number: 2,
+                    name: "Service and eBPF state".to_string(),
+                    evidence: TraceEvidence::Unavailable,
+                    details,
+                    verdict: TraceVerdict::Unknown {
+                        reason: format!("live backend_map could not be read: {error}"),
+                    },
+                },
+            };
+        }
+
+        details.push(
+            "no live eBPF backend map is attached; this step is inferred from userspace state"
+                .to_string(),
+        );
+        TraceStep {
+            step_number: 2,
+            name: "Service and eBPF state".to_string(),
+            evidence: TraceEvidence::Inferred,
+            details,
+            verdict: TraceVerdict::Pass,
+        }
+    }
+
+    async fn trace_firewall_state(
+        &self,
+        source_instance: &InstanceId,
+        service: Option<&crate::onion::types::ServiceEntry>,
+        internal_destination: bool,
+    ) -> crate::onion::trace::TraceStep {
+        use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+        let unknown = |reason: String| TraceStep {
+            step_number: 3,
+            name: "Firewall state".to_string(),
+            evidence: TraceEvidence::Unavailable,
+            details: Vec::new(),
+            verdict: TraceVerdict::Unknown { reason },
+        };
+
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Some(handle) = &self.onion_ebpf {
+            let Some(pid) = self.grill.pid(source_instance).await else {
+                return unknown("runtime does not expose the source workload PID".to_string());
+            };
+            let Some(cgroup_id) = crate::sesame::egress::cgroup_id_of_pid(pid) else {
+                return unknown("source workload cgroup id could not be resolved".to_string());
+            };
+            let mut ebpf = handle.lock().await;
+            if !internal_destination {
+                return match crate::sesame::egress::egress_enforced(&mut ebpf.bpf, cgroup_id) {
+                    Ok(false) => TraceStep {
+                        step_number: 3,
+                        name: "Firewall state".to_string(),
+                        evidence: TraceEvidence::Observed,
+                        details: vec![
+                            "live egress_enabled_map has no policy for the source cgroup; external traffic passes through".to_string(),
+                        ],
+                        verdict: TraceVerdict::Pass,
+                    },
+                    Ok(true) => unknown(
+                        "live egress enforcement is active; the exact hostname decision is observed by the TCP probe but cannot yet be attributed to one exact/CIDR map entry"
+                            .to_string(),
+                    ),
+                    Err(error) => unknown(format!("live egress map could not be read: {error}")),
+                };
+            }
+            let Some(service) = service else {
+                return unknown("destination service state is unavailable".to_string());
+            };
+            return match crate::sesame::firewall::read_firewall_state(
+                &mut ebpf.bpf,
+                cgroup_id,
+                service.app_id,
+            ) {
+                Ok(state) => {
+                    let verdict = crate::onion::trace::evaluate_firewall(
+                        state.source_namespace_id,
+                        service.namespace_id,
+                        state.action,
+                    );
+                    TraceStep {
+                        step_number: 3,
+                        name: "Firewall state".to_string(),
+                        evidence: TraceEvidence::Observed,
+                        details: vec![format!(
+                            "live maps: source cgroup {cgroup_id}, source namespace {:?}, destination namespace {}, action {:?}",
+                            state.source_namespace_id, service.namespace_id, state.action
+                        )],
+                        verdict,
+                    }
+                }
+                Err(error) => unknown(format!("live firewall maps could not be read: {error}")),
+            };
+        }
+
+        let _ = (source_instance, service, internal_destination);
+        unknown("no live eBPF firewall maps are attached on this node".to_string())
+    }
+}
+
+impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Stop one instance and wait for it to actually exit (DEP6).
     ///
     /// SIGTERM first, then poll the runtime until the container reports
@@ -7679,6 +8096,92 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     }
 }
 
+const DNS_TRACE_SCRIPT: &str = r#"
+output=$(nslookup "$1" 2>&1)
+status=$?
+printf '%s\n' "$output"
+printf '__RB_TRACE_DNS_STATUS__=%s\n' "$status"
+"#;
+
+const TCP_TRACE_SCRIPT: &str = r#"
+output=$(nc -z -w 3 "$1" "$2" 2>&1)
+status=$?
+printf '%s\n' "$output"
+printf '__RB_TRACE_TCP_STATUS__=%s\n' "$status"
+"#;
+
+fn trace_dns_command(name: &str) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        DNS_TRACE_SCRIPT.to_string(),
+        "reliaburger-trace".to_string(),
+        name.to_string(),
+    ]
+}
+
+fn trace_tcp_command(host: &str, port: u16) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        TCP_TRACE_SCRIPT.to_string(),
+        "reliaburger-trace".to_string(),
+        host.to_string(),
+        port.to_string(),
+    ]
+}
+
+fn trace_probe_step(
+    step_number: u32,
+    name: &str,
+    target: &str,
+    probe: Result<crate::onion::trace::ProbeOutput, String>,
+    expected_value: Option<&str>,
+) -> crate::onion::trace::TraceStep {
+    use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+    match probe {
+        Ok(probe) => {
+            let mut details = vec![format!("fixed workload probe target: {target}")];
+            details.extend(probe.lines);
+            let verdict = if probe.status == 0 {
+                if let Some(expected) = expected_value
+                    && !details.iter().any(|line| line.contains(expected))
+                {
+                    TraceVerdict::Fail {
+                        reason: format!(
+                            "probe succeeded but its answer did not contain expected value {expected}"
+                        ),
+                    }
+                } else {
+                    TraceVerdict::Pass
+                }
+            } else if probe.status == 126 || probe.status == 127 {
+                TraceVerdict::Unknown {
+                    reason: format!("source image does not provide the fixed {name} probe tool"),
+                }
+            } else {
+                TraceVerdict::Fail {
+                    reason: format!("{name} exited with status {}", probe.status),
+                }
+            };
+            TraceStep {
+                step_number,
+                name: name.to_string(),
+                evidence: TraceEvidence::Observed,
+                details,
+                verdict,
+            }
+        }
+        Err(reason) => TraceStep {
+            step_number,
+            name: name.to_string(),
+            evidence: TraceEvidence::Unavailable,
+            details: vec![format!("fixed workload probe target: {target}")],
+            verdict: TraceVerdict::Unknown { reason },
+        },
+    }
+}
+
 /// The health-wait deadline for a rolling redeploy: the configured
 /// `health_timeout`, uncapped (M7).
 ///
@@ -7730,6 +8233,237 @@ pub fn workload_spiffe_uri(
 mod tests {
     use super::*;
     use crate::grill::mock::MockGrill;
+
+    #[test]
+    fn trace_targets_are_positional_arguments_not_shell_source() {
+        let hostile = "api; touch /tmp/never";
+        let dns = trace_dns_command(hostile);
+        let tcp = trace_tcp_command(hostile, 443);
+        assert!(!dns[2].contains(hostile));
+        assert_eq!(dns[4], hostile);
+        assert!(!tcp[2].contains(hostile));
+        assert_eq!(tcp[4], hostile);
+        assert_eq!(tcp[5], "443");
+    }
+
+    #[test]
+    fn missing_workload_probe_tool_is_unknown_not_a_network_failure() {
+        let step = trace_probe_step(
+            1,
+            "DNS query",
+            "api.internal",
+            Ok(crate::onion::trace::ProbeOutput {
+                status: 127,
+                lines: vec!["nslookup: not found".to_string()],
+            }),
+            None,
+        );
+        assert!(matches!(
+            step.verdict,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn trace_runs_fixed_dns_and_tcp_probes_from_the_source_workload() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(
+            r#"
+            [app.source]
+            image = "source:v1"
+
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+
+        let vip = crate::onion::vip::VirtualIP::from_qualified("default__destination");
+        grill.set_exec_outputs([
+            format!(
+                "Name: destination.default.internal\nAddress: {vip}\n__RB_TRACE_DNS_STATUS__=0\n"
+            ),
+            "__RB_TRACE_TCP_STATUS__=0\n".to_string(),
+        ]);
+        grill.block_execs();
+        let (response, receiver) = oneshot::channel();
+        tx.send(AgentCommand::Trace {
+            request: crate::onion::trace::TraceRequest {
+                source: "source".to_string(),
+                source_namespace: "default".to_string(),
+                destination: "destination".to_string(),
+                destination_namespace: "default".to_string(),
+                port: None,
+            },
+            internal_destination: true,
+            source_node: "node-a".to_string(),
+            response,
+        })
+        .await
+        .unwrap();
+
+        grill.wait_for_execs(1).await;
+        let (status_response, status_receiver) = oneshot::channel();
+        tx.send(AgentCommand::Status {
+            response: status_response,
+        })
+        .await
+        .unwrap();
+        let statuses = tokio::time::timeout(std::time::Duration::from_secs(1), status_receiver)
+            .await
+            .expect("a workload trace must not block the agent command loop")
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        grill.release_execs(1);
+
+        let result = receiver.await.unwrap().unwrap();
+
+        assert_eq!(result.steps.len(), 4);
+        assert_eq!(
+            result.steps[0].verdict,
+            crate::onion::trace::TraceVerdict::Pass
+        );
+        assert_eq!(
+            result.steps[1].evidence,
+            crate::onion::trace::TraceEvidence::Inferred
+        );
+        assert_eq!(
+            result.steps[3].verdict,
+            crate::onion::trace::TraceVerdict::Pass
+        );
+        assert!(matches!(
+            result.steps[2].verdict,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+        assert!(matches!(
+            result.overall_result,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+        assert!(result.latency_ms.is_some());
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trace_concurrency_is_bounded_without_queueing_more_workload_processes() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(
+            r#"
+            [app.source]
+            image = "source:v1"
+
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+
+        grill.set_exec_outputs(
+            (0..16).map(|_| "__RB_TRACE_DNS_STATUS__=0\n__RB_TRACE_TCP_STATUS__=0\n".to_string()),
+        );
+        grill.block_execs();
+        let request = crate::onion::trace::TraceRequest {
+            source: "source".to_string(),
+            source_namespace: "default".to_string(),
+            destination: "destination".to_string(),
+            destination_namespace: "default".to_string(),
+            port: None,
+        };
+        let mut active_receivers = Vec::new();
+        for _ in 0..MAX_CONCURRENT_TRACES {
+            let (response, receiver) = oneshot::channel();
+            tx.send(AgentCommand::Trace {
+                request: request.clone(),
+                internal_destination: true,
+                source_node: "node-a".to_string(),
+                response,
+            })
+            .await
+            .unwrap();
+            active_receivers.push(receiver);
+        }
+        grill
+            .wait_for_execs(MAX_CONCURRENT_TRACES.try_into().unwrap())
+            .await;
+
+        let (response, receiver) = oneshot::channel();
+        tx.send(AgentCommand::Trace {
+            request,
+            internal_destination: true,
+            source_node: "node-a".to_string(),
+            response,
+        })
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+            .await
+            .expect("the excess trace must be refused without joining a queue")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, BunError::TraceBusy));
+
+        grill.release_execs(MAX_CONCURRENT_TRACES);
+        for receiver in active_receivers {
+            let _ = receiver.await;
+        }
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_in_flight_workload_trace() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(
+            r#"
+            [app.source]
+            image = "source:v1"
+
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+
+        grill.block_execs();
+        let (response, receiver) = oneshot::channel();
+        tx.send(AgentCommand::Trace {
+            request: crate::onion::trace::TraceRequest {
+                source: "source".to_string(),
+                source_namespace: "default".to_string(),
+                destination: "destination".to_string(),
+                destination_namespace: "default".to_string(),
+                port: None,
+            },
+            internal_destination: true,
+            source_node: "node-a".to_string(),
+            response,
+        })
+        .await
+        .unwrap();
+        grill.wait_for_execs(1).await;
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+            .await
+            .expect("shutdown must cancel the trace probe")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result.overall_result,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+        handle.await.unwrap();
+    }
 
     fn test_agent() -> (
         BunAgent<MockGrill>,

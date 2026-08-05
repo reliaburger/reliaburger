@@ -1,8 +1,8 @@
 # Phase 15 Implementation Plan — Testing, Benchmarking, Diagnostics & Chaos
 
 **Originally written:** 6 July 2026
-**Revised:** 29 July 2026 — re-verified after the 12b programme, both codebase
-reviews and the first Phase 15 implementation tranche. **Scope extended** to
+**Revised:** 3 August 2026 — re-verified after the 12b programme, both codebase
+reviews and the Phase 15 implementation. **Scope extended** to
 complete the `relish fault`/`relish chaos` surface, which the original plan
 assumed was finished.
 
@@ -31,7 +31,11 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 | Faults apply cluster-wide | **At review time:** `target_node` was dead. **Now:** step 13b authenticates and authorises target-node distribution. |
 | `deployer` is the right role for faults | **At review time:** plain Deployer could inject. **Now:** step 13 requires Deployer plus `inject_workload_faults` and acknowledgement. |
 
-**Still true and load-bearing:** `main() -> ExitCode` (`relish.rs:833`) but every dispatched command returns `Result<(), RelishError>`, so `wtf`'s 0/1/2 contract still needs a richer return; `insta` is a dev-dependency with existing snapshot dirs; `src/relish/fault.rs` has the duration/percentage/bandwidth parsers to reuse (`:16,:61,:81`); there is no `src/testkit/`, no `/v1/capabilities`, no `/v1/trace`, no `src/firewall/evaluate.rs`.
+Those implementation gaps are now closed. `CommandOutcome` carries the 0/1/2
+diagnostic contract; `src/testkit/`, `/v1/capabilities` and `/v1/trace` exist.
+The trace firewall evaluator lives with the shared trace contract in
+`src/onion/trace.rs`, because it evaluates the same live-map facts as the eBPF
+connect hook rather than rebuilding declared policy in a separate module.
 
 ---
 
@@ -39,14 +43,14 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 
 | Deliverable | Status today | Work |
 |---|---|---|
-| `relish test` | absent | build (§6 stream B) |
+| `relish test` | **Shipped.** 39 ordinary cases and four acceptance profiles. |
 | `relish test --chaos` | **Shipped in step 14.** Five serial scenarios with server-owned guards and exact fault-id cleanup. |
-| `relish bench` | absent | build (stream E) |
-| `relish wtf` | absent | build (stream F) |
-| `relish trace` | absent | build (stream G) |
+| `relish bench` | **Shipped.** Seven leased public-data-plane suites. |
+| `relish wtf` | **Shipped.** Authenticated evidence, correlation and 0/1/2 exit contract. |
+| `relish trace` | **Shipped.** Source-workload DNS/TCP probes plus live service/firewall state. |
 | `relish fault ...` | 15 subcommands, gaps | **complete (stream C — new)** |
 | `relish chaos ...` | stringly-typed, undesigned | **fold into `fault` (stream C — new)** |
-| Book chapter 15 | harness half written | append command sections |
+| Book chapter 15 | **Command and diagnostics sections appended.** |
 
 **Milestone:** `relish test` green against a 3-node dev cluster; `relish test --chaos` runs all five scenarios *with real node kills*; `relish bench` produces a comparable report; `relish wtf` diagnoses seeded failures; `relish trace` walks four steps; the documented fault surface matches the implemented one.
 
@@ -352,8 +356,18 @@ exist; no private material or host path appears on the wire.
 
 ### Stream G — `relish trace` (steps 19–20)
 
-**19/20 — `/v1/trace` endpoint + pure firewall evaluator**
-**20/20 — `relish trace` CLI + phase close-out** (progress.md, both READMEs, chapter 15 final pass, this plan's checklist)
+**19/20 — `/v1/trace` endpoint + pure firewall evaluator** — shipped. The
+endpoint accepts a strict POST body, enforces source/destination scope and runs
+fixed, bounded probes from the source workload. Internal traces read live
+service state and attached eBPF backend/firewall maps. External probes need an
+Admin, the independent operation grant, protected-cluster permission and an
+exact `host:port` allowlist entry.
+
+**20/20 — `relish trace` CLI + phase close-out** — shipped. Relish discovers a
+reachable node hosting the source, preserves `Pass`/`Fail`/`Unknown` and
+observed/inferred/unavailable evidence in human/JSON/YAML output, and maps the
+overall result to exit 0/1/2. Progress, both READMEs and chapter 15 describe the
+actual contract.
 
 ---
 
@@ -644,14 +658,23 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
 
 Reuse existing response structs from `src/relish/client.rs` / `src/bun/api.rs` rather than redefining them; add `pub` or move types if needed.
 
-### 7.6 Trace types — shared, so put them in `src/onion/trace.rs` or `src/bun/api.rs`; match the design doc exactly
+### 7.6 Trace types — shared in `src/onion/trace.rs`
+
+> **Deviation recorded during step 19.** A two-state `Pass`/`Fail` contract
+> would turn missing probe tools or unavailable kernel maps into either a lie
+> or a failure attributed to the application. Trace now carries explicit
+> evidence provenance and `Unknown`, plus a strict schema version and source
+> node. This matches the runner and `wtf`: missing evidence never becomes
+> green.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceResult {
+    pub schema_version: u32,
     pub source: String,
     pub destination: String,
     pub destination_port: u16,
+    pub source_node: String,
     pub steps: Vec<TraceStep>,
     pub overall_result: TraceVerdict,
     pub latency_ms: Option<f64>,
@@ -660,7 +683,8 @@ pub struct TraceResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceStep {
     pub step_number: u32,
-    pub name: String,                    // "Service resolution", "Backend health", "Firewall", "TCP probe"
+    pub name: String,
+    pub evidence: TraceEvidence,
     pub details: Vec<String>,
     pub verdict: TraceVerdict,
 }
@@ -670,6 +694,13 @@ pub struct TraceStep {
 pub enum TraceVerdict {
     Pass,
     Fail { reason: String },
+    Unknown { reason: String },
+}
+
+pub enum TraceEvidence {
+    Observed,
+    Inferred,
+    Unavailable,
 }
 ```
 
@@ -843,34 +874,59 @@ OK entries (emit when the corresponding check passes and data was available): "a
 
 ### 7.11 Trace: endpoint and semantics
 
-**Endpoint:** `GET /v1/trace?from={app}&namespace={ns}&to={dest}&port={port}` (protected) in `src/bun/api.rs`; assembly logic in a helper module so it stays testable (`src/onion/trace.rs`: `pub async fn run_trace(deps..., from, to, port) -> TraceResult`).
+**Endpoint:** `POST /v1/trace` with a strict `TraceRequest` body. The route is
+authenticated and scope-aware. Bun accepts application/DNS labels for an
+internal destination; everything else is external and must pass the separate
+Admin, server-operation, protected-cluster and exact `host:port` allowlist
+checks. Arbitrary command text is never accepted.
 
 Steps (destination is a cluster app):
-1. **Service resolution** — look up `to` in the Onion service map. Details: VIP, whether the eBPF interception layer is live (`capabilities.ebpf`; if false, note `"userspace service map (eBPF not active on this node)"` — still Pass). Fail: `service map has no entry for '{to}'`.
-2. **Backend health** — list backends with health; Fail if 0 healthy: `service has {n} backends, none healthy`.
-3. **Firewall verdict** — call `firewall::evaluate::evaluate_app_connection(&desired_specs, from, to, port)`. This is a **pure function over declared policy** (`allow_from` in app specs), not a live nftables query — say so in `details` (`"policy verdict (declared allow_from), not live nftables"`). If firewall capability is off: Pass with note `"firewall disabled — all traffic permitted"`. Fail: `DROP: '{to}' does not list '{from}' in allow_from`.
-4. **TCP probe** — pick the first healthy backend, `tokio::time::timeout(5s, TcpStream::connect(addr))`, measure elapsed → `latency_ms`. Fail: refused/timeout with which address was tried. **Documented limitation** (put it in details and in the book): the probe originates from the bun agent process on the source node, not from inside the source app's network namespace, so app-netns-specific issues can escape it. `// TODO(v2): optionally probe via exec inside the source instance.`
+1. **DNS query** — execute fixed `nslookup "$1"` inside the source workload,
+   query `<app>.<namespace>.internal`, and require its output to contain the
+   live VIP.
+2. **Service and eBPF state** — read the live userspace service map and require
+   a healthy backend. On Linux with Onion attached, read `backend_map` too;
+   otherwise label the userspace result `Inferred`.
+3. **Firewall state** — on Linux with the hooks attached, resolve the source
+   workload PID to its cgroup, read `cgroup_namespace_map` and `firewall_map`,
+   and evaluate those facts with the same rule as the connect hook. Missing
+   live maps produce `Unknown`, not a declared-policy pass.
+4. **TCP probe** — execute fixed `nc -z -w 3 "$1" "$2"` inside the source
+   workload against the service VIP. The task has an eight-second outer bound
+   and reports measured latency.
 
-Destination is an external host (contains a dot and isn't a known service): step 1 becomes system DNS (`tokio::net::lookup_host`), step 3 evaluates the egress allowlist if wired (else Pass + note), `--port` becomes mandatory (CLI validates).
+For an external host, DNS and TCP still originate in the workload and `--port`
+is mandatory. With no egress policy, the live enable map proves pass-through.
+With active egress enforcement, the TCP result is observed but the map can't
+yet attribute a resolved address to the requested hostname, so the firewall
+step is `Unknown`.
 
-`overall_result`: Fail if any step failed (first failure's reason); steps after a failed step are still attempted where meaningful (probe is skipped if there's no backend to probe).
+`overall_result`: `Fail` wins, then `Unknown`, then `Pass`. All meaningful
+steps still run. A missing POSIX shell, `nslookup` or `nc` is `Unknown`; it
+isn't misreported as a network failure.
 
-**CLI side** (`src/relish/trace.rs`): resolve which node hosts a `from` instance via `/v1/status` (any instance will do; take the first), construct a `BunClient` for that node's address (node API addresses come from `/v1/cluster/nodes`), call `/v1/trace`, render:
+**CLI side** (`src/relish/trace_cmd.rs`): query reachable node status views
+concurrently, select the lexicographically first node with a running source
+instance, construct an authenticated peer `BunClient`, call `/v1/trace`, and
+render human, JSON or YAML. Human output labels evidence provenance; exit 0 is
+Pass, 1 is Fail and 2 is Unknown.
 
 ```
 $ relish trace web --to redis
 
-  trace: web → redis:6379
+Trace default/web -> default/redis:6379 from node node-a
 
-  1. Service resolution        PASS   redis → 127.128.0.3 (userspace service map)
-  2. Backend health            PASS   2/2 backends healthy
-  3. Firewall                  PASS   allow_from includes 'web' (declared policy)
-  4. TCP probe                 PASS   10.0.1.5:30891 in 1.3 ms
+  1. DNS query [PASS; observed]
+  2. Service and eBPF state [PASS; observed]
+  3. Firewall state [PASS; observed]
+  4. TCP probe [PASS; observed]
 
-  result: PASS (1.3 ms)
+Overall: PASS (1.30 ms TCP probe)
 ```
 
-Failures print the failing step in red with its reason and stop the summary at `result: FAIL — <reason>`. Snapshot-test this rendering with `insta` from a fixed `TraceResult` fixture.
+Machine output uses strict schema version 1. The rendering and exit mapping are
+covered by fixed-result unit tests; source-node selection and the API path use
+mock clients and agent orchestration tests.
 
 ---
 
@@ -988,8 +1044,8 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 16/20 bench suites
 - [x] 17/20 wtf engine
 - [x] 18/20 `relish wtf` CLI
-- [ ] 19/20 trace endpoint
-- [ ] 20/20 `relish trace` + close-out
+- [x] 19/20 trace endpoint
+- [x] 20/20 `relish trace` + close-out
 - [ ] acceptance runbook on a 3-node dev cluster
 
 ---
@@ -1053,6 +1109,21 @@ and is compared with scheduled instances and the live resolver, so a service
 with no resolver entry remains diagnosable. Restart/deploy history limitations,
 app-unlabelled alerts and incomplete certificate inventory are explicit
 Unknown results. Twenty-two focused engine, collector and command tests pass.
+
+**3 August 2026, steps 19–20 implementation.** `POST /v1/trace` runs bounded,
+fixed DNS and TCP probes inside the selected source workload and reads live
+userspace service state plus attached Linux eBPF backend/firewall maps. The
+agent spawns the owned trace task; a regression test holds `exec()` in flight
+and proves status still responds. Eight per-node execution permits bound
+concurrency and the ninth request is refused rather than queued. Strict
+schema-v1 human/JSON/YAML results
+preserve observed, inferred and unavailable provenance, and `Unknown` exits 2.
+External probes fail closed behind Admin, `probe_external_destination`, the
+protected-cluster policy and an exact `host:port` allowlist. Focused tests pass
+with default and no-default features. A live ProcessGrill launch was not
+possible in the implementation sandbox, so the checked mock-runtime
+orchestration is not presented as real-runtime acceptance; the three-node
+runc/Apple acceptance run remains open with the rest of the final runbook.
 A live standalone ProcessGrill run produced one correctly coalesced shared-disk
 warning, four honest Unknown sources and exit status 2; no false clustered
 registry warning appeared. The full three-node acceptance run remains open.

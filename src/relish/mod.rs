@@ -33,6 +33,7 @@ pub mod reader;
 pub mod setup;
 pub mod source;
 pub mod test_cmd;
+pub mod trace_cmd;
 pub mod tui;
 pub mod upgrade;
 pub mod wtf;

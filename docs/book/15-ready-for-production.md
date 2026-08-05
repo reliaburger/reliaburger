@@ -2009,3 +2009,133 @@ Finally, the shell contract is small enough to remember. `relish wtf` returns
 finding, and 2 for warnings or unknown evidence. `--app` removes unrelated
 cluster checks structurally. `--watch` repeats the human report every 30
 seconds, while JSON and YAML remain one schema-versioned report per process.
+
+## Trace the connection you actually care about
+
+Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
+us that the node works. It says very little about `web`. The application has
+its own network namespace, cgroup identity, firewall decision and DNS setup.
+The useful question is therefore: can *this workload* make the connection?
+
+`relish trace web --to redis` starts by asking every reachable node for status.
+It chooses a node with a running `web` instance, then sends a strict request to
+that node's authenticated `/v1/trace` endpoint. Bun doesn't accept a shell
+command. It accepts application names, namespaces, a destination and an
+optional port.
+
+The distinction matters. Bun's DNS probe always runs the same script:
+
+```sh
+output=$(nslookup "$1" 2>&1)
+status=$?
+printf '%s\n' "$output"
+printf '__RB_TRACE_DNS_STATUS__=%s\n' "$status"
+```
+
+The requested name becomes `$1`, a positional argument. It never becomes part
+of the script. The TCP probe does the same with `nc -z -w 3 "$1" "$2"`.
+Quoting the positional parameters lets the shell pass each value as data even
+if it contains punctuation. The API also validates internal names as DNS
+labels, but that isn't our only command-injection defence.
+
+Both commands execute through the runtime's `exec()` implementation. On runc
+and Apple Container that means they run inside the selected workload. The
+image must contain a POSIX shell, `nslookup` and `nc`. If it doesn't, trace says
+`Unknown`. A missing debugging tool isn't proof that the network failed.
+
+## Don't stop the control plane to debug it
+
+A DNS query can wait. A TCP connect can wait too. Each workload operation has
+an eight-second outer timeout, but awaiting those operations in Bun's command
+loop would still delay status, shutdown and every command queued behind it.
+
+The agent therefore builds a `PreparedTrace<G>`. It contains owned copies of
+the runtime handle, request, source instance and service state needed by the
+trace. The command arm moves that value and the response channel into a new
+task:
+
+```rust
+tokio::spawn(async move {
+    let _ = response.send(trace.run().await);
+});
+```
+
+We saw `move` closures earlier. An `async move` block applies the same rule to
+an asynchronous block: it owns every captured value rather than borrowing the
+agent's stack frame. Tokio requires spawned futures to be valid independently
+of their caller. Ownership makes that requirement visible in the type system.
+It also gives us a useful test. The mock runtime holds `exec()` in flight while
+the test asks Bun for status. Status still returns before the probe is
+released.
+
+Spawning doesn't make capacity free. Bun owns a semaphore with eight trace
+permits. `try_acquire_owned()` moves one permit into `PreparedTrace`; dropping
+the trace returns it automatically. If all eight are occupied, the ninth
+request gets HTTP 429 immediately. We test that refusal while all eight mock
+`exec()` calls are held. A bound that merely queues an unlimited number of
+waiting tasks isn't a resource bound.
+
+`PreparedTrace` also owns a clone of Bun's cancellation token. Each probe
+selects between runtime execution, its timeout and shutdown. Cancelling Bun
+drops an in-flight probe immediately, returns the semaphore permit and reports
+Unknown if the caller is still listening. A separate held-`exec()` test proves
+that path; graceful shutdown doesn't wait for a diagnostic timeout.
+
+## Four steps, three kinds of evidence
+
+An internal trace reports four layers:
+
+1. A real `nslookup` from the source workload for
+   `<destination>.<namespace>.internal`. The answer must contain the VIP from
+   live service state.
+2. The live userspace service map and its healthy backends. On Linux with
+   Onion attached, Bun also reads the actual eBPF `backend_map`.
+3. The live firewall decision. Bun resolves the source PID to its cgroup, reads
+   `cgroup_namespace_map` and `firewall_map`, then applies the same rule as the
+   eBPF connect hook.
+4. A real TCP connect from the source workload to the service VIP and port.
+
+Portable builds don't have attached kernel maps. They can still observe DNS,
+userspace service state and TCP, but they can't claim to have inspected eBPF.
+`TraceEvidence` makes that difference part of the response:
+
+```rust
+pub enum TraceEvidence {
+    Observed,
+    Inferred,
+    Unavailable,
+}
+
+pub enum TraceVerdict {
+    Pass,
+    Fail { reason: String },
+    Unknown { reason: String },
+}
+```
+
+Evidence answers "how do we know?" A verdict answers "what did we learn?" A
+healthy userspace service map without an attached backend map is inferred but
+can pass that layer. A firewall map we can't read is unavailable and therefore
+unknown. A live map with no allow entry is an observed failure. Overall, Fail
+wins, then Unknown, then Pass. Missing evidence can't quietly turn green.
+
+Relish preserves that contract in human, JSON and YAML output. Pass exits 0,
+Fail exits 1 and Unknown exits 2, matching `wtf`. The JSON schema is versioned
+and rejects unknown top-level fields so automation doesn't silently interpret
+a changed response as the old one.
+
+External probing has a narrower safety boundary. The caller supplies `--port`
+and must be an Admin. The server must grant `probe_external_destination`, the
+protected-cluster gate must allow it where applicable, and
+`external_probe_allowlist` must contain the exact `host:port`. No wildcard or
+CIDR matching. When live egress enforcement is active, the TCP result is still
+observed, but the current kernel map stores resolved addresses rather than the
+requested hostname relationship. Trace calls that firewall evidence Unknown.
+Honest again. Slightly annoying again. You can probably see the pattern by
+now.
+
+The remaining acceptance work needs a real three-node environment and the
+rootful runc and Apple Container profiles. The implementation sandbox used for
+this tranche couldn't launch a live Bun process, so the checked evidence is
+the pure contract, API/authentication tests and mock-runtime orchestration. We
+don't turn that platform limitation into a production claim.

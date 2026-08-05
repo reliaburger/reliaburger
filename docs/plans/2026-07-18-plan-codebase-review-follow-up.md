@@ -513,6 +513,13 @@ startup. M8 must add certificate expiry evidence and should not make
     state prevents absent services from disappearing; bounded restart/deploy
     stores remain degraded evidence; app scope, watch mode and the exact 0/1/2
     exit contract are implemented.
+  - [x] Observed source-workload trace and CLI. Fixed DNS and TCP probes run in
+    the source runtime, live userspace/eBPF/firewall state is labelled
+    separately from inference, and missing evidence produces `Unknown`.
+    External probes require exact server-owned destination authority.
+  - [x] Documentation close-out for the Phase 15 commands. The final real
+    three-node runc/Apple acceptance run remains open and keeps this parent
+    item unchecked.
 - [ ] Add certificate expiry evidence and production rotation/renewal before
   treating the TLS-expiry diagnostic as an accepted capability.
 

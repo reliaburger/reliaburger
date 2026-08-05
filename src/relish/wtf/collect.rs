@@ -302,7 +302,7 @@ fn capability_identity(report: Option<&ClusterCapabilityReport>) -> (String, boo
     )
 }
 
-fn node_client(entry: &BunClient, node: &NodeStatus) -> Result<BunClient, String> {
+pub(crate) fn node_client(entry: &BunClient, node: &NodeStatus) -> Result<BunClient, String> {
     let entry_url = url::Url::parse(entry.base_url())
         .map_err(|error| format!("invalid entry endpoint: {error}"))?;
     let api_port = entry_url

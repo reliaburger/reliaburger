@@ -133,6 +133,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/diagnostics", AnyToken),
     route(Get, "/v1/diagnostics/apps", AnyToken),
+    route(Post, "/v1/trace", AnyToken),
     route(Post, "/v1/test/leases", Deployer),
     route(Get, "/v1/test/leases/{id}", AnyToken),
     route(Post, "/v1/test/leases/{id}/renew", Deployer),

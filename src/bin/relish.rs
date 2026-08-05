@@ -408,6 +408,23 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    /// Trace DNS, service-map, firewall and TCP evidence from a workload.
+    Trace {
+        /// Source application name.
+        source: String,
+        /// Source namespace.
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Destination application, hostname or IP address.
+        #[arg(long)]
+        to: String,
+        /// Namespace of an internal destination.
+        #[arg(long, default_value = "default")]
+        to_namespace: String,
+        /// Destination port. Internal services derive it when omitted.
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1491,6 +1508,25 @@ async fn main() -> ExitCode {
                 .await,
             );
         }
+        Command::Trace {
+            source,
+            namespace,
+            to,
+            to_namespace,
+            port,
+        } => {
+            return finish_outcome(
+                reliaburger::relish::trace_cmd::run(reliaburger::relish::trace_cmd::TraceArgs {
+                    source,
+                    source_namespace: namespace,
+                    destination: to,
+                    destination_namespace: to_namespace,
+                    port,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
     };
 
     finish(result)
@@ -1727,6 +1763,40 @@ mod tests {
                 app: Some(ref app),
                 watch: true
             } if app == "payments"
+        ));
+    }
+
+    #[test]
+    fn parse_trace_namespaces_port_and_machine_output() {
+        let parsed = parse(&[
+            "relish",
+            "--output",
+            "yaml",
+            "trace",
+            "api",
+            "--namespace",
+            "frontend",
+            "--to",
+            "db",
+            "--to-namespace",
+            "storage",
+            "--port",
+            "5432",
+        ])
+        .unwrap();
+        assert_eq!(parsed.output, OutputFormat::Yaml);
+        assert!(matches!(
+            parsed.command,
+            Command::Trace {
+                source,
+                namespace,
+                to,
+                to_namespace,
+                port: Some(5432),
+            } if source == "api"
+                && namespace == "frontend"
+                && to == "db"
+                && to_namespace == "storage"
         ));
     }
 

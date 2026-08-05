@@ -760,6 +760,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
 | `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
 | `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics |
+| `POST` | `/v1/trace` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
@@ -838,6 +839,27 @@ all selected evidence was observed and healthy, 1 means a critical finding,
 and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
 history is deliberately reported as degraded, not silently accepted as a
 complete historical record.
+
+`relish trace <source> --to <destination>` finds a running source instance,
+then asks that node to run fixed `nslookup` and TCP-connect probes inside the
+source workload. Internal destinations derive their port from the live service
+map; use `--namespace`, `--to-namespace` and `--port` when needed. The four
+steps cover the actual DNS answer, live userspace and attached eBPF service
+state, live attached firewall state, and the TCP result. Each step is labelled
+`observed`, `inferred` or `unavailable`. A failure exits 1; missing evidence or
+missing probe tools exits 2 rather than pretending the path is healthy.
+
+External probes are denied by default. They require an Admin credential,
+`probe_external_destination` in `[testing].allowed_operations`, the protected
+cluster gate where applicable, and an exact `host:port` entry. Wildcards and
+CIDR entries do not match:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["probe_external_destination"]
+external_probe_allowlist = ["example.com:443"]
+```
 
 Workload faults are opt-in too. Injection needs a Deployer-or-higher
 credential, explicit `--acknowledge`, and this server policy:

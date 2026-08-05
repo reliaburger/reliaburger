@@ -45,12 +45,14 @@ The `relish exec` and `relish exec --debug` commands require the Bun agent runni
 
 ### Onion (resolve, trace)
 
-The `relish resolve` and `relish trace` commands query the Onion eBPF service discovery layer:
+The `relish resolve` and `relish trace` commands inspect Onion's userspace and,
+where attached, kernel state:
 
-- `resolve` queries the eBPF service map to show virtual IPs, real backends, health status, and node placement for a given service name.
-- `trace` performs end-to-end connectivity diagnosis through the eBPF DNS interception, connect() rewrite, nftables firewall evaluation, and TCP probe layers.
+- `resolve` queries the userspace service map to show virtual IPs, real backends, health status, and node placement for a given service name.
+- `trace` runs a real DNS query and TCP connect inside the source workload, then reads the userspace service map and any attached eBPF backend and cgroup-firewall maps.
 
-Both commands call the Bun agent API on the relevant node, which reads the eBPF maps from kernel space.
+Relish first finds the node hosting the source instance. That Bun agent owns
+the network locality and live map handles needed to make the observations.
 
 ### Mayo (metrics queries)
 
@@ -939,14 +941,33 @@ Filter flags:
 
 **`relish trace <app> --to <app|host>`**
 
-End-to-end connectivity diagnosis. Traces the full path a connection would take through the eBPF service discovery layer, showing every step:
+End-to-end connectivity diagnosis. Relish finds a running source instance and
+calls `POST /v1/trace` on that node. Bun runs only fixed probe scripts; request
+values become positional arguments and never shell syntax. The source image
+must provide a POSIX `sh`, `nslookup` and `nc` for every observation to run.
+The response contains four steps:
 
-1. **DNS resolution (eBPF):** Resolves the destination name through the eBPF DNS interception. Shows whether the service map contains the entry and the virtual IP assigned.
-2. **Connect interception (eBPF):** Shows the virtual IP to real backend rewrite, including how many healthy backends exist.
-3. **Network path:** Shows the source and destination nodes and the nftables firewall verdict (ACCEPT or DROP, with the matching rule).
-4. **TCP probe:** Performs a real SYN handshake and reports latency.
+1. **DNS query:** Runs `nslookup` inside the source workload. For an internal service it queries `<app>.<namespace>.internal` and checks that the answer contains the live VIP.
+2. **Service and eBPF state:** Reads the userspace service map. On Linux with Onion attached, it also reads the live `backend_map` and requires a healthy kernel backend. Otherwise the userspace result is explicitly `inferred`.
+3. **Firewall state:** On Linux with the firewall hooks attached, resolves the source PID to its cgroup and evaluates the live namespace and firewall maps using the same rule as the connect hook. Without those maps the result is `Unknown`, never an invented pass.
+4. **TCP probe:** Runs `nc` inside the source workload against the service VIP and selected port and reports observed latency.
 
-If any step fails, the trace shows exactly where and why: service map entry missing, no healthy backends, nftables rule blocking, TCP connection refused or timed out. This replaces the Kubernetes debugging sequence of checking DNS, endpoints, network policies, kube-proxy, and CNI separately.
+Every step labels its evidence `observed`, `inferred` or `unavailable` and its
+verdict `Pass`, `Fail` or `Unknown`. `Fail` wins the overall result; incomplete
+evidence cannot become green. Exit statuses are 0, 1 and 2 respectively.
+Workload probes run on a spawned, bounded task so an eight-second probe timeout
+can't stall Bun's command loop. Bun permits at most eight concurrent traces per
+node and returns HTTP 429 for the ninth instead of accumulating an unbounded
+queue of workload processes. Agent shutdown cancels in-flight probes and
+releases their permits immediately.
+
+External destinations require `--port`, an Admin credential, the server-owned
+`probe_external_destination` permission and an exact `host:port` entry in
+`[testing].external_probe_allowlist`. Unknown and production clusters also
+need `allow_protected_mutation = true`. The external TCP result is observed,
+but when egress enforcement is active the current kernel maps contain resolved
+addresses rather than hostname attribution, so that firewall step remains
+`Unknown`.
 
 **`relish inspect <resource>`**
 

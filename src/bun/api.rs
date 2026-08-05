@@ -355,6 +355,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
+        .route("/v1/trace", post(trace_handler))
         .route("/v1/test/leases", post(test_lease_create_handler))
         .route("/v1/test/leases/{id}", get(test_lease_get_handler))
         .route("/v1/test/leases/{id}/renew", post(test_lease_renew_handler))
@@ -774,6 +775,171 @@ async fn desired_apps_handler(
         }
     };
     Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response()
+}
+
+/// `POST /v1/trace` — fixed DNS and TCP probes from a local source workload.
+async fn trace_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(mut request): Json<crate::onion::trace::TraceRequest>,
+) -> Response {
+    if let Err(response) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return response;
+    }
+    if request.port == Some(0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": "trace destination port must be between 1 and 65535"}),
+            ),
+        )
+            .into_response();
+    }
+    if !valid_trace_label(&request.source) || !valid_trace_label(&request.source_namespace) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "trace source and namespace must be DNS labels"})),
+        )
+            .into_response();
+    }
+    if let Err(response) = crate::sesame::auth::authorize_scoped(
+        auth.as_deref(),
+        &request.source,
+        &request.source_namespace,
+    ) {
+        return response;
+    }
+
+    let internal_destination = valid_trace_label(&request.destination);
+    if internal_destination {
+        if !valid_trace_label(&request.destination_namespace) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "internal destination namespace must be a DNS label"})),
+            )
+                .into_response();
+        }
+        if let Err(response) = crate::sesame::auth::authorize_scoped(
+            auth.as_deref(),
+            &request.destination,
+            &request.destination_namespace,
+        ) {
+            return response;
+        }
+        let (sender, receiver) = oneshot::channel();
+        if state
+            .cmd_tx
+            .send(AgentCommand::ResolveAll { response: sender })
+            .await
+            .is_err()
+        {
+            return (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response();
+        }
+        let services = match receiver.await {
+            Ok(services) => services,
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "agent dropped service-map response",
+                )
+                    .into_response();
+            }
+        };
+        let Some(service) = services.iter().find(|service| {
+            service.app_name == request.destination
+                && service.namespace == request.destination_namespace
+        }) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "internal destination is absent from the live service map"})),
+            )
+                .into_response();
+        };
+        request.port.get_or_insert(service.port);
+    } else {
+        let Some(port) = request.port else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "external trace destination requires --port"})),
+            )
+                .into_response();
+        };
+        let Some(auth) = auth.as_deref() else {
+            return (
+                StatusCode::FORBIDDEN,
+                "external trace requires an authenticated Admin credential",
+            )
+                .into_response();
+        };
+        if let Err(error) = state.static_capabilities.test_policy.authorise(
+            crate::testkit::safety::OperationPermission::ProbeExternalDestination,
+            &crate::testkit::safety::OperationAuthorisation {
+                principal: &auth.principal_id,
+                role: auth.role,
+                acknowledged: false,
+            },
+        ) {
+            return (StatusCode::FORBIDDEN, error.to_string()).into_response();
+        }
+        if !state
+            .static_capabilities
+            .test_policy
+            .permits_external_probe(&request.destination, port)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "external trace destination is not exactly allowlisted as host:port",
+            )
+                .into_response();
+        }
+    }
+
+    let (sender, receiver) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::Trace {
+            request,
+            internal_destination,
+            source_node: state.static_capabilities.node_id.clone(),
+            response: sender,
+        })
+        .await
+        .is_err()
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(20), receiver).await {
+        Ok(Ok(Ok(result))) => Json(result).into_response(),
+        Ok(Ok(Err(crate::bun::BunError::AppNotFound { .. }))) => (
+            StatusCode::NOT_FOUND,
+            "source app has no running instance on this node",
+        )
+            .into_response(),
+        Ok(Ok(Err(crate::bun::BunError::TraceBusy))) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many connectivity traces are already running on this node",
+        )
+            .into_response(),
+        Ok(Ok(Err(error))) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        Ok(Err(_)) => (StatusCode::SERVICE_UNAVAILABLE, "agent dropped response").into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "trace timed out after 20 seconds",
+        )
+            .into_response(),
+    }
+}
+
+fn valid_trace_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && edge(bytes[0])
+        && edge(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
 }
 
 fn filter_desired_apps_for_scope(
@@ -5913,6 +6079,16 @@ mod tests {
         assert_eq!(visible, vec![evidence("api", "tenant-a")]);
     }
 
+    #[test]
+    fn internal_trace_names_are_single_dns_labels() {
+        for valid in ["api", "api-v2", "a1"] {
+            assert!(valid_trace_label(valid), "rejected {valid:?}");
+        }
+        for invalid in ["", "API", "-api", "api-", "api.default", "api;id"] {
+            assert!(!valid_trace_label(invalid), "accepted {invalid:?}");
+        }
+    }
+
     /// Start a test agent and return the router and shutdown handle.
     fn test_setup() -> (Router, CancellationToken) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -6180,6 +6356,79 @@ mod tests {
         assert_eq!(
             get_status(app, "/v1/status", None).await,
             StatusCode::UNAUTHORIZED
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn external_trace_refuses_the_open_bootstrap_window() {
+        let (app, shutdown) = test_setup();
+        let body = serde_json::json!({
+            "source": "api",
+            "source_namespace": "default",
+            "destination": "example.com",
+            "destination_namespace": "default",
+            "port": 443
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/trace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn external_trace_needs_admin_policy_and_exact_destination() {
+        use crate::testkit::safety::{ClusterSafetyClass, OperationPermission};
+
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let mut capabilities = crate::bun::capabilities::StaticCapabilities::default();
+        capabilities.test_policy.safety_class = ClusterSafetyClass::Staging;
+        capabilities
+            .test_policy
+            .allowed_operations
+            .insert(OperationPermission::ProbeExternalDestination);
+        capabilities.test_policy.external_probe_allowlist = vec!["example.com:443".to_string()];
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            capabilities,
+            None,
+        )
+        .await;
+
+        let body = |port| {
+            serde_json::json!({
+                "source": "api",
+                "source_namespace": "default",
+                "destination": "example.com",
+                "destination_namespace": "default",
+                "port": port
+            })
+            .to_string()
+        };
+        assert_eq!(
+            post_status(app.clone(), "/v1/trace", &plaintext, &body(80)).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_status(app.clone(), "/v1/trace", &plaintext, &body(0)).await,
+            StatusCode::BAD_REQUEST
+        );
+        // The exact allowlisted destination passes the policy boundary and
+        // reaches the local-source check. No workload was seeded, hence 404.
+        assert_eq!(
+            post_status(app, "/v1/trace", &plaintext, &body(443)).await,
+            StatusCode::NOT_FOUND
         );
         shutdown.cancel();
     }

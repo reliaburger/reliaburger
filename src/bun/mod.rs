@@ -93,6 +93,10 @@ pub enum BunError {
     #[error("security error: {reason}")]
     SecurityError { reason: String },
 
+    /// All bounded connectivity-trace execution slots are occupied.
+    #[error("too many connectivity traces are already running on this node")]
+    TraceBusy,
+
     /// A self-upgrade operation failed.
     #[error(transparent)]
     Upgrade(#[from] crate::upgrade::UpgradeError),

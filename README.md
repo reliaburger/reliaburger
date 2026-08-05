@@ -114,6 +114,7 @@ make audit                   # reject new RustSec dependency findings
 relish test --profile development # run the 39-case live-cluster catalogue
 relish bench --quick --output json # benchmark real DNS and service data paths
 relish wtf                       # diagnose live cluster evidence (0/1/2 exit)
+relish trace web --to redis      # probe DNS and TCP from the web workload
 make examples                # validate and dry-run every example config
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
@@ -145,7 +146,11 @@ timeouts and uncertain cleanup fail instead of becoming green skips.
 unavailable and inherently incomplete evidence as `Unknown`, and correlates
 timestamped restarts with recent deploys and error logs. It returns 0 only when
 every selected check is observed and healthy, 1 for critical findings, and 2
-for warnings or unknown evidence.
+for warnings or unknown evidence. `relish trace` locates a running source
+instance, executes fixed DNS and TCP probes inside that workload, and compares
+the result with the live service map and, on supported Linux nodes, attached
+eBPF backend and firewall maps. Every step says whether its evidence was
+observed, inferred or unavailable; incomplete evidence returns exit status 2.
 
 ## Licence
 

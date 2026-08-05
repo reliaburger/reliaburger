@@ -9,6 +9,7 @@ mod diagnose;
 mod model;
 
 pub use collect::collect;
+pub(crate) use collect::node_client;
 pub use diagnose::diagnose;
 pub use model::{
     AlertObservation, ApplicationEvidence, CertificateObservation, ClusterEvidence,

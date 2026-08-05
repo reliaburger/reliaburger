@@ -1297,7 +1297,8 @@ convergence and adoption" theme under 12b.6).
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
 > Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
-> (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
+> (20 numbered steps plus prerequisite tranches, test catalogue, data structures,
+> acceptance runbook).
 >
 > The harness half is done; the diagnostic commands are the largest block of genuinely
 > unbuilt feature work left in the project. Smoker's service-to-service `Partition` deferral
@@ -1359,11 +1360,17 @@ convergence and adoption" theme under 12b.6).
     metadata without paths, certificate bodies or key material
   - [x] Authenticated cross-node collection with ten-second bounds, desired-app
     and service evidence, rendering, app scope, watch mode and 0/1/2 exit contract
-- [ ] `relish trace` (end-to-end connectivity debugging)
+- [x] `relish trace` (end-to-end connectivity debugging): source-node
+  discovery; fixed bounded DNS/TCP probes inside the source workload; live
+  userspace service state and attached Linux eBPF backend/firewall reads;
+  explicit observed/inferred/unavailable evidence; strict schema-v1
+  human/JSON/YAML output and 0/1/2 exit contract. External probes fail closed
+  behind Admin, an independent server permission, protected-cluster policy and
+  an exact `host:port` allowlist
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
-- [ ] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
-  `trace`) when those commands land
+- [x] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
+  `trace`), including safety, evidence provenance and acceptance limitations
 - [ ] All Phase 15 tests green
 
 ## Phase 15a: Current-State Hardening
@@ -1496,6 +1503,13 @@ convergence and adoption" theme under 12b.6).
   - [x] Seven-suite benchmark runner and CLI: real source-workload DNS/service
     paths, strict failed-versus-skipped outcomes, fresh preflight evidence,
     explicit destructive consent and unconditional server-owned cleanup.
+  - [x] Authenticated source-workload trace and CLI: fixed positional-argument
+    DNS/TCP probes run off the agent command loop; live userspace and attached
+    kernel state are distinguished from inference; incomplete evidence is
+    `Unknown`; external destinations use exact server-owned authorisation.
+  - [x] Phase 15 command documentation across both READMEs, the Relish/Bun
+    designs, chapter 15 and the implementation plan. Real three-node catalogue,
+    chaos, benchmark and trace acceptance remains the unchecked phase gate.
 
 ### Optional
 
