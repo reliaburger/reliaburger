@@ -71,11 +71,19 @@ Monday even when the repository is quiet.
 | `thrift` GHSA-2f9f-gq7v-9h6m | Runtime reachable through Parquet/DataFusion when the operator runs `relish logs-query remote` against a local or remote archive. There is no fixed `thrift` release. | **Temporary risk acceptance.** Query only Bun-produced Parquet in operator-controlled object stores; don't point the command at untrusted archives. A crafted trusted-store object can still cause process memory exhaustion, so this isn't a complete defence. Phase 15a/M2 owns replacement or upstream upgrade; recheck by 18 August 2026. GitHub Dependabot remains the detection source because RustSec doesn't currently carry this GHSA. |
 | `lru` RUSTSEC-2026-0002 | Transitive through ratatui 0.29. Its layout cache uses `LruCache`, but source review finds no call to the affected `LruCache::iter_mut` API. | **Temporary exception.** No reachable affected call. Phase 15a/M2 owns the ratatui/lru upgrade; CI exception expires 18 August 2026. |
 | `anyhow` RUSTSEC-2026-0190 | Direct error type. Repository call-path review finds no `Error::downcast_mut`, the affected API. No fixed release exists. | **Temporary exception.** Avoid `downcast_mut`; Phase 15a/M2 owns upstream recheck; CI exception expires 18 August 2026. |
+| `rkyv` RUSTSEC-2026-0235 | Cargo locks `rust_decimal`'s optional `rkyv` 0.7 dependency through `openraft` and `byte-unit`, but `byte-unit` disables `rust_decimal`'s defaults and doesn't enable its `rkyv` feature. `cargo tree --target all -i rkyv` prints no active path; Reliaburger neither compiles `rkyv` nor reads an rkyv archive. | **Temporary exception.** `rust_decimal` 1.x deliberately pins its optional support to `rkyv` 0.7, so the advisory's 0.8.17 fix isn't compatible. Phase 15a/M2 owns the upstream recheck; CI exception expires 18 August 2026. |
 | `bincode`, `rustls-pemfile`, `paste`, `proc-macro-error` informational advisories | `bincode` persists Raft vote/log-id metadata and needs a format migration. `rustls-pemfile` parses configured TLS material. `paste` and `proc-macro-error` are build-time transitive macros. These are maintenance notices rather than published vulnerabilities. | **Temporary exceptions.** Phase 15a/M2 owns migration/upgrade; CI exceptions expire 18 August 2026. |
 
-The remaining `lru` and `thrift` GitHub alerts therefore stay visible. They are
-not being called fixed. The acceptance decision is narrowly about known API
-reachability and trusted input, with a forced re-review date.
+On 5 August 2026, CI loaded 1,189 advisories and found the new `rkyv` advisory.
+The package appears in `Cargo.lock` because Cargo resolves optional dependency
+versions even when their features are disabled. The all-target feature graph
+confirmed that no build selects it. We added the same fail-closed expiry as the
+other exceptions rather than claiming that a breaking 0.8 substitution would
+work under `rust_decimal` 1.x.
+
+The remaining `lru`, `thrift` and lock-only `rkyv` alerts therefore stay
+visible. They are not being called fixed. The acceptance decision is narrowly
+about known API reachability and trusted input, with a forced re-review date.
 
 **Verification:** `make audit`, `cargo fmt --all -- --check` and portable
 all-target clippy pass. `make test` runs 2,633 tests (all pass; 39 separately

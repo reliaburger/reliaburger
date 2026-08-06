@@ -423,6 +423,13 @@ isn't called by ratatui's layout cache. The former can parse a crafted Parquet o
 operator points the remote log-query command at it, so trusted storage is a compensating
 control, not a fix. We wrote both decisions down, named an owner and gave them an expiry.
 
+A later `rkyv` advisory showed why the compiled graph matters too. Cargo locked
+`rust_decimal`'s optional `rkyv` 0.7 dependency, but `byte-unit` disables the defaults that
+would enable it. `cargo tree --target all -i rkyv` found no active path, and Reliaburger reads
+no rkyv archives. The advertised fix starts at the incompatible rkyv 0.8 API while
+`rust_decimal` 1.x deliberately pins its optional integration to 0.7. We recorded a temporary,
+expiring exception instead of pretending that changing an unused lockfile version was a fix.
+
 The repository audit denies every new vulnerability and maintenance warning. Its short
 exception list expires on 18 August 2026, and the Make target fails after that date until we
 review it. CI runs the audit on changes and releases; a weekly job catches a new advisory
