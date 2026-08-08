@@ -1636,6 +1636,15 @@ capacity:
 quota = period × cores × percentage / 100
 ```
 
+One ordering detail earned its comment the hard way. Our first version wrote
+`cpu.max` before spawning the helper. Sensible-looking, and wrong: the helper
+faults hundreds of megabytes of ballast into residency *inside* that cgroup,
+so a 5% quota turned a sub-second startup into a crawl on shared CI hardware
+and tripped the four-second readiness timeout. The parent now writes `cpu.max`
+only after the helper prints `ready`. The burn threads run unthrottled for one
+pipe round-trip, which is bounded and harmless. The memory ceiling still goes
+in before spawn, because it is the safety bound on the allocation itself.
+
 Memory needs a more careful definition. `--memory 90%` means "bring total node
 usage to 90%", not "allocate another 90%". The helper reads Linux `MemTotal`
 and `MemAvailable` *after* joining its cgroup, then allocates only the

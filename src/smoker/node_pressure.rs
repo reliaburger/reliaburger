@@ -9,6 +9,11 @@
 //! server-owned `[testing]` limits, which default to zero. Linux cgroup v2 is
 //! required; Apple Container and rootless nodes report the capability as
 //! unavailable.
+//!
+//! Control ordering matters: the memory ceiling is written before the helper
+//! spawns (it bounds the ballast allocation), but the CPU quota is written
+//! only after the helper reports ready, so startup page-faulting is never
+//! throttled against the readiness timeout.
 
 use std::path::{Path, PathBuf};
 
@@ -161,8 +166,7 @@ impl NodePressureController {
                 .as_ref()
                 .ok_or_else(|| "node-pressure helper executable is unavailable".to_string())?;
             let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
-            let (_memory_ceiling_bytes, cores) =
-                prepare_fault_cgroup(&cgroup, cpu_percentage, memory_percentage)?;
+            let (_memory_ceiling_bytes, cores) = prepare_fault_cgroup(&cgroup, memory_percentage)?;
 
             let mut command = tokio::process::Command::new(executable);
             command
@@ -201,7 +205,7 @@ impl NodePressureController {
             )
             .await;
             if !matches!(&started, Ok(Ok(_))) || ready.trim() != "ready" {
-                let reason = if matches!(&started, Err(_)) {
+                let reason = if started.is_err() {
                     "node-pressure helper did not become ready within 4 seconds".to_string()
                 } else {
                     let stderr = child.stderr.take().map(tokio::io::BufReader::new).map(
@@ -250,6 +254,22 @@ impl NodePressureController {
                 let _ = child.wait().await;
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err(reason);
+            }
+
+            // Throttle only after the helper is resident and ready. The spin
+            // workers run unthrottled for at most this one round-trip; the
+            // memory ceiling has bounded the allocation since before spawn.
+            if cpu_percentage > 0
+                && let Err(error) = write_control(
+                    &cgroup,
+                    "cpu.max",
+                    &node_cpu_max(cpu_percentage, cores as u32),
+                )
+            {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = remove_fault_cgroup(&cgroup);
+                return Err(error);
             }
 
             self.active.insert(id, NodePressureHandle { child, cgroup });
@@ -334,11 +354,7 @@ fn cleanup_stale_cgroups(root: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_fault_cgroup(
-    cgroup: &Path,
-    cpu_percentage: u8,
-    memory_percentage: u8,
-) -> Result<(u64, usize), String> {
+fn prepare_fault_cgroup(cgroup: &Path, memory_percentage: u8) -> Result<(u64, usize), String> {
     std::fs::create_dir(cgroup)
         .map_err(|error| format!("failed to create {}: {error}", cgroup.display()))?;
     let setup = (|| {
@@ -354,16 +370,14 @@ fn prepare_fault_cgroup(
             write_control_if_present(cgroup, "memory.oom.group", "1")?;
         }
 
+        // The CPU quota is deliberately NOT written here. The helper faults
+        // its ballast in while inside this cgroup; a pre-applied quota would
+        // throttle that startup work and race the readiness timeout. `apply`
+        // writes `cpu.max` once the helper reports ready. The memory ceiling
+        // must stay pre-spawn: it is the safety bound on the allocation.
         let cores = std::thread::available_parallelism()
             .map(|cores| cores.get())
             .unwrap_or(1);
-        if cpu_percentage > 0 {
-            write_control(
-                cgroup,
-                "cpu.max",
-                &node_cpu_max(cpu_percentage, cores as u32),
-            )?;
-        }
         Ok((memory_ceiling, cores))
     })();
     if setup.is_err() {
@@ -489,7 +503,16 @@ pub fn run_helper(
     ballast
         .try_reserve_exact(memory_len)
         .map_err(|error| format!("failed to reserve pressure memory: {error}"))?;
-    ballast.resize(memory_len, 0xa5);
+    // Fill by page-sized memcpy, not `resize(len, 0xa5)`: an unoptimised
+    // build lowers the per-byte resize loop to ~100 MB/s, slow enough to
+    // trip the parent's readiness timeout on multi-hundred-MB deltas.
+    const PAGE: usize = 4096;
+    let page = [0xa5u8; PAGE];
+    while memory_len - ballast.len() >= PAGE {
+        ballast.extend_from_slice(&page);
+    }
+    let tail = memory_len - ballast.len();
+    ballast.extend_from_slice(&page[..tail]);
 
     let mut workers = Vec::with_capacity(cpu_workers);
     for _ in 0..cpu_workers {
