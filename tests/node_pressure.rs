@@ -18,7 +18,10 @@ fn pressure_target() -> (u8, u64) {
         .saturating_mul(100)
         .saturating_add(total.saturating_sub(1))
         / total.max(1);
-    let target = u8::try_from(used_percentage_ceiling.saturating_add(1).min(90)).unwrap();
+    // Target three points above current usage, not one: the delta must dwarf
+    // the tens of megabytes a live host reclaims and frees on its own, or the
+    // reached-the-target assertion measures noise instead of the helper.
+    let target = u8::try_from(used_percentage_ceiling.saturating_add(3).min(90)).unwrap();
     (target, memory_bytes_to_target(total, available, target))
 }
 
@@ -29,6 +32,12 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         eprintln!("skipped: set RELIABURGER_NODE_PRESSURE_TESTS=1");
         return;
     }
+
+    // This binary runs with every nextest thread reserved, but the suite
+    // that just finished is still being torn down: the kernel reclaims the
+    // exited processes' memory for a while. Let usage settle before
+    // snapshotting the target, or the baseline is a moving number.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     let (memory_percentage, expected_memory_bytes) = pressure_target();
     eprintln!(
@@ -96,7 +105,7 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
     assert!(!parent_membership.contains("reliaburger-chaos/fault-42424"));
 
     let used_after = total.saturating_sub(available);
-    let measurement_tolerance = 32 * 1024 * 1024;
+    let measurement_tolerance = 64 * 1024 * 1024;
     assert!(
         used_after.saturating_add(measurement_tolerance) >= target_bytes,
         "node uses {used_after} bytes, below the {target_bytes}-byte target"
