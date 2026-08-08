@@ -68,13 +68,17 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
     let meminfo = std::fs::read_to_string("/proc/meminfo").expect("read meminfo after pressure");
     let (total, available) = parse_linux_meminfo(&meminfo).expect("parse meminfo after pressure");
     let target_bytes = node_memory_max(total, memory_percentage);
-    assert_eq!(
-        std::fs::read_to_string(cgroup.join("memory.max"))
-            .unwrap()
-            .trim()
-            .parse::<u64>()
-            .unwrap(),
-        target_bytes
+    // Hosted runners use memory-balloon drivers, so MemTotal can drift a few
+    // kilobytes between the controller's read and this one. The ceiling only
+    // has to match the recomputed target within that noise.
+    let memory_ceiling = std::fs::read_to_string(cgroup.join("memory.max"))
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap();
+    assert!(
+        memory_ceiling.abs_diff(target_bytes) <= 1024 * 1024,
+        "memory.max {memory_ceiling} deviates from the {target_bytes}-byte target by over 1 MiB"
     );
 
     let helper_pid = std::fs::read_to_string(cgroup.join("cgroup.procs"))
