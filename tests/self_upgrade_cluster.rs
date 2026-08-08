@@ -51,6 +51,7 @@ struct ClusterHarness {
     client: reqwest::Client,
     release_pkcs8: Vec<u8>,
     external_pkcs8: Vec<u8>,
+    service_token: String,
 }
 
 fn free_tcp_port(allocated: &mut HashSet<u16>) -> u16 {
@@ -105,6 +106,18 @@ impl ClusterHarness {
         let (release_pkcs8, release_public) = signing::generate_keypair().unwrap();
         let (external_pkcs8, external_public) = signing::generate_keypair().unwrap();
 
+        // The clustered registry fails closed: blob writes need the service
+        // token derived from the cluster master key (or a minted user token).
+        // Share one key file across the nodes so the harness can push the
+        // upgrade binary the way a real operator's tooling would.
+        let master_key = [42u8; 32];
+        let master_key_path = root.path().join("master.key");
+        std::fs::write(&master_key_path, hex::encode(master_key)).unwrap();
+        let mut permissions = std::fs::metadata(&master_key_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+        std::fs::set_permissions(&master_key_path, permissions).unwrap();
+        let service_token = reliaburger::sesame::token::derive_service_token(&master_key).unwrap();
+
         let mut nodes = Vec::new();
         let mut seed_gossip: Option<u16> = None;
         // Keep every endpoint numerically distinct for the lifetime of this
@@ -152,6 +165,9 @@ reporting_port = {reporting_port}
 [network]
 advertise_address = "127.0.0.1"
 
+[security]
+master_key_path = "{master_key}"
+
 [storage]
 data = "{node_root}/data"
 images = "{node_root}/images"
@@ -173,6 +189,7 @@ max_boot_attempts = 2
 retain_versions = 3
 "#,
                     node_root = node_root.display(),
+                    master_key = master_key_path.display(),
                     bin = bin_dir.display(),
                     external = encode_public_key(&external_public),
                     release = encode_public_key(&release_public),
@@ -230,6 +247,7 @@ retain_versions = 3
             client: reqwest::Client::new(),
             release_pkcs8,
             external_pkcs8,
+            service_token,
         };
 
         // Every node healthy, then a leader elected with a full council.
@@ -378,6 +396,7 @@ retain_versions = 3
         let push = self
             .client
             .post(&push_url)
+            .header("authorization", format!("Bearer {}", self.service_token))
             .body(bytes.clone())
             .send()
             .await
