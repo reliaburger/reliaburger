@@ -157,13 +157,13 @@ pub fn step_to_fault_request(
         target_instance: None,
         target_node: None,
         duration,
-        injected_by: format!(
-            "scenario:{}",
-            std::env::var("USER").unwrap_or_else(|_| "unknown".into())
-        ),
+        // Compatibility wire field only. Bun attributes the request from the
+        // authenticated context, never from client-controlled JSON.
+        injected_by: String::new(),
         reason: Some(step.description.clone()),
         include_leader: false,
         override_safety: false,
+        acknowledged: false,
     })
 }
 

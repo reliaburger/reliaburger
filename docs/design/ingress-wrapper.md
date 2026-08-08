@@ -1,21 +1,28 @@
 # Wrapper: Built-In Ingress Proxy
 
+> **Current v1 contract (2026-07-22):** Wrapper supports plain HTTP,
+> `tls = "cluster"` using the Sesame Ingress CA, and `tls = "explicit"`
+> using the certificate/key configured on the node. Omitting `tls` means
+> plain HTTP. `auto` and `acme` are deferred and rejected during route
+> rebuild. Sections labelled *deferred design* preserve the original ACME
+> proposal; they don't describe a command or capability that works today.
+
 ## 1. Overview
 
 Wrapper is Reliaburger's built-in reverse proxy for external traffic. It's compiled into the single `reliaburger` binary and runs on every node by default, consistent with the homogeneous node design. There's no separate install step, no IngressClass resource, no annotations, and no external cert-manager deployment.
 
 Wrapper provides:
 
-- **TLS termination** with automatic certificate provisioning (ACME for public services, cluster Ingress CA for internal services)
+- **TLS termination** with cluster-issued or operator-supplied certificates
 - **Host-based and path-based routing** to backend apps
 - **Health-check-aware load balancing**, only routing to instances that pass health checks
 - **Connection draining** during rolling deploys, letting in-flight requests complete before old instances stop
 - **WebSocket support** with transparent upgrade handling for `Connection: Upgrade` requests
 - **Basic rate limiting** with per-IP and per-route token bucket rate limiting to absorb traffic spikes
 
-Wrapper runs as a set of async tasks inside the Bun agent process (not a separate process). It binds to ports 80 and 443 on the host network namespace and proxies incoming requests to backend containers identified by their dynamically allocated host ports. The routing table is derived from the service map, which is populated by the hierarchical reporting tree. When instances are added, removed, or rescheduled, Wrapper updates its routing table automatically within seconds.
+Wrapper runs as a set of async tasks inside the Bun agent process (not a separate process). When enabled, it binds to ports 80 and 443 on the host network namespace and proxies incoming requests to backend containers identified by their dynamically allocated host ports. The routing table is derived from the service map. When instances are added, removed, or rescheduled, Wrapper rebuilds its routing table.
 
-Operators can disable Wrapper on specific nodes via `[ingress] enabled = false` in `node.toml` (e.g., GPU-heavy compute nodes where ingress traffic would compete for resources), but the default is that every node serves ingress traffic. An external load balancer (cloud LB, DNS round-robin, or BGP anycast) can be placed in front of the cluster to distribute traffic across nodes, but isn't required.
+Wrapper is disabled by default. Operators enable it on selected nodes with `[ingress] enabled = true` in `node.toml`. An external load balancer (cloud LB, DNS round-robin, or BGP anycast) can sit in front of those nodes.
 
 ---
 
@@ -24,7 +31,7 @@ Operators can disable Wrapper on specific nodes via `[ingress] enabled = false` 
 | Dependency | Role | Failure Impact |
 |---|---|---|
 | **Bun agent** | Lifecycle host. Wrapper runs as async tasks within the Bun process. Bun starts Wrapper after the node has joined the cluster and the service map is initialised. | If Bun crashes, Wrapper stops. Bun's watchdog restarts the entire agent within seconds. |
-| **Sesame (PKI)** | Provides the Ingress CA intermediate certificate and private key (via council members) for `tls = "cluster"` routes. Sesame's ACME account key management backs `tls = "acme"` routes. | If Sesame is unavailable, existing certificates continue serving traffic until expiry. New `tls = "cluster"` certificate signing requests queue until a council member is reachable. ACME certificates are independent of Sesame's CA hierarchy — they rely on an external ACME provider. |
+| **Sesame (PKI)** | Provides Ingress CA signing material to the resolver on a council-enabled ingress node for `tls = "cluster"` routes. | Without a usable resolver, Wrapper falls back to its development self-signed listener certificate. That isn't a production substitute for a cluster certificate. |
 | **Reporting tree** | Delivers runtime state (which app instances are running, on which nodes, at which host ports, and their health status) from Bun agents through council members to the leader, and back down to each node. Wrapper reads this state to build its routing table. | If the reporting tree stalls, Wrapper continues routing with the last known good routing table. Stale backends are detected by Wrapper's own active health probes. |
 | **Onion (service map)** | The in-kernel BPF hash map that maps app names to lists of healthy backend `(host_ip, host_port)` entries. Wrapper reads this map to resolve which backends are available for each ingress route. | The service map is maintained by Bun locally on each node. It is always available as long as Bun is running. |
 
@@ -34,7 +41,7 @@ Operators can disable Wrapper on specific nodes via `[ingress] enabled = false` 
 1. Bun joins cluster (mTLS handshake via Sesame node certificate)
 2. Bun populates the service map from reporting tree state
 3. Bun starts Wrapper listener tasks
-4. Wrapper loads TLS certificates from local cache (or requests new ones)
+4. Wrapper loads an operator certificate or builds its in-memory Ingress CA resolver
 5. Wrapper binds ports 80 and 443
 6. Wrapper begins accepting connections
 ```
@@ -49,7 +56,7 @@ Wrapper doesn't accept connections until at least one routing table entry exists
 
 Wrapper binds two TCP listeners on the host network namespace:
 
-- **Port 80 (HTTP)**: Serves two purposes: (1) issues HTTP 301 redirects to HTTPS for routes that have TLS enabled, and (2) responds to ACME HTTP-01 challenge requests at `/.well-known/acme-challenge/<token>`. No application traffic is served over plain HTTP.
+- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1.
 - **Port 443 (HTTPS)**: The primary listener. Terminates TLS using `rustls`, performs SNI-based certificate selection, and routes the decrypted request to the appropriate backend.
 
 Both ports are configurable via `node.toml`:
@@ -67,8 +74,8 @@ Each listener spawns a tokio task per accepted connection. Connections are track
                     │                   Node                      │
                     │                                             │
   Port 80 ────────►│  HTTP Listener                              │
-                    │    ├─ ACME HTTP-01 challenges               │
-                    │    └─ 301 redirect → HTTPS                  │
+                    │    ├─ plain-HTTP routes                     │
+                    │    └─ 308 redirect → HTTPS for TLS routes   │
                     │                                             │
   Port 443 ───────►│  HTTPS Listener (rustls)                    │
                     │    ├─ SNI → certificate selection            │
@@ -114,46 +121,49 @@ Wrapper manages TLS certificates per ingress route. Each route specifies a TLS m
 
 | Mode | Source | Use Case |
 |---|---|---|
-| `"acme"` | Let's Encrypt via ACME protocol (HTTP-01 or DNS-01 challenge) | Public-facing services where browsers must trust the certificate |
 | `"cluster"` | Ingress CA (Sesame's intermediate CA dedicated to ingress) | Internal services, air-gapped environments, or services where clients trust the cluster root CA |
-| `"auto"` | `"acme"` if the cluster has internet access; `"cluster"` if configured as air-gapped | Default when a TLS mode is not explicitly specified |
+| `"explicit"` | Certificate and key paths from the node's `[ingress]` configuration | Public services where the operator already has a trusted certificate |
+| omitted, `"none"`, `"off"`, or `"disabled"` | No certificate | Deliberately plain-HTTP routes |
 
-**ACME flow (HTTP-01):**
+`auto`, `acme`, and unknown values are configuration errors. Wrapper refuses
+the route rather than guessing or falling back to plaintext.
 
-```
-1. Wrapper generates a CSR for the requested hostname
-2. Wrapper contacts the ACME provider (default: Let's Encrypt)
-3. ACME provider issues an HTTP-01 challenge token
-4. Wrapper serves the challenge token at http://<host>/.well-known/acme-challenge/<token>
-5. ACME provider verifies the challenge
-6. ACME provider issues the certificate
-7. Wrapper stores the certificate + private key encrypted on disk
-8. Wrapper loads the certificate into the rustls ServerConfig
-```
-
-**Cluster CA flow:**
+**Cluster CA flow (current):**
 
 ```
-1. Wrapper generates a keypair locally
-2. Wrapper creates a CSR containing the hostname(s)
-3. Wrapper sends the CSR to its nearest council member over the inter-node mTLS channel
-4. The council member validates the CSR against the app spec (the requesting node
-   must be running an app with an ingress route for that hostname)
-5. The council member signs the certificate with the Ingress CA private key
-6. Wrapper receives the signed certificate
-7. Wrapper stores the certificate + private key encrypted on disk
-8. Wrapper loads the certificate into the rustls ServerConfig
+1. Bun reconstructs the Ingress CA signing material from council state
+2. Wrapper installs an SNI certificate resolver
+3. The first handshake for a hostname generates and signs a leaf certificate
+4. Wrapper caches that certified key in memory for later handshakes
+```
+
+This currently requires the ingress node to have council state and the
+wrapping key material. If it doesn't, the listener uses its self-signed
+development certificate. Operators must not treat that fallback as a
+cluster-issued production certificate.
+
+**Explicit flow (current):**
+
+```
+1. The operator sets both `tls_cert` and `tls_key` in `[ingress]`
+2. Wrapper reads the PEM files during startup
+3. Routes marked `tls = "explicit"` use that listener certificate
 ```
 
 **Certificate storage:**
 
-Certificates are stored in `<data_dir>/ingress/certs/` with filenames derived from the hostname hash. Private keys are encrypted at rest using the node's Sesame-issued data encryption key. On startup, Wrapper loads all cached certificates and only requests new ones for routes whose certificates are missing or expired.
+Cluster-issued leaf certificates and keys live in the resolver's memory cache.
+They are regenerated after process restart. Operator-supplied material remains
+in the configured files and follows the operator's file permissions and
+rotation process.
 
 **Certificate renewal:**
 
-- ACME certificates (90-day lifetime): renewed at 60 days (30 days before expiry)
-- Cluster certificates (90-day lifetime): renewed at 60 days (30 days before expiry)
-- Renewal runs as a background tokio task that checks certificate expiry every hour
+Automatic renewal and hot reload aren't implemented. The current in-memory
+resolver also doesn't replace a cached cluster leaf at expiry. Production
+acceptance therefore needs renewal before the cluster mode can be called
+hands-off; until then, restart Wrapper before expiry or use externally rotated
+operator material.
 
 ### 3.5 Connection Draining During Deploys
 
@@ -319,68 +329,12 @@ pub struct IngressRoute {
 
 #[derive(Clone, Copy)]
 pub enum TlsMode {
-    /// ACME (Let's Encrypt) — for public-facing services.
-    Acme,
+    /// Plain HTTP.
+    Disabled,
     /// Cluster Ingress CA — for internal services or air-gapped environments.
     Cluster,
-    /// Auto: ACME if internet access, Cluster if air-gapped.
-    Auto,
-}
-
-/// TLS configuration for a single hostname.
-pub struct TlsConfig {
-    /// Hostname this config applies to.
-    pub hostname: String,
-    /// TLS mode.
-    pub mode: TlsMode,
-    /// The current certificate chain (leaf + intermediates).
-    pub cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
-    /// The private key.
-    pub private_key: rustls::pki_types::PrivateKeyDer<'static>,
-    /// When the leaf certificate expires.
-    pub not_after: SystemTime,
-    /// When renewal should be attempted (not_after - 30 days).
-    pub renew_at: SystemTime,
-    /// Serial number of the leaf certificate.
-    pub serial: String,
-}
-
-/// ACME certificate state machine.
-pub struct AcmeCertificate {
-    /// Hostname being provisioned.
-    pub hostname: String,
-    /// Current state.
-    pub state: AcmeState,
-    /// ACME account URI.
-    pub account_uri: String,
-    /// ACME order URL (if provisioning).
-    pub order_url: Option<String>,
-    /// Challenge token (if awaiting validation).
-    pub challenge_token: Option<String>,
-    /// Challenge key authorisation (if awaiting validation).
-    pub challenge_key_auth: Option<String>,
-    /// Number of retry attempts for the current provisioning.
-    pub retry_count: u32,
-    /// Backoff deadline for retries.
-    pub retry_after: Option<Instant>,
-}
-
-#[derive(Clone, Copy)]
-pub enum AcmeState {
-    /// No certificate, no pending order.
-    NeedsCertificate,
-    /// Order created, waiting for challenge to be set up.
-    OrderCreated,
-    /// Challenge response is being served on port 80, waiting for ACME validation.
-    ChallengePending,
-    /// Challenge validated, waiting for certificate issuance.
-    CertificatePending,
-    /// Certificate issued and loaded.
-    Active,
-    /// Renewal in progress (existing certificate still active).
-    Renewing,
-    /// Provisioning failed, will retry with backoff.
-    Failed,
+    /// Operator-supplied certificate and key.
+    Explicit,
 }
 
 /// Per-route rate limiting configuration.
@@ -443,8 +397,10 @@ pub struct WrapperConfig {
     pub http_port: u16,
     /// HTTPS listener port (default: 443).
     pub https_port: u16,
-    /// Email address for ACME account registration.
-    pub tls_acme_email: Option<String>,
+    /// Operator-supplied certificate PEM path.
+    pub tls_cert_path: Option<PathBuf>,
+    /// Operator-supplied private-key PEM path.
+    pub tls_key_path: Option<PathBuf>,
     /// Default drain timeout for rolling deploys.
     pub drain_timeout: Duration,
     /// Global default rate limit (applied to routes without explicit config).
@@ -453,10 +409,6 @@ pub struct WrapperConfig {
     pub health_probe: HealthProbeConfig,
     /// Minimum TLS version (default: TLS 1.2).
     pub min_tls_version: TlsVersion,
-    /// ACME directory URL (default: Let's Encrypt production).
-    pub acme_directory_url: String,
-    /// Path to the certificate cache directory.
-    pub cert_cache_dir: String,
 }
 
 #[derive(Clone, Copy)]
@@ -506,80 +458,44 @@ Every inbound HTTPS request follows this path:
 
 ### 5.2 TLS Modes
 
-**Mode: `acme`**
-
-Used for public-facing services where browsers and external clients need to trust the certificate. Wrapper provisions certificates from Let's Encrypt (or another ACME-compatible CA configured via `acme_directory_url`).
-
-- **HTTP-01 challenge (default):** Wrapper serves the challenge token on port 80 at `/.well-known/acme-challenge/<token>`. This requires that external DNS for the hostname points to the cluster and that port 80 is reachable from the internet.
-- **DNS-01 challenge (optional):** For wildcard certificates or environments where port 80 isn't reachable. Requires a DNS provider integration (configured via `[ingress.acme_dns]` in `node.toml`). Supported providers: Cloudflare, Route53, Google Cloud DNS.
-
 **Mode: `cluster`**
 
-Used for internal services, air-gapped environments, or services where clients trust the cluster's root CA. The certificate is signed by the Ingress CA (one of Sesame's three intermediate CAs). No external service is required.
+Used where clients trust the cluster root. On an ingress node with reconstructed
+Ingress CA material, the SNI resolver issues and caches a hostname certificate
+locally. There is no network CSR round-trip in the current implementation.
 
-Certificate signing follows the CSR model:
+**Mode: `explicit`**
 
-1. Wrapper generates a keypair and CSR locally.
-2. CSR is sent to the nearest council member over the inter-node mTLS channel.
-3. Council member validates that the requesting node runs an app with an ingress route for the requested hostname.
-4. Council member signs the CSR with the Ingress CA private key (90-day lifetime).
-5. Signed certificate is returned to Wrapper.
+Used with `tls_cert` and `tls_key` in the node's `[ingress]` configuration.
+This is the public-certificate path in v1. The same listener certificate serves
+all explicit routes on that node, so its SANs must cover every advertised host.
 
-**Mode: `auto`**
+**Mode: omitted / `none` / `off` / `disabled`**
 
-Default when `tls` isn't explicitly specified. Resolves to `acme` if the cluster has internet access (determined during `relish init` or via `[cluster] air_gapped = false`). Resolves to `cluster` if `[cluster] air_gapped = true`.
+The application route is served as plain HTTP. There is deliberately no
+implicit TLS default.
 
-### 5.3 ACME Certificate Provisioning
+### 5.3 ACME Certificate Provisioning (deferred design)
 
-ACME provisioning is managed per hostname by the `AcmeCertificate` state machine:
+`auto` and `acme` are reserved but rejected. A future implementation needs an
+explicit issuer model, production/staging directory selection, account-key
+ownership, challenge lifecycle, rate-limit coordination, renewal, persistence,
+revocation, multi-node distribution and hermetic acceptance tests. Until all of
+that exists, Wrapper doesn't expose port 80 as an HTTP-01 challenge responder.
 
-```
-NeedsCertificate ──► OrderCreated ──► ChallengePending ──► CertificatePending ──► Active
-        ▲                                    │                       │
-        │                                    ▼                       ▼
-        └──────────────────────── Failed (retry with exponential backoff)
-                                  1s → 2s → 4s → ... → max 1 hour
-```
+If we implement it, the leader should lease each hostname to one challenge
+solver and distribute the resulting certificate to ingress nodes. DNS-01
+provider integrations should be separate optional adapters; claiming support
+for Cloudflare, Route53 or Google Cloud DNS before those adapters and their
+credential boundaries exist would repeat the same documentation mistake.
 
-**Leader election for ACME:**
+### 5.4 Certificate Renewal (required follow-up)
 
-Because every node runs Wrapper, multiple nodes could attempt to provision a certificate for the same hostname simultaneously. To prevent this, ACME provisioning is leader-coordinated:
-
-1. When Wrapper on any node detects that a route needs an ACME certificate, it sends a `CertificateRequest { hostname }` to the cluster leader via the reporting tree.
-2. The leader selects one node (preferably the requesting node) to perform the ACME challenge.
-3. Only the selected node interacts with the ACME provider.
-4. Once the certificate is issued, the leader distributes it to all nodes via the reporting tree.
-5. All nodes store the certificate locally and load it into their `rustls` config.
-
-This ensures exactly one ACME order per hostname and avoids hitting Let's Encrypt rate limits.
-
-**ACME account:**
-
-A single ACME account is created during `relish init` (using the email from `tls_acme_email`) and stored encrypted in Raft state. All nodes use the same account credentials. The account key is an ECDSA P-256 key.
-
-### 5.4 Certificate Renewal
-
-A background tokio task runs every hour and iterates all loaded certificates:
-
-```rust
-async fn renewal_loop(certs: Arc<DashMap<String, TlsConfig>>) {
-    loop {
-        let now = SystemTime::now();
-        for entry in certs.iter() {
-            if now >= entry.renew_at {
-                // Trigger renewal (same flow as initial provisioning)
-                // Existing certificate continues serving traffic during renewal
-                renew_certificate(entry.hostname.clone(), entry.mode).await;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(3600)).await;
-    }
-}
-```
-
-Renewal is non-disruptive: the old certificate continues serving traffic while the new one is being provisioned. Once issued, the new certificate is hot-swapped into the `rustls::ServerConfig` via a `rustls::server::ResolvesServerCert` implementation that reads from the `DashMap`. No connections are dropped.
-
-If renewal fails, Wrapper retries with exponential backoff (1 hour, 2 hours, 4 hours, up to 24 hours). An alert fires in Mayo metrics and `relish wtf` reports the expiring certificate. At 7 days before expiry, the alert severity escalates to critical.
+The v1 cluster resolver caches a generated leaf for the life of the Bun process
+and doesn't inspect its expiry. Operator certificates load at startup and don't
+hot-reload. A production implementation must renew or reload before expiry,
+retain the last valid certificate while rotation runs, expose expiry telemetry,
+and fail acceptance when a required certificate can't be refreshed.
 
 ### 5.5 Connection Draining
 
@@ -675,7 +591,7 @@ Per-route rate limits are configured in the app spec:
 [app.api.ingress]
 host = "api.myapp.com"
 path = "/v1"
-tls = "acme"
+tls = "cluster"
 rate_limit_rps = 100
 rate_limit_burst = 200
 ```
@@ -709,10 +625,10 @@ End-to-end latency for a routing table update: typically 1-3 seconds, dominated 
 
 ```toml
 [ingress]
-# Whether Wrapper is enabled on this node. Default: true.
+# Whether Wrapper is enabled on this node. Default: false.
 enabled = true
 
-# HTTP listener port. Used for ACME challenges and HTTPS redirects.
+# HTTP listener port. Serves plain routes and HTTPS redirects.
 # Default: 80.
 http_port = 80
 
@@ -720,9 +636,10 @@ http_port = 80
 # Default: 443.
 https_port = 443
 
-# Email address for ACME account registration.
-# Required if any route uses tls = "acme" or tls = "auto" on a non-air-gapped cluster.
-tls_acme_email = "ops@example.com"
+# Optional operator-supplied PEM files. Configure both or neither.
+# Required by routes using tls = "explicit".
+tls_cert = "/etc/reliaburger/ingress/fullchain.pem"
+tls_key = "/etc/reliaburger/ingress/private-key.pem"
 
 # Default drain timeout for rolling deploys.
 # Per-app drain_timeout in the app spec overrides this.
@@ -738,10 +655,6 @@ drain_timeout = "30s"
 # Minimum TLS version. Default: "1.2".
 # Set to "1.3" to disable TLS 1.2.
 min_tls_version = "1.2"
-
-# ACME directory URL. Default: Let's Encrypt production.
-# Use "https://acme-staging-v02.api.letsencrypt.org/directory" for testing.
-acme_directory_url = "https://acme-v02.api.letsencrypt.org/directory"
 
 # Active health probe interval. Default: "5s".
 health_probe_interval = "5s"
@@ -766,8 +679,8 @@ host = "myapp.com"
 # Path prefix to match. Default: "/" (match all paths).
 path = "/"
 
-# TLS mode. Default: "auto".
-tls = "acme"
+# TLS mode. Omit for plain HTTP; use "cluster" or "explicit" for HTTPS.
+tls = "explicit"
 
 # Whether to allow WebSocket upgrades on this route. Default: false.
 websocket = false
@@ -786,7 +699,7 @@ drain_timeout = "30s"
 Wrapper validates ingress configuration at deploy time:
 
 - **Duplicate host/path:** If two apps declare the same `(host, path)` combination, the deploy is rejected with a clear error message.
-- **Missing ACME email:** If a route uses `tls = "acme"` and no `tls_acme_email` is configured, the deploy is rejected.
+- **Unsupported TLS mode:** `auto`, `acme`, and unknown values reject the routing-table rebuild. Supported values are `cluster`, `explicit`, and the plain-HTTP aliases.
 - **Invalid hostname:** Hostnames are validated against RFC 952 (alphanumeric, hyphens, dots, no wildcards in v1).
 - **Path format:** Paths must start with `/` and not contain query strings or fragments.
 
@@ -796,11 +709,11 @@ Wrapper validates ingress configuration at deploy time:
 
 | Failure | Detection | Impact | Recovery |
 |---|---|---|---|
-| **ACME challenge failure** | ACME provider returns error or challenge times out after 5 minutes | New certificate not issued. If this is the initial certificate for a route, the route serves TLS errors (no valid cert). If renewing, the existing certificate continues serving. | Exponential backoff retry (1s → 1h max). Alert fires. Operator can debug with `relish ingress cert-status <hostname>`. Common causes: DNS not pointing to cluster, port 80 blocked by firewall, rate limit hit at ACME provider. |
+| **Unsupported TLS mode** | Routing-table rebuild parses `auto`, `acme`, or an unknown value | The new routing table is rejected; the previous table remains active. | Choose `cluster`, `explicit`, or a plain-HTTP alias. |
 | **Backend pool empty** | All backends removed from service map or all fail active health probes | Route returns 502 Bad Gateway for all requests. | Automatic: backends re-appear when health checks pass or new instances are scheduled. Wrapper re-adds them within seconds. |
-| **Certificate expiry** | Renewal failed repeatedly and the certificate's `not_after` timestamp has passed | Clients receive TLS errors. Browsers show security warnings. API clients reject the connection. | Emergency: operator can manually provide a certificate via `relish ingress cert-install <hostname> --cert <file> --key <file>`. Root cause should be investigated (ACME provider blocked, Ingress CA unavailable, etc.). |
+| **Certificate expiry** | Currently detected by clients, not by Wrapper | Clients reject the connection. | Restart before a cluster-issued leaf expires, or rotate the configured operator files and restart. Automatic detection, telemetry and hot rotation are required follow-up work. |
 | **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. After timeout, remaining connections are forcibly closed (TCP RST). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
-| **Council unreachable (cluster TLS)** | CSR request to council member times out | New `tls = "cluster"` certificates cannot be issued. Renewals fail. Existing certificates continue serving until they expire (90-day lifetime). | Council recovery. Wrapper retries CSR requests every 5 minutes. Alert fires when any certificate is within 30 days of expiry and renewal is failing. |
+| **Ingress CA resolver unavailable at startup** | Bun can't reconstruct the Ingress CA material and logs a warning | The HTTPS listener uses its self-signed development certificate; `cluster` doesn't meet its production trust contract on that node. | Restore council/wrapping material before enabling ingress, or configure an explicit certificate pair. A future capability gate should reject placement on such a node. |
 | **Port 80/443 already in use** | `bind()` returns `EADDRINUSE` | Wrapper cannot start. Bun logs the error and retries every 30 seconds. | Operator must free the ports or reconfigure Wrapper to use alternative ports. |
 | **rustls handshake failure** | Client sends unsupported TLS version or cipher suite | Connection dropped during handshake | Client-side fix (upgrade TLS version). Wrapper logs the failure at debug level to avoid log flooding. |
 | **Upstream connection refused** | Backend process crashed between health probe and request routing | Individual request fails with 502. Wrapper marks backend as locally unhealthy after `threshold_unhealthy` consecutive failures. | Automatic: backend removed from pool. Next request goes to a healthy backend. Bun's container supervision restarts the crashed process. |
@@ -828,13 +741,14 @@ Wrapper uses `rustls` (a memory-safe TLS implementation) with the following defa
 - **ECDH groups:** X25519, secp256r1, secp384r1.
 - **No support for:** TLS 1.0, TLS 1.1, RC4, 3DES, CBC-mode ciphers, RSA key exchange (non-ECDHE). These are structurally impossible with rustls, which doesn't implement them.
 
-OCSP stapling: rustls supports OCSP stapling. Wrapper fetches and caches OCSP responses for ACME-issued certificates and staples them in the TLS handshake. For cluster-issued certificates, OCSP isn't applicable (no public responder).
+Wrapper doesn't currently fetch or staple OCSP responses. Cluster-issued certificates have no public OCSP responder. Operators using explicit certificates must account for the client behaviour they require.
 
-### 8.2 ACME Account Security
+### 8.2 ACME Account Security (deferred design)
 
-- The ACME account private key is stored in Raft state, encrypted with the cluster's data encryption key.
-- Only council members can decrypt the ACME account key. Worker nodes request ACME operations via the leader; they never hold the account key directly.
-- ACME account deactivation: `relish ingress acme-deactivate` deactivates the ACME account and creates a new one. Use this if the account key is suspected to be compromised.
+There is no ACME account or `relish ingress acme-deactivate` command in v1.
+A future implementation must define who owns the account key, how Raft state
+encrypts and rotates it, which nodes may solve challenges, and how an operator
+revokes a compromised account without distributing the key to every worker.
 
 ### 8.3 Rate Limiting Against DDoS
 
@@ -916,7 +830,7 @@ Routing table rebuilds (triggered by service map changes) are O(n) where n is th
 | SNI-based certificate selection | Integration test: configure two routes with different hostnames and certificates. Connect with different SNI values. Verify correct certificate is served. |
 | Missing SNI handling | Connect without SNI. Verify connection is rejected (no default certificate). |
 | Certificate hot-swap | Load a certificate, verify it is served. Replace with a new certificate. Verify new certificate is served without connection drops. |
-| ACME HTTP-01 challenge response | Unit test: verify that `/.well-known/acme-challenge/<token>` returns the correct key authorisation. |
+| ACME HTTP-01 challenge response *(deferred)* | Acceptance test must prove the challenge is served only while a valid lease exists and ordinary TLS routes don't gain a permanent plaintext bypass. |
 | Cluster CA certificate signing | Integration test: submit a CSR to a mock council member. Verify the returned certificate is valid and signed by the Ingress CA. |
 | Expired certificate detection | Unit test: load a certificate with `not_after` in the past. Verify renewal is triggered immediately. |
 | Certificate cache persistence | Integration test: provision a certificate, restart Wrapper, verify the certificate is loaded from disk without re-provisioning. |
@@ -985,7 +899,7 @@ A cloud-native reverse proxy designed for dynamic service discovery. Traefik wat
 
 **What we borrow:** Traefik's model of auto-discovering backends from an orchestrator's API and dynamically updating routes. Wrapper does the same, but reads from the reporting tree and service map rather than the Kubernetes API.
 
-**What we do differently:** Traefik is a standalone process that must be deployed, configured, and updated separately. Wrapper is built into the Reliaburger binary. Traefik's ACME implementation is per-instance (requires shared storage for multi-instance setups); Wrapper coordinates ACME via the cluster leader.
+**What we do differently:** Traefik is a standalone process that must be deployed, configured, and updated separately. Wrapper is built into the Reliaburger binary. Wrapper has no ACME implementation in v1; any future design needs cluster coordination instead of pretending independent nodes can safely share an account and hostname.
 
 ### 11.3 HAProxy
 
@@ -1011,9 +925,9 @@ A web server with automatic HTTPS as a first-class feature. Caddy provisions TLS
 
 - ACME implementation reference: [Caddy's automatic HTTPS](https://caddyserver.com/docs/automatic-https)
 
-**What we borrow:** Caddy's philosophy that TLS should be automatic and zero-configuration directly inspired Wrapper's `tls = "auto"` default. The idea that a proxy should handle certificate lifecycle without operator intervention is core to Wrapper's design.
+**What we may borrow later:** Caddy demonstrates that automatic certificate lifecycle can be a good product default once its issuer, challenges, renewal and failure behaviour are complete. Wrapper doesn't expose that promise in v1.
 
-**What we do differently:** Caddy is a standalone web server. Wrapper is embedded in the orchestrator binary. Caddy's ACME implementation is per-instance; Wrapper coordinates ACME cluster-wide via the leader to avoid duplicate orders and rate limit issues. Wrapper adds the `tls = "cluster"` mode (Ingress CA) for air-gapped environments, which Caddy doesn't support.
+**What we do differently:** Caddy is a standalone web server. Wrapper is embedded in the orchestrator binary and already has a `tls = "cluster"` mode for clients that trust Reliaburger's root. A future ACME design would need cluster-wide leases to avoid duplicate orders and rate-limit failures.
 
 ---
 
@@ -1026,14 +940,14 @@ All dependencies are Rust crates compiled into the single `reliaburger` binary.
 | [`hyper`](https://crates.io/crates/hyper) | 1.x | HTTP/1.1 and HTTP/2 server and client implementation | Used for both the listener (server) and the backend proxy connection (client). Provides streaming body support for efficient proxying. |
 | [`rustls`](https://crates.io/crates/rustls) | 0.23.x | TLS implementation | Memory-safe TLS. No OpenSSL dependency. Supports TLS 1.2 and 1.3. SNI-based certificate selection via `ResolvesServerCert`. Session tickets for TLS 1.3 PSK resumption. |
 | [`tokio`](https://crates.io/crates/tokio) | 1.x | Async runtime | Multi-threaded runtime with work-stealing scheduler. Provides `TcpListener`, `TcpStream`, timers, channels, and task spawning. Already used throughout the Bun agent. |
-| [`instant-acme`](https://crates.io/crates/instant-acme) | 0.7.x | ACME protocol client | Async ACME client supporting HTTP-01 and DNS-01 challenges. Handles account creation, order management, challenge fulfillment, and certificate download. Alternative: `acme-lib` (synchronous API, less suitable for async context). |
+| [`instant-acme`](https://crates.io/crates/instant-acme) *(candidate, not currently a dependency)* | To decide | Deferred ACME protocol client | Reassess when automatic public certificates enter the roadmap; library choice follows the issuer and challenge design. |
 | [`h2`](https://crates.io/crates/h2) | 0.4.x | HTTP/2 protocol implementation | Used by hyper internally. Listed explicitly because Wrapper must handle HTTP/2 connection-level concerns (flow control, stream multiplexing, GOAWAY frames during drain). |
 | [`tungstenite`](https://crates.io/crates/tungstenite) | 0.24.x | WebSocket protocol implementation | Used for WebSocket upgrade detection and Close frame generation during connection draining. After the upgrade handshake, Wrapper uses raw TCP proxying (not tungstenite's frame parser) for performance. |
 | [`tokio-tungstenite`](https://crates.io/crates/tokio-tungstenite) | 0.24.x | Async wrapper for tungstenite | Integrates tungstenite with tokio's async I/O model. Used during the upgrade handshake phase. |
 | [`arc-swap`](https://crates.io/crates/arc-swap) | 1.x | Lock-free atomic Arc swapping | Used for the routing table swap during rebuilds. Readers (request handlers) never block. Writers (routing table rebuilder) swap in the new table atomically. |
 | [`dashmap`](https://crates.io/crates/dashmap) | 6.x | Concurrent hash map | Used for the TLS certificate map (hostname → TlsConfig), rate limiter state (IP → TokenBucket), and connection tracker (ConnectionId → ConnectionState). |
-| [`rcgen`](https://crates.io/crates/rcgen) | 0.13.x | X.509 certificate and CSR generation | Used to generate CSRs for both ACME and cluster CA certificate requests. Also used to generate the ACME account key. |
-| [`webpki`](https://crates.io/crates/webpki) | 0.22.x | Certificate validation | Used to validate ACME-issued certificates after download (verify chain, check hostname, check expiry). |
+| [`rcgen`](https://crates.io/crates/rcgen) | 0.13.x | X.509 certificate generation | Used for the development certificate and cluster-CA leaf certificates. |
+| [`webpki`](https://crates.io/crates/webpki) *(candidate, not currently a direct dependency)* | To decide | Deferred certificate validation | Reassess with ACME and explicit-certificate validation work. |
 | [`rustls-pemfile`](https://crates.io/crates/rustls-pemfile) | 2.x | PEM file parsing | Used to load certificates from disk cache and from operator-provided manual certificate files. |
 
 ---

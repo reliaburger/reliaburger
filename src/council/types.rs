@@ -224,6 +224,35 @@ pub enum RaftRequest {
     /// replacement (not a delta) keeps the apply idempotent and the leader
     /// authoritative — a follower never merges partial views.
     PublishEndpoints(Box<crate::onion::catalog::EndpointCatalog>),
+    /// Create a durable Phase 15 resource lease.
+    TestLeaseCreate(crate::testkit::lease::TestLease),
+    /// Atomically apply an app and attach its ownership to an active lease.
+    TestLeaseAppSpec {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        app_id: AppId,
+        spec: Box<AppSpec>,
+    },
+    /// Atomically apply a namespace quota and attach it to an active lease.
+    TestLeaseNamespaceSpec {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        name: String,
+        spec: Box<crate::config::NamespaceSpec>,
+    },
+    /// Extend an active lease. An expired lease cannot be revived.
+    TestLeaseRenew {
+        lease_id: String,
+        owner_id: String,
+        renewed_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    },
+    /// Persist that cleanup has started or resumed.
+    TestLeaseBeginCleanup { lease_id: String },
+    /// Remove a lease only after its resources were confirmed absent.
+    TestLeaseFinishCleanup { lease_id: String },
+    /// Retain bounded evidence explaining why cleanup must be retried.
+    TestLeaseCleanupFailed { lease_id: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +380,10 @@ pub struct DesiredState {
     /// Defaults empty so pre-12b.4 snapshots load cleanly.
     #[serde(default)]
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
+    /// leader resume cleanup after the issuing process dies.
+    #[serde(default)]
+    pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.

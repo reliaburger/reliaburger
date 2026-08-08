@@ -4,6 +4,18 @@ Cross-cutting design for Reliaburger's deployment system: rolling deploys with z
 
 This subsystem is cross-cutting. It doesn't live in a single component; it coordinates across Meat (scheduling), Bun (container lifecycle), Wrapper (connection draining and routing pool updates), Onion (service map backend updates), and Ketchup (deploy event logging). The deploy orchestration loop itself runs on the leader node as part of the Meat scheduler.
 
+> **Implementation status (2026-07-22).** The detailed `DeployState` below is
+> the library state machine and Raft schema, not the path the current binary
+> persists for cluster rollouts. The shipped cluster path commits desired
+> `AppSpec`s, schedules placements and lets each Bun reconcile its local share;
+> Bun performs the actual local rolling replacement. We now expose that real
+> work through a separate `DeployOperation`: a stable ID, target set, current
+> phase/target, timestamps and explicit terminal outcome. It is node-local and
+> bounded to fifty terminal records. `/v1/deploys/active` and
+> `/v1/deploys/operations` serve it. Per-app spec history still backs rollback.
+> Claims later in this document about every transition living in Raft describe
+> the intended converged design, not current production behaviour.
+
 ---
 
 ## 1. Overview
@@ -667,6 +679,13 @@ Result: web-1' (v1, Node A), web-2' (v1, Node B), web-3 (v1, Node C)
 ```
 
 ### 5.3 Deploy History Tracking
+
+There are two shipped histories. Bun's `DeployOperation` store describes the
+worker which really ran: it stays visible after the SSE consumer disconnects
+and records `unknown` if that worker disappears without a terminal event. The
+per-app `DeployHistoryEntry` list describes completed versions/specs and backs
+rollback. Neither should be confused with the Raft-backed design below, which
+remains the target architecture.
 
 Every deploy is recorded in the per-app deploy history stored in Raft. The history includes:
 

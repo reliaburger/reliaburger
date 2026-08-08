@@ -98,17 +98,17 @@ pub struct EgressCidrValue {
 /// Whether egress is enforced for this app.
 pub const EGRESS_ALLOW: u32 = 1;
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 // SAFETY: plain-old-data structs — #[repr(C)], no padding surprises
 // (explicit _pad fields), every bit pattern is a valid value.
 unsafe impl aya::Pod for EgressKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 // SAFETY: as above.
 unsafe impl aya::Pod for Egress6Key {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 // SAFETY: as above.
 unsafe impl aya::Pod for EgressValue {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 // SAFETY: as above.
 unsafe impl aya::Pod for EgressCidrValue {}
 
@@ -698,7 +698,7 @@ pub const EGRESS_ENFORCE: u32 = 1;
 /// exact-match maps (`egress_map`, `egress6_map`), the CIDR LPM tries
 /// (`egress_cidr4_map`, `egress_cidr6_map`) and `egress_enabled_map`
 /// (per-cgroup enforcement flag); without it they return `Unsupported`.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod maps {
     use std::collections::HashSet;
     use std::net::IpAddr;
@@ -974,7 +974,7 @@ mod maps {
     }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub use maps::*;
 
 /// Errors from writing the eBPF egress maps.
@@ -983,7 +983,7 @@ pub enum EgressMapError {
     #[error("egress eBPF maps require Linux with --features ebpf")]
     Unsupported,
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     #[error("egress map operation failed: {0}")]
     MapError(#[from] aya::maps::MapError),
 

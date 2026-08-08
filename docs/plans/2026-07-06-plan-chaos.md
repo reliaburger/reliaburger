@@ -1,7 +1,10 @@
 # Phase 15 Implementation Plan — Testing, Benchmarking, Diagnostics & Chaos
 
 **Originally written:** 6 July 2026
-**Revised:** 26 July 2026 — re-verified against `main` after the 12b programme, both codebase reviews (2026-07-17 posture, 2026-07-19 code-logic) and PRs #133–#142. **Scope extended** to complete the `relish fault`/`relish chaos` surface, which the original plan assumed was finished.
+**Revised:** 3 August 2026 — re-verified after the 12b programme, both codebase
+reviews and the Phase 15 implementation. **Scope extended** to
+complete the `relish fault`/`relish chaos` surface, which the original plan
+assumed was finished.
 
 **Audience:** the implementing model. Deliberately prescriptive: exact paths, type names, signatures, test names, commit boundaries. Where this plan and the source disagree, the source wins — then fix this file and say so in the commit.
 
@@ -22,13 +25,17 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 | `TestHarness` in `tests/integration.rs` is reusable | It's **private** (`tests/integration.rs:29`) and there's now a `tests/support/` directory. Needs promoting or duplicating |
 | Reuse `Capabilities` as a fresh name | **Name collision**: `NodeCapabilities` (`src/meat/cluster_state.rs:15`) and `PlatformCapabilities` (`src/bun/supervisor.rs:74`) exist. Use **`ClusterCapabilities`** |
 | `[cluster] environment` needs adding | Still true — `ClusterSection` (`src/config/node.rs:308`) has no `environment` |
-| Smoker is library-only (review L14/L15) | **Wired.** `apply_fault` (`src/bun/agent.rs:3102`) has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, and eBPF Delay/Drop/Bandwidth |
+| Smoker is library-only (review L14/L15) | **Mostly wired.** `apply_fault` has real paths for Kill, Pause, Resume, CpuStress, DnsNxdomain, MemoryPressure, DiskIoThrottle, eBPF Drop and source-scoped eBPF Partition. Delay and Bandwidth now refuse honestly because no TC packet program is attached. |
 | Graceful-skip is needed for most subsystems | Still the right stance, but **far fewer skips**: ingress, rollups, GitOps, egress, eBPF sync, identity are all wired now |
-| `relish test --chaos` scenarios use `node-kill` | **`node-kill`/`node-drain` always return an error** (`agent.rs:3299`). Three of the five scenarios cannot work until this is implemented — see §2 |
-| Faults apply cluster-wide | **Node-local only.** The CLI POSTs to one agent; `target_node` is never used to route (`src/relish/fault.rs:512`) |
-| `deployer` is the right role for faults | Design says **admin or an explicit `fault-injection` grant** (`chaos-smoker.md:88,1429`). Today plain `Deployer` (`src/bun/authz.rs:152`) |
+| `relish test --chaos` scenarios use `node-kill` | **At review time:** `node-kill`/`node-drain` always returned an error. **Now:** step 11 implements and proves both; step 14 consumes them in the guarded catalogue. |
+| Faults apply cluster-wide | **At review time:** `target_node` was dead. **Now:** step 13b authenticates and authorises target-node distribution. |
+| `deployer` is the right role for faults | **At review time:** plain Deployer could inject. **Now:** step 13 requires Deployer plus `inject_workload_faults` and acknowledgement. |
 
-**Still true and load-bearing:** `main() -> ExitCode` (`relish.rs:833`) but every dispatched command returns `Result<(), RelishError>`, so `wtf`'s 0/1/2 contract still needs a richer return; `insta` is a dev-dependency with existing snapshot dirs; `src/relish/fault.rs` has the duration/percentage/bandwidth parsers to reuse (`:16,:61,:81`); there is no `src/testkit/`, no `/v1/capabilities`, no `/v1/trace`, no `src/firewall/evaluate.rs`.
+Those implementation gaps are now closed. `CommandOutcome` carries the 0/1/2
+diagnostic contract; `src/testkit/`, `/v1/capabilities` and `/v1/trace` exist.
+The trace firewall evaluator lives with the shared trace contract in
+`src/onion/trace.rs`, because it evaluates the same live-map facts as the eBPF
+connect hook rather than rebuilding declared policy in a separate module.
 
 ---
 
@@ -36,14 +43,14 @@ The original plan was written before Phase 12b, both reviews and their follow-up
 
 | Deliverable | Status today | Work |
 |---|---|---|
-| `relish test` | absent | build (§6 stream B) |
-| `relish test --chaos` | absent | build (stream D) — **blocked on stream C** |
-| `relish bench` | absent | build (stream E) |
-| `relish wtf` | absent | build (stream F) |
-| `relish trace` | absent | build (stream G) |
+| `relish test` | **Shipped.** 39 ordinary cases and four acceptance profiles. |
+| `relish test --chaos` | **Shipped in step 14.** Five serial scenarios with server-owned guards and exact fault-id cleanup. |
+| `relish bench` | **Shipped.** Seven leased public-data-plane suites. |
+| `relish wtf` | **Shipped.** Authenticated evidence, correlation and 0/1/2 exit contract. |
+| `relish trace` | **Shipped.** Source-workload DNS/TCP probes plus live service/firewall state. |
 | `relish fault ...` | 15 subcommands, gaps | **complete (stream C — new)** |
 | `relish chaos ...` | stringly-typed, undesigned | **fold into `fault` (stream C — new)** |
-| Book chapter 15 | harness half written | append command sections |
+| Book chapter 15 | **Command and diagnostics sections appended.** |
 
 **Milestone:** `relish test` green against a 3-node dev cluster; `relish test --chaos` runs all five scenarios *with real node kills*; `relish bench` produces a comparable report; `relish wtf` diagnoses seeded failures; `relish trace` walks four steps; the documented fault surface matches the implemented one.
 
@@ -58,7 +65,7 @@ The old plan's five chaos scenarios (§6 there, stream D here) are:
 | C1 leader failure | `node-kill` | ❌ hard error |
 | C2 dead worker rescheduled | `node-kill` | ❌ hard error |
 | C3 minority partition | `/v1/chaos/partition` | ✅ real (blocks gossip + Raft transports) |
-| C4 resource exhaustion | `cpu` + `memory` | ✅ on Linux |
+| C4 resource exhaustion | `node-pressure` | ✅ on opted-in rootful Linux |
 | C5 node death during deploy | `node-kill` | ❌ hard error |
 
 `apply_fault`'s `NodeDrain | NodeKill` arm returns *"is a cluster-level operation and cannot be applied as a node-local fault"* (`agent.rs:3299-3312`). That refusal is correct and honest — CHAOS1 made it so rather than let it lie — but it means **60 % of the chaos suite is unimplementable until node-level faults exist**.
@@ -89,16 +96,26 @@ From `docs/design/chaos-smoker.md`, `docs/design/cli-relish.md:760-782`, `docs/w
 ### 3.3 Faults that can't take effect
 
 - **`node-drain` / `node-kill`** — always error. Needed by C1/C2/C5.
-- **`memory <app> oom`** — always rejected (`agent.rs:3219`), though the design's own example scenario uses it (`chaos-smoker.md:1170`).
-- **`partition`** — the last *silent* no-op: succeeds and does nothing without eBPF (`agent.rs:3313-3335`), with an explicit `TODO(Phase 15)` to fix here.
-- `delay`/`drop`/`bandwidth` honestly reject without eBPF; `cpu`/`memory`/`disk-io` reject off Linux. Both fine — capability-gate and skip.
+- **`memory <app> oom`** — deliberately rejected because it is irreversible; the current
+  documentation points operators at `kill` for the restart path.
+- **`partition`** — fixed in 12/20. The service fault requires the loaded connect hook,
+  resolves source cgroups server-side and owns the exact map keys it installs. The
+  gossip/Raft transport operation is now a distinct `CouncilPartition`.
+- **`delay` / `bandwidth`** — honestly rejected even with eBPF. The loaded cgroup
+  connect hook cannot delay or pace packets; both need a production TC data path.
+- `drop` honestly rejects without eBPF; `cpu`/`memory`/`disk-io` reject off Linux. Both
+  are capability-gated.
 
 ### 3.4 Design features absent
 
 - **`[smoker]` config section** (`default_duration`, `max_duration`) — doesn't exist. Default 10m is hardcoded CLI-side (`fault.rs:13`); the only ceiling is a hardcoded 24h clamp (`types.rs:302`), not the designed 1h with a rejection message.
-- **`fault-injection` permission** — absent. `Deployer` can inject; the design explicitly forbids it.
-- **Leader-mediated distribution** — the design routes faults leader → target nodes via the reporting tree (`chaos-smoker.md:84-91`). Implementation is node-local.
-- **Audit event `fault.injected`** — absent. `injected_by` comes from client-side `$USER` (`fault.rs:139`), i.e. spoofable; `source_ip` isn't even a field.
+- **Fault operation permission** — absent at review time; step 13 shipped the
+  typed `inject_workload_faults` server grant plus acknowledgement.
+- **Leader-mediated distribution** — absent at review time; step 13b shipped
+  authenticated target-node routing with target-side authorisation.
+- **Audit event `fault.injected`** — absent at review time; step 13 now ignores
+  client identity and emits structured authenticated inject/clear events.
+  Source address remains absent.
 - **Unix-socket `relish fault clear` fallback** for a degraded API — absent.
 - Startup sweep of stale kernel fault maps — absent (relies on the in-kernel `expires_ns`).
 
@@ -111,13 +128,17 @@ From `docs/design/chaos-smoker.md`, `docs/design/cli-relish.md:760-782`, `docs/w
 ## 4. Decisions — all four settled (26 July 2026)
 
 **Resolved: option (a) on every one.** The recommendations below are now the
-plan of record; step 13b is in scope, and `--node` routing, the
-`fault-injection` permission, the `relish chaos` deprecation and
+plan of record; step 13b is in scope, and `--node` routing, the typed
+`inject_workload_faults` operation, the `relish chaos` deprecation and
 transport-quiesce node kills all get built.
 
 **D1. Cluster-wide fault routing.** Faults are node-local. Options: (a) **implement `--node` routing via the leader's reporting tree, as designed** — makes `node-kill` meaningful and is what "inject into the live cluster" implies; (b) keep node-local and document the deviation. (a) is more work (~1 extra step) but (b) leaves `target_node` dead and the chaos suite weak.
 
-**D2. Fault authorisation.** Design says admin-or-`fault-injection`-grant; today any Deployer. Options: (a) **add the `fault-injection` permission and require it**, a small security fix in the same family as C3; (b) leave as Deployer and amend the design doc. (a).
+**D2. Fault authorisation.** Workload injection requires both the Deployer
+role and the server-owned `inject_workload_faults` operation grant. Admin is a
+role, not an implicit override of a server which disabled faults. Injection
+also needs explicit acknowledgement. Node/council and pressure faults keep
+their stricter Admin plus `alter_node_state`/`saturate_capacity` boundaries.
 
 **D3. `relish chaos` fate.** It's undesigned, stringly-typed, and overlaps `fault`. Options: (a) **promote `council-partition`/`worker-isolation` to typed subcommands under `relish fault` and keep `relish chaos` as a deprecated alias for one release**; (b) delete it; (c) leave it. (a) — it's used by existing chaos tests.
 
@@ -136,6 +157,7 @@ src/
     bench/ mod.rs report.rs compare.rs suites.rs
   smoker/
     node_fault.rs                # NEW — node-kill/drain: transport quiesce + restore
+    node_pressure.rs             # NEW — bounded node CPU/memory helper ownership
     types.rs                     # MODIFIED — SmokerConfig limits
   relish/
     test_cmd.rs bench_cmd.rs wtf.rs trace.rs   # NEW command bodies
@@ -244,14 +266,45 @@ Tests: unit — `node_kill_quiesces_all_cluster_transports`, `node_kill_restores
 Implement: `src/smoker/node_fault.rs` — a reversible quiesce that blocks gossip, Raft and reporting transports (the mechanism `/v1/chaos/partition` already uses at `agent.rs:2505`, generalised), with `FaultReversal::NodeQuiesce`; replace the `NodeDrain | NodeKill` refusal arm; `node-drain` additionally cordons the node (the scheduler's `apply_upgrade_cordon` seam from Phase 14 already exists).
 Book: §"Killing a node without killing the process".
 
+**11b/20 — Node-scoped pressure prerequisite**
+Tests: pure request/ceiling/quota and policy tests; API role, permission and
+acknowledgement tests; privileged rootful-Linux cgroup-v2 acceptance proving
+effect, Bun isolation, clear and restart cleanup.
+Implement: `src/smoker/node_pressure.rs`; a dedicated helper cgroup outside
+Bun, one concurrent helper per node, total-node CPU quota and memory-usage
+target, 90% hard ceilings, `PR_SET_PDEATHSIG`, startup sweeping and live
+capability evidence. Route by target node under `saturate_capacity`; clearing
+is de-escalating and must not grant `alter_node_state`.
+Book: §"Pressuring a node without pressuring Bun".
+
 **12/20 — Partition stops lying; memory-oom decision**
-Tests: `partition_without_ebpf_is_refused_not_silently_dropped`; move the quorum-rail acceptance test onto an eBPF node or a mock so the `TODO(Phase 15)` no-op can go; `memory_oom_is_implemented_or_refused_consistently`.
-Implement: remove the silent-success `Partition` arm — honest error without eBPF, like `delay`/`drop`. Decide `memory oom`: implement via `memory.max` squeeze **or** remove it from the docs; don't leave documented-but-rejected.
+Tests: `service_partition_without_ebpf_is_refused_not_recorded_as_success`;
+`service_partition_does_not_consume_raft_quorum`; root-only Linux
+`partition_fault_blocks_its_source_cgroup_and_clears`; the real three-node
+quorum acceptance now uses `/v1/chaos/partition`.
+Implement: shipped. Service partitions resolve cgroup ids on Bun, install and
+own exact connect-map keys, roll back partial writes and propagate failures.
+`CouncilPartition` carries the separate Raft/gossip transport operation.
+Delay/bandwidth reject until TC exists. `memory oom` remains an explicit,
+documented refusal because an OOM kill is not reversible; use a Kill fault to
+exercise restart behaviour.
 Book: §"The last fault that lied".
 
 **13/20 — Fault authorisation and audit (D2)**
-Tests: `deployer_cannot_inject_without_the_grant`; `admin_can_inject`; `fault_injection_permission_grants_a_deployer`; `injected_faults_emit_an_audit_event_with_the_authenticated_principal`.
-Implement: `fault-injection` permission; `require_fault_injection` in the inject/clear handlers; `ROUTE_MATRIX` updated; `injected_by` taken from the **authenticated principal server-side**, not the client's `$USER`; emit `fault.injected` into the event store with principal, target, type, duration.
+Tests: shipped. API tests prove a Deployer cannot inject without the grant,
+the grant cannot replace acknowledgement, an acknowledging Deployer can
+inject, clear needs the grant but not destructive acknowledgement, and the
+deprecated council route cannot bypass Admin or acknowledgement. Structured
+event tests pin authenticated attribution.
+Implement: shipped. `InjectWorkloadFaults` is a typed server-owned operation;
+ordinary inject/clear handlers enforce it, and node/council/pressure reversal
+uses its matching operation. Relish no longer supplies `$USER` as authority.
+Bun replaces the compatibility field from the authenticated token name and
+records the stable credential principal in additive `action`, `principal` and
+`details` event fields. `fault.injected` includes target, type and duration;
+all clear paths emit a stable audit action. Reversal still needs the matching
+grant and role, but deliberately needs neither destructive acknowledgement
+nor the protected-cluster mutation switch.
 Book: §"Who may break production".
 
 *(If D1 = implement routing, insert **13b/20 — leader-mediated fault distribution**: `--node` routes through the leader's reporting tree; `target_node` stops being dead.)*
@@ -259,24 +312,62 @@ Book: §"Who may break production".
 ### Stream D — `relish test --chaos` (step 14)
 
 **14/20 — Chaos suite with production guards**
-Tests: pure `chaos_preflight(caps, flags, is_tty) -> Result<(), RefusalReason>` — `refuses_fewer_than_three_nodes`, `refuses_production_without_override`, `allows_production_with_override`, `requires_yes_when_not_a_tty`; integration — `--chaos` against the 1-node harness exits 1 naming the 3-node requirement.
-Implement: the five scenarios (now genuinely runnable), `ChaosGuard` that always clears the faults **it injected** (track ids — never a blanket clear), `--chaos`/`--override`/`--yes`.
+Tests: shipped. Pure preflight tests cover fewer than three nodes,
+non-interactive consent, protected server policy, missing operation grants and
+unavailable node pressure. A one-node HTTP harness proves refusal before any
+lease is created. Runner tests inject through a mock API, then prove timeout
+and panic both clear only the exact returned fault ids. The 22-test real
+cluster gate exercises the additive council-partition id contract.
+Implement: shipped. Five serial scenarios cover leader loss, worker
+rescheduling, minority council partition, bounded node pressure and node death
+during a live deploy. The suite uses the digest-pinned runc/Apple workload;
+ProcessGrill remains a separate ordinary-test profile. `ChaosGuard` is shared
+between the case task and runner, stores each id with its direct owner client
+and never sends a blanket clear. `/v1/chaos/partition` now returns its
+node-local id additively so the legacy council effect obeys the same ownership
+rule. Each destructive case refreshes its 15-second capability snapshot after
+acquiring the serial permit.
+
+There is no `--override`. Unknown and production clusters need
+`allow_protected_mutation = true` in server policy. `--yes` or the exact
+interactive answer `yes` records consent only; it cannot add role or
+operation authority. Missing node failure, node pressure, container workload
+or required operation evidence refuses the suite instead of producing a green
+skip.
 Book: §"Chaos with a safety catch".
 
 ### Stream E — `relish bench` (steps 15–16)
 
-**15/20 — bench schema + regression comparison** (direction-aware, 10 % threshold, `schema_version` guard)
+**15/20 — bench schema + regression comparison** — shipped. Direction-aware,
+strictly greater than 10% threshold, schema guard, workload-parameter checks,
+per-node platform fingerprints and informational hosted runs.
 **16/20 — the seven suites** (`--quick` scaling, per-suite timeout, skip plumbing, `--capacity` opt-in)
 
 ### Stream F — `relish wtf` (steps 17–18)
 
 **17/20 — pure `diagnose()` + pattern catalogue** (13 patterns, one `check_*` fn each, crashloop→deploy correlation)
-**18/20 — `collect()` fan-out + CLI** (parallel, 10s per-request timeouts, `--app`, `--watch`, exit 0/1/2)
+**18/20 — `collect()` fan-out + CLI** — shipped (parallel, 10s per-request timeouts, `--app`, `--watch`, exit 0/1/2)
+
+The step-18 prerequisite now includes authenticated schema-v1 local diagnostic
+evidence. Disk capacity is attributed to configured storage domains and CPU
+throttling comes from a bounded cgroup counter delta. Public node-certificate
+metadata is deliberately degraded until workload inventory and node hot reload
+exist; no private material or host path appears on the wire.
 
 ### Stream G — `relish trace` (steps 19–20)
 
-**19/20 — `/v1/trace` endpoint + pure firewall evaluator**
-**20/20 — `relish trace` CLI + phase close-out** (progress.md, both READMEs, chapter 15 final pass, this plan's checklist)
+**19/20 — `/v1/trace` endpoint + pure firewall evaluator** — shipped. The
+endpoint accepts a strict POST body, enforces source/destination scope and runs
+fixed, bounded probes from the source workload. Internal traces read live
+service state and attached eBPF backend/firewall maps. External probes need an
+Admin, the independent operation grant, protected-cluster permission and an
+exact `host:port` allowlist entry.
+
+**20/20 — `relish trace` CLI + phase close-out** — shipped. Relish discovers a
+reachable node hosting the source, preserves `Pass`/`Fail`/`Unknown` and
+observed/inferred/unavailable evidence in human/JSON/YAML output, and maps the
+overall result to exit 0/1/2. Progress, both READMEs and chapter 15 describe the
+actual contract.
 
 ---
 
@@ -367,7 +458,7 @@ pub struct TestCaseResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestReport {
-    pub schema_version: u32,             // 1
+    pub schema_version: u32,             // 2
     pub started_at: String,              // RFC 3339
     pub duration_ms: u64,
     pub cluster_nodes: u32,
@@ -439,16 +530,28 @@ Polling helpers use a 500 ms interval and the context deadline; every HTTP call 
 
 ### 7.4 Bench types — `src/testkit/bench/report.rs`, `compare.rs`
 
+> **Deviation recorded during step 15.** `BenchReport` now carries a
+> `BenchEnvironment` rather than only `cluster_nodes`. It records topology,
+> every node's build and runtime/kernel/architecture fingerprints, explicit
+> unknown nodes and hosted-CI evidence. `BenchMetric.parameters` fingerprints
+> workload size and method. Comparison permits version and Git SHA changes
+> (those are normally the subject of the experiment) but refuses different
+> targets, profiles, runtime versions, rootless modes, kernels, architectures,
+> topology, quick/capacity mode or metric method. A zero baseline uses
+> `change_percent: null`, never non-finite JSON. Hosted results retain the
+> measured changes but make the verdict informational.
+
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchReport {
-    pub schema_version: u32,             // 1
+    pub schema_version: u32,             // 2
     pub started_at: String,
     pub duration_ms: u64,
     pub cluster_nodes: u32,
     pub quick: bool,
     pub metrics: Vec<BenchMetric>,
     pub skipped: Vec<SkippedSuite>,      // { name, reason }
+    pub failed: Vec<FailedSuite>,        // { name, reason }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,9 +578,23 @@ pub struct Comparison {
 pub fn compare(baseline: &BenchReport, current: &BenchReport, threshold: f64) -> Comparison;
 ```
 
-Baseline file = a previous `relish bench --output json` capture, verbatim. Reject `schema_version != 1` with a clear error.
+Baseline file = a previous `relish bench --output json` capture, verbatim.
+Schema 2 adds a first-class `failed` list: a suite which started and timed out,
+panicked, hit an API error or lost cleanup evidence is not a preflight skip.
+Reject any other schema, unknown field or report containing failed suites
+before calculating a regression verdict.
 
 ### 7.5 Wtf types — `src/relish/wtf.rs` (structs match `docs/design/cli-relish.md` §4, with one deviation)
+
+> **Deviation recorded during step 17.** The report is schema-versioned and
+> adds a first-class `unknown` list and `unknown_count`. Inputs group cluster
+> and application evidence, and every source is an `Evidence<T>` tagged as
+> `available`, `degraded`, `unavailable`, or `unsupported`. Available and
+> degraded evidence carries an observation timestamp. This implements the review rule that an absent source
+> can never produce an OK row. Crashloops use timestamped restart events;
+> throttling uses throttled-time deltas; disk and certificate checks require
+> capacity and public lifecycle metadata rather than guessing from adjacent
+> metrics. Collection may honestly leave those newer contracts unsupported.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,14 +658,23 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
 
 Reuse existing response structs from `src/relish/client.rs` / `src/bun/api.rs` rather than redefining them; add `pub` or move types if needed.
 
-### 7.6 Trace types — shared, so put them in `src/onion/trace.rs` or `src/bun/api.rs`; match the design doc exactly
+### 7.6 Trace types — shared in `src/onion/trace.rs`
+
+> **Deviation recorded during step 19.** A two-state `Pass`/`Fail` contract
+> would turn missing probe tools or unavailable kernel maps into either a lie
+> or a failure attributed to the application. Trace now carries explicit
+> evidence provenance and `Unknown`, plus a strict schema version and source
+> node. This matches the runner and `wtf`: missing evidence never becomes
+> green.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceResult {
+    pub schema_version: u32,
     pub source: String,
     pub destination: String,
     pub destination_port: u16,
+    pub source_node: String,
     pub steps: Vec<TraceStep>,
     pub overall_result: TraceVerdict,
     pub latency_ms: Option<f64>,
@@ -557,7 +683,8 @@ pub struct TraceResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceStep {
     pub step_number: u32,
-    pub name: String,                    // "Service resolution", "Backend health", "Firewall", "TCP probe"
+    pub name: String,
+    pub evidence: TraceEvidence,
     pub details: Vec<String>,
     pub verdict: TraceVerdict,
 }
@@ -567,6 +694,13 @@ pub struct TraceStep {
 pub enum TraceVerdict {
     Pass,
     Fail { reason: String },
+    Unknown { reason: String },
+}
+
+pub enum TraceEvidence {
+    Observed,
+    Inferred,
+    Unavailable,
 }
 ```
 
@@ -658,7 +792,12 @@ Scenarios (whitepaper SLA: full operability after leader loss < 20 s — assert 
 - **C1 `leader_failure_elects_new_leader_and_cluster_recovers`** — identify leader via `/v1/cluster/council`; `node-kill` it (duration 60 s, auto-recover); assert a *different* leader within 30 s; deploy a canary app during the outage window and see it Running; after recovery the old node rejoins Alive.
 - **C2 `dead_worker_node_has_workloads_rescheduled`** — deploy 3-replica app spread over workers; `node-kill` a worker hosting ≥1 replica; assert membership marks it Suspect→Dead (guards H4–H7) and desired replica count is restored on surviving nodes within 90 s.
 - **C3 `minority_partition_degrades_and_heals`** — partition one node away (`/v1/chaos/partition`); majority still accepts a deploy; partitioned node either serves stale reads or refuses writes, but never a second leader (guards C3-review); heal; membership reconverges, no duplicate instances left behind.
-- **C4 `resource_exhaustion_degrades_gracefully`** — inject `memory 90%` + `cpu 80%` on one worker; assert cluster-level API stays responsive, health checks on *other* nodes don't flap, and (if scheduler pressure-awareness exists) new replicas avoid the pressured node — otherwise just assert no false Dead; clear faults; node returns to normal.
+- **C4 `resource_exhaustion_degrades_gracefully`** — inject
+  `node-pressure --memory 90% --cpu 80%` on one worker; assert cluster-level
+  API stays responsive, health checks on *other* nodes don't flap, and new
+  replicas avoid the pressured node when live scheduler evidence supports that
+  assertion; always assert no false Dead, clear the owned fault and prove the
+  helper/cgroup disappeared.
 - **C5 `node_death_during_deploy_ends_clean`** — start a rolling deploy of a 4-replica app, `node-kill` a worker mid-roll; assert the deploy terminates in a defined state (Complete or RolledBack, not stuck), replica count eventually correct, no orphaned instances in `/v1/status` (guards M16/H1).
 
 Report: chaos results are ordinary `TestCaseResult`s inside a `TestReport` with `chaos: true`.
@@ -666,6 +805,26 @@ Report: chaos results are ordinary `TestCaseResult`s inside a `TestReport` with 
 ---
 
 ### 7.9 The bench suites
+
+> **Deviation recorded during step 16.** The implementation reserves
+> `rbtest-bench-*` namespaces because the durable lease boundary deliberately
+> rejects the old unowned `rbbench-*` prefix. Every suite gets a separate
+> lease; capacity allocates additional leases before the 128-resource ceiling,
+> and the runner retains every id outside the abortable suite task. A timeout
+> is `failed`, never `skipped`.
+>
+> The discovery sample is an actual `nslookup` executed in the source
+> workload, not `GET /v1/resolve`. Network throughput executes `wget` there
+> against `target.namespace.internal`, so both DNS and the service VIP stay in
+> the measured path. Reconstruction is omitted unless the operator supplies
+> `--disruptive --yes`; capacity requires `--capacity --yes`.
+>
+> Pickle still has no leased image-delete or cache-eviction API. Pushing a
+> fresh 16 MiB repository on every run would leak durable catalogue data, so
+> `image_distribution` instead times the digest-pinned multi-architecture OCI
+> daemonset to Running on every node and fingerprints its uncontrolled current
+> cache state. A deterministic cold-cache Pickle replication benchmark remains
+> blocked on that ownership API; the metric doesn't pretend otherwise.
 
 Client-side orchestration in `src/testkit/bench/suites.rs`, all through public APIs, each suite returning `Vec<BenchMetric>` or a skip reason. Namespace `rbbench-{run_id}`; teardown always.
 
@@ -679,7 +838,7 @@ Client-side orchestration in `src/testkit/bench/suites.rs`, all through public A
 | 6 | `image_distribution` | s | no | Requires `Registry` (+replication wired): push ~16 MiB synthetic image, time until N nodes hold it. Skip until review L10 lands. | skipped |
 | 7 | `cluster_capacity` | apps | yes | Only with explicit `--capacity` flag (deviation from design doc — deliberately saturating a cluster must be opt-in; note it in cli-relish.md): deploy minimal apps until scheduling fails; count; tear down. | never |
 
-Rules: p-quantiles computed on sorted samples (no interpolation needed at these sizes); every suite has a hard `tokio::time::timeout` budget (5 min full, 60 s quick) — a suite that overruns reports itself skipped with reason "timed out", the harness moves on.
+Rules: p-quantiles computed on sorted samples (no interpolation needed at these sizes); every suite has a hard `tokio::time::timeout` budget (5 min full, 60 s quick). A suite that overruns records a failure, the harness aborts its task, reverses exact owned faults, releases all leases, then moves on.
 
 ---
 
@@ -715,34 +874,59 @@ OK entries (emit when the corresponding check passes and data was available): "a
 
 ### 7.11 Trace: endpoint and semantics
 
-**Endpoint:** `GET /v1/trace?from={app}&namespace={ns}&to={dest}&port={port}` (protected) in `src/bun/api.rs`; assembly logic in a helper module so it stays testable (`src/onion/trace.rs`: `pub async fn run_trace(deps..., from, to, port) -> TraceResult`).
+**Endpoint:** `POST /v1/trace` with a strict `TraceRequest` body. The route is
+authenticated and scope-aware. Bun accepts application/DNS labels for an
+internal destination; everything else is external and must pass the separate
+Admin, server-operation, protected-cluster and exact `host:port` allowlist
+checks. Arbitrary command text is never accepted.
 
 Steps (destination is a cluster app):
-1. **Service resolution** — look up `to` in the Onion service map. Details: VIP, whether the eBPF interception layer is live (`capabilities.ebpf`; if false, note `"userspace service map (eBPF not active on this node)"` — still Pass). Fail: `service map has no entry for '{to}'`.
-2. **Backend health** — list backends with health; Fail if 0 healthy: `service has {n} backends, none healthy`.
-3. **Firewall verdict** — call `firewall::evaluate::evaluate_app_connection(&desired_specs, from, to, port)`. This is a **pure function over declared policy** (`allow_from` in app specs), not a live nftables query — say so in `details` (`"policy verdict (declared allow_from), not live nftables"`). If firewall capability is off: Pass with note `"firewall disabled — all traffic permitted"`. Fail: `DROP: '{to}' does not list '{from}' in allow_from`.
-4. **TCP probe** — pick the first healthy backend, `tokio::time::timeout(5s, TcpStream::connect(addr))`, measure elapsed → `latency_ms`. Fail: refused/timeout with which address was tried. **Documented limitation** (put it in details and in the book): the probe originates from the bun agent process on the source node, not from inside the source app's network namespace, so app-netns-specific issues can escape it. `// TODO(v2): optionally probe via exec inside the source instance.`
+1. **DNS query** — execute fixed `nslookup "$1"` inside the source workload,
+   query `<app>.<namespace>.internal`, and require its output to contain the
+   live VIP.
+2. **Service and eBPF state** — read the live userspace service map and require
+   a healthy backend. On Linux with Onion attached, read `backend_map` too;
+   otherwise label the userspace result `Inferred`.
+3. **Firewall state** — on Linux with the hooks attached, resolve the source
+   workload PID to its cgroup, read `cgroup_namespace_map` and `firewall_map`,
+   and evaluate those facts with the same rule as the connect hook. Missing
+   live maps produce `Unknown`, not a declared-policy pass.
+4. **TCP probe** — execute fixed `nc -z -w 3 "$1" "$2"` inside the source
+   workload against the service VIP. The task has an eight-second outer bound
+   and reports measured latency.
 
-Destination is an external host (contains a dot and isn't a known service): step 1 becomes system DNS (`tokio::net::lookup_host`), step 3 evaluates the egress allowlist if wired (else Pass + note), `--port` becomes mandatory (CLI validates).
+For an external host, DNS and TCP still originate in the workload and `--port`
+is mandatory. With no egress policy, the live enable map proves pass-through.
+With active egress enforcement, the TCP result is observed but the map can't
+yet attribute a resolved address to the requested hostname, so the firewall
+step is `Unknown`.
 
-`overall_result`: Fail if any step failed (first failure's reason); steps after a failed step are still attempted where meaningful (probe is skipped if there's no backend to probe).
+`overall_result`: `Fail` wins, then `Unknown`, then `Pass`. All meaningful
+steps still run. A missing POSIX shell, `nslookup` or `nc` is `Unknown`; it
+isn't misreported as a network failure.
 
-**CLI side** (`src/relish/trace.rs`): resolve which node hosts a `from` instance via `/v1/status` (any instance will do; take the first), construct a `BunClient` for that node's address (node API addresses come from `/v1/cluster/nodes`), call `/v1/trace`, render:
+**CLI side** (`src/relish/trace_cmd.rs`): query reachable node status views
+concurrently, select the lexicographically first node with a running source
+instance, construct an authenticated peer `BunClient`, call `/v1/trace`, and
+render human, JSON or YAML. Human output labels evidence provenance; exit 0 is
+Pass, 1 is Fail and 2 is Unknown.
 
 ```
 $ relish trace web --to redis
 
-  trace: web → redis:6379
+Trace default/web -> default/redis:6379 from node node-a
 
-  1. Service resolution        PASS   redis → 127.128.0.3 (userspace service map)
-  2. Backend health            PASS   2/2 backends healthy
-  3. Firewall                  PASS   allow_from includes 'web' (declared policy)
-  4. TCP probe                 PASS   10.0.1.5:30891 in 1.3 ms
+  1. DNS query [PASS; observed]
+  2. Service and eBPF state [PASS; observed]
+  3. Firewall state [PASS; observed]
+  4. TCP probe [PASS; observed]
 
-  result: PASS (1.3 ms)
+Overall: PASS (1.30 ms TCP probe)
 ```
 
-Failures print the failing step in red with its reason and stop the summary at `result: FAIL — <reason>`. Snapshot-test this rendering with `insta` from a fixed `TraceResult` fixture.
+Machine output uses strict schema version 1. The rendering and exit mapping are
+covered by fixed-result unit tests; source-node selection and the API path use
+mock clients and agent orchestration tests.
 
 ---
 
@@ -822,14 +1006,14 @@ After step 14 and again after step 20, on macOS with Lima:
 relish dev create --nodes 3
 relish test --output json | tee /tmp/test-report.json   # 0 failed; skips carry reasons
 relish test --filter scheduling
-relish fault kill web --count 1 --reason "runbook"      # new flags land in `fault list`
+relish fault kill web --count 1 --reason "runbook" --acknowledge
 relish fault clear web                                  # clear-by-app
-relish fault node-kill <node> --duration 60s            # real now
+relish fault node-kill <node> --duration 60s --acknowledge
 relish test --chaos --yes                               # 5 scenarios; `fault list` empty after
 relish bench --quick --output json > /tmp/base.json
 relish bench --quick --compare /tmp/base.json           # ~0 regressions against itself
 relish wtf                                              # exit 0 healthy
-relish fault kill <app> --count 1 && relish wtf         # finding appears; exit non-zero
+relish fault kill <app> --count 1 --acknowledge && relish wtf
 relish trace <appA> --to <appB>
 relish dev destroy
 ```
@@ -850,17 +1034,18 @@ Record date, cluster size and observed skips at the bottom of this file.
 - [x] 8/20 catalogue B — **all 13 groups, 39 cases.** Control-plane groups on `ProcessRuntime`; container-workload groups (firewall/ingress/volumes/secrets-config) on a `busybox` image gated on `Capability::ContainerRuntime`; image-registry builds + pushes a synthetic OCI image via the raw `/v2` protocol (`src/testkit/oci.rs`) to the on-node loopback registry (2 cases real, `deploy_from_cluster_registry` skips — synthetic image isn't runnable). Two acceptance runs, one per runtime; skips all name their reason
 - [x] 9/20 fault targeting flags + CLI fidelity
 - [x] 10/20 `[smoker]` duration config
-- [ ] 11/20 node-level faults
-- [ ] 12/20 partition honesty + memory-oom decision
-- [ ] 13/20 fault authorisation + audit
-- [ ] 13b/20 leader-mediated distribution *(in scope — D1 resolved)*
-- [ ] 14/20 chaos suite
-- [ ] 15/20 bench schema + comparison
-- [ ] 16/20 bench suites
-- [ ] 17/20 wtf engine
-- [ ] 18/20 `relish wtf` CLI
-- [ ] 19/20 trace endpoint
-- [ ] 20/20 `relish trace` + close-out
+- [x] 11/20 node-level faults
+- [x] 11b/20 node-scoped pressure prerequisite
+- [x] 12/20 partition honesty + memory-oom decision
+- [x] 13/20 fault authorisation + audit
+- [x] 13b/20 authenticated target-node distribution
+- [x] 14/20 chaos suite
+- [x] 15/20 bench schema + comparison
+- [x] 16/20 bench suites
+- [x] 17/20 wtf engine
+- [x] 18/20 `relish wtf` CLI
+- [x] 19/20 trace endpoint
+- [x] 20/20 `relish trace` + close-out
 - [ ] acceptance runbook on a 3-node dev cluster
 
 ---
@@ -871,7 +1056,74 @@ Carried from the 6 July plan (all still apply): don't assert broken behaviour; `
 
 New for this revision:
 
-12. **Chaos work touches the cluster plane.** Run `make test-cluster` (21 tests) on every stream-C/D commit, not just `make ci`.
+12. **Chaos work touches the cluster plane.** Run `make test-cluster` (currently
+    22 tests) on every stream-C/D commit, not just `make ci`.
 13. **`ROUTE_MATRIX` is enforced by a test.** Every new route (`/v1/capabilities`, `/v1/trace`) needs a matrix entry or `matrix_covers_every_mounted_route` fails. Routes naming `{app}` additionally need `authorize_scoped` (the C3 drift guard).
-14. **Don't reintroduce a silent no-op.** Step 12 exists because `Partition` still succeeds while doing nothing. Any new fault arm either works, or returns an error saying why — never `Ok(())` with no effect.
-15. **`injected_by` is currently spoofable.** Until step 13, treat it as a hint, not an audit record.
+14. **Don't reintroduce a silent no-op.** Step 12 fixed `Partition` and exposed that
+    Delay/Bandwidth had the same problem behind a loaded eBPF handle. Any new fault arm
+    either works and has effect evidence, or returns an error saying why. Never
+    `Ok(())` with no effect.
+15. **Audit identity and display names are different contracts.** The
+    authenticated token name may remain readable in `FaultSummary.injected_by`,
+    but audit events use the stable `principal_id` (`token:<hash>`). Never copy
+    identity from a request body or `$USER`.
+
+---
+
+## 12. Validation record
+
+**29 July 2026, step 14 implementation.** `make ci` passed 3,076
+default-feature tests, doctests, and 3,052 no-default-feature tests; both
+nextest runs reported 41 intentionally skipped tests. `make test-cluster`
+passed all 22 real multi-node cluster tests with no skips. The focused Phase
+15 testkit slice passed all 67 tests, including exact cleanup after timeout and
+panic and capability refresh after serial queueing.
+
+The full five-case `relish test --chaos --yes` run remains unchecked in the
+runbook. The available Lima environment is one rootful Linux VM, not three
+independent runc nodes; pretending three Bun processes sharing one host cgroup
+are three node-pressure domains would weaken C4 rather than validate it. Run
+the catalogue on three real nodes (or three independent VMs) before checking
+the final acceptance item.
+
+**3 August 2026, step 16 implementation.** The 19 focused benchmark library
+tests pass with default and no-default features; the Relish parser test and
+all-target/all-feature Clippy pass. The runner's unit evidence covers
+nearest-rank p99, medians, strict hosted/topology fingerprints, explicit risk
+gates, timeout-as-failure and retained cleanup errors. A real multi-node
+`relish bench --quick` and disruptive/capacity acceptance run remains open in
+the final runbook.
+
+**3 August 2026, step 17 implementation.** The pure `diagnose()` engine has a
+schema-v1 output contract and 12 focused catalogue tests. Tests cover node and
+council failure, restart-window crashloops, deploy and log correlation,
+deduplicated no-backend advice, active deploys, alerts, faults, attributed
+disk capacity, cgroup throttled time, certificate lifecycle, Pickle redundancy
+and app scoping. Unavailable and unsupported inputs produce `Unknown`; the
+engine never emits the corresponding OK result.
+
+**3 August 2026, step 18 implementation.** The authenticated collector fans
+bounded requests across expected nodes and retains partial facts as degraded
+evidence. Desired application state comes from a new read-only diagnostic view
+and is compared with scheduled instances and the live resolver, so a service
+with no resolver entry remains diagnosable. Restart/deploy history limitations,
+app-unlabelled alerts and incomplete certificate inventory are explicit
+Unknown results. Twenty-two focused engine, collector and command tests pass.
+
+**3 August 2026, steps 19–20 implementation.** `POST /v1/trace` runs bounded,
+fixed DNS and TCP probes inside the selected source workload and reads live
+userspace service state plus attached Linux eBPF backend/firewall maps. The
+agent spawns the owned trace task; a regression test holds `exec()` in flight
+and proves status still responds. Eight per-node execution permits bound
+concurrency and the ninth request is refused rather than queued. Strict
+schema-v1 human/JSON/YAML results
+preserve observed, inferred and unavailable provenance, and `Unknown` exits 2.
+External probes fail closed behind Admin, `probe_external_destination`, the
+protected-cluster policy and an exact `host:port` allowlist. Focused tests pass
+with default and no-default features. A live ProcessGrill launch was not
+possible in the implementation sandbox, so the checked mock-runtime
+orchestration is not presented as real-runtime acceptance; the three-node
+runc/Apple acceptance run remains open with the rest of the final runbook.
+A live standalone ProcessGrill run produced one correctly coalesced shared-disk
+warning, four honest Unknown sources and exit status 2; no false clustered
+registry warning appeared. The full three-node acceptance run remains open.

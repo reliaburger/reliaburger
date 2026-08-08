@@ -109,6 +109,7 @@ impl Harness {
             None,
             None,
             Some(aggregated_rx),
+            "default".to_string(),
             options.node_name,
             600,
             reliaburger::cluster::ClusterHttp::plaintext(),
@@ -121,6 +122,8 @@ impl Harness {
             256 * 1024 * 1024,
             options.require_signatures,
             reliaburger::bun::capabilities::StaticCapabilities::default(),
+            reliaburger::bun::readiness::ReadinessTracker::new(),
+            None,
         );
         let server_shutdown = shutdown.clone();
         let server_task = tokio::spawn(async move {
@@ -293,6 +296,7 @@ async fn start_registry_with_council(
         persist_path: None,
         auth: None,
         require_read_auth: false,
+        allow_unauthenticated_bootstrap: true,
         quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
         sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
             reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,

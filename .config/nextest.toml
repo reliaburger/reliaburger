@@ -42,6 +42,13 @@ filter = 'binary(self_upgrade) | binary(self_upgrade_cluster)'
 test-group = "upgrade-heavy"
 slow-timeout = { period = "120s", terminate-after = 3 }
 
+# Node pressure asserts on whole-node memory usage; any concurrently
+# running test binary churns that measurement by hundreds of megabytes.
+# Reserve every test thread so it runs alone.
+[[profile.default.overrides]]
+filter = 'binary(node_pressure)'
+threads-required = "num-test-threads"
+
 [[profile.ci.overrides]]
 filter = 'binary(ebpf) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
@@ -61,3 +68,9 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'binary(self_upgrade) | binary(self_upgrade_cluster)'
 test-group = "upgrade-heavy"
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# Same exclusivity as the default profile: node pressure measures the
+# whole node.
+[[profile.ci.overrides]]
+filter = 'binary(node_pressure)'
+threads-required = "num-test-threads"

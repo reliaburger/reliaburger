@@ -6,7 +6,11 @@ The idea is simple: if you don't know how your system fails, you're going to fin
 
 Most chaos engineering tools are separate systems. Chaos Mesh needs CRDs, an operator, and a privileged DaemonSet. Litmus spawns runner pods for each experiment. Gremlin is a SaaS with a privileged agent on every node. The barrier to entry is high enough that most teams never adopt them.
 
-Smoker takes a different approach. It's built into Reliaburger. No extra binaries, no sidecars, no CRDs. When no faults are active, the overhead is a single empty hash map lookup per `connect()` call — about 50 nanoseconds. When you want to break something, it's one command: `relish fault delay redis 200ms`.
+Smoker takes a different approach. It's built into Reliaburger. No extra
+binaries, no sidecars, no CRDs. When no connect-time fault is active, the
+loaded eBPF hook does one empty hash-map lookup and continues. When you want to
+break a connection, it's one command:
+`relish fault drop redis 100% --acknowledge`.
 
 ## Safety first
 
@@ -37,7 +41,9 @@ Four variants. The `match` in `evaluate_safety` handles every one. The compiler 
 
 **Quorum protection** is the hard limit. In a 5-member council, you can fault at most 2 members — `(5 - 1) / 2 = 2`. A third would break Raft quorum, and the cluster would stop accepting writes. This rail cannot be overridden. No `--force`, no `--yes-i-really-mean-it`. If you need to test what happens when quorum breaks, you use the in-memory test infrastructure, not production.
 
-**Replica minimum** prevents you from killing all instances of a service. `relish fault kill web --count 0` (kill all) is rejected if it would leave zero surviving replicas. At least one must survive.
+**Replica minimum** prevents you from killing all instances of a service.
+`relish fault kill web --count 0 --acknowledge` (kill all) is rejected if it
+would leave zero surviving replicas. At least one must survive.
 
 **Leader protection** blocks faults targeting the cluster leader unless you explicitly pass `--include-leader`. This is overridable because sometimes you *want* to test leader failover — but you should know you're doing it.
 
@@ -71,7 +77,11 @@ The registry is wrapped in `Arc<tokio::sync::Mutex<FaultRegistry>>` because the 
 
 ## Process faults: the easy ones
 
-The simplest faults are process signals. `relish fault kill web-3` sends SIGKILL to the container's main process. `relish fault pause web` sends SIGSTOP, which freezes the process. Health checks fail after the configured timeout, triggering the restart logic.
+The simplest faults are process signals.
+`relish fault kill web-3 --acknowledge` sends SIGKILL to the container's main
+process. `relish fault pause web --acknowledge` sends SIGSTOP, which freezes
+the process. Health checks fail after the configured timeout, triggering the
+restart logic.
 
 A pause used to be a trap. SIGSTOP froze the process, but nothing ever un-froze it — expiry deleted the registry entry and left the workload wedged. You had to remember to send a separate `--resume` (SIGCONT) fault by hand. That's exactly the kind of "cleanup that doesn't clean up" a chaos tool must not have. Now a pause records the PIDs it froze, and when the fault clears or expires the agent SIGCONTs them automatically. The manual resume still exists, but you no longer *need* it: the process comes back on its own when the fault's time is up.
 
@@ -128,11 +138,14 @@ All resource faults are Linux-only. On macOS, the functions return `ResourceFaul
 
 This is where Smoker earns its keep. Network faults operate at the kernel level, in the same eBPF programs that Onion uses for service discovery.
 
-We add three new BPF maps alongside Onion's existing maps:
+The loaded Onion program adds one map alongside its existing maps:
 
-- `fault_connect_map` — per-service connection faults (drop, delay, partition)
-- `fault_bw_map` — per-service bandwidth throttling
-- `fault_state_map` — per-CPU PRNG state for probabilistic faults
+- `fault_connect_map` — per-service connection faults (drop and partition)
+
+Earlier designs also named `fault_bw_map` and `fault_state_map`. No loaded
+program consumes them. Keeping their Rust structs didn't make bandwidth
+shaping real, so Bun now refuses delay and bandwidth until a TC packet path
+owns the maps and proves the effect.
 
 There's no `fault_dns_map`. DNS resolution moved out of the kernel and into a userspace responder (Chapter 3), so the DNS fault lives there too. More on that in a moment — it's a good lesson in keeping a fault pointed at the code that actually runs.
 
@@ -178,7 +191,13 @@ The application sees `ECONNREFUSED` — exactly what a real connection failure l
 
 ### Partition
 
-A partition between service A and service B uses the `source_cgroup_id` field in the key. The eBPF program checks `bpf_get_current_cgroup_id()` against the key. If the calling process is in the blocked cgroup and the destination matches, the connection is refused with ENETUNREACH.
+A partition between service A and service B uses the `source_cgroup_id` field
+in the key. The eBPF program checks `bpf_get_current_cgroup_id()` against the
+key. Clients don't get to assert that id: Bun resolves every running instance
+of the named source app, records every exact key it writes, and removes those
+keys on clear or expiry. If the calling process is in a blocked cgroup and the
+destination matches, Linux refuses `connect()` with `EPERM` before sending a
+packet.
 
 Bidirectional partitions require two map entries (A→B and B→A). Unidirectional partitions are one entry — A can't reach B, but B can still reach A.
 
@@ -238,7 +257,13 @@ if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
 
 The application's `getaddrinfo("redis.internal")` now fails with `EAI_NONAME`. From the application's perspective, the service simply doesn't exist — which is the whole point.
 
-Two things fall out of this. First, `DnsNxdomain` no longer counts as an "eBPF fault": it works wherever the responder runs, so `requires_ebpf()` returns `false` for it. The faults that genuinely need the kernel data path (delay, drop, partition, bandwidth) still return `true` and still get rejected honestly on a node without eBPF. Second, reversal is free: clearing or expiring the fault removes it from the registry, we republish the smaller set, and the name resolves again on the very next query. No kernel map to clean up, because there never should have been one.
+Two things fall out of this. First, `DnsNxdomain` no longer counts as an "eBPF
+fault": it works wherever the responder runs, so `requires_ebpf()` returns
+`false` for it. Drop and partition need the connect hook. Delay and bandwidth
+need a future TC hook and are rejected on every current node. Second, reversal
+is free: clearing or expiring the DNS fault removes it from the registry, we
+republish the smaller set, and the name resolves again on the very next query.
+No kernel map to clean up, because there never should have been one.
 
 ## Network security
 
@@ -286,7 +311,7 @@ duration = "3m"
 The executor builds a timeline, sorts by activation time, and runs each step at the right moment. A speed multiplier lets you run scenarios faster for CI:
 
 ```bash
-relish fault scenario payment-cascade.toml --speed 10.0
+relish fault scenario payment-cascade.toml --speed 10.0 --acknowledge
 ```
 
 Dry-run mode prints the timeline without executing:
@@ -327,12 +352,25 @@ Each fault type now maps to a mechanism, and the mechanism is the truth:
 
 - **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT`. A pause now records its frozen PIDs and auto-resumes them on clear or expiry, so a paused workload can't be left wedged. These work on every platform because signals are POSIX, not Linux-specific.
 - **CPU stress, memory pressure and disk-IO throttle** cap the *target* instance's cgroup — `cpu.max`, `memory.high`, `io.max` — after threading the workload's namespace/app/ordinal into the fault. The pre-limit value is saved and restored on clear or expiry. They need cgroups, so they work on Linux and return a clear "requires Linux cgroups" error elsewhere.
-- **Node drain and node kill** are cluster-level operations, not node-local faults, so the agent rejects them honestly (a 4xx with a clear reason) rather than recording a success that changes nothing. The real effect belongs with the scheduler and self-healing machinery.
-- **Delay, drop, bandwidth** need the eBPF data path from Chapter 3. Without the `ebpf` feature loaded, the API now *rejects* these with "requires the eBPF data path, which is not loaded on this node" instead of recording a fault it can't enforce. A 400, not a fake 200.
+- **Node drain and node kill** are authenticated cluster-level operations with
+  separate scheduler and transport effects. They never borrow a workload
+  fault's implementation.
+- **Drop and service partition** need the eBPF data path from Chapter 3.
+  Without it, the API rejects them. **Delay and bandwidth** need packet-time TC
+  control and are rejected even when the connect hook is loaded. A 400, not a
+  fake 200.
 - **DNS NXDOMAIN** acts in the userspace `.internal` responder (see above), so it needs no eBPF — it takes effect wherever the responder runs, and reverses on clear or expiry by republishing the faulted-service set.
-- **Partition** populates the real transport blocklists.
+- **Council partition** populates the real gossip/Raft transport blocklists.
+- **Service partition** populates source-cgroup/VIP/port keys in
+  `fault_connect_map`.
 
-That last one is worth dwelling on, because it turns out you don't need eBPF to partition a cluster honestly. The gossip transport (Chapter 2) and the Raft network (also Chapter 2) each consult a shared blocklist before sending or accepting a datagram: if the peer's address is in the set, the packet is dropped. The set is normally empty. A partition fault resolves the target peer names to their gossip addresses and inserts them into both blocklists; healing clears them. Because the check sits on both the send and receive paths, cutting one node off from two peers is symmetric — the isolated node stops answering SWIM probes, its peers stop hearing from it, and within the failure-detection window they mark it Dead. Heal, and it rejoins. The `partition_isolates_a_node_for_real` integration test drives exactly this through the HTTP API on a three-node cluster: no kernel, no eBPF, a genuine network partition.
+That distinction is worth dwelling on. You don't need eBPF to partition the
+cluster control plane honestly. Gossip and Raft each consult a transport
+blocklist; the council operation resolves peer names and inserts their
+addresses there. But that says nothing about whether one workload can reach
+another service VIP. The latter is a cgroup connect-map rule. Giving the two
+operations distinct enum variants means the compiler, the quorum rail and the
+cleanup code can no longer quietly treat them as the same fault.
 
 ### The safety context is real too
 
@@ -352,7 +390,14 @@ The safety context had the subtlest gap. It was built "every time a fault arrive
 
 Last, a partial failure. A resource fault writes a cgroup limit to each replica in turn; if the third write failed, the caller dropped the fault from the registry — discarding the reversal state for the two replicas already throttled, which stayed throttled forever. The apply loop now rolls back the replicas it already changed before returning the error, so a fault that can't be applied to all of its targets is applied to none of them.
 
-One gap we've left deliberately, with its edges marked. The service-to-service `Partition` fault (`relish fault partition web --from api`) is an eBPF connect-map entry, like delay and drop — and on a node without the data path its apply arm is still an accepted no-op rather than an honest rejection. The reason is a test: the quorum-rail acceptance suite injects a `Partition` precisely to exercise the safety context on a cluster built without eBPF, and tightening the arm to reject would break that path. Folding `Partition` in with the other eBPF faults, and moving that test onto an eBPF-loaded node, is a Phase 15 job — flagged in the code so it isn't mistaken for finished.
+Phase 15 closed one gap we had left deliberately. A service-to-service
+`Partition` fault
+(`relish fault partition web --from api --acknowledge`) now refuses unless Bun
+has loaded the eBPF connect path. Bun resolves the source app's live cgroup ids
+itself, writes one exact source/VIP/port key per cgroup, owns those keys for
+reversal and rolls back a partial write. The old quorum test moved onto the
+separate `CouncilPartition` transport operation, so an eBPF-free cluster no
+longer needs a pretend service partition to test Raft safety.
 
 ## Process workloads
 
@@ -630,7 +675,14 @@ No prefix means the build can push anywhere — fine for shared infrastructure i
 
 Every chapter is supposed to end with what was tricky, what clicked, and what we'd do differently. This chapter had more of those moments than most.
 
-**Safety rails must be non-overridable.** We initially considered making all four rails overridable with `--force`. Then we thought about what happens when someone runs `relish fault kill web --count 0 --force` at 3am and takes down every replica of the payments service. Quorum protection and replica minimum are now hard limits. No flag, no escape hatch, no "but I really need to". If you want to test total failure, use the in-memory test harness where there's nothing real to break.
+**Safety rails must be non-overridable.** We initially considered making all
+four rails overridable with `--force`. Then we thought about what happens when
+someone runs
+`relish fault kill web --count 0 --override-safety --acknowledge` at 3am and
+takes down every replica of the payments service. Quorum protection and
+replica minimum are now hard limits. No flag, no escape hatch, no "but I
+really need to". If you want to test total failure, use the in-memory test
+harness where there's nothing real to break.
 
 **`#[repr(C)]` alignment is invisible until it isn't.** We wrote the BPF map structs, ran the size assertions, and three of them failed. The issue: a `u8` field followed by a `u64` field gets 7 bytes of implicit padding that the C compiler inserts for alignment. The Rust compiler does the same thing with `#[repr(C)]`, but if you don't add explicit `_pad` fields, the size assertion catches the mismatch. We reorganised the structs to pack small fields together (action + probability as two adjacent `u8`s, followed by `_pad: [u8; 6]`, then the `u64`s). The size assertion pattern — test it on every platform, catch it before any BPF code runs — saved us from a class of bugs that would have been hellish to debug at runtime.
 

@@ -4,6 +4,13 @@ Design document for the Smoker subsystem of Reliaburger. Smoker provides built-i
 
 Sourced from whitepaper section 18 (Fault Injection).
 
+> **Implementation status (29 July 2026).** Drop and directional service
+> partition faults run in the loaded cgroup `connect4` hook. DNS NXDOMAIN runs
+> in the userspace resolver. Delay and bandwidth remain design work: no TC
+> packet program is attached, so Bun rejects both instead of recording a fault
+> that can't affect traffic. The pseudocode below describes the intended TC
+> implementation where it says so; it is not evidence that the code ships.
+
 ---
 
 ## 1. Overview
@@ -23,24 +30,25 @@ Fault injection is exposed through the `relish fault` CLI subcommand. Every faul
 
 ```bash
 # Network faults
-relish fault delay redis 200ms
-relish fault drop api 10%
-relish fault partition web --from payment-service
-relish fault dns redis nxdomain
-relish fault bandwidth api 1mbps
+relish fault delay redis 200ms --acknowledge              # reserved: rejected until TC ships
+relish fault drop api 10% --acknowledge
+relish fault partition web --from payment-service --acknowledge
+relish fault dns redis nxdomain --acknowledge
+relish fault bandwidth api 1mbps --acknowledge            # reserved: rejected until TC ships
 
 # Resource faults
-relish fault cpu inference 50%
-relish fault memory redis 90%
-relish fault disk-io web 10mbps
+relish fault cpu inference 50% --acknowledge
+relish fault memory redis 90% --acknowledge
+relish fault disk-io web 10mbps --acknowledge
 
 # Process faults
-relish fault kill web-3
-relish fault pause payment-service
+relish fault kill web-3 --acknowledge
+relish fault pause payment-service --acknowledge
 
 # Node-level faults
-relish fault node-drain node-05
-relish fault node-kill node-05
+relish fault node-drain node-05 --acknowledge
+relish fault node-kill node-05 --acknowledge
+relish fault node-pressure node-05 --cpu 80% --memory 90% --acknowledge
 
 # Management
 relish fault list
@@ -51,11 +59,11 @@ relish fault clear redis
 Every fault accepts common options:
 
 ```bash
-relish fault delay redis 200ms \
+relish fault drop redis 10% \
   --duration 5m \
   --instance redis-1 \
   --node node-03 \
-  --jitter 50ms
+  --acknowledge
 ```
 
 If `--duration` is omitted, the fault defaults to 10 minutes and prints a warning. Faults never persist across Bun restarts.
@@ -68,9 +76,16 @@ Smoker is not a standalone subsystem. It extends three existing components:
 
 ### 2.1 Onion (eBPF Service Mesh)
 
-Smoker's network faults are implemented by extending the same eBPF programs that Onion uses for service discovery. The DNS interception hook (attached to `sock_ops` for UDP+TCP port 53) and the connect interception hook (attached to `connect4` / `sock_ops`) already intercept every relevant system call. Smoker adds fault map lookups to these existing programs -- it does not load new eBPF programs.
+The shipped network path extends Onion's cgroup `connect4` program with one
+`fault_connect_map` lookup. That implements connect-time drop and directional
+service partition. DNS does not use an eBPF DNS hook: the supervised userspace
+responder applies NXDOMAIN (see §5.1.3). Delay and bandwidth need packet-time
+control, so they require a TC program that is not loaded today.
 
-The existing Onion maps (`dns_map`, `backend_map`, `firewall_map`) are unmodified. Smoker adds three BPF maps (`fault_connect_map`, `fault_bw_map`, `fault_state_map`) that the eBPF programs check around the normal service map lookup. (The DNS fault is the exception: DNS resolution runs in userspace, so `DnsNxdomain` is applied there rather than through a BPF map — see §5.1.3.)
+The existing Onion maps (`backend_map`, `firewall_map`) are unmodified.
+`fault_connect_map` is the only fault map consumed by a loaded program.
+`fault_bw_map` and the delay/TC design below are reserved contracts, not live
+map ownership.
 
 ### 2.2 Bun (Node Agent)
 
@@ -78,6 +93,10 @@ Bun is the userspace agent that manages containers on each node. Smoker uses Bun
 
 - **BPF map writes.** Bun writes fault rules into the kernel BPF maps via the `bpf()` syscall (through libbpf-rs or aya).
 - **Cgroup control.** Resource faults (CPU stress, memory pressure, disk I/O throttle) use the same cgroup hierarchy that Bun already manages for container isolation.
+- **Node-pressure control.** Whole-node CPU/memory pressure uses a separate,
+  Bun-owned cgroup and child helper. Bun itself never joins the pressured
+  cgroup. The operator must opt in with the server's `saturate_capacity`
+  permission and zero-by-default CPU/memory ceilings.
 - **Process signals.** Process faults (SIGKILL, SIGSTOP, SIGCONT) are sent by Bun to the container's PID namespace via `kill(2)`.
 - **Fault lifecycle.** Bun tracks active faults, enforces expiry timers, and cleans up fault state on expiry, crash recovery, or explicit `relish fault clear`.
 
@@ -85,10 +104,16 @@ Bun is the userspace agent that manages containers on each node. Smoker uses Bun
 
 All fault injection requests flow through the cluster API on the leader node:
 
-- **Permission checks.** The leader validates that the requesting user has the `admin` role or an explicit `fault-injection` Permission grant.
+- **Permission checks.** Bun combines the authenticated role with a typed
+  server-owned operation grant. Workload faults use Deployer plus
+  `inject_workload_faults`; node/council faults use Admin plus
+  `alter_node_state`; node pressure uses Admin plus `saturate_capacity`.
+  Injection also needs explicit acknowledgement.
 - **Safety rail enforcement.** The leader evaluates blast radius protection rules (quorum, replica, leader guards) before approving a fault.
 - **Distribution.** The leader instructs target node(s) via the reporting tree to activate the fault.
-- **Audit logging.** Every fault injection is logged as a cluster event with full attribution (who, what, when, source IP).
+- **Audit logging.** Every successful injection and reversal is logged as a
+  structured cluster event with the authenticated credential principal,
+  action, target, type and duration. Source address is not yet an event field.
 
 ---
 
@@ -148,7 +173,7 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 +---------------------------------------------------------------+
 |  Userspace (Bun agent)                                        |
 |                                                               |
-|  relish fault delay redis 200ms                               |
+|  relish fault delay redis 200ms --acknowledge                 |
 |    -> API call to leader                                      |
 |    -> leader validates (permissions, safety rails)            |
 |    -> leader instructs target node(s) via reporting tree      |
@@ -178,7 +203,7 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 ### 3.3 Request Flow
 
 ```
-relish fault delay redis 200ms --duration 5m
+relish fault delay redis 200ms --duration 5m --acknowledge
   |
   v
 Relish CLI -> Unix socket or cluster API
@@ -258,9 +283,9 @@ pub enum FaultType {
         cores: Option<u32>,
     },
 
-    /// Push memory usage toward the target's memory limit.
-    /// If `oom` is true, trigger an immediate OOM kill.
-    /// Otherwise `percentage` specifies how full to push memory (0-100).
+    /// Squeeze the workload's memory.high toward memory.max.
+    /// `oom` is a compatibility flag which Bun rejects because an OOM kill is
+    /// not reversible; use Kill to exercise restart after abrupt termination.
     MemoryPressure {
         percentage: u8,
         oom: bool,
@@ -543,11 +568,22 @@ pub struct BpfFaultStateValue {
 
 ### 5.1 Network Faults
 
-Network faults are implemented in eBPF. Each fault type extends the existing Onion interception hooks with a fault map lookup.
+Drop and service partition are implemented at connect time. DNS NXDOMAIN is
+implemented in userspace. Delay and bandwidth are deliberately unavailable
+until Reliaburger owns a TC packet hook and can prove effect and cleanup.
 
 #### 5.1.1 Delay (via sock_ops TCP_BPF_DELACK)
 
-The eBPF program attached to the `connect4` hook cannot sleep -- eBPF programs must be non-blocking. Delay is therefore implemented using a `sock_ops` program that intercepts the TCP state machine. When a SYN-ACK is received (connection established), the program checks the fault map. If a delay is configured, it sets the socket's `TCP_BPF_DELACK` timer to defer the application-visible connection completion by the specified duration.
+> **Status: unimplemented.** The loaded `connect4` hook cannot sleep and no
+> `sock_ops`, `sk_msg` or TC delay program is attached. `relish fault delay`
+> still parses the intended contract, but Bun rejects activation. The sketch
+> below is retained as design work only; a production implementation should
+> prefer a TC/netem-style packet path and must prove TCP and UDP semantics,
+> jitter, expiry, detach and concurrent ownership.
+
+The original design proposed a `sock_ops` program that intercepts the TCP state
+machine after the connect hook. If a delay is configured, it would defer
+traffic by the specified duration.
 
 From the application's perspective, `connect()` takes 200ms longer than usual. For HTTP-level delays on established connections, the `sk_msg` program can hold data in a BPF ring buffer before releasing it to the socket.
 
@@ -744,7 +780,20 @@ normal_resolution:
 
 #### 5.1.4 Partition (via source cgroup check)
 
-A partition between service A and service B is implemented as a directional rule in `fault_connect_map`. The key includes a source cgroup ID (identifying the calling app) and a destination virtual IP. Bidirectional partitions require two rules.
+A partition between service A and service B is implemented as a directional
+rule in `fault_connect_map`. Bun ignores client authority over cgroup ids: it
+resolves every running instance of `--from` to the cgroup-v2 inode id observed
+by `bpf_get_current_cgroup_id()`, then installs one
+source-cgroup/destination-VIP/port key per instance. It rolls back a partial
+multi-key write and records the exact keys so clear, expiry and shutdown delete
+what that fault owns. Omitting `--from` installs the explicit wildcard key.
+Bidirectional partitions require two rules.
+
+This service-data-plane operation is separate from
+`relish chaos council-partition`, which blocks gossip and Raft transports and
+therefore consumes the quorum safety budget. Conflating the two used to make a
+service partition look like a node failure while allowing the service operation
+to report success without eBPF.
 
 ```c
 // eBPF pseudocode: partition fault in connect4 program
@@ -778,10 +827,9 @@ int smoker_partition_connect4(struct bpf_sock_addr *ctx) {
         return CGROUP_SOCK_ADDR_ALLOW;
 
     if (val->action == FAULT_ACTION_PARTITION) {
-        // Return ENETUNREACH -- application sees a network
-        // unreachable error, as if the destination network
-        // has been physically partitioned.
-        return CGROUP_SOCK_ADDR_REJECT_UNREACH;  // maps to -ENETUNREACH
+        // A cgroup socket-address hook denies by returning zero. Linux exposes
+        // that to connect(2) as EPERM; no packet reaches the backend.
+        return 0;
     }
 
     // Handle other fault types (drop, delay) as shown above
@@ -793,7 +841,17 @@ int smoker_partition_connect4(struct bpf_sock_addr *ctx) {
 
 #### 5.1.5 Bandwidth Throttle (via tc eBPF + token bucket)
 
-Bandwidth throttling is implemented using a `tc` (traffic control) eBPF program attached to the container's network interface, combined with a token bucket rate limiter stored in `fault_bw_map`. Packets exceeding the configured rate are queued in a BPF ring buffer and released at the throttled rate. This operates at the packet level, giving accurate bandwidth shaping.
+> **Status: unimplemented.** No TC classifier, qdisc or bandwidth map is
+> attached to workload interfaces. The cgroup connect hook sees connection
+> setup, not packet flow, so it cannot enforce a byte rate. Bun rejects
+> `relish fault bandwidth` instead of swallowing a `MapNotFound` error.
+
+The intended implementation uses a `tc` (traffic control) eBPF program attached
+to the workload interface, combined with a token bucket or a kernel qdisc.
+This sketch is a starting point, not shipped behaviour. In particular, merely
+dropping packets above a token rate is loss injection rather than faithful
+bandwidth shaping; production work should use pacing and document burst
+semantics.
 
 ```c
 // eBPF pseudocode: bandwidth throttle in tc program
@@ -898,68 +956,18 @@ fn cpu_burn_loop(target_percent: u8, cores: Option<u32>) {
 }
 ```
 
-#### 5.2.2 Memory Pressure via mlock
+#### 5.2.2 Memory Pressure via `memory.high`
 
-Bun spawns a process inside the target container's memory cgroup that allocates and `mlock()`s pages, pushing the container toward its memory limit. At 90%, the application has only 10% of its memory headroom remaining. This triggers the same kernel memory pressure signals (PSI, `memory.high` events) as real contention.
+Bun reads the target workload's hard `memory.max` and saves its current
+`memory.high`. A 90% fault writes 90% of the hard limit to `memory.high`, so the
+kernel forces reclaim and allocation stalls as the workload crosses that soft
+boundary. Clear and expiry restore the exact saved value. A cgroup with no hard
+limit is refused because there is no meaningful percentage to calculate.
 
-```rust
-/// Allocate and mlock memory inside the target cgroup to create pressure.
-/// `target_percent` is 0-100 (percentage of cgroup memory limit to consume).
-/// `oom` if true, allocate beyond limit to trigger OOM kill.
-fn memory_pressure(
-    cgroup_memory_limit: u64,
-    target_percent: u8,
-    oom: bool,
-) {
-    let target_bytes = if oom {
-        // Allocate more than the limit to trigger OOM
-        cgroup_memory_limit + (64 * 1024 * 1024)  // limit + 64MB
-    } else {
-        // Calculate current usage, then allocate the difference
-        let current_usage = read_cgroup_memory_current();
-        let target_usage = (cgroup_memory_limit * target_percent as u64) / 100;
-        if target_usage <= current_usage {
-            return;  // already at or above target
-        }
-        target_usage - current_usage
-    };
-
-    // Allocate in 4KB page chunks to avoid a single giant allocation
-    let page_size = 4096_usize;
-    let num_pages = (target_bytes as usize) / page_size;
-    let mut pages: Vec<*mut u8> = Vec::with_capacity(num_pages);
-
-    for _ in 0..num_pages {
-        let page = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                page_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if page == libc::MAP_FAILED {
-            break;  // OOM killer will handle the rest
-        }
-
-        // Touch the page to ensure it is physically allocated
-        unsafe { std::ptr::write_volatile(page as *mut u8, 0xAA) };
-
-        // mlock to prevent kernel from reclaiming it
-        unsafe { libc::mlock(page, page_size) };
-
-        pages.push(page as *mut u8);
-    }
-
-    // Hold allocations until fault is cleared or expires.
-    // The parent Bun process will kill this child to release memory.
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-```
+The `oom` spelling remains in the compatibility wire type, but Bun rejects it.
+Lowering `memory.max` or allocating past it kills a process and can't be
+reversed. Use a Kill fault when the hypothesis concerns restart after an abrupt
+termination.
 
 #### 5.2.3 Disk I/O Throttle via blkio cgroup
 
@@ -1042,7 +1050,9 @@ fn process_fault(
 }
 ```
 
-For `relish fault kill web --count 2`, Bun selects `count` instances randomly from all healthy instances of the service and sends SIGKILL to each.
+For `relish fault kill web --count 2 --acknowledge`, Bun selects `count`
+instances randomly from all healthy instances of the service and sends SIGKILL
+to each.
 
 ### 5.4 Node-Level Faults
 
@@ -1140,11 +1150,10 @@ For multi-step fault injection (chaos game days, automated resilience tests, CI 
 name = "Payment cascade failure"
 
 [[step]]
-description = "Database latency spike"
-fault = "delay"
+description = "Database CPU contention"
+fault = "cpu"
 target = "pg"
-value = "500ms"
-jitter = "200ms"
+value = "50%"
 duration = "2m"
 
 [[step]]
@@ -1163,12 +1172,6 @@ value = "95%"
 start_after = "4m"
 duration = "2m"
 
-[[step]]
-description = "Payment service OOM"
-fault = "memory"
-target = "payment-service"
-value = "oom"
-start_after = "6m"
 ```
 
 Scenario execution:
@@ -1426,27 +1429,54 @@ if (val->probability > 100 || val->action > FAULT_ACTION_MAX) {
 
 ### 8.1 Permission Model
 
-Fault injection requires the `admin` role or an explicit `fault-injection` Permission grant. The default `deployer` role cannot inject faults. All fault injections are logged as events with full attribution:
+Workload fault injection requires two independent server-side decisions: the
+credential has at least the `deployer` role, and `[testing].allowed_operations`
+contains `inject_workload_faults`. The request must also carry explicit
+acknowledgement. An Admin role doesn't override a missing operation grant.
+Council/node faults instead require Admin plus `alter_node_state`; node
+pressure requires Admin plus `saturate_capacity`.
 
-```
-Event: fault.injected
-  who:    alice@myorg
-  what:   delay redis 200ms --duration 5m
-  when:   2026-02-16T14:32:00Z
-  from:   10.0.1.42
-  node:   node-03
+Every successful injection and reversal records a structured event:
+
+```json
+{
+  "kind": "fault",
+  "severity": "warning",
+  "action": "fault.injected",
+  "principal": "token:4f5c…",
+  "app": "redis",
+  "node": "node-03",
+  "details": {
+    "fault_id": "7",
+    "fault_type": "DnsNxdomain",
+    "duration_seconds": "300"
+  }
+}
 ```
 
 Permission evaluation flow:
 
 ```
-relish fault delay redis 200ms
-  -> Relish CLI sends request with user identity (from auth token)
+relish fault dns redis nxdomain --acknowledge
+  -> Relish sends its bearer token; the request body carries no audit identity
   -> Leader receives request
-  -> Leader checks: does user have 'admin' role OR 'fault-injection' permission?
+  -> Bun authenticates the token and derives the stable credential principal
+  -> Bun checks: role >= Deployer, operation grant, protected-cluster policy,
+     and explicit acknowledgement
   -> If no: reject with 403 Forbidden
   -> If yes: proceed to safety rail evaluation
 ```
+
+Reversal is de-escalating. It still requires the role and operation which owns
+that class of fault, but it deliberately doesn't require destructive
+acknowledgement or `allow_protected_mutation`. Removing an active fault must
+remain possible after policy is tightened. The deprecated `/v1/chaos` council
+route applies the same Admin/operation boundary and cannot bypass this model.
+
+`FaultSummary.injected_by` is a human-readable authenticated token name for
+compatibility. It is not the audit key. The event's `principal` is the stable
+authenticated credential id, and Bun never accepts either value from `$USER`
+or a client-supplied JSON field.
 
 ### 8.2 Blast Radius Protection
 
@@ -1471,7 +1501,8 @@ Fault rules exist only in BPF maps (kernel memory) and Bun's in-process state. T
 `relish fault clear` is designed to always work, even if the cluster API is degraded. It is processed locally by the Bun agent via a Unix socket. This socket:
 
 - Is **not** mounted into any workload's namespace. Containers cannot invoke it.
-- Is only accessible from the host filesystem or via the cluster API (which requires `admin` or `fault-injection` permission).
+- Is only accessible from the host filesystem or via the cluster API (which
+  enforces the same role plus typed operation grant).
 - Uses standard Unix file permissions (owned by root, mode 0600 or group-readable for the Bun group).
 
 This ensures that even during a fault injection gone wrong, an operator with host access can always clear all faults.
@@ -1482,15 +1513,18 @@ This ensures that even during a fault injection gone wrong, an operator with hos
 
 ### 9.1 Zero Overhead When Inactive
 
-When no faults are active, all four fault BPF maps are empty. The eBPF programs perform one additional hash lookup per interception (for each relevant map). An empty BPF hash map lookup is approximately 20-50 nanoseconds, which is negligible compared to the cost of a `connect()` syscall (~1 microsecond) or DNS resolution (~10 microseconds).
+When no connect fault is active, `fault_connect_map` is empty and the loaded
+program performs one additional hash lookup per intercepted VIP connection.
+DNS faults run in userspace; no TC bandwidth program runs.
 
-Measured overhead with empty fault maps:
+The original design used the following estimates. They are not current
+benchmark evidence and must not be quoted as measured Reliaburger performance:
 
 | Operation | Baseline (Onion only) | With Smoker maps (empty) | Overhead |
 |---|---|---|---|
 | `connect()` to VIP | ~1.2 us | ~1.25 us | ~50 ns (+4%) |
-| DNS `.internal` resolution | ~8 us | ~8.05 us | ~50 ns (<1%) |
-| TCP throughput (sustained) | 9.4 Gbps | 9.4 Gbps | unmeasurable |
+| DNS `.internal` resolution | n/a (userspace) | n/a (userspace) | not measured |
+| TCP throughput (sustained) | not measured | not measured | not measured |
 
 ### 9.2 Fault Activation Latency
 
@@ -1559,7 +1593,8 @@ Safety rails must be tested to verify they correctly prevent dangerous faults:
 - Attempt to partition a majority of council nodes. Verify rejection with QuorumRisk error.
 - Attempt to kill all replicas of a service. Verify rejection with ReplicaMinimum error.
 - Attempt to fault the leader node. Verify rejection unless `--include-leader` is present.
-- Attempt to fault >50% of nodes. Verify rejection unless `--override-safety` is present.
+- Attempt to fault >50% of nodes. Verify rejection; a client safety override
+  must not widen server policy.
 - Verify that `relish fault clear` works via Unix socket even when the cluster API is unavailable.
 
 ### 10.3 Chaos Test for Smoker Itself
@@ -1569,6 +1604,38 @@ Smoker should be tested under its own fault conditions:
 - Inject a fault, then crash and restart Bun. Verify startup cleanup removes all BPF map entries.
 - Inject a fault, then kill the leader. Verify the fault continues to operate (BPF maps are on the target node, not the leader) and that `relish fault clear` still works via the local Unix socket.
 - Inject multiple overlapping faults on the same service. Verify all are applied correctly and cleaned up independently.
+
+### 10.4 Built-in recovery catalogue
+
+The shipped `relish test --chaos` catalogue is intentionally smaller than the
+fault matrix above. It tests five recovery claims which the current primitives
+can make honestly:
+
+1. council leader failure, a different elected leader, a live canary, then
+   rejoin;
+2. worker death while three replicas are live, all three restored on
+   survivors, then rejoin;
+3. minority council isolation, a live majority canary, then exact healing;
+4. bounded whole-node CPU/memory pressure while the API and membership remain
+   observable, then exact clearing; and
+5. node death during an observed rolling deploy, a terminal non-`Unknown`
+   deployment outcome, and restored replicas.
+
+The suite runs serially. Before it creates anything, it requires three nodes,
+the digest-pinned runc/Apple workload, fresh `NodeKill` and `NodePressure`
+evidence, the three server operations `provision_isolated_workloads`,
+`alter_node_state` and `saturate_capacity`, protected-cluster permission where
+applicable, and explicit operator consent. A missing destructive prerequisite
+refuses the suite rather than skipping a scenario. ProcessGrill remains a
+separate profile; fixed host ports can't prove three replicas reschedule onto
+two survivors.
+
+Each case refreshes capability evidence after entering the one-wide execution
+queue. Its shared `ChaosGuard` records the exact target-local fault id, owning
+node and direct API client. Runner teardown reverses those ids newest first
+after pass, failure, timeout or panic, then releases the workload lease.
+Cleanup failure remains recorded for retry and produces `Unknown`. The
+catalogue never uses blanket clear or heal as a substitute for ownership.
 
 ---
 
@@ -1634,7 +1701,11 @@ Netflix pioneered chaos engineering with [Chaos Monkey](https://netflix.github.i
 - **Built-in, not bolted-on.** Smoker is part of the orchestrator binary. No CRDs, no operators, no DaemonSets, no sidecars. Fault injection is a natural extension of the eBPF programs and cgroup controls already in use.
 - **Automatic safety rails.** Quorum protection, replica minimums, and leader guarding are enforced by default. Other systems require manual annotation or configuration to prevent dangerous faults.
 - **No persistence.** BPF maps and in-process state only. No CRDs to orphan, no iptables rules to leak, no config files to corrupt. A restart always produces a clean state.
-- **Imperative CLI, not declarative CRDs.** `relish fault delay redis 200ms` is simpler than writing a YAML manifest, applying it, waiting for reconciliation, and then deleting it to clean up. For repeatable tests, TOML scenario files provide declarative scripting without the reconciliation complexity.
+- **Imperative CLI, not declarative CRDs.**
+  `relish fault delay redis 200ms --acknowledge` is simpler than writing a YAML
+  manifest, applying it, waiting for reconciliation, and then deleting it to
+  clean up. For repeatable tests, TOML scenario files provide declarative
+  scripting without the reconciliation complexity.
 
 ---
 

@@ -26,7 +26,7 @@ fn event(start: Instant, phase: &str, message: &str) {
 }
 
 /// Run the council partition scenario against a live cluster.
-pub async fn council_partition(client: &BunClient) -> Result<(), RelishError> {
+pub async fn council_partition(client: &BunClient, acknowledged: bool) -> Result<(), RelishError> {
     println!();
     println!("\x1b[1mCHAOS  Council Partition\x1b[0m");
     println!("{}", "─".repeat(55));
@@ -110,7 +110,7 @@ pub async fn council_partition(client: &BunClient) -> Result<(), RelishError> {
     // For now, inject via the provided client (assumes it can reach the target).
     // TODO: support --agent per-node targeting
     client
-        .inject_partition(&peers_to_block, duration_secs)
+        .inject_partition(&peers_to_block, duration_secs, acknowledged)
         .await?;
 
     // Poll and observe
@@ -162,7 +162,7 @@ pub async fn council_partition(client: &BunClient) -> Result<(), RelishError> {
 }
 
 /// Run the worker isolation scenario against a live cluster.
-pub async fn worker_isolation(client: &BunClient) -> Result<(), RelishError> {
+pub async fn worker_isolation(client: &BunClient, acknowledged: bool) -> Result<(), RelishError> {
     println!();
     println!("\x1b[1mCHAOS  Worker Isolation\x1b[0m");
     println!("{}", "─".repeat(55));
@@ -206,7 +206,7 @@ pub async fn worker_isolation(client: &BunClient) -> Result<(), RelishError> {
     );
 
     client
-        .inject_partition(&peers_to_block, duration_secs)
+        .inject_partition(&peers_to_block, duration_secs, acknowledged)
         .await?;
 
     // Observe — poll for stale detection

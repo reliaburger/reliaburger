@@ -391,6 +391,14 @@ impl NodeConfig {
             });
         }
 
+        self.testing
+            .validate()
+            .map_err(|error| ConfigError::Validation {
+                field: "testing".to_string(),
+                context: "node config".to_string(),
+                reason: error.to_string(),
+            })?;
+
         // Service discovery needs the eBPF data path. A VIP the DNS
         // responder hands out only routes because the eBPF connect hook
         // rewrites it to a live backend. With `[dns] enabled` but `[ebpf]`

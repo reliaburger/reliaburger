@@ -82,6 +82,16 @@ before pull. Quietly pointing it at the shared writable tree would turn a
 missing capability into cross-workload filesystem access, which is worse than
 an honest refusal.
 
+Rootless networking is userspace state, not a durable nftables map. Grill
+starts one `slirp4netns` process against the container init PID and owns its API
+socket and optional host forward. Schema-v2 instance records persist those
+recreation parameters plus a PID/start-time fingerprint. During adoption Grill
+reclaims a matching live owner, or replaces a missing owner and reapplies the
+forward before returning success. It never signals a PID whose start time no
+longer matches. Rootless cgroup limits remain an admission-time refusal: Bun
+doesn't create a delegated user scope, so the OCI rewrite removes the rootful
+cgroup path rather than fabricating a path runc cannot write.
+
 ---
 
 ## 2. Dependencies
@@ -731,10 +741,11 @@ pub struct MetricsConfig {
 
 #[derive(Debug, Clone)]
 pub struct IngressConfig {
-    pub enabled: bool,                    // default: true
+    pub enabled: bool,                    // default: false
     pub http_port: u16,                   // default: 80
     pub https_port: u16,                  // default: 443
-    pub tls_acme_email: Option<String>,
+    pub tls_cert: Option<PathBuf>,         // operator-supplied PEM chain
+    pub tls_key: Option<PathBuf>,          // operator-supplied PEM key
 }
 
 #[derive(Debug, Clone)]
@@ -814,10 +825,96 @@ pub struct UpgradeConfig {
 - `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
 - `EventStream` -- real-time events (starts, stops, health changes, OOMs)
 - `SchedulingDirective` -- from parent to Bun: start/stop/update workloads
+- `NodeReadinessReport` -- an additive, independently expiring lease carrying
+  the live `Starting`, `Ready`, `Degraded` or `Stopped` state of every critical
+  long-lived subsystem, with transition and last-error times
 
 **Bun <-> eBPF kernel maps:** Direct memory-mapped access via `libbpf` file descriptors. Map updates are atomic `bpf_map_update_elem()` calls. No serialisation protocol -- the map keys and values are C-compatible structs (`#[repr(C)]`).
 
 **Bun <-> nftables:** Netlink socket via the `nft` library or direct `nftnl` bindings. Rules are expressed as nftables objects and committed atomically.
+
+### 4.7 Liveness, Readiness and Task Ownership
+
+`GET /v1/health` answers one narrow question: is the HTTP process alive? It is
+public because upgrade supervisors and local process managers need a cheap
+liveness probe. It does not claim that Bun can schedule safely.
+
+`GET /v1/readiness`, `GET /v1/capabilities` and
+`GET /v1/capabilities/cluster` require an authenticated caller. The first
+returns 200 only when every registered critical owner is `Ready`; it returns
+503 with the complete state evidence otherwise. The local capability endpoint
+combines that decision with live DNS, egress and registry state, build/runtime
+fingerprints, topology and server-owned test policy. Every capability is
+`available`, `unavailable` or `unknown`, and the snapshot expires after 15
+seconds. Merely wiring a metrics, logs or events store produces `unknown`
+freshness, not a green claim.
+
+The cluster endpoint calls the local endpoint concurrently on every current
+member with one five-second deadline. Peer calls use the cluster HTTP client
+(mTLS when configured) and internal service token. A missing token refuses the
+call rather than retrying anonymously. The collector checks the schema,
+expected node identity, expiry and a 1 MiB response bound, then retains failed
+or timed-out peers as explicit `unknown` results.
+
+Readiness and local capability inputs are direct reads from a process-wide
+evidence tracker, so a dead agent command loop cannot make the endpoint hang or
+fabricate a healthy answer.
+
+The reporting worker sends readiness in its own extension frame. The leader
+leases it by aggregator receive time and leadership epoch, independently of
+ordinary state, DNS and egress frames. A missing or stale readiness lease makes
+the scheduler mark the node unready. One healthy heartbeat cannot keep another
+dead subsystem looking alive.
+
+Task ownership decides restart policy. Unique socket listeners and one-consumer
+channels are non-reconstructible owners: Bun records an unexpected exit as
+`Degraded` and never starts a second claimant. A task may restart only when a
+factory can recreate everything it owns. That path has an explicit retry count,
+recovery deadline, delay and shutdown deadline. The security-state/CRL refresh
+loop uses it; the agent, API, registry, DNS, ingress, gossip, Raft and reporting
+owners do not.
+
+### 4.8 Phase 15 resource leases
+
+Phase 15-created apps live under a server-owned lease, not the lifetime of a
+Relish process. `POST /v1/test/leases` creates a random 128-bit lease id and a
+dedicated `rbtest-*` namespace. `POST /v1/test/leases/{id}/renew` extends an
+active lease and `DELETE /v1/test/leases/{id}` starts cleanup. The owner may
+read, renew and release it; an Admin may inspect or release it. Creation and
+renewal also require the server's `provision_isolated_workloads` permission.
+The cluster safety class and protected-cluster gate still apply.
+
+The server accepts at most 64 live lease records, at most 128 resources per
+lease, and a lifetime from one second up to the configured maximum (which has
+an absolute 86,400-second ceiling). An ordinary apply may never use an
+`rbtest-*` namespace. A leased apply carries
+`X-Reliaburger-Test-Lease: <id>` and may contain apps plus the lease's matching
+namespace quota declaration. Bun fills an omitted app namespace with the
+lease's namespace and rejects a different one.
+
+Standalone Bun writes `test-leases.json` under `[storage].data`, flushes it
+before asking the agent to deploy, and retains a `cleaning` record until the
+agent confirms every app stopped. A per-lease operation guard also prevents
+expiry cleanup overtaking a deploy which the agent accepted but hasn't
+finished; unrelated leases still proceed concurrently. Cluster Bun stores
+leases in `DesiredState`; one Raft entry adds both the app spec and its
+ownership, so a client cannot die between those actions. Lease mutations sent
+to a follower reach the leader with the original user's bearer/cookie
+credentials. The leader repeats normal authentication and policy checks. It
+never substitutes the internal service principal.
+
+A one-second reaper resumes expired or interrupted cleanup. Every agent or
+consensus step has a ten-second bound. Failure leaves the record in `cleaning`
+with its resource list and bounded last error intact; restart and leadership
+transfer therefore retry instead of forgetting ownership. Standalone release confirms the runtime stop.
+Cluster release removes apps and their owned namespace declaration from
+replicated desired state, after which ordinary reconciliation removes any
+remaining runtime instance. The runner separately polls every node for runtime
+absence before it calls cleanup confirmed.
+
+Version one owns apps and their namespace quota declaration. Jobs, faults,
+credentials, images, mounts and node state need their own resource variants
+before their Phase 15 cases can use this contract.
 
 ---
 
@@ -1123,6 +1220,7 @@ All configuration is in `/etc/reliaburger/node.toml`. Every field has a default;
 
 ```toml
 [cluster]
+name = "default"
 join = ["10.0.1.5:9443"]
 ```
 
@@ -1132,6 +1230,7 @@ join = ["10.0.1.5:9443"]
 |---------|-----|---------|--------------------|-------------|
 | `[node]` | `name` | hostname | string | Human-readable node name. Must be unique in the cluster. |
 | `[node.labels]` | (any key) | (none) | string key-value pairs | Arbitrary labels for placement constraints. `zone`, `rack`, `storage`, `role` are common. |
+| `[cluster]` | `name` | `default` | DNS-style name | Stable cluster identity and SPIFFE trust domain. Must match on every node. |
 | `[cluster]` | `join` | `[]` | list of `"host:port"` strings | Addresses of existing cluster members. Empty for first node. |
 | `[storage]` | `data` | `/var/lib/reliaburger/data` | absolute path | Raft log, scheduling state. Small, critical. |
 | `[storage]` | `images` | `/var/lib/reliaburger/images` | absolute path | OCI image layers (Pickle). Large, read-heavy. |
@@ -1158,15 +1257,21 @@ join = ["10.0.1.5:9443"]
 | `[metrics]` | `retention_1m` | `"7d"` | duration, 1d-365d | Retention for 1-minute downsampled metrics. |
 | `[metrics]` | `retention_1h` | `"90d"` | duration, 7d-3650d | Retention for 1-hour downsampled metrics. |
 | `[metrics]` | `max_storage` | `"5Gi"` | resource string (bytes) | Maximum disk space for metrics. |
-| `[ingress]` | `enabled` | `true` | bool | Whether this node serves external ingress traffic. |
+| `[ingress]` | `enabled` | `false` | bool | Whether this node serves external ingress traffic. |
 | `[ingress]` | `http_port` | `80` | 1-65535 | HTTP listen port for Wrapper. |
 | `[ingress]` | `https_port` | `443` | 1-65535 | HTTPS listen port for Wrapper. |
-| `[ingress]` | `tls_acme_email` | (none) | email string | ACME account email for Let's Encrypt certificates. |
+| `[ingress]` | `tls_cert` | (none) | path | Operator-supplied TLS certificate chain. Set with `tls_key`. |
+| `[ingress]` | `tls_key` | (none) | path | Operator-supplied TLS private key. Set with `tls_cert`. |
 | `[process_workloads]` | `allowed_binaries` | `[]` | list of absolute path strings | Binaries permitted to run as process workloads. Empty = disabled. |
+| `[testing]` | `safety_class` | `"unknown"` | `unknown`, `development`, `staging`, `production` | Typed safety boundary for Phase 15 operations. Unknown is protected. |
+| `[testing]` | `allowed_operations` | `[]` | list of operation names | Server-owned permissions for diagnostics, isolated workloads, faults, node changes, capacity saturation and external probes. |
+| `[testing]` | `allow_protected_mutation` | `false` | bool | Additional server-side gate for mutation on unknown/production clusters. A client flag cannot change it. |
+| `[testing]` | `max_lease_seconds` | `3600` | positive integer seconds | Maximum lifetime of a server-owned test resource lease. |
 | `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
 | `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
 | `[upgrades]` | `release_url` | `"https://releases.reliaburger.dev/metadata.json"` | URL | Release metadata endpoint for version checks. |
+| `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish trace` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
 
 ---
 
@@ -1288,7 +1393,7 @@ join = ["10.0.1.5:9443"]
 | **Secret decryption in Bun's memory** | Bun process memory contains plaintext secrets | Secrets are decrypted in memory only, never written to disk. `mlock()` the decryption buffer to prevent swapping. Zero the buffer after injection. |
 | **eBPF programs run in kernel space** | A malicious eBPF program could compromise the kernel | eBPF programs are compiled into the Bun binary (not loaded from external files). The kernel's BPF verifier rejects unsafe programs. |
 | **containerd socket access** | Access to the containerd socket allows arbitrary container operations | The socket is owned by root and the `reliaburger` group. Only Bun has access. It is NOT mounted into any workload's namespace. |
-| **Smoker fault injection** | Faults could disrupt production | `admin` or `fault-injection` role required. Duration limits. No persistence across restarts. Blast radius protection (quorum, replica guards). |
+| **Smoker fault injection** | Faults could disrupt production | Workload faults require Deployer plus the server's `inject_workload_faults` grant and acknowledgement; node/council and pressure faults require Admin plus their matching server grants. Duration limits, no persistence across restarts and blast-radius guards still apply. |
 | **`node.toml` contains external signing key** | Compromise of `node.toml` reveals the external key | File permissions 0600, owned by root. The external key is a public-key-like verification key, not a signing private key -- it verifies signatures, it cannot create them. |
 | **Inline script execution** | Arbitrary code execution via git push | Lettuce enforces `require_signed_commits` for any config containing `script` fields. Scripts must be signed by a trusted key. |
 

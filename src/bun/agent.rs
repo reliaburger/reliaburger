@@ -46,6 +46,11 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 /// before it escalates to SIGKILL (DEP6).
 const STOP_GRACE_SECS: u64 = 10;
 
+/// A trace starts processes inside a workload and may remain in flight for two
+/// eight-second probe bounds. Refuse excess work instead of building an
+/// unbounded queue of authenticated diagnostic tasks.
+const MAX_CONCURRENT_TRACES: usize = 8;
+
 /// Build a shared drain tracker for a new agent. The completion channel's
 /// receiver is dropped because the retire path polls `wait_drained` rather
 /// than consuming the notification stream.
@@ -75,6 +80,8 @@ fn probe_host(container_ip: Option<std::net::Ipv4Addr>) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ApplyEvent {
+    /// The agent accepted the deploy and assigned its queryable operation ID.
+    Accepted { operation_id: String },
     /// Informational progress update.
     Progress { message: String },
     /// A single instance was created and started.
@@ -108,6 +115,10 @@ pub enum AgentCommand {
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
     },
+    /// Get the local desired application specs for standalone diagnostics.
+    DesiredApps {
+        response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
+    },
     /// Get status of run-to-completion workload instances.
     JobStatus {
         response: oneshot::Sender<Vec<JobStatus>>,
@@ -116,6 +127,10 @@ pub enum AgentCommand {
     /// protection: actively deployed images must not be collected).
     ActiveImages {
         response: oneshot::Sender<std::collections::HashSet<String>>,
+    },
+    /// Snapshot active and recent real deploy operations.
+    DeployOperations {
+        response: oneshot::Sender<crate::bun::deploy_operations::DeployOperationSnapshot>,
     },
     /// Get logs for an app.
     Logs {
@@ -137,6 +152,13 @@ pub enum AgentCommand {
         namespace: String,
         command: Vec<String>,
         response: oneshot::Sender<Result<String, BunError>>,
+    },
+    /// Run the fixed Phase 15 connectivity probe from a local workload.
+    Trace {
+        request: crate::onion::trace::TraceRequest,
+        internal_destination: bool,
+        source_node: String,
+        response: oneshot::Sender<Result<crate::onion::trace::TraceResult, BunError>>,
     },
     /// Get cluster node membership from the gossip layer.
     Nodes {
@@ -164,7 +186,8 @@ pub enum AgentCommand {
     InjectPartition {
         peers: Vec<String>,
         duration_secs: u64,
-        response: oneshot::Sender<Result<String, BunError>>,
+        injected_by: String,
+        response: oneshot::Sender<Result<(String, crate::smoker::types::FaultSummary), BunError>>,
     },
     /// Remove all network partitions (chaos testing).
     HealPartition {
@@ -232,6 +255,12 @@ pub enum AgentCommand {
     /// Clear a specific fault by ID.
     ClearFault {
         fault_id: u64,
+        /// Whether the authenticated API caller may reverse a workload fault.
+        allow_workload_fault: bool,
+        /// Whether the authenticated API caller may reverse node state.
+        allow_node_fault: bool,
+        /// Whether the authenticated API caller may remove node pressure.
+        allow_node_pressure: bool,
         response: oneshot::Sender<Result<String, BunError>>,
     },
     /// Clear all active faults.
@@ -1093,10 +1122,12 @@ pub struct PartitionBlocklists {
     pub raft: Option<Arc<tokio::sync::RwLock<std::collections::HashSet<std::net::SocketAddr>>>>,
     /// raft_port - gossip_port, to map a peer's gossip addr → raft addr.
     pub raft_port_offset: i32,
+    /// Shared all-transport gate used by reversible node-failure faults.
+    pub node_gate: crate::smoker::node_fault::NodeTransportGate,
 }
 
 /// Egress enforcement bound to a running instance's cgroup (L16).
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 #[derive(Clone)]
 struct EgressBinding {
     /// The instance's cgroup id (key into the egress maps).
@@ -1108,51 +1139,80 @@ struct EgressBinding {
     resolved: Vec<crate::sesame::egress::EgressDestination>,
 }
 
+/// An immutable, owned connectivity trace that can run outside the agent
+/// command loop. Workload probes have explicit timeouts, but even a bounded
+/// probe must not delay status, shutdown or another control-plane command.
+struct PreparedTrace<G> {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    shutdown: CancellationToken,
+    grill: G,
+    source_instance: InstanceId,
+    request: crate::onion::trace::TraceRequest,
+    internal_destination: bool,
+    source_node: String,
+    service: Option<crate::onion::types::ServiceEntry>,
+    destination_port: u16,
+    dns_name: String,
+    expected_vip: Option<String>,
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
     command_rx: mpsc::Receiver<AgentCommand>,
     shutdown: CancellationToken,
+    /// Process-wide long-lived-task evidence shared with the API and reporter.
+    readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    /// Hard per-node concurrency bound for workload connectivity traces.
+    trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
     cluster: Option<ClusterHandle>,
+    /// Immutable cluster identity used as every workload SPIFFE trust domain.
+    trust_domain: String,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
+    /// Reference-counted node drains, independent from binary-upgrade drains.
+    node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
+    /// Owned helper processes and cgroups for node-scoped capacity pressure.
+    node_pressure: crate::smoker::node_pressure::NodePressureController,
     /// eBPF program handle for writing fault maps (Linux + ebpf feature only).
     /// `None` on macOS or when eBPF is not loaded.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
     /// Egress enforcement state per instance with an allowlist: its cgroup
     /// id, the raw allow list, and the last-resolved destinations — so
     /// enforcement can be lifted on stop and the allowlist re-resolved as
     /// DNS changes (L16).
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
     /// Workloads fenced by the current live-enforcement incident. Kept after
     /// stop so the next capability report records what happened; cleared only
     /// after every required hook and pre-start guarantee recovers.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_affected_workloads: std::collections::BTreeSet<(String, String)>,
     /// Ticks since the last egress re-resolution (the event loop runs at 1s).
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_reresolve_ticks: u32,
     /// Kernel-truth sweep interval in seconds (`[ebpf] sweep_interval_secs`,
     /// 0 disables). The sweep deletes egress/namespace map entries whose
     /// cgroup no longer maps to a live instance and reinstalls entries a
     /// live instance lost.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     ebpf_sweep_interval_secs: u64,
     /// Ticks since the last kernel-truth sweep.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     ebpf_sweep_ticks: u64,
     /// `firewall_map` keys last written to the kernel, so the next reconcile
     /// deletes entries for departed cgroups (NET5). eBPF only.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     firewall_bpf_keys: std::collections::HashSet<crate::onion::types::FirewallKey>,
     /// `cgroup_namespace_map` keys (cgroup ids) last written, for the same
     /// reconcile-and-prune reason (NET5). eBPF only.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
@@ -1185,6 +1245,8 @@ pub struct BunAgent<G: Grill> {
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
+    /// Real apply-worker activity and bounded terminal outcomes for the API.
+    deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -1272,25 +1334,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             supervisor: WorkloadSupervisor::new(grill, port_allocator),
             command_rx,
             shutdown,
+            readiness: None,
+            trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
+            trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
-            #[cfg(feature = "ebpf")]
+            node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
+            node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_reresolve_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_interval_secs: 60,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             firewall_bpf_keys: std::collections::HashSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
@@ -1311,6 +1378,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -1336,31 +1404,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         command_rx: mpsc::Receiver<AgentCommand>,
         shutdown: CancellationToken,
         cluster: ClusterHandle,
+        trust_domain: String,
     ) -> Self {
         let (deploy_ops_tx, deploy_ops_rx) = mpsc::channel(256);
         Self {
             supervisor: WorkloadSupervisor::new(grill, port_allocator),
             command_rx,
             shutdown,
+            readiness: None,
+            trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
+            trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
-            #[cfg(feature = "ebpf")]
+            node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
+            node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_reresolve_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_interval_secs: 60,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             ebpf_sweep_ticks: 0,
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             firewall_bpf_keys: std::collections::HashSet::new(),
-            #[cfg(feature = "ebpf")]
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
@@ -1387,6 +1461,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             },
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -1427,6 +1502,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `relish logs` (which asks the runtime directly).
     pub fn set_log_sink(&mut self, log_tx: mpsc::Sender<crate::ketchup::types::LogRecord>) {
         self.log_tx = Some(log_tx);
+    }
+
+    /// Attach process-wide readiness and capability evidence.
+    pub fn set_readiness_tracker(&mut self, readiness: crate::bun::readiness::ReadinessTracker) {
+        self.readiness = Some(readiness);
     }
 
     /// Attach the cluster event store used by the TUI and events API.
@@ -1520,6 +1600,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.smoker_config = config;
     }
 
+    /// Configure the opt-in node-pressure helper and clean owned crash
+    /// leftovers. The result feeds capability evidence.
+    pub fn configure_node_pressure(
+        &mut self,
+        limits: crate::smoker::node_pressure::NodePressureLimits,
+        executable: std::path::PathBuf,
+    ) -> bool {
+        self.node_pressure.configure(limits, executable)
+    }
+
     /// Record detected platform capabilities (GPUs, rootless mode) so the
     /// supervisor refuses workloads this node can't honour (D15/M22).
     pub fn set_platform_capabilities(
@@ -1607,7 +1697,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Attach a loaded eBPF handle so the agent can write fault and
     /// egress map entries (L8). Only present with the `ebpf` feature;
     /// `bun` calls this at startup when `[ebpf] enabled`.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub async fn set_onion_ebpf(
         &mut self,
         ebpf: std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
@@ -1628,20 +1718,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Configure the kernel-truth sweep interval (`[ebpf]
     /// sweep_interval_secs`); 0 disables the sweep.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub fn set_ebpf_sweep_interval(&mut self, secs: u64) {
         self.ebpf_sweep_interval_secs = secs;
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
 
     /// Mirror an app's current service-map entry into the kernel
     /// `backend_map` so the eBPF connect hook rewrites its VIP to live
     /// backends (L8 completeness). Called after every service-map add /
     /// health change. A no-op without the eBPF data path loaded.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sync_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
@@ -1656,13 +1746,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn sync_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
 
     /// Drop an app's `backend_map` entry. Must be called *before* the app
     /// is unregistered from the service map, while its VIP/port are still
     /// known. A no-op without the eBPF data path loaded.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn remove_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
@@ -1680,7 +1770,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn remove_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
 
     /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
@@ -1692,7 +1782,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// cross-namespace `allow_from` rule. Both maps are rebuilt from scratch
     /// each call (a new instance of app A changes rules wherever A is a
     /// *source*), deleting keys no longer desired. A no-op without eBPF.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sync_firewall_ebpf(&mut self) {
         let Some(handle) = self.onion_ebpf.clone() else {
             return;
@@ -1768,7 +1858,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.firewall_bpf_keys = desired_fw_keys;
     }
 
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn sync_firewall_ebpf(&mut self) {}
 
     /// Enable on-disk instance records under `dir` ({data_dir}/instances).
@@ -1858,8 +1948,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
         let runtime = self.supervisor.grill().runtime_kind();
+        let rootless_network = self
+            .supervisor
+            .grill()
+            .rootless_network_record(instance_id)
+            .await;
         let record = crate::grill::records::InstanceRecord {
-            schema: 1,
+            schema: 2,
             instance_id: instance_id.0.clone(),
             namespace: instance.namespace.clone(),
             app_name: instance.app_name.clone(),
@@ -1879,6 +1974,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .get(&(instance.app_name.clone(), instance.namespace.clone()))
                 .cloned(),
             oci_spec,
+            rootless_network,
         };
         if let Err(e) = crate::grill::records::write_record(dir, &record) {
             eprintln!("bun: warning: failed to write instance record for {instance_id}: {e}");
@@ -2083,6 +2179,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub async fn run(&mut self) {
         let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
+        if let Some(readiness) = self.readiness.clone() {
+            let (capabilities, _) = self.live_egress_report_state().await;
+            readiness.set_capabilities(capabilities).await;
+        }
+
         loop {
             tokio::select! {
                 _ = self.shutdown.cancelled() => {
@@ -2100,6 +2201,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 _ = health_interval.tick() => {
                     self.enforce_live_egress_or_stop().await;
+                    if let Some(readiness) = self.readiness.clone() {
+                        let (capabilities, _) = self.live_egress_report_state().await;
+                        readiness.set_capabilities(capabilities).await;
+                    }
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.check_apps().await;
@@ -2127,7 +2232,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
 
         let (capabilities, enforced_instances) = self.live_egress_report_state().await;
-        #[cfg(feature = "ebpf")]
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
         let egress_affected_workloads: Vec<
             crate::reporting::types::EgressAffectedWorkload,
         > = self
@@ -2140,7 +2245,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 },
             )
             .collect();
-        #[cfg(not(feature = "ebpf"))]
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         let egress_affected_workloads = Vec::new();
 
         let instances = self.supervisor.list_instances();
@@ -2211,6 +2316,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_cpu_millicores: self.capacity_cpu_millicores,
             capacity_memory_mb: self.capacity_memory_mb,
             capabilities,
+            readiness: match &self.readiness {
+                Some(readiness) => Some(readiness.snapshot().await),
+                None => None,
+            },
             egress_degraded: !egress_affected_workloads.is_empty(),
             egress_affected_workloads,
         };
@@ -2218,7 +2327,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Read the hooks and enforcement map as kernel truth for reporting.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn live_egress_report_state(
         &self,
     ) -> (
@@ -2257,7 +2366,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// A portable build has no kernel enforcement to report.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn live_egress_report_state(
         &self,
     ) -> (
@@ -2384,7 +2493,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
+                let operation = match self.deploy_operations.start(&config).await {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        let message = format!("deploy refused: {error}");
+                        self.record_event(
+                            crate::bun::events::EventKind::Deploy,
+                            crate::bun::events::EventSeverity::Critical,
+                            None,
+                            None,
+                            message.clone(),
+                        )
+                        .await;
+                        let _ = events.send(ApplyEvent::Error { message }).await;
+                        return;
+                    }
+                };
+                let _ = events
+                    .send(ApplyEvent::Accepted {
+                        operation_id: operation.id().to_string(),
+                    })
+                    .await;
                 if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    let message =
+                        "node is draining for a binary upgrade; retry shortly".to_string();
                     self.record_event(
                         crate::bun::events::EventKind::Deploy,
                         crate::bun::events::EventSeverity::Critical,
@@ -2393,12 +2525,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         "deploy refused while node is draining".to_string(),
                     )
                     .await;
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: "node is draining for a binary upgrade; retry shortly"
-                                .to_string(),
-                        })
+                    operation
+                        .finish(
+                            crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                            message.clone(),
+                        )
                         .await;
+                    let _ = events.send(ApplyEvent::Error { message }).await;
                     return;
                 }
                 // Forward deploy events to the caller, mirroring errors into the
@@ -2408,29 +2541,54 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // through `deploy_ops_tx`.
                 let (forward_tx, mut forward_rx) = mpsc::channel(64);
                 let event_store = self.events.clone();
+                let observed_operation = operation.clone();
                 tokio::spawn(async move {
                     while let Some(event) = forward_rx.recv().await {
-                        if let ApplyEvent::Error { message } = &event
-                            && let Some(store) = &event_store
-                        {
-                            let timestamp = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            store.write().await.record(
-                                timestamp,
-                                crate::bun::events::EventKind::Deploy,
-                                crate::bun::events::EventSeverity::Critical,
-                                None,
-                                None,
-                                None,
-                                message.clone(),
-                            );
+                        match &event {
+                            ApplyEvent::Complete { created, .. } => {
+                                observed_operation
+                                    .finish(
+                                        crate::bun::deploy_operations::DeployOperationOutcome::Completed,
+                                        format!("deploy completed ({created} instances)"),
+                                    )
+                                    .await;
+                            }
+                            ApplyEvent::Error { message } => {
+                                observed_operation
+                                    .finish(
+                                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                                        message.clone(),
+                                    )
+                                    .await;
+                                if let Some(store) = &event_store {
+                                    let timestamp = SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs();
+                                    store.write().await.record(
+                                        timestamp,
+                                        crate::bun::events::EventKind::Deploy,
+                                        crate::bun::events::EventSeverity::Critical,
+                                        None,
+                                        None,
+                                        None,
+                                        message.clone(),
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
-                        if events.send(event).await.is_err() {
-                            return;
-                        }
+                        // A disconnected SSE client doesn't cancel the deploy or
+                        // its evidence. Keep draining the worker to a terminal
+                        // outcome even when this send fails.
+                        let _ = events.send(event).await;
                     }
+                    observed_operation
+                        .finish(
+                            crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
+                            "deploy worker ended without a terminal event",
+                        )
+                        .await;
                 });
                 let worker = DeployWorker {
                     grill: self.supervisor.grill().clone(),
@@ -2438,6 +2596,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     ops: DeployOps {
                         tx: self.deploy_ops_tx.clone(),
                     },
+                    operation: Some(operation),
                 };
                 tokio::spawn(async move {
                     worker.run_deploy(config, forward_tx).await;
@@ -2455,6 +2614,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let statuses = self.get_status().await;
                 let _ = response.send(statuses);
             }
+            AgentCommand::DesiredApps { response } => {
+                let mut apps = self
+                    .deployed_specs
+                    .iter()
+                    .map(
+                        |((app, namespace), spec)| crate::bun::diagnostics::DesiredAppEvidence {
+                            app: app.clone(),
+                            namespace: namespace.clone(),
+                            desired_replicas: crate::bun::diagnostics::desired_replica_count(
+                                spec.replicas,
+                                1,
+                            ),
+                            scheduled_replicas: self
+                                .supervisor
+                                .list_instances()
+                                .iter()
+                                .filter(|instance| {
+                                    instance.app_name == *app && instance.namespace == *namespace
+                                })
+                                .count()
+                                .try_into()
+                                .unwrap_or(u32::MAX),
+                            service_port: spec.port,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                apps.sort_by(|left, right| {
+                    (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app))
+                });
+                let _ = response.send(apps);
+            }
             AgentCommand::JobStatus { response } => {
                 let statuses = self.get_job_status();
                 let _ = response.send(statuses);
@@ -2468,6 +2658,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .filter(|image| !image.is_empty())
                     .collect();
                 let _ = response.send(images);
+            }
+            AgentCommand::DeployOperations { response } => {
+                let _ = response.send(self.deploy_operations.snapshot().await);
             }
             AgentCommand::Logs {
                 app_name,
@@ -2500,6 +2693,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self.exec_app(&app_name, &namespace, &command).await;
                 let _ = response.send(result);
             }
+            AgentCommand::Trace {
+                request,
+                internal_destination,
+                source_node,
+                response,
+            } => match self.prepare_trace(request, internal_destination, source_node) {
+                Ok(trace) => {
+                    tokio::spawn(async move {
+                        let _ = response.send(trace.run().await);
+                    });
+                }
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                }
+            },
             AgentCommand::Nodes { response } => {
                 let nodes = self.get_cluster_nodes();
                 let _ = response.send(nodes);
@@ -2520,22 +2728,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::InjectPartition {
                 peers,
                 duration_secs,
+                injected_by,
                 response,
             } => {
                 // Legacy chaos API — create a partition fault in the registry
                 let request = crate::smoker::types::FaultRequest {
-                    fault_type: crate::smoker::types::FaultType::Partition {
-                        source_app: None,
-                        source_cgroup_id: 0,
-                    },
+                    fault_type: crate::smoker::types::FaultType::CouncilPartition,
                     target_service: peers.join(","),
                     target_instance: None,
                     target_node: None,
                     duration: std::time::Duration::from_secs(duration_secs),
-                    injected_by: "relish chaos".into(),
+                    injected_by,
                     reason: Some("legacy chaos partition".into()),
                     include_leader: false,
                     override_safety: false,
+                    acknowledged: false,
                 };
                 // Safety rails apply to the legacy path too (M1): a partition
                 // that would strand quorum must be refused, not waved through
@@ -2567,7 +2774,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 );
                 let msg =
                     format!("partition injected: blocking {blocked} peer(s) for {duration_secs}s");
-                let _ = response.send(Ok(msg));
+                let summary = crate::smoker::types::FaultSummary::from(&rule);
+                let _ = response.send(Ok((msg, summary)));
             }
             AgentCommand::HealPartition { response } => {
                 // Legacy chaos API — clear all faults, reversing each so no
@@ -2683,26 +2891,66 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
             }
-            AgentCommand::ClearFault { fault_id, response } => {
-                let msg = match self
-                    .fault_registry
-                    .remove(crate::smoker::types::FaultId(fault_id))
-                {
+            AgentCommand::ClearFault {
+                fault_id,
+                allow_workload_fault,
+                allow_node_fault,
+                allow_node_pressure,
+                response,
+            } => {
+                let fault_id = crate::smoker::types::FaultId(fault_id);
+                if let Some(rule) = self.fault_registry.get(fault_id) {
+                    let denied = if rule.fault_type.is_node_operation() {
+                        (!allow_node_fault).then_some(
+                            "node fault reversal requires alter_node_state authorisation",
+                        )
+                    } else if matches!(
+                        rule.fault_type,
+                        crate::smoker::types::FaultType::NodePressure { .. }
+                    ) {
+                        (!allow_node_pressure).then_some(
+                            "node pressure reversal requires saturate_capacity authorisation",
+                        )
+                    } else {
+                        (!allow_workload_fault).then_some(
+                            "workload fault reversal requires inject_workload_faults authorisation",
+                        )
+                    };
+                    if let Some(reason) = denied {
+                        let _ = response.send(Err(BunError::FaultRejected {
+                            reason: reason.to_string(),
+                        }));
+                        return;
+                    }
+                }
+                let msg = match self.fault_registry.get(fault_id).cloned() {
                     Some(rule) => {
                         self.delete_fault_bpf_entry(&rule).await;
-                        self.reverse_fault(&rule).await;
+                        let node_pressure = matches!(
+                            &rule.fault_type,
+                            crate::smoker::types::FaultType::NodePressure { .. }
+                        );
+                        if node_pressure {
+                            if let Err(reason) = self.node_pressure.clear(rule.id).await {
+                                let _ = response.send(Err(BunError::FaultRejected { reason }));
+                                return;
+                            }
+                        } else {
+                            self.reverse_fault(&rule).await;
+                        }
+                        self.fault_registry.remove(fault_id);
                         // A DnsNxdomain fault lives in the published set, not a
                         // BPF map, so republish so the responder stops faulting
                         // the target.
                         self.publish_dns_faults();
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
-                    None => format!("fault {fault_id} not found"),
+                    None => format!("fault {} not found", fault_id.0),
                 };
                 let _ = response.send(Ok(msg));
             }
             AgentCommand::ClearAllFaults { response } => {
-                let removed = self.fault_registry.clear();
+                let removed = self.fault_registry.clear_workload_faults();
                 for rule in &removed {
                     self.delete_fault_bpf_entry(rule).await;
                     self.reverse_fault(rule).await;
@@ -3084,7 +3332,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     f.fault_type,
                     crate::smoker::types::FaultType::NodeKill { .. }
                         | crate::smoker::types::FaultType::NodeDrain
-                        | crate::smoker::types::FaultType::Partition { .. }
+                        | crate::smoker::types::FaultType::NodePressure { .. }
+                        | crate::smoker::types::FaultType::CouncilPartition
                 )
             })
             .count() as u32;
@@ -3234,15 +3483,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.publish_dns_faults();
                 Ok(())
             }
-            FaultType::Delay { .. } | FaultType::Drop { .. } | FaultType::Bandwidth { .. } => {
-                // Packet-level network faults genuinely need the eBPF
-                // data path. Apply via BPF maps when it's loaded;
-                // otherwise reject honestly rather than record fake
-                // success (the old stub recorded everything).
-                #[cfg(feature = "ebpf")]
+            FaultType::Drop { .. } | FaultType::Partition { .. } => {
+                // Connect-time drop and partition faults have a real cgroup
+                // eBPF implementation. Record the exact keys only after every
+                // requested map write succeeds.
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 {
                     if self.onion_ebpf.is_some() {
-                        self.write_fault_bpf_entry(rule).await;
+                        let reversal = self.write_fault_bpf_entry(rule).await?;
+                        self.record_reversal(rule.id, reversal);
                         return Ok(());
                     }
                 }
@@ -3251,6 +3500,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.fault_type
                 ))
             }
+            FaultType::Delay { .. } => Err(
+                "delay faults need a TC packet hook; the current cgroup connect hook cannot delay packets"
+                    .to_string(),
+            ),
+            FaultType::Bandwidth { .. } => Err(
+                "bandwidth faults need a TC packet hook; no bandwidth program is attached"
+                    .to_string(),
+            ),
             FaultType::MemoryPressure { percentage, oom } => {
                 // Squeeze the TARGET instance's `memory.high` toward its hard
                 // limit so the kernel forces reclaim/allocation stalls on the
@@ -3339,43 +3596,71 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 })
             }
-            FaultType::NodeDrain | FaultType::NodeKill { .. } => {
-                // Honest rejection (CHAOS1). A node drain/kill is a
-                // cluster-level operation — cordon + evict local replicas, or
-                // terminate the node's workloads — driven by the scheduler and
-                // membership machinery, not a per-instance action here. Rather
-                // than record a fake success that changes nothing (the old
-                // behaviour), refuse the fault so the operator gets a clear
-                // 4xx instead of a lie. The real effect lands with the
-                // upgrade/self-healing themes that own that machinery.
-                Err(format!(
-                    "{} is a cluster-level operation and cannot be applied as a node-local fault; drain or stop the node through the scheduler instead",
-                    rule.fault_type
-                ))
-            }
-            FaultType::Partition { .. } => {
-                // A service-to-service partition is an eBPF connect-map fault
-                // (`write_fault_bpf_entry` writes a `FAULT_ACTION_PARTITION`
-                // entry keyed by target VIP + source cgroup). It is reached
-                // through this arm only when the data path is loaded; the
-                // Delay/Drop/Bandwidth branch above already routes the other
-                // eBPF network faults. This arm is left as an accepted no-op
-                // because the quorum-rail acceptance test injects a Partition
-                // to exercise the safety context on a node with no eBPF, and
-                // an honest eBPF-or-reject here would fail that path.
-                //
-                // TODO(Phase 15): fold Partition into the eBPF network-fault
-                // arm (honest-reject without the data path) and move the
-                // quorum-rail acceptance test onto an eBPF-loaded node so the
-                // no-op can go. The council-level transport partition
-                // (`relish chaos council-partition`) is a different mechanism
-                // and IS wired — see `InjectPartition`/`apply_partition`.
-                #[cfg(feature = "ebpf")]
-                if self.onion_ebpf.is_some() {
-                    self.write_fault_bpf_entry(rule).await;
+            FaultType::NodeDrain => {
+                if rule.duration_ns == 0 {
+                    return Err("node faults require a non-zero duration".to_string());
                 }
+                if self.cluster.is_none() {
+                    return Err("node drain requires an active cluster runtime".to_string());
+                }
+                let Some(readiness) = self.readiness.clone() else {
+                    return Err(
+                        "node drain requires live readiness evidence for scheduler fencing"
+                            .to_string(),
+                    );
+                };
+
+                if self.node_drain_gate.begin() {
+                    readiness.register("node:chaos-drain", true).await;
+                }
+                readiness
+                    .degraded("node:chaos-drain", "node drain fault is active")
+                    .await;
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodeDrain);
                 Ok(())
             }
+            FaultType::NodeKill { kill_containers } => {
+                if rule.duration_ns == 0 {
+                    return Err("node faults require a non-zero duration".to_string());
+                }
+                let Some(cluster) = &self.cluster else {
+                    return Err("node kill requires an active cluster runtime".to_string());
+                };
+
+                cluster.partition_blocklists.node_gate.quiesce();
+                if *kill_containers {
+                    let ids: Vec<_> = self
+                        .supervisor
+                        .list_instances()
+                        .iter()
+                        .map(|instance| instance.id.clone())
+                        .collect();
+                    for id in ids {
+                        if let Err(error) = self.supervisor.grill().kill(&id).await {
+                            eprintln!("smoker: node-kill container {} failed: {error}", id.0);
+                        }
+                    }
+                }
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodeQuiesce);
+                Ok(())
+            }
+            FaultType::NodePressure {
+                cpu_percentage,
+                memory_percentage,
+            } => {
+                if rule.duration_ns == 0 {
+                    return Err("node pressure requires a non-zero duration".to_string());
+                }
+                self.node_pressure
+                    .apply(rule.id, *cpu_percentage, *memory_percentage)
+                    .await?;
+                self.record_reversal(rule.id, crate::smoker::types::FaultReversal::NodePressure);
+                Ok(())
+            }
+            FaultType::CouncilPartition => Err(
+                "council partitions must use the authenticated /v1/chaos/partition operation"
+                    .to_string(),
+            ),
         }
     }
 
@@ -3537,7 +3822,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// it), a capped `cpu.max`, a squeezed `memory.high` or an `io.max`
     /// throttle (restore the saved value). Best-effort: an instance that has
     /// since exited simply has nothing left to restore.
-    async fn reverse_fault(&self, rule: &crate::smoker::types::FaultRule) {
+    async fn reverse_fault(&mut self, rule: &crate::smoker::types::FaultRule) {
         use crate::smoker::types::FaultReversal;
         match &rule.reversal {
             FaultReversal::None => {}
@@ -3583,6 +3868,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FaultReversal::Partition { peers } => {
                 self.remove_partition(peers).await;
             }
+            FaultReversal::BpfConnectKeys(_) => {
+                // `delete_fault_bpf_entry` owns map cleanup before this
+                // generic non-eBPF reversal path runs.
+            }
+            FaultReversal::NodeDrain => {
+                if self.node_drain_gate.finish()
+                    && let Some(readiness) = self.readiness.clone()
+                {
+                    readiness.ready("node:chaos-drain").await;
+                }
+            }
+            FaultReversal::NodeQuiesce => {
+                if let Some(cluster) = &self.cluster {
+                    cluster.partition_blocklists.node_gate.restore();
+                }
+            }
+            FaultReversal::NodePressure => {
+                if let Err(error) = self.node_pressure.clear(rule.id).await {
+                    eprintln!(
+                        "smoker: clear node pressure for {} failed: {error}",
+                        rule.id
+                    );
+                }
+            }
         }
     }
 
@@ -3619,7 +3928,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .find(|f| {
                 matches!(
                     f.fault_type,
-                    crate::smoker::types::FaultType::Partition { .. }
+                    crate::smoker::types::FaultType::CouncilPartition
                 )
             })
             .map(|f| {
@@ -3679,7 +3988,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// The network-byte-order VIP + port for a fault's target service, if
     /// it is registered. VIP is deterministic from the app name; the port
     /// comes from the service entry. Connect/bandwidth fault keys need both.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     fn fault_vip_port(&self, target_service: &str) -> Option<(u32, u16)> {
         // Smoker targets a service by bare name; match the first entry in
         // any namespace (PR 2 adds a namespace-qualified fault target).
@@ -3688,42 +3997,92 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|e| (e.vip.to_network_byte_order(), e.port.to_be()))
     }
 
+    /// Resolve every running instance of a partition's source app to the
+    /// cgroup id observed by `bpf_get_current_cgroup_id()`.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn partition_source_cgroup_ids(
+        &self,
+        source_app: Option<&str>,
+        client_supplied_id: u64,
+    ) -> Result<Vec<u64>, String> {
+        if client_supplied_id != 0 {
+            return Err(
+                "source_cgroup_id is server-resolved and must be zero in fault requests"
+                    .to_string(),
+            );
+        }
+        let Some(source_app) = source_app else {
+            return Ok(vec![0]);
+        };
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| instance.app_name == source_app)
+            .map(|instance| instance.id.clone())
+            .collect();
+        if instances.is_empty() {
+            return Err(format!("no running instances of source app {source_app}"));
+        }
+
+        let mut cgroup_ids = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let pid = self
+                .supervisor
+                .grill()
+                .pid(&instance)
+                .await
+                .ok_or_else(|| format!("source instance {} has no running PID", instance.0))?;
+            let cgroup_id = crate::sesame::egress::cgroup_id_of_pid(pid).ok_or_else(|| {
+                format!(
+                    "could not resolve the cgroup id for source instance {}",
+                    instance.0
+                )
+            })?;
+            cgroup_ids.push(cgroup_id);
+        }
+        cgroup_ids.sort_unstable();
+        cgroup_ids.dedup();
+        Ok(cgroup_ids)
+    }
+
     /// Write the eBPF map entry for a newly injected network fault (P2).
     ///
     /// Only reachable with the `ebpf` feature: without it, `apply_fault`
     /// rejects network faults before we get here. `expires_ns` comes from
     /// the rule, which now uses CLOCK_MONOTONIC (P0) to match the kernel's
     /// `bpf_ktime_get_ns()`.
-    #[cfg(feature = "ebpf")]
-    async fn write_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn write_fault_bpf_entry(
+        &self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Result<crate::smoker::types::FaultReversal, String> {
         use crate::smoker::bpf_maps;
         use crate::smoker::bpf_types::*;
-        use crate::smoker::types::FaultType;
+        use crate::smoker::types::{FaultReversal, FaultType};
 
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
+        let source_cgroup_ids = match &rule.fault_type {
+            FaultType::Partition {
+                source_app,
+                source_cgroup_id,
+            } => {
+                self.partition_source_cgroup_ids(source_app.as_deref(), *source_cgroup_id)
+                    .await?
+            }
+            _ => vec![0],
         };
-        let vip_port = self.fault_vip_port(&rule.target_service);
+        let (vip, port) = self
+            .fault_vip_port(&rule.target_service)
+            .ok_or_else(|| format!("no service VIP exists for {}", rule.target_service))?;
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Err("the eBPF data path is not loaded on this node".to_string());
+        };
         let expires = rule.expires_at_ns;
         let mut ebpf = handle.lock().await;
 
-        // Connect/bandwidth faults need the target VIP; DNS is keyed by name.
-        let require_vip = || match vip_port {
-            Some(vp) => Some(vp),
-            None => {
-                eprintln!(
-                    "smoker: no VIP for {} — {} fault not applied",
-                    rule.target_service, rule.fault_type
-                );
-                None
-            }
-        };
-
         match &rule.fault_type {
             FaultType::Drop { probability } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
+                let key = connect_fault_key(vip, port);
                 let value = BpfConnectFaultValue {
                     action: FAULT_ACTION_DROP,
                     probability: *probability,
@@ -3732,39 +4091,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     jitter_ns: 0,
                     expires_ns: expires,
                 };
-                let _ = bpf_maps::write_connect_fault(
-                    &mut ebpf.bpf,
-                    connect_fault_key(vip, port),
-                    value,
-                );
-            }
-            FaultType::Delay {
-                delay_ns,
-                jitter_ns,
-            } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
-                let value = BpfConnectFaultValue {
-                    action: FAULT_ACTION_DELAY,
-                    probability: 100,
-                    _pad: [0; 6],
-                    delay_ns: *delay_ns,
-                    jitter_ns: *jitter_ns,
-                    expires_ns: expires,
-                };
-                let _ = bpf_maps::write_connect_fault(
-                    &mut ebpf.bpf,
-                    connect_fault_key(vip, port),
-                    value,
-                );
+                bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value)
+                    .map_err(|error| format!("failed to install drop fault: {error}"))?;
+                Ok(FaultReversal::BpfConnectKeys(vec![(
+                    key.virtual_ip,
+                    key.port,
+                    key.source_cgroup_id,
+                )]))
             }
             FaultType::Partition {
-                source_cgroup_id, ..
+                source_app: _,
+                source_cgroup_id: _,
             } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
                 let value = BpfConnectFaultValue {
                     action: FAULT_ACTION_PARTITION,
                     probability: 100,
@@ -3773,27 +4111,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     jitter_ns: 0,
                     expires_ns: expires,
                 };
-                let _ = bpf_maps::write_connect_fault(
-                    &mut ebpf.bpf,
-                    partition_fault_key(vip, port, *source_cgroup_id),
-                    value,
-                );
+                let mut installed = Vec::with_capacity(source_cgroup_ids.len());
+                for source_cgroup_id in source_cgroup_ids {
+                    let key = partition_fault_key(vip, port, source_cgroup_id);
+                    if let Err(error) = bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value) {
+                        for installed_key in installed.iter().rev() {
+                            let _ = bpf_maps::delete_connect_fault(&mut ebpf.bpf, installed_key);
+                        }
+                        return Err(format!("failed to install partition fault: {error}"));
+                    }
+                    installed.push(key);
+                }
+                Ok(FaultReversal::BpfConnectKeys(
+                    installed
+                        .iter()
+                        .map(|key| (key.virtual_ip, key.port, key.source_cgroup_id))
+                        .collect(),
+                ))
             }
-            FaultType::Bandwidth { bytes_per_sec } => {
-                let Some((vip, port)) = require_vip() else {
-                    return;
-                };
-                let value = BpfBandwidthFaultValue {
-                    rate_bytes_per_sec: *bytes_per_sec,
-                    tokens: *bytes_per_sec, // start with a full bucket
-                    last_refill_ns: crate::smoker::types::monotonic_now_ns(),
-                    expires_ns: expires,
-                };
-                let _ =
-                    bpf_maps::write_bw_fault(&mut ebpf.bpf, bandwidth_fault_key(vip, port), value);
-            }
-            // Non-network faults never reach here (apply_fault handles them).
-            _ => {}
+            _ => Err(format!(
+                "{} has no connect-map implementation",
+                rule.fault_type
+            )),
         }
     }
 
@@ -3802,7 +4141,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Best-effort: VIP is deterministic from the app name, but the port
     /// comes from the service entry — if the service is already gone we
     /// skip, since the kernel ignores the entry past its `expires_ns`.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn delete_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
         use crate::smoker::bpf_maps;
         use crate::smoker::bpf_types::*;
@@ -3814,40 +4153,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
         };
-        let vip_port = self.fault_vip_port(&rule.target_service);
         let mut ebpf = handle.lock().await;
 
-        match &rule.fault_type {
-            FaultType::Drop { .. } | FaultType::Delay { .. } => {
-                if let Some((vip, port)) = vip_port {
-                    let _ = bpf_maps::delete_connect_fault(
-                        &mut ebpf.bpf,
-                        &connect_fault_key(vip, port),
+        if let crate::smoker::types::FaultReversal::BpfConnectKeys(keys) = &rule.reversal {
+            for (vip, port, source_cgroup_id) in keys {
+                if let Err(error) = bpf_maps::delete_connect_fault(
+                    &mut ebpf.bpf,
+                    &partition_fault_key(*vip, *port, *source_cgroup_id),
+                ) {
+                    eprintln!(
+                        "smoker: delete connect fault key for {} failed: {error}",
+                        rule.id
                     );
                 }
             }
-            FaultType::Partition {
-                source_cgroup_id, ..
-            } => {
-                if let Some((vip, port)) = vip_port {
-                    let _ = bpf_maps::delete_connect_fault(
-                        &mut ebpf.bpf,
-                        &partition_fault_key(vip, port, *source_cgroup_id),
-                    );
-                }
-            }
-            FaultType::Bandwidth { .. } => {
-                if let Some((vip, port)) = vip_port {
-                    let _ =
-                        bpf_maps::delete_bw_fault(&mut ebpf.bpf, &bandwidth_fault_key(vip, port));
-                }
-            }
-            _ => {}
+            return;
+        }
+
+        // Compatibility fallback for a rule created before exact key
+        // ownership was recorded.
+        if let Some((vip, port)) = self.fault_vip_port(&rule.target_service)
+            && matches!(rule.fault_type, FaultType::Drop { .. })
+            && let Err(error) =
+                bpf_maps::delete_connect_fault(&mut ebpf.bpf, &connect_fault_key(vip, port))
+        {
+            eprintln!(
+                "smoker: delete legacy connect fault key for {} failed: {error}",
+                rule.id
+            );
         }
     }
 
     /// Delete is a no-op without the eBPF data path (nothing was written).
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn delete_fault_bpf_entry(&self, _rule: &crate::smoker::types::FaultRule) {}
 
     /// Enforce the image trust policy for a workload before deploying it.
@@ -4441,7 +4779,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Returns an error — failing the deploy closed — when enforcement is
     /// required but cannot be guaranteed (connect6 missing, cgroup id
     /// unresolvable, map programming failed).
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn apply_egress_pre_start(
         &mut self,
         instance_id: &InstanceId,
@@ -4491,7 +4829,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// A build without the eBPF data path cannot enforce an allowlist.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn apply_egress_pre_start(
         &mut self,
         _instance_id: &InstanceId,
@@ -4513,7 +4851,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// instance start (the re-resolve loop fills the allowlist in later),
     /// but a programming or representation error fails the deploy — a
     /// workload must never start ahead of a policy we could not install.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn program_egress_pre_start(
         &mut self,
         instance_id: &InstanceId,
@@ -4625,7 +4963,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Pre-start deny-all: enforcement on, no allow entries. Unlike the
     /// post-start variant, a failure here fails the deploy — the process
     /// has not started yet, so refusing is still possible.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn deny_all_pre_start(
         &mut self,
         handle: &std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
@@ -4676,7 +5014,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Goes through `reprogram_cgroup_egress` because instances can share a
     /// cgroup path — deleting one instance's entries directly would wipe a
     /// co-tenant's policy.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn clear_egress(&mut self, instance_id: &InstanceId) {
         let Some(binding) = self.egress_bindings.remove(instance_id) else {
             return;
@@ -4685,7 +5023,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
 
     /// Rebuild the kernel egress state for one cgroup id from the current
@@ -4693,7 +5031,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// of what the surviving bindings allow (and the enforcement flag).
     /// With no surviving binding the cgroup is scrubbed completely.
     /// Failures leave the cgroup denying more than intended, never less.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn reprogram_cgroup_egress(&mut self, cgroup_id: u64) {
         use crate::sesame::egress;
 
@@ -4752,7 +5090,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// read, or a repaired enforcement flag is still absent, stop every
     /// affected workload. Keeping it running would turn its allowlist into a
     /// label rather than a control.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn enforce_live_egress_or_stop(&mut self) {
         use crate::sesame::egress;
 
@@ -4836,7 +5174,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_instances_after_egress_loss(affected_ids).await;
     }
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn stop_instances_after_egress_loss(
         &mut self,
         affected_ids: std::collections::HashSet<InstanceId>,
@@ -4864,14 +5202,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Portable builds cannot have live egress bindings.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn enforce_live_egress_or_stop(&mut self) {}
 
     /// Periodically re-resolve DNS-based egress allowlists and reprogram the
     /// eBPF egress maps when an app's destination IPs change (L16). Rate-
     /// limited to roughly once every five minutes; a no-op while nothing
     /// enforces egress.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn reresolve_egress(&mut self) {
         // ~5 minutes at the 1s event-loop tick.
         const RERESOLVE_EVERY_TICKS: u32 = 300;
@@ -4920,7 +5258,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn reresolve_egress(&mut self) {}
 
     /// Reconcile kernel truth against live instances (the sweep half of the
@@ -4929,7 +5267,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// and prune stale `cgroup_namespace_map` keys. The one-second live check
     /// fences adopted policy-bearing workloads with no trustworthy binding;
     /// the sweep never installs their policy after they have already run.
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sweep_kernel_networking(&mut self) {
         use crate::sesame::egress;
 
@@ -5045,7 +5383,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// No-op without the eBPF data path.
-    #[cfg(not(feature = "ebpf"))]
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn sweep_kernel_networking(&mut self) {}
 
     /// Run any due health checks.
@@ -5727,14 +6065,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             crate::sesame::types::WorkloadType::App
         };
 
-        // TODO: get cluster_name from config rather than hardcoding
-        let cluster_name = "default";
-        let spiffe_uri = crate::sesame::types::SpiffeUri {
-            trust_domain: cluster_name.to_string(),
-            namespace: namespace.to_string(),
-            workload_type,
-            name: app_name.to_string(),
-        };
+        let spiffe_uri =
+            workload_spiffe_uri(&self.trust_domain, namespace, app_name, workload_type);
 
         // Generate CSR (keypair stays local)
         let (csr_der, private_key_der) =
@@ -5756,7 +6088,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 &csr_der,
                 &spiffe_uri,
                 crate::sesame::identity::CertUsage::Mtls,
-                cluster_name,
+                &self.trust_domain,
                 "local",
                 &instance_id.0,
             )
@@ -6178,6 +6510,373 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(output)
     }
 
+    /// Capture the immutable state needed by a connectivity trace. The slow
+    /// workload and kernel observations run later on a spawned task.
+    fn prepare_trace(
+        &self,
+        request: crate::onion::trace::TraceRequest,
+        internal_destination: bool,
+        source_node: String,
+    ) -> Result<PreparedTrace<G>, BunError> {
+        if request.port == Some(0) {
+            return Err(BunError::SecurityError {
+                reason: "trace destination port must be between 1 and 65535".to_string(),
+            });
+        }
+        let source_instance = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .find(|instance| {
+                instance.app_name == request.source
+                    && instance.namespace == request.source_namespace
+                    && instance.state == ContainerState::Running
+            })
+            .map(|instance| instance.id.clone())
+            .ok_or_else(|| BunError::AppNotFound {
+                app_name: request.source.clone(),
+                namespace: request.source_namespace.clone(),
+            })?;
+
+        let service_id = crate::onion::service_id::ServiceId::new(
+            &request.destination_namespace,
+            &request.destination,
+        );
+        let merged_services = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+        let service = internal_destination
+            .then(|| merged_services.resolve(&service_id).cloned())
+            .flatten();
+        let destination_port = request
+            .port
+            .or_else(|| service.as_ref().map(|entry| entry.port))
+            .ok_or_else(|| BunError::SecurityError {
+                reason: "external trace destination requires an explicit port".to_string(),
+            })?;
+        let dns_name = if internal_destination {
+            format!(
+                "{}.{}.internal",
+                request.destination, request.destination_namespace
+            )
+        } else {
+            request.destination.clone()
+        };
+        let expected_vip = service.as_ref().map(|entry| entry.vip.to_string());
+        let permit = self
+            .trace_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| BunError::TraceBusy)?;
+
+        Ok(PreparedTrace {
+            _permit: permit,
+            shutdown: self.shutdown.clone(),
+            grill: self.supervisor.grill().clone(),
+            source_instance,
+            request,
+            internal_destination,
+            source_node,
+            service,
+            destination_port,
+            dns_name,
+            expected_vip,
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            onion_ebpf: self.onion_ebpf.clone(),
+        })
+    }
+}
+
+impl<G: Grill + Clone + 'static> PreparedTrace<G> {
+    /// Trace DNS, live service/firewall state and a TCP connection from one
+    /// running workload. The command strings are fixed; request values are
+    /// positional shell arguments and can never become shell syntax.
+    async fn run(self) -> Result<crate::onion::trace::TraceResult, BunError> {
+        use crate::onion::trace::TraceResult;
+
+        let dns_probe = self
+            .run_workload_trace_probe(
+                &self.source_instance,
+                trace_dns_command(&self.dns_name),
+                "__RB_TRACE_DNS_STATUS__",
+            )
+            .await;
+        let dns_step = trace_probe_step(
+            1,
+            "DNS query",
+            &self.dns_name,
+            dns_probe,
+            self.expected_vip.as_deref(),
+        );
+
+        let service_step = self
+            .trace_service_state(self.service.as_ref(), self.internal_destination)
+            .await;
+        let firewall_step = self
+            .trace_firewall_state(
+                &self.source_instance,
+                self.service.as_ref(),
+                self.internal_destination,
+            )
+            .await;
+
+        let connect_host = self
+            .expected_vip
+            .as_deref()
+            .unwrap_or(self.request.destination.as_str());
+        let started = std::time::Instant::now();
+        let tcp_probe = self
+            .run_workload_trace_probe(
+                &self.source_instance,
+                trace_tcp_command(connect_host, self.destination_port),
+                "__RB_TRACE_TCP_STATUS__",
+            )
+            .await;
+        let tcp_succeeded = tcp_probe.as_ref().is_ok_and(|probe| probe.status == 0);
+        let tcp_step = trace_probe_step(
+            4,
+            "TCP probe",
+            &format!("{connect_host}:{}", self.destination_port),
+            tcp_probe,
+            None,
+        );
+        let latency_ms = tcp_succeeded.then(|| started.elapsed().as_secs_f64() * 1000.0);
+
+        let steps = vec![dns_step, service_step, firewall_step, tcp_step];
+        let overall_result = crate::onion::trace::overall_verdict(&steps);
+        Ok(TraceResult {
+            schema_version: crate::onion::trace::TRACE_SCHEMA_VERSION,
+            source: format!("{}/{}", self.request.source_namespace, self.request.source),
+            destination: if self.internal_destination {
+                format!(
+                    "{}/{}",
+                    self.request.destination_namespace, self.request.destination
+                )
+            } else {
+                self.request.destination.clone()
+            },
+            destination_port: self.destination_port,
+            source_node: self.source_node,
+            steps,
+            overall_result,
+            latency_ms,
+        })
+    }
+
+    async fn run_workload_trace_probe(
+        &self,
+        source_instance: &InstanceId,
+        command: Vec<String>,
+        marker: &str,
+    ) -> Result<crate::onion::trace::ProbeOutput, String> {
+        let future = self.grill.exec(source_instance, &command);
+        let result = tokio::select! {
+            _ = self.shutdown.cancelled() => {
+                return Err("workload probe cancelled because the agent is shutting down".to_string());
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(8), future) => result,
+        };
+        match result {
+            Ok(Ok(output)) => crate::onion::trace::parse_probe_output(&output, marker)
+                .ok_or_else(|| "source image lacks a usable POSIX shell or probe tool".to_string()),
+            Ok(Err(error)) => Err(format!("workload probe could not start: {error}")),
+            Err(_) => Err("workload probe timed out after 8 seconds".to_string()),
+        }
+    }
+
+    async fn trace_service_state(
+        &self,
+        service: Option<&crate::onion::types::ServiceEntry>,
+        internal_destination: bool,
+    ) -> crate::onion::trace::TraceStep {
+        use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+        if !internal_destination {
+            return TraceStep {
+                step_number: 2,
+                name: "Service and eBPF state".to_string(),
+                evidence: TraceEvidence::Inferred,
+                details: vec![
+                    "external destinations bypass the internal service and backend maps"
+                        .to_string(),
+                ],
+                verdict: TraceVerdict::Pass,
+            };
+        }
+        let Some(service) = service else {
+            return TraceStep {
+                step_number: 2,
+                name: "Service and eBPF state".to_string(),
+                evidence: TraceEvidence::Observed,
+                details: Vec::new(),
+                verdict: TraceVerdict::Fail {
+                    reason: "destination is absent from the live userspace service map".to_string(),
+                },
+            };
+        };
+        let healthy = service
+            .backends
+            .iter()
+            .filter(|backend| backend.healthy)
+            .count();
+        let mut details = vec![format!(
+            "userspace service map: VIP {}, {} of {} backends healthy",
+            service.vip,
+            healthy,
+            service.backends.len()
+        )];
+        if healthy == 0 {
+            return TraceStep {
+                step_number: 2,
+                name: "Service and eBPF state".to_string(),
+                evidence: TraceEvidence::Observed,
+                details,
+                verdict: TraceVerdict::Fail {
+                    reason: "live service state has no healthy backend".to_string(),
+                },
+            };
+        }
+
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Some(handle) = &self.onion_ebpf {
+            let bpf_map = crate::onion::ebpf::maps::BpfServiceMap::new();
+            let mut ebpf = handle.lock().await;
+            return match bpf_map.read_backends(&mut ebpf, service.vip, service.port) {
+                Ok(Some(value)) => {
+                    let kernel_healthy = value
+                        .backends
+                        .iter()
+                        .take(value.count as usize)
+                        .filter(|backend| backend.healthy == 1)
+                        .count();
+                    details.push(format!(
+                        "live backend_map: {} entries, {kernel_healthy} healthy",
+                        value.count
+                    ));
+                    let verdict = if value.count == 0 || kernel_healthy == 0 {
+                        TraceVerdict::Fail {
+                            reason: "live eBPF backend map has no healthy backend".to_string(),
+                        }
+                    } else {
+                        TraceVerdict::Pass
+                    };
+                    TraceStep {
+                        step_number: 2,
+                        name: "Service and eBPF state".to_string(),
+                        evidence: TraceEvidence::Observed,
+                        details,
+                        verdict,
+                    }
+                }
+                Ok(None) => TraceStep {
+                    step_number: 2,
+                    name: "Service and eBPF state".to_string(),
+                    evidence: TraceEvidence::Observed,
+                    details,
+                    verdict: TraceVerdict::Fail {
+                        reason: "service exists in userspace but is absent from live backend_map"
+                            .to_string(),
+                    },
+                },
+                Err(error) => TraceStep {
+                    step_number: 2,
+                    name: "Service and eBPF state".to_string(),
+                    evidence: TraceEvidence::Unavailable,
+                    details,
+                    verdict: TraceVerdict::Unknown {
+                        reason: format!("live backend_map could not be read: {error}"),
+                    },
+                },
+            };
+        }
+
+        details.push(
+            "no live eBPF backend map is attached; this step is inferred from userspace state"
+                .to_string(),
+        );
+        TraceStep {
+            step_number: 2,
+            name: "Service and eBPF state".to_string(),
+            evidence: TraceEvidence::Inferred,
+            details,
+            verdict: TraceVerdict::Pass,
+        }
+    }
+
+    async fn trace_firewall_state(
+        &self,
+        source_instance: &InstanceId,
+        service: Option<&crate::onion::types::ServiceEntry>,
+        internal_destination: bool,
+    ) -> crate::onion::trace::TraceStep {
+        use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+        let unknown = |reason: String| TraceStep {
+            step_number: 3,
+            name: "Firewall state".to_string(),
+            evidence: TraceEvidence::Unavailable,
+            details: Vec::new(),
+            verdict: TraceVerdict::Unknown { reason },
+        };
+
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Some(handle) = &self.onion_ebpf {
+            let Some(pid) = self.grill.pid(source_instance).await else {
+                return unknown("runtime does not expose the source workload PID".to_string());
+            };
+            let Some(cgroup_id) = crate::sesame::egress::cgroup_id_of_pid(pid) else {
+                return unknown("source workload cgroup id could not be resolved".to_string());
+            };
+            let mut ebpf = handle.lock().await;
+            if !internal_destination {
+                return match crate::sesame::egress::egress_enforced(&mut ebpf.bpf, cgroup_id) {
+                    Ok(false) => TraceStep {
+                        step_number: 3,
+                        name: "Firewall state".to_string(),
+                        evidence: TraceEvidence::Observed,
+                        details: vec![
+                            "live egress_enabled_map has no policy for the source cgroup; external traffic passes through".to_string(),
+                        ],
+                        verdict: TraceVerdict::Pass,
+                    },
+                    Ok(true) => unknown(
+                        "live egress enforcement is active; the exact hostname decision is observed by the TCP probe but cannot yet be attributed to one exact/CIDR map entry"
+                            .to_string(),
+                    ),
+                    Err(error) => unknown(format!("live egress map could not be read: {error}")),
+                };
+            }
+            let Some(service) = service else {
+                return unknown("destination service state is unavailable".to_string());
+            };
+            return match crate::sesame::firewall::read_firewall_state(
+                &mut ebpf.bpf,
+                cgroup_id,
+                service.app_id,
+            ) {
+                Ok(state) => {
+                    let verdict = crate::onion::trace::evaluate_firewall(
+                        state.source_namespace_id,
+                        service.namespace_id,
+                        state.action,
+                    );
+                    TraceStep {
+                        step_number: 3,
+                        name: "Firewall state".to_string(),
+                        evidence: TraceEvidence::Observed,
+                        details: vec![format!(
+                            "live maps: source cgroup {cgroup_id}, source namespace {:?}, destination namespace {}, action {:?}",
+                            state.source_namespace_id, service.namespace_id, state.action
+                        )],
+                        verdict,
+                    }
+                }
+                Err(error) => unknown(format!("live firewall maps could not be read: {error}")),
+            };
+        }
+
+        let _ = (source_instance, service, internal_destination);
+        unknown("no live eBPF firewall maps are attached on this node".to_string())
+    }
+}
+
+impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Stop one instance and wait for it to actually exit (DEP6).
     ///
     /// SIGTERM first, then poll the runtime until the container reports
@@ -6279,6 +6978,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Gracefully stop all instances.
     async fn shutdown_all(&mut self) {
+        // Reverse every owned fault before the process goes away. The
+        // node-pressure helper also has PR_SET_PDEATHSIG and startup sweeping
+        // for crash recovery, but graceful shutdown should leave no helper or
+        // cgroup behind in the first place.
+        let faults = self.fault_registry.clear();
+        for rule in &faults {
+            self.delete_fault_bpf_entry(rule).await;
+            self.reverse_fault(rule).await;
+        }
+        self.publish_dns_faults();
+
         let ids: Vec<InstanceId> = self
             .supervisor
             .list_instances()
@@ -6668,6 +7378,7 @@ struct DeployWorker<G: Grill> {
     grill: G,
     port_allocator: PortAllocator,
     ops: DeployOps,
+    operation: Option<crate::bun::deploy_operations::DeployOperationHandle>,
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
@@ -6689,8 +7400,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             })
             .collect();
 
+        if !config.app.is_empty()
+            && let Some(operation) = &self.operation
+        {
+            operation
+                .advance(
+                    crate::bun::deploy_operations::DeployOperationPhase::DeployingApps,
+                    None,
+                    format!("deploying {} app(s)", config.app.len()),
+                )
+                .await;
+        }
+
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if let Some(operation) = &self.operation {
+                operation
+                    .advance(
+                        crate::bun::deploy_operations::DeployOperationPhase::DeployingApps,
+                        Some(crate::bun::deploy_operations::DeployTarget {
+                            kind: crate::bun::deploy_operations::DeployTargetKind::App,
+                            name: app_name.clone(),
+                            namespace: namespace.to_string(),
+                        }),
+                        format!("deploying app {namespace}/{app_name}"),
+                    )
+                    .await;
+            }
 
             // Gate on image signature first (IMG1). A verified image comes back
             // pinned to its manifest digest; the pinned spec shadows the
@@ -6706,7 +7442,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(reason) => {
                     let _ = events.send(ApplyEvent::Error { message: reason }).await;
-                    continue;
+                    return;
                 }
             };
 
@@ -6827,8 +7563,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if !config.job.is_empty()
+            && let Some(operation) = &self.operation
+        {
+            operation
+                .advance(
+                    crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
+                    None,
+                    format!("deploying {} job(s)", config.job.len()),
+                )
+                .await;
+        }
+
         for (job_name, spec) in &config.job {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if let Some(operation) = &self.operation {
+                operation
+                    .advance(
+                        crate::bun::deploy_operations::DeployOperationPhase::DeployingJobs,
+                        Some(crate::bun::deploy_operations::DeployTarget {
+                            kind: crate::bun::deploy_operations::DeployTargetKind::Job,
+                            name: job_name.clone(),
+                            namespace: namespace.to_string(),
+                        }),
+                        format!("deploying job {namespace}/{job_name}"),
+                    )
+                    .await;
+            }
             let _ = events
                 .send(ApplyEvent::Progress {
                     message: format!("deploying job {job_name}"),
@@ -6878,6 +7639,15 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if let Some(operation) = &self.operation {
+            operation
+                .advance(
+                    crate::bun::deploy_operations::DeployOperationPhase::RebuildingRoutes,
+                    None,
+                    "rebuilding service and ingress routes",
+                )
+                .await;
+        }
         self.ops.rebuild_routing_table().await;
 
         let _ = events
@@ -7326,6 +8096,92 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     }
 }
 
+const DNS_TRACE_SCRIPT: &str = r#"
+output=$(nslookup "$1" 2>&1)
+status=$?
+printf '%s\n' "$output"
+printf '__RB_TRACE_DNS_STATUS__=%s\n' "$status"
+"#;
+
+const TCP_TRACE_SCRIPT: &str = r#"
+output=$(nc -z -w 3 "$1" "$2" 2>&1)
+status=$?
+printf '%s\n' "$output"
+printf '__RB_TRACE_TCP_STATUS__=%s\n' "$status"
+"#;
+
+fn trace_dns_command(name: &str) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        DNS_TRACE_SCRIPT.to_string(),
+        "reliaburger-trace".to_string(),
+        name.to_string(),
+    ]
+}
+
+fn trace_tcp_command(host: &str, port: u16) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        TCP_TRACE_SCRIPT.to_string(),
+        "reliaburger-trace".to_string(),
+        host.to_string(),
+        port.to_string(),
+    ]
+}
+
+fn trace_probe_step(
+    step_number: u32,
+    name: &str,
+    target: &str,
+    probe: Result<crate::onion::trace::ProbeOutput, String>,
+    expected_value: Option<&str>,
+) -> crate::onion::trace::TraceStep {
+    use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
+    match probe {
+        Ok(probe) => {
+            let mut details = vec![format!("fixed workload probe target: {target}")];
+            details.extend(probe.lines);
+            let verdict = if probe.status == 0 {
+                if let Some(expected) = expected_value
+                    && !details.iter().any(|line| line.contains(expected))
+                {
+                    TraceVerdict::Fail {
+                        reason: format!(
+                            "probe succeeded but its answer did not contain expected value {expected}"
+                        ),
+                    }
+                } else {
+                    TraceVerdict::Pass
+                }
+            } else if probe.status == 126 || probe.status == 127 {
+                TraceVerdict::Unknown {
+                    reason: format!("source image does not provide the fixed {name} probe tool"),
+                }
+            } else {
+                TraceVerdict::Fail {
+                    reason: format!("{name} exited with status {}", probe.status),
+                }
+            };
+            TraceStep {
+                step_number,
+                name: name.to_string(),
+                evidence: TraceEvidence::Observed,
+                details,
+                verdict,
+            }
+        }
+        Err(reason) => TraceStep {
+            step_number,
+            name: name.to_string(),
+            evidence: TraceEvidence::Unavailable,
+            details: vec![format!("fixed workload probe target: {target}")],
+            verdict: TraceVerdict::Unknown { reason },
+        },
+    }
+}
+
 /// The health-wait deadline for a rolling redeploy: the configured
 /// `health_timeout`, uncapped (M7).
 ///
@@ -7355,10 +8211,259 @@ pub fn tail_lines(s: &str, n: usize) -> String {
     }
 }
 
+/// Construct the identity the agent requests for an app or job.
+///
+/// Keeping this in one function prevents certificate SANs and JWT claims from
+/// drifting onto different trust domains.
+pub fn workload_spiffe_uri(
+    trust_domain: &str,
+    namespace: &str,
+    name: &str,
+    workload_type: crate::sesame::types::WorkloadType,
+) -> crate::sesame::types::SpiffeUri {
+    crate::sesame::types::SpiffeUri {
+        trust_domain: trust_domain.to_string(),
+        namespace: namespace.to_string(),
+        workload_type,
+        name: name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::grill::mock::MockGrill;
+
+    #[test]
+    fn trace_targets_are_positional_arguments_not_shell_source() {
+        let hostile = "api; touch /tmp/never";
+        let dns = trace_dns_command(hostile);
+        let tcp = trace_tcp_command(hostile, 443);
+        assert!(!dns[2].contains(hostile));
+        assert_eq!(dns[4], hostile);
+        assert!(!tcp[2].contains(hostile));
+        assert_eq!(tcp[4], hostile);
+        assert_eq!(tcp[5], "443");
+    }
+
+    #[test]
+    fn missing_workload_probe_tool_is_unknown_not_a_network_failure() {
+        let step = trace_probe_step(
+            1,
+            "DNS query",
+            "api.internal",
+            Ok(crate::onion::trace::ProbeOutput {
+                status: 127,
+                lines: vec!["nslookup: not found".to_string()],
+            }),
+            None,
+        );
+        assert!(matches!(
+            step.verdict,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn trace_runs_fixed_dns_and_tcp_probes_from_the_source_workload() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(
+            r#"
+            [app.source]
+            image = "source:v1"
+
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+
+        let vip = crate::onion::vip::VirtualIP::from_qualified("default__destination");
+        grill.set_exec_outputs([
+            format!(
+                "Name: destination.default.internal\nAddress: {vip}\n__RB_TRACE_DNS_STATUS__=0\n"
+            ),
+            "__RB_TRACE_TCP_STATUS__=0\n".to_string(),
+        ]);
+        grill.block_execs();
+        let (response, receiver) = oneshot::channel();
+        tx.send(AgentCommand::Trace {
+            request: crate::onion::trace::TraceRequest {
+                source: "source".to_string(),
+                source_namespace: "default".to_string(),
+                destination: "destination".to_string(),
+                destination_namespace: "default".to_string(),
+                port: None,
+            },
+            internal_destination: true,
+            source_node: "node-a".to_string(),
+            response,
+        })
+        .await
+        .unwrap();
+
+        grill.wait_for_execs(1).await;
+        let (status_response, status_receiver) = oneshot::channel();
+        tx.send(AgentCommand::Status {
+            response: status_response,
+        })
+        .await
+        .unwrap();
+        let statuses = tokio::time::timeout(std::time::Duration::from_secs(1), status_receiver)
+            .await
+            .expect("a workload trace must not block the agent command loop")
+            .unwrap();
+        assert_eq!(statuses.len(), 2);
+        grill.release_execs(1);
+
+        let result = receiver.await.unwrap().unwrap();
+
+        assert_eq!(result.steps.len(), 4);
+        assert_eq!(
+            result.steps[0].verdict,
+            crate::onion::trace::TraceVerdict::Pass
+        );
+        assert_eq!(
+            result.steps[1].evidence,
+            crate::onion::trace::TraceEvidence::Inferred
+        );
+        assert_eq!(
+            result.steps[3].verdict,
+            crate::onion::trace::TraceVerdict::Pass
+        );
+        assert!(matches!(
+            result.steps[2].verdict,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+        assert!(matches!(
+            result.overall_result,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+        assert!(result.latency_ms.is_some());
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trace_concurrency_is_bounded_without_queueing_more_workload_processes() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(
+            r#"
+            [app.source]
+            image = "source:v1"
+
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+
+        grill.set_exec_outputs(
+            (0..16).map(|_| "__RB_TRACE_DNS_STATUS__=0\n__RB_TRACE_TCP_STATUS__=0\n".to_string()),
+        );
+        grill.block_execs();
+        let request = crate::onion::trace::TraceRequest {
+            source: "source".to_string(),
+            source_namespace: "default".to_string(),
+            destination: "destination".to_string(),
+            destination_namespace: "default".to_string(),
+            port: None,
+        };
+        let mut active_receivers = Vec::new();
+        for _ in 0..MAX_CONCURRENT_TRACES {
+            let (response, receiver) = oneshot::channel();
+            tx.send(AgentCommand::Trace {
+                request: request.clone(),
+                internal_destination: true,
+                source_node: "node-a".to_string(),
+                response,
+            })
+            .await
+            .unwrap();
+            active_receivers.push(receiver);
+        }
+        grill
+            .wait_for_execs(MAX_CONCURRENT_TRACES.try_into().unwrap())
+            .await;
+
+        let (response, receiver) = oneshot::channel();
+        tx.send(AgentCommand::Trace {
+            request,
+            internal_destination: true,
+            source_node: "node-a".to_string(),
+            response,
+        })
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+            .await
+            .expect("the excess trace must be refused without joining a queue")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, BunError::TraceBusy));
+
+        grill.release_execs(MAX_CONCURRENT_TRACES);
+        for receiver in active_receivers {
+            let _ = receiver.await;
+        }
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_in_flight_workload_trace() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(
+            r#"
+            [app.source]
+            image = "source:v1"
+
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+            "#,
+        )
+        .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+
+        grill.block_execs();
+        let (response, receiver) = oneshot::channel();
+        tx.send(AgentCommand::Trace {
+            request: crate::onion::trace::TraceRequest {
+                source: "source".to_string(),
+                source_namespace: "default".to_string(),
+                destination: "destination".to_string(),
+                destination_namespace: "default".to_string(),
+                port: None,
+            },
+            internal_destination: true,
+            source_node: "node-a".to_string(),
+            response,
+        })
+        .await
+        .unwrap();
+        grill.wait_for_execs(1).await;
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+            .await
+            .expect("shutdown must cancel the trace probe")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result.overall_result,
+            crate::onion::trace::TraceVerdict::Unknown { .. }
+        ));
+        handle.await.unwrap();
+    }
 
     fn test_agent() -> (
         BunAgent<MockGrill>,
@@ -7384,6 +8489,42 @@ mod tests {
         (agent, tx, shutdown, grill_handle)
     }
 
+    async fn test_cluster_fault_agent() -> (
+        BunAgent<MockGrill>,
+        crate::smoker::node_fault::NodeTransportGate,
+        crate::bun::readiness::ReadinessTracker,
+    ) {
+        let (_membership_tx, membership_rx) = tokio::sync::watch::channel(Vec::new());
+        let (_snapshot_tx, snapshot_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(8);
+        let node_gate = crate::smoker::node_fault::NodeTransportGate::new();
+        let cluster = ClusterHandle {
+            membership_rx,
+            raft_metrics_rx: None,
+            council: None,
+            snapshot_rx,
+            wrapping_ikm: None,
+            partition_blocklists: PartitionBlocklists {
+                node_gate: node_gate.clone(),
+                ..PartitionBlocklists::default()
+            },
+            crl_handle: Default::default(),
+        };
+        let mut agent = BunAgent::with_cluster(
+            MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            command_rx,
+            CancellationToken::new(),
+            cluster,
+            "test".to_string(),
+        );
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        readiness.register("agent:test", true).await;
+        readiness.ready("agent:test").await;
+        agent.set_readiness_tracker(readiness.clone());
+        (agent, node_gate, readiness)
+    }
+
     impl<G: Grill + Clone + 'static> BunAgent<G> {
         /// Test-only: run a deploy to completion against an agent that is not
         /// yet on its `run` loop. Deploys now execute on a spawned task that
@@ -7397,6 +8538,7 @@ mod tests {
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
                 },
+                operation: None,
             };
             let events = events.clone();
             let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -7642,6 +8784,19 @@ mod tests {
             _ => None,
         });
         assert_ne!(created, Some(1), "no instance should be created");
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations {
+            response: snapshot_tx,
+        })
+        .await
+        .unwrap();
+        let snapshot = snapshot_rx.await.unwrap();
+        assert!(snapshot.active_deploys.is_empty());
+        assert_eq!(snapshot.history.len(), 1);
+        assert_eq!(
+            snapshot.history[0].outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Failed)
+        );
 
         shutdown.cancel();
         let _ = handle.await;
@@ -7738,6 +8893,8 @@ mod tests {
         let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
         let handle = tokio::spawn(async move { agent.run().await });
 
         // Hold create() at a deterministic barrier, simulating a slow image
@@ -7772,6 +8929,109 @@ mod tests {
         );
 
         grill_handle.release_creates(1);
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn deploy_operations_track_live_phase_conflicts_and_disconnected_clients() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let grill_handle = grill.clone();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let handle = tokio::spawn(async move { agent.run().await });
+
+        grill_handle.block_creates();
+        let (events, mut event_rx) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let operation_id = match event_rx.recv().await.unwrap() {
+            ApplyEvent::Accepted { operation_id } => operation_id,
+            event => panic!("first event was not acceptance: {event:?}"),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            grill_handle.wait_for_creates(1),
+        )
+        .await
+        .expect("deploy never entered create");
+
+        let (snapshot_tx, snapshot_rx) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations {
+            response: snapshot_tx,
+        })
+        .await
+        .unwrap();
+        let snapshot = snapshot_rx.await.unwrap();
+        assert_eq!(snapshot.active_deploys.len(), 1);
+        let active = &snapshot.active_deploys[0];
+        assert_eq!(active.id.as_str(), operation_id);
+        assert_eq!(
+            active.phase,
+            crate::bun::deploy_operations::DeployOperationPhase::DeployingApps
+        );
+        assert_eq!(
+            active
+                .current_target
+                .as_ref()
+                .map(|target| target.name.as_str()),
+            Some("web")
+        );
+
+        let (conflict_events, mut conflict_rx) = mpsc::channel(8);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events: conflict_events,
+        })
+        .await
+        .unwrap();
+        match conflict_rx.recv().await.unwrap() {
+            ApplyEvent::Error { message } => {
+                assert!(message.contains(&operation_id));
+                assert!(message.contains("already being changed"));
+            }
+            event => panic!("overlapping deploy was not refused: {event:?}"),
+        }
+
+        // Losing the SSE consumer must not lose the operation outcome.
+        drop(event_rx);
+        grill_handle.release_creates(1);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (snapshot_tx, snapshot_rx) = oneshot::channel();
+                tx.send(AgentCommand::DeployOperations {
+                    response: snapshot_tx,
+                })
+                .await
+                .unwrap();
+                let snapshot = snapshot_rx.await.unwrap();
+                if let Some(operation) = snapshot
+                    .history
+                    .into_iter()
+                    .find(|operation| operation.id.as_str() == operation_id)
+                {
+                    break operation;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deploy never reached terminal operation history");
+        assert_eq!(
+            terminal.outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Completed)
+        );
+        assert!(terminal.finished_at.is_some());
+        assert!(terminal.finished_at.unwrap() >= terminal.started_at);
+
         shutdown.cancel();
         let _ = handle.await;
     }
@@ -8778,7 +10038,40 @@ mod tests {
                     gid_mappings: None,
                 },
             },
+            rootless_network: None,
         }
+    }
+
+    #[tokio::test]
+    async fn started_rootless_instance_persists_network_recreation_state() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+        grill.set_pid(std::process::id());
+        let rootless_network = crate::grill::records::RootlessNetworkRecord {
+            api_socket: records.path().join("slirp4netns.sock"),
+            owner_pid: 4243,
+            owner_pid_started_at: 1001,
+            container_pid: 4244,
+            port_mapping: Some(crate::grill::oci::PortMapping {
+                host_port: 30000,
+                container_port: 8080,
+            }),
+        };
+        grill.set_rootless_network(rootless_network.clone());
+
+        let (events, mut event_rx) = mpsc::channel(64);
+        agent.deploy(basic_config(), &events).await;
+        drop(events);
+        while event_rx.recv().await.is_some() {}
+
+        let persisted = crate::grill::records::load_records(records.path());
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].schema, 2);
+        assert_eq!(persisted[0].rootless_network, Some(rootless_network));
     }
 
     #[tokio::test]
@@ -9412,32 +10705,142 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn node_drain_is_rejected_not_faked() {
-        // CHAOS1: a node-drain fault used to return Ok while doing nothing.
-        // It's a cluster-level operation, so a node-local fault must refuse
-        // honestly rather than lie about applying it.
-        let (mut agent, _tx, _shutdown) = test_agent();
-        let rule = fault_rule(crate::smoker::types::FaultType::NodeDrain);
-        let result = agent.apply_fault(&rule).await;
-        let err = result.expect_err("node drain must be rejected, not silently accepted");
-        assert!(
-            err.contains("cluster-level"),
-            "unexpected rejection reason: {err}"
-        );
+    fn register_fault(
+        agent: &mut BunAgent<MockGrill>,
+        fault_type: crate::smoker::types::FaultType,
+        duration: std::time::Duration,
+    ) -> crate::smoker::types::FaultRule {
+        agent
+            .fault_registry
+            .insert(&crate::smoker::types::FaultRequest {
+                fault_type,
+                target_service: String::new(),
+                target_instance: None,
+                target_node: Some("node-a".to_string()),
+                duration,
+                injected_by: "test".to_string(),
+                reason: Some("node fault test".to_string()),
+                include_leader: false,
+                override_safety: false,
+                acknowledged: true,
+            })
     }
 
     #[tokio::test]
-    async fn node_kill_is_rejected_not_faked() {
-        let (mut agent, _tx, _shutdown) = test_agent();
-        let rule = fault_rule(crate::smoker::types::FaultType::NodeKill {
-            kill_containers: true,
-        });
-        let result = agent.apply_fault(&rule).await;
-        assert!(
-            result.is_err(),
-            "node kill must be rejected as a node-local fault"
+    async fn node_drain_stops_scheduling_but_keeps_cluster_transports() {
+        let (mut agent, gate, readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeDrain,
+            std::time::Duration::from_secs(30),
         );
+
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(!gate.is_quiesced(), "drain must keep gossip and Raft alive");
+        assert!(
+            !readiness.snapshot().await.ready,
+            "drain must withdraw scheduler readiness"
+        );
+
+        let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
+        agent.reverse_fault(&stored).await;
+        assert!(readiness.snapshot().await.ready);
+    }
+
+    #[tokio::test]
+    async fn node_kill_quiesces_all_cluster_transports_and_restores() {
+        let (mut agent, gate, _readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_secs(30),
+        );
+
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(gate.is_quiesced());
+
+        let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
+        agent.reverse_fault(&stored).await;
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
+    async fn node_fault_refuses_without_a_duration() {
+        let (mut agent, _gate, _readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::ZERO,
+        );
+
+        let error = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("node faults must always be reversible by a deadline");
+        assert!(error.contains("duration"));
+    }
+
+    #[tokio::test]
+    async fn node_pressure_refuses_when_server_limits_are_disabled() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
+            },
+            std::time::Duration::from_secs(30),
+        );
+        let error = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("pressure must not claim success while server limits are zero");
+        assert!(error.contains("configured maximum of 0%"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn node_fault_clear_needs_explicit_node_authorisation() {
+        let (mut agent, gate, _readiness) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_secs(30),
+        );
+        agent.apply_fault(&rule).await.unwrap();
+
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::ClearFault {
+                fault_id: rule.id.0,
+                allow_workload_fault: false,
+                allow_node_fault: false,
+                allow_node_pressure: false,
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(agent.fault_registry.get(rule.id).is_some());
+        assert!(gate.is_quiesced());
+
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::ClearFault {
+                fault_id: rule.id.0,
+                allow_workload_fault: false,
+                allow_node_fault: true,
+                allow_node_pressure: false,
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_ok());
+        assert!(agent.fault_registry.get(rule.id).is_none());
+        assert!(!gate.is_quiesced());
     }
 
     #[tokio::test]
@@ -9454,6 +10857,37 @@ mod tests {
             .await
             .expect_err("memory oom must be rejected");
         assert!(err.contains("reversible"), "unexpected reason: {err}");
+    }
+
+    #[tokio::test]
+    async fn service_partition_without_ebpf_is_refused_not_recorded_as_success() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let rule = fault_rule(crate::smoker::types::FaultType::Partition {
+            source_app: Some("web".to_string()),
+            source_cgroup_id: 0,
+        });
+        let error = agent
+            .apply_fault(&rule)
+            .await
+            .expect_err("partition must not claim success without a loaded eBPF path");
+        assert!(error.contains("eBPF data path"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unimplemented_packet_faults_are_refused_even_if_the_cli_can_describe_them() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let delay = fault_rule(crate::smoker::types::FaultType::Delay {
+            delay_ns: 10_000_000,
+            jitter_ns: 0,
+        });
+        let error = agent.apply_fault(&delay).await.unwrap_err();
+        assert!(error.contains("TC packet hook"), "{error}");
+
+        let bandwidth = fault_rule(crate::smoker::types::FaultType::Bandwidth {
+            bytes_per_sec: 125_000,
+        });
+        let error = agent.apply_fault(&bandwidth).await.unwrap_err();
+        assert!(error.contains("no bandwidth program"), "{error}");
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -9504,7 +10938,7 @@ mod tests {
         let mut rule = fault_rule(crate::smoker::types::FaultType::Pause);
         rule.reversal = crate::smoker::types::FaultReversal::Pause(vec![pid]);
 
-        let (agent, _tx, _shutdown) = test_agent();
+        let (mut agent, _tx, _shutdown) = test_agent();
         agent.reverse_fault(&rule).await;
 
         // Bounded observable wait: poll waitpid until the resumed child exits.
@@ -9532,7 +10966,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reversing_a_pause_without_state_is_a_noop() {
-        let (agent, _tx, _shutdown) = test_agent();
+        let (mut agent, _tx, _shutdown) = test_agent();
         let rule = fault_rule(crate::smoker::types::FaultType::Pause);
         // reversal defaults to None; must not panic or error.
         agent.reverse_fault(&rule).await;
@@ -9567,6 +11001,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let context = agent.build_safety_context(&request).await;
         let check = crate::smoker::safety::evaluate_safety(&request, &context);

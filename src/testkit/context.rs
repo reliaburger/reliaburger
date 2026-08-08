@@ -6,11 +6,13 @@
 //! else — which is what makes it safe to point `relish test` at a cluster
 //! that has real work on it.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::bun::agent::InstanceStatus;
 use crate::bun::capabilities::ClusterCapabilities;
 use crate::relish::client::BunClient;
+use crate::testkit::deadline::Deadline;
+use crate::testkit::report::CleanupOutcome;
 
 /// Prefix for every namespace the test runner creates.
 ///
@@ -26,10 +28,13 @@ pub const TEST_NAMESPACE_PREFIX: &str = "rbtest";
 /// on a process-runtime cluster without shipping a separate binary or image.
 pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 
-/// The stock public image container-workload cases deploy. Small, ubiquitous,
-/// and carries `sh`/`httpd`/`wget` — enough to exercise volumes, ingress and
-/// firewall without building an image.
-pub const BUSYBOX_IMAGE: &str = "busybox:latest";
+/// Immutable multi-architecture OCI workload for container-profile cases.
+///
+/// This is the official BusyBox 1.37.0 OCI index, resolved on 28 July 2026.
+/// The index contains both `linux/amd64` and `linux/arm64`; pinning the index
+/// rather than a tag makes runc and Apple Container execute identical content
+/// on repeated acceptance runs.
+pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "docker.io/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
 /// One test case's handle on the cluster.
 #[derive(Clone)]
@@ -37,11 +42,19 @@ pub struct TestContext {
     pub client: BunClient,
     /// This case's own namespace, e.g. `rbtest-4f2a91-03`.
     pub namespace: String,
+    /// Server-owned app/resource lease. Production runners always set this;
+    /// `None` remains only for focused unit tests of the runner itself.
+    pub(crate) lease_id: Option<String>,
+    /// Exact chaos faults owned by this case. The runner retains a clone so a
+    /// timed-out or panicking body cannot lose reversal ownership.
+    pub(crate) chaos_guard: crate::testkit::chaos::ChaosGuard,
     pub capabilities: ClusterCapabilities,
     /// Per-case budget, from `--timeout`. Poll loops measure against it so a
     /// case fails with a useful message rather than being killed from
     /// outside with none.
     pub timeout: Duration,
+    /// One absolute case deadline. Poll helpers must not start fresh budgets.
+    pub deadline: Deadline,
 }
 
 impl TestContext {
@@ -70,11 +83,32 @@ impl TestContext {
     pub async fn apply(&self, toml: &str) -> Result<(), String> {
         let config = crate::config::Config::parse(toml)
             .map_err(|error| format!("config does not parse: {error}"))?;
-        self.client
-            .apply(&config)
-            .await
+        let has_owned_declarative_resources =
+            !config.app.is_empty() || !config.namespace.is_empty();
+        let lease_compatible = config.job.is_empty()
+            && config.permission.is_empty()
+            && config.build.is_empty()
+            && has_owned_declarative_resources;
+        let result = match &self.lease_id {
+            Some(lease_id) if lease_compatible => {
+                self.client.apply_with_lease(&config, lease_id).await
+            }
+            Some(_) if has_owned_declarative_resources => {
+                return Err(
+                    "test manifest mixes lease-owned apps/namespaces with unsupported resource kinds"
+                        .to_string(),
+                );
+            }
+            _ => self.client.apply(&config).await,
+        };
+        result
             .map(|_| ())
             .map_err(|error| format!("apply failed: {error}"))
+    }
+
+    /// Fault owner shared with the runner's unconditional teardown path.
+    pub fn chaos(&self) -> &crate::testkit::chaos::ChaosGuard {
+        &self.chaos_guard
     }
 
     /// Wait until `app` has at least `replicas` instances in the `running`
@@ -181,15 +215,15 @@ impl TestContext {
 
     /// A TOML spec for an idle container workload in this test's namespace.
     ///
-    /// Runs a stock `busybox` image (pulled from Docker Hub by the runc
-    /// runtime) doing nothing but staying up, so a case can `exec` into it —
-    /// the workload for volume and firewall-source cases. No health check, so
-    /// it reaches Running as soon as the container starts. Needs
+    /// Runs the digest-pinned multi-architecture test workload doing nothing
+    /// but staying up, so a case can `exec` into it. This is the workload for
+    /// volume and firewall-source cases. No health check, so it reaches
+    /// Running as soon as the container starts. Needs
     /// [`Capability::ContainerRuntime`](crate::bun::capabilities::Capability::ContainerRuntime).
     pub fn container_idle_spec(&self, app: &str) -> String {
         format!(
             "[app.{app}]\n\
-             image = \"{BUSYBOX_IMAGE}\"\n\
+             image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
              command = [\"sleep\", \"infinity\"]\n\
              namespace = \"{ns}\"\n",
             ns = self.namespace,
@@ -198,14 +232,15 @@ impl TestContext {
 
     /// A TOML spec for an HTTP container workload in this test's namespace.
     ///
-    /// Runs `busybox httpd` serving `/etc`, health-checked on `/hostname`
-    /// (which maps to `/etc/hostname`, always present). The workload for
-    /// ingress and firewall-target cases. Port is derived from the app name.
+    /// Runs the pinned workload's `httpd` serving `/etc`, health-checked on
+    /// `/hostname` (which maps to `/etc/hostname`, always present). This is the
+    /// workload for ingress and firewall-target cases. Port derives from the
+    /// app name.
     pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
         let port = testapp_port(app);
         format!(
             "[app.{app}]\n\
-             image = \"{BUSYBOX_IMAGE}\"\n\
+             image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
              command = [\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]\n\
              port = {port}\n\
              replicas = {replicas}\n\
@@ -250,7 +285,8 @@ impl TestContext {
                 let ip = node.address.rsplit_once(':').map(|(ip, _)| ip)?;
                 Some((
                     node.node_id,
-                    BunClient::new(&format!("{scheme}://{ip}:{port}")),
+                    self.client
+                        .with_base_url(&format!("{scheme}://{ip}:{port}")),
                 ))
             })
             .collect();
@@ -266,6 +302,22 @@ impl TestContext {
                     instance.app_name == app && instance.namespace == self.namespace
                 }));
             }
+        }
+        Ok(all)
+    }
+
+    async fn namespace_instances(&self) -> Result<Vec<InstanceStatus>, String> {
+        let mut all = Vec::new();
+        for (node, client) in self.node_clients().await? {
+            let statuses = client
+                .status()
+                .await
+                .map_err(|error| format!("could not inspect cleanup on node {node}: {error}"))?;
+            all.extend(
+                statuses
+                    .into_iter()
+                    .filter(|instance| instance.namespace == self.namespace),
+            );
         }
         Ok(all)
     }
@@ -294,7 +346,6 @@ impl TestContext {
     where
         F: Fn(&[InstanceStatus]) -> bool,
     {
-        let deadline = Instant::now() + self.timeout;
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
             if let Ok(instances) = self.cluster_instances(app).await {
@@ -303,7 +354,7 @@ impl TestContext {
                     return Ok(());
                 }
             }
-            if Instant::now() >= deadline {
+            if self.deadline.remaining().is_zero() {
                 let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
                 return Err(format!(
                     "timed out after {:?} waiting for {app} to reach {what} cluster-wide; \
@@ -357,13 +408,10 @@ impl TestContext {
     where
         F: Fn(&[InstanceStatus]) -> bool,
     {
-        let deadline = Instant::now() + self.timeout;
         let poll = Duration::from_millis(500);
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
-            if let Ok(Ok(all)) =
-                tokio::time::timeout(Duration::from_secs(10), self.client.status()).await
-            {
+            if let Ok(Ok(all)) = self.deadline.run("status poll", self.client.status()).await {
                 last = all
                     .into_iter()
                     .filter(|instance| {
@@ -374,7 +422,7 @@ impl TestContext {
                     return Ok(());
                 }
             }
-            if Instant::now() >= deadline {
+            if self.deadline.remaining().is_zero() {
                 let seen: Vec<(&str, &str)> = last
                     .iter()
                     .map(|instance| (instance.app_name.as_str(), instance.state.as_str()))
@@ -390,33 +438,159 @@ impl TestContext {
         }
     }
 
-    /// Stop every app this case created. Best-effort: it never errors and
-    /// never returns anything the runner has to check.
+    /// Stop every app this case created and report whether removal was seen.
     ///
     /// The runner calls this after *every* case — pass, fail or timeout —
     /// because the case that failed halfway is exactly the one that left a
     /// workload running. The [`is_test_namespace`](Self::is_test_namespace)
     /// guard is a second lock on top of the name match: even a bug in
     /// namespace construction cannot make teardown stop an operator's app.
-    pub async fn teardown(&self) {
-        if !Self::is_test_namespace(&self.namespace) {
-            return;
+    pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
+        let faults = self.chaos_guard.cleanup(deadline).await;
+        let resources = self.teardown_resources(deadline).await;
+        merge_cleanup(faults, resources)
+    }
+
+    async fn teardown_resources(&self, deadline: Deadline) -> CleanupOutcome {
+        if let Some(lease_id) = &self.lease_id {
+            match deadline
+                .run("lease release", self.client.release_test_lease(lease_id))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(crate::relish::RelishError::ApiError { status: 404, .. })) => {
+                    // The expiry reaper may have completed first. Absence is
+                    // durable ownership evidence, but runtime absence still
+                    // needs the independent check below.
+                }
+                Ok(Err(crate::relish::RelishError::AgentUnreachable))
+                | Ok(Err(crate::relish::RelishError::RequestTimeout)) => {
+                    return CleanupOutcome::Unknown {
+                        reason: "could not reach the lease owner to confirm cleanup".to_string(),
+                    };
+                }
+                Ok(Err(error)) => {
+                    return CleanupOutcome::Failed {
+                        reason: format!("server-owned lease cleanup failed: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return CleanupOutcome::Unknown {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+            loop {
+                match deadline
+                    .run("cleanup confirmation", self.namespace_instances())
+                    .await
+                {
+                    Ok(Ok(instances)) if instances.is_empty() => {
+                        return CleanupOutcome::Confirmed;
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        return CleanupOutcome::Unknown { reason: error };
+                    }
+                    Err(error) => {
+                        return CleanupOutcome::Unknown {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
-        let Ok(instances) = self.client.status().await else {
-            // A cluster we can't reach has nothing we can tear down. Not an
-            // error the caller can act on — swallow it.
-            return;
+        if !Self::is_test_namespace(&self.namespace) {
+            return CleanupOutcome::Failed {
+                reason: format!("refused to clean unsafe namespace {}", self.namespace),
+            };
+        }
+        let instances = match deadline.run("cleanup status", self.client.status()).await {
+            Ok(Ok(instances)) => instances,
+            Ok(Err(error)) => {
+                return CleanupOutcome::Unknown {
+                    reason: format!("could not inspect owned resources: {error}"),
+                };
+            }
+            Err(error) => {
+                return CleanupOutcome::Unknown {
+                    reason: error.to_string(),
+                };
+            }
         };
-        let mut apps: Vec<&str> = instances
+        let mut apps: Vec<String> = instances
             .iter()
             .filter(|instance| instance.namespace == self.namespace)
-            .map(|instance| instance.app_name.as_str())
+            .map(|instance| instance.app_name.clone())
             .collect();
         apps.sort_unstable();
         apps.dedup();
-        for app in apps {
-            let _ = self.client.stop(app, &self.namespace).await;
+        if apps.is_empty() {
+            return CleanupOutcome::NotRequired;
         }
+        for app in &apps {
+            match deadline
+                .run("cleanup stop", self.client.stop(app, &self.namespace))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return CleanupOutcome::Failed {
+                        reason: format!("failed to stop {app}: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return CleanupOutcome::Unknown {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+        }
+
+        loop {
+            match deadline
+                .run("cleanup confirmation", self.client.status())
+                .await
+            {
+                Ok(Ok(instances))
+                    if !instances.iter().any(|instance| {
+                        instance.namespace == self.namespace && apps.contains(&instance.app_name)
+                    }) =>
+                {
+                    return CleanupOutcome::Confirmed;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return CleanupOutcome::Unknown {
+                        reason: format!("could not confirm cleanup: {error}"),
+                    };
+                }
+                Err(error) => {
+                    return CleanupOutcome::Unknown {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+fn merge_cleanup(left: CleanupOutcome, right: CleanupOutcome) -> CleanupOutcome {
+    use CleanupOutcome::{Confirmed, Failed, NotRequired, Unknown};
+
+    match (left, right) {
+        (Failed { reason: left }, Failed { reason: right }) => Failed {
+            reason: format!("{left}; {right}"),
+        },
+        (Failed { reason }, _) | (_, Failed { reason }) => Failed { reason },
+        (Unknown { reason: left }, Unknown { reason: right }) => Unknown {
+            reason: format!("{left}; {right}"),
+        },
+        (Unknown { reason }, _) | (_, Unknown { reason }) => Unknown { reason },
+        (NotRequired, NotRequired) => NotRequired,
+        (Confirmed | NotRequired, Confirmed | NotRequired) => Confirmed,
     }
 }
 
@@ -443,8 +617,11 @@ mod tests {
         TestContext {
             client: BunClient::new_with_token("http://127.0.0.1:9117", None),
             namespace: namespace.to_string(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
+            deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
         }
     }
 
@@ -477,7 +654,12 @@ mod tests {
         let http = Config::parse(&ctx.container_http_spec("web", 1)).unwrap();
         let web = http.app.get("web").expect("app web");
         assert_eq!(web.namespace.as_deref(), Some("rbtest-abc-00"));
-        assert_eq!(web.image.as_deref(), Some(BUSYBOX_IMAGE));
+        assert_eq!(web.image.as_deref(), Some(PINNED_TEST_WORKLOAD_IMAGE));
+        let (_, digest) = PINNED_TEST_WORKLOAD_IMAGE
+            .split_once("@sha256:")
+            .expect("test workload must use a digest-pinned reference");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(web.health.is_some());
         assert_eq!(web.port, Some(ctx.container_port("web")));
 

@@ -178,6 +178,9 @@ enum Command {
     Chaos {
         /// Scenario or action: council-partition, worker-isolation, status, heal.
         action: String,
+        /// Confirm that a partition action is intentional.
+        #[arg(long)]
+        acknowledge: bool,
     },
     /// Inject faults for chaos testing (Smoker).
     Fault {
@@ -368,15 +371,59 @@ enum Command {
         /// Run the chaos suite instead of the integration suite.
         #[arg(long)]
         chaos: bool,
-        /// Allow chaos against a cluster tagged environment = "production".
-        #[arg(long = "override")]
-        override_production: bool,
-        /// Skip the interactive chaos confirmation prompt (for CI).
-        #[arg(long)]
+        /// Confirm real fault injection without granting server authority.
+        #[arg(long, requires = "chaos")]
         yes: bool,
-        /// Run all tests inside one fixed namespace instead of one per test.
+        /// Acceptance profile: development, full-runc, full-apple, process-grill.
+        #[arg(long, default_value = "development")]
+        profile: String,
+        /// Readable rbtest-* prefix; each case receives a unique suffix.
         #[arg(long)]
         namespace: Option<String>,
+    },
+    /// Run reproducible performance benchmarks against the real data plane.
+    Bench {
+        /// Abbreviated suite for development and CI.
+        #[arg(long)]
+        quick: bool,
+        /// Compare with a previous JSON benchmark report.
+        #[arg(long)]
+        compare: Option<PathBuf>,
+        /// Deliberately schedule minimal workloads until the cluster is full.
+        #[arg(long, requires = "yes")]
+        capacity: bool,
+        /// Include the leader-failure reconstruction benchmark.
+        #[arg(long, requires = "yes")]
+        disruptive: bool,
+        /// Acknowledge capacity saturation and disruptive benchmark effects.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Diagnose cluster health and correlate likely causes.
+    Wtf {
+        /// Scope application checks and log correlation to one app.
+        #[arg(long)]
+        app: Option<String>,
+        /// Re-run diagnosis every 30 seconds until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Trace DNS, service-map, firewall and TCP evidence from a workload.
+    Trace {
+        /// Source application name.
+        source: String,
+        /// Source namespace.
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Destination application, hostname or IP address.
+        #[arg(long)]
+        to: String,
+        /// Namespace of an internal destination.
+        #[arg(long, default_value = "default")]
+        to_namespace: String,
+        /// Destination port. Internal services derive it when omitted.
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -855,6 +902,9 @@ enum FaultAction {
         /// Override the node-percentage safety rail.
         #[arg(long)]
         override_safety: bool,
+        /// Confirm that this destructive node operation is intentional.
+        #[arg(long)]
+        acknowledge: bool,
     },
     /// Simulate abrupt node failure.
     NodeKill {
@@ -875,6 +925,35 @@ enum FaultAction {
         /// Override the node-percentage safety rail.
         #[arg(long)]
         override_safety: bool,
+        /// Confirm that this destructive node operation is intentional.
+        #[arg(long)]
+        acknowledge: bool,
+    },
+    /// Consume bounded CPU and memory capacity on one node.
+    NodePressure {
+        /// Target node name.
+        target: String,
+        /// Total-node CPU percentage to consume (e.g. "80%").
+        #[arg(long, default_value = "0%")]
+        cpu: String,
+        /// Total-node memory-usage target (e.g. "90%").
+        #[arg(long, default_value = "0%")]
+        memory: String,
+        /// Pressure duration (default: 10m).
+        #[arg(long)]
+        duration: Option<String>,
+        /// Allow targeting the cluster leader.
+        #[arg(long)]
+        include_leader: bool,
+        /// A human reason recorded alongside the fault.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Override the node-percentage safety rail.
+        #[arg(long)]
+        override_safety: bool,
+        /// Confirm that capacity saturation is intentional.
+        #[arg(long)]
+        acknowledge: bool,
     },
     /// List all active faults.
     List,
@@ -882,6 +961,12 @@ enum FaultAction {
     Clear {
         /// Fault id or service name to clear (omit to clear all).
         target: Option<String>,
+        /// Node which owns a node-level fault id.
+        #[arg(long, requires = "target")]
+        node: Option<String>,
+        /// Confirm that reversing a node-level fault is intentional.
+        #[arg(long, requires = "node")]
+        acknowledge: bool,
     },
     /// Run a scripted chaos scenario from a TOML file.
     #[command(visible_alias = "run")]
@@ -894,6 +979,9 @@ enum FaultAction {
         /// Speed multiplier (e.g. 2.0 = double speed).
         #[arg(long, default_value = "1.0")]
         speed: f64,
+        /// Confirm that this scenario may inject its workload faults.
+        #[arg(long)]
+        acknowledge: bool,
     },
 }
 
@@ -1003,7 +1091,10 @@ async fn main() -> ExitCode {
         }
         Command::Resolve { ref name } => commands::resolve(name).await,
         Command::Routes => commands::routes().await,
-        Command::Chaos { ref action } => commands::chaos(action).await,
+        Command::Chaos {
+            ref action,
+            acknowledge,
+        } => commands::chaos(action, acknowledge).await,
         Command::Snapshot { ref action } => match action {
             SnapshotAction::Create {
                 app,
@@ -1119,6 +1210,7 @@ async fn main() -> ExitCode {
                 include_leader,
                 reason,
                 override_safety,
+                acknowledge,
             } => {
                 reliaburger::relish::fault::node_drain(
                     target,
@@ -1126,6 +1218,7 @@ async fn main() -> ExitCode {
                     *include_leader,
                     reason.as_deref(),
                     *override_safety,
+                    *acknowledge,
                 )
                 .await
             }
@@ -1136,6 +1229,7 @@ async fn main() -> ExitCode {
                 include_leader,
                 reason,
                 override_safety,
+                acknowledge,
             } => {
                 reliaburger::relish::fault::node_kill(
                     target,
@@ -1144,18 +1238,47 @@ async fn main() -> ExitCode {
                     *include_leader,
                     reason.as_deref(),
                     *override_safety,
+                    *acknowledge,
+                )
+                .await
+            }
+            FaultAction::NodePressure {
+                target,
+                cpu,
+                memory,
+                duration,
+                include_leader,
+                reason,
+                override_safety,
+                acknowledge,
+            } => {
+                reliaburger::relish::fault::node_pressure(
+                    target,
+                    cpu,
+                    memory,
+                    duration,
+                    *include_leader,
+                    reason.as_deref(),
+                    *override_safety,
+                    *acknowledge,
                 )
                 .await
             }
             FaultAction::List => reliaburger::relish::fault::list().await,
-            FaultAction::Clear { target } => {
-                reliaburger::relish::fault::clear(target.clone()).await
+            FaultAction::Clear {
+                target,
+                node,
+                acknowledge,
+            } => {
+                reliaburger::relish::fault::clear(target.clone(), node.as_deref(), *acknowledge)
+                    .await
             }
             FaultAction::Scenario {
                 path,
                 dry_run,
                 speed,
-            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed).await,
+                acknowledge,
+            } => reliaburger::relish::fault::scenario(path, *dry_run, *speed, *acknowledge).await,
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, dry_run).await,
         Command::History {
@@ -1336,11 +1459,8 @@ async fn main() -> ExitCode {
             parallel,
             timeout,
             chaos,
-            // The production/confirmation guards these two feed land with the
-            // chaos scenarios in a later Phase 15 step; parsed now so the flag
-            // surface is stable.
-            override_production: _,
-            yes: _,
+            yes,
+            profile,
             namespace,
         } => {
             // `relish test` reports pass/fail through its exit code, so it
@@ -1351,7 +1471,57 @@ async fn main() -> ExitCode {
                     parallel,
                     timeout,
                     chaos,
+                    yes,
+                    profile,
                     namespace,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
+        Command::Bench {
+            quick,
+            compare,
+            capacity,
+            disruptive,
+            yes,
+        } => {
+            return finish_outcome(
+                reliaburger::relish::bench_cmd::run(reliaburger::relish::bench_cmd::BenchArgs {
+                    quick,
+                    compare,
+                    capacity,
+                    disruptive,
+                    yes,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
+        Command::Wtf { app, watch } => {
+            return finish_outcome(
+                reliaburger::relish::wtf_cmd::run(reliaburger::relish::wtf_cmd::WtfArgs {
+                    app,
+                    watch,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
+        Command::Trace {
+            source,
+            namespace,
+            to,
+            to_namespace,
+            port,
+        } => {
+            return finish_outcome(
+                reliaburger::relish::trace_cmd::run(reliaburger::relish::trace_cmd::TraceArgs {
+                    source,
+                    source_namespace: namespace,
+                    destination: to,
+                    destination_namespace: to_namespace,
+                    port,
                     output: cli.output,
                 })
                 .await,
@@ -1441,6 +1611,7 @@ mod tests {
             "--reason",
             "game-day",
             "--override-safety",
+            "--acknowledge",
         ])
         .unwrap();
         match cli.command {
@@ -1451,6 +1622,7 @@ mod tests {
                 assert_eq!(targeting.node.as_deref(), Some("node-2"));
                 assert_eq!(targeting.reason.as_deref(), Some("game-day"));
                 assert!(targeting.override_safety);
+                assert!(targeting.acknowledge);
             }
             _ => panic!("expected a fault delay command"),
         }
@@ -1462,7 +1634,10 @@ mod tests {
         assert!(matches!(
             clear_by_name.command,
             Command::Fault {
-                action: FaultAction::Clear { target: Some(ref t) }
+                action: FaultAction::Clear {
+                    target: Some(ref t),
+                    ..
+                }
             } if t == "redis"
         ));
         let resume = parse(&["relish", "fault", "resume", "redis"]).unwrap();
@@ -1483,11 +1658,10 @@ mod tests {
                 filter: None,
                 parallel: 4,
                 chaos: false,
-                override_production: false,
-                yes: false,
+                ref profile,
                 namespace: None,
                 ..
-            }
+            } if profile == "development"
         ));
 
         let full = parse(&[
@@ -1500,8 +1674,8 @@ mod tests {
             "--timeout",
             "5m",
             "--chaos",
-            "--override",
-            "--yes",
+            "--profile",
+            "full-runc",
             "--namespace",
             "rbtest-fixed",
         ])
@@ -1512,20 +1686,132 @@ mod tests {
                 parallel,
                 timeout,
                 chaos,
-                override_production,
                 yes,
+                profile,
                 namespace,
             } => {
                 assert_eq!(filter.as_deref(), Some("scheduling,firewall"));
                 assert_eq!(parallel, 8);
                 assert_eq!(timeout, "5m");
                 assert!(chaos);
-                assert!(override_production);
-                assert!(yes);
+                assert!(!yes);
+                assert_eq!(profile, "full-runc");
                 assert_eq!(namespace.as_deref(), Some("rbtest-fixed"));
             }
             _ => panic!("expected a Test command"),
         }
+    }
+
+    #[test]
+    fn parse_bench_command_defaults_and_explicit_risk_flags() {
+        let bare = parse(&["relish", "bench"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Command::Bench {
+                quick: false,
+                compare: None,
+                capacity: false,
+                disruptive: false,
+                yes: false,
+            }
+        ));
+        assert!(parse(&["relish", "bench", "--capacity"]).is_err());
+        assert!(parse(&["relish", "bench", "--disruptive"]).is_err());
+
+        let full = parse(&[
+            "relish",
+            "bench",
+            "--quick",
+            "--compare",
+            "base.json",
+            "--capacity",
+            "--disruptive",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            full.command,
+            Command::Bench {
+                quick: true,
+                compare: Some(ref path),
+                capacity: true,
+                disruptive: true,
+                yes: true,
+            } if path == std::path::Path::new("base.json")
+        ));
+    }
+
+    #[test]
+    fn parse_wtf_scope_watch_and_machine_output() {
+        let bare = parse(&["relish", "wtf"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Command::Wtf {
+                app: None,
+                watch: false
+            }
+        ));
+
+        let scoped = parse(&[
+            "relish", "--output", "json", "wtf", "--app", "payments", "--watch",
+        ])
+        .unwrap();
+        assert_eq!(scoped.output, OutputFormat::Json);
+        assert!(matches!(
+            scoped.command,
+            Command::Wtf {
+                app: Some(ref app),
+                watch: true
+            } if app == "payments"
+        ));
+    }
+
+    #[test]
+    fn parse_trace_namespaces_port_and_machine_output() {
+        let parsed = parse(&[
+            "relish",
+            "--output",
+            "yaml",
+            "trace",
+            "api",
+            "--namespace",
+            "frontend",
+            "--to",
+            "db",
+            "--to-namespace",
+            "storage",
+            "--port",
+            "5432",
+        ])
+        .unwrap();
+        assert_eq!(parsed.output, OutputFormat::Yaml);
+        assert!(matches!(
+            parsed.command,
+            Command::Trace {
+                source,
+                namespace,
+                to,
+                to_namespace,
+                port: Some(5432),
+            } if source == "api"
+                && namespace == "frontend"
+                && to == "db"
+                && to_namespace == "storage"
+        ));
+    }
+
+    #[test]
+    fn test_command_has_no_client_side_production_override_but_accepts_consent() {
+        assert!(parse(&["relish", "test", "--override"]).is_err());
+        let parsed = parse(&["relish", "test", "--chaos", "--yes"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Test {
+                chaos: true,
+                yes: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2139,6 +2425,7 @@ mod tests {
             "--include-leader",
             "--duration",
             "30s",
+            "--acknowledge",
         ])
         .unwrap();
         match cli.command {
@@ -2148,6 +2435,7 @@ mod tests {
                         target,
                         containers,
                         include_leader,
+                        acknowledge,
                         duration,
                         ..
                     },
@@ -2155,9 +2443,48 @@ mod tests {
                 assert_eq!(target, "node-05");
                 assert!(containers);
                 assert!(include_leader);
+                assert!(acknowledge);
                 assert_eq!(duration.as_deref(), Some("30s"));
             }
             _ => panic!("expected Fault NodeKill"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_node_pressure_with_server_gated_targets() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "node-pressure",
+            "worker-2",
+            "--cpu",
+            "80%",
+            "--memory",
+            "90%",
+            "--duration",
+            "30s",
+            "--acknowledge",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action:
+                    FaultAction::NodePressure {
+                        target,
+                        cpu,
+                        memory,
+                        duration,
+                        acknowledge,
+                        ..
+                    },
+            } => {
+                assert_eq!(target, "worker-2");
+                assert_eq!(cpu, "80%");
+                assert_eq!(memory, "90%");
+                assert_eq!(duration.as_deref(), Some("30s"));
+                assert!(acknowledge);
+            }
+            _ => panic!("expected Fault NodePressure"),
         }
     }
 
@@ -2177,7 +2504,7 @@ mod tests {
         let cli = parse(&["relish", "fault", "clear"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Clear { target },
+                action: FaultAction::Clear { target, .. },
             } => assert!(target.is_none()),
             _ => panic!("expected Fault Clear"),
         }
@@ -2188,7 +2515,27 @@ mod tests {
         let cli = parse(&["relish", "fault", "clear", "42"]).unwrap();
         match cli.command {
             Command::Fault {
-                action: FaultAction::Clear { target },
+                action: FaultAction::Clear { target, .. },
+            } => assert_eq!(target.as_deref(), Some("42")),
+            _ => panic!("expected Fault Clear"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_clear_on_node_requires_explicit_targeting() {
+        let cli = parse(&[
+            "relish",
+            "fault",
+            "clear",
+            "42",
+            "--node",
+            "node-05",
+            "--acknowledge",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Clear { target, .. },
             } => assert_eq!(target.as_deref(), Some("42")),
             _ => panic!("expected Fault Clear"),
         }

@@ -163,7 +163,10 @@ pub struct IngressSpec {
     pub host: String,
     /// URL path prefix. Default: "/".
     pub path: Option<String>,
-    /// TLS mode: "auto" (Let's Encrypt), "cluster" (air-gapped), "acme".
+    /// TLS mode: `"cluster"`, `"explicit"`, or `"none"`.
+    ///
+    /// Automatic ACME (`"auto"`/`"acme"`) is deferred and rejected during
+    /// ingress route validation.
     pub tls: Option<String>,
     /// Enable WebSocket upgrade support.
     pub websocket: Option<bool>,

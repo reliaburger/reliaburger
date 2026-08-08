@@ -168,6 +168,83 @@ tests and terminates a hung test after a bounded interval. Retries are zero. Aut
 rerunning a flaky distributed test makes the dashboard greener while preserving the race.
 We're trying to remove the race.
 
+## Alive isn't ready
+
+An HTTP listener can answer while the agent command loop is dead. It can also answer while
+DNS, Raft or the registry has fallen over. Returning `{"status":"ok"}` in those cases tells
+the truth about the process and lies about the node. Those are two different questions, so
+we now give them two different endpoints.
+
+`GET /v1/health` remains the public liveness probe. If it answers, a process manager knows
+the binary is alive and accepting HTTP. Authenticated callers use `/v1/readiness` for the
+stronger claim. It returns 200 only when every critical subsystem is `Ready`, and 503 with
+the evidence when any of them is still `Starting`, has become `Degraded`, or has `Stopped`.
+Each record includes when its state changed and the latest error and error time. No more
+searching the logs to discover that a green node lost half its control plane.
+The combined capability report names the node and gives the snapshot a 15-second expiry;
+after that, a diagnostic must call the state unknown rather than replaying an old green.
+
+The four states are a Rust `enum`:
+
+```rust
+pub enum SubsystemState {
+    Starting,
+    Ready,
+    Degraded,
+    Stopped,
+}
+```
+
+An enum is better than four booleans because only one variant can exist at a time, and a
+`match` must consider every variant. The tracker sits behind an `Arc<RwLock<_>>`. `Arc`
+gives the API, agent and task wrappers shared ownership; Tokio's asynchronous `RwLock`
+allows concurrent readers while serialising a transition. We copy a snapshot out before
+returning it, so a slow HTTP client never holds the lock.
+
+Readiness also travels to the leader in its own reporting message. Why another message?
+Reliaburger uses positional bincode frames between nodes. Adding a field to an existing
+frame would make an older binary run out of bytes while decoding it. Appending a new enum
+variant preserves every existing discriminant. An old node may reject the new extension,
+but it still decodes the ordinary report. The leader treats a missing or expired readiness
+extension as unready. Rolling compatibility doesn't mean optimistic guessing.
+
+There is one more trap here: “supervise” doesn't automatically mean “restart”. A gossip
+task owns a UDP socket. A report worker owns the receiving end of a channel. Starting a
+second copy may fail to bind, steal messages or leave two authorities alive. Those owners
+never auto-restart. Bun records their death and fences scheduling.
+
+The security-state refresher is different. Its factory owns only cloneable handles and can
+recreate its timer from scratch, so Bun may reconstruct it. Even then the policy names a
+maximum retry count, a delay, a recovery window and a shutdown deadline. The factory takes
+a child cancellation token for each attempt. Rust's ownership rules help us state the real
+question: can this closure build a completely new owner without borrowing the dead one? If
+the answer isn't obviously yes, we don't restart it.
+
+The scheduler consumes the same evidence under an independent receive-time lease. A fresh
+metrics report can't keep stale readiness alive, and a leader change starts with no inherited
+lease. Until the node proves every critical owner again, it receives no new work. Briefly
+under-scheduling is inconvenient. Scheduling onto a node whose control plane is half dead is
+worse.
+
+Readiness isn't the whole capability story. Pickle can have a healthy TCP listener and still
+be useless to peers, or have enough members for two copies while one layer has only one. Its
+capability record therefore reports both inputs and outcomes: the actual `SocketAddr`, TLS
+and P2P state, target copy count, active members and under-replicated layers. The listener is
+an `Option<SocketAddr>` because an unbound registry has no honest address; `None` says that
+directly instead of smuggling absence through `0.0.0.0:0`.
+
+In cluster mode the default loopback setting derives the gossip-advertised IP. An explicit
+bind must be that IP or a wildcard. Otherwise Bun refuses to start. This is a useful pattern
+for configuration defaults: a safe standalone default can become a derived cluster value,
+but it must never survive into a mode where its guarantee is false.
+
+Identity evidence needs the same discipline. `[cluster].name` is the SPIFFE
+trust domain for app, job and build-signer certificates. Generated configs now
+persist it and Bun rejects malformed domains at startup. The acceptance test
+uses a non-default name, signs a real workload CSR with that cluster's Workload
+CA, validates the chain and checks the URI SAN. A string-format assertion alone
+would have missed the original wiring bug.
+
 ## Correctness is not a benchmark
 
 One test transferred 100 MB over the P2P path and asserted that it finished in under five
@@ -298,6 +375,34 @@ webhook test accidentally exercised startup, or whether a five-second performanc
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
 lines, but read the covered tests too.
 
+## Examples are tests when we run them
+
+Twenty-one configuration files sat under `examples/`. The Make target labelled itself a
+dry-run, then called `relish apply` without `--dry-run`, discarded both output streams and
+reported every file as broken because no agent was running. It managed to test the absence
+of Bun 21 times. Two configs really were stale, but the useful errors went into the same
+bin.
+
+The repaired target builds Relish once, sends every file through the real parser, validator
+and planner, and keeps a failed command's diagnostic. Successful plans stay quiet. That
+makes `make examples` cheap enough for every pull request, and it catches the same drift a
+reader would hit after copying an example.
+
+We apply the same rule to platform promises. The `ebpf` Cargo feature can be selected on
+macOS even though Aya and the kernel hooks exist only on Linux. An Aya-using branch therefore
+needs both conditions:
+
+```rust
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod maps;
+```
+
+You have met `#[cfg]` already. `all(a, b)` is its Boolean AND: the compiler includes the
+item only when both predicates are true. The matching fallback uses
+`not(all(...))`, so an all-feature macOS build still gets the unsupported stub. Hosted macOS
+now runs the all-target, all-feature Clippy command. That's a compile-time check of the
+boundary, not a hopeful comment saying the code is portable.
+
 ## Dependencies are code too
 
 The lockfile is part of the programme. A perfectly tested call into a vulnerable archive
@@ -317,6 +422,13 @@ issue, and ratatui brings in an `lru::IterMut` soundness issue. The latter affec
 isn't called by ratatui's layout cache. The former can parse a crafted Parquet object when an
 operator points the remote log-query command at it, so trusted storage is a compensating
 control, not a fix. We wrote both decisions down, named an owner and gave them an expiry.
+
+A later `rkyv` advisory showed why the compiled graph matters too. Cargo locked
+`rust_decimal`'s optional `rkyv` 0.7 dependency, but `byte-unit` disables the defaults that
+would enable it. `cargo tree --target all -i rkyv` found no active path, and Reliaburger reads
+no rkyv archives. The advertised fix starts at the incompatible rkyv 0.8 API while
+`rust_decimal` 1.x deliberately pins its optional integration to 0.7. We recorded a temporary,
+expiring exception instead of pretending that changing an unused lockfile version was a fix.
 
 The repository audit denies every new vulnerability and maintenance warning. Its short
 exception list expires on 18 August 2026, and the Make target fails after that date until we
@@ -413,23 +525,20 @@ fault_injection: statics.cgroup_faults || statics.ebpf || cluster,
 If a field would always be `true`, it isn't a capability. Either derive it from something
 real or delete it.
 
-### A tag that decides whether we're allowed to break things
+### Policy decides whether we're allowed to break things
 
-One field isn't about wiring at all. `[cluster] environment` is a free-form string —
-`"production"`, `"staging"`, whatever you like — and the chaos suite refuses to run
-against a cluster tagged production unless you pass `--override`.
+`[cluster] environment` remains useful descriptive metadata. It is a poor
+authorisation boundary. It's free-form, absent by default and easy to misspell.
+The first proposal treated an untagged cluster as non-production and let a
+client-side `--override` bypass the check. Both failures point towards doing
+more damage.
 
-Note which way the default fails. An *untagged* cluster counts as non-production. Requiring
-a tag to avoid chaos would mean the cluster nobody remembered to label is the one that gets
-its leader killed, and "we forgot to set a config field" is a bad reason to have an
-outage. The tag is a brake, not an accelerator, so absent means "no brake requested",
-and the operator who wants the brake is the one who has to say so.
-
-The comparison is case-insensitive, which sounds like a detail and is really a small
-lesson about guards. An operator who writes `environment = "Production"` means precisely
-what one who writes `"production"` means. A guard that only matches one spelling isn't a
-strict guard — it's a broken one, and it fails silently in the direction of *not*
-protecting you.
+The capabilities response now carries the server's typed `[testing]` policy.
+Its safety class defaults to `unknown`, and unknown is protected. Each operation
+class has its own allowlist entry and minimum authenticated role. Protected
+mutation needs a second server-side gate. A confirmation flag can record the
+operator's acknowledgement, but it cannot add a permission the server didn't
+grant. This is an interlock, not a warning label.
 
 ## A workload in your pocket
 
@@ -531,34 +640,39 @@ teach something about Rust.
 
 ### An outcome with data attached
 
-The tempting shape is a boolean, or `Result<(), Error>`. Both are wrong here,
-because a case can finish in four ways and only two of them are pass and fail:
+The tempting shape is a boolean, or `Result<(), Error>`. Both are wrong here.
+A case still has four top-level states, but a timeout is not a fifth verdict:
 
 ```rust
 pub enum TestOutcome {
-    Passed,
-    Failed { message: String },
-    Skipped { reason: String },
-    TimedOut,
+    Pass,
+    Fail { reason: String },
+    Skipped { capability: Capability, reason: String },
+    Unknown { kind: UnknownKind, reason: String },
 }
 ```
 
 This is a Rust enum — a *sum type*, not the integer constants C calls an enum.
-Each variant can carry different data: `Failed` has a message, `Skipped` has a
-reason, `Passed` and `TimedOut` carry nothing because there's nothing to say.
+Each variant can carry different data. `Fail` explains the assertion,
+`Skipped` names the capability which was proven absent, and `Unknown` says why
+the runner couldn't establish a verdict.
 Coming from Go you'd model this as `(bool, error)` and rely on a convention
 about which combinations are legal; coming from Python you'd raise different
 exception classes and hope every caller catches the right ones. Here the
-illegal states can't be written down: there is no `Passed` with a failure
+illegal states can't be written down: there is no `Pass` with a failure
 message.
 
-`Skipped` is the variant that earns its place, and it's the one a naive design
-omits. A case that needs eBPF, run against a cluster without it, has not
-passed and has not failed. Fold it into `Passed` and you have a green that
-never ran. Fold it into `Failed` and every partially-configured cluster is
-permanently red, which trains people to ignore red. The third state is the
-honest one, and it carries *why*, so the report says "skipped: capability
-`ebpf` unavailable" rather than leaving you to guess.
+`Skipped` only means one thing: fresh capability evidence says the requested
+facility isn't available. A timeout isn't a skip. A collector error isn't a
+skip. A case deciding at runtime that it would rather not run isn't a skip
+either. Those are all `Unknown`, because we don't have enough evidence to say
+pass or fail. This sounds fussy until a production gate turns green because
+the API was down. Then it sounds obvious.
+
+Cleanup gets an independent outcome (`Confirmed`, `NotRequired`, `Failed` or
+`Unknown`). A case can pass its assertion and still leave a workload running.
+Keeping cleanup outside `TestOutcome` records both facts instead of letting
+one overwrite the other.
 
 The serde attributes matter for the same reason:
 
@@ -566,27 +680,27 @@ The serde attributes matter for the same reason:
 #[serde(rename_all = "snake_case", tag = "status")]
 ```
 
-`tag = "status"` produces `{"status": "failed", "message": "..."}` rather than
+`tag = "status"` produces `{"status": "fail", "reason": "..."}` rather than
 serde's default nesting. It's the shape a `jq` one-liner in someone's CI
 expects, and once shipped it's an API — hence `schema_version` on the report
 and a snapshot test pinning the whole thing.
 
 ### Counters that can't lie
 
-`TestReport` carries `total`, `passed`, `failed` and `skipped` alongside the
-full results list. Two representations of the same facts is an invitation for
+`TestReport` carries `total`, `passed`, `failed`, `skipped` and `unknown`
+alongside the full results list. Two representations of the same facts is an invitation for
 them to disagree, and a summary line contradicting the list beneath it
 destroys trust in both.
 
 So the counters are *derived* in one place, from the results, at construction:
 
 ```rust
-let passed = results.iter().filter(|r| r.outcome == TestOutcome::Passed).count();
+let passed = results.iter().filter(|r| r.outcome == TestOutcome::Pass).count();
 ```
 
 Not incremented as tests finish. Incrementing works right up until an early
 return or a `?` skips one, and then the arithmetic is quietly wrong forever.
-A test asserts the parts sum to the whole.
+A test asserts the four parts sum to the whole.
 
 ### Why a test case can't just be an async fn
 
@@ -695,51 +809,60 @@ scope" rule quietly does the bookkeeping a Go `defer` would do by hand.
 
 Next, hanging. A health check that never returns, a deploy that never
 completes — a case can wedge, and one wedged case must not take the run with it.
-Every case runs inside a budget:
+Every case gets one absolute deadline. Polls, API calls and assertions inherit
+the remaining budget; they don't each start a fresh two-minute timeout:
 
 ```rust
-match tokio::time::timeout(timeout, (case.run)(context.clone())).await {
-    Ok(Ok(()))       => TestOutcome::Passed,
-    Ok(Err(message)) => TestOutcome::Failed { message },
-    Err(_elapsed)    => TestOutcome::TimedOut,
+match deadline.run("case", body).await {
+    Ok(Ok(Ok(())))      => TestOutcome::Pass,
+    Ok(Ok(Err(reason))) => TestOutcome::Fail { reason },
+    Ok(Err(panic))      => TestOutcome::Unknown {
+        kind: UnknownKind::Panicked,
+        reason: panic.to_string(),
+    },
+    Err(_)              => TestOutcome::Unknown {
+        kind: UnknownKind::TimedOut,
+        reason: "case exceeded its deadline".into(),
+    },
 }
 ```
 
-`TimedOut` is its own outcome, not a `Failed` with a "timed out" message,
-because a timeout and an assertion failure are different diagnoses: one says the
-system is stuck, the other says it did the wrong thing. Folding them together
-throws that away.
+The case body runs in a nested Tokio task. That detail is easy to miss. If the
+outer task owns both the body and cleanup, a panic kills the owner before it
+can clean anything. The nested task turns the panic into evidence and leaves
+the owner alive.
 
 Then teardown, which is the whole reason this is safe to point at a real
 cluster. It runs after every case:
 
 ```rust
-let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, context.teardown()).await;
+let cleanup = context.teardown(cleanup_deadline).await;
 ```
 
 Note "after every case" — pass, fail *or* timeout. It's tempting to only clean
 up after a pass, but that's exactly backwards: the case that failed halfway is
 the one that left a workload running. Teardown is the runner's job precisely so
 a case body can `return Err(...)` the moment something's wrong without a pile of
-cleanup code first. And teardown itself gets a timeout, because "clean up after
-a hung agent" must not become the new way to hang.
+cleanup code first. Teardown then asks `/v1/status` until the resources have
+actually gone. We record timeout, API failure and a workload which remains
+present as cleanup evidence. Discarding the result with `let _ =` would make
+the happy path shorter and the report less true.
 
 Two smaller decisions round it out. Cases finish whenever they finish — a
 250-millisecond case beats a 30-second one to the join — but a report where the
 rows jump around between runs is a report nobody trusts. So each case carries
-its catalogue index, and the results are sorted back into order at the end. And
-a case that *panics* (someone reached for `.unwrap()` where they should have
-returned an `Err`) is caught and turned into a failure at its right place,
-rather than vanishing from the report:
+its catalogue index, and the results are sorted back into order at the end.
+There are two panic boundaries. The nested body catches a case panic while the
+owner still has its context for cleanup. The outer join set keeps a second
+identity map in case the runner itself panics:
 
 ```rust
 let mut identities: HashMap<tokio::task::Id, (usize, String, TestGroup)> = ...;
 ```
 
-A panicked task aborts before it can return anything, so its name and index
-can't ride back on the return value — they have to be recorded out here, keyed
-by the task's id, and looked up when the join comes back an `Err`. One case
-mishandled shouldn't blank a forty-case run.
+An outer task which panics can't return its name and index, so we record them
+out here, keyed by task id, and look them up when the join comes back as an
+`Err`. One mishandled case shouldn't blank a forty-case run.
 
 One thing the runner deliberately does *not* do is pause the clock. Elsewhere in
 this book we drove time with `tokio::test(start_paused = true)` to make a
@@ -748,6 +871,39 @@ advance the virtual clock out from under the code driving it — a trap we've hi
 before in this codebase. So the runner is timed against the real clock, and its
 own tests use small real durations: a 50-millisecond timeout against a case that
 sleeps for 30 seconds proves the timeout fires without making anyone wait.
+
+## A green result needs a profile
+
+Should a missing eBPF capability fail the run? On a developer's Mac, no. On the
+rootful-runc acceptance job which promised to test the Linux data plane, yes.
+The result alone can't answer that question, so the report records one of four
+profiles: `development`, `full-runc`, `full-apple` or `process-grill`.
+
+The development profile may accept a typed skip for a facility the node proved
+absent. A full profile marks the cases it requires. A required skip, any
+`Unknown`, missing observed evidence, or failed/unknown cleanup makes the run
+non-zero. We keep the skipped row as `Skipped`; we don't rewrite history as
+`Fail` just because the profile rejects the run.
+
+Safety has a similar split. The old proposal used a free-form
+`[cluster].environment` and let `--override` weaken a production check from the
+client. A typo such as `prodution` was enough to make the cluster look safe.
+Now `node.toml` owns a typed policy:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = [
+  "read_diagnostics",
+  "provision_isolated_workloads",
+]
+max_lease_seconds = 900
+```
+
+The default safety class is `unknown`, and unknown is protected. The server
+checks the authenticated role, the operation allowlist, protected-cluster
+policy and explicit acknowledgement. Acknowledgement records consent; it
+doesn't grant permission. There is deliberately no `relish test --override`.
 
 ## The exit code is the message
 
@@ -774,10 +930,11 @@ pub enum CommandOutcome {
 }
 ```
 
-`relish test` maps a report with any failure to `Problems` and a clean one to
-`Clean`. (`Warnings` is for `wtf`, later — a cluster that's degraded but not
-broken.) The binary keeps a second little function next to the original
-`finish`:
+`relish test` maps a report rejected by its profile to `Problems` and a clean
+one to `Clean`. That includes assertion failures, unknown evidence, required
+skips and unconfirmed cleanup. (`Warnings` is for `wtf`, later — a cluster
+that's degraded but not broken.) The binary keeps a second little function
+next to the original `finish`:
 
 ```rust
 fn finish_outcome(result: Result<CommandOutcome, RelishError>) -> ExitCode {
@@ -810,8 +967,10 @@ scheduling
   SKIP  schedule_respects_required_placement_label  (0 ms)  requires multi_node
 service-discovery
   FAIL  resolve_returns_vip_and_healthy_backends  (80 ms)  expected 2 backends, saw 1
+health-checks
+  UNKN  hanging_health_check_marks_instance_unhealthy  (120000 ms)  case exceeded its deadline
 
-4 tests: 1 passed, 2 failed, 1 skipped  (4.3s)
+4 tests: 1 passed, 1 failed, 1 skipped, 1 unknown  (120.0s)
 ```
 
 No colour crate, no terminal detection — a report that reads identically in a
@@ -856,29 +1015,26 @@ container-image supply chain the harness has no business owning. `testapp_spec`
 builds that TOML, deriving a per-app port (an FNV hash of the name) so two apps
 in one case don't fight over a socket.
 
-### Two ways to skip
+### One way to skip
 
 A case that needs the process runtime shouldn't *fail* on a runc cluster — it
 should skip, the same way a case needing eBPF skips where eBPF is off. That's the
 `requires` list from earlier, and every `testapp` case lists
 `Capability::ProcessRuntime`. The runner checks it before the case runs.
 
-But some cases can only discover whether they apply once they've *asked* the
-cluster. A placement case needs a node that advertises a label to pin to; if none
-does, there's nothing to test. The static `requires` list can't express "a node
-has a label" — that's a runtime fact. So a case can skip itself from inside its
-body:
+The first implementation also let a case skip itself after it started. That
+was convenient and ambiguous, so the current helper names the state honestly:
 
 ```rust
 let Some((node, key, value)) = labelled_node else {
-    return skip("no node advertises a label to target");
+    return unknown("no node advertises a label to target");
 };
 ```
 
-`skip` is just an `Err` carrying a marker prefix that the runner recognises and
-turns into `Skipped` rather than `Failed`. It's a small thing, but it's the
-difference between an honest "didn't apply here" and a red that scares someone at
-2 a.m.
+Was the label genuinely absent, was the collector stale, or did the API fail?
+A string can't prove which. The runner records
+`Unknown(MissingEvidence)`. If a case needs a dynamic prerequisite, the
+capability API must report it with fresh evidence before the case starts.
 
 ### Status is node-local
 
@@ -901,17 +1057,18 @@ cluster.
 
 ### The cases are the tests
 
-The catalogue is fifteen cases across five groups — scheduling, deployments,
-health-checks, process-workloads and jobs — each a behaviour sentence
-(`rolling_deploy_keeps_the_app_running`, `failing_job_retries_then_fails`). They
-run against a live cluster, so they can't run in `make ci`; what `make ci` checks
-is the scaffolding around them — that the catalogue has no duplicate names, that
-every group is covered, that every `testapp` case remembered to require the
-process runtime, that `testapp_spec` produces TOML the config parser accepts. The
-cases themselves earn their keep at the acceptance milestone, on a real
-three-node cluster. That split — unit-test the harness, acceptance-test the
-cluster — is the same honesty this chapter opened with: a green check should mean
-something specific, and never more than it can back up.
+The ordinary catalogue is now 39 cases across 13 groups: scheduling, service
+discovery, deployments, health checks, secrets and config, firewall, workload
+identity, ingress, volumes, process workloads, jobs, image registry and cluster
+coordination. Each name is a behaviour sentence
+(`rolling_deploy_keeps_the_app_running`, `failing_job_retries_then_fails`).
+They run against a live cluster, so they can't run in `make ci`; what `make ci`
+checks is the scaffolding around them — unique names, group coverage, typed
+requirements, valid generated TOML, verdict aggregation and cleanup behaviour.
+The cases themselves earn their keep at the acceptance milestone, on a real
+cluster. That split — unit-test the harness, acceptance-test the cluster — is
+the same honesty this chapter opened with: a green check should mean something
+specific, and never more than it can back up.
 
 ## The line the workload draws
 
@@ -1006,6 +1163,81 @@ check your work. Inverting the parser's own arithmetic — `bytes_per_sec * 8 /
 just move the tool a little closer to meaning what it says, which is the whole
 job before we start breaking things on purpose.
 
+## The last fault that lied
+
+The service partition arm was the last obvious silent success. Ask Bun to block
+`web` from `payments` on a node without eBPF and it added a registry row,
+returned `200 OK`, and changed no connection. The excuse was a test: the
+three-node quorum test used that same `Partition` value as shorthand for a Raft
+transport partition. Tightening the service path would break the test.
+
+That's not a reason to keep the lie. It's evidence that we'd put two different
+operations in one enum variant.
+
+A control-plane partition blocks gossip and Raft addresses between nodes. It
+can remove a council voter, so the quorum rail must count it. A service
+partition blocks `connect()` from a workload cgroup to a service VIP. It can't
+remove a Raft voter and should never consume the quorum budget. The fix starts
+by naming them separately:
+
+```rust
+pub enum FaultType {
+    Partition {
+        source_app: Option<String>,
+        source_cgroup_id: u64,
+    },
+    CouncilPartition,
+    // ...
+}
+```
+
+Why leave `source_cgroup_id` on the wire at all? Compatibility. Why refuse a
+non-zero value from a client? Authority. The kernel compares the key against
+`bpf_get_current_cgroup_id()`, and only Bun can reliably tie that number to the
+instances it supervises. Trusting an arbitrary integer from a caller would let
+the caller fault some other cgroup or create a convincing no-op with a made-up
+one.
+
+For a named source app, Bun finds every running local instance, asks the runtime
+for its PID, resolves `/proc/<pid>/cgroup` to the cgroup-v2 inode id, and writes
+one key per instance. The important bit isn't the loop. It's the ownership
+record:
+
+```rust
+pub enum FaultReversal {
+    BpfConnectKeys(Vec<(u32, u16, u64)>),
+    // ...
+}
+```
+
+That `Vec` (Rust's growable array) is the exact set this fault installed:
+network-order VIP, network-order port and source cgroup id. If the third map
+write fails, Bun deletes the first two before it reports the injection failure.
+If activation succeeds, clear and expiry delete those same keys rather than
+trying to reconstruct them from whatever the service map looks like later. The
+service may have been redeployed or removed by then. Cleanup must own facts,
+not guesses.
+
+The Linux acceptance test loads the real cgroup connect program, publishes a
+VIP backed by a local listener, and resolves the test process's own cgroup id.
+The control connection succeeds. After inserting the source-scoped partition
+key, the kernel returns `EPERM` and the backend sees no connection. Delete the
+key and the connection succeeds again. The three-node quorum test now drives
+the actual `/v1/chaos/partition` transport operation, so neither mechanism
+borrows credibility from the other.
+
+That pass uncovered two more lies hiding behind the phrase "requires eBPF".
+Delay wrote an action that the connect program explicitly ignores: a cgroup
+socket-address hook can't sleep. Bandwidth wrote a map no loaded program
+defines or reads, and discarded the resulting `MapNotFound`. Both commands now
+return an error even on an eBPF-capable node. They need a TC packet hook,
+lifecycle ownership and effect tests before they can claim success. Parsing a
+future contract is fine. Pretending it ran isn't.
+
+The memory `oom` form follows the same rule from the other direction. It
+doesn't pretend to be reversible: Bun refuses it and points the experiment at a
+Kill fault when the goal is to test restart after abrupt termination.
+
 ## Every fault must expire
 
 There's one rail that matters more than the rest: a fault has to end. A chaos
@@ -1070,9 +1302,17 @@ runtime can pull, and it carries `sh`, `httpd` and `wget` — exactly the three
 tools these cases need. A volume case runs `busybox sleep infinity` and `exec`s a
 shell into it to write and read a file. A firewall case runs `busybox httpd` as
 the target and `wget`s it from another container. An ingress case puts `httpd`
-behind the proxy and sends it an HTTP request with the right `Host` header. No
-image to build, no registry to push to — just `image = "busybox:latest"` and a
-capability gate:
+behind the proxy and sends it an HTTP request with the right `Host` header.
+
+A tag isn't an identity, though. `busybox:latest` can point at different bytes
+between two runs, which makes a failure impossible to reproduce and lets the
+runtime architectures drift apart. The catalogue uses BusyBox 1.37.0's OCI
+index digest instead. An OCI index maps one immutable name to platform-specific
+manifests, so runc selects `linux/amd64` and Apple Container selects
+`linux/arm64` without changing the test configuration. The runtime gates do
+more than pull it: they create, start and execute the workload, and any failure
+fails the test. No image to build, no registry to push to, and no moving tag.
+The capability gate stays explicit:
 
 ```rust
 Capability::ContainerRuntime => self.container_runtime != "process",
@@ -1080,10 +1320,11 @@ Capability::ContainerRuntime => self.container_runtime != "process",
 
 That gate is the mirror of `ProcessRuntime` from Part A, and together they draw
 the honest line: the `testapp` cases run on a process cluster and skip on runc;
-the `busybox` cases run on runc and skip on a process cluster. Full coverage
-means two acceptance runs, one per runtime — which is exactly right, because the
-two runtimes really are different environments and a test suite that pretended
-otherwise would be hiding the seam, not testing it.
+the pinned BusyBox cases run on runc or Apple Container and skip on a process
+cluster. Full coverage means separate acceptance runs for ProcessGrill, runc
+and Apple Container. That's exactly right. The runtimes really are different
+environments, and a test suite that pretended otherwise would hide the seam,
+not test it.
 
 Some cases still skip even on runc, and they say so honestly. Firewall
 enforcement needs eBPF, off by default on a dev cluster, so those cases require
@@ -1136,3 +1377,781 @@ the registry cases want to be on a node. But every skip names its reason, every
 group that can be exercised is, and the shape of what the cluster promises is now
 written down as tests that either hold it to that promise or say, out loud, why
 they couldn't. Which was the whole point of the chapter.
+
+## Ask each node what it can prove
+
+A test runner shouldn't infer the data plane from a config file.
+`ebpf.enabled = true` says what the operator wanted. It doesn't prove that the
+hooks attached, that the workload entered its cgroup before it started, or that
+the observation is still current.
+
+Bun now exposes an authenticated `/v1/capabilities` snapshot which combines
+startup facts with live readiness and placement evidence. Each capability has
+one of three states: `Available`, `Unavailable` or `Unknown`. The snapshot
+expires after 15 seconds.
+
+Why three? Imagine that Bun opened its metrics store but doesn't publish the
+latest sample time. Calling metrics unavailable throws away a useful fact.
+Calling them fresh turns hope into evidence. `Unknown` says exactly what we
+know: the store exists, but we can't prove freshness yet. The future `wtf`
+check needs that timestamp before it earns a green result.
+
+This changes how the runner gates a case. A known absent capability can become
+a typed skip when the selected profile allows it. Unknown or expired evidence
+becomes `Unknown`, which fails acceptance. Silence isn't evidence of absence.
+
+The snapshot also fingerprints the build target and profile, runtime and
+version, rootless mode, kernel, architecture and cluster identity. It publishes
+the server's operation policy separately from the caller's role. These facts
+let us decide whether two reports describe comparable systems before we
+compare their outcomes.
+
+Cluster collection has another tempting trap: only returning nodes which
+answered. `/v1/capabilities/cluster` instead creates one future per expected
+peer and awaits them concurrently with `join_all`. A future represents work
+which may not have completed yet; `join_all` polls all of them rather than
+waiting for one slow peer before contacting the next. Every request shares one
+absolute five-second deadline.
+
+Peer calls present the internal service token through the same cluster HTTP
+client as the control plane, including mTLS where configured. There is no
+anonymous retry. Responses have a 1 MiB limit and must carry the expected
+schema, node id and an unexpired observation. Any failure creates an explicit
+`Unknown` entry for that node. Missing evidence stays visible. That's the
+point.
+
+## Make the server own the mess
+
+Suppose the test runner creates an app, loses its network connection and gets killed by CI.
+Who deletes the app? If the answer is "the runner's `finally` block", nobody does. The code
+which should clean up is already dead.
+
+Bun now gives Phase 15 apps a server-owned lease. A Deployer asks for a
+lifetime and receives a random identifier plus an `rbtest-*` namespace. The
+lease records both the readable token name and a fingerprint of the exact
+credential, because two credentials may share a name. The server policy must
+permit isolated workloads, and the requested lifetime can't exceed the
+operator's configured maximum or the hard one-day ceiling. Bun also stops one
+caller filling the control plane with polite-looking garbage: at most 64 leases
+may exist, and each owns at most 128 resources.
+
+A leased apply sends the identifier in an HTTP header. In standalone mode Bun writes the app
+identity to `test-leases.json`, calls `sync_all`, and only then starts deployment. In cluster
+mode one Raft entry inserts both the desired app and its lease resource. There's no gap where
+the app exists but ownership doesn't. An ordinary apply can't use the reserved prefix, even
+when no matching lease exists, so two concurrent requests can't sneak through opposite sides
+of an ownership check.
+
+The resource collection is a `BTreeSet<LeasedResource>`. We met `BTreeSet` earlier for the
+safety allow-list. Here its second useful property matters: inserting the same app twice is
+idempotent. The enum owns apps and the matching namespace quota declaration:
+
+```rust
+pub enum LeasedResource {
+    App { app_id: AppId },
+    Namespace { name: String },
+}
+```
+
+Apps sort before namespaces, so cleanup removes every app before its quota
+record. That's deliberately honest. Jobs, faults, tokens, images, mounts and
+node state need different cleanup operations. Pretending a namespace owns them
+would produce green reports and leaked state, which is quite an achievement for
+a test system.
+
+Expiry moves a lease to `Cleaning`. Standalone cleanup waits for the agent to confirm the app
+stopped. Cluster cleanup removes each owned app from replicated desired state and lets the
+ordinary reconciler converge the runtimes. The record disappears only after those control
+plane operations succeed. Every cleanup step has a ten-second limit; a failure leaves the
+resource list and attempt count on disk or in Raft. A reaper checks once per second, so a Bun
+restart or Raft leadership change resumes the same cleanup instead of inventing a fresh one.
+
+Followers forward create, renew, release and leased apply requests to the
+leader. They preserve the user's credential, and the leader authenticates it
+again. Using the cluster service token here would be convenient, but it would
+also turn any compromised follower into the owner of every test lease.
+Convenience doesn't get a vote on authority.
+
+The runner now creates one lease after capability gating and before it runs a
+case. It asks for the case budget plus the fixed cleanup budget; if the server's
+maximum can't cover both, the case becomes `Unknown` without touching the
+cluster. Every app or namespace-quota apply carries the lease id. Pass,
+failure, panic and timeout all reach the same release path, and killing Relish
+merely leaves the server reaper to do the same job. `--namespace` is a readable
+base now, with a per-case suffix, because sharing one namespace between
+concurrent cases was never isolation. After release, Relish polls every node
+using the original authenticated and CA-pinned client. A missing Raft record
+isn't proof that a runtime has stopped.
+
+Container cases now use BusyBox 1.37.0 by immutable OCI index digest. The
+provisioned runc gate resolves and executes the `linux/amd64` manifest; the
+Apple Container gate does the same with `linux/arm64`. The Apple proof caught a
+nice final trap: its `container exec` command doesn't accept Docker's `--`
+separator, so our old adapter asked the runtime to execute a programme
+literally named `--`. A test which merely logged that error had been green.
+The new test fails on create, start, state or exec, and the adapter now emits
+the command shape Apple's CLI actually accepts.
+
+That closes the app/namespace and portable-workload part of the milestone.
+Jobs, faults, tokens, registry images, mounts and node state still need explicit
+ownership before the chaos catalogue can rely on them.
+
+## Who may break production
+
+Before this tranche, `/v1/fault` checked only that the caller was a Deployer.
+Relish also copied `$USER` into `injected_by`. That environment variable tells
+you which local account launched the client. It says nothing about the bearer
+token Bun authenticated, and a raw HTTP caller could put any name in the JSON
+body. Useful display hint, terrible audit trail.
+
+The corrected decision has independent gates:
+
+```text
+authenticated role
+  + server operation allowlist
+  + protected-cluster policy
+  + explicit acknowledgement
+  = permission to inject
+```
+
+For ordinary workload faults the minimum role is Deployer and the operation is
+`inject_workload_faults`. An Admin still needs the operation grant. Otherwise
+changing a role would silently enable an operation which the server owner
+disabled. Unknown and production clusters also require the server's
+`allow_protected_mutation` switch. Finally, `--acknowledge` records the
+operator's intent. It grants nothing by itself.
+
+Node drain, node kill and the deprecated council-partition route remain
+stricter: Admin plus `alter_node_state`. Node pressure uses Admin plus
+`saturate_capacity`. The target node repeats these checks after forwarding, so
+a permissive source can't confer authority on a stricter target.
+
+Reversal has a deliberately different method:
+
+```rust
+policy.authorise_reversal(operation, &caller)?;
+```
+
+It still checks the operation's minimum role and server grant. It doesn't
+require acknowledgement or the protected-cluster mutation switch. Those
+checks stop escalation. Requiring either before removing an active fault could
+trap the cluster in the dangerous state after an operator tightened policy.
+The agent receives separate booleans for workload, node and pressure reversal,
+then checks the actual stored fault type. Authority to remove one class never
+leaks into another.
+
+Bun now replaces the compatibility `injected_by` field with the authenticated
+token's readable name. Audit events use the credential's stable principal id
+instead. `ClusterEvent` gained three backwards-compatible fields:
+
+```rust
+pub action: Option<String>,
+pub principal: Option<String>,
+pub details: BTreeMap<String, String>,
+```
+
+`Option<String>` lets old non-audit events omit the two scalar fields.
+`BTreeMap` keeps action-specific facts deterministic when serialised. Serde
+defaults all three while deserialising older events and skips empty values
+while serialising, so existing consumers keep working. A successful injection
+records `fault.injected` with fault id, type, duration and target. Every
+specific, service-wide, all-workload and council clear path records its own
+stable action. The human message remains for people; automation reads the
+fields.
+
+## Make a node disappear without killing Bun
+
+What does a node failure mean in an in-process test? Killing Bun would
+certainly look realistic, but the process which owns the timer and cleanup
+would be gone too. It also makes a portable acceptance test responsible for
+restarting an external service manager. That's a different test.
+
+The node-kill primitive instead closes the three channels which make a Bun
+process part of a cluster: gossip, Raft and the reporting tree. The local
+management API stays open. Peers stop receiving SWIM acknowledgements, Raft
+traffic fails, reports stop, and the normal failure machinery reacts. From the
+cluster's point of view the node has gone. From the test runner's point of view
+there is still a narrow recovery path.
+
+All three transports share a `NodeTransportGate`. It uses an `AtomicUsize`,
+which is Rust's lock-free integer for state touched by several tasks. Each
+fault increments the count and each reversal decrements it. The transports
+open only when the count reaches zero, so clearing one of two overlapping
+faults can't accidentally heal the other one. A three-node acceptance sends
+the request through one node, watches another disappear from SWIM, clears it
+through the target's management API, and watches it rejoin. Before healing, it
+also tries to fail a second voter and proves the quorum rail says no.
+
+Drain is gentler. It adds a critical degraded entry to the node's live
+readiness report but keeps every transport open. The leader sees the node as
+alive but ineligible, re-plans placements elsewhere, and admits it again when
+the final overlapping drain reverses.
+
+These are deliberately privileged operations. The JSON field
+`acknowledged: true` records intent, but it grants nothing. Bun also requires
+an authenticated Admin and the server-owned `alter_node_state` permission.
+When one node forwards a request, it preserves the user's credential; the
+target authenticates and authorises it again. It also replaces the
+client-supplied `injected_by` value with the authenticated token name before
+recording the fault; the event uses the stable credential principal.
+
+Every node fault needs a non-zero TTL. Clearing one manually uses:
+
+```sh
+relish fault clear 7 --node worker-2
+```
+
+Reversal still needs Admin plus `alter_node_state`, but it needs neither
+destructive acknowledgement nor the protected-cluster mutation switch. A
+Deployer with `inject_workload_faults` may clear workload faults and leaves
+node faults alone. Fault IDs and timers still live in the target process,
+though. If peers have already
+removed the failed node from their live directory, the operator must point
+Relish at that node's still-open API to clear it; expiry needs no route and
+will restore it automatically. Durable lease ownership for node state remains
+unfinished. The chaos catalogue must account for that rather than turning
+cleanup uncertainty into a cheerful skip.
+
+## Pressuring a node without pressuring Bun
+
+A workload CPU fault edits that workload's cgroup. Useful, but it doesn't test
+what happens when one whole node runs short of capacity. C4 in the chaos
+catalogue needs the latter: consume a bounded share of one worker's CPU, bring
+the node towards a memory-usage target, and check that the rest of the cluster
+stays healthy.
+
+The tempting implementation is to start a burn loop inside Bun. That would put
+the control plane in the experiment's blast radius and make the process
+responsible for cleaning up the resource starvation it is suffering. A fine
+way to create a memorable afternoon, but not a useful primitive.
+
+Bun now owns `/sys/fs/cgroup/reliaburger-chaos` instead. Each pressure fault
+gets one child cgroup and one hidden helper process. Bun stays in its original
+cgroup. The child writes its PID to `cgroup.procs`, allocates the required
+resident memory and starts one burn thread per available core. The cgroup's
+`cpu.max` limits those threads to the requested percentage of total machine
+capacity:
+
+```text
+quota = period × cores × percentage / 100
+```
+
+One ordering detail earned its comment the hard way. Our first version wrote
+`cpu.max` before spawning the helper. Sensible-looking, and wrong: the helper
+faults hundreds of megabytes of ballast into residency *inside* that cgroup,
+so a 5% quota turned a sub-second startup into a crawl on shared CI hardware
+and tripped the four-second readiness timeout. The parent now writes `cpu.max`
+only after the helper prints `ready`. The burn threads run unthrottled for one
+pipe round-trip, which is bounded and harmless. The memory ceiling still goes
+in before spawn, because it is the safety bound on the allocation itself.
+
+Memory needs a more careful definition. `--memory 90%` means "bring total node
+usage to 90%", not "allocate another 90%". The helper reads Linux `MemTotal`
+and `MemAvailable` *after* joining its cgroup, then allocates only the
+difference. The kernel-enforced `memory.max` is the requested percentage of
+physical memory. That ceiling doesn't depend on a momentary usage reading, so
+the parent's setup and the child's later calculation can't race into an
+accidental OOM. `memory.swap.max = 0` also keeps the evidence about resident
+pressure rather than swap throughput.
+
+This helper runs before Bun constructs Tokio's runtime. We replaced
+`#[tokio::main]` with an ordinary `main` which handles the hidden synchronous
+subcommand first and explicitly builds the normal multi-thread runtime for the
+agent path. Otherwise Tokio's worker threads would exist before the helper
+joined its cgroup, muddying process ownership and wasting memory in a programme
+which only needs to park.
+
+Linux gives us one more safety net: `prctl(PR_SET_PDEATHSIG, SIGKILL)` asks the
+kernel to kill the helper when its Bun parent dies. `prctl` is a C system call,
+so Rust requires an `unsafe` block. The block's safety comment explains the
+invariant: the call changes process metadata and doesn't dereference Rust
+memory. We then read `getppid()` to close the small race where Bun could die
+before the parent-death signal was installed. A fresh Bun sweeps any empty
+`fault-*` cgroups left by a hard crash.
+
+None of this is enabled by merely running as root. The server policy needs the
+independent `saturate_capacity` operation plus non-zero CPU or memory ceilings;
+both ceilings have a hard 90% maximum. The caller needs an authenticated Admin
+role and explicit acknowledgement, and the target repeats those checks after
+cross-node forwarding. Only one helper may run on a node, so two individually
+safe requests can't add up past the configured bound.
+
+Clearing pressure is deliberately easier than creating it, but not a role
+shortcut. It still needs Admin plus `saturate_capacity`; it doesn't need
+acknowledgement or the protected-cluster mutation switch. That operation
+doesn't let the same caller reverse a drain or node kill. Clear, expiry and
+graceful shutdown kill the child and remove its cgroup. Parent death and
+startup sweep cover the paths where normal cleanup code never gets a turn.
+
+The privileged acceptance test checks the real hierarchy rather than a mock.
+It verifies `cpu.max`, observes the helper PID inside the fault cgroup and the
+test/Bun process outside it, confirms the total-memory target, clears the
+fault, then drops the controller and proves a restarted owner removes the
+stale cgroup. On macOS, rootless Linux or a cgroup hierarchy without both
+controllers, capability evidence says `Unavailable`. Honest again.
+
+## Chaos with a safety catch
+
+We had five recovery scenarios on paper. Running them wasn't the difficult
+part. The difficult part was making sure a failed test didn't leave the
+cluster in a worse state than the failure it had found.
+
+`relish test --chaos` now checks these five claims, in this order:
+
+1. another council member becomes leader after the leader fails;
+2. three live replicas recover after their worker fails;
+3. the council majority keeps serving while its minority is isolated;
+4. the cluster stays observable under bounded whole-node pressure; and
+5. a rolling deployment reaches a real terminal outcome when a node dies
+   during an observed active operation.
+
+Each case also reverses its fault and proves the affected node rejoins or the
+expected replicas return. The fifth case is worth spelling out. If the deploy
+finishes before the runner observes an active operation, we haven't tested
+"node death during a deploy". The result is `Unknown`, not an optimistic pass.
+
+Could we run the five in parallel to save time? Individually acceptable blast
+radii don't compose. Failing one worker while another case isolates a council
+minority can turn two tidy experiments into one accidental outage. The chaos
+suite therefore ignores the ordinary parallel width and uses one permit.
+After a case gets that permit, it fetches capability evidence again. The
+evidence expires after 15 seconds; checking it before waiting in the queue
+would let a destructive decision outlive the facts behind it.
+
+The preflight is equally blunt. It requires at least three nodes, an available
+container runtime, node kill, node pressure and the server operations
+`provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`. Protected clusters need their server-owned mutation gate.
+The interactive command asks the operator to type exactly `yes`; automation
+uses `--yes`. This records consent. It doesn't invent authority, and there is
+no `--override`.
+
+Why fail the invocation instead of skipping the pressure case on a rootless
+machine? Because "five chaos tests passed" must mean we ran five chaos tests.
+A catalogue without the destructive primitive it claims to validate isn't a
+smaller success. It's a different test. ProcessGrill stays separate for the
+same reason: fixed host ports can't restore three replicas onto two surviving
+nodes. The catalogue uses the digest-pinned BusyBox OCI workload which runs
+under both runc and Apple Container, although the full pressure scenario still
+needs rootful Linux cgroup v2.
+
+Now, cleanup. A `TestContext` is cloned into the case task. When that task
+times out, the runner aborts it before cleanup; when it panics, Tokio returns a
+`JoinError`. In both cases the outer context must still know which faults the
+inner task created. The guard holds:
+
+```rust
+Arc<Mutex<Vec<OwnedFault>>>
+```
+
+`Arc<T>` is an atomically reference-counted shared owner. Unlike an ordinary
+borrow, it can cross a spawned task boundary and outlive the stack frame which
+created it. `Mutex<T>` permits one task at a time to mutate the vector. We use
+Tokio's asynchronous mutex because waiting for it must not block a runtime
+thread. Cloning the guard clones the `Arc`, not the vector, so the runner and
+case always see the same ownership ledger.
+
+Every ledger entry contains the target-local fault id, owning node and the
+direct client which created it. Teardown removes entries newest first and
+calls the specific delete endpoint. If a delete fails, the entry stays in the
+ledger for a retry and cleanup becomes `Unknown`. We never call blanket
+`fault clear` or `chaos heal`: those could reverse an operator's unrelated
+experiment. The older council-partition endpoint now returns its exact fault
+summary as an additive response field, which gives legacy callers the same
+ownership evidence without breaking their existing `message` field.
+
+The regression tests drive that guard through both timeout and panic, observe
+two exact injections and two exact reversals, and require confirmed cleanup.
+Another test starts with deliberately expired evidence, serves a fresh
+snapshot from Bun, and proves a chaos case receives the fresh one. These are
+small tests for an unpleasant class of failure. That's exactly why they're
+there.
+
+## When faster is worse
+
+Suppose one benchmark falls from 100 ms to 80 ms and another falls from 100
+requests per second to 80. The arithmetic is identical. The verdict isn't.
+
+Every benchmark metric therefore carries `higher_is_better`. Comparison uses
+that field rather than guessing from the unit. Latency rising by more than 10%
+is a regression; throughput falling by more than 10% is a regression. Exactly
+10% is the boundary, not a failure. Metrics missing from either report get
+listed separately because absence isn't performance data.
+
+The value alone still isn't enough. Fifty resolver requests and two hundred
+resolver requests don't describe the same experiment, even if both results say
+`ms`. Each metric carries a sorted map of parameters such as request count and
+payload bytes. Rust's `BTreeMap` keeps keys ordered, which makes JSON output
+and compatibility diagnostics deterministic. Different units, direction or
+parameters refuse comparison.
+
+The report also fingerprints the environment:
+
+- cluster node and council-member counts;
+- every node's compilation target and profile;
+- runtime name, version and rootless mode; and
+- kernel and architecture.
+
+What isn't a compatibility check? The binary version and Git SHA. Comparing
+two different builds is the point. We record both, then permit them to differ.
+Node names and cluster identity may differ too; two otherwise identical
+clusters can provide a useful comparison.
+
+Hosted workers are a special case. Their neighbours, CPU allocation and noisy
+storage can change underneath a run. If either report says it came from a
+hosted environment, we still calculate and show regressions, but mark the
+whole comparison informational. A shared CI worker shouldn't veto a release
+because somebody else's job woke up at the wrong moment.
+
+The JSON parser is deliberately strict. `schema_version` is 2 and every report
+type rejects unknown fields. An additive change therefore needs a schema bump
+instead of being silently ignored by an older Relish. Duplicate metric names,
+zero samples, negative or non-finite values and unknown node fingerprints also
+refuse a verdict.
+
+One small Rust detail prevents a surprisingly awkward bug. Percentage change
+usually looks like this:
+
+```text
+(current - baseline) / abs(baseline) × 100
+```
+
+A zero baseline makes that percentage undefined. JSON has no portable
+representation for infinity, so `change_percent` is `Option<f64>`: `Some(x)`
+for a finite percentage and `None` (JSON `null`) for a zero baseline. The
+directional result still works from the raw values. We keep the evidence
+without producing invalid JSON. Tiny type, useful constraint.
+
+## Measure the journey, not the shortcut
+
+Our first benchmark sketch timed service discovery with the resolve API. It
+timed an HTTP handler and a map lookup. Useful perhaps, but it didn't answer
+the question an application cares about: how long does a DNS query from my
+container take?
+
+The same shortcut appeared in the network test. Fetching a backend's published
+host port bypasses the service name, VIP and packet redirection. A wonderfully
+fast result would merely prove that we hadn't measured Reliaburger.
+
+The implemented paths are more prosaic:
+
+1. deploy a source BusyBox container under a server-owned lease;
+2. execute `nslookup target.namespace.internal` inside it for discovery;
+3. execute `wget` against that name for throughput; and
+4. let the request cross Onion's service VIP before it reaches a backend.
+
+The number includes process-exec overhead. That's deliberate and recorded in
+the metric's `parameters` map, so it can't be compared with a future raw-socket
+method by accident. If exec overhead dominates the result, the next honest
+step is a small benchmark client inside the pinned image. Switching back to
+the control API isn't.
+
+Every suite has a 60-second quick deadline or a five-minute full deadline. The
+runner starts the suite with `tokio::spawn`, then waits with
+`tokio::time::timeout`. A `JoinHandle<T>` is Tokio's owned reference to a
+spawned task. Awaiting it produces either the task's value or a `JoinError`
+(for example, when the task panics).
+
+Dropping a `JoinHandle` does not cancel its task. That catches people coming
+from ordinary scoped threads, and it would be dangerous here: a timed-out
+capacity probe could keep creating workloads in the background. The runner
+calls `abort()` and then awaits the handle so cancellation has actually
+settled.
+
+Now, the awkward bit. Aborting the suite also prevents its local cleanup code
+from running. We keep lease IDs and chaos fault IDs in cloned guards outside
+the task. The server persists each lease, while the client guard uses an
+`Arc<Mutex<Vec<_>>>` for IDs added during the run. After success, error, panic
+or timeout, the runner reverses exact owned faults and asks Bun to release
+every lease. It accepts a metric only after both cleanup paths are confirmed.
+
+This is why schema 2 has both `skipped` and `failed`. A missing optional
+capability discovered before provisioning is a skip. Once a suite starts, a
+timeout, API error, panic or uncertain cleanup is a failure. Calling the latter
+a skip would make the report look healthier as the system became less
+responsive. That's quite a trick, but not a useful one.
+
+Two probes need another lock. State reconstruction really kills the observed
+council leader, so it needs `--disruptive --yes`. Capacity deliberately fills
+the scheduler with one-millicore, one-mebibyte workloads and needs
+`--capacity --yes`. These flags record the operator's intent. The authenticated
+role and server-owned operation policy still decide whether anything happens.
+Relish adds a dedicated capacity-probe header to each saturating apply. Bun
+accepts it only with a live lease, Admin role, `saturate_capacity` and the
+protected-cluster mutation gate. The client isn't its own safety authority.
+
+Image distribution has one remaining caveat. Pickle doesn't yet provide
+lease-owned manifest deletion or deterministic cache eviction. Pushing a
+fresh 16 MiB image per run would leave permanent catalogue entries. Instead,
+the current metric deploys the pinned multi-architecture image once per node
+and records `cache_state = uncontrolled`. That measures current image
+availability, not a clean cold-cache replication experiment. The report says
+so. We can build the stronger benchmark after we can clean up its evidence.
+
+## Diagnosis starts with what we actually know
+
+Imagine `relish wtf` says every certificate is healthy. Good news. Except it
+never managed to read certificate metadata. That's not healthy. It's a blank
+space wearing a green hat.
+
+The diagnosis engine therefore accepts an evidence snapshot rather than a
+pile of convenient values. Each source has one of four states:
+
+```rust
+enum Evidence<T> {
+    Available { observed_at: u64, value: T },
+    Degraded { observed_at: u64, value: T, reason: String },
+    Unavailable { reason: String },
+    Unsupported { reason: String },
+}
+```
+
+The angle brackets make `Evidence` a generic enum: `T` stands for the type of
+value a particular source returns. `Evidence<Vec<NodeObservation>>` and
+`Evidence<CouncilObservation>` share the same availability rules without
+turning their very different data into untyped JSON. The compiler still knows
+which value belongs where.
+
+`Degraded` carries facts we can still use, plus the reason the inventory isn't
+complete. `Unavailable` means the source should work but didn't answer.
+`Unsupported` means we don't yet expose the fact needed for an honest verdict.
+All three produce an `Unknown` report entry. None produces OK. This sounds
+fussy until a diagnostic command is the thing you reach for during an outage.
+Then it's the whole point.
+
+The snapshot also supplies `collected_at`. The pure function
+`diagnose(&WtfInputs)` never reads the wall clock or makes a network request.
+The same captured evidence always produces the same report, which makes every
+time window deterministic in a unit test.
+
+Take crashloops. A workload with a lifetime restart count of 30 may have run
+perfectly for six months since its last failure. Calling that a current
+crashloop is nonsense. We require three timestamped restart events inside the
+last 15 minutes. When that pattern fires, the engine looks for a deploy of the
+same application and namespace in the preceding 30 minutes, then attaches the
+first recent error log. One finding now answers three questions: what failed,
+what changed, and what did the process say?
+
+The same rule keeps the other checks honest. Disk pressure needs used capacity
+with a node and storage-domain attribution. CPU throttling needs an increase in
+cgroup throttled time, not high CPU usage. Certificate expiry needs public
+`not_after` and rotation state, never private key material. If Bun can't expose
+one of those facts yet, `wtf` says so.
+
+Output uses four separate lists: `critical`, `warnings`, `unknown`, and `ok`.
+The report carries schema version 1 and rejects unknown top-level fields while
+deserialising. This is less forgiving than Serde's default. That's useful for
+an automation contract: adding a field requires us to decide whether an older
+consumer can understand it, instead of silently pretending that it can.
+
+Finally, application scope is structural. `relish wtf --app api` runs app
+checks and filters alerts, restarts, services and deploys to `api`; it doesn't
+manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
+Unknown means missing required evidence. It doesn't mean "we chose not to ask".
+
+## A small diagnostic surface
+
+Mayo already records CPU usage. Could `wtf` call an application throttled when
+that number reaches its configured limit? No. A busy process can use its full
+entitlement without the kernel ever delaying it, while a bursty process can
+accumulate throttled time between ordinary usage samples. They are different
+facts.
+
+Bun's authenticated `/v1/diagnostics` endpoint reads the cgroup v2 `cpu.stat`
+counter twice. The window defaults to one second and the server clamps it to
+ten. We subtract the first cumulative `throttled_usec` value from the second
+and report seconds of actual throttling. If an instance appears, disappears or
+resets its counter during the window, the source becomes degraded or
+unavailable. Churn isn't zero throttling.
+
+The endpoint also resolves each configured storage domain to its containing
+filesystem. It returns the domain attribution with byte counts
+and a percentage, but never the configured host path. The distinction matters:
+"disk is full" is less useful than "the filesystem holding image layers is
+full", and an API response doesn't need to publish the server's directory
+layout to say either.
+
+Certificates get the same treatment. The wire carries only the certificate
+kind, identity, issuer, serial, expiry time and rotation state. It does not
+carry DER, PEM or private keys. Right now Bun can safely expose its node leaf,
+but it doesn't expose a complete workload inventory and it can't hot-reload a
+new node leaf into every cluster transport. The source therefore says
+`degraded`. `wtf` can still warn if that known leaf approaches expiry, but it
+won't claim that certificate rotation is healthy.
+
+Notice what the endpoint doesn't do. It doesn't diagnose anything. It records
+local facts with a schema version and collection state. Relish will fan those
+facts out across the cluster and the pure engine will decide what they mean.
+Keeping observation and judgement separate lets us test both halves without
+teaching the API handler a second, subtly different diagnostic catalogue.
+
+## Asking the whole cluster
+
+The pure function is useful, but operators can't diagnose a cluster by writing
+a Rust value by hand. Relish now builds that value from live APIs.
+
+It starts with the configured Bun node. That first health check is special: if
+it fails, Relish stops. Without an entry node it can't know which peers should
+exist, so a partial report would look more authoritative than it is. Once the
+entry answers, Relish reads the membership view and fans requests out to every
+expected node concurrently. Each peer gets the same transport, credentials and
+certificate authority as the entry client, and every request has a ten-second
+limit.
+
+This introduces another useful Rust pattern. We can create a `Vec` of futures
+and pass it to `join_all`. The futures run concurrently, but the returned
+results retain their input order. Each result is a `Result`, so one dead node
+doesn't cancel evidence from the healthy ones. The collector turns the failed
+part into `Evidence::Unavailable` or `Evidence::Degraded` and carries on.
+
+The collector asks a separate question for services: what *should* exist? Bun's
+authenticated `/v1/diagnostics/apps` view supplies desired and scheduled
+replica counts. Relish compares those with the live resolver table. If we only
+walked the resolver, a service with no entry would vanish from the diagnosis.
+That is precisely the broken service we wanted to find. Absence is evidence
+only when you also have the intended state.
+
+We put bounds on correlation too. Relish fetches recent logs only for
+applications that already have enough timestamped restart events to be
+crashloop candidates. It caps the number of candidates and lines, and accepts
+stderr or structured error levels rather than matching an alarming word in a
+perfectly ordinary sentence. The restart and terminal deploy stores remain
+bounded and process-local. Even an empty response therefore arrives as
+`Degraded`, because restarting Bun can erase relevant history. Honest, if a
+little annoying. That's better than green.
+
+Finally, the shell contract is small enough to remember. `relish wtf` returns
+0 only when every selected source was observed and healthy, 1 for a critical
+finding, and 2 for warnings or unknown evidence. `--app` removes unrelated
+cluster checks structurally. `--watch` repeats the human report every 30
+seconds, while JSON and YAML remain one schema-versioned report per process.
+
+## Trace the connection you actually care about
+
+Say `web` can't reach `redis`. Checking Bun's own DNS and TCP access might tell
+us that the node works. It says very little about `web`. The application has
+its own network namespace, cgroup identity, firewall decision and DNS setup.
+The useful question is therefore: can *this workload* make the connection?
+
+`relish trace web --to redis` starts by asking every reachable node for status.
+It chooses a node with a running `web` instance, then sends a strict request to
+that node's authenticated `/v1/trace` endpoint. Bun doesn't accept a shell
+command. It accepts application names, namespaces, a destination and an
+optional port.
+
+The distinction matters. Bun's DNS probe always runs the same script:
+
+```sh
+output=$(nslookup "$1" 2>&1)
+status=$?
+printf '%s\n' "$output"
+printf '__RB_TRACE_DNS_STATUS__=%s\n' "$status"
+```
+
+The requested name becomes `$1`, a positional argument. It never becomes part
+of the script. The TCP probe does the same with `nc -z -w 3 "$1" "$2"`.
+Quoting the positional parameters lets the shell pass each value as data even
+if it contains punctuation. The API also validates internal names as DNS
+labels, but that isn't our only command-injection defence.
+
+Both commands execute through the runtime's `exec()` implementation. On runc
+and Apple Container that means they run inside the selected workload. The
+image must contain a POSIX shell, `nslookup` and `nc`. If it doesn't, trace says
+`Unknown`. A missing debugging tool isn't proof that the network failed.
+
+## Don't stop the control plane to debug it
+
+A DNS query can wait. A TCP connect can wait too. Each workload operation has
+an eight-second outer timeout, but awaiting those operations in Bun's command
+loop would still delay status, shutdown and every command queued behind it.
+
+The agent therefore builds a `PreparedTrace<G>`. It contains owned copies of
+the runtime handle, request, source instance and service state needed by the
+trace. The command arm moves that value and the response channel into a new
+task:
+
+```rust
+tokio::spawn(async move {
+    let _ = response.send(trace.run().await);
+});
+```
+
+We saw `move` closures earlier. An `async move` block applies the same rule to
+an asynchronous block: it owns every captured value rather than borrowing the
+agent's stack frame. Tokio requires spawned futures to be valid independently
+of their caller. Ownership makes that requirement visible in the type system.
+It also gives us a useful test. The mock runtime holds `exec()` in flight while
+the test asks Bun for status. Status still returns before the probe is
+released.
+
+Spawning doesn't make capacity free. Bun owns a semaphore with eight trace
+permits. `try_acquire_owned()` moves one permit into `PreparedTrace`; dropping
+the trace returns it automatically. If all eight are occupied, the ninth
+request gets HTTP 429 immediately. We test that refusal while all eight mock
+`exec()` calls are held. A bound that merely queues an unlimited number of
+waiting tasks isn't a resource bound.
+
+`PreparedTrace` also owns a clone of Bun's cancellation token. Each probe
+selects between runtime execution, its timeout and shutdown. Cancelling Bun
+drops an in-flight probe immediately, returns the semaphore permit and reports
+Unknown if the caller is still listening. A separate held-`exec()` test proves
+that path; graceful shutdown doesn't wait for a diagnostic timeout.
+
+## Four steps, three kinds of evidence
+
+An internal trace reports four layers:
+
+1. A real `nslookup` from the source workload for
+   `<destination>.<namespace>.internal`. The answer must contain the VIP from
+   live service state.
+2. The live userspace service map and its healthy backends. On Linux with
+   Onion attached, Bun also reads the actual eBPF `backend_map`.
+3. The live firewall decision. Bun resolves the source PID to its cgroup, reads
+   `cgroup_namespace_map` and `firewall_map`, then applies the same rule as the
+   eBPF connect hook.
+4. A real TCP connect from the source workload to the service VIP and port.
+
+Portable builds don't have attached kernel maps. They can still observe DNS,
+userspace service state and TCP, but they can't claim to have inspected eBPF.
+`TraceEvidence` makes that difference part of the response:
+
+```rust
+pub enum TraceEvidence {
+    Observed,
+    Inferred,
+    Unavailable,
+}
+
+pub enum TraceVerdict {
+    Pass,
+    Fail { reason: String },
+    Unknown { reason: String },
+}
+```
+
+Evidence answers "how do we know?" A verdict answers "what did we learn?" A
+healthy userspace service map without an attached backend map is inferred but
+can pass that layer. A firewall map we can't read is unavailable and therefore
+unknown. A live map with no allow entry is an observed failure. Overall, Fail
+wins, then Unknown, then Pass. Missing evidence can't quietly turn green.
+
+Relish preserves that contract in human, JSON and YAML output. Pass exits 0,
+Fail exits 1 and Unknown exits 2, matching `wtf`. The JSON schema is versioned
+and rejects unknown top-level fields so automation doesn't silently interpret
+a changed response as the old one.
+
+External probing has a narrower safety boundary. The caller supplies `--port`
+and must be an Admin. The server must grant `probe_external_destination`, the
+protected-cluster gate must allow it where applicable, and
+`external_probe_allowlist` must contain the exact `host:port`. No wildcard or
+CIDR matching. When live egress enforcement is active, the TCP result is still
+observed, but the current kernel map stores resolved addresses rather than the
+requested hostname relationship. Trace calls that firewall evidence Unknown.
+Honest again. Slightly annoying again. You can probably see the pattern by
+now.
+
+The remaining acceptance work needs a real three-node environment and the
+rootful runc and Apple Container profiles. The implementation sandbox used for
+this tranche couldn't launch a live Bun process, so the checked evidence is
+the pure contract, API/authentication tests and mock-runtime orchestration. We
+don't turn that platform limitation into a production claim.

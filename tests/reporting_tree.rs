@@ -42,6 +42,7 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                     if let Some(req) = req {
                         let snapshot = AgentSnapshot {
                             capabilities: Default::default(),
+                            readiness: None,
                             egress_degraded: false,
                             egress_affected_workloads: Vec::new(),
                             instances: vec![InstanceSnapshot {

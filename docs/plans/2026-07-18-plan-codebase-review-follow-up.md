@@ -71,11 +71,19 @@ Monday even when the repository is quiet.
 | `thrift` GHSA-2f9f-gq7v-9h6m | Runtime reachable through Parquet/DataFusion when the operator runs `relish logs-query remote` against a local or remote archive. There is no fixed `thrift` release. | **Temporary risk acceptance.** Query only Bun-produced Parquet in operator-controlled object stores; don't point the command at untrusted archives. A crafted trusted-store object can still cause process memory exhaustion, so this isn't a complete defence. Phase 15a/M2 owns replacement or upstream upgrade; recheck by 18 August 2026. GitHub Dependabot remains the detection source because RustSec doesn't currently carry this GHSA. |
 | `lru` RUSTSEC-2026-0002 | Transitive through ratatui 0.29. Its layout cache uses `LruCache`, but source review finds no call to the affected `LruCache::iter_mut` API. | **Temporary exception.** No reachable affected call. Phase 15a/M2 owns the ratatui/lru upgrade; CI exception expires 18 August 2026. |
 | `anyhow` RUSTSEC-2026-0190 | Direct error type. Repository call-path review finds no `Error::downcast_mut`, the affected API. No fixed release exists. | **Temporary exception.** Avoid `downcast_mut`; Phase 15a/M2 owns upstream recheck; CI exception expires 18 August 2026. |
+| `rkyv` RUSTSEC-2026-0235 | Cargo locks `rust_decimal`'s optional `rkyv` 0.7 dependency through `openraft` and `byte-unit`, but `byte-unit` disables `rust_decimal`'s defaults and doesn't enable its `rkyv` feature. `cargo tree --target all -i rkyv` prints no active path; Reliaburger neither compiles `rkyv` nor reads an rkyv archive. | **Temporary exception.** `rust_decimal` 1.x deliberately pins its optional support to `rkyv` 0.7, so the advisory's 0.8.17 fix isn't compatible. Phase 15a/M2 owns the upstream recheck; CI exception expires 18 August 2026. |
 | `bincode`, `rustls-pemfile`, `paste`, `proc-macro-error` informational advisories | `bincode` persists Raft vote/log-id metadata and needs a format migration. `rustls-pemfile` parses configured TLS material. `paste` and `proc-macro-error` are build-time transitive macros. These are maintenance notices rather than published vulnerabilities. | **Temporary exceptions.** Phase 15a/M2 owns migration/upgrade; CI exceptions expire 18 August 2026. |
 
-The remaining `lru` and `thrift` GitHub alerts therefore stay visible. They are
-not being called fixed. The acceptance decision is narrowly about known API
-reachability and trusted input, with a forced re-review date.
+On 5 August 2026, CI loaded 1,189 advisories and found the new `rkyv` advisory.
+The package appears in `Cargo.lock` because Cargo resolves optional dependency
+versions even when their features are disabled. The all-target feature graph
+confirmed that no build selects it. We added the same fail-closed expiry as the
+other exceptions rather than claiming that a breaking 0.8 substitution would
+work under `rust_decimal` 1.x.
+
+The remaining `lru`, `thrift` and lock-only `rkyv` alerts therefore stay
+visible. They are not being called fixed. The acceptance decision is narrowly
+about known API reachability and trusted input, with a forced re-review date.
 
 **Verification:** `make audit`, `cargo fmt --all -- --check` and portable
 all-target clippy pass. `make test` runs 2,633 tests (all pass; 39 separately
@@ -346,59 +354,275 @@ doctests and the RustSec audit also pass.
 
 ### M1. Expose subsystem readiness and death as live evidence
 
-- [ ] Add `Starting`, `Ready`, `Degraded` and `Stopped` state with last error/time
+- [x] Add `Starting`, `Ready`, `Degraded` and `Stopped` state with last error/time
   for critical long-lived tasks (FUNC-3).
-- [ ] Keep `/v1/health` as liveness; add readiness and authenticated capability
+- [x] Keep `/v1/health` as liveness; add readiness and authenticated capability
   evidence for scheduling and Phase 15.
-- [ ] Restart only reconstructible tasks with explicit ownership and deadlines.
+- [x] Restart only reconstructible tasks with explicit ownership and deadlines.
+
+**Delivered:** one process-wide tracker pre-registers the complete critical
+owner set before startup and records state transitions, last failure/time and
+restart count. Authenticated `/v1/readiness` and `/v1/capabilities` expose it;
+an independent rolling-safe reporting frame gives the scheduler a
+receive-time/leadership-epoch lease whose absence fails closed. Unique
+socket/channel owners never respawn. The reconstructible security refresher
+uses explicit retry, recovery and shutdown bounds.
 
 ### M2. Repair cheap executable checks and platform lint
 
-- [ ] Make `make examples` pass `--dry-run`, preserve useful error output and fix
+- [x] Make `make examples` pass `--dry-run`, preserve useful error output and fix
   the two stale Phase 8 examples (FUNC-2).
-- [ ] Gate Linux/Aya modules at module boundaries so the advertised macOS
+- [x] Gate Linux/Aya modules at module boundaries so the advertised macOS
   all-feature lint contract is coherent.
-- [ ] Add dependency-advisory scanning with a pinned policy and CI ownership.
+- [x] Add dependency-advisory scanning with a pinned policy and CI ownership.
+
+**Delivered:** `make examples` now invokes the already-built Relish binary with
+`--dry-run`, prints the captured diagnostic for a failing file and validates all
+21 checked-in configs. The stale Phase 8 namespace and health durations are
+corrected, and portable Linux CI owns the target. Aya-dependent branches now
+require both the `ebpf` feature and Linux, while no-eBPF stubs remain available
+on macOS; hosted macOS runs the same all-target/all-feature Clippy gate as Linux.
+The merged RustSec policy remains change-, release- and weekly-gated with named,
+expiring exceptions. All three checks pass on this change.
 
 ### M3. Make clustered registry defaults peer-reachable
 
-- [ ] Derive a peer-reachable bind in cluster mode or reject an incomplete
+- [x] Derive a peer-reachable bind in cluster mode or reject an incomplete
   clustered registry configuration (FUNC-1).
-- [ ] Include replication/P2P reachability and redundancy in capability and
+- [x] Include replication/P2P reachability and redundancy in capability and
   `wtf` evidence.
+
+**Delivered:** standalone Bun retains the loopback registry default. Clustered
+Bun derives that default to its gossip-advertised IP, accepts a wildcard or the
+same explicit IP, and fails startup when an explicit listener excludes the
+address peers use. Cluster registry reads and writes fail closed from the first
+request, including when a misconfiguration leaves the service token absent.
+`/v1/capabilities` publishes the bound socket, readiness, TLS/P2P state,
+redundancy target, active membership and under-replicated layer count for Phase
+15 diagnostics. Seven bind/evidence tests plus both clustered-bootstrap auth
+regressions pass.
 
 ### M4. Carry the configured trust domain into workload identities
 
-- [ ] Pass immutable cluster identity into the agent instead of hard-coding
+- [x] Pass immutable cluster identity into the agent instead of hard-coding
   `default` (FUNC-4).
-- [ ] Add a non-default-cluster SPIFFE issuance and verification test.
+- [x] Add a non-default-cluster SPIFFE issuance and verification test.
+
+**Delivered:** `[cluster].name` is a validated DNS-style trust domain with a
+backwards-compatible `default`. All three config generators persist the requested
+cluster name. Bun passes it as immutable agent and API state, so app, job, OIDC
+and persistent build-signer identities use one domain. The acceptance test
+issues a `payments.prod` workload leaf, validates its CA chain and checks its
+URI SAN; focused config, generator and signer tests cover the surrounding data
+path.
 
 ### M5. Preserve rootless published ports through Bun replacement
 
-- [ ] Persist rootless proxy parameters and ownership, respawn them during
+- [x] Persist rootless proxy parameters and ownership, respawn them during
   adoption, and test a real replacement (FUNC-5).
+
+**Delivered:** rootless runc now starts and owns `slirp4netns`, applies the OCI
+port mapping through its API socket, and persists the socket, container PID,
+mapping and owner PID/start-time fingerprint in schema-v2 instance records. An
+adopter reclaims a surviving owner or safely replaces a missing one before it
+reports the workload adopted. The real non-root Linux test kills the original
+proxy, creates a replacement Grill, and proves the same host port serves the
+same container afterwards. That test also exposed and removed an invented,
+undelegated systemd cgroup path which made rootless runc fail at startup.
 
 ### M6. Publish real deployment operation state
 
-- [ ] Give deploys stable operation IDs, phases, start times and outcomes; expose
+- [x] Give deploys stable operation IDs, phases, start times and outcomes; expose
   active state plus bounded history (FUNC-6).
-- [ ] Build `wtf` deploy-stuck logic only after this evidence exists.
+- [x] M8: build `wtf` deploy-stuck logic from this evidence.
+
+**Delivered:** every real Bun deploy worker receives a time-based monotonic ID
+which appears as the first standalone SSE event. Its accepted, app, job and
+routing phases, current target, timestamps and terminal outcome are queryable
+through `/v1/deploys/active`; `/v1/deploys/operations` adds the newest 50
+terminal records. Same-target concurrent deploys fail before mutation, a lost
+SSE client doesn't lose the outcome, and a worker which disappears without a
+terminal event becomes `unknown`. The existing per-app rollback history remains
+a separate contract. Phase 15 `wtf` will consume this evidence in M8.
 
 ### M7. Decide and document the v1 ingress/TLS contract
 
-- [ ] Either implement and accept-test automatic ACME with production-safe
+- [x] Either implement and accept-test automatic ACME with production-safe
   defaults, or mark it deferred and correct the whitepaper/examples now.
+
+**Decision:** ACME is deferred. The v1 route contract is deliberate plain HTTP,
+`tls = "cluster"`, or `tls = "explicit"`; `auto`, `acme` and unknown values fail
+route rebuild. Every plaintext request to a TLS route now gets a 308, including
+the ACME challenge prefix which previously bypassed the redirect despite there
+being no responder. Kubernetes Ingress TLS imports use the cluster CA and emit
+a review warning because Kubernetes TLS Secret material isn't imported. The
+whitepaper, Wrapper/Sesame/Bun/Brioche designs, Chapter 3 and Rust API comments
+now distinguish this shipped contract from the deferred issuer design.
+
+The same audit found a prerequisite for Phase 15: cluster leaves stay in an
+in-memory cache until process replacement and explicit files load only at
+startup. M8 must add certificate expiry evidence and should not make
+`wtf certificate-expiry` green until renewal or hot reload is real.
 
 ### M8. Implement the corrected Phase 15 prerequisites and catalogue
 
-- [ ] Follow §8.9 of the review: contracts/safety, capability/evidence API,
-  leases/hermetic workload, ordinary catalogue, then chaos primitives.
-- [ ] Implement authenticated real drain/kill and node-scoped pressure before
-  C1/C2/C4/C5. Unsupported scenarios must not become green skips.
-- [ ] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
+- [x] Land schema-versioned result/evidence/profile contracts, one inherited
+  absolute deadline, panic-safe ownership, independently verified cleanup and
+  a typed server-owned safety policy. Unknown clusters are protected and the
+  old client-side production override no longer exists.
+- [x] Replace startup booleans with fresh expiring capability/evidence reports.
+- [x] Add server-owned durable resource leases and a hermetic OCI workload.
+  - [x] App/namespace-resource lease API, standalone/Raft ownership and
+    restart-safe cleanup. Lease and resource counts, TTLs, forwarding and
+    cleanup waits are server-bounded; reserved namespaces cannot bypass
+    ownership.
+  - [x] Make the runner use those leases for pass, failure, panic and timeout.
+  - [x] Add a pinned multi-architecture OCI workload accepted through both
+    runc and Apple Container. Keep the ProcessGrill helper as a separate
+    profile.
+- [x] Keep the delivered 39-case ordinary catalogue across all 13 groups.
+- [x] Add the guarded five-scenario chaos catalogue after the safety, evidence
+  and ownership gates. It runs serially, refuses missing node-kill/pressure or
+  server-operation prerequisites, refreshes short-lived capability evidence
+  before each case and reverses only exact fault ids retained outside the case
+  task. ProcessGrill stays separate from the pinned runc/Apple workload.
+- [x] Implement authenticated real drain/kill before C1/C2/C5.
+- [x] Implement node-scoped pressure before C4. Unsupported scenarios must
+  not become green skips.
+- [x] Separate service-data-plane and council transport partitions; make the
+  former prove a real source-cgroup/VIP/port eBPF effect and refuse delay or
+  bandwidth until a TC packet path exists.
+- [x] Enforce fault authority at the server: workload faults require
+  `inject_workload_faults` plus acknowledgement, node/council and pressure
+  faults keep their matching Admin operations, and reversal requires the
+  matching grant without a destructive acknowledgement. Attribute structured
+  inject/clear audit events to the authenticated credential rather than
+  client-supplied `$USER`.
+- [x] Use explicit `Pass`, `Fail`, `Skipped` and `Unknown`; a full profile fails
   on missing required capabilities, timeout or unknown evidence.
 - [ ] Continue with fingerprinted benchmarks, telemetry-backed `wtf`, observed
   source-namespace trace, documentation and real-cluster acceptance.
+  - [x] Benchmark schema and comparison semantics: strict versioned JSON,
+    topology and per-node platform fingerprints, workload-method compatibility,
+    direction-aware thresholds and informational hosted runs.
+  - [x] Public-API benchmark suites and `relish bench` orchestration. DNS and
+    network samples originate inside the leased source workload and cross the
+    real `.internal`/service-VIP path; destructive and saturating probes are
+    separately acknowledged; timeout, panic and cleanup uncertainty are
+    failures rather than skips.
+  - [x] Pure `wtf` diagnosis engine. Timestamped restart events and real active
+    deploy operations drive its crashloop/deploy correlation; every unavailable
+    or unsupported source produces `Unknown` and can never produce an OK row.
+  - [x] Authenticated local diagnostic telemetry for attributed storage
+    capacity, actual cgroup throttled-time deltas and safe public node-leaf
+    metadata. Partial inventories are degraded rather than green; host paths,
+    certificate bodies and private material aren't serialised.
+  - [x] Authenticated cross-node `wtf` collection and CLI. Desired application
+    state prevents absent services from disappearing; bounded restart/deploy
+    stores remain degraded evidence; app scope, watch mode and the exact 0/1/2
+    exit contract are implemented.
+  - [x] Observed source-workload trace and CLI. Fixed DNS and TCP probes run in
+    the source runtime, live userspace/eBPF/firewall state is labelled
+    separately from inference, and missing evidence produces `Unknown`.
+    External probes require exact server-owned destination authority.
+  - [x] Documentation close-out for the Phase 15 commands. The final real
+    three-node runc/Apple acceptance run remains open and keeps this parent
+    item unchecked.
+- [ ] Add certificate expiry evidence and production rotation/renewal before
+  treating the TLS-expiry diagnostic as an accepted capability.
+
+**Capability/evidence tranche delivered:** authenticated
+`GET /v1/capabilities` retains the v2 summary fields for compatibility and adds
+schema-v3, 15-second evidence. Each fact is `available`, `unavailable` or
+`unknown`; a stale snapshot is unknown, never absent. The report includes build
+target/profile, runtime/version, rootless mode, kernel, architecture, cluster
+identity, readiness, placement evidence and server-owned operation policy.
+Stores without a published freshness timestamp remain unknown. Cluster-mode
+nodes advertise drain and kill as available. Rootful Linux nodes advertise
+node pressure only after the owned cgroup/controller startup probe succeeds and
+the server has non-zero pressure ceilings.
+
+`GET /v1/capabilities/cluster` fans out concurrently to current members with
+one five-second absolute deadline. It presents the cluster service credential
+over the configured cluster HTTP client, refuses an anonymous fallback, caps
+responses at 1 MiB, checks schema, node identity and expiry, and retains every
+failed peer as an explicit unknown result. Volume semantics, telemetry
+freshness and certificate expiry remain honest unknown or unavailable
+prerequisites.
+
+**Node-failure tranche delivered:** `node-drain` publishes degraded critical
+readiness while leaving gossip, Raft and reporting open. The scheduler
+therefore withdraws the node and re-plans its placements, then admits it again
+after reversal. `node-kill` reference-counts a shared transport gate across
+inbound and outbound gossip, Raft and reporting; peers observe a genuine failed
+member and ordinary failover runs. `--containers` additionally kills every
+local workload instance.
+
+Both operations require a real Admin credential, the server-owned
+`alter_node_state` grant, an explicit `--acknowledge`, a named target and a
+non-zero TTL. A source node forwards the caller's credential and the target
+repeats the checks. Clearing a node fault has the same boundary:
+the caller remains Admin and the server keeps the `alter_node_state` grant,
+but a de-escalating `relish fault clear <id> --node <name>` needs neither
+destructive acknowledgement nor the protected-cluster mutation switch. A
+general Deployer clear leaves node faults intact. Automatic expiry is
+target-local and always remains available; if gossip has already dropped the
+target from its live routing table, manual reversal must address that node's
+still-live management endpoint directly. A three-node acceptance observes a
+follower leave and rejoin through
+the real transports, and proves a second voter failure is refused while the
+first remains down. Durable lease ownership for node state is still open and
+the chaos catalogue must not claim it yet.
+
+**Node-pressure tranche delivered:** `relish fault node-pressure` routes to a
+named node and requires Admin, the independent `saturate_capacity` operation,
+explicit acknowledgement and server-owned CPU/memory ceilings. Both ceilings
+default to zero and validate at or below 90%. A rootful Linux node creates one
+dedicated cgroup and helper outside Bun, applies a whole-node CPU quota and
+allocates only enough resident memory to reach the requested total-node usage.
+Clear, TTL and graceful shutdown remove the helper and cgroup;
+`PR_SET_PDEATHSIG` plus startup sweeping cover process death. Rootless,
+non-Linux and missing-controller nodes publish unavailable evidence. A
+privileged cgroup-v2 acceptance proves the effect, isolation and cleanup.
+
+**Network-fault honesty tranche delivered:** service `Partition` and
+gossip/Raft `CouncilPartition` are distinct variants with distinct safety
+semantics. Bun rejects a service partition without a loaded eBPF path, resolves
+the source app's live cgroup ids server-side, rolls back partial map writes and
+records the exact keys for reversal. A root-only Linux acceptance proves a
+source-scoped key returns `EPERM` before any packet reaches the backend and
+that deleting the key restores the connection. The 22-test cluster gate proves
+the real transport endpoint still enforces the voter quorum budget. Delay and
+bandwidth now fail explicitly even on eBPF-capable nodes: the connect hook
+cannot delay or pace packets and no TC program owns those contracts.
+
+**Resource-lease tranche delivered:** a Deployer may create, inspect, renew and
+release an app/namespace lease only when the server policy permits isolated
+workload provisioning. The server chooses a 128-bit identifier and an isolated
+`rbtest-*` namespace, clamps lifetime to the configured one-day hard ceiling,
+and limits one control plane to 64 leases with 128 resources each. The owner
+passes the lease id on `/v1/apply`; a standalone Bun persists app ownership
+before deploying, while a cluster commits app or namespace desired state and
+ownership in one Raft entry. Followers forward mutations with the caller's
+credential, not the cluster service principal.
+
+Standalone cleanup waits for the agent's stop result. Cluster cleanup removes
+the owned desired state through Raft. Each step has a ten-second ceiling, and a
+failed, timed-out or interrupted attempt leaves the durable lease in
+`cleaning` for the one-second reaper to resume after process death or leadership
+change. The `rbtest-*` prefix is now lease-only, so an ordinary apply can't race
+ownership. This tranche owns apps and their namespace quota declaration. The
+ownership models for jobs, faults, tokens, images, mounts and node state remain
+open work.
+
+**Hermetic workload delivered:** container cases use the official BusyBox
+1.37.0 OCI index pinned at
+`sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
+The index carries `linux/amd64` and `linux/arm64`; the real runc and Apple
+Container gates both create, start and exercise their selected manifest. The
+Apple proof exposed and fixed an invalid Docker-style `--` in
+`container exec`. ProcessGrill stays separate and continues to run the
+installed Bun's testapp.
 
 ## Optional
 

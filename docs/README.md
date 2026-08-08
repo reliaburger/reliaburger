@@ -70,7 +70,8 @@ sudo apt install runc
 Download the latest binary from [github.com/opencontainers/runc/releases](https://github.com/opencontainers/runc/releases) and place it in your `PATH`.
 
 Notes:
-- Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
+- Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. It uses `slirp4netns` for outbound networking and published ports, and restores that userspace network across Bun replacement. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
+- Rootless resource limits remain unsupported and fail admission because Reliaburger doesn't create a delegated user cgroup. Ubuntu hosts that set `kernel.apparmor_restrict_unprivileged_userns=1` also need an AppArmor policy permitting the installed Bun binary (or that restriction disabled) before runc can write UID/GID maps.
 - Rootless stores bundles/images in `~/.local/share/reliaburger/`; root mode uses `/var/lib/reliaburger/`
 - OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
 - Root-mode writable images use one private OverlayFS upper per workload over the shared content-addressed image generation. A restart or Bun adoption reuses that workload's upper; exit and kill unmount it.
@@ -118,8 +119,10 @@ make release     # compile (optimised)
 make test        # portable nextest suite
 make test-doc    # Rust documentation examples
 make test-linux  # provisioned Linux runtime/kernel suite
+make test-rootless-runc # non-root runc/slirp replacement proof
 make lint        # clippy with warnings as errors
 make audit       # RustSec advisory and dependency-maintenance gate
+make examples    # validate and dry-run every checked-in workload config
 make fmt         # format with rustfmt
 make ci          # portable format, lint and test checks
 make clean       # remove build artefacts
@@ -142,6 +145,7 @@ make test-no-default       # portable suite without default features
 make test-doc              # doctests (nextest does not run them)
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
+make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
@@ -316,6 +320,12 @@ the token hash and expiry to Raft, and prints the plaintext once. During an
 election, retry against the current leader: a follower returns an error and
 does not commit or disclose a usable token.
 
+Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
+and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
+The value is immutable for the life of the process and becomes the prefix of
+app, job and build-signer identities, for example
+`spiffe://prod/ns/default/app/api`.
+
 The generated security section contains the material paths and the secure
 mode:
 
@@ -380,6 +390,7 @@ Commands:
 | `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
 | `join-token create --node-id <id> --ttl 15m` | Mint one Admin-authorised, single-use token that enrols exactly that node id |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
+| `test [--profile <profile>]` | Run the 39-case live-cluster catalogue; full profiles fail on required skips, unknown evidence or unconfirmed cleanup |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |
 | `top` | Show live resource usage (CPU, memory) for all apps |
@@ -398,17 +409,20 @@ Commands:
 | `snapshot delete <app> <name>` | Delete a snapshot |
 | `secret pubkey [dir]` | Print the cluster's age public key |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
-| `fault delay <target> <delay>` | Add latency to connections to a service |
-| `fault drop <target> <pct>` | Fail a percentage of connections (ECONNREFUSED) |
-| `fault dns <target> nxdomain` | Return NXDOMAIN for DNS resolution |
-| `fault partition <target>` | Block traffic between services |
-| `fault kill <target>` | Kill instances of a service (SIGKILL) |
-| `fault pause <target>` | Freeze instances of a service (SIGSTOP) |
-| `fault node-drain <node>` | Simulate graceful node departure |
-| `fault node-kill <node>` | Simulate abrupt node failure |
+| `fault delay <target> <delay>` | Reserved contract; currently refused until the TC packet path ships |
+| `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
+| `fault dns <target> nxdomain --acknowledge` | Return NXDOMAIN for DNS resolution |
+| `fault partition <target> [--from <app>] --acknowledge` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
+| `fault bandwidth <target> <rate>` | Reserved contract; currently refused until the TC packet path ships |
+| `fault kill <target> --acknowledge` | Kill instances of a service (SIGKILL) |
+| `fault pause <target> --acknowledge` | Freeze instances of a service (SIGSTOP) |
+| `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
+| `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
+| `fault node-pressure <node> --cpu 80% --memory 90% --acknowledge` | Consume server-bounded Linux node capacity in an owned cgroup |
 | `fault list` | List all active faults |
-| `fault clear [id]` | Clear all faults (or a specific one by ID) |
-| `fault scenario <file>` | Run a scripted chaos scenario from a TOML file |
+| `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
+| `fault clear <id> --node <node>` | Reverse a node fault on its owning node |
+| `fault scenario <file> --acknowledge` | Run a scripted chaos scenario from a TOML file |
 | `dev create` | Create a local dev cluster (Lima VMs with rootless runc) |
 | `dev status` | Show dev cluster status |
 | `dev shell <node>` | Open a shell on a dev cluster node |
@@ -640,13 +654,20 @@ parallel (rarest layer first). Two operational constraints to know:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each
   other's registry URLs from gossip IPs plus the local port setting.
-- **`registry_bind` defaults to loopback**, which disables peer replication
-  and P2P in cluster mode (bun warns at startup). Bind wider only behind the
-  perimeter firewall's cluster-node allowlist: the registry has no auth/TLS yet.
+- **`registry_bind` defaults to loopback for standalone Bun.** In cluster mode
+  Bun derives the gossip-advertised IP from that default, so the address peers
+  use is actually bound. An explicit different interface fails startup; an
+  explicit wildcard remains valid.
+- Cluster registry reads and writes require authentication from the first request and
+  normally use the master-key-derived service token plus the node's cluster TLS
+  identity. A misconfigured cluster without that token still fails closed. The
+  open, tokenless bootstrap window exists only for a loopback standalone registry.
+- Authenticated `GET /v1/capabilities` reports the selected listener, TLS/P2P
+  state, redundancy target, active node count and under-replicated layer count.
 
 ```toml
 [images]
-registry_bind = "0.0.0.0"   # cluster mode; keep firewalled
+registry_bind = "0.0.0.0"   # optional wildcard; default derives advertise IP
 pull_through = true          # cache external images in the cluster
 cache_recheck_secs = 3600    # how long a cached mutable tag is trusted
 p2p_concurrency = 4          # parallel layer fetches per image pull
@@ -734,7 +755,20 @@ The bun agent exposes a local HTTP API on port 9117:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/health` | Agent liveness check |
+| `GET` | `/v1/readiness` | Authenticated critical-subsystem readiness evidence (200 ready, 503 fenced) |
+| `GET` | `/v1/capabilities` | Authenticated live DNS, egress and node-readiness evidence |
+| `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
+| `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
+| `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics |
+| `POST` | `/v1/trace` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
+| `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
+| `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as Admin) |
+| `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
+| `DELETE` | `/v1/test/leases/{id}` | Release a lease and start/confirm owned app cleanup |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
+| `GET` | `/v1/deploys/active` | Live accepted deploy operations, phases and current targets |
+| `GET` | `/v1/deploys/operations` | Live operations plus the newest 50 terminal outcomes |
+| `GET` | `/v1/deploys/history/{app}` | Per-app version/spec history used by rollback |
 | `GET` | `/v1/status` | List all instances |
 | `GET` | `/v1/status/{app}/{namespace}` | Status for a specific app |
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app |
@@ -743,7 +777,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership) |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join a cluster (JSON body: `{"token":"...","addr":"..."}`) |
-| `POST` | `/v1/chaos/partition` | Inject network partition (JSON: `{"peers":[...],"duration_secs":N}`) |
+| `POST` | `/v1/chaos/partition` | Inject an acknowledged council partition and return its exact fault id |
 | `POST` | `/v1/chaos/heal` | Remove all active partitions |
 | `GET` | `/v1/chaos/status` | Query active chaos state |
 
@@ -751,5 +785,141 @@ The CLI uses this API internally. You can also call it directly:
 
 ```sh
 curl http://127.0.0.1:9117/v1/health
-curl http://127.0.0.1:9117/v1/status
+curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  http://127.0.0.1:9117/v1/readiness
+curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  http://127.0.0.1:9117/v1/capabilities
+curl -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  http://127.0.0.1:9117/v1/deploys/active
 ```
+
+Phase 15's command runner and ordinary 39-case catalogue are implemented. Its
+app ownership API has landed too, and the runner creates a separate lease for
+every case. `[testing].allowed_operations` must include
+`"provision_isolated_workloads"`; unknown and production safety classes also
+need `allow_protected_mutation = true`. Lease lifetimes default to a maximum of
+3,600 seconds and must stay in the validated 1-86,400 second range. A leased
+apply carries `X-Reliaburger-Test-Lease: <id>` and may contain apps plus the
+lease's own namespace quota declaration. Bun reserves every `rbtest-*`
+namespace for this path, persists ownership across a standalone restart or in
+Raft, and retries interrupted cleanup. The runner releases the lease after a
+pass, failure, panic or timeout. Container cases use the official BusyBox
+1.37.0 multi-architecture OCI index pinned at
+`sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
+The same immutable reference is accepted by the provisioned runc and Apple
+Container gates; ProcessGrill cases keep using the node's installed Bun.
+
+`relish test --chaos` adds five serial recovery scenarios: council leader
+failure, worker death with live replicas, a minority council partition,
+bounded node pressure, and node death during a rolling deploy. Run it
+interactively and type `yes`, or pass `--yes` in automation. It refuses rather
+than skipping when the cluster has fewer than three nodes, fresh node-kill or
+node-pressure evidence is absent, the container workload can't run, or server
+policy doesn't grant `provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`. There is no client override. Every case refreshes
+capability evidence after entering the serial queue and records exact fault
+ids for panic- and timeout-safe reversal; uncertain cleanup is `Unknown`.
+
+`relish bench` is implemented too. It creates a separate durable lease per
+suite, measures deployment and scheduling through public APIs, executes real
+DNS queries and service-VIP transfers from a source container, and cleans up
+after success, error, panic or timeout. Use `--quick --output json` for a
+baseline and `--compare <file>` for a strict direction-aware comparison.
+Leader reconstruction needs `--disruptive --yes`; capacity saturation needs
+`--capacity --yes`. Server policy still decides whether either operation may
+run.
+
+`relish wtf` collects bounded evidence from every expected node using the same
+authenticated client identity. It diagnoses node and council health,
+crashloops, stalled deploys, missing service backends, active faults and alerts,
+disk pressure, actual cgroup throttling, certificate lifecycle and Pickle
+redundancy. Use `--app <name>` for application scope or `--watch` for a
+30-second human refresh. JSON and YAML use schema version 1. Exit status 0 means
+all selected evidence was observed and healthy, 1 means a critical finding,
+and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
+history is deliberately reported as degraded, not silently accepted as a
+complete historical record.
+
+`relish trace <source> --to <destination>` finds a running source instance,
+then asks that node to run fixed `nslookup` and TCP-connect probes inside the
+source workload. Internal destinations derive their port from the live service
+map; use `--namespace`, `--to-namespace` and `--port` when needed. The four
+steps cover the actual DNS answer, live userspace and attached eBPF service
+state, live attached firewall state, and the TCP result. Each step is labelled
+`observed`, `inferred` or `unavailable`. A failure exits 1; missing evidence or
+missing probe tools exits 2 rather than pretending the path is healthy.
+
+External probes are denied by default. They require an Admin credential,
+`probe_external_destination` in `[testing].allowed_operations`, the protected
+cluster gate where applicable, and an exact `host:port` entry. Wildcards and
+CIDR entries do not match:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["probe_external_destination"]
+external_probe_allowlist = ["example.com:443"]
+```
+
+Workload faults are opt-in too. Injection needs a Deployer-or-higher
+credential, explicit `--acknowledge`, and this server policy:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["inject_workload_faults"]
+```
+
+An Admin role does not replace the operation grant. Production and unknown
+clusters additionally need the server-owned `allow_protected_mutation = true`
+gate. Bun ignores the request body's audit identity, derives the readable
+fault owner and stable credential principal from authentication, and emits
+machine-readable `fault.injected` and clear events. Reversal needs the same
+role and operation grant, but not destructive acknowledgement or the
+protected-cluster mutation switch.
+
+Node-level faults have a separate privilege boundary. The caller must be an
+Admin, `[testing].allowed_operations` must contain `"alter_node_state"`, and
+the command must include `--acknowledge` and a non-zero duration. `node-drain`
+publishes not-ready evidence so the scheduler moves placements while cluster
+traffic stays live. `node-kill` closes gossip, Raft and reporting traffic;
+`--containers` also kills local workloads. Both reverse on expiry. A manual
+clear needs the owning node because fault IDs are node-local:
+`relish fault clear <id> --node <node>`. Once peers have removed
+the failed node from their live directory, point `--endpoint` at that node's
+still-running management API. An ordinary clear never removes node faults.
+
+Node pressure uses an independent `"saturate_capacity"` permission and two
+server-owned ceilings. Both default to zero, so installing Bun doesn't enable
+capacity saturation by accident:
+
+```toml
+[testing]
+safety_class = "development"
+allowed_operations = ["saturate_capacity"]
+max_node_pressure_cpu_percent = 80
+max_node_pressure_memory_percent = 90
+```
+
+The caller must still be an Admin and pass `--acknowledge`. Linux cgroup v2
+must expose the CPU and memory controllers; rootless and non-Linux nodes report
+the capability as unavailable. `relish fault node-pressure worker-2 --cpu
+80% --memory 90% --duration 60s --acknowledge` creates a dedicated helper
+cgroup, never moves Bun into it, and permits only one pressure helper per node.
+The CPU limit applies across all cores. Memory is a target for total node
+usage, not an extra percentage, and the helper cgroup has a hard ceiling at the
+requested share of physical memory. Bun kills the helper and removes the
+cgroup on clear, expiry and graceful shutdown; Linux parent-death signalling
+plus a startup sweep cover process death. Pressure reversal is de-escalating,
+so it does not need acknowledgement or the protected-cluster mutation switch.
+It still needs an Admin credential and the server's `"saturate_capacity"`
+grant, including through `--node`; it never inherits authority to reverse
+drain or kill from an unrelated operation.
+
+Standalone apply streams an `Accepted` SSE event before progress, containing
+the operation ID used by these endpoints. Active records report `accepted`,
+`deploying_apps`, `deploying_jobs` or `rebuilding_routes`; terminal records use
+the `finished` phase plus an explicit `completed`, `failed`, `cancelled` or
+`unknown` outcome. `unknown` means the worker ended without terminal evidence.
+It is not treated as a green deploy. Concurrent operations may target different
+apps, but Bun refuses a second operation for the same namespace/name.

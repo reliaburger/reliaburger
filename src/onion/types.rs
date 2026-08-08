@@ -130,19 +130,19 @@ pub struct FirewallValue {
 // SAFETY: All BPF map structs are #[repr(C)], Copy, 'static, and have
 // no padding holes (all padding is explicit via _pad fields). This makes
 // them safe to interpret as raw bytes for BPF map operations.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BackendKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BackendEndpoint {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for BackendValue {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for DnsMapKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for DnsMapValue {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for FirewallKey {}
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 unsafe impl aya::Pod for FirewallValue {}
 
 // ---------------------------------------------------------------------------

@@ -120,6 +120,8 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
     let data_dir = std::env::temp_dir().join(format!("rb-failover-{name}-{gossip_port}"));
     let _ = std::fs::remove_dir_all(&data_dir);
     let reconciler_state_dir = data_dir.clone();
+    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
+    readiness.register("agent", true).await;
 
     let (handle, cluster_runtime) = runtime::start(
         ClusterParams {
@@ -143,6 +145,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
+            readiness: Some(readiness.clone()),
         },
         shutdown.clone(),
     )
@@ -167,11 +170,19 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         cmd_rx,
         shutdown.clone(),
         handle,
+        "default".to_string(),
     );
     agent.set_node_capacity(8000, 16384);
+    agent.set_readiness_tracker(readiness.clone());
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
-    let agent_task = tokio::spawn(async move { agent.run().await });
+    let agent_task = reliaburger::bun::readiness::spawn_owned(
+        "agent",
+        true,
+        readiness,
+        shutdown.clone(),
+        async move { agent.run().await },
+    );
 
     // Leader scheduler with a fast learning period, so a fresh leader
     // starts scheduling within seconds of gaining coverage.

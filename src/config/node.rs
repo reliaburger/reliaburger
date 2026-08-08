@@ -33,6 +33,8 @@ pub struct NodeConfig {
     pub ebpf: EbpfSection,
     pub upgrades: UpgradeSection,
     pub smoker: SmokerSection,
+    /// Server-owned permissions and limits for Phase 15 diagnostics.
+    pub testing: crate::testkit::safety::ClusterTestPolicy,
 }
 
 impl NodeConfig {
@@ -236,6 +238,22 @@ impl Default for IngressSection {
 }
 
 impl IngressSection {
+    /// Validate the operator-supplied TLS material as one atomic setting.
+    ///
+    /// Supplying only one half would otherwise make Wrapper silently ignore
+    /// it and generate its development certificate.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        if self.tls_cert.is_some() == self.tls_key.is_some() {
+            Ok(())
+        } else {
+            Err(super::error::ConfigError::Validation {
+                field: "tls_cert/tls_key".to_string(),
+                context: "ingress".to_string(),
+                reason: "must either both be set or both be omitted".to_string(),
+            })
+        }
+    }
+
     /// Convert into the Wrapper subsystem's config type.
     pub fn to_wrapper_config(&self) -> crate::wrapper::types::WrapperConfig {
         crate::wrapper::types::WrapperConfig {
@@ -341,6 +359,8 @@ pub struct NodeSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClusterSection {
+    /// Stable cluster name and SPIFFE trust domain.
+    pub name: String,
     /// Addresses of existing cluster members to join. Empty for the first node.
     pub join: Vec<String>,
     /// Port for Mustard SWIM gossip protocol.
@@ -351,11 +371,9 @@ pub struct ClusterSection {
     pub reporting_port: u16,
     /// Free-form environment tag, e.g. `"production"`, `"staging"`.
     ///
-    /// Reported at `/v1/capabilities` and used as a safety interlock: the
-    /// chaos suite refuses to run against a cluster tagged `production`
-    /// unless explicitly overridden. Untagged clusters are assumed
-    /// non-production, because requiring a tag to *avoid* chaos would fail
-    /// in the wrong direction on a cluster nobody remembered to label.
+    /// This remains descriptive metadata for compatibility. Phase 15
+    /// authorisation uses the typed `[testing].safety_class` instead: an
+    /// absent or misspelt free-form tag must never weaken a safety gate.
     pub environment: Option<String>,
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2
     /// D21/CP12). Off by default; set `url` to enable.
@@ -365,12 +383,38 @@ pub struct ClusterSection {
 impl Default for ClusterSection {
     fn default() -> Self {
         Self {
+            name: "default".to_string(),
             join: Vec::new(),
             gossip_port: 9443,
             raft_port: 9444,
             reporting_port: 9445,
             environment: None,
             backup: crate::council::backup::BackupConfig::default(),
+        }
+    }
+}
+
+impl ClusterSection {
+    /// Validate the cluster name used as the SPIFFE trust domain.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        let valid = !self.name.is_empty()
+            && self.name.len() <= 255
+            && self.name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(super::error::ConfigError::InvalidValue {
+                field: "cluster.name".to_string(),
+                value: self.name.clone(),
+            })
         }
     }
 }
@@ -580,9 +624,9 @@ pub struct ImagesSection {
     pub gc_interval_hours: u32,
     /// Port for the OCI Distribution API (Pickle registry).
     pub registry_port: u16,
-    /// Interface the registry binds to. Defaults to `127.0.0.1` (loopback) so
-    /// the registry is not exposed unauthenticated on all interfaces. Set to
-    /// `0.0.0.0` once cross-node replication (and auth) are wired.
+    /// Interface the registry binds to. Standalone Bun keeps the `127.0.0.1`
+    /// default. Clustered Bun derives its advertised gossip address from that
+    /// default; an explicit bind must cover the advertised address.
     pub registry_bind: String,
     /// Parallel layer fetches per P2P image pull.
     pub p2p_concurrency: usize,
@@ -860,6 +904,58 @@ mod tests {
         assert!(wc.tls_cert_path.is_none());
     }
 
+    #[test]
+    fn ingress_rejects_incomplete_explicit_certificate_pair() {
+        for toml in [
+            "[ingress]\ntls_cert = \"/cert.pem\"",
+            "[ingress]\ntls_key = \"/key.pem\"",
+        ] {
+            let config = NodeConfig::parse(toml).unwrap();
+            let error = config.ingress.validate().unwrap_err().to_string();
+            assert!(error.contains("tls_cert"), "unexpected error: {error}");
+            assert!(error.contains("tls_key"), "unexpected error: {error}");
+        }
+
+        let complete =
+            NodeConfig::parse("[ingress]\ntls_cert = \"/cert.pem\"\ntls_key = \"/key.pem\"")
+                .unwrap();
+        complete.ingress.validate().unwrap();
+    }
+
+    #[test]
+    fn phase15_policy_defaults_protected_and_parses_explicit_operations() {
+        let defaults = NodeConfig::parse("").unwrap();
+        assert!(defaults.testing.safety_class.is_protected());
+        assert!(defaults.testing.allowed_operations.is_empty());
+
+        let configured = NodeConfig::parse(
+            r#"
+            [testing]
+            safety_class = "staging"
+            allowed_operations = ["provision_isolated_workloads", "inject_workload_faults"]
+            max_lease_seconds = 900
+            max_node_pressure_cpu_percent = 80
+            max_node_pressure_memory_percent = 90
+        "#,
+        )
+        .unwrap();
+        assert_eq!(configured.testing.max_lease_seconds, 900);
+        assert_eq!(configured.testing.max_node_pressure_cpu_percent, 80);
+        assert_eq!(configured.testing.max_node_pressure_memory_percent, 90);
+        assert!(
+            configured
+                .testing
+                .allowed_operations
+                .contains(&crate::testkit::safety::OperationPermission::InjectWorkloadFaults)
+        );
+
+        let mut invalid = defaults;
+        invalid.testing.max_lease_seconds = 0;
+        assert!(invalid.validate().is_err());
+        invalid.testing.max_lease_seconds = crate::testkit::safety::MAX_TEST_LEASE_SECONDS + 1;
+        assert!(invalid.validate().is_err());
+    }
+
     /// L8: loading eBPF needs root + a recent kernel, so it is opt-in.
     #[test]
     fn ebpf_disabled_by_default() {
@@ -910,6 +1006,7 @@ mod tests {
             labels = { region = "us-east", ssd = "true" }
 
             [cluster]
+            name = "payments.prod"
             join = ["10.0.1.5:9443", "10.0.1.6:9443"]
 
             [storage]
@@ -931,6 +1028,7 @@ mod tests {
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.node.name.as_deref(), Some("node-1"));
         assert_eq!(nc.node.labels.get("region").unwrap(), "us-east");
+        assert_eq!(nc.cluster.name, "payments.prod");
         assert_eq!(nc.cluster.join.len(), 2);
         assert_eq!(nc.storage.data, PathBuf::from("/mnt/fast/data"));
         assert_eq!(nc.resources.reserved_cpu, "1000m");
@@ -947,8 +1045,21 @@ mod tests {
         "#;
         let nc = NodeConfig::parse(toml_str).unwrap();
         assert_eq!(nc.cluster.join, vec!["10.0.1.5:9443"]);
+        assert_eq!(nc.cluster.name, "default");
         // All other sections have defaults
         assert_eq!(nc.storage, StorageSection::default());
+    }
+
+    #[test]
+    fn cluster_name_must_be_a_valid_spiffe_trust_domain() {
+        let valid = NodeConfig::parse("[cluster]\nname = \"payments.prod\"").unwrap();
+        valid.cluster.validate().unwrap();
+
+        for name in ["", "UPPER", "has/slash", "-leading", "trailing-"] {
+            let mut invalid = NodeConfig::default();
+            invalid.cluster.name = name.to_string();
+            assert!(invalid.cluster.validate().is_err(), "accepted {name:?}");
+        }
     }
 
     #[test]
@@ -1140,6 +1251,43 @@ mod tests {
         assert!(nc.security.bootstrap_path.is_none());
         assert!(nc.security.identity_dir.is_none());
         assert!(!nc.security.require_mtls);
+    }
+
+    #[test]
+    fn testing_policy_defaults_to_protected_and_denied() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert_eq!(
+            nc.testing.safety_class,
+            crate::testkit::safety::ClusterSafetyClass::Unknown
+        );
+        assert!(nc.testing.allowed_operations.is_empty());
+        assert!(!nc.testing.allow_protected_mutation);
+    }
+
+    #[test]
+    fn testing_policy_parses_typed_permissions() {
+        let nc = NodeConfig::parse(
+            r#"
+            [testing]
+            safety_class = "development"
+            allowed_operations = [
+                "read_diagnostics",
+                "provision_isolated_workloads",
+            ]
+            max_lease_seconds = 900
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            nc.testing.safety_class,
+            crate::testkit::safety::ClusterSafetyClass::Development
+        );
+        assert!(
+            nc.testing
+                .allowed_operations
+                .contains(&crate::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads)
+        );
+        assert_eq!(nc.testing.max_lease_seconds, 900);
     }
 
     #[test]

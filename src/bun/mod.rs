@@ -9,11 +9,14 @@ pub mod authz;
 pub mod batch;
 pub mod build_runner;
 pub mod capabilities;
+pub mod deploy_operations;
+pub mod diagnostics;
 pub mod disk_pressure;
 pub mod events;
 pub mod gpu;
 pub mod health;
 pub mod probe;
+pub mod readiness;
 pub mod restart;
 pub mod snapshot_worker;
 pub mod supervisor;
@@ -89,6 +92,10 @@ pub enum BunError {
     /// A security or identity operation failed.
     #[error("security error: {reason}")]
     SecurityError { reason: String },
+
+    /// All bounded connectivity-trace execution slots are occupied.
+    #[error("too many connectivity traces are already running on this node")]
+    TraceBusy,
 
     /// A self-upgrade operation failed.
     #[error(transparent)]

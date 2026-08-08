@@ -1,3 +1,4 @@
+pub mod bench_cmd;
 /// Relish CLI library.
 ///
 /// Separates CLI logic from the binary so it can be tested as a library.
@@ -32,8 +33,11 @@ pub mod reader;
 pub mod setup;
 pub mod source;
 pub mod test_cmd;
+pub mod trace_cmd;
 pub mod tui;
 pub mod upgrade;
+pub mod wtf;
+pub mod wtf_cmd;
 
 pub use output::OutputFormat;
 pub use plan::{ApplyPlan, PlanAction, PlanEntry};

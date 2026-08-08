@@ -878,6 +878,7 @@ async fn kill_fault_actually_kills_the_instance() {
         reason: Some("kill test".into()),
         include_leader: false,
         override_safety: false,
+        acknowledged: true,
     };
     harness.client.inject_fault(&fault).await.unwrap();
 
@@ -938,6 +939,7 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
         reason: None,
         include_leader: false,
         override_safety: false,
+        acknowledged: true,
     };
     let result = harness.client.inject_fault(&fault).await;
     assert!(

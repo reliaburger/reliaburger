@@ -20,10 +20,6 @@ use super::rate_limit::{RateLimitResult, ShardedRateLimiter};
 use super::routing::RoutingTable;
 use super::types::{WrapperConfig, WrapperError};
 
-/// Prefix for ACME HTTP-01 challenge paths. These must stay on plain HTTP
-/// even for a TLS route, so a would-be issuer can answer the challenge.
-const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
-
 /// Shared state for the proxy handlers.
 pub struct ProxyState {
     pub routing_table: Arc<RwLock<RoutingTable>>,
@@ -407,9 +403,9 @@ async fn do_proxy(
     };
 
     // A TLS route reached over plain HTTP is redirected to HTTPS rather than
-    // served in the clear (ING1). ACME challenge paths stay on HTTP so an
-    // issuer can answer them.
-    if tls_required && !over_tls && !path.starts_with(ACME_CHALLENGE_PREFIX) {
+    // served in the clear (ING1). ACME is not implemented, so there is no
+    // plaintext challenge-path exception in the v1 contract.
+    if tls_required && !over_tls {
         return redirect_to_https(&host, req.uri());
     }
 
@@ -929,6 +925,23 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 308);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "https://secure.test/panel");
+
+        // ACME isn't implemented in v1, so its well-known path is not a
+        // plaintext escape hatch. It follows the same fail-closed redirect.
+        let url =
+            format!("http://127.0.0.1:{http_port}/.well-known/acme-challenge/not-a-responder");
+        let resp = client
+            .get(&url)
+            .header("host", "secure.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 308);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            location,
+            "https://secure.test/.well-known/acme-challenge/not-a-responder"
+        );
 
         shutdown.cancel();
     }

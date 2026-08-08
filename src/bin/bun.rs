@@ -74,6 +74,22 @@ enum Command {
         #[arg(long, default_value = "64")]
         alloc_mib: usize,
     },
+    /// Internal node-pressure worker. Not part of Bun's public CLI.
+    #[command(name = "__node-pressure-helper", hide = true)]
+    NodePressureHelper {
+        /// Dedicated cgroup prepared by the parent Bun.
+        #[arg(long)]
+        cgroup: PathBuf,
+        /// Bun PID used to close the parent-death-signal race.
+        #[arg(long)]
+        parent_pid: u32,
+        /// Total-node memory-usage target, recomputed after joining the cgroup.
+        #[arg(long)]
+        memory_percentage: u8,
+        /// Number of CPU-burning worker threads.
+        #[arg(long)]
+        cpu_workers: usize,
+    },
 }
 
 /// Build cluster startup parameters from node config.
@@ -172,7 +188,50 @@ fn cluster_params_from_config(
         labels: config.node.labels.clone(),
         // Wired in by the caller (run) once the disk-pressure channel exists.
         self_disk_pressured_rx: None,
+        readiness: None,
     })
+}
+
+/// Assemble Pickle's live listener, membership and catalogue evidence.
+async fn current_registry_capability(
+    bind: reliaburger::pickle::capability::RegistryBindPlan,
+    tls: bool,
+    p2p_enabled: bool,
+    redundancy_target: u32,
+    membership: Option<
+        &tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
+    >,
+    council: Option<&Arc<reliaburger::council::CouncilNode>>,
+    catalog: &Arc<RwLock<ManifestCatalog>>,
+) -> reliaburger::pickle::capability::RegistryCapabilityEvidence {
+    let known_nodes = membership
+        .map(|receiver| {
+            receiver
+                .borrow()
+                .iter()
+                .filter(|member| member.state == reliaburger::mustard::state::NodeState::Alive)
+                .count()
+        })
+        .unwrap_or(1)
+        .max(1);
+    let authoritative;
+    let local;
+    let catalog = if let Some(council) = council {
+        authoritative = council.manifest_catalog().await;
+        &authoritative
+    } else {
+        local = catalog.read().await;
+        &local
+    };
+    reliaburger::pickle::capability::registry_capability_evidence(
+        bind,
+        true,
+        tls,
+        p2p_enabled,
+        redundancy_target,
+        known_nodes,
+        catalog,
+    )
 }
 
 /// The directory this node reads/writes its identity from: the configured
@@ -346,20 +405,6 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
     )
 }
 
-/// Whether the Pickle registry's bind address is reachable only from this
-/// host (O1).
-///
-/// `[images] registry_bind` is a bare host, not a `host:port`, so it's parsed
-/// as an `IpAddr`. Anything that isn't an IP literal — a hostname, or the
-/// unspecified `0.0.0.0`/`[::]` — counts as routable: we can't prove nobody
-/// else can reach it, and the failure we'd rather have is "you needed a token
-/// and didn't expect to".
-fn registry_bind_is_loopback(bind: &str) -> bool {
-    bind.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
-}
-
 /// Build the ingress TLS cert resolver from the cluster Ingress CA (M8).
 ///
 /// Returns `None` — falling back to a self-signed `localhost` cert — when the
@@ -423,10 +468,36 @@ async fn run_testapp(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // The helper must not construct Tokio's multi-thread runtime: those
+    // threads would join the pressure cgroup too and blur ownership. Handle
+    // this internal mode synchronously, then build the normal agent runtime.
+    if let Some(Command::NodePressureHelper {
+        cgroup,
+        parent_pid,
+        memory_percentage,
+        cpu_workers,
+    }) = &cli.command
+    {
+        return reliaburger::smoker::node_pressure::run_helper(
+            cgroup,
+            *parent_pid,
+            *memory_percentage,
+            *cpu_workers,
+        )
+        .map_err(anyhow::Error::msg);
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to construct Tokio runtime: {error}"))?;
+    runtime.block_on(run_agent(cli))
+}
+
+async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // `bun testapp` never becomes an agent — it's the workload, not the
     // orchestrator. Handle it before any node config is touched.
     if let Some(Command::Testapp {
@@ -477,10 +548,18 @@ async fn main() -> anyhow::Result<()> {
         .backup
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    config
+        .cluster
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
     // A zero alert interval would panic `tokio::time::interval` at startup
     // (OBS4); reject it here with a clear message.
     config
         .alerts
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    config
+        .ingress
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
@@ -578,6 +657,8 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         AnyGrill::Apple(_) => "apple",
     };
+    let runtime_version = runtime_version(runtime_kind).await;
+    let host_kernel = host_kernel().await;
     // Image-store handle for installing the cluster P2P image source
     // once the registry and catalog exist — the runtime is selected
     // long before them, so the source is injected late via a OnceLock
@@ -589,6 +670,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Create shutdown token
     let shutdown = CancellationToken::new();
+    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
+    for name in ["agent", "api", "registry"] {
+        readiness.register(name, true).await;
+    }
+    if config.dns.enabled {
+        readiness.register("dns", true).await;
+    }
+    let mut ingress_cluster_tls_ready = false;
+    if config.ingress.enabled {
+        readiness.register("ingress", true).await;
+    }
 
     // Mayo store first: the cluster runtime's rollup worker reads it, so
     // it must exist before the runtime starts.
@@ -647,6 +739,8 @@ async fn main() -> anyhow::Result<()> {
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
     let mut replication_membership = None;
+    // Address peers use for this node, captured before ClusterParams moves.
+    let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
     let mut api_membership: Option<Arc<RwLock<Vec<api::NodeMembershipInfo>>>> = None;
     // Handles the orchestration tasks need, captured before the
@@ -655,8 +749,10 @@ async fn main() -> anyhow::Result<()> {
     let mut orchestration = None;
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
+        registry_cluster_advertise = Some(params.gossip_addr.ip());
         params.mayo = Some(Arc::clone(&mayo_store));
         params.self_disk_pressured_rx = Some(disk_pressured_rx.clone());
+        params.readiness = Some(readiness.clone());
         // Advertised via the gossip directory (12b.2): peers reach this
         // node's API at the port it actually listens on, not a derived one.
         params.api_port = api_port;
@@ -703,7 +799,14 @@ async fn main() -> anyhow::Result<()> {
             cluster_runtime.directory_rx.clone(),
         ));
         _cluster_runtime = Some(cluster_runtime);
-        BunAgent::with_cluster(runtime, port_allocator, cmd_rx, agent_shutdown, handle)
+        BunAgent::with_cluster(
+            runtime,
+            port_allocator,
+            cmd_rx,
+            agent_shutdown,
+            handle,
+            config.cluster.name.clone(),
+        )
     } else {
         _cluster_runtime = None;
         BunAgent::new(runtime, port_allocator, cmd_rx, agent_shutdown)
@@ -756,6 +859,13 @@ async fn main() -> anyhow::Result<()> {
     agent.set_process_config(config.process_workloads.clone());
     // Bound fault durations by the `[smoker]` policy (default + maximum).
     agent.set_smoker_config(config.smoker.to_smoker_config());
+    let node_pressure_available = agent.configure_node_pressure(
+        reliaburger::smoker::node_pressure::NodePressureLimits {
+            max_cpu_percentage: config.testing.max_node_pressure_cpu_percent,
+            max_memory_percentage: config.testing.max_node_pressure_memory_percent,
+        },
+        exe_path.clone(),
+    );
 
     // Detect GPUs and record what this node can enforce, so the supervisor
     // refuses a GPU request or rootless resource limit it can't back (D15/M22)
@@ -803,12 +913,12 @@ async fn main() -> anyhow::Result<()> {
     // `mut` only matters on an `ebpf` build — the assignment below lives
     // inside a `#[cfg(feature = "ebpf")]` block, so a default build never
     // writes to it and would warn.
-    #[cfg_attr(not(feature = "ebpf"), allow(unused_mut))]
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(unused_mut))]
     let mut ebpf_loaded = false;
     if config.ebpf.enabled {
         match config.ebpf.resolve_program_dir() {
             Some(program_dir) => {
-                #[cfg(feature = "ebpf")]
+                #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 match reliaburger::onion::ebpf::loader::OnionEbpf::load(
                     &program_dir,
                     &config.ebpf.cgroup_path,
@@ -830,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
-                #[cfg(not(feature = "ebpf"))]
+                #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
                 {
                     let _ = program_dir;
                     eprintln!(
@@ -995,26 +1105,44 @@ async fn main() -> anyhow::Result<()> {
 
         let refresh_store = Arc::clone(&api_token_store);
         let refresh_council = Arc::clone(council);
-        let refresh_shutdown = shutdown.clone();
         let refresh_crl = crl_refresh.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    _ = refresh_shutdown.cancelled() => break,
-                    _ = ticker.tick() => {
-                        refresh_token_store(&refresh_store, &refresh_council).await;
-                        // Same tick refreshes the CRL so a revoked peer is
-                        // refused on its next handshake (≤5 s lag).
-                        if let Some(crl) = &refresh_crl {
-                            crl.update(refresh_council.security_state().await.crl);
+        reliaburger::bun::readiness::spawn_reconstructible(
+            "security-refresh",
+            false,
+            readiness.clone(),
+            shutdown.clone(),
+            reliaburger::bun::readiness::RestartBudget {
+                max_restarts: 3,
+                retry_delay: std::time::Duration::from_secs(1),
+                recovery_deadline: std::time::Duration::from_secs(30),
+                shutdown_deadline: std::time::Duration::from_secs(5),
+            },
+            move |attempt_shutdown| {
+                let refresh_store = Arc::clone(&refresh_store);
+                let refresh_council = Arc::clone(&refresh_council);
+                let refresh_crl = refresh_crl.clone();
+                async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        tokio::select! {
+                            _ = attempt_shutdown.cancelled() => break,
+                            _ = ticker.tick() => {
+                                refresh_token_store(&refresh_store, &refresh_council).await;
+                                // Same tick refreshes the CRL so a revoked peer is
+                                // refused on its next handshake (≤5 s lag).
+                                if let Some(crl) = &refresh_crl {
+                                    crl.update(refresh_council.security_state().await.crl);
+                                }
+                            }
                         }
                     }
+                    Ok(())
                 }
-            }
-        });
+            },
+        );
     }
     agent.set_log_sink(log_tx);
+    agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
     if let Some(manager) = upgrade_manager.clone() {
@@ -1033,8 +1161,13 @@ async fn main() -> anyhow::Result<()> {
         let dns_shutdown = shutdown.clone();
         let dns_addr = bound_dns.local_addr()?;
         println!("bun: dns responder ready on {dns_addr}");
-        let server =
-            tokio::spawn(bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()));
+        let server = reliaburger::bun::readiness::spawn_owned(
+            "dns",
+            true,
+            readiness.clone(),
+            dns_shutdown.clone(),
+            bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()),
+        );
         tokio::spawn(async move {
             let outcome = server.await;
             if !dns_shutdown.is_cancelled() {
@@ -1068,6 +1201,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(council) => build_ingress_cert_resolver(council).await,
                 None => None,
             };
+        ingress_cluster_tls_ready = ingress_resolver.is_some();
         let bound = reliaburger::wrapper::proxy::bind_proxy_with_tls(
             wrapper_config,
             routing_table,
@@ -1081,16 +1215,28 @@ async fn main() -> anyhow::Result<()> {
             "bun: ingress listening on http {} / https {}",
             bound.http_addr, bound.https_addr
         );
-        tokio::spawn(async move {
-            if let Err(e) = bound.serve().await {
-                eprintln!("bun: ingress proxy exited with error: {e}");
-            }
-        });
+        reliaburger::bun::readiness::spawn_owned(
+            "ingress",
+            true,
+            readiness.clone(),
+            shutdown.clone(),
+            async move {
+                if let Err(e) = bound.serve().await {
+                    eprintln!("bun: ingress proxy exited with error: {e}");
+                }
+            },
+        );
     }
 
-    let agent_handle = tokio::spawn(async move {
-        agent.run().await;
-    });
+    let agent_handle = reliaburger::bun::readiness::spawn_owned(
+        "agent",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            agent.run().await;
+        },
+    );
 
     // Create observability stores (the Mayo store was created above,
     // before the cluster runtime that its rollup worker feeds from)
@@ -1471,17 +1617,87 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let local_test_leases = if api_council.is_some() {
+        // Cluster leases are Raft state. Don't let an old standalone file
+        // shadow or block the replicated source of truth after a mode change.
+        reliaburger::testkit::lease::LocalLeaseStore::in_memory()
+    } else {
+        reliaburger::testkit::lease::LocalLeaseStore::open(
+            config.storage.data.join("test-leases.json"),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?
+    };
+    let lease_reaper_handle = match &api_council {
+        Some(council) => reliaburger::testkit::lease::spawn_cluster_lease_reaper(
+            Arc::clone(council),
+            shutdown.clone(),
+        ),
+        None => reliaburger::testkit::lease::spawn_local_lease_reaper(
+            local_test_leases.clone(),
+            cmd_tx.clone(),
+            shutdown.clone(),
+        ),
+    };
+
     // What this node can actually do, for `/v1/capabilities` (Phase 15).
     // Everything here is observed at startup rather than assumed: a
     // capability report that overstates is worse than none, because it turns
     // "this cluster can't" into "this test mysteriously fails".
+    let node_certificate = api_identity.as_ref().and_then(|identity| {
+        let rotation_state = if std::time::SystemTime::now() >= identity.not_after {
+            "expired"
+        } else {
+            // Node leaves are loaded at process start. We expose that fact
+            // rather than claiming the workload identity rotation loop also
+            // hot-reloads the API and cluster transports.
+            "restart_required"
+        };
+        match reliaburger::bun::diagnostics::public_certificate_metadata(
+            "node",
+            &identity.node_id,
+            &identity.certificate_der,
+            rotation_state,
+            false,
+        ) {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                eprintln!("bun: node certificate diagnostics unavailable: {error}");
+                None
+            }
+        }
+    });
+    let diagnostic_storage_paths = [
+        ("data", &config.storage.data),
+        ("images", &config.storage.images),
+        ("logs", &config.storage.logs),
+        ("metrics", &config.storage.metrics),
+        ("volumes", &config.storage.volumes),
+    ]
+    .into_iter()
+    .map(
+        |(domain, path)| reliaburger::bun::diagnostics::DiagnosticStoragePath {
+            domain: domain.to_string(),
+            path: path.clone(),
+        },
+    )
+    .collect();
     let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+        node_id: node_name.clone(),
+        cluster_name: config.cluster.name.clone(),
+        cluster_mode: cli.cluster,
         environment: config.cluster.environment.clone(),
         container_runtime: runtime_kind.to_string(),
+        runtime_version,
+        rootless,
+        kernel: host_kernel,
+        architecture: std::env::consts::ARCH.to_string(),
         // Whether the programs actually loaded and attached, not merely
         // whether the operator asked for them.
         ebpf: ebpf_loaded,
         ingress: config.ingress.enabled,
+        ingress_cluster_tls: ingress_cluster_tls_ready,
+        ingress_explicit_tls: config.ingress.tls_cert.is_some() && config.ingress.tls_key.is_some(),
         // The perimeter firewall is Linux-only and disabled in rootless
         // mode, matching `BunAgent`'s own `perimeter_config` decision.
         firewall: {
@@ -1503,8 +1719,24 @@ async fn main() -> anyhow::Result<()> {
         // Host execution is deny-by-default: an empty allowlist refuses
         // every process workload.
         process_workloads: !config.process_workloads.allowed_binaries.is_empty(),
-        // CPU/memory/disk faults write cgroup v2 files.
-        cgroup_faults: cfg!(target_os = "linux"),
+        // CPU/memory/disk faults need writable cgroup v2 control files.
+        cgroup_faults: {
+            #[cfg(target_os = "linux")]
+            {
+                !rootless && std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        },
+        node_pressure: node_pressure_available,
+        registry_signatures_required: config.images.trust_policy.require_signatures,
+        diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
+            storage_paths: diagnostic_storage_paths,
+            node_certificate,
+        },
+        test_policy: config.testing.clone(),
     };
 
     let app = api::router_with_upgrade(
@@ -1526,6 +1758,7 @@ async fn main() -> anyhow::Result<()> {
         upgrade_manager.clone().map(Arc::new),
         // Batch capacity (F1): the leader's aggregated worker reports.
         api_aggregated_rx.clone(),
+        config.cluster.name.clone(),
         Some(node_name.clone()),
         config.images.build_timeout_secs,
         cluster_http.clone(),
@@ -1536,6 +1769,8 @@ async fn main() -> anyhow::Result<()> {
         // signature-requiring trust policy (12b.2 JOB7).
         config.images.trust_policy.require_signatures,
         static_capabilities,
+        readiness.clone(),
+        Some(local_test_leases),
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener
@@ -1551,19 +1786,27 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let server_handle = tokio::spawn(async move {
-        match api_acceptor {
-            Some(acceptor) => serve_api_over_tls(listener, acceptor, app, server_shutdown).await,
-            None => {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        server_shutdown.cancelled().await;
-                    })
-                    .await
-                    .ok();
+    let server_handle = reliaburger::bun::readiness::spawn_owned(
+        "api",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            match api_acceptor {
+                Some(acceptor) => {
+                    serve_api_over_tls(listener, acceptor, app, server_shutdown).await
+                }
+                None => {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown.cancelled().await;
+                        })
+                        .await
+                        .ok();
+                }
             }
-        }
-    });
+        },
+    );
 
     // Spawn alert evaluation + webhook dispatch task
     if let Some(ref alert_evaluator) = alerts {
@@ -1571,11 +1814,7 @@ async fn main() -> anyhow::Result<()> {
         let eval_alerts = Arc::clone(alert_evaluator);
         let eval_shutdown = shutdown.clone();
         let eval_interval = config.alerts.evaluation_interval_secs;
-        let cluster_name = config
-            .node
-            .name
-            .clone()
-            .unwrap_or_else(|| "local".to_string());
+        let cluster_name = config.cluster.name.clone();
 
         let webhook_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1623,10 +1862,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start the Pickle OCI registry server
-    let registry_addr = format!(
-        "{}:{}",
-        config.images.registry_bind, config.images.registry_port
-    );
+    let mut registry_bind = reliaburger::pickle::capability::plan_registry_bind(
+        &config.images.registry_bind,
+        config.images.registry_port,
+        registry_cluster_advertise,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
     let pickle_dir = if std::fs::create_dir_all(&config.storage.images).is_ok() {
         config.storage.images.clone()
     } else {
@@ -1675,9 +1916,12 @@ async fn main() -> anyhow::Result<()> {
         auth: registry_auth,
         // O1: reads stay open on the loopback default (a local pull needs no
         // token) and require a principal anywhere a stranger could reach the
-        // port. A hostname we can't resolve to a literal is treated as
-        // routable — the safe way to be wrong.
-        require_read_auth: !registry_bind_is_loopback(&config.images.registry_bind),
+        // actual selected listener.
+        require_read_auth: !registry_bind.listen_addr.ip().is_loopback(),
+        // Only the literal loopback standalone listener gets an open first-push
+        // window. Cluster mode fails closed even when its master key is absent.
+        allow_unauthenticated_bootstrap: registry_cluster_advertise.is_none()
+            && registry_bind.listen_addr.ip().is_loopback(),
         quota: registry_quota,
         sessions: upload_sessions.clone(),
     };
@@ -1731,7 +1975,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
-    let pickle_listener = tokio::net::TcpListener::bind(&registry_addr).await?;
+    let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
+    registry_bind.listen_addr = pickle_listener.local_addr()?;
+    let registry_addr = registry_bind.listen_addr;
     println!(
         "bun: Pickle registry listening on {registry_addr} ({})",
         if registry_over_tls {
@@ -1741,17 +1987,62 @@ async fn main() -> anyhow::Result<()> {
         }
     );
 
-    // In cluster mode a loopback-bound registry silently disables peer
-    // replication, healing, and P2P image pulls — peers address us as
-    // <scheme>://<gossip-ip>:<registry_port>. Warn loudly rather than
-    // fail: single-node-with-council setups are legitimate.
-    if api_council.is_some() && config.images.registry_bind == "127.0.0.1" {
-        eprintln!(
-            "bun: WARNING: [images] registry_bind is 127.0.0.1 in cluster mode — \
-             image replication and P2P pulls between nodes will not work; \
-             set registry_bind to a peer-reachable address"
+    if registry_cluster_advertise.is_some()
+        && registry_addr.ip().to_string() != config.images.registry_bind
+    {
+        println!(
+            "bun: Pickle registry derived peer-reachable bind {registry_addr} from cluster advertise address"
         );
     }
+
+    let registry_p2p_enabled =
+        replication_membership.is_some() && config.images.p2p_concurrency > 0;
+    readiness
+        .set_registry(
+            current_registry_capability(
+                registry_bind,
+                registry_over_tls,
+                registry_p2p_enabled,
+                config.images.redundancy,
+                replication_membership.as_ref(),
+                api_council.as_ref(),
+                &pickle_catalog,
+            )
+            .await,
+        )
+        .await;
+    let registry_evidence_readiness = readiness.clone();
+    let registry_evidence_catalog = Arc::clone(&pickle_catalog);
+    let registry_evidence_membership = replication_membership.clone();
+    let registry_evidence_council = api_council.clone();
+    let registry_evidence_shutdown = shutdown.clone();
+    let registry_redundancy = config.images.redundancy;
+    let registry_evidence_handle = reliaburger::bun::readiness::spawn_owned(
+        "registry-evidence",
+        false,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = registry_evidence_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let evidence = current_registry_capability(
+                            registry_bind,
+                            registry_over_tls,
+                            registry_p2p_enabled,
+                            registry_redundancy,
+                            registry_evidence_membership.as_ref(),
+                            registry_evidence_council.as_ref(),
+                            &registry_evidence_catalog,
+                        ).await;
+                        registry_evidence_readiness.set_registry(evidence).await;
+                    }
+                }
+            }
+        },
+    );
 
     // Sweep expired upload sessions and their temp files (REG8) so an
     // abandoned push doesn't leak a temp forever.
@@ -1793,21 +2084,27 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let pickle_shutdown = shutdown.clone();
-    let pickle_handle = tokio::spawn(async move {
-        match pickle_acceptor {
-            Some(acceptor) => {
-                serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+    let pickle_handle = reliaburger::bun::readiness::spawn_owned(
+        "registry",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        async move {
+            match pickle_acceptor {
+                Some(acceptor) => {
+                    serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
+                }
+                None => {
+                    axum::serve(pickle_listener, pickle_app)
+                        .with_graceful_shutdown(async move {
+                            pickle_shutdown.cancelled().await;
+                        })
+                        .await
+                        .ok();
+                }
             }
-            None => {
-                axum::serve(pickle_listener, pickle_app)
-                    .with_graceful_shutdown(async move {
-                        pickle_shutdown.cancelled().await;
-                    })
-                    .await
-                    .ok();
-            }
-        }
-    });
+        },
+    );
 
     // Scheduled image GC (L10/M2): two-phase — nominate candidates,
     // let the arbiter (Raft in cluster mode, the local catalog's same
@@ -2015,7 +2312,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Wait for everything to finish
-    let _ = tokio::join!(agent_handle, server_handle, pickle_handle);
+    let _ = tokio::join!(
+        agent_handle,
+        server_handle,
+        pickle_handle,
+        registry_evidence_handle,
+        lease_reaper_handle
+    );
 
     // OBS7: the flush loops break on cancellation and drop whatever they'd
     // buffered since their last tick. Force one final flush of both stores so
@@ -2103,6 +2406,41 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
         }
         other => anyhow::bail!("unknown runtime: {other}"),
     }
+}
+
+async fn runtime_version(runtime: &str) -> Option<String> {
+    match runtime {
+        "process" => Some(env!("CARGO_PKG_VERSION").to_string()),
+        "runc" => bounded_version_command("runc", &["--version"]).await,
+        "apple" => bounded_version_command("container", &["--version"]).await,
+        _ => None,
+    }
+}
+
+async fn host_kernel() -> String {
+    bounded_version_command("uname", &["-sr"])
+        .await
+        .unwrap_or_else(|| std::env::consts::OS.to_string())
+}
+
+async fn bounded_version_command(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new(program)
+            .args(arguments)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
 }
 
 /// Bind and wire the `.internal` resolver for the selected runtime.
@@ -2232,23 +2570,6 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-
-    /// O1: only an IP literal that *is* loopback keeps registry reads open.
-    /// `0.0.0.0` is the interesting case — it reads like a local default and
-    /// is the most exposed bind there is.
-    #[test]
-    fn only_loopback_literals_keep_registry_reads_open() {
-        assert!(registry_bind_is_loopback("127.0.0.1"));
-        assert!(registry_bind_is_loopback("::1"));
-
-        assert!(!registry_bind_is_loopback("0.0.0.0"));
-        assert!(!registry_bind_is_loopback("::"));
-        assert!(!registry_bind_is_loopback("10.0.1.5"));
-        // A hostname could resolve anywhere, and could resolve somewhere else
-        // tomorrow, so it counts as routable.
-        assert!(!registry_bind_is_loopback("localhost"));
-        assert!(!registry_bind_is_loopback(""));
-    }
 
     #[test]
     fn process_runtime_refuses_dns_before_workload_creation() {

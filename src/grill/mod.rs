@@ -295,6 +295,15 @@ pub trait Grill: Send + Sync {
         std::future::ready(None)
     }
 
+    /// Snapshot rootless userspace-network ownership for an adoption record.
+    fn rootless_network_record(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Option<records::RootlessNetworkRecord>> + Send {
+        let _ = instance;
+        std::future::ready(None)
+    }
+
     /// Get the OS process ID for an instance, if available.
     ///
     /// Returns `None` for runtimes where the PID isn't directly visible
@@ -496,6 +505,19 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.log_stem(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.log_stem(instance).await,
+        }
+    }
+
+    async fn rootless_network_record(
+        &self,
+        instance: &InstanceId,
+    ) -> Option<records::RootlessNetworkRecord> {
+        match self {
+            AnyGrill::Process(g) => g.rootless_network_record(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.rootless_network_record(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.rootless_network_record(instance).await,
         }
     }
 

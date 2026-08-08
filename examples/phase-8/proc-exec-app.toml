@@ -14,5 +14,5 @@ replicas = 1
 
 [app.metrics-exporter.health]
 path = "/healthz"
-interval = "10s"
-timeout = "3s"
+interval = 10
+timeout = 3

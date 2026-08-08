@@ -61,6 +61,9 @@ pub struct PickleState {
     /// open read hands every image in the cluster — including `cache/` copies
     /// of credentialed private upstreams — to anyone who can reach the port.
     pub require_read_auth: bool,
+    /// Whether an empty token store may accept writes before the first user
+    /// token exists. This is only safe for a loopback-only standalone registry.
+    pub allow_unauthenticated_bootstrap: bool,
     /// Storage quotas (REG4). Default is unlimited.
     pub quota: QuotaConfig,
     /// Chunked upload-session tracking for TTL expiry (REG8).
@@ -85,7 +88,13 @@ impl PickleState {
             return Ok(());
         };
         let bearer = Self::bearer(headers);
-        match super::registry_auth::authorise_write(auth, bearer.as_deref()).await {
+        match super::registry_auth::authorise_write(
+            auth,
+            bearer.as_deref(),
+            self.allow_unauthenticated_bootstrap,
+        )
+        .await
+        {
             Ok(()) => Ok(()),
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
@@ -1129,6 +1138,7 @@ mod tests {
             persist_path: None,
             auth: None,
             require_read_auth: false,
+            allow_unauthenticated_bootstrap: true,
             quota: QuotaConfig::default(),
             sessions: UploadSessions::new(super::super::registry_auth::DEFAULT_UPLOAD_TTL),
         };
@@ -1892,6 +1902,7 @@ mod tests {
             persist_path: None,
             auth: None,
             require_read_auth: false,
+            allow_unauthenticated_bootstrap: true,
             quota: QuotaConfig {
                 per_repository_bytes: 4,
                 total_bytes: 0,
@@ -1936,6 +1947,7 @@ mod tests {
             persist_path: None,
             auth: None,
             require_read_auth: false,
+            allow_unauthenticated_bootstrap: true,
             quota: QuotaConfig {
                 per_repository_bytes: 4,
                 total_bytes: 0,
@@ -2007,6 +2019,7 @@ mod tests {
             persist_path: None,
             auth: None,
             require_read_auth: false,
+            allow_unauthenticated_bootstrap: true,
             quota: QuotaConfig::default(),
             // A zero TTL: any session is immediately expired on the next
             // chunk, which is exactly what we want to assert.

@@ -20,6 +20,8 @@ spiffe://prod/ns/default/app/api
 
 The trust domain is your cluster name. Then namespace, workload type (app or job), and name. Simple, hierarchical, unambiguous. Two workloads with different URIs are different identities. Same URI means same identity.
 
+That last sentence only holds if Bun actually carries the cluster name into the agent. For a while it didn't: node certificates and CA names used the value passed to `relish init`, but workload issuance quietly wrote `default`. `[cluster].name` now stores the identity in every generated node config. Bun validates it once, passes it into the agent as immutable state, and uses the same value for certificate SANs, OIDC claims and persistent build signers. A `payments.prod` cluster therefore issues `spiffe://payments.prod/...`, not an identity that accidentally belongs to some imaginary default cluster.
+
 We already defined the `SpiffeUri` type back in Phase 4:
 
 ```rust

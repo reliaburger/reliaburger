@@ -12,6 +12,7 @@ pub mod catalog;
 pub mod dns;
 pub mod service_id;
 pub mod service_map;
+pub mod trace;
 pub mod types;
 pub mod vip;
 

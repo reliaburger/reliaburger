@@ -77,6 +77,9 @@ impl AuthState {
 pub struct AuthContext {
     /// The name of the authenticated token.
     pub token_name: String,
+    /// Stable identifier for this exact credential, independent of its
+    /// human-readable name.
+    pub principal_id: String,
     /// The role granted by the token.
     pub role: ApiRole,
     /// The scoped app names (if any).
@@ -122,10 +125,16 @@ pub fn authenticate(
 
     Ok(AuthContext {
         token_name: stored.name.clone(),
+        principal_id: token_principal_id(stored),
         role: stored.role,
         scoped_apps: stored.scope.apps.clone(),
         scoped_namespaces: stored.scope.namespaces.clone(),
     })
+}
+
+fn token_principal_id(token: &ApiToken) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, &token.token_hash);
+    format!("token:{}", hex::encode(digest.as_ref()))
 }
 
 /// Authenticate a bearer without holding the token-store lock (AUTH5).
@@ -194,6 +203,7 @@ pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusC
 fn system_context() -> AuthContext {
     AuthContext {
         token_name: SYSTEM_PRINCIPAL.to_string(),
+        principal_id: SYSTEM_PRINCIPAL.to_string(),
         role: ApiRole::Admin,
         scoped_apps: None,
         scoped_namespaces: None,
@@ -303,6 +313,7 @@ pub async fn auth_middleware(
 fn readonly_session_context(token_name: &str) -> AuthContext {
     AuthContext {
         token_name: token_name.to_string(),
+        principal_id: format!("session:{token_name}"),
         role: ApiRole::ReadOnly,
         scoped_apps: None,
         scoped_namespaces: None,
@@ -526,6 +537,7 @@ mod tests {
     fn require_role_admin_passes() {
         let ctx = AuthContext {
             token_name: "admin-token".to_string(),
+            principal_id: "token:admin".to_string(),
             role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,
@@ -539,6 +551,7 @@ mod tests {
     fn require_role_readonly_rejects_deployer() {
         let ctx = AuthContext {
             token_name: "ro-token".to_string(),
+            principal_id: "token:readonly".to_string(),
             role: ApiRole::ReadOnly,
             scoped_apps: None,
             scoped_namespaces: None,
@@ -569,6 +582,7 @@ mod tests {
     fn authorize_rejects_deployer_context_on_admin_route() {
         let ctx = AuthContext {
             token_name: "dep".to_string(),
+            principal_id: "token:deployer".to_string(),
             role: ApiRole::Deployer,
             scoped_apps: None,
             scoped_namespaces: None,
@@ -646,6 +660,7 @@ mod tests {
     fn scoped_ctx(apps: Option<Vec<&str>>, namespaces: Option<Vec<&str>>) -> AuthContext {
         AuthContext {
             token_name: "scoped".to_string(),
+            principal_id: "token:scoped".to_string(),
             role: ApiRole::Deployer,
             scoped_apps: apps.map(|a| a.into_iter().map(String::from).collect()),
             scoped_namespaces: namespaces.map(|n| n.into_iter().map(String::from).collect()),
@@ -696,6 +711,7 @@ mod tests {
     fn real_admin_still_passes_user_management_routes() {
         let admin = AuthContext {
             token_name: "alice".to_string(),
+            principal_id: "token:alice".to_string(),
             role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,
@@ -710,6 +726,7 @@ mod tests {
         // A normal Admin user does not (it is not the internal principal).
         let admin = AuthContext {
             token_name: "alice".to_string(),
+            principal_id: "token:alice".to_string(),
             role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,

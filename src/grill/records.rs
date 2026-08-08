@@ -27,10 +27,29 @@ pub enum RuntimeKind {
     Apple,
 }
 
+/// Ownership and forwarding state for a rootless runc network.
+///
+/// `slirp4netns` is a userspace process rather than kernel state. Its PID plus
+/// start time prevents an adopter from taking ownership of a reused PID; the
+/// remaining fields are enough to recreate it when it did not survive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootlessNetworkRecord {
+    /// slirp4netns API socket used to manage host forwards.
+    pub api_socket: PathBuf,
+    /// PID of the slirp4netns process owned by the previous Bun.
+    pub owner_pid: u32,
+    /// Process start time for PID-reuse protection.
+    pub owner_pid_started_at: u64,
+    /// Container init PID whose network namespace slirp4netns serves.
+    pub container_pid: u32,
+    /// Published port, if this workload exposes one.
+    pub port_mapping: Option<crate::grill::oci::PortMapping>,
+}
+
 /// Everything needed to adopt one running workload instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceRecord {
-    /// Record format version. Currently 1.
+    /// Record format version. Currently 2; older records remain readable.
     pub schema: u32,
     /// Instance id string, e.g. `web-0`.
     pub instance_id: String,
@@ -60,6 +79,9 @@ pub struct InstanceRecord {
     pub app_spec: Option<AppSpec>,
     /// The OCI spec the instance was started with.
     pub oci_spec: OciSpec,
+    /// Rootless userspace-network owner and recreation parameters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootless_network: Option<RootlessNetworkRecord>,
 }
 
 /// Record path for an instance id within the records directory.
@@ -141,10 +163,12 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
 /// (±2s slack — some platforms round start times differently depending
 /// on when they're asked).
 pub fn is_live(record: &InstanceRecord) -> bool {
-    match process_start_time(record.pid) {
-        Some(started_at) => started_at.abs_diff(record.pid_started_at) <= 2,
-        None => false,
-    }
+    process_matches(record.pid, record.pid_started_at)
+}
+
+/// Whether `pid` still belongs to the process with the recorded start time.
+pub fn process_matches(pid: u32, recorded_started_at: u64) -> bool {
+    process_start_time(pid).is_some_and(|started_at| started_at.abs_diff(recorded_started_at) <= 2)
 }
 
 /// Poll a process we have no `Child` handle for (an adoptee).
@@ -242,6 +266,7 @@ mod tests {
             host_port: Some(30123),
             app_spec: None,
             oci_spec: oci_spec(),
+            rootless_network: None,
         }
     }
 
@@ -253,6 +278,29 @@ mod tests {
 
         let loaded = load_records(dir.path());
         assert_eq!(loaded, vec![original]);
+    }
+
+    #[test]
+    fn rootless_network_ownership_roundtrips_and_old_records_default_absent() {
+        let mut original = record(4242, 1000);
+        original.rootless_network = Some(RootlessNetworkRecord {
+            api_socket: PathBuf::from("/run/user/1000/reliaburger/web.sock"),
+            owner_pid: 5000,
+            owner_pid_started_at: 2000,
+            container_pid: 4243,
+            port_mapping: Some(crate::grill::oci::PortMapping {
+                host_port: 30123,
+                container_port: 8080,
+            }),
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: InstanceRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.rootless_network, original.rootless_network);
+
+        let mut old = serde_json::to_value(record(4242, 1000)).unwrap();
+        old.as_object_mut().unwrap().remove("rootless_network");
+        let old: InstanceRecord = serde_json::from_value(old).unwrap();
+        assert!(old.rootless_network.is_none());
     }
 
     #[test]

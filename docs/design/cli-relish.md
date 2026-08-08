@@ -45,12 +45,14 @@ The `relish exec` and `relish exec --debug` commands require the Bun agent runni
 
 ### Onion (resolve, trace)
 
-The `relish resolve` and `relish trace` commands query the Onion eBPF service discovery layer:
+The `relish resolve` and `relish trace` commands inspect Onion's userspace and,
+where attached, kernel state:
 
-- `resolve` queries the eBPF service map to show virtual IPs, real backends, health status, and node placement for a given service name.
-- `trace` performs end-to-end connectivity diagnosis through the eBPF DNS interception, connect() rewrite, nftables firewall evaluation, and TCP probe layers.
+- `resolve` queries the userspace service map to show virtual IPs, real backends, health status, and node placement for a given service name.
+- `trace` runs a real DNS query and TCP connect inside the source workload, then reads the userspace service map and any attached eBPF backend and cgroup-firewall maps.
 
-Both commands call the Bun agent API on the relevant node, which reads the eBPF maps from kernel space.
+Relish first finds the node hosting the source instance. That Bun agent owns
+the network locality and live map handles needed to make the observations.
 
 ### Mayo (metrics queries)
 
@@ -758,39 +760,41 @@ relish upgrade rollback <version>   # Roll back to specific version
 relish upgrade resume               # Resume a paused upgrade
 
 # Fault injection (Smoker)
-relish fault delay <app> <duration>         # Add latency to connections
-relish fault drop <app> <percent>           # Fail percentage of connections
-relish fault partition <app> --from <app>   # Block traffic between apps
-relish fault dns <app> nxdomain             # DNS resolution failure
-relish fault bandwidth <app> <rate>         # Throttle bandwidth
-relish fault cpu <app> <percent>            # Consume CPU allocation
-relish fault memory <app> <percent|oom>     # Push memory usage / trigger OOM
-relish fault disk-io <app> <rate>           # Throttle disk I/O
-relish fault kill <instance>                # Kill specific instance
-relish fault kill <app> --count <n>         # Kill N random instances
-relish fault pause <app>                    # SIGSTOP all instances
-relish fault pause <app> --instance <id>    # SIGSTOP one instance
+relish fault delay <app> <duration> --acknowledge       # Reserved; rejected until TC ships
+relish fault drop <app> <percent> --acknowledge         # Fail percentage of connections
+relish fault partition <app> --from <app> --acknowledge # Block traffic between apps
+relish fault dns <app> nxdomain --acknowledge           # DNS resolution failure
+relish fault bandwidth <app> <rate> --acknowledge       # Reserved; rejected until TC ships
+relish fault cpu <app> <percent> --acknowledge          # Consume CPU allocation
+relish fault memory <app> <percent> --acknowledge       # Push memory toward memory.high
+relish fault disk-io <app> <rate> --acknowledge         # Throttle disk I/O
+relish fault kill <instance> --acknowledge              # Kill specific instance
+relish fault kill <app> --count <n> --acknowledge       # Kill N random instances
+relish fault pause <app> --acknowledge                  # SIGSTOP all instances
+relish fault pause <app> --instance <id> --acknowledge  # SIGSTOP one instance
 relish fault pause <app> --resume           # SIGCONT (unfreeze)
-relish fault node-drain <node>              # Simulate graceful node departure
-relish fault node-kill <node>               # Simulate abrupt node failure
-relish fault node-kill <node> --duration <d> # Auto-recover after duration
-relish fault run <file>                     # Run scripted chaos scenario
+relish fault node-drain <node> --acknowledge # Withdraw from scheduling, keep transports
+relish fault node-kill <node> --acknowledge  # Quiesce gossip, Raft and reporting
+relish fault node-kill <node> --duration <d> --acknowledge # Auto-recover after duration
+relish fault node-pressure <node> --cpu 80% --memory 90% --acknowledge
+relish fault run <file> --acknowledge       # Run scripted chaos scenario
 relish fault run <file> --dry-run           # Preview scenario timing
-relish fault run <file> --speed <multiplier> # Run at adjusted speed
+relish fault run <file> --speed <multiplier> --acknowledge # Run at adjusted speed
 relish fault list                           # Show all active faults
-relish fault clear                          # Remove ALL faults
+relish fault clear                          # Remove all workload faults
 relish fault clear <app>                    # Remove faults targeting app
+relish fault clear <id> --node <node>       # Reverse a node fault
 
 # Testing
 relish test                                 # Run full integration test suite
 relish test --filter <groups>               # Run specific test groups
 relish test --parallel <n>                  # Set concurrency level
-relish test --chaos                         # Run chaos test suite
-relish test --chaos --filter <groups>       # Run specific chaos tests
-relish test --chaos --override              # Run against production clusters
+relish test --chaos                         # Run chaos suite (interactive confirmation)
+relish test --chaos --yes                   # Non-interactive consent for CI
+relish test --profile <profile>             # development/full-runc/full-apple/process-grill
 relish test --timeout <duration>            # Set test timeout
 relish test --output json                   # Machine-readable results
-relish test --namespace <name>              # Use specific namespace
+relish test --namespace <rbtest-name>        # Prefix each case's reserved namespace
 
 # Benchmarks
 relish bench                                # Run full performance benchmark
@@ -798,6 +802,8 @@ relish bench --quick                        # Abbreviated suite for CI (~2 min)
 relish bench --compare <file>               # Compare against baseline
 relish bench --quick --compare <file>       # Quick bench with regression check
 relish bench --output json                  # Machine-readable results
+relish bench --disruptive --yes              # Include real leader failure
+relish bench --capacity --yes                # Saturate with leased minimal apps
 
 # Kubernetes migration
 relish import -f <path>                     # Convert K8s YAML to Reliaburger TOML
@@ -814,6 +820,16 @@ relish export --format kubernetes -f <path> # Export to Kubernetes manifests
   --token <token>           # API token / RELIABURGER_TOKEN
   --ca-cert <path>          # Cluster root CA / RELIABURGER_CA_CERT
 ```
+
+The delay and bandwidth subcommands deliberately remain parseable so the CLI
+contract does not need another migration when the TC data path lands. Today the
+server rejects both: the loaded cgroup connect hook can refuse a connection but
+cannot sleep or pace packets. Service partition is different. Bun resolves the
+named source app to its live cgroup ids, writes exact source/VIP/port keys into
+the connect map, and refuses the request when eBPF is unavailable. The numeric
+cgroup id in the wire type is server-owned and clients must leave it as zero.
+`memory oom` is also refused because a kill cannot be reversed; use a Kill
+fault when the experiment needs to exercise restart after abrupt termination.
 
 ### Detailed Command Behaviour
 
@@ -925,14 +941,33 @@ Filter flags:
 
 **`relish trace <app> --to <app|host>`**
 
-End-to-end connectivity diagnosis. Traces the full path a connection would take through the eBPF service discovery layer, showing every step:
+End-to-end connectivity diagnosis. Relish finds a running source instance and
+calls `POST /v1/trace` on that node. Bun runs only fixed probe scripts; request
+values become positional arguments and never shell syntax. The source image
+must provide a POSIX `sh`, `nslookup` and `nc` for every observation to run.
+The response contains four steps:
 
-1. **DNS resolution (eBPF):** Resolves the destination name through the eBPF DNS interception. Shows whether the service map contains the entry and the virtual IP assigned.
-2. **Connect interception (eBPF):** Shows the virtual IP to real backend rewrite, including how many healthy backends exist.
-3. **Network path:** Shows the source and destination nodes and the nftables firewall verdict (ACCEPT or DROP, with the matching rule).
-4. **TCP probe:** Performs a real SYN handshake and reports latency.
+1. **DNS query:** Runs `nslookup` inside the source workload. For an internal service it queries `<app>.<namespace>.internal` and checks that the answer contains the live VIP.
+2. **Service and eBPF state:** Reads the userspace service map. On Linux with Onion attached, it also reads the live `backend_map` and requires a healthy kernel backend. Otherwise the userspace result is explicitly `inferred`.
+3. **Firewall state:** On Linux with the firewall hooks attached, resolves the source PID to its cgroup and evaluates the live namespace and firewall maps using the same rule as the connect hook. Without those maps the result is `Unknown`, never an invented pass.
+4. **TCP probe:** Runs `nc` inside the source workload against the service VIP and selected port and reports observed latency.
 
-If any step fails, the trace shows exactly where and why: service map entry missing, no healthy backends, nftables rule blocking, TCP connection refused or timed out. This replaces the Kubernetes debugging sequence of checking DNS, endpoints, network policies, kube-proxy, and CNI separately.
+Every step labels its evidence `observed`, `inferred` or `unavailable` and its
+verdict `Pass`, `Fail` or `Unknown`. `Fail` wins the overall result; incomplete
+evidence cannot become green. Exit statuses are 0, 1 and 2 respectively.
+Workload probes run on a spawned, bounded task so an eight-second probe timeout
+can't stall Bun's command loop. Bun permits at most eight concurrent traces per
+node and returns HTTP 429 for the ninth instead of accumulating an unbounded
+queue of workload processes. Agent shutdown cancels in-flight probes and
+releases their permits immediately.
+
+External destinations require `--port`, an Admin credential, the server-owned
+`probe_external_destination` permission and an exact `host:port` entry in
+`[testing].external_probe_allowlist`. Unknown and production clusters also
+need `allow_protected_mutation = true`. The external TCP result is observed,
+but when egress enforcement is active the current kernel maps contain resolved
+addresses rather than hostname attribution, so that firewall step remains
+`Unknown`.
 
 **`relish inspect <resource>`**
 
@@ -973,13 +1008,58 @@ Automated diagnosis. Checks the entire cluster and produces a categorised report
 
 - **CRITICAL:** Crashlooping apps, unresponsive nodes, quorum loss, broken Raft.
 - **WARNING:** High disk usage, expiring TLS certificates, CPU throttling, active faults.
+- **UNKNOWN:** A required source was unavailable, stale, or cannot expose the
+  necessary fact in the current API.
 - **OK:** Healthy nodes, healthy quorum, normal eBPF maps, image redundancy met, certificates valid, gossip convergence.
+
+An OK row always rests on an available, timestamped observation. The command
+doesn't turn a missing source into success. For example, it diagnoses a
+crashloop from restart events inside a 15-minute window rather than a lifetime
+restart counter, and reports CPU throttling only from a cgroup throttled-time
+delta rather than ordinary CPU usage. JSON and YAML use a versioned report
+contract with separate `critical`, `warnings`, `unknown`, and `ok` lists.
 
 The key differentiator: `wtf` doesn't just enumerate problems. It correlates them with recent events, identifies likely root causes, and suggests specific remediation. For example, it links a crashlooping app to a recent deploy and shows the relevant log line, saving the operator from running `logs`, `events`, and `history` separately.
 
 `--app <app>` scopes the check to a single app for deeper, faster diagnosis. `--watch` runs continuously with 30-second refresh -- useful during deploys or incidents.
 
-Exit codes: 0 (all OK), 1 (criticals found), 2 (warnings only).
+Exit codes: 0 (all observed checks OK), 1 (criticals found), 2 (warnings or
+unknown evidence only).
+
+Collection starts with the configured Bun endpoint. If that node isn't
+healthy, the command fails because it has no trustworthy cluster view. It then
+uses `/v1/cluster/nodes` and the entry node's API port, transport and
+credentials to query every expected node concurrently. Each node request has a
+ten-second bound. One failed peer degrades the relevant source and produces an
+Unknown row; it doesn't discard facts returned by the other peers.
+
+Desired replicas come from the authenticated `/v1/diagnostics/apps` view, not
+from whichever instances happened to answer. The collector compares that
+intent with scheduled replicas and the entry node's live resolver state. This
+means a service with zero backends stays visible instead of disappearing from
+the input. Restart and terminal deploy histories currently come from bounded,
+process-local rings, so the collector labels them degraded even when the
+current window is empty. Alert status doesn't yet carry application and
+namespace labels; an app-scoped alert verdict is therefore Unknown rather than
+a cluster result presented as an app result.
+
+Recent logs are not a cluster-wide fishing expedition. The collector fetches
+them only for applications with enough timestamped restarts to be crashloop
+candidates, caps the number of candidates and lines, and accepts structured
+`level=error` or stderr evidence rather than matching the word "error"
+anywhere in ordinary output. `--watch` supports human output only; JSON and
+YAML are exact single-report contracts.
+
+The authenticated `GET /v1/diagnostics` endpoint supplies local evidence that
+doesn't belong in the general metrics summary. It samples cgroup v2
+`throttled_usec` twice over a bounded 1–10 second window, attributes configured
+data, image, log, metric and volume paths to their containing filesystems, and
+returns public X.509 identity, issuer, serial and expiry metadata. Host paths,
+certificate bodies and key material never cross the API. A partial inventory
+uses `degraded`, carrying both the safe facts and the reason they can't support
+an OK verdict. Node leaves currently require a Bun restart to reload, so
+certificate rotation remains Unknown even when the leaf itself has plenty of
+validity left.
 
 #### Forensics Commands
 
@@ -1162,21 +1242,143 @@ commands manage long-lived API bearer credentials, not node enrolment.
 
 **`relish test`**
 
-Runs the full integration test suite. Each test creates its own namespace, runs validation, and tears down. Tests are independent, idempotent, and safe to run against production clusters (they don't interfere with existing workloads). Test apps are compiled into the Bun binary.
+Runs the selected acceptance profile. Each case owns resources through a
+server-side lease and the panic-safe outer runner independently verifies its
+release. Namespace isolation alone isn't enough: faults, tokens, images,
+mounts and node state aren't namespace-scoped. Unknown and production clusters
+are protected by default. The client can't make them writable with an
+override flag.
+
+The app-and-namespace-lease foundation is implemented.
+`BunClient::create_test_lease` calls
+`POST /v1/test/leases`; leased applies send the returned id in
+`X-Reliaburger-Test-Lease`; renew and release use
+`POST /v1/test/leases/{id}/renew` and `DELETE /v1/test/leases/{id}`. Bun owns
+the TTL and cleanup reaper. Standalone ownership is flushed before deploy;
+cluster ownership and desired state share one Raft entry. The runner asks for
+the case timeout plus its cleanup budget and refuses to start when the server's
+maximum is shorter. Pass, failure, panic and timeout release through the same
+path. Namespace quota declarations use the same lease. This does not yet make
+every resource hermetic: app and namespace ownership is complete, but jobs,
+faults, tokens, images, mounts and node state need resource variants.
+
+Container-profile cases use the official BusyBox 1.37.0 OCI index pinned by
+digest, not `latest`. The index resolves to `linux/amd64` under runc and
+`linux/arm64` under Apple Container. Both runtime gates create, start and
+execute the pinned workload; a pull, platform-selection or exec failure fails
+the gate. ProcessGrill remains a separate profile and launches `bun testapp`
+from each node.
+
+Every case reports exactly one of `Pass`, `Fail`, `Skipped` or `Unknown`.
+`Pass` needs directly observed evidence. `Skipped` means a known missing
+capability which the selected profile marks optional. A timeout, stale source,
+collector error, ambiguous result or uncertain cleanup is `Unknown`, never a
+green skip. Full profiles fail on a skipped required case, any `Fail`, any
+`Unknown`, or unconfirmed cleanup.
 
 Subsystems tested: scheduling, service discovery, deployments, health checks, secrets & config, firewall, workload identity, ingress, volumes, process workloads, jobs, image registry (Pickle), cluster coordination.
 
-`--parallel <n>` controls concurrency. `--filter <groups>` selects specific subsystems. `--output json` for CI. `--timeout <duration>` for pipeline time limits.
+`--parallel <n>` controls concurrency. `--filter <groups>` selects specific
+subsystems. `--profile` selects `development`, `full-runc`, `full-apple` or
+`process-grill`; full profiles reject a missing required capability, timeout,
+unknown evidence or unconfirmed cleanup. `--output json` emits the
+schema-versioned report for CI. `--timeout <duration>` sets one inherited
+deadline per case.
+
+Before a case runs, Relish fetches Bun's authenticated capability snapshot.
+Fresh `available` evidence permits the case, fresh `unavailable` evidence may
+produce a typed skip when the selected profile makes it optional, and
+`unknown` or expired evidence produces `Unknown` rather than a green skip.
+`GET /v1/capabilities/cluster` retains one result per expected node, including
+peers which failed authentication, timed out or returned stale evidence.
 
 **`relish test --chaos`**
 
-Combines integration tests with Smoker fault injection to verify cluster recovery. Tests: leader failure, node failure, network partition, resource exhaustion, cascading failure. Requires at least 3 nodes. Includes a confirmation prompt and refuses to run against clusters tagged `environment = production` unless `--override` is passed.
+Runs five serial recovery scenarios: council leader failure, a dead worker
+with live replicas, a minority council partition, bounded whole-node pressure,
+and a node death during an active rolling deploy. Each scenario uses the
+digest-pinned BusyBox workload on runc or Apple Container. ProcessGrill remains
+a separate acceptance profile because its host-port model can't restore the
+same replica count on two surviving nodes.
+
+This suite refuses before creating a lease unless fresh evidence proves at
+least three nodes, the container runtime, node kill and node pressure. Server
+policy must grant `provision_isolated_workloads`, `alter_node_state` and
+`saturate_capacity`; protected clusters must explicitly enable protected
+mutation. An interactive invocation requires the operator to type exactly
+`yes`; automation passes `--yes`. Consent grants no role or server operation,
+and there is deliberately no client override. Missing destructive
+prerequisites fail the invocation rather than becoming green skips.
+
+Chaos cases always run one at a time. The runner refreshes the 15-second
+capability evidence after each case enters that serial queue, creates its
+server-owned workload lease, and records every injected fault by exact
+target-local id, owning node and direct client. Teardown clears those exact
+faults newest first, then releases the workload lease. It takes the same path
+after failure, timeout or panic; any unconfirmed reversal makes cleanup
+`Unknown`. Blanket `fault clear` and `chaos heal` aren't used as ownership
+substitutes.
+
+Node drain and kill use an Admin with the server's `alter_node_state` grant
+and explicit acknowledgement to withdraw scheduler readiness or
+reference-count a shared gossip/Raft/reporting transport gate. Both require a
+TTL and reverse automatically. The target node repeats authorisation after
+forwarding, and general fault clearing cannot reverse node state. Node fault
+IDs remain target-local; a manual clear names the owning node and, after
+failure detection removes it from live routing, the operator addresses that
+node's management endpoint directly. Real node-scoped resource exhaustion is
+available only when a rootful Linux node advertises `NodePressure` and the
+server policy grants `saturate_capacity` with non-zero CPU/memory ceilings.
+The helper runs in an owned cgroup outside Bun and only one may run per node.
+Rootless, Apple and missing-controller cases remain unavailable rather than
+green skips.
+
+Ordinary workload faults use a separate gate. The caller needs at least the
+Deployer role, `[testing].allowed_operations` must contain
+`"inject_workload_faults"`, and every injection command or non-dry-run scenario
+needs `--acknowledge`. Admin doesn't override a disabled server operation.
+Clearing a workload fault still needs that role and grant, but no destructive
+acknowledgement or protected-cluster mutation switch. Bun derives audit
+identity from the bearer token, ignores the client body's compatibility value,
+and emits stable `fault.injected`/clear actions with credential principal,
+target, type and duration.
 
 **`relish bench`**
 
-Deploys stress-generation workloads (compiled into Bun), saturates the cluster, collects measurements, tears down, and produces a report. Measures: scheduler throughput, service discovery latency, network throughput, deploy speed, state reconstruction time, image distribution speed, cluster capacity.
+Deploys leased benchmark workloads, measures the public data plane, confirms
+teardown, and produces a schema-versioned report. Measures: scheduler throughput,
+service discovery latency, network throughput, deploy speed, state
+reconstruction time, image distribution speed and, only when explicitly
+requested, cluster capacity.
 
-`--quick` runs an abbreviated suite (~2 min) for CI. `--compare <file>` detects regressions against a baseline JSON report (flags any metric regressing >10%).
+Each report records topology, hosted-CI evidence and every node's build target,
+profile, runtime version, rootless mode, kernel and architecture. Metrics also
+record their workload size and method. `--quick` runs an abbreviated suite.
+`--compare <file>` flags a direction-aware regression only when it is strictly
+greater than 10%. It lists missing metrics rather than inventing a comparison.
+
+Comparison deliberately permits different binary versions and Git SHAs: that
+is usually what we are measuring. It refuses unlike topology, target/profile,
+runtime, rootless mode, kernel, architecture, quick/capacity mode, units,
+direction or workload parameters. Schema 2 rejects unknown fields instead of
+silently misreading them. If either report identifies a hosted environment,
+the changes remain visible but the verdict is informational; noisy shared
+workers must not turn a release red.
+
+Preflight omissions such as a missing optional capability remain typed skips.
+Once a suite starts, a timeout, panic, API error or unconfirmed cleanup is a
+failure and makes the command exit 1. DNS latency comes from `nslookup` inside
+a source workload. Network throughput runs `wget` there against the
+destination's fully-qualified `.internal` name, crossing the service VIP
+rather than a backend host port.
+
+The reconstruction suite kills the observed council leader, so it runs only
+with `--disruptive --yes` and available server-owned node-failure authority.
+The capacity suite needs `--capacity --yes`. Those flags record intent; they
+don't expand server policy or API roles. Relish marks each saturating apply
+with a dedicated acknowledgement header; Bun requires a durable lease, Admin,
+`saturate_capacity` and the protected-cluster mutation gate before accepting
+it. A plain leased apply cannot accidentally enter the capacity path.
 
 #### Kubernetes Migration
 

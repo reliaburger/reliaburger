@@ -84,6 +84,24 @@ impl FaultRegistry {
         std::mem::take(&mut self.faults)
     }
 
+    /// Remove every workload-scoped fault while retaining node operations.
+    ///
+    /// A general-purpose clear is available to Deployers, whereas node state
+    /// needs an independently authorised Admin operation. Stale expiry-queue
+    /// entries for removed faults are discarded lazily.
+    pub fn clear_workload_faults(&mut self) -> Vec<FaultRule> {
+        let mut removed = Vec::new();
+        self.faults.retain(|fault| {
+            if fault.fault_type.is_node_operation() {
+                true
+            } else {
+                removed.push(fault.clone());
+                false
+            }
+        });
+        removed
+    }
+
     /// Remove all faults targeting a specific service. Returns removed rules.
     pub fn clear_by_service(&mut self, service: &str) -> Vec<FaultRule> {
         let mut removed = Vec::new();
@@ -198,6 +216,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         }
     }
 
@@ -212,6 +231,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         }
     }
 
@@ -257,6 +277,22 @@ mod tests {
     fn remove_nonexistent_returns_none() {
         let mut reg = FaultRegistry::new();
         assert!(reg.remove(FaultId(99)).is_none());
+    }
+
+    #[test]
+    fn workload_clear_retains_node_faults() {
+        let mut reg = FaultRegistry::new();
+        reg.insert(&delay_request("redis", 60));
+        let mut node = delay_request("", 60);
+        node.fault_type = FaultType::NodeDrain;
+        node.target_node = Some("node-a".to_string());
+        reg.insert(&node);
+
+        let removed = reg.clear_workload_faults();
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(reg.len(), 1);
+        assert!(reg.iter().all(|fault| fault.fault_type.is_node_operation()));
     }
 
     #[test]

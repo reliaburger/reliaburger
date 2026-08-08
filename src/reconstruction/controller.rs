@@ -292,6 +292,7 @@ mod tests {
             reports,
             stale_nodes: vec![],
             capabilities: HashMap::new(),
+            readiness: HashMap::new(),
         }
     }
 

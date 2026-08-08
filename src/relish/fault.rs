@@ -131,6 +131,9 @@ pub struct FaultTargeting {
     /// overridable).
     #[arg(long)]
     pub override_safety: bool,
+    /// Confirm that injecting this workload fault is intentional.
+    #[arg(long)]
+    pub acknowledge: bool,
 }
 
 /// Build a `FaultRequest`, filling the common fields from `targeting`.
@@ -146,10 +149,13 @@ fn make_request(
         target_instance: targeting.instance.clone(),
         target_node: targeting.node.clone(),
         duration,
-        injected_by: std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
+        // Compatibility wire field only. Bun replaces it with the
+        // authenticated token name before recording the fault.
+        injected_by: String::new(),
         reason: targeting.reason.clone(),
         include_leader: false,
         override_safety: targeting.override_safety,
+        acknowledged: targeting.acknowledge,
     }
 }
 
@@ -359,6 +365,7 @@ pub async fn node_drain(
     include_leader: bool,
     reason: Option<&str>,
     override_safety: bool,
+    acknowledged: bool,
 ) -> Result<(), RelishError> {
     let targeting = FaultTargeting {
         node: Some(target.into()),
@@ -373,6 +380,7 @@ pub async fn node_drain(
         &targeting,
     );
     request.include_leader = include_leader;
+    request.acknowledged = acknowledged;
     inject_and_print(&request).await
 }
 
@@ -384,6 +392,7 @@ pub async fn node_kill(
     include_leader: bool,
     reason: Option<&str>,
     override_safety: bool,
+    acknowledged: bool,
 ) -> Result<(), RelishError> {
     let targeting = FaultTargeting {
         node: Some(target.into()),
@@ -398,6 +407,41 @@ pub async fn node_kill(
         &targeting,
     );
     request.include_leader = include_leader;
+    request.acknowledged = acknowledged;
+    inject_and_print(&request).await
+}
+
+/// Consume bounded CPU and memory capacity on one node.
+#[allow(clippy::too_many_arguments)]
+pub async fn node_pressure(
+    target: &str,
+    cpu: &str,
+    memory: &str,
+    duration: &Option<String>,
+    include_leader: bool,
+    reason: Option<&str>,
+    override_safety: bool,
+    acknowledged: bool,
+) -> Result<(), RelishError> {
+    let cpu_percentage = parse_percentage(cpu)?;
+    let memory_percentage = parse_percentage(memory)?;
+    let targeting = FaultTargeting {
+        node: Some(target.into()),
+        reason: reason.map(str::to_string),
+        override_safety,
+        ..FaultTargeting::default()
+    };
+    let mut request = make_request(
+        FaultType::NodePressure {
+            cpu_percentage,
+            memory_percentage,
+        },
+        String::new(),
+        get_duration(duration)?,
+        &targeting,
+    );
+    request.include_leader = include_leader;
+    request.acknowledged = acknowledged;
     inject_and_print(&request).await
 }
 
@@ -420,7 +464,7 @@ pub async fn list() -> Result<(), RelishError> {
             "{:<6} {:<22} {:<15} {:<15} {:<10} {}",
             f.id,
             f.fault_type,
-            f.target_service,
+            f.target_node.as_deref().unwrap_or(&f.target_service),
             f.target_instance.as_deref().unwrap_or("-"),
             format!("{}s", f.remaining_secs),
             f.injected_by,
@@ -435,12 +479,22 @@ pub async fn list() -> Result<(), RelishError> {
 ///
 /// A bare number is a fault id; anything else is a service name (its first
 /// caller for the registry's `clear_by_service`). No argument clears all.
-pub async fn clear(target: Option<String>) -> Result<(), RelishError> {
+pub async fn clear(
+    target: Option<String>,
+    node: Option<&str>,
+    acknowledged: bool,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let msg = match target {
         None => client.clear_all_faults().await?,
         Some(arg) => match arg.parse::<u64>() {
-            Ok(id) => client.clear_fault(id).await?,
+            Ok(id) => client.clear_fault(id, node, acknowledged).await?,
+            Err(_) if node.is_some() => {
+                return Err(RelishError::ApiError {
+                    status: 0,
+                    body: "--node can only be used when clearing a numeric fault id".to_string(),
+                });
+            }
             Err(_) => client.clear_faults_by_service(&arg).await?,
         },
     };
@@ -453,6 +507,7 @@ pub async fn scenario(
     path: &std::path::Path,
     dry_run: bool,
     speed: f64,
+    acknowledged: bool,
 ) -> Result<(), RelishError> {
     use crate::smoker::scenario;
 
@@ -486,7 +541,8 @@ pub async fn scenario(
             entry.step.value,
         );
 
-        let req = scenario::step_to_fault_request(&entry.step, speed)?;
+        let mut req = scenario::step_to_fault_request(&entry.step, speed)?;
+        req.acknowledged = acknowledged;
         match client.inject_fault(&req).await {
             Ok(summary) => {
                 println!(
@@ -608,6 +664,7 @@ mod tests {
             node: Some("node-2".into()),
             reason: Some("game day".into()),
             override_safety: true,
+            acknowledge: true,
         };
         let request = make_request(
             FaultType::Pause,
@@ -620,6 +677,7 @@ mod tests {
         assert_eq!(request.target_node.as_deref(), Some("node-2"));
         assert_eq!(request.reason.as_deref(), Some("game day"));
         assert!(request.override_safety);
+        assert!(request.acknowledged);
     }
 
     /// `dns redis banana` used to silently inject NXDOMAIN; now the positional

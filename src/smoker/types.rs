@@ -37,8 +37,9 @@ impl fmt::Display for FaultId {
 /// acts in the userspace DNS responder (Onion's `.internal` resolver),
 /// not the kernel, so it works wherever the responder runs. Resource
 /// faults (CpuStress, MemoryPressure, DiskIoThrottle) require cgroups on
-/// Linux. Process faults (Kill, Pause, Resume) and node faults
-/// (NodeDrain, NodeKill) work on all platforms.
+/// Linux. Process faults (Kill, Pause, Resume) work on all platforms.
+/// NodeDrain and NodeKill need a cluster runtime; NodePressure additionally
+/// needs an explicitly enabled Linux cgroup-v2 pressure controller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum FaultType {
@@ -63,10 +64,17 @@ pub enum FaultType {
     Partition {
         /// Source app name (the caller that gets blocked).
         source_app: Option<String>,
-        /// Source cgroup ID (resolved at activation time, 0 = all callers).
+        /// Legacy wire field. Bun resolves source cgroups server-side; API
+        /// requests must leave this as zero.
         #[serde(default)]
         source_cgroup_id: u64,
     },
+
+    /// Legacy gossip/Raft transport partition used by `relish chaos`.
+    ///
+    /// This is distinct from a service-to-service eBPF partition: only this
+    /// variant can remove a council voter from quorum.
+    CouncilPartition,
 
     /// Throttle bandwidth to the target service.
     Bandwidth {
@@ -122,6 +130,14 @@ pub enum FaultType {
         #[serde(default)]
         kill_containers: bool,
     },
+
+    /// Consume bounded CPU and memory capacity on one node.
+    NodePressure {
+        /// Percentage of total node CPU capacity to consume (0 disables CPU).
+        cpu_percentage: u8,
+        /// Target percentage of total node memory usage (0 disables memory).
+        memory_percentage: u8,
+    },
 }
 
 impl FaultType {
@@ -130,6 +146,23 @@ impl FaultType {
     /// for a bounded window, so duration limits apply to them.
     pub fn is_instantaneous(&self) -> bool {
         matches!(self, FaultType::Kill { .. } | FaultType::Resume)
+    }
+
+    /// Whether applying or reversing this fault changes node-level cluster
+    /// state and therefore needs the `alter_node_state` permission.
+    pub fn is_node_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeDrain | Self::NodeKill { .. } | Self::CouncilPartition
+        )
+    }
+
+    /// Whether the fault must be routed to a named node.
+    pub fn is_node_targeted(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeDrain | Self::NodeKill { .. } | Self::NodePressure { .. }
+        )
     }
 }
 
@@ -157,6 +190,7 @@ impl fmt::Display for FaultType {
                     write!(f, "partition (all callers)")
                 }
             }
+            Self::CouncilPartition => write!(f, "council-partition"),
             Self::Bandwidth { bytes_per_sec } => {
                 // The parser reads megabits/s (`1mbps` = 125_000 bytes/s), so
                 // invert that here rather than dividing by 1024² — otherwise
@@ -207,6 +241,13 @@ impl fmt::Display for FaultType {
                     write!(f, "node-kill")
                 }
             }
+            Self::NodePressure {
+                cpu_percentage,
+                memory_percentage,
+            } => write!(
+                f,
+                "node-pressure (cpu {cpu_percentage}%, memory {memory_percentage}%)"
+            ),
         }
     }
 }
@@ -246,15 +287,15 @@ impl FaultType {
 /// State captured when a persistent fault is applied, so clearing or expiring
 /// it can put the target back exactly as it was.
 ///
-/// eBPF network faults reverse themselves through the BPF maps and process
-/// Kill has nothing to undo, so those carry `None`. Resource faults and Pause,
-/// which leave a durable change on the target instance's cgroup or process,
-/// record what to restore here. The field is runtime-only: it never crosses
-/// the wire (`#[serde(skip)]` on the rule), because a Bun restart already
-/// drops every active fault and starts clean.
+/// eBPF service faults record their exact map keys. Process Kill has nothing
+/// to undo, so it carries `None`. Resource faults and Pause, which leave a
+/// durable change on the target instance's cgroup or process, record what to
+/// restore here. The field is runtime-only: it never crosses the wire
+/// (`#[serde(skip)]` on the rule), because a Bun restart already drops every
+/// active fault and starts clean.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum FaultReversal {
-    /// Nothing to undo (network faults, Kill, honest-rejection faults).
+    /// Nothing to undo (Kill and honest-rejection faults).
     #[default]
     None,
     /// A CPU-stress cap: restore each instance's saved `cpu.max`.
@@ -272,6 +313,16 @@ pub enum FaultReversal {
     /// Stored as peer node ids (resolved to addresses at reversal time so a
     /// peer that changed address is still cleared correctly).
     Partition { peers: Vec<String> },
+    /// Exact eBPF connect-map keys installed for a service network fault.
+    ///
+    /// Tuple fields are `(virtual IP, network-order port, source cgroup id)`.
+    BpfConnectKeys(Vec<(u32, u16, u64)>),
+    /// A scheduler drain: restore readiness when the final drain owner clears.
+    NodeDrain,
+    /// A simulated node failure: reopen gossip, Raft and reporting transports.
+    NodeQuiesce,
+    /// Bounded node-capacity consumers: terminate the owned helper and cgroup.
+    NodePressure,
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +473,12 @@ pub struct FaultRequest {
     /// Override the >50% node safety check.
     #[serde(default)]
     pub override_safety: bool,
+    /// Explicit operator acknowledgement for destructive server operations.
+    ///
+    /// This records consent only. Authentication, role and server policy still
+    /// decide whether the operation is allowed.
+    #[serde(default)]
+    pub acknowledged: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +624,9 @@ pub struct FaultSummary {
     pub target_service: String,
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
+    /// Target node, for routed node faults.
+    #[serde(default)]
+    pub target_node: Option<String>,
     /// Seconds remaining before auto-expiry.
     pub remaining_secs: u64,
     /// Who injected it.
@@ -580,6 +640,7 @@ impl From<&FaultRule> for FaultSummary {
             fault_type: rule.fault_type.to_string(),
             target_service: rule.target_service.clone(),
             target_instance: rule.target_instance.clone(),
+            target_node: rule.target_node.clone(),
             remaining_secs: rule.remaining().as_secs(),
             injected_by: rule.injected_by.clone(),
         }
@@ -711,6 +772,19 @@ mod tests {
     }
 
     #[test]
+    fn pressure_routes_to_a_node_but_clear_is_not_node_state_mutation() {
+        let pressure = FaultType::NodePressure {
+            cpu_percentage: 80,
+            memory_percentage: 90,
+        };
+        assert!(pressure.is_node_targeted());
+        assert!(!pressure.is_node_operation());
+        assert!(FaultType::NodeDrain.is_node_targeted());
+        assert!(FaultType::NodeDrain.is_node_operation());
+        assert!(FaultType::CouncilPartition.is_node_operation());
+    }
+
+    #[test]
     fn fault_type_serialization_round_trip() {
         let types = vec![
             FaultType::Delay {
@@ -723,6 +797,7 @@ mod tests {
                 source_app: Some("web".into()),
                 source_cgroup_id: 123,
             },
+            FaultType::CouncilPartition,
             FaultType::Bandwidth {
                 bytes_per_sec: 1_000_000,
             },
@@ -744,6 +819,10 @@ mod tests {
             FaultType::NodeDrain,
             FaultType::NodeKill {
                 kill_containers: true,
+            },
+            FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
             },
         ];
         for ft in &types {
@@ -909,11 +988,30 @@ mod tests {
             reason: Some("testing latency tolerance".into()),
             include_leader: false,
             override_safety: false,
+            acknowledged: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: FaultRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.target_service, "redis");
         assert_eq!(back.target_instance.as_deref(), Some("redis-1"));
         assert_eq!(back.duration, Duration::from_secs(300));
+        assert!(back.acknowledged);
+    }
+
+    #[test]
+    fn old_fault_request_without_acknowledgement_defaults_to_false() {
+        let request: FaultRequest = serde_json::from_value(serde_json::json!({
+            "fault_type": { "type": "NodeDrain" },
+            "target_service": "",
+            "target_instance": null,
+            "target_node": "node-a",
+            "duration": { "secs": 30, "nanos": 0 },
+            "injected_by": "old-client",
+            "reason": null,
+            "include_leader": false,
+            "override_safety": false
+        }))
+        .unwrap();
+        assert!(!request.acknowledged);
     }
 }

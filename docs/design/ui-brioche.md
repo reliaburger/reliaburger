@@ -628,8 +628,8 @@ pub struct IngressRoute {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TlsMode {
-    Acme,
     Cluster,
+    Explicit,
     None,
 }
 
@@ -1066,8 +1066,8 @@ A table of all active ingress routes with real-time traffic metrics, plus a clus
 
 | Host | Path | Backend | TLS | Backends | Req/s | Errors/s | P50 | P95 | P99 | Cert Expires |
 |------|------|---------|-----|----------|-------|----------|-----|-----|-----|-------------|
-| myapp.com | / | web | ACME | 5/5 | 1.2k | 0.3 | 12ms | 45ms | 120ms | 58d |
-| api.myapp.com | /v1 | api | ACME | 3/3 | 890 | 1.1 | 8ms | 22ms | 55ms | 58d |
+| myapp.com | / | web | Explicit | 5/5 | 1.2k | 0.3 | 12ms | 45ms | 120ms | 58d |
+| api.myapp.com | /v1 | api | Cluster | 3/3 | 890 | 1.1 | 8ms | 22ms | 55ms | 58d |
 | dashboard.internal | / | dash | Cluster | 2/2 | 15 | 0 | 5ms | 12ms | 18ms | 340d |
 
 **Visual warnings:**
@@ -1232,14 +1232,14 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 Brioche is served over TLS by default. The TLS certificate is the node's API certificate, issued by the cluster's internal CA. For operators accessing Brioche from outside the cluster, they must either:
 
 1. Add the cluster's root CA to their browser's trust store (recommended for teams).
-2. Use `tls = "acme"` on an ingress route pointing to Brioche for a publicly-trusted certificate.
+2. Configure an operator-supplied certificate/key pair on the ingress node and use `tls = "explicit"` on the route.
 3. Accept the browser's certificate warning (acceptable for ad-hoc debugging).
 
 ```toml
-# Expose Brioche via a publicly-trusted certificate
+# Expose Brioche with an operator-supplied certificate
 [app.brioche-proxy.ingress]
 host = "dashboard.myorg.com"
-tls = "acme"
+tls = "explicit"
 backend = "internal://brioche"  # Routes to the local Brioche on any node
 ```
 

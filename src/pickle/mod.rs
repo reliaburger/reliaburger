@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod build;
+pub mod capability;
 pub mod gc;
 pub mod p2p;
 pub mod pull;

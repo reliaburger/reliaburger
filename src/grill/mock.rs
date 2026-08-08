@@ -22,6 +22,13 @@ pub struct MockGrill {
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
+    pid: Arc<Mutex<Option<u32>>>,
+    rootless_network: Arc<Mutex<Option<crate::grill::records::RootlessNetworkRecord>>>,
+    exec_outputs: Arc<Mutex<std::collections::VecDeque<String>>>,
+    /// Deterministic gate for tests that need `exec()` to remain in flight.
+    block_exec: Arc<AtomicBool>,
+    exec_started: Arc<tokio::sync::Semaphore>,
+    exec_release: Arc<tokio::sync::Semaphore>,
     /// Deterministic gate for tests that need `create()` to remain in flight.
     block_create: Arc<AtomicBool>,
     create_started: Arc<tokio::sync::Semaphore>,
@@ -42,6 +49,12 @@ impl Default for MockGrill {
             container_ip: Arc::default(),
             honours_cgroup_path: Arc::default(),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
+            pid: Arc::default(),
+            rootless_network: Arc::default(),
+            exec_outputs: Arc::default(),
+            block_exec: Arc::new(AtomicBool::new(false)),
+            exec_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            exec_release: Arc::new(tokio::sync::Semaphore::new(0)),
             block_create: Arc::new(AtomicBool::new(false)),
             create_started: Arc::new(tokio::sync::Semaphore::new(0)),
             create_release: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -97,6 +110,35 @@ impl MockGrill {
         *self.container_ip.lock().unwrap() = Some(ip);
     }
 
+    /// Queue deterministic combined outputs for successive `exec()` calls.
+    #[allow(dead_code)]
+    pub fn set_exec_outputs(&self, outputs: impl IntoIterator<Item = String>) {
+        *self.exec_outputs.lock().unwrap() = outputs.into_iter().collect();
+    }
+
+    /// Hold future `exec()` calls until [`Self::release_execs`] is called.
+    #[allow(dead_code)]
+    pub fn block_execs(&self) {
+        self.block_exec.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until `count` blocked `exec()` calls have started.
+    #[allow(dead_code)]
+    pub async fn wait_for_execs(&self, count: u32) {
+        let permits = Arc::clone(&self.exec_started)
+            .acquire_many_owned(count)
+            .await
+            .expect("exec gate closed");
+        permits.forget();
+    }
+
+    /// Release `count` calls held by [`Self::block_execs`].
+    #[allow(dead_code)]
+    pub fn release_execs(&self, count: usize) {
+        self.block_exec.store(false, Ordering::SeqCst);
+        self.exec_release.add_permits(count);
+    }
+
     /// Make `honours_cgroup_path()` report `value`, simulating a runtime
     /// (root-mode runc) that places workloads into the OCI `cgroupsPath`
     /// — which enables the agent's pre-start egress programming path.
@@ -110,6 +152,18 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_runtime_kind(&self, kind: crate::grill::records::RuntimeKind) {
         *self.runtime_kind.lock().unwrap() = kind;
+    }
+
+    /// Make `pid()` report a live test process so record-persistence paths run.
+    #[allow(dead_code)]
+    pub fn set_pid(&self, pid: u32) {
+        *self.pid.lock().unwrap() = Some(pid);
+    }
+
+    /// Make adoption records include rootless userspace-network ownership.
+    #[allow(dead_code)]
+    pub fn set_rootless_network(&self, network: crate::grill::records::RootlessNetworkRecord) {
+        *self.rootless_network.lock().unwrap() = Some(network);
     }
 
     /// Hold future `create()` calls until [`Self::release_creates`] is called.
@@ -227,6 +281,36 @@ impl super::Grill for MockGrill {
 
     fn honours_cgroup_path(&self) -> bool {
         *self.honours_cgroup_path.lock().unwrap()
+    }
+
+    async fn pid(&self, _instance: &InstanceId) -> Option<u32> {
+        *self.pid.lock().unwrap()
+    }
+
+    async fn exec(&self, instance: &InstanceId, _command: &[String]) -> Result<String, GrillError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("exec".to_string(), instance.clone()));
+        if self.block_exec.load(Ordering::SeqCst) {
+            self.exec_started.add_permits(1);
+            let permit = self.exec_release.acquire().await.expect("exec gate closed");
+            permit.forget();
+        }
+        self.exec_outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| GrillError::NotFound {
+                instance: instance.clone(),
+            })
+    }
+
+    async fn rootless_network_record(
+        &self,
+        _instance: &InstanceId,
+    ) -> Option<crate::grill::records::RootlessNetworkRecord> {
+        self.rootless_network.lock().unwrap().clone()
     }
 
     async fn adopt(

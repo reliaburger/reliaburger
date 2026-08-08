@@ -2,7 +2,7 @@
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
-use crate::testkit::registry::{TestCase, skip};
+use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
@@ -50,7 +50,7 @@ async fn schedule_respects_required_placement_label(ctx: TestContext) -> Result<
             .next()
             .map(|(k, v)| (node.node_id.clone(), k.clone(), v.clone()))
     }) else {
-        return skip("no node advertises a label to target");
+        return unknown("no node advertises a label to target");
     };
 
     let app = "sched-pinned";

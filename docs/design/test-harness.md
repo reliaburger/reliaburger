@@ -52,6 +52,7 @@ be visible until we remove its race.
 
 | Command | Contract | Automation |
 |---|---|---|
+| `make lint` | Clippy for every target and feature available on the host | Linux and hosted macOS |
 | `make test` | Portable unit, component and integration correctness via nextest | Linux and hosted macOS |
 | `make test-no-default` | The same portable contract without default features | Linux |
 | `make test-doc` | Rust documentation examples | Linux and hosted macOS |
@@ -66,6 +67,7 @@ be visible until we remove its race.
 | `make bench-10k` | Deterministic 10,000-member per-node scale acceptance | Pull requests |
 | `make coverage` | Combined default and no-default portable line coverage | Pull requests |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
+| `make examples` | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux pull requests |
 
 Apple Container is the only manual runtime exception. GitHub's hosted macOS runners cannot
 provide its nested virtualisation. Everything else runs on a pull request and release tags
@@ -81,8 +83,18 @@ continues to track ecosystem advisories that RustSec doesn't carry.
 
 ## Gating rules
 
-Use `#[cfg(target_os = "linux")]` when code cannot exist on the current target. The compiler
-then omits it, so it must be counted as platform-specific rather than ignored.
+Use `#[cfg(target_os = "linux")]` when code cannot exist on the current target. For an
+optional Linux dependency, gate its owner with both facts:
+
+```rust
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod maps;
+```
+
+The `all` predicate means both conditions must hold. This matters when macOS runs
+`--all-features`: enabling the portable Cargo feature does not somehow install Linux or make
+Aya available. The compiler omits the module, so it must be counted as platform-specific
+rather than ignored.
 
 Use `#[ignore = "requires …"]` for code that compiles but needs root, a provisioned runtime
 or deliberate wall-clock time. The matching Make target supplies the prerequisite and runs

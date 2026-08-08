@@ -42,7 +42,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill) — **`H13` runc/apple return `None`; successful jobs there get retried then Failed**
 - [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container, volumes, multi-app, full-featured)
 - [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts) — **`C1` CRITICAL: whiteout path traversal deletes host files outside rootfs**
-- [x] Rootless runc (user namespaces, UID/GID mapping, rootless cgroups v2, no-sudo containers) — **`M22` resource limits ~~silently dropped~~ (12b.6: a rootless node now *refuses* a limit-requiring workload rather than dropping the limit); slirp4netns still unwired → empty netns, no connectivity (deferred to the runc-create seam)**
+- [x] Rootless runc (user namespaces, UID/GID mapping, no-sudo read-only containers) — resource-requiring workloads fail admission because delegated cgroup enforcement is not implemented; the spec omits an undelegated cgroup path rather than failing every start. `slirp4netns` now owns the network namespace and published ports, with persisted ownership and recreation across Bun replacement (M5).
 - [x] Streaming apply progress via SSE (real-time deploy feedback instead of blocking response)
 - [x] HostPath-style volumes (dual-mode: explicit source for hostPath, managed for auto-provisioned storage) — ~~`M21` managed mode half-wired~~ **fixed in Phase 12 E0**: the agent creates managed volume dirs (and loop mounts) before the OCI spec's bind mounts reference them; `[storage] volumes` config wired; volumes never deleted on Stop (reconciler rebalances would destroy data)
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
@@ -180,9 +180,9 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Rolling deploy orchestrator (DeployDriver trait, per-step health-gated replacement) — **`[lib-only]` `L2` orchestrator/`DeployDriver` only in tests; the wired path is the agent's inline redeploy (`H2`/`H3` bugs)**
 - [x] Automatic rollback (revert upgraded instances on health failure) — **`M16` rollback leaks the failed step's new instance**
 - [x] Dependency ordering (`run_before` jobs complete before rolling)
-- [x] Deploy Raft persistence (active deploys + history capped at 50 per app) — **`[lib-only]` state-machine support only; the binary never writes deploy requests; history is a local `Vec` and only records on redeploy (empty until the 2nd deploy)**
+- [x] Deploy state models and history — the library-side `DeployState` Raft commands remain separate from the binary's desired-state reconciler. The real Bun path records every accepted worker with a stable operation ID, live phase/target and bounded 50-entry outcome history (M6); per-app rollback history records fresh and rolling deploys locally.
 - [x] CLI: `relish deploy`, `relish history`, `relish rollback`, `relish lint` — **`X3` `rollback` calls no endpoint (prints advice); `X5` dry-run fallback makes `apply`/`deploy` exit 0 when the agent is down**
-- [x] API: `/v1/deploys/active`, `/v1/deploys/history/{app}` — **`/v1/deploys/active` hardcoded empty**
+- [x] API: `/v1/deploys/active`, `/v1/deploys/operations`, `/v1/deploys/history/{app}` — active operations now come from the running worker path; operation history and per-app rollback history are explicit separate contracts.
 - [x] `make deploy-demo` for local testing
 - [x] Book chapter 7: "Ship It"
 - Autoscaling, Lettuce GitOps, blue-green, K8s migration — see Phase 9
@@ -998,9 +998,11 @@ whole theme lands.
     (`Disabled`/`Cluster`/`Explicit`) parsed from `IngressSpec.tls`, carried into
     `PathRoute`. Unsupported modes (`auto`/`acme`) are rejected at routing rebuild rather
     than silently served plaintext; a TLS-marked route reached over plain HTTP gets a 308
-    to HTTPS (ACME challenge paths excepted). Cluster-CA path: `tls::issue_ingress_cert`
+    to HTTPS on every path. Cluster-CA path: `tls::issue_ingress_cert`
     issues a server-auth ingress cert from the Sesame Ingress CA (reuses the existing CA
     hierarchy, no parallel scheme). Explicit certs keep the existing disk-file contract.
+    Every plaintext path now redirects for TLS routes: the old ACME challenge
+    exception was removed because v1 has no challenge responder.
   - [x] **ING2 — connection permits through the full lifetime.** TLS handshakes are bounded
     by a semaphore and a per-handshake deadline (`tokio::time::timeout`), so a slow-handshake
     flood can't exhaust tasks. The proxy holds a connection permit for the whole request; for
@@ -1139,10 +1141,11 @@ whole theme lands.
     the supervisor **rejects** a GPU-requesting workload when `gpu_enabled = false` or the
     detector found no device, instead of silently scheduling onto a node reporting zero GPUs.
     (OCI `/dev/nvidia*` device passthrough deferred; placement is now honest.)
-  - [x] M22 rootless: **reject** path chosen (runc.rs is out of this seam). A rootless node
+  - [x] M22 rootless: **reject** path chosen. A rootless node
     refuses a workload declaring cpu/memory limits (rather than silently dropping them via
     `make_rootless`'s `resources = None`), with a clear error naming the fix. slirp4netns
-    wiring remains deferred to the runc-create seam.
+    networking and published-port adoption landed later in M5; workload DNS and
+    delegated rootless cgroup limits remain unsupported.
   - [x] Reserved resources: `reserved_cpu`/`reserved_memory` were already wired
     (`bun.rs::node_capacity` → `set_node_capacity`); confirmed, nothing dead to remove. GPU
     capacity is not yet threaded through the reporting protocol (orchestrate seam) — the
@@ -1163,9 +1166,8 @@ whole theme lands.
     device; the throttle is lifted on clear/expiry.
   - [x] Pause auto-resumes: the frozen PIDs are recorded and SIGCONT'd on clear/expiry
     (`expire_faults` and both clear paths), so a paused workload never stays frozen.
-  - [x] Node drain / node kill return an honest rejection (a cluster-level operation, not a
-    node-local fault) instead of a fake Ok; the real effect lands with the self-healing/
-    upgrade themes that own the cluster machinery.
+  - [x] Node drain / node kill initially returned an honest rejection instead of a fake Ok.
+    Phase 15 M8 now supplies their authenticated cluster-level effects and reversal.
   - [x] `DnsNxdomain` acts in the userspace `.internal` resolver (was: wrote a `fault_dns_map`
     entry into a never-loaded eBPF object, so it did nothing on any config — caught by the
     12b.6 gate). The agent publishes the faulted-service set on a `watch` channel
@@ -1254,7 +1256,8 @@ whole theme lands.
     (eBPF/runc/netns/Btrfs/Buildah/cgroups) — **green** on the merge commit. (A local Lima
     run was redundant and only tripped a guest `~/.cargo` permission quirk, not code.)
   - [x] Apple platform gate: `make test-apple` **2/2 passed on real Apple silicon**
-    (`apple_container_grill_creates_instance`, `adopt_re_tracks_a_running_apple_container`),
+    (`pinned_test_workload_runs_under_apple_container`,
+    `adopt_re_tracks_a_running_apple_container`),
     run twice back-to-back (idempotent). The gate caught the inspect-schema bug fixed in
     #118 — a green unit test had hidden it.
   - Gate findings fixed before close: DnsNxdomain userspace no-op (#117) and Apple
@@ -1281,7 +1284,7 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 - [x] Dual-signature verification (embedded Ed25519 release key set + external operator key from node.toml; air-gapped `--binary` needs embedded only)
 - [x] Automatic rollback on failure (crash-loop boot budget reverts the symlink; nodes refuse previously-reverted upgrade ids; leader pauses the run; `upgrade resume` retries with a fresh id)
 - [x] Version retention and GC (keep newest `retain_versions`, rollback targets protected)
-- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption + Apple `container inspect` adoption; pid+start-time fingerprinting for pid-based runtimes, container liveness for Apple VMs; file-backed process logs). `[runc adoption unverified on Linux; Apple adoption gated behind make test-apple]`
+- [x] Workload adoption across the swap (ProcessGrill pidfile records + runc `state` adoption + Apple `container inspect` adoption; pid+start-time fingerprinting for pid-based runtimes, container liveness for Apple VMs; file-backed process logs). Rootless runc persists and restores its `slirp4netns` owner and host forward; `make test-rootless-runc` exercises a real non-root replacement. Apple adoption remains gated behind `make test-apple`.
 - [x] Book chapter 14: "Changing the Tyres at Full Speed"
 - [x] All Phase 14 tests green (unit tests in the portable suite; 5 single-node + 3 cluster real-binary integration tests are ignored by default and owned by the required `upgrade-node` and `upgrade-cluster` CI jobs). The jobs use nextest resource groups and no retries, so contention or convergence flakes remain visible.
 
@@ -1294,11 +1297,12 @@ convergence and adoption" theme under 12b.6).
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
 > Detailed implementation plan: [2026-07-06-plan-chaos.md](plans/2026-07-06-plan-chaos.md)
-> (15 commit-sized steps, test catalogue, data structures, acceptance runbook).
+> (20 numbered steps plus prerequisite tranches, test catalogue, data structures,
+> acceptance runbook).
 >
-> The harness half is done; the five diagnostic commands are the largest block of genuinely
-> unbuilt feature work left in the project. Two `TODO(Phase 15)` deferrals from Phase 15b land
-> here as well (Smoker's service-to-service `Partition` arm, Pickle push-side body streaming).
+> The harness half is done; the diagnostic commands are the largest block of genuinely
+> unbuilt feature work left in the project. Smoker's service-to-service `Partition` deferral
+> is closed below; Pickle push-side body streaming remains open.
 
 - [x] Test harness audit and suite taxonomy: nextest local/CI profiles, JUnit, timeouts,
   zero retries, serial resources and no-tests-selected failures; portable, wall-clock,
@@ -1315,15 +1319,58 @@ convergence and adoption" theme under 12b.6).
 - [x] Required CI and release validation: portable Linux/macOS, privileged Linux, cluster,
   node/cluster upgrade, coverage and three benchmark/scale jobs; release publication waits
   for the same reusable workflow. Apple Container remains a documented manual exception
-- [ ] `relish test` command (built-in test runner, parallel, filtering, JSON output)
-- [ ] `relish test --chaos` (integration tests + Smoker fault injection)
-- [ ] `relish bench` (scheduler, eBPF, network, deploy, state reconstruction benchmarks)
-- [ ] `relish wtf` (automated cluster health diagnosis)
-- [ ] `relish trace` (end-to-end connectivity debugging)
+- [x] `relish test` ordinary catalogue: 39 cases across all 13 planned groups,
+  bounded parallel execution, filtering, human/JSON/YAML reports and four
+  acceptance profiles. Report schema v2 separates `Pass`, `Fail`, typed
+  `Skipped` and `Unknown`; timeouts, panics and untyped runtime skips are
+  unknown, cleanup has an independent verdict, and full profiles reject
+  required skips or missing observed evidence
+- [x] `relish test --chaos`: five serial live scenarios for leader loss,
+  worker rescheduling, minority partition, bounded node pressure and node death
+  during deploy. Pure preflight refuses fewer than three nodes, protected
+  server policy, missing operation grants, missing container/node-failure
+  evidence and non-interactive runs without `--yes`; there is no client-side
+  production override. The runner and case task share exact fault-id ownership,
+  refresh capability evidence before each destructive case and reverse only
+  their own faults after pass, failure, timeout or panic
+- [x] `relish bench` (scheduler, service data plane, network, deploy, state reconstruction benchmarks)
+  - [x] Versioned report and comparison contract: topology and per-node
+    build/runtime/kernel fingerprints, metric-method parameters, strict schema
+    parsing, direction-aware >10% changes, explicit missing metrics and
+    compatibility refusal. Different version/Git SHA is comparable; noisy
+    hosted runs are marked informational.
+  - [x] Public-API benchmark suites and CLI orchestration: one durable lease
+    per suite (and additional bounded leases for capacity), 60/300-second
+    inherited deadlines, panic/timeout-safe fault and resource cleanup, and
+    schema-v2 failed-suite evidence. Discovery runs `nslookup` inside a source
+    workload; throughput runs `wget` from there through `.internal` DNS and
+    the service VIP. Leader reconstruction requires `--disruptive --yes`;
+    capacity requires `--capacity --yes`. The image metric honestly records
+    the current cache state of the pinned multi-architecture OCI daemonset;
+    deterministic cold-cache Pickle replication still needs leased image
+    deletion/eviction ownership.
+    Bun independently marks and authorises every capacity apply: durable lease,
+    Admin, `saturate_capacity` and protected-cluster policy all have to agree.
+- [x] `relish wtf` (automated cluster health diagnosis)
+  - [x] Schema-v1 pure diagnosis engine with separate critical, warning,
+    unknown and OK outcomes; timestamped crashloop detection, deploy/log
+    correlation and honest evidence requirements for all catalogue checks
+  - [x] Authenticated schema-v1 local telemetry: configured storage-domain
+    capacity, bounded cgroup throttled-time deltas and public node-certificate
+    metadata without paths, certificate bodies or key material
+  - [x] Authenticated cross-node collection with ten-second bounds, desired-app
+    and service evidence, rendering, app scope, watch mode and 0/1/2 exit contract
+- [x] `relish trace` (end-to-end connectivity debugging): source-node
+  discovery; fixed bounded DNS/TCP probes inside the source workload; live
+  userspace service state and attached Linux eBPF backend/firewall reads;
+  explicit observed/inferred/unavailable evidence; strict schema-v1
+  human/JSON/YAML output and 0/1/2 exit contract. External probes fail closed
+  behind Admin, an independent server permission, protected-cluster policy and
+  an exact `host:port` allowlist
 - [x] Book chapter 15 test-harness and benchmarking foundations: Rust attributes, ignored
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
-- [ ] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
-  `trace`) when those commands land
+- [x] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
+  `trace`), including safety, evidence provenance and acceptance limitations
 - [ ] All Phase 15 tests green
 
 ## Phase 15a: Current-State Hardening
@@ -1343,7 +1390,7 @@ convergence and adoption" theme under 12b.6).
 
 ### High-value / must fix
 
-- [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. Named temporary exceptions fail closed after 18 August 2026; `thrift` and `lru` remain tracked risk, not claimed fixes.
+- [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. Named temporary exceptions fail closed after 18 August 2026; `thrift`, `lru` and lock-only, feature-inactive `rkyv` remain tracked risk, not claimed fixes.
 - [x] Contain the API authentication bootstrap window (H1 / SEC-1) — Bun now owns one token store in standalone and cluster modes; an empty store permits only IP-literal loopback. Five real-binary startup tests cover standalone/clustered bootstrap, and the 2,633-test portable suite passes.
 - [x] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3) — four cgroup hooks plus per-workload enforcement are proven before start, live loss fences affected workloads, and independent expiring capability evidence keeps placement fail closed. Merged in PR #122.
 - [x] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1) — rootful runc derives and mounts a veth-gateway resolver, Bun pre-binds supervised UDP/TCP with `IP_FREEBIND`, and independent rolling-safe readiness leases gate placement. A checked-in two-workload rootful-runc/netns acceptance test resolves `redis.internal`; it also forced fixes for colliding long veth names and destructive repeated rootfs extraction. Unsupported runtimes and addresses fail before creation. Portable default/no-default suites pass 2,661/2,643 tests (39 named skips in each).
@@ -1368,14 +1415,101 @@ convergence and adoption" theme under 12b.6).
 
 ### Medium-value
 
-- [ ] Live subsystem readiness/capability evidence and supervised failure (M1)
-- [ ] Executable examples, coherent cross-platform lint and advisory scanning (M2)
-- [ ] Peer-reachable clustered registry defaults (M3)
-- [ ] Configured workload trust domain (M4)
-- [ ] Rootless proxy adoption across Bun replacement (M5)
-- [ ] Real deployment operation state (M6)
-- [ ] Explicit v1 ingress/TLS contract (M7)
+- [x] Live subsystem readiness/capability evidence and supervised failure (M1)
+  — critical owners publish `Starting`, `Ready`, `Degraded` and `Stopped`
+  evidence with failure times; authenticated readiness/capability APIs and an
+  independently expiring report lease fence scheduling fail closed. Only the
+  reconstructible security refresher retries, within explicit budgets.
+- [x] Executable examples, coherent cross-platform lint and advisory scanning (M2)
+  — all 21 repository configs pass the real Relish dry-run path, failures retain
+  their diagnostics, and hosted Linux owns the check. Aya code now compiles only
+  for Linux plus `ebpf`, so macOS enforces the advertised all-feature Clippy
+  contract. The existing pinned RustSec change/release/weekly gate passes.
+- [x] Peer-reachable clustered registry defaults (M3) — cluster mode derives
+  the safe standalone loopback default to the gossip-advertised IP and rejects
+  an explicit mismatched interface. Remote reads and writes require authentication from
+  first boot and fail closed if the service token is absent; authenticated
+  capabilities expose listener, TLS/P2P, membership and achieved redundancy
+  evidence for future `wtf` checks.
+- [x] Configured workload trust domain (M4) — `[cluster].name` now flows from
+  generated config into immutable agent/API state and every app, job, JWT and
+  build-signer SPIFFE identity. Bun validates malformed domains at startup; a
+  non-default `payments.prod` acceptance issues and verifies a real leaf.
+- [x] Rootless proxy adoption across Bun replacement (M5) — schema-v2 instance records own the slirp API socket, port mapping and PID/start-time fingerprint. Adoption reclaims a surviving proxy or recreates it before returning success; a real non-root runc test proves the host port before and after replacement.
+- [x] Real deployment operation state (M6) — accepted SSE events carry stable IDs; live phase/current-target/start evidence and newest-first bounded outcomes are exposed by authenticated APIs. Overlapping same-target workers are refused, disconnected clients don't erase outcomes and missing terminal evidence records `unknown`.
+- [x] Explicit v1 ingress/TLS contract (M7) — `cluster`, `explicit`, and
+  deliberate plain HTTP are the complete v1 set; `auto`/`acme` remain rejected.
+  The whitepaper, component designs, book and examples now say so. Kubernetes
+  imports translate a TLS stanza to `cluster` and warn that the referenced
+  Secret wasn't imported. TLS routes redirect every plaintext path, including
+  the unused ACME challenge prefix. The audit also records certificate renewal,
+  hot reload and expiry evidence as Phase 15 prerequisites rather than claiming
+  they already work.
 - [ ] Corrected Phase 15 prerequisites and catalogue (M8)
+  - [x] Result/evidence/profile contracts, inherited absolute deadlines,
+    panic-safe runner ownership, verified cleanup reporting and typed
+    server-owned `[testing]` safety policy. Unknown clusters fail protected;
+    the client-side production override was removed
+  - [x] Fresh expiring capability/evidence API — authenticated schema-v3 local
+    snapshots separate available, unavailable and unknown facts with 15-second
+    expiry. Authenticated cluster fan-out uses the service identity, one shared
+    deadline and an explicit evidence/unknown result for every expected node.
+    Reports include build/runtime/topology fingerprints and server policy
+  - [ ] Server resource leases and hermetic OCI workload
+    - [x] Durable, bounded app/namespace leases: authenticated
+      creation/renewal/release; lease-only `rbtest-*` namespaces; standalone
+      fsync persistence and Raft ownership; restart/leader-safe reapers;
+      bounded cleanup steps.
+    - [x] Runner lease adoption: one sufficient-lifetime lease per case;
+      leased applies and confirmed release after pass, failure, panic or
+      timeout; server reaping after client death.
+    - [x] Pinned multi-architecture OCI workload: BusyBox 1.37.0's immutable
+      OCI index is used by every container case and accepted on real runc
+      (`linux/amd64`) and Apple Container (`linux/arm64`). ProcessGrill keeps
+      the installed Bun helper as a separate profile.
+  - [x] Ordinary 39-case catalogue and `relish test`
+  - [x] Authenticated real node drain/kill: Admin plus the server-owned
+    `alter_node_state` grant and explicit acknowledgement; target-side repeated
+    authorisation; scheduler withdrawal for drain; shared gossip/Raft/reporting
+    quiesce for kill; TTL and privileged manual reversal. A three-node acceptance
+    observes a follower fail and rejoin, and rejects a second voter failure.
+  - [x] Node-scoped pressure before the chaos catalogue: Admin plus the
+    independent `saturate_capacity` grant and explicit acknowledgement;
+    zero-by-default server CPU/memory ceilings capped at 90%; target-side
+    authorisation; one dedicated rootful-Linux cgroup/helper outside Bun;
+    total-node CPU quota and memory-usage target; clear/TTL/shutdown,
+    parent-death and startup-sweep cleanup. A privileged cgroup-v2 acceptance
+    proves the effect, isolation and restart cleanup. Unsupported platforms
+    publish unavailable evidence instead of claiming a green primitive.
+  - [x] Fault authorisation and structured audit: ordinary workload injection
+    requires a Deployer-or-higher credential, the server-owned
+    `inject_workload_faults` grant and explicit acknowledgement. Node/council
+    and pressure paths retain their stricter matching operations. Reversal
+    requires the same role and server grant but never destructive
+    acknowledgement. Bun ignores client-supplied audit identity and emits
+    additive `action`, stable authenticated `principal` and machine-readable
+    `details` fields for every successful inject and clear path. The deprecated
+    council API cannot bypass this boundary.
+  - [x] Guarded five-scenario chaos catalogue: serial execution on the
+    digest-pinned runc/Apple workload; server policy and consent preflight;
+    missing node kill/pressure prerequisites refuse rather than green-skip;
+    fresh per-case capability snapshots; and runner-owned exact-id reversal
+    after pass, failure, timeout or panic. The legacy council-partition
+    response now exposes its node-local fault id additively, so catalogue
+    cleanup never needs the blanket heal endpoint.
+  - [x] Fingerprinted benchmark report and comparison contract: exact schema,
+    topology and per-node build/runtime/kernel evidence, direction-aware
+    thresholds, metric-method compatibility and informational hosted results.
+  - [x] Seven-suite benchmark runner and CLI: real source-workload DNS/service
+    paths, strict failed-versus-skipped outcomes, fresh preflight evidence,
+    explicit destructive consent and unconditional server-owned cleanup.
+  - [x] Authenticated source-workload trace and CLI: fixed positional-argument
+    DNS/TCP probes run off the agent command loop; live userspace and attached
+    kernel state are distinguished from inference; incomplete evidence is
+    `Unknown`; external destinations use exact server-owned authorisation.
+  - [x] Phase 15 command documentation across both READMEs, the Relish/Bun
+    designs, chapter 15 and the implementation plan. Real three-node catalogue,
+    chaos, benchmark and trace acceptance remains the unchecked phase gate.
 
 ### Optional
 
@@ -1585,9 +1719,15 @@ work, not by `M1`.
   derived from its current `cpu.max` via a new pure `baseline_cores` (unlimited → host cores;
   a quota → quota/period; unparseable → 1, since under-reading makes the fault weaker than
   asked, which is the wrong way to be wrong)
-- [ ] `TODO(Phase 15)` — Smoker's service-to-service `Partition` apply arm stays an accepted
-  no-op without eBPF; tightening it needs the quorum-rail acceptance test moved onto an eBPF
-  node first
+- [x] `TODO(Phase 15)` — Smoker's service-to-service `Partition` no longer reports success
+  without an eBPF data path. Bun resolves every running source-app instance to its cgroup-v2
+  id server-side, installs one exact source-cgroup/VIP/port key per instance, rolls partial
+  writes back, records those keys for clear/expiry/shutdown, and propagates map failures. A
+  root-only Linux acceptance test proves the key blocks only the selected source cgroup and
+  that deleting it restores the connection. The old Raft/gossip transport partition now has
+  a distinct `CouncilPartition` variant and a real three-node quorum-rail test, so it can no
+  longer borrow the service fault's safety semantics. Delay and bandwidth commands now
+  refuse honestly until a TC packet hook exists; the connect hook cannot implement either.
 - [ ] `TODO(Phase 15)` — Pickle push-side request-body streaming (`MAX_REQUEST_BYTES`)
 
 ### Open — Optional list

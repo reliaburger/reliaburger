@@ -13,15 +13,22 @@
 //! - [`cases`] — the integration catalogue.
 //! - [`chaos`] — the chaos scenarios, selected by `--chaos`.
 
+pub mod bench;
 pub mod cases;
 pub mod chaos;
 pub mod context;
+pub mod deadline;
+pub mod lease;
 pub mod oci;
 pub mod registry;
 pub mod report;
 pub mod runner;
+pub mod safety;
 
-pub use context::TestContext;
-pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select, skip};
-pub use report::{TestCaseResult, TestGroup, TestOutcome, TestReport};
+pub use context::{PINNED_TEST_WORKLOAD_IMAGE, TestContext};
+pub use registry::{TestCase, TestFn, all_cases, chaos_cases, parse_filter, select, unknown};
+pub use report::{
+    CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
+    TestProfile, TestReport, UnknownKind,
+};
 pub use runner::{RunConfig, run};

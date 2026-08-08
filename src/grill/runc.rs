@@ -37,6 +37,8 @@ struct RuncEntry {
     adopted_pid: Option<u32>,
     /// Start time of the adopted pid, to detect pid reuse (M23).
     adopted_pid_started_at: Option<u64>,
+    /// Published port to install after rootless runc exposes its init PID.
+    port_mapping: Option<super::oci::PortMapping>,
     state: ContainerState,
     exit_code: Option<i32>,
 }
@@ -62,6 +64,8 @@ pub struct RuncGrill {
     networks: Arc<Mutex<HashMap<InstanceId, ContainerNetwork>>>,
     /// Active host-port publications, torn down with the container.
     port_handles: Arc<Mutex<HashMap<InstanceId, PortMapHandle>>>,
+    /// Rootless userspace networks, including the slirp owner process.
+    slirp_handles: Arc<Mutex<HashMap<InstanceId, super::rootless::Slirp4netnsHandle>>>,
     /// Node index for IP address assignment (maps to a /23 subnet).
     node_index: u16,
     /// Counter for assigning container indices within the node's subnet.
@@ -96,6 +100,7 @@ impl RuncGrill {
             entries: Arc::new(Mutex::new(HashMap::new())),
             networks: Arc::new(Mutex::new(HashMap::new())),
             port_handles: Arc::new(Mutex::new(HashMap::new())),
+            slirp_handles: Arc::new(Mutex::new(HashMap::new())),
             node_index,
             next_container_index: Arc::new(Mutex::new(0)),
             dns_nameserver: None,
@@ -155,11 +160,86 @@ impl RuncGrill {
         Ok(output)
     }
 
+    /// Wait for `runc run` to publish the container init PID.
+    async fn wait_for_container_pid(&self, instance: &InstanceId) -> Result<u32, GrillError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let output = self.runc_command(&["state", &instance.0], instance).await?;
+            if output.status.success()
+                && let Ok(state) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                && state.get("status").and_then(|value| value.as_str()) == Some("running")
+                && let Some(pid) = state.get("pid").and_then(|value| value.as_u64())
+                && let Ok(pid) = u32::try_from(pid)
+            {
+                return Ok(pid);
+            }
+            if let Some(reason) = self.runc_start_failure(instance).await {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason,
+                });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: "runc did not publish a running container PID within 5s".to_string(),
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Return the useful part of an early `runc run` failure instead of
+    /// waiting for the state-poll deadline and hiding the runtime error.
+    async fn runc_start_failure(&self, instance: &InstanceId) -> Option<String> {
+        let (status, log_path) = {
+            let mut entries = self.entries.lock().await;
+            let entry = entries.get_mut(instance)?;
+            let status = entry.child.as_mut()?.try_wait().ok()??;
+            (status, entry.log_path.clone())
+        };
+        let log = tokio::fs::read_to_string(log_path)
+            .await
+            .unwrap_or_default();
+        let detail = log.trim();
+        Some(if detail.is_empty() {
+            format!("runc run exited before the container started ({status})")
+        } else {
+            format!("runc run exited before the container started ({status}): {detail}")
+        })
+    }
+
+    /// Start the rootless network and install its optional host forward.
+    async fn start_rootless_network(
+        &self,
+        instance: &InstanceId,
+        container_pid: u32,
+        api_socket: &std::path::Path,
+        port_mapping: Option<super::oci::PortMapping>,
+    ) -> Result<(), GrillError> {
+        let handle = super::rootless::setup_slirp4netns(container_pid, api_socket, port_mapping)
+            .await
+            .map_err(|error| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("failed to start rootless networking: {error}"),
+            })?;
+        self.slirp_handles
+            .lock()
+            .await
+            .insert(instance.clone(), handle);
+        Ok(())
+    }
+
     /// Release a container's resources: force-delete any lingering runc state
     /// and tear down its network namespace + veth pair. Best-effort — safe to
     /// call more than once. `runc run` auto-deletes on exit, so the delete is a
     /// backstop; the netns teardown is the part that actually prevents leaks.
     async fn cleanup(&self, instance: &InstanceId) {
+        // slirp holds the container network namespace open. Stop it before
+        // deleting runc state so teardown cannot leave an orphaned forward.
+        if let Some(handle) = self.slirp_handles.lock().await.remove(instance) {
+            handle.shutdown().await;
+        }
         let _ = self
             .runc_command(&["delete", "--force", &instance.0], instance)
             .await;
@@ -392,6 +472,7 @@ impl RuncGrill {
                 child: None,
                 adopted_pid: None,
                 adopted_pid_started_at: None,
+                port_mapping: spec.port_mapping,
                 state: ContainerState::Pending,
                 exit_code: None,
             },
@@ -468,14 +549,37 @@ impl super::Grill for RuncGrill {
 
                 entry.child = Some(child);
                 entry.state = ContainerState::Running;
-                Ok(())
+                Ok((entry.bundle_dir.clone(), entry.port_mapping))
             })()
         };
 
-        if result.is_err() {
-            self.cleanup(instance).await;
+        let (bundle_dir, port_mapping) = match result {
+            Ok(values) => values,
+            Err(error) => {
+                self.cleanup(instance).await;
+                return Err(error);
+            }
+        };
+
+        if self.rootless {
+            let rootless = async {
+                let container_pid = self.wait_for_container_pid(instance).await?;
+                self.start_rootless_network(
+                    instance,
+                    container_pid,
+                    &bundle_dir.join("slirp4netns.sock"),
+                    port_mapping,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = rootless {
+                self.cleanup(instance).await;
+                return Err(error);
+            }
         }
-        result
+
+        Ok(())
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
@@ -610,6 +714,17 @@ impl super::Grill for RuncGrill {
         super::records::RuntimeKind::Runc
     }
 
+    async fn rootless_network_record(
+        &self,
+        instance: &InstanceId,
+    ) -> Option<super::records::RootlessNetworkRecord> {
+        self.slirp_handles
+            .lock()
+            .await
+            .get(instance)
+            .and_then(super::rootless::Slirp4netnsHandle::adoption_record)
+    }
+
     /// Root-mode runc joins the exact cgroup v2 path from the OCI spec's
     /// `cgroupsPath`, so the agent can program egress before `start`.
     /// Rootless runc may not own the cgroup tree — decline there.
@@ -640,14 +755,21 @@ impl super::Grill for RuncGrill {
             self.cleanup(instance).await;
             return Ok(false);
         }
-        let running = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
-            .is_some_and(|status| status == "running");
+        let state = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+        let running = state
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(|status| status.as_str())
+            == Some("running");
         if !running {
             self.cleanup(instance).await;
             return Ok(false);
         }
+        let container_pid = state
+            .as_ref()
+            .and_then(|value| value.get("pid"))
+            .and_then(|pid| pid.as_u64())
+            .and_then(|pid| u32::try_from(pid).ok());
 
         let bundle_dir = self.bundle_base.join(&instance.0);
         let log_path = bundle_dir.join("output.log");
@@ -659,15 +781,57 @@ impl super::Grill for RuncGrill {
                 child: None,
                 adopted_pid: Some(record.pid),
                 adopted_pid_started_at: Some(record.pid_started_at),
+                port_mapping: record.oci_spec.port_mapping,
                 state: ContainerState::Running,
                 exit_code: None,
             },
         );
 
-        // Re-track the root-mode port mapping: the map element survived
-        // the agent restart in the kernel, so only the handle (whose
-        // shutdown deletes the element) needs rebuilding.
-        if let Some(pm) = &record.oci_spec.port_mapping {
+        if self.rootless {
+            let Some(container_pid) = container_pid else {
+                self.cleanup(instance).await;
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason:
+                        "runc state omitted the container PID needed to restore rootless networking"
+                            .to_string(),
+                });
+            };
+            let surviving = record
+                .rootless_network
+                .as_ref()
+                .filter(|network| network.container_pid == container_pid)
+                .and_then(super::rootless::Slirp4netnsHandle::adopt);
+            if let Some(handle) = surviving {
+                self.slirp_handles
+                    .lock()
+                    .await
+                    .insert(instance.clone(), handle);
+            } else {
+                if let Some(previous) = &record.rootless_network {
+                    super::rootless::stop_recorded_owner(previous);
+                }
+                let api_socket = record
+                    .rootless_network
+                    .as_ref()
+                    .map(|network| network.api_socket.clone())
+                    .unwrap_or_else(|| self.bundle_base.join(&instance.0).join("slirp4netns.sock"));
+                if let Err(error) = self
+                    .start_rootless_network(
+                        instance,
+                        container_pid,
+                        &api_socket,
+                        record.oci_spec.port_mapping,
+                    )
+                    .await
+                {
+                    self.cleanup(instance).await;
+                    return Err(error);
+                }
+            }
+        } else if let Some(pm) = &record.oci_spec.port_mapping {
+            // The root-mode map element survived in the kernel; rebuild only
+            // the owner handle whose shutdown removes it.
             self.port_handles.lock().await.insert(
                 instance.clone(),
                 PortMapHandle::for_adopted(pm.host_port, pm.container_port),
@@ -898,6 +1062,127 @@ mod tests {
                 .join("bundles/rootless-writable/rootfs-lower")
                 .exists()
         );
+    }
+
+    /// Real replacement acceptance for M5. This downloads Alpine, starts a
+    /// rootless runc workload behind slirp4netns, kills the userspace network
+    /// owner to model process death, and proves an adopting grill recreates the
+    /// published port before reporting success.
+    #[tokio::test]
+    #[ignore = "requires Linux rootless runc, slirp4netns, network access and RELIABURGER_ROOTLESS_RUNC_TESTS=1"]
+    async fn rootless_published_port_survives_bun_replacement() {
+        assert!(
+            std::env::var("RELIABURGER_ROOTLESS_RUNC_TESTS").is_ok(),
+            "set RELIABURGER_ROOTLESS_RUNC_TESTS=1 after provisioning rootless runc and slirp4netns"
+        );
+        let port_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host_port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle_base = tmp.path().join("bundles");
+        let state_dir = tmp.path().join("state");
+        let image_store = ImageStore::new(tmp.path().join("images"));
+        let original = RuncGrill::new(
+            bundle_base.clone(),
+            image_store.clone(),
+            true,
+            state_dir.clone(),
+        );
+        let id = InstanceId("rootless-adoption-port".to_string());
+        let spec = crate::grill::oci::OciSpec {
+            port_mapping: Some(crate::grill::oci::PortMapping {
+                host_port,
+                container_port: 8080,
+            }),
+            root: crate::grill::oci::OciRoot {
+                path: "docker.io/library/alpine:3.20".to_string(),
+                readonly: true,
+            },
+            process: crate::grill::oci::OciProcess {
+                args: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n' | nc -l -p 8080; done".to_string(),
+                ],
+                env: vec!["PATH=/bin:/usr/bin".to_string()],
+                cwd: "/".to_string(),
+                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
+            },
+            mounts: crate::grill::oci::standard_mounts(),
+            linux: crate::grill::oci::OciLinux {
+                namespaces: crate::grill::oci::standard_namespaces(None),
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+        };
+        original.create(&id, &spec).await.unwrap();
+        original.start(&id).await.unwrap();
+        wait_for_http(host_port).await;
+
+        let pid = original.pid(&id).await.unwrap();
+        let rootless_network = original.rootless_network_record(&id).await.unwrap();
+        let record = crate::grill::records::InstanceRecord {
+            schema: 2,
+            instance_id: id.0.clone(),
+            namespace: "default".to_string(),
+            app_name: "rootless-adoption-port".to_string(),
+            replica_index: 0,
+            is_job: false,
+            image: "docker.io/library/alpine:3.20".to_string(),
+            runtime: crate::grill::records::RuntimeKind::Runc,
+            pid,
+            pid_started_at: crate::grill::records::process_start_time(pid).unwrap(),
+            runc_container_id: Some(id.0.clone()),
+            log_stem: None,
+            host_port: Some(host_port),
+            app_spec: None,
+            oci_spec: spec,
+            rootless_network: Some(rootless_network.clone()),
+        };
+
+        crate::grill::rootless::stop_recorded_owner(&rootless_network);
+        for _ in 0..100 {
+            if !crate::grill::records::process_matches(
+                rootless_network.owner_pid,
+                rootless_network.owner_pid_started_at,
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(original);
+
+        let adopter = RuncGrill::new(bundle_base, image_store, true, state_dir);
+        assert!(adopter.adopt(&id, &record).await.unwrap());
+        let replacement = adopter.rootless_network_record(&id).await.unwrap();
+        assert_ne!(replacement.owner_pid, rootless_network.owner_pid);
+        wait_for_http(host_port).await;
+        adopter.kill(&id).await.unwrap();
+    }
+
+    async fn wait_for_http(port: u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
+                && stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.is_ok()
+            {
+                let mut response = Vec::new();
+                if stream.read_to_end(&mut response).await.is_ok() && response.starts_with(b"HTTP/")
+                {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "published port {port} did not answer"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
@@ -1393,6 +1678,7 @@ mod tests {
             host_port: None,
             app_spec: None,
             oci_spec: spec,
+            rootless_network: None,
         };
         drop(original); // A Bun exec/process death drops the child handle only.
 
@@ -1413,8 +1699,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires runc, network access to a runnable OCI image, and RELIABURGER_RUNC_TESTS=1"]
-    async fn runc_captures_exit_code_and_logs() {
+    #[ignore = "requires runc, network access to the pinned OCI workload, and RELIABURGER_RUNC_TESTS=1"]
+    async fn runc_runs_pinned_multiarchitecture_test_workload() {
         assert!(
             runc_tests_enabled(),
             "set RELIABURGER_RUNC_TESTS=1 after provisioning runc"
@@ -1427,21 +1713,15 @@ mod tests {
             true,
             tmp.path().join("state"),
         );
-        let id = InstanceId("runc-capture".to_string());
+        let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
-                path: "alpine:latest".to_string(),
+                path: crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.to_string(),
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
-                // Absolute path: a bare "sh" needs $PATH, which a hand-built
-                // spec doesn't set (real images set PATH via their image config).
-                args: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "echo captured-stdout; exit 7".to_string(),
-                ],
+                args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
@@ -1461,32 +1741,23 @@ mod tests {
             .await
             .expect("runc create should succeed in the provisioned Linux suite");
         grill.start(&id).await.expect("runc run should spawn");
-
-        // Wait for the container to exit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if matches!(grill.state(&id).await, Ok(ContainerState::Stopped)) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "container never exited"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-
-        // The log file holds the container's stdout+stderr (or runc's error if
-        // the run failed — surfaced in the assert messages).
-        let logs = grill.logs(&id).await.unwrap();
-        let code = grill.exit_code(&id).await;
-
-        // Exit code is captured (7), and stdout was written to the log file.
-        assert_eq!(code, Some(7), "exit code not captured (logs: {logs:?})");
-        assert!(
-            logs.contains("captured-stdout"),
-            "container stdout not captured, got: {logs:?}"
+        assert_eq!(grill.state(&id).await.ok(), Some(ContainerState::Running));
+        let output = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf reliaburger-pinned-workload".to_string(),
+                ],
+            )
+            .await
+            .expect("the pinned workload should support exec");
+        assert_eq!(
+            output, "reliaburger-pinned-workload",
+            "unexpected output from the selected platform manifest"
         );
 
-        grill.kill(&id).await.ok();
+        grill.kill(&id).await.unwrap();
     }
 }

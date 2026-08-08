@@ -36,7 +36,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 | **Meat** (scheduler) | Provides the scheduling state that council uses to validate CSRs -- a worker node can only obtain a certificate for a workload that Meat has scheduled onto that node. |
 | **Mustard** (gossip) | Propagates the `cluster_nodes` IP set used by nftables perimeter rules. Membership changes trigger Bun to reconcile firewall state. |
 | **Onion** (eBPF service discovery) | Hosts the `connect()` interception point where eBPF firewall checks are enforced. The `firewall_map` BPF map is loaded alongside Onion's existing service map. |
-| **Wrapper** (ingress) | Consumes Ingress CA certificates for `tls = "cluster"` routes. Triggers certificate renewal through Bun. |
+| **Wrapper** (ingress) | Reconstructs Ingress CA material on council-enabled ingress nodes and issues per-SNI leaves for `tls = "cluster"` routes. Automatic renewal remains follow-up work. |
 | **Lettuce** (GitOps) | Delivers app configurations containing `ENC[AGE:...]` secret values and `firewall`/`egress` blocks to Bun for processing. |
 
 ---
@@ -354,6 +354,13 @@ impl SpiffeUri {
     }
 }
 ```
+
+The implementation reads the trust domain from `[cluster].name`. `relish init`,
+`relish setup` and `relish dev create` persist the requested cluster name into
+every generated node config; Bun validates the DNS-style value once at startup
+and passes it unchanged into app, job, OIDC and build-signing issuance. The
+historical hard-coded `default` domain remains only as the backwards-compatible
+config default.
 
 ### 4.4 API Token
 
@@ -1444,7 +1451,7 @@ Reliaburger borrows the concept of automatic mTLS identity but avoids the sideca
 
 cert-manager is a Kubernetes add-on that automates certificate lifecycle management. It supports multiple issuers (Let's Encrypt, Vault, self-signed, etc.) and integrates with Kubernetes Secrets and Ingress resources.
 
-Reliaburger's Ingress CA serves a similar purpose to cert-manager's self-signed/CA issuer for internal certificates. For public-facing TLS, Wrapper supports ACME (Let's Encrypt) directly. The workload identity certificate rotation is analogous to cert-manager's Certificate resources but is fully automatic and requires no CRDs or annotations.
+Reliaburger's Ingress CA serves a similar purpose to cert-manager's self-signed/CA issuer for internal certificates. Public-facing certificates currently come from an operator-supplied certificate/key pair. Direct ACME (Let's Encrypt) support remains a possible post-v1 feature. The workload identity certificate rotation is analogous to cert-manager's Certificate resources but is fully automatic and requires no CRDs or annotations.
 
 ### 11.6 HashiCorp Vault
 

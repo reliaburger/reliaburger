@@ -300,7 +300,12 @@ provision:
 /// Every node points at the shared master key. Only the bootstrap node (the
 /// one with an empty `join`) also points at the security bootstrap: it seeds
 /// the `SecurityState` into Raft once, and it replicates to everyone else.
-fn generate_node_config(node_name: &str, node_ip: &str, first_node_ip: Option<&str>) -> String {
+fn generate_node_config(
+    cluster_name: &str,
+    node_name: &str,
+    node_ip: &str,
+    first_node_ip: Option<&str>,
+) -> String {
     let join = match first_node_ip {
         Some(ip) => format!(r#"join = ["{ip}:9443"]"#),
         None => "join = []".to_string(),
@@ -325,6 +330,7 @@ name = "{node_name}"
 advertise_address = "{node_ip}"
 
 [cluster]
+name = "{cluster_name}"
 {join}
 gossip_port = 9443
 raft_port = 9444
@@ -418,6 +424,13 @@ pub async fn create(
     bun: Option<PathBuf>,
     relish: Option<PathBuf>,
 ) -> Result<(), RelishError> {
+    let cluster_identity = crate::config::node::ClusterSection {
+        name: name.to_string(),
+        ..crate::config::node::ClusterSection::default()
+    };
+    cluster_identity
+        .validate()
+        .map_err(|error| RelishError::InitFailed(error.to_string()))?;
     if !lima_available() {
         eprintln!("error: limactl not found in PATH");
         eprintln!();
@@ -515,7 +528,7 @@ pub async fn create(
     for (i, node) in cluster.nodes.iter().enumerate() {
         let join_ip = if i == 0 { None } else { Some(first_ip) };
         let node_ip = node.ip.as_deref().unwrap_or("127.0.0.1");
-        let config = generate_node_config(&node.name, node_ip, join_ip);
+        let config = generate_node_config(name, &node.name, node_ip, join_ip);
 
         // Write config to a temp file, copy to a user-writable path in the VM
         // (limactl copy runs as the unprivileged lima user), then install it
@@ -1055,17 +1068,23 @@ mod tests {
 
     #[test]
     fn generate_node_config_first_node_has_empty_join() {
-        let config = generate_node_config("reliaburger-1", "192.168.105.2", None);
+        let config = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
         assert!(config.contains("join = []"));
         assert!(config.contains("gossip_port = 9443"));
         assert!(config.contains(r#"name = "reliaburger-1""#));
+        assert!(config.contains("[cluster]\nname = \"dev\""));
         // Advertises its own reachable IP so cluster subsystems don't bind loopback.
         assert!(config.contains(r#"advertise_address = "192.168.105.2""#));
     }
 
     #[test]
     fn generate_node_config_subsequent_node_joins_first() {
-        let config = generate_node_config("reliaburger-2", "192.168.105.3", Some("192.168.105.2"));
+        let config = generate_node_config(
+            "dev",
+            "reliaburger-2",
+            "192.168.105.3",
+            Some("192.168.105.2"),
+        );
         assert!(config.contains(r#"join = ["192.168.105.2:9443"]"#));
         assert!(config.contains(r#"name = "reliaburger-2""#));
         assert!(config.contains(r#"advertise_address = "192.168.105.3""#));
@@ -1073,8 +1092,13 @@ mod tests {
 
     #[test]
     fn generate_node_config_includes_master_key_path_for_all_nodes() {
-        let first = generate_node_config("reliaburger-1", "192.168.105.2", None);
-        let joiner = generate_node_config("reliaburger-2", "192.168.105.3", Some("192.168.105.2"));
+        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
+        let joiner = generate_node_config(
+            "dev",
+            "reliaburger-2",
+            "192.168.105.3",
+            Some("192.168.105.2"),
+        );
         for config in [first, joiner] {
             assert!(config.contains("[security]"));
             assert!(config.contains(r#"master_key_path = "/etc/reliaburger/master.key""#));
@@ -1083,14 +1107,14 @@ mod tests {
 
     #[test]
     fn generate_node_config_marks_the_deliberate_development_plaintext_mode() {
-        let config = generate_node_config("reliaburger-1", "192.168.105.2", None);
+        let config = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
         assert!(config.contains("DEVELOPMENT-ONLY PLAINTEXT CLUSTER TRANSPORTS"));
         assert!(config.contains("require_mtls = false"));
     }
 
     #[test]
     fn generate_node_config_includes_bootstrap_path_only_for_first_node() {
-        let first = generate_node_config("reliaburger-1", "192.168.105.2", None);
+        let first = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None);
         assert!(
             first.contains(r#"bootstrap_path = "/etc/reliaburger/security-bootstrap.json""#),
             "bootstrap node must load the security bootstrap"
@@ -1099,7 +1123,12 @@ mod tests {
 
     #[test]
     fn generate_node_config_omits_bootstrap_path_for_joiners() {
-        let joiner = generate_node_config("reliaburger-2", "192.168.105.3", Some("192.168.105.2"));
+        let joiner = generate_node_config(
+            "dev",
+            "reliaburger-2",
+            "192.168.105.3",
+            Some("192.168.105.2"),
+        );
         assert!(
             !joiner.contains("bootstrap_path"),
             "joiners get SecurityState from Raft, not a local bootstrap file"

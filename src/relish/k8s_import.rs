@@ -317,7 +317,7 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
         let ingress_name = find_ingress_for_service(&ingresses, name);
         if let Some(ing_name) = ingress_name {
             if let Some(ing) = ingresses.get(&ing_name) {
-                apply_ingress(&mut app, ing);
+                apply_ingress(&mut app, &ing_name, ing, &mut report);
             }
         }
 
@@ -697,7 +697,12 @@ fn find_ingress_for_service(
     None
 }
 
-fn apply_ingress(app: &mut AppSpec, ing: &Ingress) {
+fn apply_ingress(
+    app: &mut AppSpec,
+    ingress_name: &str,
+    ing: &Ingress,
+    report: &mut MigrationReport,
+) {
     if let Some(spec) = &ing.spec {
         if let Some(rules) = &spec.rules {
             if let Some(rule) = rules.first() {
@@ -709,7 +714,27 @@ fn apply_ingress(app: &mut AppSpec, ing: &Ingress) {
                     .map(|p| p.path.clone().unwrap_or_else(|| "/".to_string()))
                     .unwrap_or_else(|| "/".to_string());
 
-                let tls = spec.tls.as_ref().map(|_| "auto".to_string());
+                let tls = spec.tls.as_ref().map(|entries| {
+                    let secret_names: Vec<&str> = entries
+                        .iter()
+                        .filter_map(|entry| entry.secret_name.as_deref())
+                        .collect();
+                    let source = if secret_names.is_empty() {
+                        "Kubernetes TLS Secret material".to_string()
+                    } else {
+                        format!(
+                            "Kubernetes TLS Secret material ({})",
+                            secret_names.join(", ")
+                        )
+                    };
+                    report.warnings.push(MigrationWarning {
+                        resource: format!("Ingress/{ingress_name}"),
+                        message: format!(
+                            "{source} is not imported; using tls = \"cluster\", so clients must trust the Reliaburger cluster root CA"
+                        ),
+                    });
+                    "cluster".to_string()
+                });
 
                 app.ingress = Some(IngressSpec {
                     host,
@@ -967,6 +992,10 @@ kind: Ingress
 metadata:
   name: web-ingress
 spec:
+  tls:
+  - hosts:
+    - myapp.com
+    secretName: web-tls
   rules:
   - host: myapp.com
     http:
@@ -984,6 +1013,15 @@ spec:
         let app = &result.config.app["web"];
         assert!(app.ingress.is_some());
         assert_eq!(app.ingress.as_ref().unwrap().host, "myapp.com");
+        assert_eq!(
+            app.ingress.as_ref().unwrap().tls.as_deref(),
+            Some("cluster")
+        );
+        assert!(result.report.warnings.iter().any(|warning| {
+            warning.resource == "Ingress/web-ingress"
+                && warning.message.contains("web-tls")
+                && warning.message.contains("not imported")
+        }));
     }
 
     #[test]

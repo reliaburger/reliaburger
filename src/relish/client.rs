@@ -94,6 +94,23 @@ fn classify_error(e: reqwest::Error) -> RelishError {
     }
 }
 
+async fn parse_typed_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, RelishError> {
+    let status = response.status().as_u16();
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(RelishError::ApiError { status, body });
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {error}"),
+        })
+}
+
 /// The `--token` CLI override, set once from `main` before any client is built.
 static CLI_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
@@ -309,6 +326,17 @@ impl BunClient {
         &self.base_url
     }
 
+    /// Address another node with the same authenticated, CA-pinned HTTP
+    /// client. Cluster fan-out must not silently lose the caller's bearer or
+    /// replace its trust roots while changing only the authority.
+    pub(crate) fn with_base_url(&self, base_url: &str) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: self.client.clone(),
+            token: self.token.clone(),
+        }
+    }
+
     /// The underlying HTTP client, pre-configured with the resolved bearer
     /// token and cluster-CA trust. Used for requests to an explicit URL that
     /// isn't relative to `base_url` — e.g. a Pickle registry `/v2` upload on a
@@ -354,19 +382,47 @@ impl BunClient {
     /// stderr as they arrive; the final `Complete` event is returned
     /// as an `ApplyResult`.
     pub async fn apply(&self, config: &Config) -> Result<ApplyResult, RelishError> {
+        self.apply_request(config, None, false).await
+    }
+
+    /// Deploy apps under a server-owned Phase 15 resource lease.
+    pub async fn apply_with_lease(
+        &self,
+        config: &Config,
+        lease_id: &str,
+    ) -> Result<ApplyResult, RelishError> {
+        self.apply_request(config, Some(lease_id), false).await
+    }
+
+    /// Deploy a deliberately saturating app under both lease and capacity policy.
+    pub async fn apply_capacity_with_lease(
+        &self,
+        config: &Config,
+        lease_id: &str,
+    ) -> Result<ApplyResult, RelishError> {
+        self.apply_request(config, Some(lease_id), true).await
+    }
+
+    async fn apply_request(
+        &self,
+        config: &Config,
+        lease_id: Option<&str>,
+        capacity_probe: bool,
+    ) -> Result<ApplyResult, RelishError> {
         let url = format!("{}/v1/apply", self.base_url);
         let toml_str = toml::to_string_pretty(config).map_err(|e| RelishError::ApiError {
             status: 0,
             body: format!("failed to serialise config: {e}"),
         })?;
 
-        let response = self
-            .client
-            .post(&url)
-            .body(toml_str)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.client.post(&url).body(toml_str);
+        if let Some(lease_id) = lease_id {
+            request = request.header("x-reliaburger-test-lease", lease_id);
+        }
+        if capacity_probe {
+            request = request.header("x-reliaburger-capacity-probe", "acknowledged");
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -394,6 +450,9 @@ impl BunClient {
                     && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
                 {
                     match &event {
+                        ApplyEvent::Accepted { operation_id } => {
+                            eprintln!("  operation {operation_id}");
+                        }
                         ApplyEvent::Progress { message } => {
                             eprintln!("  {message}");
                         }
@@ -543,6 +602,62 @@ impl BunClient {
         self.get_typed_json("/v1/capabilities").await
     }
 
+    /// Fetch an authenticated, bounded collection from current cluster peers.
+    pub async fn cluster_capabilities(
+        &self,
+    ) -> Result<crate::bun::capabilities::ClusterCapabilityReport, RelishError> {
+        self.get_typed_json("/v1/capabilities/cluster").await
+    }
+
+    /// Fetch bounded local disk, cgroup and public certificate evidence.
+    pub async fn diagnostics(
+        &self,
+        cpu_window_seconds: u64,
+    ) -> Result<crate::bun::diagnostics::LocalDiagnosticSnapshot, RelishError> {
+        self.get_typed_json(&format!(
+            "/v1/diagnostics?window_seconds={}",
+            cpu_window_seconds.clamp(1, 10)
+        ))
+        .await
+    }
+
+    /// Run the fixed server-side connectivity trace on the node hosting the
+    /// source workload.
+    pub async fn trace(
+        &self,
+        request: &crate::onion::trace::TraceRequest,
+    ) -> Result<crate::onion::trace::TraceResult, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/trace", self.base_url))
+            .json(request)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
+    /// Fetch desired application replicas and current scheduler coverage.
+    pub async fn desired_apps(
+        &self,
+    ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, RelishError> {
+        self.get_typed_json("/v1/diagnostics/apps").await
+    }
+
+    /// Fetch structured, cluster-aware recent log entries for one application.
+    pub async fn log_entries(
+        &self,
+        app: &str,
+        namespace: &str,
+        tail: usize,
+        start: u64,
+    ) -> Result<crate::ketchup::types::LogQueryResult, RelishError> {
+        self.get_typed_json(&format!(
+            "/v1/logs/query/{app}/{namespace}?tail={tail}&start={start}"
+        ))
+        .await
+    }
+
     /// Fetch deploy history for an app in a namespace.
     pub async fn deploy_history(
         &self,
@@ -560,6 +675,64 @@ impl BunClient {
             ))
             .await?;
         Ok(value["history"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Fetch live deploy operations and bounded terminal history.
+    pub async fn deploy_operations(
+        &self,
+    ) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, RelishError> {
+        self.get_typed_json("/v1/deploys/operations").await
+    }
+
+    /// Create a server-owned test resource lease.
+    pub async fn create_test_lease(
+        &self,
+        ttl_seconds: u64,
+        namespace: Option<&str>,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/test/leases", self.base_url))
+            .json(&serde_json::json!({
+                "ttl_seconds": ttl_seconds,
+                "namespace": namespace,
+            }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
+    /// Renew an active test resource lease.
+    pub async fn renew_test_lease(
+        &self,
+        lease_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/test/leases/{lease_id}/renew", self.base_url))
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
+    /// Release a lease and wait for server-confirmed cleanup.
+    pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
+        let response = self
+            .client
+            .delete(format!("{}/v1/test/leases/{lease_id}", self.base_url))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
     }
 
     /// Fetch metrics recorded for one app.
@@ -1012,12 +1185,17 @@ impl BunClient {
         &self,
         peers: &[String],
         duration_secs: u64,
-    ) -> Result<String, RelishError> {
+        acknowledged: bool,
+    ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
         let url = format!("{}/v1/chaos/partition", self.base_url);
         let response = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "peers": peers, "duration_secs": duration_secs }))
+            .json(&serde_json::json!({
+                "peers": peers,
+                "duration_secs": duration_secs,
+                "acknowledged": acknowledged,
+            }))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1032,7 +1210,10 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })?;
-        Ok(json["message"].as_str().unwrap_or("ok").to_string())
+        serde_json::from_value(json["fault"].clone()).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("partition response omitted its owned fault: {error}"),
+        })
     }
 
     /// Remove all network partitions (chaos testing).
@@ -1103,14 +1284,21 @@ impl BunClient {
     }
 
     /// Clear a specific fault by ID.
-    pub async fn clear_fault(&self, id: u64) -> Result<String, RelishError> {
+    pub async fn clear_fault(
+        &self,
+        id: u64,
+        node: Option<&str>,
+        acknowledged: bool,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/fault/{id}", self.base_url);
-        let response = self
-            .client
-            .delete(&url)
-            .send()
-            .await
-            .map_err(classify_error)?;
+        let mut request = self.client.delete(&url);
+        if let Some(node) = node {
+            request = request.query(&[
+                ("node", node),
+                ("acknowledged", if acknowledged { "true" } else { "false" }),
+            ]);
+        }
+        let response = request.send().await.map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1812,6 +2000,17 @@ mod tests {
         let client = BunClient::new_with_token(&url, None);
         client.health().await.unwrap();
         assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn changing_only_the_node_address_preserves_authentication() {
+        let (url, captured) = capture_server().await;
+        let entry = BunClient::new_with_token("http://127.0.0.1:1", Some("rbrg_cluster"));
+        entry.with_base_url(&url).health().await.unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("Bearer rbrg_cluster")
+        );
     }
 
     #[test]

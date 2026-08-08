@@ -52,6 +52,8 @@ jobs:
         run: make test-no-default
       - name: Doctests
         run: make test-doc
+      - name: Executable examples
+        run: make examples
       - name: Upload JUnit
         if: always()
         uses: actions/upload-artifact@v4
@@ -87,7 +89,14 @@ jobs:
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs buildah clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns
+          sudo apt-get install -y -qq btrfs-progs buildah clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+      - name: Permit rootless runc on Ubuntu AppArmor hosts
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Prove rootless port adoption
+        run: make test-rootless-runc
       - name: Run only provisioned Linux tests
         run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
 
@@ -136,10 +145,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-portable
+      - name: Lint every target and feature
+        run: make lint
       - run: make test
       - run: make test-doc
 

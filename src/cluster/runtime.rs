@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bun::agent::ClusterHandle;
 use crate::cluster::identity;
 use crate::config::node::ReportingTreeSection;
-use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc};
+use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc_with_node_gate};
 use crate::council::node::CouncilNode;
 use crate::council::selection::{
     CouncilAction, CouncilObservation, CouncilSelectionConfig, HealthTracker, ObservedMember,
@@ -117,6 +117,8 @@ pub struct ClusterParams {
     /// over gossip so the leader's reconciler resigns and replaces this voter.
     /// `None` (single-node / no disk-pressure loop) advertises "healthy".
     pub self_disk_pressured_rx: Option<watch::Receiver<bool>>,
+    /// Process-wide critical-subsystem evidence owned by Bun.
+    pub readiness: Option<crate::bun::readiness::ReadinessTracker>,
 }
 
 /// Open and validate the durable Raft stores under `raft_dir`.
@@ -175,7 +177,28 @@ pub async fn start(
     params: ClusterParams,
     shutdown: CancellationToken,
 ) -> std::io::Result<(ClusterHandle, ClusterRuntime)> {
+    let readiness = params.readiness.clone();
+    let supervision = TaskSupervision {
+        shutdown: shutdown.clone(),
+        readiness: readiness.clone(),
+    };
+    if let Some(evidence) = &readiness {
+        for name in [
+            "cluster:gossip",
+            "cluster:raft-rpc",
+            "cluster:report-aggregator",
+            "cluster:report-worker",
+            "cluster:leader-hint",
+            "cluster:leader-target",
+        ] {
+            evidence.register(name, true).await;
+        }
+        if params.mayo.is_some() {
+            evidence.register("cluster:rollup-worker", true).await;
+        }
+    }
     // --- Gossip ---
+    let node_gate = crate::smoker::node_fault::NodeTransportGate::new();
     // Authenticate gossip datagrams with an HMAC keyed by the shared master
     // secret (every node derives the same key). Nodes without a master key
     // (single-node / pre-security) get None and gossip in the clear as before.
@@ -186,7 +209,8 @@ pub async fn start(
     let transport = UdpMustardTransport::bind(params.gossip_addr)
         .await
         .map_err(|e| std::io::Error::other(format!("gossip bind failed: {e}")))?
-        .with_key(gossip_key);
+        .with_key(gossip_key)
+        .with_node_gate(node_gate.clone());
     // Grab the gossip blocklist before the transport moves into the
     // node — chaos partitions populate it to silently drop datagrams.
     let gossip_blocklist = transport.blocklist();
@@ -293,7 +317,8 @@ pub async fn start(
         Some(material) => TcpRaftNetworkFactory::new_tls_bound(raft_id, material),
         None => TcpRaftNetworkFactory::new(raft_id),
     }
-    .with_recovery_epoch(recovery_epoch);
+    .with_recovery_epoch(recovery_epoch)
+    .with_node_gate(node_gate.clone());
     // Same for the Raft RPC blocklist — a partition must cut both the
     // gossip and Raft transports or SWIM half-detects the peer.
     let raft_blocklist = factory.blocklist();
@@ -345,7 +370,7 @@ pub async fn start(
 
     // Now start gossip.
     let gossip_shutdown = shutdown.clone();
-    spawn_supervised("gossip", shutdown.clone(), async move {
+    spawn_supervised("cluster:gossip", supervision.clone(), async move {
         node.run(gossip_shutdown).await;
     });
 
@@ -353,13 +378,15 @@ pub async fn start(
     let raft = council.raft().clone();
     let rpc_shutdown = shutdown.clone();
     let rpc_acceptor = raft_acceptor.clone();
-    tokio::spawn(async move {
-        serve_raft_rpc(
+    let rpc_node_gate = node_gate.clone();
+    spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
+        serve_raft_rpc_with_node_gate(
             raft_listener,
             raft,
             rpc_shutdown,
             rpc_acceptor,
             recovery_epoch,
+            rpc_node_gate,
         )
         .await;
     });
@@ -451,7 +478,7 @@ pub async fn start(
         NodeId::new(&params.node_name),
         api_addr,
         reporting_addr,
-        shutdown.clone(),
+        supervision.clone(),
     );
 
     // A maintainer keeps `council_rx` pointing at the current leader's
@@ -466,17 +493,18 @@ pub async fn start(
         epoch_tx,
         api_offset,
         reporting_offset,
-        shutdown.clone(),
+        supervision.clone(),
     );
 
     // Aggregator: every node listens, but only the leader actually receives
     // reports (workers target the leader), so a leadership change needs no
     // start/stop dance — the new leader's aggregator is already running.
-    let agg_transport = TcpReportingTransport::bind_tls(
+    let agg_transport = TcpReportingTransport::bind_tls_with_node_gate(
         reporting_addr,
         shutdown.clone(),
         raft_acceptor.clone(),
         raft_connector.clone(),
+        node_gate.clone(),
     )
     .await
     .map_err(|e| std::io::Error::other(format!("reporting bind failed: {e}")))?;
@@ -499,18 +527,21 @@ pub async fn start(
         Some(epoch_rx),
         Some(membership_rx.clone()),
     );
-    spawn_supervised("report aggregator", shutdown.clone(), async move {
-        aggregator.run().await
-    });
+    spawn_supervised(
+        "cluster:report-aggregator",
+        supervision.clone(),
+        async move { aggregator.run().await },
+    );
 
     // Worker: snapshots this node's state (via the agent) and sends it to the
     // leader. Binds an ephemeral port — it only sends; replies are ignored.
     let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
-    let worker_transport = TcpReportingTransport::bind_tls(
+    let worker_transport = TcpReportingTransport::bind_tls_with_node_gate(
         SocketAddr::new(params.gossip_addr.ip(), 0),
         shutdown.clone(),
         raft_acceptor.clone(),
         raft_connector.clone(),
+        node_gate.clone(),
     )
     .await
     .map_err(|e| std::io::Error::other(format!("reporting worker bind failed: {e}")))?;
@@ -523,18 +554,19 @@ pub async fn start(
         council_rx,
         shutdown.clone(),
     );
-    spawn_supervised("report worker", shutdown.clone(), async move {
+    spawn_supervised("cluster:report-worker", supervision.clone(), async move {
         worker.run().await
     });
 
     // Rollup worker: pushes this node's metric rollups to the leader,
     // where the aggregator ingests them into the rollup store.
     if let Some(mayo) = params.mayo.clone() {
-        let rollup_transport = TcpReportingTransport::bind_tls(
+        let rollup_transport = TcpReportingTransport::bind_tls_with_node_gate(
             SocketAddr::new(params.gossip_addr.ip(), 0),
             shutdown.clone(),
             raft_acceptor.clone(),
             raft_connector.clone(),
+            node_gate.clone(),
         )
         .await
         .map_err(|e| std::io::Error::other(format!("rollup worker bind failed: {e}")))?;
@@ -546,7 +578,7 @@ pub async fn start(
             params.rollup_interval,
             shutdown.clone(),
         );
-        spawn_supervised("rollup worker", shutdown.clone(), async move {
+        spawn_supervised("cluster:rollup-worker", supervision.clone(), async move {
             rollup_worker.run().await
         });
     }
@@ -561,6 +593,7 @@ pub async fn start(
             gossip: Some(gossip_blocklist),
             raft: Some(raft_blocklist),
             raft_port_offset: port_offset,
+            node_gate,
         },
         crl_handle,
     };
@@ -585,17 +618,32 @@ pub async fn start(
 /// that can't be rebuilt from inside a generic wrapper, and a
 /// degraded-but-alive node still serves traffic, so the honest move is to
 /// surface the failure and keep the rest of the node up.
+#[derive(Clone)]
+struct TaskSupervision {
+    shutdown: CancellationToken,
+    readiness: Option<crate::bun::readiness::ReadinessTracker>,
+}
+
 fn spawn_supervised(
     name: &'static str,
-    shutdown: CancellationToken,
+    supervision: TaskSupervision,
     task: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
-    tokio::spawn(async move {
+    let task_shutdown = supervision.shutdown.clone();
+    let guarded = async move {
         task.await;
-        if !shutdown.is_cancelled() {
+        if !task_shutdown.is_cancelled() {
             eprintln!("cluster: {name} task exited unexpectedly (before shutdown)");
         }
-    });
+    };
+    match supervision.readiness {
+        Some(evidence) => {
+            crate::bun::readiness::spawn_owned(name, true, evidence, supervision.shutdown, guarded);
+        }
+        None => {
+            tokio::spawn(guarded);
+        }
+    }
 }
 
 /// Publish a [`LeaderHint`] naming THIS node while it is the Raft leader,
@@ -609,9 +657,10 @@ fn spawn_leader_hint_publisher(
     node_id: NodeId,
     api_address: SocketAddr,
     reporting_address: SocketAddr,
-    shutdown: CancellationToken,
+    supervision: TaskSupervision,
 ) {
-    spawn_supervised("leader hint publisher", shutdown.clone(), async move {
+    let shutdown = supervision.shutdown.clone();
+    spawn_supervised("cluster:leader-hint", supervision, async move {
         loop {
             let hint = {
                 let m = metrics_rx.borrow();
@@ -659,9 +708,10 @@ fn spawn_leader_target_maintainer(
     epoch_tx: watch::Sender<u64>,
     api_offset: i32,
     reporting_offset: i32,
-    shutdown: CancellationToken,
+    supervision: TaskSupervision,
 ) {
-    spawn_supervised("leader target maintainer", shutdown.clone(), async move {
+    let shutdown = supervision.shutdown.clone();
+    spawn_supervised("cluster:leader-target", supervision, async move {
         loop {
             let view = {
                 let metrics = metrics_rx.borrow();

@@ -69,6 +69,7 @@ impl Registry {
             persist_path,
             auth: None,
             require_read_auth: false,
+            allow_unauthenticated_bootstrap: true,
             quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
             sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
                 reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
@@ -235,6 +236,7 @@ async fn catalog_survives_restart() {
             persist_path: Some(persist_path.clone()),
             auth: None,
             require_read_auth: false,
+            allow_unauthenticated_bootstrap: true,
             quota: reliaburger::pickle::registry_auth::QuotaConfig::default(),
             sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
                 reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,

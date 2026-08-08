@@ -64,10 +64,11 @@ pub fn evaluate_safety(request: &FaultRequest, context: &SafetyContext) -> Safet
 /// number of affected council nodes stays at or below
 /// `(council_size - 1) / 2`. This preserves a strict majority.
 fn check_quorum_risk(request: &FaultRequest, context: &SafetyContext) -> Option<SafetyViolation> {
-    // Only node-level and partition faults affect council membership
+    // Drain only withdraws scheduler readiness; Raft stays open. Abrupt node
+    // failure and transport partitions can remove a voter from quorum.
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::NodeDrain | FaultType::Partition { .. }
+        FaultType::NodeKill { .. } | FaultType::CouncilPartition
     );
     if !targets_node {
         return None;
@@ -145,7 +146,7 @@ fn check_leader_targeted(
 ) -> Option<SafetyViolation> {
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::NodeDrain
+        FaultType::NodeKill { .. } | FaultType::NodeDrain | FaultType::NodePressure { .. }
     );
     if !targets_node {
         return None;
@@ -167,7 +168,7 @@ fn check_node_percentage(
 ) -> Option<SafetyViolation> {
     let targets_node = matches!(
         request.fault_type,
-        FaultType::NodeKill { .. } | FaultType::NodeDrain
+        FaultType::NodeKill { .. } | FaultType::NodeDrain | FaultType::NodePressure { .. }
     );
     if !targets_node {
         return None;
@@ -178,9 +179,8 @@ fn check_node_percentage(
     }
 
     let would_be_affected = context.nodes_with_active_faults + 1;
-    let threshold = context.total_nodes.div_ceil(2); // >50%, i.e. majority
 
-    if would_be_affected > threshold {
+    if would_be_affected.saturating_mul(2) > context.total_nodes {
         Some(SafetyViolation::NodePercentageExceeded {
             affected_nodes: would_be_affected,
             total_nodes: context.total_nodes,
@@ -221,6 +221,25 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
+        }
+    }
+
+    fn node_pressure_request(target_node: &str) -> FaultRequest {
+        FaultRequest {
+            fault_type: FaultType::NodePressure {
+                cpu_percentage: 80,
+                memory_percentage: 90,
+            },
+            target_service: String::new(),
+            target_instance: None,
+            target_node: Some(target_node.into()),
+            duration: Duration::from_secs(30),
+            injected_by: "test".into(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: false,
         }
     }
 
@@ -235,6 +254,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         }
     }
 
@@ -299,6 +319,31 @@ mod tests {
         assert!(check.approved);
     }
 
+    #[test]
+    fn service_partition_does_not_consume_raft_quorum() {
+        let mut ctx = default_context();
+        ctx.council_nodes_with_active_faults = ctx.council_size;
+        let req = FaultRequest {
+            fault_type: FaultType::Partition {
+                source_app: Some("web".to_string()),
+                source_cgroup_id: 0,
+            },
+            target_service: "payments".to_string(),
+            target_instance: None,
+            target_node: None,
+            duration: Duration::from_secs(30),
+            injected_by: "test".to_string(),
+            reason: None,
+            include_leader: false,
+            override_safety: false,
+            acknowledged: false,
+        };
+        assert!(
+            evaluate_safety(&req, &ctx).approved,
+            "an application data-plane partition cannot remove a Raft voter"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Replica minimum
     // -----------------------------------------------------------------------
@@ -358,6 +403,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         // Pause affects all replicas → 0 survive
         let check = evaluate_safety(&req, &ctx);
@@ -380,6 +426,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(!check.approved);
@@ -401,6 +448,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(check.approved);
@@ -439,6 +487,23 @@ mod tests {
         assert!(check.approved);
     }
 
+    #[test]
+    fn node_pressure_protects_the_leader_but_not_raft_quorum() {
+        let mut ctx = default_context();
+        ctx.council_nodes_with_active_faults = 2;
+        let leader = node_pressure_request("node-1");
+        assert!(matches!(
+            evaluate_safety(&leader, &ctx).violation,
+            Some(SafetyViolation::LeaderTargeted)
+        ));
+
+        let worker = node_pressure_request("node-4");
+        assert!(
+            evaluate_safety(&worker, &ctx).approved,
+            "pressure keeps cluster transports open and must not consume a voter"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Node percentage
     // -----------------------------------------------------------------------
@@ -453,6 +518,24 @@ mod tests {
         assert!(matches!(
             check.violation,
             Some(SafetyViolation::NodePercentageExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn node_percentage_rejects_two_of_three_nodes() {
+        let mut ctx = default_context();
+        ctx.total_nodes = 3;
+        ctx.nodes_with_active_faults = 1;
+        let req = node_kill_request("node-3");
+
+        let check = evaluate_safety(&req, &ctx);
+
+        assert!(matches!(
+            check.violation,
+            Some(SafetyViolation::NodePercentageExceeded {
+                affected_nodes: 2,
+                total_nodes: 3,
+            })
         ));
     }
 
@@ -510,6 +593,7 @@ mod tests {
             reason: None,
             include_leader: false,
             override_safety: false,
+            acknowledged: false,
         };
         let check = evaluate_safety(&req, &ctx);
         assert!(check.approved);

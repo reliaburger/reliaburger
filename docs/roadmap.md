@@ -416,7 +416,9 @@ Chaos tests (via Smoker):
 
 Design docs: [chaos-smoker.md](design/chaos-smoker.md), [agent-bun.md](design/agent-bun.md), [security-sesame.md](design/security-sesame.md), [discovery-onion.md](design/discovery-onion.md)
 
-**Milestone:** `relish fault delay redis 200ms` works, process jobs run with full isolation, batch scheduling meets throughput targets. All Phase 8 tests pass, including chaos suite.
+**Milestone:** `relish fault delay redis 200ms --acknowledge` works, process
+jobs run with full isolation, batch scheduling meets throughput targets. All
+Phase 8 tests pass, including chaos suite.
 
 ---
 
@@ -701,7 +703,10 @@ Integration tests:
 ### Implementation
 
 1. **`relish test` command.** Test runner that executes all subsystem integration tests (compiled into binary), parallel execution, filtering, JSON output for CI.
-2. **`relish test --chaos`.** Combines integration tests with Smoker fault injection, confirmation prompt, production safety check.
+2. **`relish test --chaos`.** Five serial recovery scenarios using Smoker
+   fault injection, fresh capability evidence, server-owned safety policy,
+   explicit consent and exact panic-safe fault reversal. Missing destructive
+   prerequisites fail rather than becoming green skips.
 3. **`relish bench`.** Benchmark harness (scheduler throughput, eBPF latency, network throughput, deploy speed, state reconstruction), regression detection via `--compare`.
 4. **`relish wtf`.** Automated cluster health diagnosis with root cause correlation.
 5. **`relish trace`.** End-to-end connectivity debugging through eBPF, firewall, and network layers.

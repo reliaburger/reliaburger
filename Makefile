@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-no-default test-slow test-linux test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-no-default test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -29,7 +29,11 @@ test-slow: ## Run required wall-clock acceptance tests
 	$(NEXTEST) --run-ignored=only -E 'binary(integration)'
 
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)'
+	$(CARGO) build --features ebpf --bin bun
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | binary(node_pressure) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)'
+
+test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
+	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(rootless_published_port_survives_bun_replacement)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(chaos)'
@@ -44,7 +48,7 @@ test-upgrade-cluster: ## Run only the cluster self-upgrade tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade_cluster)'
 
 test-apple: ## Run the manual Apple Container acceptance tests on Apple silicon
-	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(apple_container_grill_creates_instance) | test(adopt_re_tracks_a_running_apple_container)'
+	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(pinned_test_workload_runs_under_apple_container) | test(adopt_re_tracks_a_running_apple_container)'
 
 check: ## Type-check without producing binaries (fast)
 	$(CARGO) check
@@ -67,13 +71,15 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 	$(CARGO) audit
 
 examples: build ## Dry-run every example config with relish
-	@failed=0; total=0; \
+	@failed=0; total=0; output=$$(mktemp); \
+	trap 'rm -f "$$output"' EXIT HUP INT TERM; \
 	for f in $$(find examples -name '*.toml' | sort); do \
 		total=$$((total + 1)); \
-		if $(CARGO) run --quiet --bin relish -- apply "$$f" >/dev/null 2>&1; then \
+		if target/debug/relish apply "$$f" --dry-run >"$$output" 2>&1; then \
 			printf "  ✓ %s\n" "$$f"; \
 		else \
 			printf "  ✗ %s\n" "$$f"; \
+			sed 's/^/    /' "$$output" >&2; \
 			failed=$$((failed + 1)); \
 		fi; \
 	done; \

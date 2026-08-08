@@ -126,6 +126,7 @@ impl Harness {
             None,
             None,
             aggregated_rx,
+            "default".to_string(),
             options.node_name,
             900,
             reliaburger::cluster::ClusterHttp::plaintext(),
@@ -134,6 +135,8 @@ impl Harness {
             256 * 1024 * 1024,
             false,
             reliaburger::bun::capabilities::StaticCapabilities::default(),
+            reliaburger::bun::readiness::ReadinessTracker::new(),
+            None,
         );
         let server_shutdown = shutdown.clone();
         let server_task = tokio::spawn(async move {

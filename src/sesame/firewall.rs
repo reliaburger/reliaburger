@@ -34,6 +34,17 @@ pub struct CgroupNamespaceEntry {
     pub namespace_id: u32,
 }
 
+/// Live kernel values used by `relish trace` to mirror the connect hook's
+/// namespace decision without pretending declared policy is kernel truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveFirewallState {
+    /// Source namespace id from `cgroup_namespace_map`, or `None` when the
+    /// source cgroup would bypass namespace isolation.
+    pub source_namespace_id: Option<u32>,
+    /// Explicit cross-namespace action from `firewall_map`.
+    pub action: Option<u32>,
+}
+
 /// Resolve firewall rules from app configs and running instance state.
 ///
 /// Given the current service map entries and cgroup IDs for each app,
@@ -158,7 +169,7 @@ pub enum FirewallMapError {
     #[error("firewall eBPF maps require Linux with --features ebpf")]
     Unsupported,
 
-    #[cfg(feature = "ebpf")]
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     #[error("firewall map operation failed: {0}")]
     MapError(#[from] aya::maps::MapError),
 
@@ -171,9 +182,9 @@ pub enum FirewallMapError {
 /// `cgroup_namespace_map` (cgroup → namespace, which makes the connect
 /// hook enforce cross-namespace isolation at all); without it they are
 /// absent. The connect hook is already implemented in `ebpf/onion_connect.bpf.c`.
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod maps {
-    use super::{FirewallKey, FirewallMapError, FirewallValue};
+    use super::{FirewallKey, FirewallMapError, FirewallValue, LiveFirewallState};
     use aya::maps::HashMap;
 
     /// Allow a single `(src_cgroup, dst_app)` cross-namespace connection.
@@ -257,9 +268,53 @@ mod maps {
         )?;
         Ok(map.keys().filter_map(|k| k.ok()).collect())
     }
+
+    /// Read the exact namespace and allow values the live connect hook would
+    /// consult for one source/destination pair.
+    pub fn read_firewall_state(
+        bpf: &mut aya::Ebpf,
+        source_cgroup_id: u64,
+        destination_app_id: u32,
+    ) -> Result<LiveFirewallState, FirewallMapError> {
+        let source_namespace_id = {
+            let namespace_map: HashMap<_, u64, u32> = HashMap::try_from(
+                bpf.map_mut("cgroup_namespace_map")
+                    .ok_or(FirewallMapError::MapNotFound {
+                        map_name: "cgroup_namespace_map",
+                    })?,
+            )?;
+            match namespace_map.get(&source_cgroup_id, 0) {
+                Ok(namespace_id) => Some(namespace_id),
+                Err(aya::maps::MapError::KeyNotFound) => None,
+                Err(error) => return Err(error.into()),
+            }
+        };
+
+        let firewall_map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
+            bpf.map_mut("firewall_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "firewall_map",
+                })?,
+        )?;
+        let key = FirewallKey {
+            src_cgroup_id: source_cgroup_id,
+            dst_app_id: destination_app_id,
+            _pad: 0,
+        };
+        let action = match firewall_map.get(&key, 0) {
+            Ok(value) => Some(value.action),
+            Err(aya::maps::MapError::KeyNotFound) => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(LiveFirewallState {
+            source_namespace_id,
+            action,
+        })
+    }
 }
 
-#[cfg(feature = "ebpf")]
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub use maps::*;
 
 #[cfg(test)]

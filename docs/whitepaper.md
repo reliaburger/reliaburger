@@ -138,7 +138,7 @@ The unit of deployment is an **App**, not a Pod/Deployment/Service triple. At it
 
 ### 3.3 Convention Over Configuration
 
-Sensible defaults everywhere. TLS is automatic: when an App declares an ingress block, TLS defaults to `"auto"` without needing to be specified (Let's Encrypt for public services when the cluster has internet access, or the cluster's Ingress CA for air-gapped environments). Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
+Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is a post-v1 feature: `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
 
 ### 3.4 Homogeneous Nodes
 
@@ -518,12 +518,12 @@ This eliminates a large proportion of Kubernetes debugging pain: encapsulation o
 
 ### 9.2 Built-In Ingress (Wrapper)
 
-Wrapper runs on every node by default and handles TLS termination (automatic via Let's Encrypt or the cluster's Ingress CA), host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support.
+Wrapper can run on every node and handles TLS termination, host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support. It is opt-in in `node.toml`. The v1 TLS sources are the cluster's Ingress CA and an operator-supplied certificate/key pair. Automatic ACME/Let's Encrypt provisioning is deferred.
 
 ```toml
 [app.web.ingress]
 host = "myapp.com"
-tls = "acme"        # or "cluster" for air-gapped environments
+tls = "cluster"     # clients must trust the cluster root CA
 ```
 
 There's no IngressClass, no annotations, no separate cert-manager installation. External traffic reaches the cluster via a standard TCP/UDP load balancer (or DNS round-robin) pointing to any set of nodes. Wrapper on each node can route traffic for any app, so you don't need application-aware routing at the load balancer layer.
@@ -765,15 +765,20 @@ Process Apps use `exec` instead of `image`; process Jobs use `exec` or `script` 
 Smoker is Reliaburger's built-in chaos engineering system. Because Onion's eBPF programs already intercept every DNS resolution and `connect()` call, and Bun already manages cgroups for every container, fault injection is a natural extension of existing infrastructure. No new binaries, processes, or sidecars.
 
 ```bash
-relish fault delay redis 200ms          # add 200ms latency
-relish fault drop api 10%               # fail 10% of connections
-relish fault dns redis nxdomain         # DNS failure
-relish fault cpu inference 50%          # CPU stress in cgroup
-relish fault kill web-3                 # kill an instance
-relish fault run chaos/scenario.toml    # scripted multi-step scenario
+relish fault delay redis 200ms --acknowledge       # reserved until TC ships
+relish fault drop api 10% --acknowledge            # fail 10% of connections
+relish fault dns redis nxdomain --acknowledge      # DNS failure
+relish fault cpu inference 50% --acknowledge       # CPU stress in cgroup
+relish fault kill web-3 --acknowledge              # kill an instance
+relish fault run chaos/scenario.toml --acknowledge # scripted multi-step scenario
 ```
 
-Safety rails enforce permission requirements, duration limits (default 10 min), no persistence across restarts, and blast radius protection (quorum, replica, and leader guards).
+Safety rails require an authenticated role, the matching server-owned
+`[testing].allowed_operations` grant and explicit acknowledgement. They also
+enforce duration limits (default 10 min), no persistence across restarts and
+blast-radius protection (quorum, replica and leader guards). Admin doesn't
+override a disabled operation, and Bun attributes audit events to the
+authenticated credential rather than a client-supplied name.
 
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|
@@ -788,9 +793,22 @@ Safety rails enforce permission requirements, duration limits (default 10 min), 
 
 ## 19. Testing & Benchmarks
 
-Reliaburger compiles its test and benchmark suite into the binary. `relish test` runs 39 integration tests across 13 subsystems (scheduling, service discovery, deployments, health checks, secrets, firewall, workload identity, ingress, volumes, process workloads, jobs, image registry, cluster coordination). Tests are independent, idempotent, and safe to run against production clusters.
+Reliaburger compiles its test suite into the binary. `relish test` runs 39
+integration tests across 13 subsystems (scheduling, service discovery,
+deployments, health checks, secrets, firewall, workload identity, ingress,
+volumes, process workloads, jobs, image registry, cluster coordination).
+Every case uses a server-owned workload lease and reports `Pass`, `Fail`,
+`Skipped` or `Unknown`; timeouts and uncertain cleanup never become green.
 
-`relish test --chaos` combines the integration suite with Smoker fault injection to verify recovery from leader failure, node failure, network partitions, and resource exhaustion.
+`relish test --chaos` runs five serial recovery scenarios covering leader
+failure, worker failure with live replicas, minority council partition,
+bounded whole-node pressure, and node death during a rolling deploy. This
+suite is deliberately destructive. It refuses without three nodes, fresh
+primitive evidence, the required server policy, a digest-pinned runc or Apple
+Container workload, and exact operator consent (`--yes` for automation).
+Consent can't override server policy. Each case owns exact fault ids and
+reverses them after failure, timeout or panic; unconfirmed reversal is
+`Unknown`.
 
 `relish bench` measures performance against the design goals (Section 2) and produces a report with regression detection when compared against a baseline.
 
@@ -911,7 +929,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **Binary count** | Many (apiserver, scheduler, controller-manager, etcd, kubelet, kube-proxy) | 1 | 1 | 1 | **1** |
 | **Networking** | Overlay (CNI required) | Overlay (CNI required) | Host or overlay | Host (bridge) | **Per-container namespaces + port mapping (no overlay)** |
 | **Ingress** | Separate install | Bundled (Traefik) | Separate | N/A | **Built-in (Wrapper)** |
-| **TLS certificates** | Separate (cert-manager) | Separate | Separate | N/A | **Built-in (ACME or Ingress CA)** |
+| **TLS certificates** | Separate (cert-manager) | Separate | Separate | N/A | **Built-in Ingress CA or operator-supplied; ACME deferred** |
 | **Metrics** | Separate (Prometheus) | Separate | Separate | N/A | **Built-in (Mayo + app scraping)** |
 | **Alerting** | Separate (Alertmanager) | Separate | Separate | N/A | **Built-in (5 default alerts)** |
 | **Logs** | Separate (Loki/EFK) | Separate | Built-in (alloc logs) | `docker logs` | **Built-in (Ketchup)** |

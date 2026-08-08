@@ -117,6 +117,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Workload lifecycle.
     route(Post, "/v1/apply", Deployer),
     route(Get, "/v1/status", AnyToken),
+    route(Get, "/v1/readiness", AnyToken),
     route(Get, "/v1/jobs", AnyToken),
     route(Get, "/v1/events", AnyToken),
     route(Get, "/v1/ws/events", AnyToken),
@@ -129,6 +130,14 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/exec/{app}/{namespace}", Deployer),
     // Cluster + upgrade.
     route(Get, "/v1/capabilities", AnyToken),
+    route(Get, "/v1/capabilities/cluster", AnyToken),
+    route(Get, "/v1/diagnostics", AnyToken),
+    route(Get, "/v1/diagnostics/apps", AnyToken),
+    route(Post, "/v1/trace", AnyToken),
+    route(Post, "/v1/test/leases", Deployer),
+    route(Get, "/v1/test/leases/{id}", AnyToken),
+    route(Post, "/v1/test/leases/{id}/renew", Deployer),
+    route(Delete, "/v1/test/leases/{id}", Deployer),
     route(Get, "/v1/cluster/nodes", AnyToken),
     route(Get, "/v1/cluster/council", AnyToken),
     route(Post, "/v1/upgrade/apply", Admin),
@@ -140,8 +149,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/upgrade/cluster-rollback", Admin),
     route(Post, "/v1/cluster/elect", Admin),
     // Chaos.
-    route(Post, "/v1/chaos/partition", Deployer),
-    route(Post, "/v1/chaos/heal", Deployer),
+    route(Post, "/v1/chaos/partition", Admin),
+    route(Post, "/v1/chaos/heal", Admin),
     route(Get, "/v1/chaos/status", AnyToken),
     // Snapshots. Reads need any token, mutations a Deployer; both are
     // additionally held to the token's app/namespace scope in the handlers.
@@ -168,6 +177,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/alerts", AnyToken),
     route(Get, "/v1/logs/sql", AnyToken),
     route(Get, "/v1/deploys/active", AnyToken),
+    route(Get, "/v1/deploys/operations", AnyToken),
     route(Get, "/v1/deploys/history/{app}", AnyToken),
     route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
     route(Get, "/v1/placements/{node_id}", AnyToken),

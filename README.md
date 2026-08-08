@@ -94,6 +94,7 @@ systems along the way, aimed at programmers coming from C, Python or Go:
 12. [Squeezing Every Drop](docs/book/12-squeezing-every-drop.md) *(in progress)*
 13. [A Room with a View](docs/book/13-a-room-with-a-view.md)
 14. [Changing the Tyres at Full Speed](docs/book/14-changing-the-tyres.md)
+15. [Ready for Production](docs/book/15-ready-for-production.md) *(in progress)*
 - [Appendix: Rust for C, Python, and Go Programmers](docs/book/16-appendix-rust.md)
 
 ## What's inside
@@ -110,9 +111,46 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 ```sh
 make test                    # run the portable nextest suite
 make audit                   # reject new RustSec dependency findings
+relish test --profile development # run the 39-case live-cluster catalogue
+relish bench --quick --output json # benchmark real DNS and service data paths
+relish wtf                       # diagnose live cluster evidence (0/1/2 exit)
+relish trace web --to redis      # probe DNS and TCP from the web workload
+make examples                # validate and dry-run every example config
 make observability-demo      # start bun, collect metrics, query APIs, show dashboard
 make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
+
+The Phase 15 runner and 39-case catalogue are live. Bun also exposes durable,
+server-owned app/namespace leases, and the runner now uses one for every case.
+Container cases use one digest-pinned BusyBox 1.37.0 OCI index, accepted through
+both runc and Apple Container. Authenticated, TTL-bounded node drain and node
+kill now exercise the real scheduler and cluster transports. Opt-in,
+server-bounded Linux node pressure runs outside Bun in an owned cgroup and
+cleans up on clear, expiry, graceful shutdown, parent death or restart. The
+service partition now has a root-only, source-cgroup eBPF effect proof and is
+separate from the Raft/gossip quorum operation; unsupported delay and bandwidth
+faults refuse instead of claiming success. `relish test --chaos` now runs five
+serial recovery scenarios with fresh destructive-capability evidence, exact
+fault ownership, and panic- and timeout-safe reversal. Missing node-failure,
+node-pressure, policy or three-node prerequisites refuse instead of becoming
+green skips. Workload injection is opt-in through the server-owned
+`inject_workload_faults` operation, needs explicit operator acknowledgement,
+and records structured audit events attributed to the authenticated
+credential. Reversal keeps the matching role and grant but doesn't require a
+destructive acknowledgement. `relish bench` now runs seven public-API suites
+under server-owned leases. Its DNS and throughput measurements originate
+inside a source workload, strict environment fingerprints prevent unlike
+comparisons, and hosted-runner changes stay informational. Started-suite
+timeouts and uncertain cleanup fail instead of becoming green skips.
+`relish wtf` now fans authenticated requests across the expected nodes, keeps
+unavailable and inherently incomplete evidence as `Unknown`, and correlates
+timestamped restarts with recent deploys and error logs. It returns 0 only when
+every selected check is observed and healthy, 1 for critical findings, and 2
+for warnings or unknown evidence. `relish trace` locates a running source
+instance, executes fixed DNS and TCP probes inside that workload, and compares
+the result with the live service map and, on supported Linux nodes, attached
+eBPF backend and firewall maps. Every step says whether its evidence was
+observed, inferred or unavailable; incomplete evidence returns exit status 2.
 
 ## Licence
 
