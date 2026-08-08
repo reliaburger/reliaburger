@@ -1851,3 +1851,223 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   book); the components table and repo layout moved into a new
   "Under the hood" manual chapter; the status wall replaced by a
   progress.md link.
+
+## Phase 16: Post-Phase-15 Audit — Truthfulness & Hardening
+
+> Source audit: [2026-08-08-audit-post-phase15.md](plans/2026-08-08-audit-post-phase15.md)
+> (five parallel doc-vs-code sweeps run against `main` at the PR #151 merge:
+> whitepaper, the seven+eight component design docs, and the manual/READMEs).
+> The Phase-15 code-review bugs it references are staged separately in
+> [2026-08-06-plan-phase15-followup.md](plans/2026-08-06-plan-phase15-followup.md);
+> Phase A of that plan (green CI) is done — its Phases B–H feed Section C below.
+>
+> The audit's one finding that shapes everything: **the code is more honest than
+> the docs.** Reliaburger repeatedly fails *closed* — refusing an unsupported
+> operation — where the whitepaper and design docs claim a working feature. So
+> the through-line of Phase 16 is truthfulness: make the docs describe the system
+> that exists, wire (or explicitly mark as unbuilt) the features documented as
+> shipped, and fix the real defects the sweeps surfaced along the way.
+>
+> Work top-to-bottom by section. Sections A, F and G are cheap and should land
+> first; each `[ ]` box below is roughly one PR and is checked only when it
+> merges with `make ci` green.
+
+### Section A — Cheap correctness now (config + mechanical doc sweeps)
+
+- [ ] **Reject unknown config keys.** Add `#[serde(deny_unknown_fields)]` across
+  every `src/config/` struct (and the sub-configs in `smoker`, `lettuce`,
+  `mayo`, `ketchup`, `wrapper`). Today no struct rejects unknown keys, which is
+  why dozens of hallucinated doc keys "parse" and silently do nothing. Turn that
+  whole class of silent misconfig into a startup error. Expect fallout: fix any
+  real example/config that relied on a now-rejected key; add a round-trip test
+  per section.
+- [ ] **`/api/v1` → `/v1` doc sweep.** The real API/UI routes have no `/api`
+  prefix. Fix every occurrence across the whitepaper, `ui-brioche.md`,
+  `metrics-mayo.md`, `logs-ketchup.md`, `gitops-lettuce.md`, `cli-relish.md`.
+- [ ] **Port `9443` → `9117` doc sweep.** `9443` is gossip; the API/UI listens on
+  `9117`. Fix the whitepaper, `cli-relish.md`, `ui-brioche.md` and any config
+  example that shows `:9443` as an API address.
+- [ ] **eBPF errno sweep.** Connection denials surface as `EPERM`, not
+  `ECONNREFUSED`/`ENETUNREACH` (~12 occurrences, and several docs contradict
+  themselves). Fix `whitepaper.md`, `chaos-smoker.md` §5.1.2/§9/§10.1,
+  `discovery-onion.md`, and the stale code comments in
+  `ebpf/onion_connect.bpf.c` and `src/smoker/types.rs`.
+- [ ] **Dependency-table sweep.** Every design doc's §12 crate table lists crates
+  absent from `Cargo.toml` (git2, sequoia-openpgp, keyring, indicatif, chrono,
+  promql-parser, regex, memmap2, tonic/gRPC, dashmap, arc-swap, sled, sigstore,
+  …). gRPC is claimed in three docs and used nowhere. Replace each table with the
+  crates actually used, or delete it.
+- [ ] **`allow_from` syntax sweep.** Documented three ways
+  (`app.api@production`, `app.api`); code accepts `namespace/app` or bare `app`
+  (`src/sesame/firewall.rs:90`). Pick the real form and fix `discovery-onion.md`,
+  `security-sesame.md`, and any example.
+
+### Section B — New code defects found by the audit
+
+- [ ] **Ingress default-cert SNI resolver.** `src/wrapper/tls.rs:226-255` mints
+  cluster-Ingress-CA leaves for *any* SNI hostname with an unbounded cache keyed
+  by attacker-controlled input. Gate leaf minting on the routing table's known
+  hosts and bound the cache; decide whether an unknown SNI gets a TLS alert
+  (the v1 contract's stated behaviour) or the self-signed default (current).
+  Reconcile `ingress-wrapper.md` §TLS with whichever is chosen.
+- [ ] **Build-namespace scope check is a no-op.** `validate_build_namespace`
+  (`src/config/build.rs:111`) does no namespace comparison, and the push scope
+  check only fires when the destination contains `/`
+  (`src/pickle/build.rs:283`), so any Deployer token can push to any repo.
+  Enforce the caller's namespace against the destination; test cross-namespace
+  push refusal.
+- [ ] **Firewall perimeter port range.** `src/firewall/rules.rs:45` hardcodes
+  `30000-31000` while the network default allocates `10000-60000`
+  (`src/config/node.rs:509`), so the perimeter can drop legitimately-allocated
+  host ports. Derive the perimeter range from the configured network range.
+- [ ] **`auto_rollback` default and wiring.** Default is `true` in code
+  (`src/meat/deploy_types.rs:57`) but `false` in the docs, and the wired rolling
+  path rolls back unconditionally without reading the flag (only the unwired
+  `meat` state machine consults it). Make the wired path honour the flag; align
+  the default; fix `deployments.md`.
+- [ ] **`live_council_voter()` always-false gate.** `is_council` is never set in
+  production, so the `relish council recover` guard (`src/bun/agent.rs:2391`)
+  keys on a field that's always false. Populate `is_council` from the live
+  council membership, or re-derive the guard from Raft state.
+- [ ] **Silent backend drop.** `TooManyBackends` is discarded by every caller via
+  `let _ =` (`src/onion/service_map.rs:134`); documented as a logged warning.
+  Log it (and surface a Mayo alert if one is warranted).
+- [ ] **Stale `upgrade/orchestrator.rs` module comment** describes a
+  leadership-transfer flow the code doesn't use. Rewrite the comment to match
+  the shipped ordering.
+
+### Section C — Carry-forward Phase 15 review defects
+
+> These are the confirmed bugs from the PR #151 deep review, detailed in
+> `2026-08-06-plan-phase15-followup.md`. Land them as that plan's Phases B–H.
+
+- [ ] **Registry regressions that break routable clusters** (follow-up Phase B):
+  build pipeline hardwired to `localhost`; buildah push presents no creds;
+  self-upgrade `fetch_binary` sends no bearer → 401. Loopback-only CI never sees
+  these.
+- [ ] **Cluster lease-cleanup snapshot race** (`src/testkit/lease.rs:610`) — a
+  resource attached between the state snapshot and `TestLeaseBeginCleanup` leaks
+  forever and `FinishCleanup` destroys the ownership record.
+- [ ] **`cluster_apply` treats Raft `Refused` as committed**
+  (`src/bun/api.rs:2344`).
+- [ ] **Clear-all fault authorisation gaps** — empty `service=` matches every
+  node fault; blanket clear reverses `NodePressure`; both under the Deployer
+  grant instead of Admin.
+- [ ] **NodePressure TTL-expiry wedge** (`src/bun/agent.rs:3958`) and
+  **node-kill quorum TOCTOU** (`src/bun/api.rs:3968`).
+- [ ] **`relish wtf` can never exit 0** (two collectors hard-wired `Degraded`)
+  and **benchmark probes ignore exec exit status** (broken data plane → green
+  numbers).
+
+### Section D — Honesty rewrites: docs describing unbuilt features as shipped
+
+> Each item: either add a clear "planned / not-yet-wired" marker in the doc, or
+> wire the feature (Section E overlaps where wiring is the better call). No item
+> should keep presenting an absent capability in the present tense.
+
+- [ ] **Registry push durability** (whitepaper §12/§Q7, `registry-pickle.md` §1)
+  — the highest-impact falsehood. Push is async (`oci-replication: pending`),
+  replication is a 60s leader heal loop, and `redundancy = 2` counts the pusher
+  (so "N=2 peers" is 1 peer). Remove the "survives any single node failure"
+  guarantee; correct the model and the `push_sync`/pull-through-credentials
+  claims.
+- [ ] **Worker-node trust model** (`security-sesame.md` §3.2/§8.2) — "workers
+  never hold CA/age/OIDC keys" is false; every clustered node loads the master
+  key and unwraps age + Workload-CA keys locally. Rewrite the threat model (or
+  open a real key-split as future work).
+- [ ] **CLI command tables** (whitepaper §16, `cli-relish.md` §2–§9) — ~two dozen
+  commands are documented that don't exist or have a different shape
+  (`scale`, `events`, `plan`, `firewall`, `identity`, `ca *`, `pickle gc`,
+  `completions`, `login`, `volume *` [it's `snapshot`], `token rotate`,
+  `exec --debug`, `import --kubeconfig`, `deploy <app> <image>`, drift-`diff`,
+  `top` CPU/memory, `status`/`lint` exit codes). Reconcile to the real clap
+  surface; also fix the config-file/env/keychain story (no config file, env is
+  `RELIABURGER_*`, no keyring).
+- [ ] **metrics-mayo + logs-ketchup wholesale** — implementation is Parquet +
+  DataFusion SQL, not the documented TSDB/binary-log. Rewrite storage, query,
+  retention, scraping, metric names, alert-expression and config sections; and
+  fix the behaviour gaps the sweep confirmed (stderr never distinguished from
+  stdout; `--grep` is substring not regex; log-follow is local-node only;
+  `--since` rejects RFC3339).
+- [ ] **gossip-mustard topology** — ports 9443/44/45 not 7946/47; join is a UDP
+  ping with no TCP full-state exchange; no LEAVING/drain state; reporting tree is
+  a flat star to the leader, not two-level; council steady-state is 7 not 5;
+  resource summaries are never gossiped so council eligibility filters never
+  reject anyone. Rewrite §3–§6 to the running system.
+- [ ] **Security controls documented as shipped but absent** — audit-log scope
+  (fault-only, in-memory, no source IP), TPM sealing/attestation, `relish ca`
+  rotation, token expiry/rotation, per-namespace age keys + per-app JWT
+  audiences (the JWT node claim is literally `"local"`). Mark each planned or
+  wire it (Section E).
+- [ ] **Process-workload isolation** (whitepaper §17, `agent-bun.md` §8) — no
+  namespaces/seccomp/`burger` user; only an honest refusal of mount isolation.
+  Rewrite the isolation story to what's enforced (binary allowlist + refusal).
+- [ ] **Franchise** (whitepaper §21) — entirely unimplemented and actively
+  refused. Mark the section explicitly as future.
+- [ ] **Stale "deferred" markers that are themselves wrong** — ingress WebSocket
+  (`ingress-wrapper.md` §5.6, actually shipped + tested), `secret rotate`
+  (`security-sesame.md` §5.5, shipped), onion IPv6/sendmsg hooks
+  (`discovery-onion.md` §13, shipped). Flip these to shipped.
+
+### Section E — Wire it, or mark it: library-only features
+
+> Each of these exists as tested library code with no production caller. Decide
+> per item: wire it to a caller, or delete the dead code and mark the feature
+> planned. Don't leave it looking done.
+
+- [ ] **Raft log encryption** — `src/sesame/raft_encryption.rs` (AES-256-GCM,
+  tested) has zero call sites; `durable_log.rs` writes plaintext. This is the
+  documented at-rest mitigation. Wire it into the durable log or mark §11.4
+  planned.
+- [ ] **cgroup resource requests** — `cpu.weight`/`memory.high` are computed
+  (`src/grill/cgroup.rs`) but never written to the OCI spec, so requests don't
+  shape enforcement. Wire them or document limits-only.
+- [ ] **Cron / scheduled jobs** — `schedule` is parsed, read by no scheduler
+  (`src/bun/api.rs:2364`), and a testkit case depends on it. Implement cron
+  firing or mark scheduled jobs planned and skip/adjust the case.
+- [ ] **Blue-green deploy** — `src/meat/blue_green.rs` + `orchestrator.rs` have no
+  production caller; the wired agent path never branches on `strategy`. Wire the
+  strategy dispatch or mark blue-green planned and refuse the config.
+- [ ] **`run_before` dependency ordering** — parsed and lint-checked, consumed
+  nowhere. Enforce pre-deploy job gating or mark it planned.
+- [ ] **Prometheus scraping + metrics fan-out + rollup retention + ingress
+  metrics** — `src/mayo/scrape.rs`, `query_fanout.rs`, `RollupStore::prune`, and
+  `ingress_requests_total` are all unwired/never-emitted. Wire the ones worth
+  wiring; mark the rest planned.
+- [ ] **GitOps coordinator failover + sync history + Brioche GitOps view** —
+  library-only or never written. Wire or mark planned.
+- [ ] **Ingress health probes / retry / `X-Real-IP`/`X-Request-ID` / ALPN-HTTP2 /
+  drain-termination protocol** — all absent. Prioritise the drain-termination
+  protocol (expired drains currently let connections run against a
+  about-to-be-killed container); wire or mark the rest.
+
+### Section F — User-facing doc fixes (manual + READMEs)
+
+> Copy-paste correctness matters most here — a user runs these verbatim.
+
+- [ ] **Fix broken manual snippets:** `join-token create` needs the required
+  `--node-id` (manual 02); `dev create` is rootful/sudo not "rootless runc"
+  (docs/README:426 and the stale `src/relish/dev.rs` module comment);
+  `relish top` prints no CPU/memory (docs/README:396, manual 01/04);
+  `apply --dry-run` sample output is a format that no longer exists
+  (docs/README:543).
+- [ ] **Add a diagnostics chapter** covering `relish wtf`, `relish trace`,
+  `relish bench` (absent from all seven manual chapters and the docs/README
+  command table); extend the command table with those plus the ~15 other real
+  commands it omits (`token *`, `logs-export`, `logs-search`, `compile`, `diff`,
+  `fmt`, `import`, `export`, `council recover`, `secret rotate`, `dev test|disk|clean`,
+  `fault cpu|memory|disk-io|resume`).
+- [ ] **Small consistency fixes:** top-level README "Twelve subsystems" → 13
+  (Lettuce omitted); "six starter chapters" → seven; `init` described as
+  "scaffold a project" → it generates cluster PKI/identity/config.
+
+### Section G — Time-boxed
+
+- [ ] **Advisory-exception review before 18 August 2026.** The exceptions in
+  `.cargo/audit.toml` (thrift, lru, anyhow, rkyv, plus the bincode/rustls-pemfile/
+  paste/proc-macro-error maintenance notices) fail closed after that date —
+  `make audit` starts failing on the 18th. Re-review each, extend or fix, and
+  bump the expiry. (Also follow-up plan G4.)
+
+- [ ] **Close the Phase 16 gate** — rerun the doc-vs-code sweep after Sections
+  A–F land and confirm no present-tense claim describes an unbuilt feature.
