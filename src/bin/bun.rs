@@ -413,6 +413,7 @@ fn refuse_open_non_loopback_bind(listen: &str) -> anyhow::Result<()> {
 /// yet cluster-signed.
 async fn build_ingress_cert_resolver(
     council: &std::sync::Arc<reliaburger::council::CouncilNode>,
+    routing_table: std::sync::Arc<tokio::sync::RwLock<reliaburger::wrapper::routing::RoutingTable>>,
 ) -> Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> {
     use reliaburger::sesame::types::CaRole;
 
@@ -436,6 +437,7 @@ async fn build_ingress_cert_resolver(
         keypair,
         params,
         lifetime,
+        routing_table,
         vec![default_cert],
         default_key,
     ) {
@@ -1198,7 +1200,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // wrapping IKM to unwrap the Ingress CA key). A disk cert still wins.
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
-                Some(council) => build_ingress_cert_resolver(council).await,
+                Some(council) => build_ingress_cert_resolver(council, routing_table.clone()).await,
                 None => None,
             };
         ingress_cluster_tls_ready = ingress_resolver.is_some();

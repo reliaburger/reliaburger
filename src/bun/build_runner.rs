@@ -1058,6 +1058,29 @@ pub async fn build_submit_handler(
         Err(resp) => return resp,
     };
 
+    // Bind the push to the caller's namespace scope (AUTH1). The *destination's*
+    // namespace decides who may push there — never a self-declared build field —
+    // so a Deployer token scoped to namespace `a` cannot push an image into
+    // namespace `b`'s repository. An unscoped token still pushes anywhere. This
+    // runs before the council existence check so the scope gate applies in both
+    // single-node and clustered mode.
+    match crate::pickle::build::destination_scope(&request.spec) {
+        Ok((namespace, image)) => {
+            if let Err(resp) =
+                crate::sesame::auth::authorize_scoped(auth.as_deref(), &image, &namespace)
+            {
+                return resp;
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
     // A build's `pickle://ns/name` destination must target an existing
     // namespace (12b.2 T6). Desired-state namespaces are the source of
     // truth; `default` is always available. Without a council this node

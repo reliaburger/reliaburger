@@ -1920,18 +1920,25 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 
 ### Section B — New code defects found by the audit
 
-- [ ] **Ingress default-cert SNI resolver.** `src/wrapper/tls.rs:226-255` mints
-  cluster-Ingress-CA leaves for *any* SNI hostname with an unbounded cache keyed
-  by attacker-controlled input. Gate leaf minting on the routing table's known
-  hosts and bound the cache; decide whether an unknown SNI gets a TLS alert
-  (the v1 contract's stated behaviour) or the self-signed default (current).
-  Reconcile `ingress-wrapper.md` §TLS with whichever is chosen.
-- [ ] **Build-namespace scope check is a no-op.** `validate_build_namespace`
-  (`src/config/build.rs:111`) does no namespace comparison, and the push scope
-  check only fires when the destination contains `/`
-  (`src/pickle/build.rs:283`), so any Deployer token can push to any repo.
-  Enforce the caller's namespace against the destination; test cross-namespace
-  push refusal.
+- [x] **Ingress default-cert SNI resolver** — the resolver now mints/caches a
+  cluster-Ingress-CA leaf only for a hostname that currently has an ingress
+  route (`RoutingTable::contains_host`, read via a non-blocking `try_read` on
+  the shared routing table), and the cache is capped (`MAX_SNI_CACHE`). An
+  unknown SNI — or no SNI, or a routing table momentarily locked for a rebuild
+  — gets the self-signed default, which a hostname-validating client rejects.
+  This closes both the cert-minting oracle and the unbounded-cache memory DoS.
+  Chose the self-signed-default fallback (fail-safe, least behaviour change)
+  over a hard TLS alert; reconciled `ingress-wrapper.md` §TLS. New tests prove
+  an unconfigured SNI never mints or caches, and a configured host still gets a
+  minted cluster cert.
+- [x] **Build-namespace scope check is a no-op** — `build_submit_handler` now
+  binds every image push to the caller's namespace scope via `authorize_scoped`,
+  using the *destination's* namespace (`destination_scope`, bare names → the
+  `default` namespace) rather than a self-declared build field. A Deployer token
+  scoped to namespace `a` can no longer push into namespace `b`'s repository or
+  to a bare-named repo; an unscoped token is unaffected. Runs in both single-node
+  and clustered mode. Tests cover cross-namespace refusal, the bare-name bypass,
+  and the unscoped pass-through.
 - [ ] **Firewall perimeter port range.** `src/firewall/rules.rs:45` hardcodes
   `30000-31000` while the network default allocates `10000-60000`
   (`src/config/node.rs:509`), so the perimeter can drop legitimately-allocated

@@ -177,22 +177,30 @@ fn certified_key(
     )))
 }
 
+/// Largest number of per-SNI certificates the resolver caches. The host
+/// allowlist already bounds this to the number of configured ingress routes;
+/// the cap is defence in depth against a pathologically large route set.
+const MAX_SNI_CACHE: usize = 1024;
+
 /// Per-SNI ingress certificate resolver backed by the cluster Ingress CA (M8).
 ///
-/// On each TLS handshake it looks at the client's SNI hostname and returns a
-/// certificate for it, issued from the Ingress CA and cached so a repeat
-/// handshake doesn't re-sign. A handshake with no SNI (or an issuance failure)
-/// falls back to the self-signed default, preserving the previous behaviour
-/// rather than dropping the connection.
+/// On each TLS handshake it looks at the client's SNI hostname. A cluster-CA
+/// certificate is minted (and cached) **only for a host that currently has an
+/// ingress route**; every other SNI — unknown host, no SNI, or a routing table
+/// momentarily locked for a rebuild — is served the self-signed default. That
+/// allowlist is the security boundary: without it, an attacker's arbitrary SNI
+/// would drive unbounded CA signing and grow the cache without limit.
 ///
 /// `rustls`'s `resolve` is a synchronous trait method called on the handshake
-/// path, so the cache uses `std::sync::Mutex` (not the tokio one): the lock is
-/// never held across an `.await`.
+/// path, so the cache uses `std::sync::Mutex` (not the tokio one) and the
+/// routing table is read with `try_read()`: neither lock is held across an
+/// `.await`, and a contended rebuild simply falls back to the default cert.
 pub struct IngressCertResolver {
     ca_keypair: rcgen::KeyPair,
     ca_params: rcgen::CertificateParams,
     lifetime: std::time::Duration,
     default_key: Arc<rustls::sign::CertifiedKey>,
+    routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
     cache: std::sync::Mutex<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
 }
 
@@ -204,12 +212,15 @@ impl std::fmt::Debug for IngressCertResolver {
 }
 
 impl IngressCertResolver {
-    /// Build a resolver from the Ingress CA material and a self-signed
-    /// fallback cert/key (used when a handshake carries no SNI).
+    /// Build a resolver from the Ingress CA material, the live ingress routing
+    /// table (the host allowlist), and a self-signed fallback cert/key (served
+    /// for any SNI that isn't a configured route, and when a handshake carries
+    /// no SNI).
     pub fn new(
         ca_keypair: rcgen::KeyPair,
         ca_params: rcgen::CertificateParams,
         lifetime: std::time::Duration,
+        routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
         default_cert: Vec<CertificateDer<'static>>,
         default_key: PrivateKeyDer<'static>,
     ) -> Result<Self, TlsError> {
@@ -218,6 +229,7 @@ impl IngressCertResolver {
             ca_params,
             lifetime,
             default_key: certified_key(default_cert, default_key)?,
+            routes,
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -233,10 +245,36 @@ impl IngressCertResolver {
         let (chain, key) =
             issue_ingress_cert(&hosts, self.lifetime, &self.ca_keypair, &self.ca_params).ok()?;
         let certified = certified_key(chain, key).ok()?;
-        if let Ok(mut cache) = self.cache.lock() {
+        if let Ok(mut cache) = self.cache.lock()
+            && (cache.len() < MAX_SNI_CACHE || cache.contains_key(hostname))
+        {
             cache.insert(hostname.to_string(), Arc::clone(&certified));
         }
         Some(certified)
+    }
+
+    /// Whether `hostname` currently has an ingress route, read without blocking
+    /// the synchronous handshake path. A rebuild write briefly makes this
+    /// `false`; that only means the default cert is served for one handshake.
+    fn is_configured_host(&self, hostname: &str) -> bool {
+        self.routes
+            .try_read()
+            .map(|table| table.contains_host(hostname))
+            .unwrap_or(false)
+    }
+
+    /// The certificate to serve for a handshake's SNI (`None` = no SNI). A
+    /// cluster cert is minted/served only for a configured ingress host; every
+    /// other case gets the self-signed default. Split out from
+    /// [`ResolvesServerCert::resolve`] so the decision is unit-testable without
+    /// fabricating a `ClientHello`.
+    fn certificate_for(&self, server_name: Option<&str>) -> Arc<rustls::sign::CertifiedKey> {
+        match server_name {
+            Some(name) if self.is_configured_host(name) => self
+                .key_for(name)
+                .unwrap_or_else(|| Arc::clone(&self.default_key)),
+            _ => Arc::clone(&self.default_key),
+        }
     }
 }
 
@@ -245,13 +283,11 @@ impl rustls::server::ResolvesServerCert for IngressCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        match client_hello.server_name() {
-            Some(name) => Some(
-                self.key_for(name)
-                    .unwrap_or_else(|| Arc::clone(&self.default_key)),
-            ),
-            None => Some(Arc::clone(&self.default_key)),
-        }
+        // Mint (or serve a cached) cluster cert only for a configured ingress
+        // host. An unknown SNI never triggers CA signing or a cache insert — it
+        // gets the self-signed default, whose name mismatch the client rejects,
+        // exactly as an unconfigured host should be.
+        Some(self.certificate_for(client_hello.server_name()))
     }
 }
 
@@ -337,6 +373,7 @@ mod tests {
             hierarchy.ingress.signing_keypair,
             hierarchy.ingress.certificate_params,
             std::time::Duration::from_secs(90 * 24 * 3600),
+            empty_routes(),
             vec![default_cert],
             default_key,
         )
@@ -349,5 +386,108 @@ mod tests {
         // A different host issues a distinct cert.
         let other = resolver.key_for("other.example.com").unwrap();
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    /// An empty routing table — every SNI is an unconfigured host.
+    fn empty_routes() -> Arc<tokio::sync::RwLock<super::super::routing::RoutingTable>> {
+        Arc::new(tokio::sync::RwLock::new(
+            super::super::routing::RoutingTable::new(),
+        ))
+    }
+
+    fn resolver_with(
+        routes: Arc<tokio::sync::RwLock<super::super::routing::RoutingTable>>,
+    ) -> IngressCertResolver {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("test-cluster", b"test-wrap-ikm").unwrap();
+        let (default_cert, default_key) = generate_self_signed_cert().unwrap();
+        IngressCertResolver::new(
+            hierarchy.ingress.signing_keypair,
+            hierarchy.ingress.certificate_params,
+            std::time::Duration::from_secs(3600),
+            routes,
+            vec![default_cert],
+            default_key,
+        )
+        .unwrap()
+    }
+
+    /// The security fix: an SNI for a host with no ingress route is served the
+    /// self-signed default — it never triggers CA signing and never touches the
+    /// cache, so an attacker's arbitrary SNI can neither mint certs nor grow
+    /// memory.
+    #[test]
+    fn unconfigured_sni_gets_the_default_and_never_caches() {
+        let resolver = resolver_with(empty_routes());
+
+        let served = resolver.certificate_for(Some("attacker.example.com"));
+        assert!(
+            Arc::ptr_eq(&served, &resolver.default_key),
+            "an unconfigured host must get the self-signed default"
+        );
+        // No SNI also gets the default.
+        assert!(Arc::ptr_eq(
+            &resolver.certificate_for(None),
+            &resolver.default_key
+        ));
+        // Crucially, nothing was minted or cached.
+        assert!(resolver.cache.lock().unwrap().is_empty());
+    }
+
+    /// A configured ingress host still gets a real cluster-CA cert, cached.
+    #[tokio::test]
+    async fn configured_sni_mints_a_cluster_cert() {
+        use crate::config::app::IngressSpec;
+        use crate::onion::service_id::ServiceId;
+        use crate::onion::service_map::ServiceMap;
+        use crate::onion::types::BackendInstance;
+        use std::collections::HashMap;
+        use std::net::Ipv4Addr;
+
+        let mut map = ServiceMap::new();
+        map.register_app("web", "default", 8080, None).unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "web"),
+            BackendInstance {
+                instance_id: "web-0".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 2, 2),
+                host_port: 30001,
+                healthy: true,
+            },
+        )
+        .unwrap();
+        let mut configs = HashMap::new();
+        configs.insert(
+            ("default".to_string(), "web".to_string()),
+            IngressSpec {
+                host: "myapp.example.com".to_string(),
+                path: None,
+                tls: Some("cluster".to_string()),
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        );
+        let mut table = super::super::routing::RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        let routes = Arc::new(tokio::sync::RwLock::new(table));
+
+        let resolver = resolver_with(routes);
+        let served = resolver.certificate_for(Some("myapp.example.com"));
+        // A configured host gets a minted cert, not the default...
+        assert!(!Arc::ptr_eq(&served, &resolver.default_key));
+        // ...and it is cached (case-insensitively matched, cached by SNI).
+        assert!(
+            resolver
+                .cache
+                .lock()
+                .unwrap()
+                .contains_key("myapp.example.com")
+        );
+        // An unconfigured host on the same resolver still gets the default.
+        assert!(Arc::ptr_eq(
+            &resolver.certificate_for(Some("evil.example.com")),
+            &resolver.default_key
+        ));
     }
 }

@@ -279,6 +279,22 @@ pub fn context_upload_url_at(scheme: &str, address: &str, digest: &str) -> Strin
     format!("{scheme}://{address}/v2/_buildcontext/blobs/uploads/?digest={digest}")
 }
 
+/// The namespace and image name a `pickle://` destination targets.
+///
+/// A bare `pickle://name:tag` targets the `default` namespace; a
+/// `pickle://ns/name:tag` targets namespace `ns`. The namespace is taken from
+/// the destination itself — never from a self-declared build field — so it can
+/// be checked against the authenticated caller's token scope before the build
+/// runs. Used by the build submit handler to bind an image push to its owner.
+pub fn destination_scope(spec: &BuildSpec) -> Result<(String, String), BuildError> {
+    let dest = parse_pickle_destination(&spec.destination)?;
+    let (namespace, image) = match dest.name.split_once('/') {
+        Some((ns, image)) => (ns.to_string(), image.to_string()),
+        None => ("default".to_string(), dest.name.clone()),
+    };
+    Ok((namespace, image))
+}
+
 /// Check that a build's namespace is allowed to push to the destination.
 pub fn check_namespace_scope(
     spec: &BuildSpec,
@@ -756,6 +772,70 @@ mod tests {
             check_namespace_scope(&spec, &namespaces),
             Err(BuildError::NamespaceMismatch { .. })
         ));
+    }
+
+    // --- destination scope / push authorisation (Phase 16 B) ---
+
+    #[test]
+    fn destination_scope_uses_default_for_bare_names() {
+        let spec = spec_with_destination("pickle://victim-app:v1");
+        assert_eq!(
+            destination_scope(&spec).unwrap(),
+            ("default".to_string(), "victim-app".to_string())
+        );
+    }
+
+    #[test]
+    fn destination_scope_reads_namespace_prefix() {
+        let spec = spec_with_destination("pickle://team-b/api:v1");
+        assert_eq!(
+            destination_scope(&spec).unwrap(),
+            ("team-b".to_string(), "api".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_token_cannot_push_across_namespaces_or_to_bare_names() {
+        use crate::sesame::auth::{AuthContext, authorize_scoped};
+        // A Deployer scoped to `team-a` only. `spec_with_destination` leaves the
+        // build's own `namespace` field None, so this proves the gate reads the
+        // destination, not a self-declared field.
+        let ctx = AuthContext {
+            token_name: "ci".into(),
+            principal_id: "ci-1".into(),
+            role: crate::sesame::types::ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: Some(vec!["team-a".into()]),
+        };
+
+        // Pushing into another namespace's repository is refused.
+        let (ns, image) =
+            destination_scope(&spec_with_destination("pickle://team-b/api:v1")).unwrap();
+        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_err());
+
+        // A bare name resolves to `default` — the old bypass — and is refused too.
+        let (ns, image) = destination_scope(&spec_with_destination("pickle://victim:v1")).unwrap();
+        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_err());
+
+        // The caller's own namespace is allowed.
+        let (ns, image) =
+            destination_scope(&spec_with_destination("pickle://team-a/api:v1")).unwrap();
+        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_ok());
+    }
+
+    #[test]
+    fn unscoped_token_pushes_anywhere() {
+        use crate::sesame::auth::{AuthContext, authorize_scoped};
+        let ctx = AuthContext {
+            token_name: "admin".into(),
+            principal_id: "admin-1".into(),
+            role: crate::sesame::types::ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        let (ns, image) =
+            destination_scope(&spec_with_destination("pickle://anything/api:v1")).unwrap();
+        assert!(authorize_scoped(Some(&ctx), &image, &ns).is_ok());
     }
 
     // --- multi-platform ---
