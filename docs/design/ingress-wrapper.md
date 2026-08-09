@@ -133,9 +133,19 @@ the route rather than guessing or falling back to plaintext.
 ```
 1. Bun reconstructs the Ingress CA signing material from council state
 2. Wrapper installs an SNI certificate resolver
-3. The first handshake for a hostname generates and signs a leaf certificate
+3. The first handshake for a hostname that has a configured ingress route
+   generates and signs a leaf certificate
 4. Wrapper caches that certified key in memory for later handshakes
 ```
+
+The resolver mints and caches a cluster leaf **only for a hostname that
+currently has an ingress route**. That host allowlist is a security boundary:
+without it, an attacker-chosen SNI would drive unbounded Ingress-CA signing and
+grow the in-memory cache without limit. An SNI for any other host — and a
+handshake with no SNI at all — is served the self-signed development
+certificate instead; a client that validates the hostname rejects it, so an
+unconfigured host can never obtain a trusted cluster certificate. The cache is
+additionally capped as defence in depth.
 
 This currently requires the ingress node to have council state and the
 wrapping key material. If it doesn't, the listener uses its self-signed
@@ -430,8 +440,9 @@ Every inbound HTTPS request follows this path:
 1.  TCP accept on port 443
 2.  TLS handshake (rustls)
     - SNI hostname extracted
-    - Certificate selected from TlsConfig map by hostname
-    - If no certificate matches SNI, connection is terminated with TLS alert
+    - A cluster leaf is minted/served only for a configured ingress host;
+      an unknown SNI (or none) is served the self-signed default, which a
+      hostname-validating client rejects
 3.  HTTP/1.1 or HTTP/2 request parsed (via hyper)
 4.  Host header extracted (falls back to SNI hostname)
 5.  Routing table lookup:
@@ -828,7 +839,7 @@ Routing table rebuilds (triggered by service map changes) are O(n) where n is th
 | TLS 1.2 handshake completes when permitted | Integration test: connect with TLS 1.2 client. Verify success when `min_tls_version = "1.2"`, failure when `min_tls_version = "1.3"`. |
 | TLS 1.0/1.1 rejected | Integration test: connect with TLS 1.0/1.1 client. Verify handshake failure. |
 | SNI-based certificate selection | Integration test: configure two routes with different hostnames and certificates. Connect with different SNI values. Verify correct certificate is served. |
-| Missing SNI handling | Connect without SNI. Verify connection is rejected (no default certificate). |
+| Unconfigured / missing SNI | Connect with an SNI that has no route, and with no SNI. Verify the self-signed default is served (not a minted cluster leaf) and nothing is cached, so an arbitrary SNI can't drive CA signing. |
 | Certificate hot-swap | Load a certificate, verify it is served. Replace with a new certificate. Verify new certificate is served without connection drops. |
 | ACME HTTP-01 challenge response *(deferred)* | Acceptance test must prove the challenge is served only while a valid lease exists and ordinary TLS routes don't gain a permanent plaintext bypass. |
 | Cluster CA certificate signing | Integration test: submit a CSR to a mock council member. Verify the returned certificate is valid and signed by the Ingress CA. |

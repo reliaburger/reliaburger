@@ -222,6 +222,17 @@ impl RoutingTable {
         self.routes.len()
     }
 
+    /// Whether `host` currently has any ingress route.
+    ///
+    /// Host is normalised the same way [`lookup`](Self::lookup) normalises it,
+    /// so an SNI value matches regardless of case or trailing port. The TLS
+    /// resolver uses this to mint a per-SNI certificate only for a configured
+    /// ingress host — an arbitrary SNI can then neither drive CA signing nor
+    /// grow the certificate cache.
+    pub fn contains_host(&self, host: &str) -> bool {
+        self.routes.contains_key(&normalise_host(host))
+    }
+
     /// Total number of routes across all hosts.
     pub fn route_count(&self) -> usize {
         self.routes.values().map(|r| r.len()).sum()
@@ -432,6 +443,21 @@ mod tests {
         table.rebuild(&map, &configs).unwrap();
 
         assert!(table.lookup("other.com", "/").is_none());
+    }
+
+    #[test]
+    fn contains_host_matches_configured_routes_only() {
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        // Configured host — case-insensitive and port-insensitive, like lookup.
+        assert!(table.contains_host("myapp.com"));
+        assert!(table.contains_host("MYAPP.COM"));
+        assert!(table.contains_host("myapp.com:8443"));
+        // Anything else is not a route.
+        assert!(!table.contains_host("other.com"));
+        assert!(!RoutingTable::new().contains_host("myapp.com"));
     }
 
     #[test]
