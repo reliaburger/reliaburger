@@ -35,7 +35,7 @@ pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 /// Parsed from a TOML file containing `[app.*]`, `[job.*]`,
 /// `[namespace.*]`, and `[permission.*]` tables.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// App definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -81,6 +81,42 @@ mod tests {
         assert!(config.job.is_empty());
         assert!(config.namespace.is_empty());
         assert!(config.permission.is_empty());
+    }
+
+    /// Phase 16: a mistyped field inside an app is a loud error, not a silent
+    /// no-op. Before `deny_unknown_fields`, `replcias` (typo) parsed and the
+    /// app quietly kept the default replica count.
+    #[test]
+    fn parse_config_rejects_unknown_app_field() {
+        let error = Config::parse(
+            r#"
+            [app.web]
+            image = "nginx"
+            replcias = 3
+        "#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("replcias"),
+            "error should name the unknown field, got: {error}"
+        );
+    }
+
+    /// Phase 16: a mistyped top-level table (here `permision`) no longer
+    /// vanishes — the whole class of silent misconfiguration now fails parsing.
+    #[test]
+    fn parse_config_rejects_unknown_top_level_table() {
+        let error = Config::parse(
+            r#"
+            [permision.deployer]
+            actions = ["deploy"]
+        "#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("permision"),
+            "error should name the unknown table, got: {error}"
+        );
     }
 
     #[test]

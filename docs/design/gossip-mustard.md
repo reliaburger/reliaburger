@@ -232,19 +232,19 @@ enum GossipPayload {
         /// Target node being probed.
         target: NodeId,
         /// Piggybacked membership updates (bounded to MAX_PIGGYBACK_UPDATES).
-        updates: ArrayVec<MembershipUpdate, MAX_PIGGYBACK_UPDATES>,
+        updates: Vec<MembershipUpdate>,
     },
     PingReq {
         /// Node that the sender wants the receiver to probe on its behalf.
         target: NodeId,
         /// Original requester, so the indirect probe result can be routed back.
         requester: NodeId,
-        updates: ArrayVec<MembershipUpdate, MAX_PIGGYBACK_UPDATES>,
+        updates: Vec<MembershipUpdate>,
     },
     Ack {
         /// Responding to a PING or PING-REQ for this target.
         target: NodeId,
-        updates: ArrayVec<MembershipUpdate, MAX_PIGGYBACK_UPDATES>,
+        updates: Vec<MembershipUpdate>,
     },
 }
 
@@ -1307,7 +1307,6 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 | [`serde`](https://crates.io/crates/serde) | Serialisation framework. All data structures derive Serialize/Deserialize. |
 | [`ring`](https://crates.io/crates/ring) | HMAC-SHA256 for gossip message authentication. SHA-256 for spec hashing. |
 | [`age`](https://crates.io/crates/age) | Encryption for the recovery candidate list and Raft log at-rest encryption. |
-| [`arrayvec`](https://crates.io/crates/arrayvec) | Fixed-capacity vectors for piggybacked updates (no heap allocation in the hot path). |
 
 ---
 

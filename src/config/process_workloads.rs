@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Process workloads run host binaries or inline scripts as first-class
 /// workloads with optional isolation (mount namespace, cgroup limits).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProcessWorkloadsConfig {
     /// Binaries allowed to run as process workloads.
     ///

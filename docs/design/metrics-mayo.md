@@ -30,7 +30,7 @@ The result is that operators get Prometheus + Thanos + Alertmanager functionalit
 |-----------|-------------|
 | **Bun** (node agent) | Host process. Bun's container runtime (Grill) provides cgroup stats for auto-collected metrics. Bun's Prometheus scraper feeds application metrics into the local Mayo TSDB. Bun drives Mayo's lifecycle (init, retention, shutdown). |
 | **Council** (Raft consensus group) | Council members act as the hierarchical aggregation tier. Each council member receives pre-aggregated rollups from its assigned subset of cluster nodes. Cluster-wide queries fan out to council aggregators (3-7 nodes) rather than every node. |
-| **Brioche** (web UI) | Queries Mayo via internal gRPC for dashboard rendering. Brioche displays cluster overview, app detail, node detail, and ingress dashboards -- all sourced from Mayo data. Alert state is also surfaced through Brioche. |
+| **Brioche** (web UI) | Queries Mayo over the internal HTTP API for dashboard rendering. Brioche displays cluster overview, app detail, node detail, and ingress dashboards -- all sourced from Mayo data. Alert state is also surfaced through Brioche. |
 | **Relish** (CLI) | `relish metrics`, `relish alerts`, and `relish top` query Mayo. The CLI can target a single node's TSDB or fan out through the leader for cross-node queries. |
 | **Mustard** (gossip) | Provides cluster membership and node identity, used by Mayo to determine which nodes are alive for query fan-out and which council member a node reports rollups to. |
 | **Meat** (scheduler) | Provides the app-to-node placement map so the leader knows which nodes to fan out to for single-app queries. |
@@ -127,7 +127,7 @@ Single-app query path:
 
 ### 3.4 Prometheus-Compatible Remote-Read API
 
-Each node exposes a Prometheus-compatible remote-read API endpoint at `/api/v1/read`. External Prometheus instances can configure Mayo as a `remote_read` target to federate data out for teams that prefer their existing Prometheus + Grafana stack. The API supports:
+Each node exposes a Prometheus-compatible remote-read API endpoint at `/v1/read`. External Prometheus instances can configure Mayo as a `remote_read` target to federate data out for teams that prefer their existing Prometheus + Grafana stack. The API supports:
 
 - The standard Prometheus remote-read protobuf protocol.
 - Label matchers (`=`, `!=`, `=~`, `!~`).
@@ -546,7 +546,7 @@ Every 60 seconds, each node generates a `NodeRollup` containing 1-minute aggrega
 - Per-node: total CPU, memory, disk, network, running app count
 - Per-ingress-route: request count, error count, p50/p95/p99 latency
 
-The node pushes this rollup to its assigned council aggregator via an internal gRPC call. The assignment is `hash(node_id) % len(council_members)`, recomputed when council membership changes (Mustard gossip propagates council membership).
+The node pushes this rollup to its assigned council aggregator via an internal bincode-over-TCP call. The assignment is `hash(node_id) % len(council_members)`, recomputed when council membership changes (Mustard gossip propagates council membership).
 
 **Council aggregator processing:**
 
@@ -818,7 +818,7 @@ max_rollup_size_bytes = 1048576  # 1MB
 
 **Behaviour:**
 
-1. Nodes assigned to the failed aggregator detect the failure via Mustard gossip (membership change) or via gRPC push failure (connection refused / timeout).
+1. Nodes assigned to the failed aggregator detect the failure via Mustard gossip (membership change) or via rollup push failure (connection refused / timeout).
 2. Nodes recompute their aggregator assignment based on the updated council membership. They begin pushing rollups to their new aggregator.
 3. The new aggregator has no historical rollups for the reassigned nodes. A coverage gap exists for the reassignment period (typically <60 seconds if gossip propagation is fast).
 4. Nodes include their previous 5 minutes of rollups in the first push to the new aggregator to minimise the gap.
@@ -870,7 +870,7 @@ max_rollup_size_bytes = 1048576  # 1MB
 
 ### 8.1 Metrics Access Control
 
-- **Internal API (Brioche, Relish, inter-node queries):** Secured via mutual TLS using the Sesame PKI. All inter-node gRPC calls (query fan-out, rollup push) use mTLS with certificates issued by the cluster CA. Only nodes with valid cluster certificates can query or push metrics.
+- **Internal API (Brioche, Relish, inter-node queries):** Secured via mutual TLS using the Sesame PKI. All inter-node calls (query fan-out over HTTP, rollup push over TCP) use mTLS with certificates issued by the cluster CA. Only nodes with valid cluster certificates can query or push metrics.
 - **Prometheus remote-read API:** Protected by the same mTLS requirement by default. For external Prometheus instances, operators must provide the cluster CA certificate and a client certificate (issued via `relish cert issue --for prometheus`). Alternatively, operators can enable token-based authentication for the remote-read endpoint.
 - **Per-namespace isolation (future):** The query API enforces namespace-scoped access when the caller is authenticated as a namespace-scoped identity (e.g., a workload identity token from app.web in namespace `team-a` can only query metrics for apps in `team-a`). Cluster-wide queries require a cluster-scoped identity.
 - **Metric label scrubbing:** Application-scraped metrics are stored as-is. Mayo does not inject or strip labels from application metrics. Operators concerned about label cardinality explosion (a common Prometheus anti-pattern) can configure `max_samples_per_scrape` to limit ingest.
@@ -1054,18 +1054,13 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
-| **Custom TSDB engine** | Core storage, indexing, compaction | Written in Rust specifically for Mayo. The Prometheus TSDB Go code is the design reference, but a direct port is not possible (Go -> Rust) and the embedded use case allows significant simplification (single-writer, no WAL replication, no remote-write ingest). |
-| `sled` or `rocksdb` (via `rust-rocksdb`) | Label index storage | Persistent sorted key-value store for the label posting lists and label-to-MetricId mappings. `sled` is pure Rust (simpler build, no C++ dependency) but less battle-tested than RocksDB. Decision deferred to implementation (see Open Questions). |
-| `zstd` (`zstd` crate) | Block compression | Zstd compression for downsampled and archived tier blocks. Level 3 provides a good balance of compression ratio and speed. |
-| `promql-parser` | PromQL parsing | Parses PromQL expressions into an AST for alert evaluation and query processing. If no mature Rust crate exists, a custom parser will be implemented using `nom` or `pest`. |
-| `hyper` + `tonic` | HTTP + gRPC server | `hyper` serves the Prometheus remote-read API (HTTP/1.1 protobuf) and the `/metrics` scrape endpoint. `tonic` handles inter-node gRPC for query fan-out and rollup push. |
-| `prost` | Protobuf serialisation | Encodes/decodes Prometheus remote-read protobuf messages and internal rollup messages. |
-| `memmap2` | Memory-mapped file access | Memory-maps block index files and chunk files for zero-copy reads during queries. |
+| `datafusion` | SQL query engine over Parquet | Executes queries against the on-disk Parquet blocks. Parquet read/write support ships with DataFusion, so there is no separate arrow/parquet dependency. Mayo's query language is DataFusion SQL, not PromQL. |
+| `object_store` | Block storage abstraction | Reads and writes Parquet blocks behind a single interface over a local path, `file://`, `s3://`, or `gs://`. |
+| `prometheus-parse` | Prometheus exposition parsing | Parses `text/plain` `/metrics` scrape responses (with `# HELP`, `# TYPE`, and metric lines) into samples. |
+| `bincode` | Rollup serialisation | Encodes `NodeRollup` payloads pushed node-to-council over TCP. |
+| `hyper` | HTTP server | Serves the Prometheus remote-read API and the `/metrics` scrape endpoint, and handles inter-node query fan-out over HTTP. |
 | `tokio` | Async runtime | Drives the scrape scheduler, query fan-out, rollup push, and compaction background tasks. Already used by Bun. |
-| `reqwest` or `hyper` (client) | HTTP client | Scrapes application `/metrics` endpoints and delivers webhook notifications. |
-| `nom` or `pest` | Parser combinators | For parsing Prometheus exposition format from scrape targets (text/plain Content-Type with `# HELP`, `# TYPE` lines, metric lines). |
-| `ulid` | ULID generation | Generates unique, lexicographically sortable block IDs (used as block directory names). |
-| `crc32fast` | Checksum | WAL segment and block integrity verification. |
+| `reqwest` | HTTP client | Scrapes application `/metrics` endpoints and delivers webhook notifications. |
 
 ### 12.2 Build Considerations
 

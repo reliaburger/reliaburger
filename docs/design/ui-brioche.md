@@ -32,7 +32,7 @@ Brioche depends on the following Reliaburger subsystems:
 
 | Dependency | Role | Interaction |
 |------------|------|-------------|
-| **Bun** | HTTP server; hosts Brioche's static assets and API endpoints | Brioche's compiled assets are served by Bun's built-in HTTP listener on the API port (default `9443`) |
+| **Bun** | HTTP server; hosts Brioche's static assets and API endpoints | Brioche's compiled assets are served by Bun's built-in HTTP listener on the API port (default `9117`) |
 | **Mayo** | Metrics queries (CPU, memory, disk, GPU, request rate, error rate, custom metrics) | Brioche issues PromQL-compatible queries against the local Mayo TSDB via internal API; cross-node queries fan out through council aggregators |
 | **Ketchup** | Log queries and streaming | Brioche opens a streaming connection (WebSocket or SSE) for live log tailing; historical queries hit Ketchup's structured log index |
 | **Cluster API** | State queries (apps, nodes, jobs, deploy history, configuration, alert state) | Standard Bun API endpoints; reads are served by any council member from local Raft state |
@@ -65,7 +65,7 @@ At startup, Bun registers a route handler that serves these embedded assets. The
 ```rust
 // In Bun's HTTP server initialisation (axum router)
 let app = Router::new()
-    .nest("/api/v1", api_routes())
+    .nest("/v1", api_routes())
     .fallback(brioche_handler);
 
 async fn brioche_handler(uri: axum::http::Uri) -> impl IntoResponse {
@@ -98,7 +98,7 @@ async fn brioche_handler(uri: axum::http::Uri) -> impl IntoResponse {
 
 ### 3.2 SPA Routing
 
-Brioche is a single-page application. All navigation occurs client-side. Any request to a path that does not match a static asset or an `/api/` prefix returns `index.html`, allowing the SPA router to handle the URL. This means bookmarking `https://node-03:9443/apps/web` works -- the server returns `index.html`, and the client-side router renders the app detail view for `web`.
+Brioche is a single-page application. All navigation occurs client-side. Any request to a path that does not match a static asset or an `/api/` prefix returns `index.html`, allowing the SPA router to handle the URL. This means bookmarking `https://node-03:9117/apps/web` works -- the server returns `index.html`, and the client-side router renders the app detail view for `web`.
 
 URL structure:
 
@@ -136,10 +136,10 @@ Brioche runs on every node, but the data it displays comes from the cluster API.
 ```
 
 - **Static asset requests** (`/`, `/apps`, CSS, JS, fonts): Served directly from the embedded assets on the local node. No network hop.
-- **API read requests** (`GET /api/v1/*`): The local Bun forwards to the nearest council member if the local node is not a council member. Council members serve from local Raft state.
-- **API write requests** (`POST /api/v1/*`, `PUT`, `DELETE`): Forwarded to the current leader, which commits via Raft before responding.
-- **Metrics queries** (`GET /api/v1/metrics/query`): Routed to the leader (or council aggregator), which fans out to relevant nodes and merges results.
-- **Log streaming** (`WS /api/v1/logs/:app/stream`): The council member multiplexes log streams from the nodes running the requested app.
+- **API read requests** (`GET /v1/*`): The local Bun forwards to the nearest council member if the local node is not a council member. Council members serve from local Raft state.
+- **API write requests** (`POST /v1/*`, `PUT`, `DELETE`): Forwarded to the current leader, which commits via Raft before responding.
+- **Metrics queries** (`GET /v1/metrics/query`): Routed to the leader (or council aggregator), which fans out to relevant nodes and merges results.
+- **Log streaming** (`WS /v1/logs/:app/stream`): The council member multiplexes log streams from the nodes running the requested app.
 
 ### 3.4 Frontend Technology
 
@@ -180,7 +180,7 @@ struct ClusterOverviewPage {
 {% extends "layout.html" %}
 {% block content %}
 <div id="cluster-overview"
-     hx-get="/api/v1/ui/cluster-overview"
+     hx-get="/v1/ui/cluster-overview"
      hx-trigger="every 5s"
      hx-swap="innerHTML">
 
@@ -225,7 +225,7 @@ struct ClusterOverviewPage {
   </section>
 
   <section class="active-alerts"
-           hx-get="/api/v1/ui/alerts-summary"
+           hx-get="/v1/ui/alerts-summary"
            hx-trigger="every 3s"
            hx-swap="innerHTML">
     {% for alert in alerts %}
@@ -255,7 +255,7 @@ Brioche uses two mechanisms for real-time data:
 ```html
 <!-- Streaming logs via SSE -->
 <div hx-ext="sse"
-     sse-connect="/api/v1/logs/web/stream?follow=true"
+     sse-connect="/v1/logs/web/stream?follow=true"
      sse-swap="message">
   <!-- Log lines appended here in real-time -->
 </div>
@@ -948,11 +948,11 @@ The default landing page. Provides a single-glance view of cluster health.
 
 | Section | API Endpoint | Refresh |
 |---------|-------------|---------|
-| Resource summary | `GET /api/v1/cluster/summary` | 5s (HTMX poll) |
-| Node health map | `GET /api/v1/nodes?fields=name,status` | 5s (HTMX poll) |
-| Recent deploys | `GET /api/v1/deploys?limit=10&sort=desc` | 10s (HTMX poll) |
-| Active alerts | `GET /api/v1/alerts?state=firing` | 3s (HTMX poll) |
-| Event stream | `SSE /api/v1/events/stream` | Real-time |
+| Resource summary | `GET /v1/cluster/summary` | 5s (HTMX poll) |
+| Node health map | `GET /v1/nodes?fields=name,status` | 5s (HTMX poll) |
+| Recent deploys | `GET /v1/deploys?limit=10&sort=desc` | 10s (HTMX poll) |
+| Active alerts | `GET /v1/alerts?state=firing` | 3s (HTMX poll) |
+| Event stream | `SSE /v1/events/stream` | Real-time |
 
 **Node health map behaviour:** Each node is rendered as a coloured tile. Colour indicates status: green for healthy, yellow for degraded, red for unreachable, blue for draining. A star icon marks the leader. Clicking a tile navigates to the node detail page. At large cluster sizes (>100 nodes), the map switches to a compact grid with tooltip details on hover.
 
@@ -971,7 +971,7 @@ Accessed via `/apps/:name`. The primary operational view for understanding a sin
    - Error rate (5xx/sec from Wrapper metrics)
    - Time range selector: 15m, 1h, 6h, 24h, 7d, 30d, custom
 
-   Charts are initialised via a JSON config block rendered into the page, and uPlot fetches data from `/api/v1/metrics/query?expr=...&range=...`. The chart refresh interval is 10 seconds for the active time range.
+   Charts are initialised via a JSON config block rendered into the page, and uPlot fetches data from `/v1/metrics/query?expr=...&range=...`. The chart refresh interval is 10 seconds for the active time range.
 
 3. **Instance Table:**
 
@@ -1183,13 +1183,13 @@ Brioche shares its HTTP listener with the Bun API server. There is no separate p
 # /etc/reliaburger/node.toml
 
 [api]
-port = 9443                # Default. Serves both API and Brioche UI.
+port = 9117                # Default. Serves both API and Brioche UI.
 bind_address = "0.0.0.0"   # Default. Bind to all interfaces.
 ```
 
 The same port serves:
 
-- `/api/v1/*` -- REST API endpoints (used by Relish CLI, Brioche, CI systems)
+- `/v1/*` -- REST API endpoints (used by Relish CLI, Brioche, CI systems)
 - `/*` -- Brioche SPA (static assets and page routes)
 
 There is no configuration to enable or disable Brioche. It is always available on every node because the assets are compiled into the binary. This is intentional: the overhead of embedded static assets is negligible (~500KB in the binary), and having the dashboard available on every node simplifies debugging in production (any node's IP works).
@@ -1203,7 +1203,7 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 1. User navigates to any node's Brioche URL.
 2. Brioche renders a login page requesting an API token.
 3. The user enters their token (generated via `relish token create` or the Brioche UI itself if already authenticated).
-4. The token is sent to `POST /api/v1/auth/validate`.
+4. The token is sent to `POST /v1/auth/validate`.
 5. On success, the token is stored in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie with the name `rb_session`.
 6. Subsequent API requests from the browser include the cookie automatically.
 
@@ -1211,7 +1211,7 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 
 - The cookie contains the API token encrypted with a per-node session key (derived from the node's identity via HKDF). This prevents cookie theft from being directly useful on a different node, though the cluster's shared token validation means a stolen raw token works anywhere.
 - Cookie expiry matches the token's TTL. When the token expires, the cookie is invalidated and the user is redirected to the login page.
-- Logout (`POST /api/v1/auth/logout`) clears the cookie.
+- Logout (`POST /v1/auth/logout`) clears the cookie.
 
 **OIDC flow (when configured):**
 
@@ -1425,11 +1425,11 @@ fn security_headers() -> HeaderMap {
 
 ### 8.6 Secret Handling
 
-Brioche never displays plaintext secret values. Environment variables that originate from `ENC[AGE:...]` fields are transmitted to the browser as `[encrypted]`. The API endpoint `GET /api/v1/apps/:name/env` returns `EnvValue::Encrypted` for these fields; the plaintext is never included in the API response. This is enforced at the API layer, not just the UI layer, so even a compromised browser or a direct API call cannot retrieve secret values through Brioche.
+Brioche never displays plaintext secret values. Environment variables that originate from `ENC[AGE:...]` fields are transmitted to the browser as `[encrypted]`. The API endpoint `GET /v1/apps/:name/env` returns `EnvValue::Encrypted` for these fields; the plaintext is never included in the API response. This is enforced at the API layer, not just the UI layer, so even a compromised browser or a direct API call cannot retrieve secret values through Brioche.
 
 ### 8.7 Management Perimeter
 
-As described in the whitepaper (Section 11.3), the Brioche port (shared with the API port `9443`) is protected by the management perimeter firewall. Only cluster nodes and explicitly authorised administrator CIDR ranges (configured in `node.toml`) can reach it. Traffic from outside these ranges is dropped by nftables before it reaches the Bun HTTP listener.
+As described in the whitepaper (Section 11.3), the Brioche port (shared with the API port `9117`) is protected by the management perimeter firewall. Only cluster nodes and explicitly authorised administrator CIDR ranges (configured in `node.toml`) can reach it. Traffic from outside these ranges is dropped by nftables before it reaches the Bun HTTP listener.
 
 ---
 
@@ -1504,7 +1504,7 @@ async fn test_cluster_overview_returns_valid_response() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/api/v1/cluster/summary")
+                .uri("/v1/cluster/summary")
                 .header("Authorisation", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -1525,7 +1525,7 @@ async fn test_app_detail_returns_encrypted_env_values() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/api/v1/apps/web/env")
+                .uri("/v1/apps/web/env")
                 .header("Authorisation", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -1547,7 +1547,7 @@ async fn test_write_endpoints_require_csrf_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/apps/web/rollback")
+                .uri("/v1/apps/web/rollback")
                 .header("Authorisation", "Bearer test-admin-token")
                 // No X-CSRF-Token header
                 .body(Body::empty())
@@ -1566,7 +1566,7 @@ async fn test_read_only_token_cannot_trigger_deploy() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/v1/apps/web/rollback")
+                .uri("/v1/apps/web/rollback")
                 .header("Authorisation", "Bearer test-readonly-token")
                 .header("X-CSRF-Token", "valid-csrf-token")
                 .body(Body::empty())
@@ -1738,9 +1738,8 @@ HashiCorp Consul's built-in UI provides service catalog browsing, health check s
 
 | Crate | Version | Purpose | Size Impact |
 |-------|---------|---------|-------------|
-| `axum` | 0.7+ | HTTP framework (already used by Bun's API server) | 0 (shared) |
-| `rust-embed` | 8+ | Static asset embedding at compile time | ~5KB runtime |
-| `askama` | 0.12+ | Compile-time HTML templates | 0 runtime (generates code) |
+| `axum` | 0.8+ | HTTP framework (already used by Bun's API server), built on `hyper` + `tower` | 0 (shared) |
+| `rust-embed` | 8+ | Static asset embedding at compile time (HTML, CSS, JS, icons) | ~5KB runtime |
 | `tokio-stream` | 0.1+ | SSE stream support | 0 (already a tokio dependency) |
 | `mime_guess` | 2+ | Content-Type detection for embedded assets | ~50KB (MIME database) |
 
@@ -1872,7 +1871,7 @@ Brioche's real-time data is exclusively server-to-client (logs, events, deploy p
 
 ## Appendix: API Endpoint Summary
 
-All endpoints are prefixed with `/api/v1`. Authentication is required for all endpoints.
+All endpoints are prefixed with `/v1`. Authentication is required for all endpoints.
 
 ### Read Endpoints (GET)
 

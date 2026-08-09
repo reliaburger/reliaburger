@@ -22,7 +22,7 @@ Smoker takes a different approach. Because Onion's eBPF layer already intercepts
 Key design properties:
 
 - **Zero overhead when inactive.** When no faults are active, all fault BPF maps are empty. The eBPF programs perform a single hash lookup that returns "no fault" and proceed on the normal path. No iptables rules, no tc rules, no sidecars.
-- **Kernel-level fidelity.** Network faults happen at the socket layer in eBPF. Applications see exactly the same error codes and behaviours they would see during a real failure -- `ECONNREFUSED`, `ENETUNREACH`, `EAI_NONAME`. No simulation layer to leak abstractions.
+- **Kernel-level fidelity.** Network faults happen at the socket layer in eBPF. Applications see real kernel error codes, not a simulation. A cgroup connect hook denies by returning zero, which the kernel surfaces to `connect()` as `EPERM` (drop and partition faults); the userspace resolver returns NXDOMAIN, so `getaddrinfo()` fails with `EAI_NONAME` (DNS faults). No simulation layer to leak abstractions.
 - **Automatic safety rails.** Smoker prevents faults that would make the cluster unrecoverable: quorum protection, replica minimums, leader guarding, and mandatory expiry.
 - **No persistence.** Fault rules exist only in BPF maps (kernel memory) and Bun's in-process state. They are never written to disk. A Bun restart clears all faults on that node.
 
@@ -91,7 +91,7 @@ map ownership.
 
 Bun is the userspace agent that manages containers on each node. Smoker uses Bun for:
 
-- **BPF map writes.** Bun writes fault rules into the kernel BPF maps via the `bpf()` syscall (through libbpf-rs or aya).
+- **BPF map writes.** Bun writes fault rules into the kernel BPF maps via the `bpf()` syscall (through aya).
 - **Cgroup control.** Resource faults (CPU stress, memory pressure, disk I/O throttle) use the same cgroup hierarchy that Bun already manages for container isolation.
 - **Node-pressure control.** Whole-node CPU/memory pressure uses a separate,
   Bun-owned cgroup and child helper. Bun itself never joins the pressured
@@ -138,11 +138,11 @@ Smoker adds four BPF maps to the kernel, managed alongside Onion's existing serv
 |    1. Is this a virtual IP?                                   |
 |    2. Look up fault_connect_map[virtual_ip:port]              |
 |       -> empty: normal backend selection from backend_map     |
-|       -> drop(10%): generate random, if < 10% return          |
-|          -ECONNREFUSED                                        |
+|       -> drop(10%): generate random, if < 10% deny (return 0, |
+|          surfaced to connect() as -EPERM)                     |
 |       -> delay(200ms): store timestamp, defer via timer       |
 |       -> partition(from=X): check source cgroup, if match     |
-|          return -ENETUNREACH                                  |
+|          deny (return 0, surfaced as -EPERM)                  |
 |    3. Look up fault_bw_map[virtual_ip:port]                   |
 |       -> empty: no throttle                                   |
 |       -> 1mbps: attach token bucket rate limiter to socket    |
@@ -254,7 +254,7 @@ pub enum FaultType {
         jitter_ns: u64,
     },
 
-    /// Fail a percentage of connections with ECONNREFUSED.
+    /// Fail a percentage of connections with EPERM (the connect hook denies).
     /// probability: 0-100 (percentage of connections to drop).
     Drop {
         probability: u8,
@@ -660,7 +660,7 @@ int smoker_delay_sockops(struct bpf_sock_ops *skops) {
 
 #### 5.1.2 Drop (via PRNG in connect hook)
 
-On each `connect()` interception, the eBPF program reads a per-CPU PRNG state from `fault_state_map`, generates a random value, and compares it to the configured drop percentage. If the random value falls within the drop range, the program returns `-ECONNREFUSED` directly from the hook. No packet is ever sent.
+On each `connect()` interception, the eBPF program reads a per-CPU PRNG state from `fault_state_map`, generates a random value, and compares it to the configured drop percentage. If the random value falls within the drop range, the program denies the connection by returning 0 from the hook, which the kernel surfaces to `connect()` as `-EPERM`. No packet is ever sent.
 
 ```c
 // eBPF pseudocode: drop fault in connect4 program
@@ -703,9 +703,9 @@ int smoker_drop_connect4(struct bpf_sock_addr *ctx) {
     __u8 roll = x % 100;  // 0-99
     if (roll < val->probability) {
         state->faults_injected++;
-        // Return ECONNREFUSED -- application sees a refused connection,
-        // indistinguishable from a real backend refusing the connection.
-        return CGROUP_SOCK_ADDR_REJECT;  // maps to -ECONNREFUSED
+        // Deny by returning zero -- the cgroup connect hook's denial is
+        // surfaced to connect(2) as EPERM (not ECONNREFUSED).
+        return CGROUP_SOCK_ADDR_REJECT;  // maps to -EPERM
     }
 
     return CGROUP_SOCK_ADDR_ALLOW;  // this connection passes through
@@ -1561,9 +1561,9 @@ Each fault type must be tested not only for correct injection but also for corre
 **Network fault tests:**
 
 - Inject `delay redis 200ms`, verify that connections to redis take ~200ms longer (within jitter bounds). Clear the fault, verify latency returns to baseline.
-- Inject `drop api 50%`, make 1000 connections, verify ~500 fail with ECONNREFUSED (within statistical bounds). Clear, verify 0% failures.
+- Inject `drop api 50%`, make 1000 connections, verify ~500 fail with EPERM (within statistical bounds). Clear, verify 0% failures.
 - Inject `dns redis nxdomain`, verify `getaddrinfo("redis.internal")` returns EAI_NONAME. Clear, verify resolution works.
-- Inject `partition web --from payment`, verify payment->web connections fail with ENETUNREACH, verify web->payment still works. Clear, verify both directions work.
+- Inject `partition web --from payment`, verify payment->web connections fail with EPERM, verify web->payment still works. Clear, verify both directions work.
 - Inject `bandwidth api 1mbps`, transfer 10MB, verify transfer time is ~10 seconds (+/- 20%). Clear, verify full bandwidth.
 
 **Resource fault tests:**
@@ -1713,9 +1713,8 @@ Netflix pioneered chaos engineering with [Chaos Monkey](https://netflix.github.i
 
 ### 12.1 Rust Crates
 
-**libbpf-rs** or **aya** -- eBPF map manipulation from Rust userspace. Both provide safe wrappers around the `bpf()` syscall for map CRUD operations. The choice depends on which library Onion already uses for its service mesh eBPF programs (Smoker should use the same library to share BPF object lifecycle management).
+**aya** -- eBPF map manipulation from Rust userspace. It provides safe wrappers around the `bpf()` syscall for map CRUD operations. Smoker uses the same library Onion already uses for its service mesh eBPF programs, sharing BPF object lifecycle management.
 
-- `libbpf-rs`: Rust bindings to libbpf (C library). Mature, tracks upstream libbpf closely. Requires libbpf as a build dependency.
 - `aya`: Pure Rust eBPF library. No C dependencies. Provides `aya::maps::HashMap` for typed BPF map access.
 
 ```rust

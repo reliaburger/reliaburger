@@ -1874,33 +1874,49 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 
 ### Section A — Cheap correctness now (config + mechanical doc sweeps)
 
-- [ ] **Reject unknown config keys.** Add `#[serde(deny_unknown_fields)]` across
-  every `src/config/` struct (and the sub-configs in `smoker`, `lettuce`,
-  `mayo`, `ketchup`, `wrapper`). Today no struct rejects unknown keys, which is
-  why dozens of hallucinated doc keys "parse" and silently do nothing. Turn that
-  whole class of silent misconfig into a startup error. Expect fallout: fix any
-  real example/config that relied on a now-rejected key; add a round-trip test
-  per section.
-- [ ] **`/api/v1` → `/v1` doc sweep.** The real API/UI routes have no `/api`
-  prefix. Fix every occurrence across the whitepaper, `ui-brioche.md`,
-  `metrics-mayo.md`, `logs-ketchup.md`, `gitops-lettuce.md`, `cli-relish.md`.
-- [ ] **Port `9443` → `9117` doc sweep.** `9443` is gossip; the API/UI listens on
-  `9117`. Fix the whitepaper, `cli-relish.md`, `ui-brioche.md` and any config
-  example that shows `:9443` as an API address.
-- [ ] **eBPF errno sweep.** Connection denials surface as `EPERM`, not
-  `ECONNREFUSED`/`ENETUNREACH` (~12 occurrences, and several docs contradict
-  themselves). Fix `whitepaper.md`, `chaos-smoker.md` §5.1.2/§9/§10.1,
-  `discovery-onion.md`, and the stale code comments in
-  `ebpf/onion_connect.bpf.c` and `src/smoker/types.rs`.
-- [ ] **Dependency-table sweep.** Every design doc's §12 crate table lists crates
-  absent from `Cargo.toml` (git2, sequoia-openpgp, keyring, indicatif, chrono,
-  promql-parser, regex, memmap2, tonic/gRPC, dashmap, arc-swap, sled, sigstore,
-  …). gRPC is claimed in three docs and used nowhere. Replace each table with the
-  crates actually used, or delete it.
-- [ ] **`allow_from` syntax sweep.** Documented three ways
-  (`app.api@production`, `app.api`); code accepts `namespace/app` or bare `app`
-  (`src/sesame/firewall.rs:90`). Pick the real form and fix `discovery-onion.md`,
-  `security-sesame.md`, and any example.
+- [x] **Reject unknown config keys** — `#[serde(deny_unknown_fields)]` on every
+  TOML-deserialised config struct: all of `src/config/` (app/node trees + their
+  sub-specs), plus the externally-defined sections `GitOpsConfig` (`[gitops]`),
+  `BackupConfig` (`[cluster.backup]`) and `ClusterTestPolicy` (`[testing]`). The
+  runtime configs in `smoker`/`mayo`/`ketchup`/`wrapper` are built *from* those
+  TOML sections, not parsed from TOML, so they didn't need it; `deny_unknown_fields`
+  is a no-op for bincode, so Raft/wire round-trips are unaffected. A typo or a
+  removed key is now a parse error naming the field instead of a silent no-op.
+  Fallout fixed: the `parse_logs_section_ignores_removed_max_file_size` test now
+  asserts rejection; `make examples` was running `relish apply` on a fault-scenario
+  file that only "passed" because the old parser swallowed its fields into an empty
+  config — the target now routes `[[step]]` files to `relish fault scenario
+  --dry-run` and validates them for real. Added positive tests for a mistyped app
+  field and a mistyped top-level table.
+- [x] **`/api/v1` → `/v1` doc sweep** — real API/UI routes have no `/api` prefix.
+  Fixed metrics-mayo, gitops-lettuce and all of ui-brioche. Left the two
+  book/03 `/api/v1` mentions untouched: they're a generic ingress path-routing
+  example (longest-prefix match), not the management API.
+- [x] **Port `9443` → `9117` doc sweep** — `9443` is gossip; the API/UI is
+  `9117`. Fixed only the API/UI-context uses (cli-relish:30,116; ui-brioche
+  API-port/bookmark/config/firewall lines). Left every legitimate gossip/join
+  `:9443` (whitepaper member lists, book ch2, manual, README dev-cluster). The
+  fictional `~/.config/relish/config.toml` `cluster = ":9443"` example is left
+  for the Section D cli-relish rewrite (the config file itself doesn't exist).
+- [x] **eBPF errno sweep** — a BPF `return 0` deny surfaces as `EPERM`, not
+  `ECONNREFUSED`/`ENETUNREACH`. Fixed chaos-smoker (drop/partition faults + ASCII
+  diagrams + fidelity claim), discovery-onion (connect-hook denies), the code
+  comments in `ebpf/onion_connect.bpf.c` and `src/smoker/types.rs`, security-sesame
+  firewall test, and book chapters 03/08. Deliberately KEPT genuine no-listener
+  refusals (no-eBPF case, stale-but-real backend address) and DNS `EAI_NONAME`.
+- [x] **Dependency-table sweep** — deleted every crate row absent from
+  `Cargo.toml` across all 14 design docs (git2, sequoia-openpgp, ssh-key, keyring,
+  indicatif, chrono, tonic/gRPC, dashmap, arc-swap, sled, sigstore, memmap2, ulid,
+  containerd-client, libbpf-rs, and more), corrected `libbpf-rs`→`aya`, and killed
+  every claim of a gRPC *transport* (reporting/rollups are bincode-over-TCP;
+  registry/logs/queries are HTTP). Kept honestly-labelled "alternatives evaluated"
+  rows (raft-rs, foca, instant-acme). Left user-gRPC *proxying* text (ingress,
+  deployments) alone. Deeper prose that still names deleted crates (storage-engine
+  debates, the Askama UI narrative) belongs to the Section D wholesale rewrites.
+- [x] **`allow_from` syntax sweep** — code accepts `"namespace/app"` or bare
+  `"app"`. Fixed the two wrong-syntax examples (discovery-onion `app.api@production`
+  → `production/api`; security-sesame `["app.api","app.admin"]` → `["api","admin"]`).
+  book/04's `["api", "frontend/web"]` was already the canonical correct form.
 
 ### Section B — New code defects found by the audit
 

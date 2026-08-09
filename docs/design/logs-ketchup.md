@@ -516,7 +516,7 @@ The `relish logs` command provides a unified view across all nodes. The aggregat
 
 1. The CLI sends a `LogQuery` to the cluster leader via the HTTP API.
 2. The leader looks up which nodes run the target app (from the Raft-stored placement state).
-3. The leader opens concurrent gRPC streams (or HTTP/2 streams) to each relevant node's Ketchup endpoint.
+3. The leader opens concurrent HTTP streams to each relevant node's Ketchup endpoint.
 4. Each node's Ketchup executes the query locally and streams matching `LogEntry` records.
 5. The leader performs a k-way merge sort on the incoming streams, ordered by `timestamp_nanos`.
 6. Merged entries are streamed back to the CLI (or Brioche UI) as newline-delimited JSON over the HTTP response.
@@ -825,15 +825,10 @@ Datadog's agent collects logs, metrics, and traces from each host and ships them
 | Crate | Version | Purpose |
 |-------|---------|---------|
 | `tokio` | 1.x | Async runtime for capture tasks, query handlers, export tasks, and maintenance timers. Provides `AsyncBufReadExt` for line-oriented reading from container stdout/stderr pipes. |
-| `zstd` | 0.13.x | Compression and decompression of archived log files. Used in streaming mode for the compression pipeline and in seekable-frame mode for random access into compressed files during queries. |
-| `serde_json` | 1.x | JSON detection (parsing log lines to determine if they are structured JSON) and JSON field extraction for `--json-field` queries. Also used for serialising `LogEntry` records to JSONL format during export. |
-| `memmap2` | 0.9.x | Memory-mapped file access for `.idx` files. Provides zero-copy read access to the sparse timestamp index, enabling O(1) access to any index entry without loading the entire file into heap memory. |
-| `regex` | 1.x | Compiled regular expression matching for `--grep` queries. The `regex` crate uses SIMD-accelerated DFA construction for high-throughput matching (~1 GB/s on modern CPUs). |
-| `chrono` | 0.4.x | Date and time handling for day-boundary rotation, retention calculation, and timestamp parsing in `--since`/`--until` arguments. |
-| `tokio-util` | 0.7.x | `CancellationToken` for graceful shutdown of capture tasks when a workload stops. `ReusableBoxFuture` for efficient task reuse in the capture pipeline. |
-| `bytes` | 1.x | Zero-copy byte buffer management for the write pipeline. `BytesMut` is used to construct binary log records before writing to disk. |
-| `notify` (or `inotify`) | 7.x | Filesystem event notification for tail/follow mode. Ketchup watches the active log file for new writes and pushes new entries to streaming query clients. On Linux, this uses `inotify`; on macOS (dev environments), `kqueue`. |
-| `aws-sdk-s3` (optional) | 1.x | S3 upload for log export. Compiled behind a `feature = "export-s3"` flag to avoid pulling in the AWS SDK for clusters that don't use S3 export. |
+| `datafusion` | 45 | SQL query engine over the on-disk Parquet log blocks. `--grep` is a SQL `LIKE` substring match. Parquet handles columnar (ZSTD) compression internally, so there is no separate compression dependency. |
+| `object_store` | 0.14 | Reads and writes Parquet log blocks and ships exported archives behind a single interface over a local path, `file://`, `s3://`, or `gs://`. The built-in S3 backend removes the need for a dedicated AWS SDK. |
+| `serde_json` | 1.x | JSON detection (parsing log lines to determine if they are structured JSON) and JSON field extraction for `--json-field` queries. Also used for serialising log records during export. |
+| `tokio-util` | 0.7.x | `CancellationToken` for graceful shutdown of capture tasks when a workload stops. |
 
 ---
 

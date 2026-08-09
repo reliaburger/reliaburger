@@ -275,6 +275,7 @@ impl<'de> Deserialize<'de> for EnvValue {
 /// Exactly one of `content` (inline) or `source` (git path) must be set.
 /// Validated in the validation pass, not at parse time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFileSpec {
     /// Absolute path inside the container where the file is mounted.
     pub path: PathBuf,
@@ -298,6 +299,7 @@ pub struct ConfigFileSpec {
 /// - **Managed:** omit `source`. Reliaburger creates a directory under
 ///   `storage.volumes/{namespace}/{app}` and bind-mounts it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VolumeSpec {
     /// Mount path inside the container.
     pub path: PathBuf,

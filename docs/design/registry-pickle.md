@@ -180,7 +180,7 @@ This ensures that tag resolution (which digest does `myapp:v1.4.2` point to?) is
 
 ### 3.5 Layer Storage on Disk
 
-Layer blobs are the bulk of image data (megabytes to gigabytes) and are too large for Raft. They live on each node's local filesystem in the content-addressed blob store. Layer transfer between nodes uses a direct node-to-node gRPC streaming protocol over mTLS, outside the Raft consensus path.
+Layer blobs are the bulk of image data (megabytes to gigabytes) and are too large for Raft. They live on each node's local filesystem in the content-addressed blob store. Layer transfer between nodes uses a direct node-to-node HTTP streaming protocol over mTLS, outside the Raft consensus path.
 
 ---
 
@@ -521,7 +521,7 @@ pub enum PickleRaftCommand {
 │               └── redis/
 │                   └── 7-alpine/
 │                       └── manifest.json
-└── pickle.db                               # embedded KV store (sled/redb) for indices
+└── pickle.db                               # embedded KV store (redb) for indices
 ```
 
 ---
@@ -547,7 +547,7 @@ Pickle implements the OCI Distribution Spec push flow:
    - Initiates replication (step 5).
 
 5. **Synchronous replication.** For each of N selected peers:
-   - Open gRPC stream over mTLS to peer's Pickle replication endpoint.
+   - Open HTTP stream over mTLS to peer's Pickle replication endpoint.
    - Send layers the peer doesn't already hold (deduplicate by querying peer's blob inventory).
    - Peer stores layers, verifies digests, and sends acknowledgement.
    - If any peer is unreachable, select an alternate peer. If Pickle can't meet the redundancy target within the timeout (default 30s), it returns an error to the client.
@@ -586,7 +586,7 @@ Pickle implements the OCI Distribution Spec pull flow:
 
 3. **Pull layers.** For each layer in the manifest, client calls `GET /v2/<name>/blobs/<digest>`. Bun:
    - **Local hit:** Stream directly from local blob store.
-   - **Local miss:** Look up `PeerLocation` for this digest from Raft-synchronised state. Select the best source (closest, least loaded). Fetch the layer from the peer via gRPC streaming, store locally, and stream to the client simultaneously (tee).
+   - **Local miss:** Look up `PeerLocation` for this digest from Raft-synchronised state. Select the best source (closest, least loaded). Fetch the layer from the peer via HTTP streaming, store locally, and stream to the client simultaneously (tee).
 
 ### 5.3 Parallel Multi-Source Downloads
 
@@ -1281,20 +1281,16 @@ Pickle implements the OCI Distribution Specification for API compatibility. Any 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
 | `oci-distribution` | OCI Distribution API client/server primitives | Provides types for manifests, layer descriptors, and registry protocol handling. May need forking/wrapping for the server-side (Pickle is both client and server). |
-| `oci-spec` | OCI image and runtime spec types | Canonical Rust types for OCI image manifests, image configs, and index manifests. |
 | `hyper` | HTTP server for the OCI Distribution API endpoint | The registry API is an HTTP endpoint on each node. `hyper` provides the low-level server. |
-| `axum` or `warp` | HTTP framework layered on `hyper` | Routing for the `/v2/` API endpoints (blob uploads, manifest push/pull, tag listing). |
+| `axum` | HTTP framework layered on `hyper` | Routing for the `/v2/` API endpoints (blob uploads, manifest push/pull, tag listing). |
 | `reqwest` | HTTP client for external registry pull-through | Used to pull manifests and blobs from upstream registries (Docker Hub, GHCR, ECR). |
 | `tokio` | Async runtime | All Pickle I/O (disk, network, replication) is async. tokio provides the task scheduler, timers, and I/O primitives. |
 | `ring` or `sha2` | SHA-256 hashing for content addressing | Every blob is verified by its SHA-256 digest. `ring` for performance-critical paths; `sha2` as a pure-Rust fallback. |
-| `tonic` | gRPC framework for inter-node layer transfer | Layer replication and P2P downloads use gRPC streaming over mTLS. |
-| `rustls` | TLS implementation for mTLS connections | Used by both `tonic` (gRPC) and `hyper` (HTTPS) for Sesame certificate-based authentication. |
-| `sled` or `redb` | Embedded key-value store for local indices | Tag-to-digest mappings, blob reference counts, upload session state. Must be crash-safe (atomic writes). |
+| `rustls` | TLS implementation for mTLS connections | Used by `hyper` (HTTPS) and `reqwest` for Sesame certificate-based authentication. |
+| `redb` | Embedded key-value store for local indices | Tag-to-digest mappings, blob reference counts, upload session state. Must be crash-safe (atomic writes). |
 | `serde` + `serde_json` | Serialisation for manifests and Raft commands | OCI manifests are JSON. Raft commands are serialised for consensus. |
-| `sigstore` | Sigstore/cosign signature creation and verification | Keyless signing via OIDC, certificate chain verification, signature format compatibility. |
-| `flate2` or `zstd` | Compression for layer blobs | OCI layers are typically gzip-compressed tars. `zstd` may be used for inter-node transfer optimisation. |
+| `flate2` | Compression for layer blobs | OCI layers are typically gzip-compressed tars. |
 | `tempfile` | Temporary file handling for upload sessions | Atomic file creation in the `tmp/` upload directory. |
-| `tracing` | Structured logging and diagnostics | Push/pull/GC operations emit structured events for observability. |
 
 ### 12.2 OCI Spec Compliance
 

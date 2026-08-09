@@ -82,7 +82,7 @@ impl OperationPermission {
 
 /// Server-side test policy. Client flags cannot expand it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClusterTestPolicy {
     /// Typed operator declaration. Missing configuration remains `Unknown`.
     pub safety_class: ClusterSafetyClass,

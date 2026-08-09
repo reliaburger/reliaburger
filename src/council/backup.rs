@@ -41,7 +41,7 @@ const BACKUP_ENVELOPE_VERSION: u32 = 1;
 /// Off by default: `url` unset means the loop never starts, so a cluster that
 /// doesn't want external backups pays nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct BackupConfig {
     /// Object-store destination (`file://`, `s3://`, `gs://`). `None`
     /// disables backups entirely.

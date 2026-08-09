@@ -1351,16 +1351,8 @@ Meat is compiled into the Reliaburger binary. The following Rust crates are used
 |-------|---------|---------|
 | `tokio` | 1.x | Async runtime for the scheduling loop, timers, and channel communication. |
 | `tokio::sync::mpsc` | (part of tokio) | Unbounded channels for the scheduling queue (deploy requests flow in, decisions flow out). |
-| `std::collections::BinaryHeap` | (stdlib) | Priority queue for the cron scheduler (next-fire-time ordering). |
-| `dashmap` | 6.x | Lock-free concurrent hash map for the cluster state cache. Multiple async tasks read node state concurrently; only the reporting tree handler writes. |
 | `serde` + `bincode` | 1.x / 2.x | Serialisation for Raft log entries (`SchedulingDecision`, `BatchAllocation`). Bincode for compactness on the hot path; JSON for API responses. |
-| `cron` | 0.13.x | Cron expression parsing for scheduled jobs. |
-| `parking_lot` | 0.12.x | Fast mutex/rwlock for the autoscaler state map (low contention, but must be held briefly during metric evaluation). |
-| `metrics` | 0.24.x | Instrumentation of scheduler internals (decisions/sec, latency histograms, queue depth). Fed into Mayo. |
-| `tracing` | 0.1.x | Structured logging for scheduler decisions, used for debugging and audit trails. |
-| `core_affinity` | 0.8.x | CPU core pinning for the scheduler task when the cluster exceeds 1,000 nodes. |
 | `rand` | 0.8.x | Tie-breaking during node selection when scores are equal (optional jitter mode). |
-| `smallvec` | 1.x | Stack-allocated small vectors for filter results (avoids heap allocation when candidate sets are small). |
 
 No external scheduling frameworks or orchestration libraries are used. The scheduling algorithm is implemented directly in Reliaburger-specific code to avoid abstraction overhead and maintain full control over the hot path.
 

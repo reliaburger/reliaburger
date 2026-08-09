@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level node configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
     pub node: NodeSection,
     pub cluster: ClusterSection,
@@ -62,7 +62,7 @@ impl NodeConfig {
 /// live longer. Both are enforced server-side, beneath which the 24h hard
 /// ceiling in `FaultRule::new` still applies as a backstop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SmokerSection {
     /// Duration applied when a fault is injected without one. Default 600s.
     pub default_duration_secs: u64,
@@ -94,7 +94,7 @@ impl SmokerSection {
 /// Disabled by default: the standard runc listen address is `0.0.0.0:53`
 /// and binding port 53 needs root, so it must be an explicit choice.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DnsSection {
     /// Start the `.internal` DNS responder on this node.
     pub enabled: bool,
@@ -163,7 +163,7 @@ impl DnsSection {
 /// build time), so a dev/Lima build "just works" with `enabled = true`;
 /// a packaged install points it at the installed objects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EbpfSection {
     /// Load and attach the eBPF programs on this node at startup.
     pub enabled: bool,
@@ -208,7 +208,7 @@ impl EbpfSection {
 /// (bun typically runs as root in cluster VMs); tests override with
 /// port 0 to get ephemeral assignments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct IngressSection {
     /// Bind the ingress listeners on this node.
     pub enabled: bool,
@@ -276,7 +276,7 @@ impl IngressSection {
 /// bootstrap node needs `bootstrap_path` (it seeds the initial `SecurityState`
 /// into Raft, which then replicates to everyone else).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SecuritySection {
     /// Path to the hex-encoded 32-byte cluster master key (`{cluster}-master.key`).
     pub master_key_path: Option<PathBuf>,
@@ -304,7 +304,7 @@ pub struct SecuritySection {
 
 /// Self-upgrade configuration (Phase 14).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpgradeSection {
     /// External Ed25519 signing key (`ed25519:` + base64 of 32 bytes).
     /// Required for network upgrades; air-gapped (`--binary`) upgrades
@@ -347,7 +347,7 @@ impl Default for UpgradeSection {
 
 /// Node identity and labels.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
     /// Node name. Defaults to hostname if omitted.
     pub name: Option<String>,
@@ -357,7 +357,7 @@ pub struct NodeSection {
 
 /// Cluster membership configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClusterSection {
     /// Stable cluster name and SPIFFE trust domain.
     pub name: String,
@@ -421,7 +421,7 @@ impl ClusterSection {
 
 /// Storage paths for data, images, logs, metrics, and volumes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StorageSection {
     pub data: PathBuf,
     pub images: PathBuf,
@@ -451,7 +451,7 @@ impl Default for StorageSection {
 /// satisfies "snapshots run on a schedule" without dragging in a cron
 /// parser and chrono for a feature nobody asked for by name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SnapshotsSection {
     /// Seconds between snapshot sweeps. `0` disables the loop.
     pub interval_secs: u64,
@@ -475,7 +475,7 @@ impl Default for SnapshotsSection {
 
 /// Reserved resources and GPU detection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ResourcesSection {
     /// CPU reserved for system and Bun, e.g. "500m".
     pub reserved_cpu: String,
@@ -497,7 +497,7 @@ impl Default for ResourcesSection {
 
 /// Network configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkSection {
     /// IP address advertised to the cluster. Auto-detected if omitted.
     pub advertise_address: Option<String>,
@@ -507,6 +507,7 @@ pub struct NetworkSection {
 
 /// Port range for container port mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
@@ -526,7 +527,7 @@ impl Default for PortRange {
 /// Controls how often worker nodes send state reports to their assigned
 /// council member, and when reports are considered stale.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ReportingTreeSection {
     /// How often worker nodes send StateReports (seconds).
     pub report_interval_secs: u64,
@@ -551,7 +552,7 @@ impl Default for ReportingTreeSection {
 /// Controls the learning period after a new Raft leader is elected.
 /// The leader collects StateReports before reconciling desired vs actual state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ReconstructionSection {
     /// Percentage of alive nodes that must report before the learning period ends.
     pub report_threshold_percent: u8,
@@ -612,7 +613,7 @@ impl ReconstructionSection {
 /// Controls replication, garbage collection, and storage limits
 /// for the built-in OCI image registry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ImagesSection {
     /// Maximum storage for image blobs (e.g. "50Gi"). 0 means unlimited.
     pub max_storage: String,
@@ -653,7 +654,7 @@ pub struct ImagesSection {
 
 /// Credentials for one upstream registry host.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExternalRegistrySection {
     /// Registry host, e.g. `ghcr.io`.
     pub host: String,
@@ -682,7 +683,7 @@ pub struct ExternalRegistrySection {
 /// trust policy accepts it by construction, and there's no key material for
 /// an operator to provision or distribute.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TrustPolicySection {
     /// Require all Pickle-hosted images to be signed before scheduling.
     pub require_signatures: bool,
@@ -712,7 +713,7 @@ impl Default for ImagesSection {
 
 /// Metrics collection and storage configuration (Mayo).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MetricsSection {
     /// How often to collect system and process metrics (seconds).
     pub collection_interval_secs: u64,
@@ -754,7 +755,7 @@ impl Default for MetricsSection {
 
 /// Log collection configuration (Ketchup).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LogsSection {
     /// Days to retain log files before deletion.
     pub retention_days: u32,
@@ -787,7 +788,7 @@ impl Default for LogsSection {
 
 /// Alert evaluation and notification configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AlertsSection {
     /// How often to evaluate alert rules (seconds).
     pub evaluation_interval_secs: u64,
@@ -823,6 +824,7 @@ impl AlertsSection {
 
 /// A single webhook destination for alert notifications.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertDestination {
     /// Destination type (currently only `"webhook"`).
     #[serde(rename = "type")]
@@ -1153,12 +1155,16 @@ mod tests {
         assert_eq!(nc.logs.export_interval_secs, 600);
     }
 
-    /// OBS8: the removed `logs.max_file_size_mb` field must not break existing
-    /// configs that still set it — serde ignores unknown keys here.
+    /// Phase 16: unknown keys are rejected, not silently ignored. The removed
+    /// `logs.max_file_size_mb` field did nothing, so a config still setting it
+    /// now gets a clear error naming the field rather than a silent no-op.
     #[test]
-    fn parse_logs_section_ignores_removed_max_file_size() {
-        let nc = NodeConfig::parse("[logs]\nmax_file_size_mb = 500\n").unwrap();
-        assert_eq!(nc.logs.retention_days, 7);
+    fn parse_logs_section_rejects_removed_max_file_size() {
+        let error = NodeConfig::parse("[logs]\nmax_file_size_mb = 500\n").unwrap_err();
+        assert!(
+            error.to_string().contains("max_file_size_mb"),
+            "error should name the unknown field, got: {error}"
+        );
     }
 
     #[test]
