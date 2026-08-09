@@ -1062,7 +1062,7 @@ allow = [
 
 # Per-app inbound firewall (eBPF layer).
 [app.payment-service.firewall]
-allow_from = ["app.api", "app.admin"]
+allow_from = ["api", "admin"]
 ```
 
 ### 6.6 OIDC Configuration
@@ -1363,7 +1363,7 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 ### 10.3 Firewall Verification
 
 - **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from `admin_cidrs` or cluster nodes.
-- **eBPF firewall test:** Deploy two apps in the same namespace with `allow_from` restrictions. Verify that unauthorized apps receive `ECONNREFUSED`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
+- **eBPF firewall test:** Deploy two apps in the same namespace with `allow_from` restrictions. Verify that unauthorized apps receive `EPERM`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
 - **Egress allowlist test:** Deploy an app with an `egress` block. Verify that TCP and UDP connections to allowed IPv4/IPv6 destinations succeed and connections to disallowed destinations are dropped. Verify DNS resolution refresh by changing the DNS record and confirming the eBPF maps update.
 - **`relish firewall test` integration:** Verify that the `--from` / `--to` diagnostic command accurately reports whether a connection would be permitted.
 
@@ -1474,12 +1474,8 @@ Reliaburger's age-based secret encryption is much simpler than Vault but covers 
 | **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing. | The core crypto library. No unsafe code, constant-time operations. |
 | **age** | Asymmetric encryption for secrets (`ENC[AGE:...]` values). | Rust implementation of the age encryption format. Used for secret encryption/decryption and root CA key sealing. |
 | **x509-parser** | Parsing and validating X.509 certificates and CRLs. | Used for certificate chain validation, CRL parsing, and `relish ca status` output. |
-| **jsonwebtoken** | JWT creation and validation for OIDC workload identity tokens. | Used for minting JWTs on council nodes and validating JWTs from external OIDC providers. |
-| **webpki** | Certificate chain validation and trust anchor management. | Used alongside rustls for verifying certificate chains against the root CA trust anchor. |
 | **pem** | PEM encoding/decoding for certificates and keys. | Used for writing certificate files to workload identity mounts. |
 | **argon2** | Password hashing for API token storage. | Argon2id variant. Used for hashing API token secrets before Raft storage. |
-| **tss-esapi** | TPM 2.0 API bindings (optional, for TPM attestation and key sealing). | Conditional compilation: only included when `tpm` feature is enabled. |
-| **nftables** (nftnl-rs or nft crate) | Programmatic nftables rule management. | Used by Bun to manage the `reliaburger` nftables table, sets, and chains. |
 
 ---
 

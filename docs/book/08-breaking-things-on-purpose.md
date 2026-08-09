@@ -183,11 +183,11 @@ The simplest network fault. On each `connect()`, the eBPF program looks up `faul
 __u8 roll = x % 100;
 if (roll < fval->probability) {
     state->faults_injected++;
-    return 0;  /* -ECONNREFUSED */
+    return 0;  /* deny -> EPERM */
 }
 ```
 
-The application sees `ECONNREFUSED` — exactly what a real connection failure looks like. No simulation layer, no proxy, no iptables rules. The connection never leaves the kernel.
+The application sees `EPERM` — exactly what a real connection failure looks like. No simulation layer, no proxy, no iptables rules. The connection never leaves the kernel.
 
 ### Partition
 
@@ -279,7 +279,7 @@ For non-VIP connections, the hook checks if the calling cgroup has enforcement e
 ```c
 struct egress_value *ev = bpf_map_lookup_elem(&egress_map, &ek);
 if (!ev || ev->action != 1)
-    return 0;  /* -ECONNREFUSED: egress not allowed */
+    return 0;  /* deny -> EPERM: egress not allowed */
 ```
 
 Egress is opt-in. Apps without `[egress]` have all egress allowed. This is backward compatible — existing deployments don't need config changes.
@@ -749,7 +749,7 @@ drain_node_tracked_in_registry        registry_cleared_on_restart
 
 ### Gated tests — the kernel actually dropping packets
 
-Proving that an eBPF connect fault *really* returns `ECONNREFUSED` needs a real kernel. Those tests ride along with Chapter 3's eBPF suite, behind both the `ebpf` feature and the env var:
+Proving that an eBPF connect fault *really* returns `EPERM` needs a real kernel. Those tests ride along with Chapter 3's eBPF suite, behind both the `ebpf` feature and the env var:
 
 ```sh
 RELIABURGER_EBPF_TESTS=1 cargo test --features ebpf --test ebpf

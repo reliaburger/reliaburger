@@ -67,7 +67,7 @@ Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that 
 - Hook type: `BPF_CGROUP_INET4_CONNECT`
 - Attachment point: root cgroup v2 (`/sys/fs/cgroup`)
 - Trigger: Any `connect()` syscall
-- Behaviour: Checks whether the destination IP falls within the virtual IP range (127.128.0.0/16). If yes, looks up `(vip, port)` in `backend_map`, selects a healthy backend via round-robin, optionally checks `firewall_map` for authorisation, then rewrites the destination address and port to the selected backend's real `host_ip:host_port`. If the VIP is not found or no healthy backends exist, returns `-ECONNREFUSED`. If the destination IP is outside the VIP range, the call passes through untouched.
+- Behaviour: Checks whether the destination IP falls within the virtual IP range (127.128.0.0/16). If yes, looks up `(vip, port)` in `backend_map`, selects a healthy backend via round-robin, optionally checks `firewall_map` for authorisation, then rewrites the destination address and port to the selected backend's real `host_ip:host_port`. If the VIP is not found or no healthy backends exist, the hook denies the connection by returning 0, which the kernel surfaces to `connect()` as `EPERM`. If the destination IP is outside the VIP range, the call passes through untouched.
 
 ### BPF Maps
 
@@ -506,7 +506,7 @@ int onion_connect(struct bpf_sock_addr *ctx) {
 
     struct backend_value *val = bpf_map_lookup_elem(&backend_map, &key);
     if (!val || val->count == 0)
-        return 0;  // -ECONNREFUSED: no backends registered
+        return 0;  // -EPERM: no backends registered
 
     // --- Firewall check ---
     __u64 src_cgroup = bpf_get_current_cgroup_id();
@@ -522,7 +522,7 @@ int onion_connect(struct bpf_sock_addr *ctx) {
         };
         struct firewall_value *fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
         if (!fw || fw->action == 0)
-            return 0;  // -ECONNREFUSED: cross-namespace denied
+            return 0;  // -EPERM: cross-namespace denied
     }
 
     // Check per-app firewall rules (allow_from)
@@ -537,7 +537,7 @@ int onion_connect(struct bpf_sock_addr *ctx) {
     struct firewall_value *fw = bpf_map_lookup_elem(&firewall_map, &fw_key);
     // If there's an explicit deny, refuse
     if (fw && fw->action == 0)
-        return 0;  // -ECONNREFUSED
+        return 0;  // -EPERM
 
     // --- Backend selection: round-robin among healthy backends ---
     __u32 selected_idx = 0;
@@ -560,7 +560,7 @@ int onion_connect(struct bpf_sock_addr *ctx) {
     }
 
     if (!found)
-        return 0;  // -ECONNREFUSED: no healthy backends
+        return 0;  // -EPERM: no healthy backends
 
     // Rewrite destination to the selected backend
     struct backend_endpoint *be = &val->backends[selected_idx];
@@ -665,7 +665,7 @@ The `onion_connect` eBPF program selects backends using round-robin with health 
 2. Compute `candidate = rr_index % val->count`.
 3. If `backends[candidate].healthy == 1`, select it.
 4. Otherwise, try the next index. Repeat up to `val->count` times.
-5. If no healthy backend is found after a full scan, return `-ECONNREFUSED`.
+5. If no healthy backend is found after a full scan, the hook returns 0, which the kernel surfaces to `connect()` as `-EPERM`.
 
 The health status of each backend is maintained by Bun based on the health check results reported through the reporting tree. Bun writes the `healthy` field directly into the BPF map entry. The eBPF program never performs health checks itself -- it only reads the pre-computed health status.
 
@@ -821,7 +821,7 @@ Namespace isolation is the default security posture: apps in different namespace
    a. Looks up the source cgroup ID in `cgroup_namespace_map` to find the source namespace.
    b. Compares the source namespace ID with the destination's `namespace_id` (stored in `backend_value`).
    c. If they differ, looks up `(src_cgroup_id, dst_app_id)` in `firewall_map`.
-   d. If no explicit allow entry exists, returns `-ECONNREFUSED`.
+   d. If no explicit allow entry exists, the hook returns 0, surfaced to `connect()` as `-EPERM`.
 
 3. The enforcement happens at the source, before any packet is created. Cross-namespace connections are blocked even for same-node traffic.
 
@@ -836,7 +836,7 @@ By default, all cross-namespace connections are denied. To allow specific cross-
 namespace = "billing"
 
 [app.payment-service.firewall]
-allow_from = ["app.api@production"]   # allow api app from the production namespace
+allow_from = ["production/api"]   # allow the api app from the production namespace
 ```
 
 When Bun processes this configuration, it writes a `firewall_map` entry:
@@ -937,8 +937,8 @@ The eBPF programs are tested using the BPF test infrastructure (`BPF_PROG_TEST_R
 **Connect rewrite tests:**
 
 - `connect()` to a VIP with healthy backends rewrites to a valid backend.
-- `connect()` to a VIP with no healthy backends returns `-ECONNREFUSED`.
-- `connect()` to a VIP not in `backend_map` returns `-ECONNREFUSED`.
+- `connect()` to a VIP with no healthy backends returns `-EPERM`.
+- `connect()` to a VIP not in `backend_map` returns `-EPERM`.
 - `connect()` to a non-VIP address passes through untouched.
 - Round-robin distributes across healthy backends evenly.
 - Backends marked `healthy=0` are never selected.
@@ -1054,7 +1054,6 @@ The eBPF programs themselves are written in C (not aya-bpf/Rust) because the C B
 | Crate | Purpose |
 |-------|---------|
 | `aya` | eBPF program loading, map operations, program attachment |
-| `aya-obj` | Parsing of ELF/BTF sections in compiled BPF object files |
 | `libc` | BPF syscall wrappers (`SYS_bpf`) for any operations not covered by aya |
 | `siphasher` | SipHash-2-4 for deterministic VIP allocation |
 | `nix` | Cgroup operations, namespace manipulation |

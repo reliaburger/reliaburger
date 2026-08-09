@@ -820,7 +820,7 @@ pub struct UpgradeConfig {
 
 **Bun <-> containerd:** gRPC over Unix socket (`/run/containerd/containerd.sock`). Uses the containerd v1 API (`containerd.services.containers.v1`, `containerd.services.tasks.v1`, etc.).
 
-**Bun <-> reporting tree parent:** mTLS gRPC. Messages include:
+**Bun <-> reporting tree parent:** bincode-framed messages over an mTLS TCP connection. Messages include:
 
 - `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
 - `EventStream` -- real-time events (starts, stops, health changes, OOMs)
@@ -1732,21 +1732,13 @@ Bun Restart
 
 | Crate | Purpose | Version | License | Maturity | Notes |
 |-------|---------|---------|---------|----------|-------|
-| `containerd-client` | gRPC client for containerd API | latest | Apache-2.0 | Stable | Official containerd Rust client. Provides typed bindings for container and task management. Alternative: raw tonic gRPC with protobuf definitions, but the official client saves significant effort. |
 | `tokio` | Async runtime | 1.x | MIT | Mature, production-grade | The foundation for all async operations. Multi-threaded runtime with work-stealing scheduler. Pin Bun's critical tasks (health checker, reporting tree) to dedicated threads at high density. |
-| `tonic` | gRPC framework | 0.12+ | MIT | Mature | Used for inter-node communication (reporting tree, API forwarding, CSR flow). Also used internally by `containerd-client`. |
 | `nix` | Safe Rust bindings for Unix APIs | 0.29+ | MIT | Mature | `clone()`, `unshare()`, `mount()`, `pivot_root()`, `setns()`, `prctl()`, signal handling. Essential for process workload namespace setup. |
-| `libbpf-rs` | eBPF program loading and map management | 0.24+ | BSD-2-Clause | Active development | Loads compiled eBPF programs, manages BPF maps, handles kernel version differences. Used by Onion, Smoker, and Bun's cgroup monitoring. Alternative: `aya` (pure Rust eBPF). `libbpf-rs` chosen because it wraps the canonical C `libbpf` library, providing maximum kernel compatibility and access to CO-RE (Compile Once, Run Everywhere). `aya` is compelling but younger and may have edge cases with older kernels. |
 | `toml` + `serde` | TOML parsing and serialisation | latest | MIT/Apache-2.0 | Mature | For `node.toml` parsing and all TOML-based configuration. `serde` provides `#[serde(default)]` for optional fields with defaults. |
 | `age` | age encryption/decryption | 0.10+ | MIT/Apache-2.0 | Stable | For decrypting `ENC[AGE:...]` secrets. The `age` crate is the canonical Rust implementation of the age encryption format. |
-| `ed25519-dalek` | Ed25519 signature verification | 2.x | BSD-3-Clause | Mature | For verifying binary signatures during self-upgrade. Both embedded key set verification and external key verification. |
 | `sha2` | SHA-256 hashing | 0.10+ | MIT/Apache-2.0 | Mature | For binary integrity verification during self-upgrade. Also used for content addressing in Pickle. |
 | `hyper` | HTTP client/server | 1.x | MIT | Mature | For health check probes (HTTP GET to workload endpoints), API server, and Wrapper ingress proxy. Used via Tokio. |
-| `rustls` | TLS implementation | 0.23+ | MIT/Apache-2.0/ISC | Mature | For mTLS (inter-node, workload identity). Pure Rust, no OpenSSL dependency. Used by `tonic` for gRPC TLS and by `hyper` for HTTPS. |
-| `notify` | Filesystem event watcher | 6.x | Artistic-2.0/MIT | Mature | For watching `node.toml` changes (hot reload) and cgroup `memory.events` (OOM detection). Uses `inotify` on Linux. |
-| `nftnl` / `mnl` | nftables management | latest | GPL-2.0 / LGPL-2.1 | Stable | For managing perimeter firewall rules. `nftnl` provides high-level nftables object construction; `mnl` provides Netlink communication. Note: GPL-2.0 license on `nftnl` -- evaluate whether this is acceptable or whether we need to shell out to the `nft` CLI instead. |
-| `nvml-wrapper` | NVIDIA Management Library bindings | 0.10+ | MIT/Apache-2.0 | Stable | For GPU detection at startup. Optional runtime dependency -- Bun functions without it (GPU features disabled). |
-| `cron` | Cron expression parsing | 0.12+ | MIT/Apache-2.0 | Stable | For parsing Job schedule expressions. |
+| `rustls` | TLS implementation | 0.23+ | MIT/Apache-2.0/ISC | Mature | For mTLS (inter-node, workload identity). Pure Rust, no OpenSSL dependency. Used by `tokio-rustls` for inter-node TLS and by `hyper` for HTTPS. |
 | `rand` | Random number generation | 0.8+ | MIT/Apache-2.0 | Mature | For port allocation (random selection from available pool) and fault injection probability calculations. |
 
 ### 12.2 Evaluation Notes

@@ -525,7 +525,7 @@ The default sync mode. A tokio timer fires every `poll_interval` (default 30 sec
 
 For instant deploys on push. The webhook endpoint is served on the cluster API port (the same port used by `relish` CLI and Brioche), behind TLS (required -- plaintext webhook endpoints are rejected at config validation time).
 
-**Endpoint:** `POST /api/v1/gitops/webhook`
+**Endpoint:** `POST /v1/gitops/webhook`
 
 **Validation procedure:**
 
@@ -1008,18 +1008,16 @@ All dependencies are Rust crates, compiled into the Bun binary. No runtime depen
 
 | Crate | Version (min) | Purpose | Notes |
 |-------|--------------|---------|-------|
-| `git2` | 0.18 | libgit2 bindings for git operations (clone, fetch, checkout, log). | Statically links libgit2. Handles SSH and HTTPS transports. |
 | `toml` | 0.8 | TOML parsing and serialisation. | Already used throughout Reliaburger for config parsing. |
-| `sequoia-openpgp` | 1.17 | OpenPGP signature verification. Parses GPG signatures from commits and verifies against trusted keys. | Preferred over `pgp` crate for its active maintenance and correct implementation of the OpenPGP standard. |
-| `ssh-key` | 0.6 | SSH key parsing. Extracts fingerprints from SSH signatures for verification against `trusted_signing_keys`. | Used alongside `ssh-encoding` for SSH signature format parsing. |
-| `hmac` | 0.12 | HMAC computation for webhook signature validation. | Used with `sha2` for HMAC-SHA256. |
 | `sha2` | 0.10 | SHA-256 hash computation. Used for webhook HMAC and script content hashing. | Already used elsewhere in Bun. |
 | `reqwest` | 0.12 | HTTP client (not for webhook receiving, which uses the existing Bun API server). Reserved for future use: outbound notifications on sync events. | Optional dependency; may not be needed if notifications go through the existing alerting subsystem. |
 | `serde` / `serde_json` | 1.0 | Serialisation for webhook payload parsing and `SyncState` Raft replication. | Already a core dependency. |
 | `tokio` | 1.0 | Async runtime for the sync loop timer, webhook handler, and git fetch. | Already the async runtime for Bun. |
-| `ring` | 0.17 | Constant-time HMAC comparison for webhook validation. | Alternative to `hmac` crate; provides `ring::hmac::verify` with constant-time comparison built in. Either `ring` or `hmac` should be chosen, not both. |
+| `ring` | 0.17 | Constant-time HMAC-SHA256 computation and comparison for webhook validation. | `ring::hmac::verify` gives constant-time comparison built in. |
 
-**Binary size impact:** The `git2` crate (with statically linked libgit2) adds approximately 2-3 MB to the Bun binary. `sequoia-openpgp` adds approximately 1-2 MB. Total Lettuce contribution to binary size: approximately 4-6 MB.
+Git operations (clone, fetch, log, `verify-commit`) are shelled out to the system `git` binary via `std::process`, so there is no `libgit2` binding dependency. Commit signature verification relies on `git verify-commit` rather than a Rust OpenPGP/SSH-signature crate.
+
+**Binary size impact:** Lettuce reuses crates Bun already links (`toml`, `sha2`, `reqwest`, `serde`, `tokio`, `ring`) and shells out to the system `git` binary, so its contribution to the Bun binary is negligible.
 
 ---
 

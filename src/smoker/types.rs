@@ -51,7 +51,7 @@ pub enum FaultType {
         jitter_ns: u64,
     },
 
-    /// Fail a percentage of connections with ECONNREFUSED.
+    /// Fail a percentage of connections with EPERM.
     Drop {
         /// Percentage of connections to drop (0-100).
         probability: u8,

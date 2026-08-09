@@ -246,7 +246,7 @@ int onion_connect(struct bpf_sock_addr *ctx)
 
                 if (fval->action == FAULT_ACTION_PARTITION) {
                     /* Block this connection entirely */
-                    return 0;  /* -ECONNREFUSED */
+                    return 0;  /* deny -> EPERM */
                 }
 
                 if (fval->action == FAULT_ACTION_DROP) {
@@ -254,7 +254,7 @@ int onion_connect(struct bpf_sock_addr *ctx)
                     __u32 rand = bpf_get_prandom_u32();
                     __u8 roll = rand % 100;
                     if (roll < fval->probability)
-                        return 0;  /* -ECONNREFUSED */
+                        return 0;  /* deny -> EPERM */
                 }
 
                 /* FAULT_ACTION_DELAY is handled in sock_ops or tc netem,
@@ -273,7 +273,7 @@ no_fault:
 
     struct backend_value *val = bpf_map_lookup_elem(&backend_map, &key);
     if (!val || val->count == 0)
-        return 0;  /* -ECONNREFUSED: no backends registered */
+        return 0;  /* deny -> EPERM: no backends registered */
 
     /* --- Firewall: namespace isolation --- */
     __u64 src_cgroup = bpf_get_current_cgroup_id();
@@ -292,7 +292,7 @@ no_fault:
         struct firewall_value *fw = bpf_map_lookup_elem(
             &firewall_map, &fw_key);
         if (!fw || fw->action == FIREWALL_DENY)
-            return 0;  /* -ECONNREFUSED: cross-namespace denied */
+            return 0;  /* deny -> EPERM: cross-namespace denied */
     }
 
     /* --- Backend selection: round-robin among healthy --- */
@@ -322,7 +322,7 @@ no_fault:
     }
 
     if (!found)
-        return 0;  /* -ECONNREFUSED: no healthy backends */
+        return 0;  /* deny -> EPERM: no healthy backends */
 
     /* Rewrite destination to the selected backend */
     struct backend_endpoint *be = &val->backends[selected_idx];

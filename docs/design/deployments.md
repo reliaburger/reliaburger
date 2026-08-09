@@ -1138,7 +1138,6 @@ Argo Rollouts is a Kubernetes controller that provides advanced deployment strat
 |---|---|
 | `tokio` | Async runtime for the deploy orchestration loop, timeout handling (`tokio::time::timeout` for health check and drain deadlines), and concurrent step execution when `max_surge > 1`. |
 | `serde` / `serde_json` | Serialisation of deploy state for Raft persistence and API responses. |
-| `chrono` | Timestamps for deploy history entries and phase transitions. |
 | `toml` | Parsing `[app.<name>.deploy]` and `[app.<name>.autoscale]` configuration sections. |
 
 **State machine pattern:** The deploy state machine is implemented as an `enum`-based state machine (Rust's `enum` variants represent states, `match` expressions enforce valid transitions). No external state machine crate is needed; Rust's type system ensures exhaustive handling of all states. The pattern is:

@@ -27,7 +27,7 @@ Relish is a pure client-side binary. It doesn't run any server processes, doesn'
 
 ### Cluster API (all remote operations)
 
-Every Relish command that interacts with the cluster communicates through the Reliaburger cluster API, exposed on port 9443 (mTLS) on every node. The API follows the request routing described in the whitepaper:
+Every Relish command that interacts with the cluster communicates through the Reliaburger cluster API, exposed on port 9117 (mTLS) on every node. The API follows the request routing described in the whitepaper:
 
 - **Read-only requests** (status, inspect, logs, events, top, resolve, firewall, history, wtf) are served by any council member from its local Raft state replica. The receiving node forwards to the nearest council member if it isn't one itself.
 - **Write requests** (apply, deploy, scale, rollback, secret encrypt, volume snapshot, fault inject) are forwarded to the leader, which commits via Raft before responding.
@@ -113,7 +113,7 @@ The `relish identity`, `relish ca status`, and `relish ca rotate` commands query
             v
     +------------------+
     |  Cluster API     |
-    |  (any node:9443) |
+    |  (any node:9117) |
     +------------------+
 ```
 
@@ -1886,29 +1886,23 @@ Relish is implemented in Rust. The following crates are used:
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `clap` (derive) | 4.x | CLI argument parsing, subcommand dispatch, help generation, shell completion generation |
-| `ratatui` | 0.28.x | Terminal UI rendering framework (widgets, layouts, styles) |
+| `clap` (derive) | 4.x | CLI argument parsing, subcommand dispatch, help generation |
+| `ratatui` | 0.29.x | Terminal UI rendering framework (widgets, layouts, styles) |
 | `crossterm` | 0.28.x | Cross-platform terminal manipulation (raw mode, events, colours, cursor) |
+| `nucleo-matcher` | 0.3.x | Fuzzy matching for the TUI search view |
 | `reqwest` | 0.12.x | HTTP/2 client with mTLS, connection pooling, streaming |
 | `tokio` | 1.x | Async runtime for concurrent API calls, WebSocket streams, and TUI event loop |
-| `tokio-tungstenite` | 0.24.x | WebSocket client for streaming logs, events, and exec sessions |
+| `tokio-tungstenite` | 0.28.x | WebSocket client for streaming logs, events, and exec sessions |
 | `serde_yaml` | 0.9.x | YAML serialisation for `--output yaml` mode |
-| `indicatif` | 0.17.x | Progress bars and spinners for long-running operations (apply, upgrade, bench) |
-| `dialoguer` | 0.11.x | Interactive prompts for confirmations (apply, chaos test, upgrade) |
 | `serde` | 1.x | Serialisation/deserialisation for config, API responses, output |
 | `serde_json` | 1.x | JSON formatting for `--output json` |
 | `toml` | 0.8.x | TOML parsing for configuration files and `compile`/`lint`/`fmt` |
-| `chrono` | 0.4.x | Timestamp parsing and formatting for events, history, logs |
+| `pulldown-cmark` | 0.13.x | Markdown rendering for `relish manual` |
+| `rust-embed` | 8.x | Embedding the manual and bundled source into the binary |
 | `anyhow` | 1.x | Error handling with context |
 | `thiserror` | 2.x | Typed error definitions for API client errors |
-| `tracing` | 0.1.x | Structured logging for `--verbose` debug output |
-| `clap_complete` | 4.x | Shell completion script generation (bash, zsh, fish) |
-| `keyring` | 3.x | OS keychain integration for token storage |
 | `rustls` | 0.23.x | TLS implementation (used by reqwest) for mTLS client certs |
 | `insta` | 1.x | Snapshot testing for TUI rendering (dev dependency) |
-| `unicode-width` | 0.2.x | Correct column width calculation for Unicode characters in terminal output |
-| `textwrap` | 0.16.x | Text wrapping for long messages in human-readable output |
-| `similar` | 2.x | Diff algorithm for `relish diff` human-readable output coloring |
 
 All dependencies are vendored in the release build. The binary is statically linked (musl on Linux, native on macOS) with no runtime shared library dependencies.
 
