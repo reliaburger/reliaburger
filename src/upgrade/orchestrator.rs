@@ -1,10 +1,12 @@
 //! Leader-side rolling upgrade orchestration.
 //!
 //! The leader walks the fleet: workers (in batches of `parallel`), then
-//! non-leader council members one at a time (quorum-gated), then hands
-//! leadership to an upgraded member and lets the *new* leader upgrade the
-//! former one. All state lives in Raft (`DesiredState.active_upgrade`), so
-//! a leader change mid-run is a resume, not a restart.
+//! non-leader council members one at a time (quorum-gated), then the leader
+//! itself, last and **in place** — openraft 0.9 has no graceful leadership
+//! transfer, so the leader execs the new binary directly (a sub-second gap)
+//! and a council member re-establishes leadership while it restarts, quorum
+//! permitting. All state lives in Raft (`DesiredState.active_upgrade`), so a
+//! leader change mid-run is a resume, not a restart.
 //!
 //! The core is [`step`]: given the current state and a [`NodeControl`]
 //! (real HTTP or a test mock), poll reality, take at most one round of
