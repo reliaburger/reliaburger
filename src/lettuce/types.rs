@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Top-level GitOps configuration, parsed from the `[gitops]` section
 /// of the cluster config TOML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct GitOpsConfig {
     /// SSH or HTTPS URL of the git repository.
     pub repo: String,

@@ -13,6 +13,7 @@ use super::error::ConfigError;
 
 /// Specification for an in-cluster image build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildSpec {
     /// Path to the build context (directory containing the Dockerfile).
     pub context: PathBuf,

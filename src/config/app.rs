@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppSpec {
     /// OCI image reference. Required for container workloads.
     /// Ignored by ProcessGrill (which runs `command` as an OS process).
@@ -90,6 +91,7 @@ pub struct AppSpec {
 /// Probes the app's HTTP endpoint to determine health status.
 /// Only `path` is required; all other fields have sensible defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthSpec {
     /// HTTP path to probe, e.g. "/healthz".
     pub path: String,
@@ -148,6 +150,7 @@ impl<'de> Deserialize<'de> for HealthProtocol {
 
 /// Init container that runs before the main container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InitContainerSpec {
     /// Image to use. If omitted, inherits the parent app's image.
     pub image: Option<String>,
@@ -158,6 +161,7 @@ pub struct InitContainerSpec {
 
 /// Ingress configuration for external traffic routing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngressSpec {
     /// Hostname for routing, e.g. "myapp.com".
     pub host: String,
@@ -178,6 +182,7 @@ pub struct IngressSpec {
 
 /// Placement constraints for scheduling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlacementSpec {
     /// Hard constraints — app only schedules on nodes matching all labels.
     /// Format: "key=value" strings.
@@ -190,6 +195,7 @@ pub struct PlacementSpec {
 
 /// Deploy strategy configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploySpec {
     /// Strategy: "rolling" or "blue-green".
     pub strategy: Option<String>,
@@ -207,6 +213,7 @@ pub struct DeploySpec {
 
 /// Ingress firewall rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FirewallSpec {
     /// App names allowed to connect to this app.
     #[serde(default)]
@@ -215,6 +222,7 @@ pub struct FirewallSpec {
 
 /// Egress allowlist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EgressSpec {
     /// External destinations allowed, e.g. "api.stripe.com:443".
     #[serde(default)]
@@ -226,6 +234,7 @@ pub struct EgressSpec {
 
 /// Autoscaling configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutoscaleSpec {
     /// Metric to scale on, e.g. "cpu" or "memory".
     pub metric: String,

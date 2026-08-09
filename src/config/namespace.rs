@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// All fields are optional — omitted fields mean no quota for that resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamespaceSpec {
     /// Total CPU budget, e.g. "8000m".
     pub cpu: Option<String>,

@@ -1874,13 +1874,20 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 
 ### Section A — Cheap correctness now (config + mechanical doc sweeps)
 
-- [ ] **Reject unknown config keys.** Add `#[serde(deny_unknown_fields)]` across
-  every `src/config/` struct (and the sub-configs in `smoker`, `lettuce`,
-  `mayo`, `ketchup`, `wrapper`). Today no struct rejects unknown keys, which is
-  why dozens of hallucinated doc keys "parse" and silently do nothing. Turn that
-  whole class of silent misconfig into a startup error. Expect fallout: fix any
-  real example/config that relied on a now-rejected key; add a round-trip test
-  per section.
+- [x] **Reject unknown config keys** — `#[serde(deny_unknown_fields)]` on every
+  TOML-deserialised config struct: all of `src/config/` (app/node trees + their
+  sub-specs), plus the externally-defined sections `GitOpsConfig` (`[gitops]`),
+  `BackupConfig` (`[cluster.backup]`) and `ClusterTestPolicy` (`[testing]`). The
+  runtime configs in `smoker`/`mayo`/`ketchup`/`wrapper` are built *from* those
+  TOML sections, not parsed from TOML, so they didn't need it; `deny_unknown_fields`
+  is a no-op for bincode, so Raft/wire round-trips are unaffected. A typo or a
+  removed key is now a parse error naming the field instead of a silent no-op.
+  Fallout fixed: the `parse_logs_section_ignores_removed_max_file_size` test now
+  asserts rejection; `make examples` was running `relish apply` on a fault-scenario
+  file that only "passed" because the old parser swallowed its fields into an empty
+  config — the target now routes `[[step]]` files to `relish fault scenario
+  --dry-run` and validates them for real. Added positive tests for a mistyped app
+  field and a mistyped top-level table.
 - [ ] **`/api/v1` → `/v1` doc sweep.** The real API/UI routes have no `/api`
   prefix. Fix every occurrence across the whitepaper, `ui-brioche.md`,
   `metrics-mayo.md`, `logs-ketchup.md`, `gitops-lettuce.md`, `cli-relish.md`.

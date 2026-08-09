@@ -75,7 +75,12 @@ examples: build ## Dry-run every example config with relish
 	trap 'rm -f "$$output"' EXIT HUP INT TERM; \
 	for f in $$(find examples -name '*.toml' | sort); do \
 		total=$$((total + 1)); \
-		if target/debug/relish apply "$$f" --dry-run >"$$output" 2>&1; then \
+		if grep -q '^\[\[step\]\]' "$$f"; then \
+			cmd="fault scenario $$f --dry-run"; \
+		else \
+			cmd="apply $$f --dry-run"; \
+		fi; \
+		if target/debug/relish $$cmd >"$$output" 2>&1; then \
 			printf "  ✓ %s\n" "$$f"; \
 		else \
 			printf "  ✗ %s\n" "$$f"; \
